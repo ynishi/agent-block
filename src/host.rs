@@ -46,6 +46,16 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let root_span = info_span!("agent_block", script = %script_name);
     let _root_guard = root_span.enter();
 
+    // ── .env ──────────────────────────────────────────────────────
+    // Load .env from project_root if present. Variables are merged into
+    // the process environment so Lua's `std.env.get()` picks them up.
+    let env_path = config.project_root.join(".env");
+    match dotenvy::from_path(&env_path) {
+        Ok(()) => info!(path = %env_path.display(), ".env loaded"),
+        Err(dotenvy::Error::Io(_)) => {} // file not found — fine
+        Err(e) => tracing::warn!(path = %env_path.display(), error = %e, ".env parse error"),
+    }
+
     // ── Init ──────────────────────────────────────────────────────
     let _init_guard = info_span!("init").entered();
 
