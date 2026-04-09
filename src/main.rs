@@ -16,7 +16,7 @@ mod mcp_client;
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-block",
-    about = "Agent Runtime: 1 Agent = 1 Process = 1 Lua Script"
+    about = "Single-purpose agent building block with built-in mesh communication"
 )]
 struct Cli {
     /// Lua script path

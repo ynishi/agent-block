@@ -2,6 +2,10 @@
 name = "agent-block"
 version = "0.1.0"
 edition = "2021"
+description = "Lua-first Agent Runtime built on AgentMesh"
+authors = ["Yutaka Nishimura"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/agent-block"
 
 [[bin]]
 name = "agent-block"

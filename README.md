@@ -1,13 +1,21 @@
 # agent-block
 
-Lua-first Agent Runtime built on AgentMesh. 1 Agent = 1 Process = 1 Lua Script.
+Single-purpose agent building block with built-in mesh communication.
 
-## Philosophy
+## What is agent-block?
 
-- **Thin Rust Host** — Only runs the Lua VM and connects to the mesh. Domain logic, tool system, and FC loop are all written in Lua
-- **1 Process = 1 Agent = 1 Responsibility** — Fault isolation. One crash doesn't propagate to others
-- **MCP Support** — Call existing MCP servers (outline-mcp, etc.) from Lua
-- **AgentMesh Integration** — Agent-to-agent communication via agent-mesh relay (encrypted, streaming)
+A headless agent runtime. Each agent runs as a single process, executes its task, then exits. No rich interactive TUI, no sub-agent orchestration — orchestration belongs to the caller (shell, A2A, CI, etc.).
+
+agent-block handles the infrastructure that individual agents shouldn't have to — mesh connectivity (A2A), MCP server management, LLM API access — so that Lua code focuses purely on domain logic.
+
+Think of it like Envoy for agents: the process itself is simple, but the communication layer is fully capable.
+
+## Design Decisions
+
+- **Single run** — One process, one task, one exit. Orchestration belongs to the caller (shell, A2A, CI, etc.), not inside the agent
+- **Headless** — No terminal UI. Agents are composed via A2A/mesh protocols, not interactive prompts
+- **Runtime owns the protocol** — Mesh, MCP, and HTTP are provided by the runtime. Lua code never deals with connection management or wire formats
+- **Lua for logic, Rust for plumbing** — Domain logic in Lua. VM, networking, and protocol handling in Rust
 
 ## Architecture
 
@@ -39,7 +47,7 @@ Lua-first Agent Runtime built on AgentMesh. 1 Agent = 1 Process = 1 Lua Script.
 # Basic
 agent-block --script scripts/hello.lua
 
-# FC loop example
+# With project context
 agent-block --script scripts/test_fcloop.lua --project .
 
 # With mesh
@@ -90,15 +98,17 @@ ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9
 ### log.*
 - `log.info/warn/error/debug(msg)`
 
-## Dependencies
+## License
 
-- `mlua-isle` — Lua VM (isolated thread execution)
-- `mlua-batteries` — Lua stdlib (json, fs, env, path, time)
-- `agent-mesh-sdk` — Mesh communication
-- `reqwest` — HTTP (LLM API — custom client for tool_use support)
-- `mlua` — Lua 5.4 binding
+Licensed under either of
 
-## Phase 2 TODO
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
-- `mesh.on` — Incoming request handler
-- `llm.chat_stream` — Streaming support
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
