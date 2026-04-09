@@ -47,6 +47,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "llm-extract",
  "mlua",
  "mlua-batteries",
  "mlua-isle",
@@ -698,6 +699,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzzy-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f76a3c3a1bfb60924fded82f72b5e71d375ffc48e9a2f4dc2ae226b89e4a8f89"
+dependencies = [
+ "serde",
+ "serde_json",
+ "strsim",
+ "thiserror",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,6 +1131,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonrepair"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbd084aab201d699b6da54bc10fbedf1ab92c984eeb306d40546fa675184ec06"
+dependencies = [
+ "memchr",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,6 +1171,31 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "llm-extract"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1076e9955a16322797ee4c3817195e83ae2415ffbd89ed154b0c2b75f021082c"
+dependencies = [
+ "fuzzy-parser",
+ "jsonrepair",
+ "llm-extract-derive",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "llm-extract-derive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b19bb90e6f4809bdcca0b15a2944175825e8ac59b76e123096337560ab7ccd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "lock_api"

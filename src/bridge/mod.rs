@@ -12,6 +12,7 @@
 //! | `log`  | `log.*`, `env.*` | Logging and environment access |
 
 pub mod http;
+pub mod llm;
 pub mod log;
 pub mod mcp;
 pub mod mesh;
@@ -46,5 +47,6 @@ pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     log::register(lua, ctx)?;
     mcp::register(lua, &ctx.mcp_manager)?;
     http::register(lua, ctx)?;
+    llm::register(lua)?;
     Ok(())
 }
