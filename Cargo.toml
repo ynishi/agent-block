@@ -6,6 +6,19 @@ description = "Lua-first Agent Runtime built on AgentMesh"
 authors = ["Yutaka Nishimura"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/agent-block"
+keywords = ["lua", "agent", "runtime", "mcp", "mesh"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.70"
+
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/**/*.rs",
+    "LICENSE-*",
+    "README.md",
+    "CHANGELOG.md",
+    "examples/**/*.lua",
+]
 
 [[bin]]
 name = "agent-block"
