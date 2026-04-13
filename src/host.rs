@@ -9,16 +9,59 @@
 //! 5. Execute the user-provided Lua script via `coroutine_eval` (async-aware)
 //! 6. Graceful shutdown (Isle + MCP servers + mesh)
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use mlua_isle::AsyncIsle;
-use tracing::{info, info_span};
+use tracing::{info, info_span, warn};
 
 use crate::bridge;
 use crate::error::{BlockError, BlockResult};
 use crate::mcp_client::McpManager;
+
+/// Embedded Lua sources for blocks/ StdPkg modules.
+/// These are baked into the binary at compile time so `cargo install` works
+/// without any extra file distribution.
+const EMBEDDED_BLOCKS: &[(&str, &str)] = &[("agent", include_str!("../blocks/agent/init.lua"))];
+
+/// Build the `blocks/` portion of `package.path` from filesystem locations.
+///
+/// Priority (highest first):
+/// 1. `project_root/blocks/` — user-customisable, overrides embedded StdPkg
+/// 2. `exe_dir/blocks/`      — development hot-reload (next to the binary)
+///
+/// Returns a semicolon-terminated string ready to prepend to `package.path`,
+/// or an empty string when no `blocks/` directories are found.
+fn build_blocks_path(project_root: &Path) -> String {
+    let mut out = String::new();
+
+    // 1. project_root/blocks/
+    let project_blocks = project_root.join("blocks");
+    if project_blocks.is_dir() {
+        let pb = project_blocks.to_string_lossy();
+        out.push_str(&format!("{pb}/?.lua;{pb}/?/init.lua;"));
+    }
+
+    // 2. exe_dir/blocks/
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_blocks = exe_dir.join("blocks");
+                if exe_blocks.is_dir() {
+                    let eb = exe_blocks.to_string_lossy();
+                    out.push_str(&format!("{eb}/?.lua;{eb}/?/init.lua;"));
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "current_exe() failed; skipping exe_dir/blocks/ from package.path");
+        }
+    }
+
+    out
+}
 
 pub struct BlockConfig {
     pub script_path: PathBuf,
@@ -110,10 +153,40 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         mlua_batteries::register_all(lua, "std")?;
         bridge::register_all(lua, &ctx)?;
 
+        // ── package.path ──────────────────────────────────────────────
+        // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
         let package: mlua::Table = lua.globals().get("package")?;
         let current_path: String = package.get("path")?;
-        let new_path = format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{current_path}");
+        let blocks_paths = build_blocks_path(&ctx.project_root);
+        let new_path =
+            format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
         package.set("path", new_path)?;
+
+        // ── package.searchers — embedded fallback ─────────────────────
+        // Register a custom searcher that loads blocks/ modules from the
+        // sources baked in at compile time.  This is the lowest-priority
+        // searcher so filesystem copies always win.
+        let embedded: HashMap<&'static str, &'static str> =
+            EMBEDDED_BLOCKS.iter().copied().collect();
+
+        let searchers: mlua::Table = package.get("searchers")?;
+        let loader =
+            lua.create_function(move |lua, name: String| match embedded.get(name.as_str()) {
+                Some(source) => {
+                    let chunk = lua
+                        .load(*source)
+                        .set_name(format!("@embedded:blocks/{name}/init.lua"));
+                    let func = chunk.into_function()?;
+                    Ok(mlua::Value::Function(func))
+                }
+                None => {
+                    let msg = lua.create_string(format!("\n\tno embedded block '{name}'"))?;
+                    Ok(mlua::Value::String(msg))
+                }
+            })?;
+        // Append as the last searcher so filesystem paths remain preferred.
+        let next_idx = searchers.raw_len() + 1;
+        searchers.raw_set(next_idx, loader)?;
 
         Ok(())
     })

@@ -95,6 +95,45 @@ ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9
 - `std.path.join(...)`, `std.path.basename(path)`, `std.path.dirname(path)`
 - `std.time.now()`, `std.time.sleep(secs)`, `std.time.measure(fn)`
 
+### agent (StdPkg — `require("agent")`)
+
+Built-in ReAct loop module. Available without any path configuration after `cargo install`.
+
+```lua
+local agent = require("agent")
+
+local result = agent.run({
+    prompt  = "List files in the current directory and summarise them.",
+    system  = "You are a helpful assistant.",           -- optional
+    model   = "claude-haiku-4-5-20251001",             -- optional, env ANTHROPIC_MODEL as fallback
+    max_tokens       = 4096,                            -- per-request token limit
+    max_iterations   = 20,                              -- loop iteration cap
+    max_tokens_budget = 50000,                          -- total token budget (nil = unlimited)
+    timeout          = 120,                             -- HTTP timeout in seconds
+    mcp_servers = {                                     -- optional MCP servers to connect
+        { name = "outline", command = "outline-mcp", args = {} },
+    },
+    on_turn = function(info)                            -- optional per-turn callback
+        print("turn", info.turn_number, "#tools", #info.tool_calls)
+    end,
+    extra_tools = {},                                   -- optional extra Anthropic tool defs
+})
+
+if result.ok then
+    print(result.content)
+else
+    print("error:", result.error)
+end
+-- result fields: ok, content, usage{input_tokens,output_tokens,total_tokens}, num_turns, error, messages
+```
+
+Key behaviours:
+- MCP servers listed in `mcp_servers` are connected automatically and disconnected on exit (even on error).
+- MCP tool names are namespaced as `server_name__tool_name` to avoid collisions.
+- Tool dispatch: MCP tools via `mcp.call()`, registered Lua tools via `tool.call()`.
+- Never throws — all errors returned as `{ ok=false, error="..." }`.
+- The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
+
 ### log.*
 - `log.info/warn/error/debug(msg)`
 
