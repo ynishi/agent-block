@@ -18,6 +18,7 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "examples/**/*.lua",
+    "blocks/**/*.lua",
 ]
 
 [[bin]]
