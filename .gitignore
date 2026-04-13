@@ -4,3 +4,4 @@ workspace
 .mcp.json
 .claude
 .env
+.ryo
