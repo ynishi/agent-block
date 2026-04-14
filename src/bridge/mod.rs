@@ -97,11 +97,7 @@ pub fn json_to_lua(lua: &Lua, val: serde_json::Value) -> LuaResult<LuaValue> {
     json_to_lua_inner(lua, &val, 0)
 }
 
-fn json_to_lua_inner(
-    lua: &Lua,
-    val: &serde_json::Value,
-    depth: usize,
-) -> LuaResult<LuaValue> {
+fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaResult<LuaValue> {
     const MAX_DEPTH: usize = 128;
     if depth > MAX_DEPTH {
         return Err(LuaError::external(format!(
