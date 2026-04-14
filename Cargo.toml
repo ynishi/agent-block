@@ -1,6 +1,6 @@
 [package]
 name = "agent-block"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Lua-first Agent Runtime built on AgentMesh"
 authors = ["Yutaka Nishimura"]

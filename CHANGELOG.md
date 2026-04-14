@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-15
+
 ### Added
 
 - `blocks/` StdPkg system: Lua modules embedded via `include_str!` are bundled into the binary and loadable with `require()`. File-system copies in `project_root/blocks/` or `exe_dir/blocks/` take precedence (hot-reload friendly). No path configuration required after `cargo install`.
 - Generic Agent module (`require("agent")`): ReAct loop with MCP tool integration and dual budget control (`max_iterations` + `max_tokens_budget`). Connects to MCP servers, merges their tool schemas with registered Lua tools, dispatches `tool_use` responses, and returns a structured result `{ ok, content, usage, num_turns, error, messages }`.
 - E2E tests and sample script for the agent module (`tests/e2e_agent.rs`, `tests/fixtures/agent_require.lua`, `examples/test_agent.lua`).
+- `--mcp-timeout-secs` CLI flag for per-RPC MCP timeout, applied uniformly to `connect` / `list_tools` / `call_tool` / `disconnect`.
+- `tracing::warn!` on every MCP error path (spawn / initialize / list_tools / call_tool / disconnect — timeout and protocol failures alike) so autonomous runs leave a Rust-side log trail in addition to the Lua-visible error. Structured fields include `server`, `tool`, `timeout`, `error`.
+- E2E regression tests for the "autonomous-agent visibility" contract: CLI must reject `--mcp-timeout-secs 0` at parse time; MCP timeouts and unknown-server errors must propagate to Lua AND emit `tracing::warn!` (`tests/e2e_mcp.rs`, `tests/fixtures/mcp_errors.lua`).
 
 ### Changed
 
@@ -23,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `McpManager::call_tool` now validates that `arguments` is a JSON object (or `Null` for "no arguments") up-front; arrays/scalars are rejected with a clear error rather than being silently dropped.
 - `McpManager::disconnect` now reuses the configured `rpc_timeout` for the cancel round-trip (removed the separately hardcoded 5s `CANCEL_TIMEOUT`). `disconnect_all` logs 2nd-and-later errors at `warn` level instead of discarding them silently.
 - `mcp.connect` argv iteration now uses integer indices (`1..=len`) instead of `pairs`, guaranteeing argument order regardless of Lua table layout.
+- Internal manager concurrency primitive switched from `tokio::sync::Mutex<McpManager>` to `tokio::sync::RwLock<McpManager>`. `list_tools` / `call_tool` take `&self` so concurrent RPCs — including against the same server — proceed in parallel under read guards; `connect` / `disconnect` take the write guard. Per-server request multiplexing is delegated to rmcp's `Peer`. Covered by in-process concurrency tests.
+- **Breaking (Rust API)**: `McpManager::with_rpc_timeout` now returns `BlockResult<Self>` and rejects `Duration::ZERO`. A zero timeout would silently turn every `tokio::time::timeout` into an immediate error; for an autonomous agent that "everything broken" mode must surface at construction, not at the first RPC. The CLI flag is additionally range-checked by clap (`value_parser!(u64).range(1..)`) so the misconfig fails at parse time. The Lua-visible API is unchanged.
 
 ## [0.2.0] - 2026-04-10
 
