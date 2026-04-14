@@ -32,12 +32,15 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
                 move |_, (name, command, args): (String, String, Option<LuaTable>)| {
                     let mgr = Arc::clone(&mgr);
                     async move {
+                        // Iterate by integer index (1..=len) so argv order is
+                        // preserved regardless of table layout. `pairs` gives
+                        // no ordering guarantee for integer-keyed tables.
                         let args: Vec<String> = match args {
                             Some(tbl) => {
-                                let mut v = Vec::new();
-                                for pair in tbl.pairs::<LuaValue, String>() {
-                                    let (_, s) = pair?;
-                                    v.push(s);
+                                let len = tbl.raw_len();
+                                let mut v = Vec::with_capacity(len);
+                                for i in 1..=len {
+                                    v.push(tbl.raw_get::<String>(i)?);
                                 }
                                 v
                             }
@@ -82,6 +85,14 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
     }
 
     // mcp.call(name, tool_name, arguments)
+    //
+    // Return shape:
+    //   { ok=true,  content=[...], is_error=bool, structured_content=... }  (RPC success)
+    //   { ok=false, error="..." }                                           (transport/protocol)
+    //
+    // `ok` is reserved for protocol / transport / timeout failures.
+    // `is_error` mirrors the server-reported `isError` from `CallToolResult`
+    // so tool-execution errors reach the LLM unchanged (MCP spec intent).
     {
         let mgr = Arc::clone(manager);
         mcp_tbl.set(
@@ -90,9 +101,10 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
                 move |lua, (name, tool_name, arguments): (String, String, Option<LuaValue>)| {
                     let mgr = Arc::clone(&mgr);
                     async move {
+                        // None → Null (mcp_client treats Null as "no arguments").
                         let args_json = match arguments {
                             Some(v) => lua_to_json(&lua, v)?,
-                            None => serde_json::json!({}),
+                            None => serde_json::Value::Null,
                         };
 
                         let result = mgr
@@ -110,6 +122,14 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Array(vec![]));
                                 tbl.set("content", json_to_lua(&lua, content)?)?;
+                                let is_error = val
+                                    .get("isError")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                tbl.set("is_error", is_error)?;
+                                if let Some(sc) = val.get("structuredContent").cloned() {
+                                    tbl.set("structured_content", json_to_lua(&lua, sc)?)?;
+                                }
                             }
                             Err(e) => {
                                 tbl.set("ok", false)?;

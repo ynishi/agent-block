@@ -42,14 +42,12 @@ use rmcp::{
 };
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::error::{BlockError, BlockResult};
 
 /// Default RPC round-trip timeout when no explicit value is provided.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Timeout for graceful shutdown of a managed server.
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct McpManager {
     servers: HashMap<String, RunningService<RoleClient, ()>>,
@@ -113,9 +111,15 @@ impl McpManager {
     /// Call `tools/call` with the given tool name and arguments.
     ///
     /// Returns the full rmcp `CallToolResult` serialized to JSON
-    /// (`{"content": [...], "isError": bool, ...}`) on success.
-    /// If `arguments` is not a JSON object, the request is sent with
-    /// no `arguments` field (rmcp skips `None` during serialization).
+    /// (`{"content": [...], "isError": bool, ...}`) on success, including
+    /// the `isError` flag — tool-execution errors are passed through to
+    /// the caller, following the MCP spec's intent that the LLM sees them
+    /// and self-corrects. Only protocol / transport / timeout failures
+    /// surface as `Err(BlockError::*)`.
+    ///
+    /// `arguments` must be a JSON `Object` or `Null`. `Null` is treated as
+    /// "no arguments"; any other shape (array, scalar) returns an error
+    /// rather than silently dropping the payload.
     /// Immutable receiver so concurrent readers can share an `RwLock<McpManager>`.
     pub async fn call_tool(
         &self,
@@ -123,14 +127,35 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> BlockResult<serde_json::Value> {
+        // Validate argument shape early so the error does not depend on
+        // whether the server is registered or reachable. MCP spec requires
+        // `arguments` to be an object (or absent); an array/scalar would
+        // serialize into `CallToolRequestParams` as-is and the server
+        // would reject it with an opaque protocol error.
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        match arguments {
+            serde_json::Value::Object(obj) => {
+                params = params.with_arguments(obj);
+            }
+            serde_json::Value::Null => {}
+            other => {
+                let kind = match other {
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "bool",
+                    _ => "unknown",
+                };
+                return Err(BlockError::Mcp(format!(
+                    "call_tool '{tool_name}' on '{name}': arguments must be a JSON object \
+                     (got {kind})"
+                )));
+            }
+        }
         let srv = self
             .servers
             .get(name)
             .ok_or_else(|| BlockError::Mcp(format!("no server named '{name}'")))?;
-        let mut params = CallToolRequestParams::new(tool_name.to_string());
-        if let serde_json::Value::Object(obj) = arguments {
-            params = params.with_arguments(obj);
-        }
         let rpc_timeout = self.rpc_timeout;
         let result = timeout(rpc_timeout, srv.call_tool(params))
             .await
@@ -148,27 +173,36 @@ impl McpManager {
     ///
     /// The server is removed from the internal map **before** the cancel
     /// round-trip begins, so a slow or failed cancel never leaves a
-    /// zombie entry behind. If graceful cancel exceeds `CANCEL_TIMEOUT`,
+    /// zombie entry behind. If graceful cancel exceeds `rpc_timeout`,
     /// the service handle is dropped at the end of the match arm —
     /// rmcp's `Drop` impl cancels the peer's cancellation token, which
     /// terminates the internal task and closes the transport — and
     /// `BlockError::Timeout` is returned.
+    ///
+    /// The same `rpc_timeout` is reused here so callers have a single
+    /// knob governing every MCP round-trip (see `with_rpc_timeout`).
     ///
     /// Callers may re-`connect` the same name safely after any outcome.
     pub async fn disconnect(&mut self, name: &str) -> BlockResult<()> {
         let Some(running) = self.servers.remove(name) else {
             return Ok(());
         };
-        match timeout(CANCEL_TIMEOUT, running.cancel()).await {
+        let cancel_timeout = self.rpc_timeout;
+        match timeout(cancel_timeout, running.cancel()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(BlockError::Mcp(format!("cancel '{name}': {e}"))),
             Err(_) => Err(BlockError::Timeout(format!(
-                "cancel '{name}' timed out after {CANCEL_TIMEOUT:?}"
+                "cancel '{name}' timed out after {cancel_timeout:?}"
             ))),
         }
     }
 
-    /// Cancel all managed servers, collecting the first error if any.
+    /// Cancel all managed servers.
+    ///
+    /// Every server is disconnected regardless of individual failures.
+    /// The first error encountered is returned so shutdown can signal
+    /// a problem; **subsequent** errors are logged at `warn` level so
+    /// they are not silently discarded.
     pub async fn disconnect_all(&mut self) -> BlockResult<()> {
         let mut first_err: Option<BlockError> = None;
         let names: Vec<String> = self.servers.keys().cloned().collect();
@@ -176,6 +210,8 @@ impl McpManager {
             if let Err(e) = self.disconnect(&name).await {
                 if first_err.is_none() {
                     first_err = Some(e);
+                } else {
+                    warn!(server = %name, error = %e, "disconnect failed during disconnect_all");
                 }
             }
         }
@@ -233,6 +269,42 @@ mod tests {
             .await
             .expect("disconnect_all on empty manager should succeed");
         assert!(mgr.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_non_object_arguments() {
+        // Argument validation runs before the server lookup, so an
+        // array/scalar is rejected even without a live server.
+        let mgr = McpManager::new();
+        for bad in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("string"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let res = mgr.call_tool("anything", "dummy", bad.clone()).await;
+            let err = res.expect_err("non-object args must error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("arguments must be a JSON object"),
+                "unexpected error for {bad}: {msg}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_accepts_null_arguments_as_absent() {
+        // Null is the documented "no arguments" form. It must pass the
+        // validation gate (and fail at the server-lookup step instead).
+        let mgr = McpManager::new();
+        let res = mgr
+            .call_tool("ghost", "dummy", serde_json::Value::Null)
+            .await;
+        let err = res.expect_err("expected no-server error, not arg-shape error");
+        assert!(
+            err.to_string().contains("no server named"),
+            "Null args should reach the lookup step: {err}",
+        );
     }
 }
 
@@ -373,6 +445,62 @@ mod concurrency_tests {
         assert!(
             mgr.try_write().is_err(),
             "write lock acquired while a read guard was held",
+        );
+    }
+
+    /// A server that always returns `CallToolResult::error`, i.e.
+    /// `isError = true`. Used to lock down pass-through semantics.
+    #[derive(Clone)]
+    struct IsErrorServer;
+
+    impl ServerHandler for IsErrorServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _params: CallToolRequestParams,
+            _ctx: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, McpError> {
+            Ok(CallToolResult::error(vec![Content::text("tool blew up")]))
+        }
+    }
+
+    async fn attach_is_error_server(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            if let Ok(running) = IsErrorServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let running = ().serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    #[tokio::test]
+    async fn is_error_is_passed_through_in_ok_branch() {
+        // MCP spec: tool-execution errors come back as a successful RPC
+        // with `isError=true`. `call_tool` must return `Ok(..)` and
+        // preserve `isError` in the serialized JSON so the Lua bridge
+        // (and ultimately the LLM) sees it.
+        let mut mgr = McpManager::new();
+        attach_is_error_server(&mut mgr, "boom").await;
+
+        let val = mgr
+            .call_tool("boom", "explode", serde_json::json!({}))
+            .await
+            .expect("RPC succeeds even when isError=true");
+
+        assert_eq!(
+            val.get("isError").and_then(|v| v.as_bool()),
+            Some(true),
+            "isError must be preserved in Ok branch: {val}",
+        );
+        let content = val.get("content").and_then(|v| v.as_array()).cloned();
+        assert!(
+            content.as_ref().map(|c| !c.is_empty()).unwrap_or(false),
+            "content blocks must be forwarded alongside isError: {val:?}",
         );
     }
 }

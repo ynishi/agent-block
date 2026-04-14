@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `McpManager::call_tool` replaces the generic `call(method, params)` method. The Lua-visible API (`mcp.connect`, `mcp.list_tools`, `mcp.call`, `mcp.disconnect`) is unchanged.
 - `mcp.list_tools` now uses `list_all_tools()` internally, which handles cursor-based pagination automatically.
 - `mcp.call` and `mcp.list_tools` now return rmcp typed results serialised via `serde_json::to_value`, preserving the existing Lua JSON shape (`tools[].name`, `tools[].inputSchema`, `content[].type`, `content[].text`).
+- `mcp.call` return table now includes `is_error` (mirrors MCP `isError`) and optional `structured_content` (mirrors MCP `structuredContent`). `ok` remains reserved for transport / protocol / timeout failures; tool-execution errors are passed through so the LLM can self-correct, matching the MCP 2025-06-18 spec intent. `blocks/agent` ReAct loop now forwards `is_error` to the Anthropic `tool_result` block.
+- `McpManager::call_tool` now validates that `arguments` is a JSON object (or `Null` for "no arguments") up-front; arrays/scalars are rejected with a clear error rather than being silently dropped.
+- `McpManager::disconnect` now reuses the configured `rpc_timeout` for the cancel round-trip (removed the separately hardcoded 5s `CANCEL_TIMEOUT`). `disconnect_all` logs 2nd-and-later errors at `warn` level instead of discarding them silently.
+- `mcp.connect` argv iteration now uses integer indices (`1..=len`) instead of `pairs`, guaranteeing argument order regardless of Lua table layout.
 
 ## [0.2.0] - 2026-04-10
 

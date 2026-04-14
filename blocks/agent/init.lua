@@ -227,19 +227,27 @@ local function dispatch_tool(name, input, mcp_tool_map)
     if mcp_tool_map[name] then
         local entry = mcp_tool_map[name]
         local call_result = mcp.call(entry.server, entry.tool, input)
+        -- ok=false covers transport / protocol / timeout failures only.
         if not call_result.ok then
             return tostring(call_result.error or "mcp.call failed"), true
+        end
+
+        -- Server-reported tool-execution error (MCP `isError`). Forward the
+        -- content as-is so the LLM can self-correct in the ReAct loop.
+        local is_error = call_result.is_error == true
+        if is_error then
+            log.warn(string.format("mcp tool '%s.%s' returned isError=true", entry.server, entry.tool))
         end
 
         -- Extract content from MCP result
         local content_blocks = call_result.content or {}
         if #content_blocks == 1 and content_blocks[1].type == "text" then
-            return content_blocks[1].text, false
+            return content_blocks[1].text, is_error
         elseif #content_blocks == 0 then
-            return "", false
+            return "", is_error
         else
             -- Multiple blocks or non-text: encode as JSON
-            return std.json.encode(content_blocks), false
+            return std.json.encode(content_blocks), is_error
         end
     end
 
