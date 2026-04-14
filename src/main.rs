@@ -5,8 +5,10 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::host::{run, BlockConfig};
+use crate::mcp_client::DEFAULT_RPC_TIMEOUT;
 
 mod bridge;
 mod error;
@@ -30,6 +32,11 @@ struct Cli {
     /// Project root directory
     #[arg(short = 'p', long, default_value = ".")]
     project: PathBuf,
+
+    /// Per-RPC timeout for MCP round-trips (seconds).
+    /// Applied uniformly to connect / list_tools / call_tool.
+    #[arg(long, value_name = "SECS")]
+    mcp_timeout_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -43,10 +50,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let mcp_rpc_timeout = cli
+        .mcp_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RPC_TIMEOUT);
+
     let config = BlockConfig {
         script_path: cli.script,
         project_root: cli.project,
         relay_url: cli.relay,
+        mcp_rpc_timeout,
     };
 
     Ok(run(config).await?)

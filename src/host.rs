@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::RwLock;
 
 use mlua_isle::AsyncIsle;
 use tracing::{info, info_span, warn};
@@ -67,6 +68,9 @@ pub struct BlockConfig {
     pub script_path: PathBuf,
     pub project_root: PathBuf,
     pub relay_url: Option<String>,
+    /// Per-RPC timeout for every MCP round-trip (connect / list / call).
+    /// Defaults to [`crate::mcp_client::DEFAULT_RPC_TIMEOUT`].
+    pub mcp_rpc_timeout: Duration,
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -74,7 +78,7 @@ pub struct BlockConfig {
 pub struct HostContext {
     pub project_root: PathBuf,
     pub mesh_agent: Option<Arc<agent_mesh_sdk::MeshAgent>>,
-    pub mcp_manager: Arc<Mutex<McpManager>>,
+    pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
 }
@@ -119,7 +123,9 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         None
     };
 
-    let mcp_manager = Arc::new(Mutex::new(McpManager::new()));
+    let mcp_manager = Arc::new(RwLock::new(McpManager::with_rpc_timeout(
+        config.mcp_rpc_timeout,
+    )));
 
     // Resolve project_root to absolute path.
     // canonicalize() can fail if the path doesn't exist; fall back to
@@ -211,7 +217,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     {
         let _shutdown_guard = info_span!("shutdown").entered();
 
-        mcp_manager.lock().await.disconnect_all().await?;
+        mcp_manager.write().await.disconnect_all().await?;
 
         driver
             .shutdown()

@@ -53,3 +53,6 @@ rmcp = { version = "1.4.0", features = ["client", "transport-child-process"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
+# concurrency tests that run an MCP server over tokio::io::duplex pipes.
+rmcp = { version = "1.4.0", features = ["server"] }

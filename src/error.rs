@@ -20,7 +20,6 @@ pub enum BlockError {
     #[error("script error: {0}")]
     Script(String),
 
-    #[allow(dead_code)]
     #[error("timeout: {0}")]
     Timeout(String),
 
