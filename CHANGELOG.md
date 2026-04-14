@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Generic Agent module (`require("agent")`): ReAct loop with MCP tool integration and dual budget control (`max_iterations` + `max_tokens_budget`). Connects to MCP servers, merges their tool schemas with registered Lua tools, dispatches `tool_use` responses, and returns a structured result `{ ok, content, usage, num_turns, error, messages }`.
 - E2E tests and sample script for the agent module (`tests/e2e_agent.rs`, `tests/fixtures/agent_require.lua`, `examples/test_agent.lua`).
 
+### Changed
+
+- MCP client (`src/mcp_client.rs`) migrated from a bespoke JSON-RPC stdio implementation to [rmcp](https://crates.io/crates/rmcp) 1.4.x. The `McpServer` struct and hand-rolled request/response loop are replaced by `RunningService<RoleClient, ()>` from rmcp. The `()` unit type provides the default `ClientHandler`, which returns `method_not_found` for `sampling/createMessage` (Sampling API not advertised).
+- `McpManager::call_tool` replaces the generic `call(method, params)` method. The Lua-visible API (`mcp.connect`, `mcp.list_tools`, `mcp.call`, `mcp.disconnect`) is unchanged.
+- `mcp.list_tools` now uses `list_all_tools()` internally, which handles cursor-based pagination automatically.
+- `mcp.call` and `mcp.list_tools` now return rmcp typed results serialised via `serde_json::to_value`, preserving the existing Lua JSON shape (`tools[].name`, `tools[].inputSchema`, `content[].type`, `content[].text`).
+
 ## [0.2.0] - 2026-04-10
 
 ### Added
