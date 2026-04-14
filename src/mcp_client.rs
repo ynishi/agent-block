@@ -56,33 +56,56 @@ pub struct McpManager {
 
 impl McpManager {
     pub fn new() -> Self {
-        Self::with_rpc_timeout(DEFAULT_RPC_TIMEOUT)
+        Self {
+            servers: HashMap::new(),
+            rpc_timeout: DEFAULT_RPC_TIMEOUT,
+        }
     }
 
     /// Construct a manager with a caller-specified RPC timeout.
     /// Applies to `connect`, `list_tools`, and `call_tool` alike.
-    pub fn with_rpc_timeout(rpc_timeout: Duration) -> Self {
-        Self {
+    ///
+    /// `rpc_timeout` must be non-zero. `Duration::ZERO` would cause every
+    /// `tokio::time::timeout` to fire immediately, silently turning every
+    /// MCP round-trip into a timeout error — for an autonomous agent that
+    /// is a "everything looks broken" failure mode. We reject it at
+    /// construction time so the misconfiguration surfaces loudly at
+    /// startup instead of being swallowed at the first RPC.
+    pub fn with_rpc_timeout(rpc_timeout: Duration) -> BlockResult<Self> {
+        if rpc_timeout.is_zero() {
+            return Err(BlockError::Mcp(
+                "rpc_timeout must be > 0 (got Duration::ZERO); \
+                 every MCP RPC would time out immediately"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
             servers: HashMap::new(),
             rpc_timeout,
-        }
+        })
     }
 
     /// Spawn the MCP server process and complete the MCP initialize handshake.
     pub async fn connect(&mut self, name: &str, command: &str, args: &[String]) -> BlockResult<()> {
         let mut cmd = Command::new(command);
         cmd.args(args).stderr(Stdio::inherit());
-        let transport = TokioChildProcess::new(cmd)
-            .map_err(|e| BlockError::Mcp(format!("spawn '{command}': {e}")))?;
+        let transport = TokioChildProcess::new(cmd).map_err(|e| {
+            warn!(server = %name, command = %command, error = %e, "mcp spawn failed");
+            BlockError::Mcp(format!("spawn '{command}': {e}"))
+        })?;
         let rpc_timeout = self.rpc_timeout;
         let running = timeout(rpc_timeout, ().serve(transport))
             .await
             .map_err(|_| {
+                warn!(server = %name, timeout = ?rpc_timeout, "mcp initialize timed out");
                 BlockError::Timeout(format!(
                     "initialize '{name}' timed out after {rpc_timeout:?}"
                 ))
             })?
-            .map_err(|e| BlockError::Mcp(format!("initialize '{name}': {e}")))?;
+            .map_err(|e| {
+                warn!(server = %name, error = %e, "mcp initialize failed");
+                BlockError::Mcp(format!("initialize '{name}': {e}"))
+            })?;
         self.servers.insert(name.to_string(), running);
         Ok(())
     }
@@ -91,19 +114,23 @@ impl McpManager {
     ///
     /// Immutable receiver so concurrent readers can share an `RwLock<McpManager>`.
     pub async fn list_tools(&self, name: &str) -> BlockResult<serde_json::Value> {
-        let srv = self
-            .servers
-            .get(name)
-            .ok_or_else(|| BlockError::Mcp(format!("no server named '{name}'")))?;
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, "mcp list_tools on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
         let rpc_timeout = self.rpc_timeout;
         let tools = timeout(rpc_timeout, srv.list_all_tools())
             .await
             .map_err(|_| {
+                warn!(server = %name, timeout = ?rpc_timeout, "mcp list_tools timed out");
                 BlockError::Timeout(format!(
                     "list_tools '{name}' timed out after {rpc_timeout:?}"
                 ))
             })?
-            .map_err(|e| BlockError::Mcp(format!("list_tools '{name}': {e}")))?;
+            .map_err(|e| {
+                warn!(server = %name, error = %e, "mcp list_tools failed");
+                BlockError::Mcp(format!("list_tools '{name}': {e}"))
+            })?;
         serde_json::to_value(&tools)
             .map_err(|e| BlockError::Mcp(format!("serialize list_tools result: {e}")))
     }
@@ -152,19 +179,23 @@ impl McpManager {
                 )));
             }
         }
-        let srv = self
-            .servers
-            .get(name)
-            .ok_or_else(|| BlockError::Mcp(format!("no server named '{name}'")))?;
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, tool = %tool_name, "mcp call_tool on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
         let rpc_timeout = self.rpc_timeout;
         let result = timeout(rpc_timeout, srv.call_tool(params))
             .await
             .map_err(|_| {
+                warn!(server = %name, tool = %tool_name, timeout = ?rpc_timeout, "mcp call_tool timed out");
                 BlockError::Timeout(format!(
                     "call_tool '{tool_name}' on '{name}' timed out after {rpc_timeout:?}"
                 ))
             })?
-            .map_err(|e| BlockError::Mcp(format!("call_tool '{tool_name}' on '{name}': {e}")))?;
+            .map_err(|e| {
+                warn!(server = %name, tool = %tool_name, error = %e, "mcp call_tool failed");
+                BlockError::Mcp(format!("call_tool '{tool_name}' on '{name}': {e}"))
+            })?;
         serde_json::to_value(&result)
             .map_err(|e| BlockError::Mcp(format!("serialize call_tool result: {e}")))
     }
@@ -190,10 +221,16 @@ impl McpManager {
         let cancel_timeout = self.rpc_timeout;
         match timeout(cancel_timeout, running.cancel()).await {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(BlockError::Mcp(format!("cancel '{name}': {e}"))),
-            Err(_) => Err(BlockError::Timeout(format!(
-                "cancel '{name}' timed out after {cancel_timeout:?}"
-            ))),
+            Ok(Err(e)) => {
+                warn!(server = %name, error = %e, "mcp cancel failed");
+                Err(BlockError::Mcp(format!("cancel '{name}': {e}")))
+            }
+            Err(_) => {
+                warn!(server = %name, timeout = ?cancel_timeout, "mcp cancel timed out");
+                Err(BlockError::Timeout(format!(
+                    "cancel '{name}' timed out after {cancel_timeout:?}"
+                )))
+            }
         }
     }
 
@@ -235,6 +272,32 @@ mod tests {
     #[tokio::test]
     async fn new_manager_is_empty() {
         let mgr = McpManager::new();
+        assert!(mgr.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_rpc_timeout_rejects_zero() {
+        // A ZERO timeout would make every `tokio::time::timeout` fire
+        // immediately, silently turning every RPC into a timeout error.
+        // For an autonomous agent that is a catastrophic failure mode —
+        // the misconfiguration must surface at construction, not be
+        // swallowed at the first MCP call.
+        let err = match McpManager::with_rpc_timeout(Duration::ZERO) {
+            Ok(_) => panic!("Duration::ZERO must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("rpc_timeout must be > 0"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn with_rpc_timeout_accepts_positive() {
+        let mgr = match McpManager::with_rpc_timeout(Duration::from_millis(1)) {
+            Ok(m) => m,
+            Err(e) => panic!("positive timeout must be accepted: {e}"),
+        };
         assert!(mgr.servers.is_empty());
     }
 

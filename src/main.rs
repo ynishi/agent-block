@@ -33,9 +33,9 @@ struct Cli {
     #[arg(short = 'p', long, default_value = ".")]
     project: PathBuf,
 
-    /// Per-RPC timeout for MCP round-trips (seconds).
+    /// Per-RPC timeout for MCP round-trips (seconds). Must be > 0.
     /// Applied uniformly to connect / list_tools / call_tool.
-    #[arg(long, value_name = "SECS")]
+    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
     mcp_timeout_secs: Option<u64>,
 }
 

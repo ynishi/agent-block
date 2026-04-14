@@ -125,7 +125,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 
     let mcp_manager = Arc::new(RwLock::new(McpManager::with_rpc_timeout(
         config.mcp_rpc_timeout,
-    )));
+    )?));
 
     // Resolve project_root to absolute path.
     // canonicalize() can fail if the path doesn't exist; fall back to
