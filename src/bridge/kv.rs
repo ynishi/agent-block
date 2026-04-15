@@ -13,17 +13,6 @@ use crate::host::HostContext;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the base directory for kv storage.
-///
-/// Priority: `$AGENT_BLOCK_HOME` → `$HOME/.agent-block`
-pub(crate) fn base_dir() -> Result<PathBuf, String> {
-    if let Some(v) = std::env::var_os("AGENT_BLOCK_HOME") {
-        return Ok(PathBuf::from(v));
-    }
-    let home = std::env::var_os("HOME").ok_or_else(|| "HOME env var not set".to_string())?;
-    Ok(PathBuf::from(home).join(".agent-block"))
-}
-
 /// Validate a namespace string.
 ///
 /// Rejects: empty, contains `/`, `\`, `..`, or `\0`.
@@ -40,8 +29,7 @@ fn validate_ns(ns: &str) -> Result<(), String> {
 /// Return the path to the JSON file for a given namespace.
 fn ns_path(ns: &str) -> Result<PathBuf, String> {
     validate_ns(ns)?;
-    let base = base_dir()?;
-    Ok(base.join("kv").join(format!("{ns}.json")))
+    Ok(super::config::kv_dir()?.join(format!("{ns}.json")))
 }
 
 /// Load the JSON map from disk. Returns an empty map if the file does not exist.

@@ -11,6 +11,7 @@
 //! | `http` | `http.*`     | Async HTTP client |
 //! | `log`  | `log.*`, `env.*` | Logging and environment access |
 
+pub mod config;
 pub mod http;
 pub mod kv;
 pub mod llm;

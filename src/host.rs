@@ -140,23 +140,26 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let http_client = reqwest::Client::new();
 
     // ── SQL init ──────────────────────────────────────────────────────────
-    let sql_path = crate::bridge::kv::base_dir()
-        .map_err(BlockError::Runtime)?
-        .join("db.sqlite");
-    if let Some(parent) = sql_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| BlockError::Runtime(format!("sql dir create: {e}")))?;
+    // All knobs are ENV-driven (see `bridge/config.rs`).
+    let sql_path = crate::bridge::config::sql_path().map_err(BlockError::Runtime)?;
+    let is_memory = crate::bridge::config::is_memory_sql(&sql_path);
+    if !is_memory {
+        if let Some(parent) = sql_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BlockError::Runtime(format!("sql dir create: {e}")))?;
+        }
     }
     let conn = rusqlite::Connection::open(&sql_path)
         .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", sql_path.display())))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| BlockError::Runtime(format!("WAL pragma: {e}")))?;
-    // POC: hardcoded E2E table. Replace with manifest-driven migrate in production.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS test_kv (k TEXT PRIMARY KEY, v TEXT)",
-        [],
-    )
-    .map_err(|e| BlockError::Runtime(format!("bootstrap table: {e}")))?;
+    if !is_memory {
+        let journal = crate::bridge::config::sql_journal_mode();
+        conn.pragma_update(None, "journal_mode", &journal)
+            .map_err(|e| BlockError::Runtime(format!("journal_mode={journal}: {e}")))?;
+    }
+    let busy_ms = crate::bridge::config::sql_busy_timeout().as_millis() as i64;
+    conn.pragma_update(None, "busy_timeout", busy_ms)
+        .map_err(|e| BlockError::Runtime(format!("busy_timeout pragma: {e}")))?;
+    info!(path = %sql_path.display(), busy_ms, "sql initialized");
     let sql_conn = Arc::new(Mutex::new(conn));
     // ── end SQL init ──────────────────────────────────────────────────────
 

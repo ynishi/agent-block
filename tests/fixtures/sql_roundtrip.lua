@@ -1,6 +1,10 @@
 -- sql_roundtrip.lua — E2E fixture for std.sql bridge
 -- Tests INSERT → SELECT → UPDATE → SELECT → DELETE → COUNT
 
+-- 0. Bootstrap: manifest-driven migrate is TBD, so the fixture sets up its
+-- own table via std.sql.exec (DDL is allowed through the direct bridge).
+std.sql.exec("CREATE TABLE IF NOT EXISTS test_kv (k TEXT PRIMARY KEY, v TEXT)")
+
 -- 1. INSERT
 local ins = std.sql.exec("INSERT INTO test_kv (k, v) VALUES (?, ?)", { "hello", "world" })
 print("affected=" .. tostring(ins.affected))
