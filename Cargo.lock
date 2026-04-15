@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agent-mesh-core",
  "agent-mesh-sdk",
@@ -68,9 +68,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3f805c630e2cfc08f8ca6fc3856c06dd35dd8768e84f513996df722f749ed4f"
+checksum = "b6ddc56a7cf666320ccbc3cf10b1440a04066b2ccaed479a9d61447aaa64ff90"
 dependencies = [
  "base64",
  "chrono",
@@ -86,9 +86,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-sdk"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e7388a47887138290800b563db77df88223dd3cf25a561dbe8287e3d249a1d7"
+checksum = "e95cd4f02b685b268194d9dc128fe61dc72a9aad0b2c452c556f1c2f139cc66a"
 dependencies = [
  "agent-mesh-core",
  "async-trait",
