@@ -74,3 +74,42 @@ fn task_phase3_fixture() {
                 .and(predicate::str::contains("done")),
         );
 }
+
+#[test]
+fn task_phase4_fixture() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("task_phase4.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("timeout_abort_raises=true")
+                .and(predicate::str::contains("timeout_abort_bounded=true"))
+                .and(predicate::str::contains("a_grandchild_ran=true"))
+                .and(predicate::str::contains("b_inner_child_ran=true"))
+                .and(predicate::str::contains("unknown_opts_rejected=true"))
+                .and(predicate::str::contains("sleep_rejects_inf=true"))
+                .and(predicate::str::contains("coro_cancel_bounded=true"))
+                .and(predicate::str::contains(
+                    "opts_name_non_string_rejected=true",
+                ))
+                .and(predicate::str::contains(
+                    "opts_driver_non_string_rejected=true",
+                ))
+                .and(predicate::str::contains(
+                    "opts_non_string_key_rejected=true",
+                ))
+                .and(predicate::str::contains("driver_async_fn_alias_ok=true"))
+                .and(predicate::str::contains("driver_async_alias_ok=true"))
+                .and(predicate::str::contains("grace_zero_raises=true"))
+                .and(predicate::str::contains("grace_zero_bounded=true"))
+                .and(predicate::str::contains("cleanup_ran=true"))
+                .and(predicate::str::contains(
+                    "timeout_unknown_opts_rejected=true",
+                ))
+                .and(predicate::str::contains("grace_non_number_rejected=true"))
+                .and(predicate::str::contains("sleep_ms_out_of_range=true"))
+                .and(predicate::str::contains("done")),
+        );
+}

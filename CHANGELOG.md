@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.task` Lua bridge — structured concurrency primitives on `tokio::task::LocalSet`. Public API: `task.spawn(fn, opts?) -> handle`, `task.scope(name?, fn)`, `task.with_timeout(ms, fn, opts?)`, `task.sleep(ms)`, `task.yield()`, `task.checkpoint()`, `task.cancelled()`, `task.current()`. `handle:join()` / `handle:cancel()` / `scope:spawn()` / `scope:cancel()` surface per-task and per-scope control. Child tasks inherit a `CancelToken` via `tokio::task_local!`, so a parent cancel propagates cooperatively to every descendant at the next suspension point.
+- `task.with_timeout` 3-stage graceful-abort teardown (Kubernetes / ASP.NET Core / Spring Boot pattern): (1) `token.cancel()` on deadline, (2) `drain_scope` under `timeout(grace_ms)`, (3) `AbortHandle` hard-abort for any child that did not reach a checkpoint. `tracing` events at `target = "task"` trace each stage (`debug` on cancel / normal drain, `warn` on grace expiry with remaining child count).
+- Per-call grace override via `opts.grace_ms` and VM-wide override via `AGENT_BLOCK_TASK_GRACE_MS` env var. Default grace is 1 s — long enough for local cleanup (DB flush, fsync, HTTP release), short enough not to mask real hangs.
+- Cancel-aware sleep and yield: `task.sleep` / `task.yield` / `task.checkpoint` all observe the enclosing `CancelToken`, so `pcall`-swallowed cancellations reappear at the next checkpoint and cannot be silently suppressed.
+- Optional `coroutine` driver (`opts.driver = "coroutine"` or `AGENT_BLOCK_TASK_DRIVER=coroutine`): drives the user function via `Thread::resume` rather than `Function::call_async`, enabling `coroutine.yield(ms)` as a cancel-aware sleep inside a raw Lua thread.
+
+#### Limits and silent behaviour
+
+- **Per-scope child cap**: `scope:spawn` rejects beyond 32 concurrent children. Long fan-outs must batch or use a worker-pool pattern.
+- **Dropped-handle error suppression**: if a `task.spawn` `handle` is dropped without `handle:join()`, the child's error is recorded via `tracing::error` but is **not** propagated into the surrounding scope body (first-error / `Task.WhenAll` semantics; no `ExceptionGroup`). To surface child errors, keep and join the handle.
+- **ENV parse is silent**: a malformed `AGENT_BLOCK_TASK_GRACE_MS` (non-numeric, negative, overflow) falls back to the built-in default without raising — a bad shell env must not break every `with_timeout` in the VM at call time. Same policy as `AGENT_BLOCK_TASK_DRIVER`.
+
+#### Usage note — `task.scope` is cooperative-only
+
+`task.scope` has no deadline and performs no hard abort; on the error path it issues `token.cancel()` and awaits `drain_scope` until every child exits. This follows Trio / Swift `withThrowingTaskGroup` / Kotlin `coroutineScope` / Rust `moro` / `tokio-util::TaskTracker`. Consequence: **a child that never reaches a checkpoint (e.g. `while true do end`, blocking FFI without `task.checkpoint()`) will deadlock `task.scope`.** Mitigation:
+
+- Wrap untrusted / CPU-bound work with `task.with_timeout(ms, fn, { grace_ms = … })` — `with_timeout` is the only primitive that hard-aborts, and only after the grace window.
+- Insert `task.checkpoint()` (or `task.yield()` / cancel-aware `task.sleep`) in long-running loops so the child can observe cancellation.
+
 ## [0.4.1] - 2026-04-16
 
 ### Changed
