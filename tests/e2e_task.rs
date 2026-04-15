@@ -51,3 +51,26 @@ fn task_phase2_fixture() {
                 .and(predicate::str::contains("done")),
         );
 }
+
+#[test]
+fn task_phase3_fixture() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("task_phase3.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("outside_current_nil=true")
+                .and(predicate::str::contains("current_id_type=string"))
+                .and(predicate::str::contains("current_name=introspect"))
+                .and(predicate::str::contains("current_cancelled=false"))
+                .and(predicate::str::contains("coro_val=coro_done"))
+                .and(predicate::str::contains("coro_sleep_ok=true"))
+                .and(predicate::str::contains("coro_yield_val=99"))
+                .and(predicate::str::contains("coro_concurrent_ok=true"))
+                .and(predicate::str::contains("unknown_driver_rejected=true"))
+                .and(predicate::str::contains("coro_current_name=coro_named"))
+                .and(predicate::str::contains("done")),
+        );
+}

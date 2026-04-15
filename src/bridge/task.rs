@@ -33,11 +33,24 @@
 //! Must be called from within a `tokio::task::LocalSet` driven by a
 //! current-thread runtime.  `mlua-isle::AsyncIsle` satisfies this.
 //!
-//! # Driver selection
+//! # Driver selection (Phase 3)
 //!
-//! Phase 2 still only implements the `async_fn` driver
-//! (`Function::call_async`).  `AGENT_BLOCK_TASK_DRIVER=coroutine` and
-//! `opts.driver = "coroutine"` remain reserved for Phase 3.
+//! Two drivers are available:
+//!
+//! - `async_fn` (default) — drives the user function via `Function::call_async`,
+//!   so `task.sleep` / `task.yield` / `task.checkpoint` (which are registered
+//!   as async functions) suspend through mlua's async bridge.
+//! - `coroutine` (opt-in) — drives a raw Lua thread via `Thread::resume` in a
+//!   loop.  The Lua body uses `coroutine.yield()` for a cooperative yield and
+//!   `coroutine.yield(ms)` to sleep `ms` milliseconds.  Useful for interop
+//!   with existing coroutine-based Lua code and avoids the async_fn layer.
+//!   Selected via `opts.driver = "coroutine"` (per-spawn) or the
+//!   `AGENT_BLOCK_TASK_DRIVER=coroutine` env var (default for the VM).
+//!
+//! Every task is wrapped in a `tracing::info_span!("task", id, name, driver)`
+//! so downstream tool logs (sh / mesh / mcp / sql) carry task context.  Inside
+//! a spawned task, `std.task.current()` returns `{id, name, cancelled}` for
+//! Lua-side introspection.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -48,9 +61,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use mlua::prelude::*;
-use mlua::{Function, MultiValue, UserData, UserDataMethods, UserDataRegistry, Value};
+use mlua::{Function, MultiValue, ThreadStatus, UserData, UserDataMethods, UserDataRegistry, Value};
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinHandle};
+use tracing::{Instrument, info_span};
 
 // ---------------------------------------------------------------------------
 // CancelToken — cooperative cancellation
@@ -88,11 +102,21 @@ impl UserData for CancelToken {
     }
 }
 
+#[derive(Clone)]
+struct TaskInfo {
+    id: String,
+    name: Option<String>,
+}
+
 tokio::task_local! {
     /// Set by `spawn_into` for the duration of a spawned task so that
     /// `task.checkpoint()` can consult the task's cancellation token
     /// without the caller threading it through manually.
     static TASK_TOKEN: CancelToken;
+    /// Set by `spawn_into` for the duration of a spawned task so that
+    /// `std.task.current()` can return id/name without threading them
+    /// through the Lua function signature.
+    static TASK_INFO: TaskInfo;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,39 +302,88 @@ fn duration_to_ms(d: Duration) -> f64 {
 // spawn_into — shared logic for top-level spawn and scope:spawn
 // ---------------------------------------------------------------------------
 
-fn parse_name(opts: Option<&LuaTable>) -> LuaResult<Option<String>> {
+#[derive(Clone, Copy, Debug)]
+enum Driver {
+    AsyncFn,
+    Coroutine,
+}
+
+fn parse_opts(opts: Option<&LuaTable>) -> LuaResult<(Option<String>, Option<Driver>)> {
     match opts {
-        Some(t) => Ok(t.get::<Option<String>>("name")?),
-        None => Ok(None),
+        None => Ok((None, None)),
+        Some(t) => {
+            let name = t.get::<Option<String>>("name")?;
+            let driver = match t.get::<Option<String>>("driver")? {
+                None => None,
+                Some(s) => Some(match s.as_str() {
+                    "coroutine" => Driver::Coroutine,
+                    "async_fn" | "async" => Driver::AsyncFn,
+                    other => {
+                        return Err(LuaError::external(format!(
+                            "std.task: unknown driver '{other}' (expected 'async_fn' or 'coroutine')"
+                        )));
+                    }
+                }),
+            };
+            Ok((name, driver))
+        }
+    }
+}
+
+fn default_driver() -> Driver {
+    match std::env::var("AGENT_BLOCK_TASK_DRIVER").ok().as_deref() {
+        Some("coroutine") => Driver::Coroutine,
+        _ => Driver::AsyncFn,
     }
 }
 
 fn spawn_into(
-    _lua: &Lua,
+    lua: &Lua,
     scope: &Rc<RefCell<Scope>>,
     func: Function,
     opts: Option<LuaTable>,
 ) -> LuaResult<Handle> {
-    let name = parse_name(opts.as_ref())?;
+    let (name, driver_opt) = parse_opts(opts.as_ref())?;
+    let driver = driver_opt.unwrap_or_else(default_driver);
     let token = scope.borrow().token.clone();
 
     let (tx, rx) = oneshot::channel::<LuaResult<Value>>();
 
-    let user_fut = async move {
-        let result: LuaResult<Value> = func.call_async::<Value>(MultiValue::new()).await;
-        let _ = tx.send(result);
+    // Pre-allocate a stable id so tracing span and TaskInfo share it.  The
+    // tokio JoinHandle::id() below produces a different runtime-internal id;
+    // exposing that as well would be confusing, so we use our own.
+    let id = format!("t{}", TASK_SEQ.with(|s| s.next()));
+    let info = TaskInfo {
+        id: id.clone(),
+        name: name.clone(),
     };
 
-    // Install TASK_TOKEN for the duration of the task so `task.checkpoint()`
-    // inside the Lua function can observe cancellation.
-    let scoped_fut = TASK_TOKEN.scope(token, user_fut);
+    let lua_for_cr = lua.clone();
+    let user_fut: Pin<Box<dyn Future<Output = ()>>> = match driver {
+        Driver::AsyncFn => Box::pin(async move {
+            let result: LuaResult<Value> = func.call_async::<Value>(MultiValue::new()).await;
+            let _ = tx.send(result);
+        }),
+        Driver::Coroutine => Box::pin(async move {
+            let result = run_coroutine(&lua_for_cr, func).await;
+            let _ = tx.send(result);
+        }),
+    };
+
+    // Wrap with tracing span first so it observes TASK_TOKEN/TASK_INFO enter/exit.
+    let span = info_span!(
+        "task",
+        id = %id,
+        name = name.as_deref().unwrap_or(""),
+        driver = ?driver,
+    );
+    let traced = user_fut.instrument(span);
+    let with_info = TASK_INFO.scope(info, traced);
+    let scoped_fut = TASK_TOKEN.scope(token, with_info);
 
     let join_handle = tokio::task::spawn_local(catch_panic(scoped_fut));
     let abort = join_handle.abort_handle();
-    let id = join_handle.id().to_string();
 
-    // Attach the JoinHandle to the scope (for structured join) and keep
-    // the AbortHandle on the Lua-facing Handle (for :abort()).
     scope.borrow_mut().attach(join_handle);
 
     Ok(Handle {
@@ -320,6 +393,80 @@ fn spawn_into(
         state: JoinState::Pending(rx),
         started_at: Instant::now(),
     })
+}
+
+thread_local! {
+    static TASK_SEQ: SeqGen = SeqGen::default();
+}
+
+#[derive(Default)]
+struct SeqGen(std::cell::Cell<u64>);
+impl SeqGen {
+    fn next(&self) -> u64 {
+        let v = self.0.get().wrapping_add(1);
+        self.0.set(v);
+        v
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coroutine driver
+// ---------------------------------------------------------------------------
+
+/// Drive `func` as a raw Lua coroutine.  The Lua body uses:
+///
+/// - `coroutine.yield()` / `coroutine.yield(nil)` — cooperative yield
+/// - `coroutine.yield(ms)` where ms is a number — sleep `ms` milliseconds
+///
+/// Between resumes, we check the task-local cancellation token and, if set,
+/// raise `task cancelled` into the thread on the next resume.
+async fn run_coroutine(lua: &Lua, func: Function) -> LuaResult<Value> {
+    let thread = lua.create_thread(func)?;
+    loop {
+        if TASK_TOKEN.try_with(|t| t.is_cancelled()).unwrap_or(false) {
+            return Err(LuaError::external("task cancelled"));
+        }
+
+        let yielded: MultiValue = thread.resume(MultiValue::new())?;
+
+        match thread.status() {
+            ThreadStatus::Finished => {
+                return Ok(yielded.into_iter().next().unwrap_or(Value::Nil));
+            }
+            ThreadStatus::Resumable => {
+                let ctrl = yielded.into_iter().next().unwrap_or(Value::Nil);
+                match ctrl {
+                    Value::Nil => tokio::task::yield_now().await,
+                    Value::Integer(ms) => {
+                        let ms = ms.max(0) as u64;
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                    Value::Number(ms) => {
+                        if !ms.is_finite() || ms < 0.0 {
+                            return Err(LuaError::external(format!(
+                                "coroutine yield: invalid duration (ms={ms})"
+                            )));
+                        }
+                        tokio::time::sleep(Duration::from_nanos((ms * 1_000_000.0) as u64)).await;
+                    }
+                    other => {
+                        return Err(LuaError::external(format!(
+                            "coroutine yield: unsupported value type '{}' (expected nil or number)",
+                            other.type_name()
+                        )));
+                    }
+                }
+            }
+            ThreadStatus::Running => {
+                return Err(LuaError::external(
+                    "coroutine in Running state after resume (impossible)",
+                ));
+            }
+            ThreadStatus::Error => {
+                return Err(LuaError::external("coroutine entered Error state"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +540,24 @@ async fn checkpoint(lua: Lua, _: ()) -> LuaResult<()> {
 
 fn cancel_token(_: &Lua, _: ()) -> LuaResult<CancelToken> {
     Ok(CancelToken::new())
+}
+
+/// `std.task.current()` — returns a table `{id, name, cancelled}` describing
+/// the currently-executing spawned task, or `nil` if called from outside a
+/// spawned task (e.g. at module top level or inside a `task.scope` body).
+fn current(lua: &Lua, _: ()) -> LuaResult<Value> {
+    let info = TASK_INFO.try_with(|i| i.clone()).ok();
+    match info {
+        None => Ok(Value::Nil),
+        Some(i) => {
+            let t = lua.create_table()?;
+            t.set("id", i.id)?;
+            t.set("name", i.name)?;
+            let cancelled = TASK_TOKEN.try_with(|t| t.is_cancelled()).unwrap_or(false);
+            t.set("cancelled", cancelled)?;
+            Ok(Value::Table(t))
+        }
+    }
 }
 
 /// `task.scope(fn)` or `task.scope(name, fn)` — structured nursery.
@@ -498,6 +663,7 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     task.set("yield", lua.create_async_function(yield_now)?)?;
     task.set("checkpoint", lua.create_async_function(checkpoint)?)?;
     task.set("cancel_token", lua.create_function(cancel_token)?)?;
+    task.set("current", lua.create_function(current)?)?;
     task.set("scope", lua.create_async_function(task_scope)?)?;
     task.set("with_timeout", lua.create_async_function(with_timeout)?)?;
 
