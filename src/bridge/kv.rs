@@ -88,8 +88,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             .map_err(|e| format!("kv.get sql error: {e}"))
                     });
                     let timeout = super::config::sql_query_timeout();
-                    let row =
-                        super::sql::race_timeout(fut, timeout, &interrupt, "kv.get").await?;
+                    let row = super::sql::race_timeout(fut, timeout, &interrupt, "kv.get").await?;
                     match row {
                         None => Ok(LuaValue::Nil),
                         Some(s) => {
@@ -110,36 +109,34 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         let ctx_interrupt = Arc::clone(&ctx.kv_interrupt);
         kv_tbl.set(
             "set",
-            lua.create_async_function(
-                move |lua, (ns, key, value): (String, String, LuaValue)| {
-                    let conn = Arc::clone(&ctx_conn);
-                    let interrupt = Arc::clone(&ctx_interrupt);
-                    // Serialize synchronously on the Lua thread (LuaValue is
-                    // !Send, so it can't cross the spawn_blocking boundary).
-                    let ns_check = validate_ns(&ns).map_err(LuaError::external);
-                    let json_result = super::lua_to_json(&lua, value).and_then(|v| {
-                        serde_json::to_string(&v)
-                            .map_err(|e| LuaError::external(format!("kv.set serialize: {e}")))
-                    });
-                    async move {
-                        ns_check?;
-                        let json_str = json_result?;
-                        let fut = tokio::task::spawn_blocking(move || {
-                            let guard = super::sql::lock_conn(&conn);
-                            guard
-                                .execute(
-                                    "INSERT INTO __kv (ns, key, value) VALUES (?1, ?2, ?3) \
+            lua.create_async_function(move |lua, (ns, key, value): (String, String, LuaValue)| {
+                let conn = Arc::clone(&ctx_conn);
+                let interrupt = Arc::clone(&ctx_interrupt);
+                // Serialize synchronously on the Lua thread (LuaValue is
+                // !Send, so it can't cross the spawn_blocking boundary).
+                let ns_check = validate_ns(&ns).map_err(LuaError::external);
+                let json_result = super::lua_to_json(&lua, value).and_then(|v| {
+                    serde_json::to_string(&v)
+                        .map_err(|e| LuaError::external(format!("kv.set serialize: {e}")))
+                });
+                async move {
+                    ns_check?;
+                    let json_str = json_result?;
+                    let fut = tokio::task::spawn_blocking(move || {
+                        let guard = super::sql::lock_conn(&conn);
+                        guard
+                            .execute(
+                                "INSERT INTO __kv (ns, key, value) VALUES (?1, ?2, ?3) \
                                      ON CONFLICT(ns, key) DO UPDATE SET value = excluded.value",
-                                    rusqlite::params![ns, key, json_str],
-                                )
-                                .map(|_| ())
-                                .map_err(|e| format!("kv.set sql error: {e}"))
-                        });
-                        let timeout = super::config::sql_query_timeout();
-                        super::sql::race_timeout(fut, timeout, &interrupt, "kv.set").await
-                    }
-                },
-            )?,
+                                rusqlite::params![ns, key, json_str],
+                            )
+                            .map(|_| ())
+                            .map_err(|e| format!("kv.set sql error: {e}"))
+                    });
+                    let timeout = super::config::sql_query_timeout();
+                    super::sql::race_timeout(fut, timeout, &interrupt, "kv.set").await
+                }
+            })?,
         )?;
     }
 

@@ -116,9 +116,8 @@ fn run_query(
                     // declared encoding. Reject instead of silently replacing
                     // with U+FFFD — matches the write path's strictness and
                     // surfaces corruption early.
-                    let s = std::str::from_utf8(b).map_err(|e| {
-                        format!("non-UTF-8 TEXT in column '{}': {e}", col_names[i])
-                    })?;
+                    let s = std::str::from_utf8(b)
+                        .map_err(|e| format!("non-UTF-8 TEXT in column '{}': {e}", col_names[i]))?;
                     serde_json::Value::String(s.to_string())
                 }
                 ValueRef::Blob(_) => return Err("blob columns not supported in POC".to_string()),
