@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mesh;
 pub mod sh;
 pub mod sql;
+pub mod task;
 pub mod tool;
 
 use mlua::prelude::*;
@@ -162,5 +163,6 @@ pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     llm::register(lua)?;
     kv::register(lua, ctx)?;
     sql::register(lua, ctx)?;
+    task::register(lua)?;
     Ok(())
 }
