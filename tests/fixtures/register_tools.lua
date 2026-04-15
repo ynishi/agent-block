@@ -27,7 +27,7 @@ print("locked.other=" .. tostring(other.value))
 -- Verify that the supposedly-ignored ns did NOT receive the write.
 print("ignored_list=" .. table.concat(std.kv.list("ignored"), ","))
 
--- SQL tool registration + guardrail
+-- SQL tool registration
 local sql_names = std.sql.register_tools()
 print("sql_registered=" .. table.concat(sql_names, ","))
 
@@ -51,14 +51,5 @@ local r = tool.call("sql_query", {
 })
 print("sql_query.body=" .. tostring(r.rows[1].body))
 
--- Guardrail: DDL through tool must be rejected.
-local bad = tool.call("sql_exec", { sql = "DROP TABLE poc_notes" })
-print("ddl_blocked=" .. tostring(bad.error ~= nil))
-
--- Guardrail: DML through sql_query must be rejected.
-local bad2 = tool.call("sql_query", { sql = "INSERT INTO poc_notes (body) VALUES ('x')" })
-print("dml_in_query_blocked=" .. tostring(bad2.error ~= nil))
-
--- Confirm table still exists (DDL was blocked).
 local count = tool.call("sql_query", { sql = "SELECT COUNT(*) AS n FROM poc_notes" })
 print("poc_notes_count=" .. tostring(count.rows[1].n))

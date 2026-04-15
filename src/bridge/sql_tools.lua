@@ -5,24 +5,12 @@
 --   allowed : array of op names    (default: {"query","exec"})
 --   prefix  : tool name prefix     (default: "sql_")
 --
--- Handlers apply a first-keyword allowlist:
---   query : SELECT / WITH
---   exec  : INSERT / UPDATE / DELETE
--- Anything else returns { error = "..." } without touching the DB.
--- NOTE: this is a thin guardrail, not a full permission gate. Production
--- will enforce via manifest-driven perms (see issue §Permission 分離).
---
 -- Returns: array of registered tool names.
 
 std.sql.register_tools = function(opts)
     opts = opts or {}
     local allowed = opts.allowed or { "query", "exec" }
     local prefix = opts.prefix or "sql_"
-
-    local function first_keyword(sql)
-        if type(sql) ~= "string" then return nil end
-        return (sql:match("^%s*(%a+)") or ""):upper()
-    end
 
     local base_schema = {
         type = "object",
@@ -38,26 +26,17 @@ std.sql.register_tools = function(opts)
 
     local defs = {
         query = {
-            description = "Run a read-only SQL query (SELECT / WITH). Returns { rows = [{ col = val, ... }, ...] }.",
+            description = "Run a SQL query against the agent's local SQLite database (embedded, file-backed UTF-8, persists across runs, agent-private). Use for SELECT-style reads. Returns { rows = [{ col = val, ... }, ...] }. Has a 5s default timeout (errors with 'sql timeout' if exceeded). Type mapping: Lua booleans are stored as 0/1 integers (SQLite has no native bool); BLOB columns are unsupported; TEXT is UTF-8; NULL columns are returned as the std.sql.null sentinel (compare with `row.col == std.sql.null`).",
             input_schema = base_schema,
             handler = function(input)
-                local kw = first_keyword(input.sql)
-                if kw ~= "SELECT" and kw ~= "WITH" then
-                    return { error = "query allows SELECT or WITH only (got " .. tostring(kw) .. ")" }
-                end
                 local rows = std.sql.query(input.sql, input.params)
                 return { rows = rows }
             end,
         },
         exec = {
-            description = "Run a write SQL statement (INSERT / UPDATE / DELETE). Returns { affected = N, last_id = M }.",
+            description = "Run a SQL statement against the agent's local SQLite database (embedded, file-backed, persists across runs, agent-private). Use for INSERT / UPDATE / DELETE / CREATE TABLE / other DDL. Returns { affected = N, last_id = M }. Has a 5s default timeout (errors with 'sql timeout' if exceeded). Type mapping: Lua booleans are stored as 0/1 integers (SQLite has no native bool); BLOB columns are unsupported; TEXT is UTF-8.",
             input_schema = base_schema,
             handler = function(input)
-                local kw = first_keyword(input.sql)
-                local allowed_kw = { INSERT = true, UPDATE = true, DELETE = true }
-                if not allowed_kw[kw] then
-                    return { error = "exec allows INSERT / UPDATE / DELETE only (got " .. tostring(kw) .. ")" }
-                end
                 local r = std.sql.exec(input.sql, input.params)
                 return { affected = r.affected, last_id = r.last_id }
             end,

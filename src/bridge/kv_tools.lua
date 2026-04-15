@@ -32,7 +32,7 @@ std.kv.register_tools = function(opts)
 
     local defs = {
         get = {
-            description = "Fetch a value by namespace/key. Returns { value = ... } (value may be nil if missing).",
+            description = "Get a value from the agent's local key-value store (JSON-file backed, persists across runs, agent-private). Returns { value = ... } (nil if the key is missing).",
             input_schema = build_schema({ key = { type = "string" } }, { "key" }),
             handler = function(input)
                 local ns = ns_lock or input.ns
@@ -40,7 +40,7 @@ std.kv.register_tools = function(opts)
             end,
         },
         set = {
-            description = "Store a value under namespace/key.",
+            description = "Store a value in the agent's local key-value store (JSON-file backed, persists across runs, agent-private). Overwrites any existing value at the same key.",
             input_schema = build_schema({
                 key   = { type = "string" },
                 value = { description = "Value to store (string / number / bool / table)" },
@@ -52,7 +52,7 @@ std.kv.register_tools = function(opts)
             end,
         },
         delete = {
-            description = "Delete key. Returns { deleted = bool }.",
+            description = "Delete a key from the agent's local key-value store. Returns { deleted = bool } (false if the key did not exist).",
             input_schema = build_schema({ key = { type = "string" } }, { "key" }),
             handler = function(input)
                 local ns = ns_lock or input.ns
@@ -60,7 +60,7 @@ std.kv.register_tools = function(opts)
             end,
         },
         list = {
-            description = "List keys in the namespace, optionally filtered by prefix.",
+            description = "List keys in a namespace of the agent's local key-value store, optionally filtered by prefix. Returns { keys = [...] }.",
             input_schema = build_schema(
                 { prefix = { type = "string", description = "Optional key prefix filter" } },
                 {}

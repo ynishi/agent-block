@@ -26,8 +26,6 @@ fn register_tools_roundtrip() {
                 ))
                 .and(predicate::str::contains("sql_exec.affected=1"))
                 .and(predicate::str::contains("sql_query.body=hello"))
-                .and(predicate::str::contains("ddl_blocked=true"))
-                .and(predicate::str::contains("dml_in_query_blocked=true"))
                 .and(predicate::str::contains("poc_notes_count=1")),
         );
 }

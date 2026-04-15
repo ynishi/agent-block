@@ -22,3 +22,21 @@ fn sql_roundtrip() {
                 .and(predicate::str::contains("count=0")),
         );
 }
+
+#[test]
+fn sql_null_sentinel_roundtrip() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("sql_null.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("row_count=2")
+                .and(predicate::str::contains("r1.note_is_null=true"))
+                .and(predicate::str::contains("r1.note_is_nil=false"))
+                .and(predicate::str::contains("r1.has_note_key=true"))
+                .and(predicate::str::contains("r2.note_is_null=false"))
+                .and(predicate::str::contains("r2.note=hi")),
+        );
+}

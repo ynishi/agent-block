@@ -5,18 +5,26 @@
 //! | ENV var                            | Default                  | Used by  |
 //! |------------------------------------|--------------------------|----------|
 //! | `AGENT_BLOCK_HOME`                 | `$HOME/.agent-block`     | both     |
-//! | `AGENT_BLOCK_KV_DIR`               | `{HOME}/kv`              | std.kv   |
+//! | `AGENT_BLOCK_KV_PATH`              | `{HOME}/kv.sqlite`       | std.kv   |
 //! | `AGENT_BLOCK_SQL_PATH`             | `{HOME}/db.sqlite`       | std.sql  |
-//! | `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`  | `5000`                   | std.sql  |
-//! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | std.sql  |
+//! | `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`  | `5000`                   | both     |
+//! | `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` | `5000`                   | both     |
+//! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | both     |
 //!
-//! Special: `AGENT_BLOCK_SQL_PATH=:memory:` selects an in-memory database.
+//! `std.kv` and `std.sql` are backed by separate SQLite database files so
+//! that agent-internal KV state and explicit user SQL data don't share WAL,
+//! page cache, or backup lifecycle. Pragma/timeout knobs apply to both.
+//!
+//! Special: `=:memory:` selects an in-memory database (works for both
+//! `AGENT_BLOCK_KV_PATH` and `AGENT_BLOCK_SQL_PATH`).
 //! Journal mode is ignored for `:memory:` (SQLite forces MEMORY).
+//! `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS=0` disables the query timeout.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_SQL_BUSY_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_SQL_QUERY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_SQL_JOURNAL_MODE: &str = "WAL";
 
 /// Base dir for agent-block local state.
@@ -29,16 +37,16 @@ pub fn base_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".agent-block"))
 }
 
-/// Dir for std.kv JSON files.
-/// `AGENT_BLOCK_KV_DIR` → `{base_dir}/kv`.
-pub fn kv_dir() -> Result<PathBuf, String> {
-    if let Some(v) = std::env::var_os("AGENT_BLOCK_KV_DIR") {
+/// Path to the std.kv SQLite database file (or `:memory:`).
+/// `AGENT_BLOCK_KV_PATH` → `{base_dir}/kv.sqlite`.
+pub fn kv_path() -> Result<PathBuf, String> {
+    if let Some(v) = std::env::var_os("AGENT_BLOCK_KV_PATH") {
         return Ok(PathBuf::from(v));
     }
-    Ok(base_dir()?.join("kv"))
+    Ok(base_dir()?.join("kv.sqlite"))
 }
 
-/// Path to the SQLite database file (or `:memory:`).
+/// Path to the std.sql SQLite database file (or `:memory:`).
 /// `AGENT_BLOCK_SQL_PATH` → `{base_dir}/db.sqlite`.
 pub fn sql_path() -> Result<PathBuf, String> {
     if let Some(v) = std::env::var_os("AGENT_BLOCK_SQL_PATH") {
@@ -67,4 +75,18 @@ pub fn sql_busy_timeout() -> Duration {
 pub fn sql_journal_mode() -> String {
     std::env::var("AGENT_BLOCK_SQL_JOURNAL_MODE")
         .unwrap_or_else(|_| DEFAULT_SQL_JOURNAL_MODE.to_string())
+}
+
+/// Per-query timeout. `0` disables the timeout.
+/// `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` → 5000ms.
+pub fn sql_query_timeout() -> Option<Duration> {
+    let ms = std::env::var("AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SQL_QUERY_TIMEOUT_MS);
+    if ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
 }

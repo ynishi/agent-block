@@ -81,8 +81,53 @@ pub struct HostContext {
     pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
-    /// Shared SQLite connection for `sql.*` bridge.
+    /// Shared SQLite connection for `sql.*` bridge (user tables).
     pub sql_conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Interrupt handle for the sql connection.
+    /// Used to cancel in-flight queries on timeout (see `bridge/sql.rs`).
+    pub sql_interrupt: Arc<rusqlite::InterruptHandle>,
+    /// Shared SQLite connection for `kv.*` bridge (`__kv` table only).
+    /// Separate from sql_conn so KV scratch state and user SQL data don't
+    /// share WAL, page cache, or backup lifecycle.
+    pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Interrupt handle for the kv connection.
+    pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
+}
+
+/// Open a SQLite connection at `path` (or `:memory:`) and apply the shared
+/// pragmas driven by ENV (`journal_mode`, `busy_timeout`). Returns the
+/// connection wrapped in Arc<Mutex<_>> together with its interrupt handle.
+///
+/// `label` is used only for the init log line (`sql` / `kv`) so that the two
+/// databases are distinguishable in tracing output.
+fn open_sqlite(
+    path: &Path,
+    label: &'static str,
+) -> BlockResult<(
+    Arc<Mutex<rusqlite::Connection>>,
+    Arc<rusqlite::InterruptHandle>,
+)> {
+    let is_memory = crate::bridge::config::is_memory_sql(path);
+    if !is_memory {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BlockError::Runtime(format!("{label} dir create: {e}")))?;
+        }
+    }
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", path.display())))?;
+    if !is_memory {
+        let journal = crate::bridge::config::sql_journal_mode();
+        conn.pragma_update(None, "journal_mode", &journal)
+            .map_err(|e| BlockError::Runtime(format!("journal_mode={journal}: {e}")))?;
+    }
+    let busy_ms = crate::bridge::config::sql_busy_timeout().as_millis() as i64;
+    conn.pragma_update(None, "busy_timeout", busy_ms)
+        .map_err(|e| BlockError::Runtime(format!("busy_timeout pragma: {e}")))?;
+    info!(label, path = %path.display(), busy_ms, "sqlite initialized");
+    let interrupt = Arc::new(conn.get_interrupt_handle());
+    let conn = Arc::new(Mutex::new(conn));
+    Ok((conn, interrupt))
 }
 
 pub async fn run(config: BlockConfig) -> BlockResult<()> {
@@ -139,29 +184,13 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 
     let http_client = reqwest::Client::new();
 
-    // ── SQL init ──────────────────────────────────────────────────────────
+    // ── SQLite init (kv + sql get separate DB files) ──────────────────────
     // All knobs are ENV-driven (see `bridge/config.rs`).
     let sql_path = crate::bridge::config::sql_path().map_err(BlockError::Runtime)?;
-    let is_memory = crate::bridge::config::is_memory_sql(&sql_path);
-    if !is_memory {
-        if let Some(parent) = sql_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| BlockError::Runtime(format!("sql dir create: {e}")))?;
-        }
-    }
-    let conn = rusqlite::Connection::open(&sql_path)
-        .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", sql_path.display())))?;
-    if !is_memory {
-        let journal = crate::bridge::config::sql_journal_mode();
-        conn.pragma_update(None, "journal_mode", &journal)
-            .map_err(|e| BlockError::Runtime(format!("journal_mode={journal}: {e}")))?;
-    }
-    let busy_ms = crate::bridge::config::sql_busy_timeout().as_millis() as i64;
-    conn.pragma_update(None, "busy_timeout", busy_ms)
-        .map_err(|e| BlockError::Runtime(format!("busy_timeout pragma: {e}")))?;
-    info!(path = %sql_path.display(), busy_ms, "sql initialized");
-    let sql_conn = Arc::new(Mutex::new(conn));
-    // ── end SQL init ──────────────────────────────────────────────────────
+    let (sql_conn, sql_interrupt) = open_sqlite(&sql_path, "sql")?;
+
+    let kv_path = crate::bridge::config::kv_path().map_err(BlockError::Runtime)?;
+    let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
 
     let ctx = HostContext {
         project_root,
@@ -169,6 +198,9 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         mcp_manager: Arc::clone(&mcp_manager),
         http_client,
         sql_conn,
+        sql_interrupt,
+        kv_conn,
+        kv_interrupt,
     };
 
     let script_path = config.script_path.clone();

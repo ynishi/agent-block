@@ -92,10 +92,18 @@ fn lua_to_json_inner(val: &LuaValue, depth: usize) -> LuaResult<serde_json::Valu
 
 /// Convert a serde_json::Value to a Lua value.
 ///
-/// JSON `null` maps to Lua `nil` (matching `std.json.decode` from
-/// mlua-batteries).  This means JSON objects with `null` values lose those
-/// keys on the Lua side, but the resulting Lua value can be re-encoded by
-/// `std.json.encode` without error.
+/// JSON `null` maps to the `LightUserData(null_ptr)` sentinel
+/// (`mlua::Value::NULL`), which is the same representation `lua_to_json`
+/// accepts on the way out — so the round-trip is symmetric.  Using the
+/// sentinel rather than Lua `nil` means JSON `null` values survive being
+/// placed into Lua tables (tables cannot hold `nil`), so SQL NULL columns
+/// and MCP/LLM JSON payloads do not lose the distinction between "null"
+/// and "absent".  Agents can compare a value against the exposed
+/// `std.sql.null` constant to detect it.
+///
+/// Note: this differs from mlua-batteries' `std.json.decode`, which keeps
+/// the Lua-idiomatic "null → nil" lowering for `json.decode` itself.  Our
+/// bridge paths (sql / kv / mcp / mesh / llm) prefer round-trip fidelity.
 pub fn json_to_lua(lua: &Lua, val: serde_json::Value) -> LuaResult<LuaValue> {
     json_to_lua_inner(lua, &val, 0)
 }
@@ -108,7 +116,7 @@ fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaRes
         )));
     }
     match val {
-        serde_json::Value::Null => Ok(LuaValue::Nil),
+        serde_json::Value::Null => Ok(LuaValue::NULL),
         serde_json::Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
