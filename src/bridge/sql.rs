@@ -30,7 +30,8 @@ use crate::host::HostContext;
 /// - nil        → Null
 /// - boolean    → Integer(0 or 1)  (SQLite has no native bool)
 /// - integer    → Integer(i64)
-/// - number     → Real(f64)
+/// - number     → Real(f64), rejects NaN / ±Inf (SQLite stores but
+///   JSON/Lua round-trip and serde_json cannot represent them)
 /// - string     → Text(String)
 ///
 /// Unsupported types (table, function, userdata) return an error.
@@ -45,7 +46,14 @@ fn lua_params_to_values(tbl: &LuaTable) -> Result<Vec<Value>, String> {
             LuaValue::Nil => Value::Null,
             LuaValue::Boolean(b) => Value::Integer(if b { 1 } else { 0 }),
             LuaValue::Integer(n) => Value::Integer(n),
-            LuaValue::Number(f) => Value::Real(f),
+            LuaValue::Number(f) => {
+                if !f.is_finite() {
+                    return Err(format!(
+                        "SQL param #{i} is non-finite ({f}); NaN and ±Inf are not supported"
+                    ));
+                }
+                Value::Real(f)
+            }
             LuaValue::String(s) => Value::Text(
                 s.to_str()
                     .map_err(|e| format!("param string encoding error: {e}"))?
@@ -85,9 +93,22 @@ fn run_query(
             let val = match row.get_ref(i).map_err(|e| format!("sql error: {e}"))? {
                 ValueRef::Null => serde_json::Value::Null,
                 ValueRef::Integer(n) => serde_json::Value::Number(n.into()),
-                ValueRef::Real(f) => serde_json::Number::from_f64(f)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null),
+                ValueRef::Real(f) => {
+                    // SQLite can store non-finite doubles via the C API, but
+                    // serde_json refuses NaN / ±Inf (returns None from
+                    // `from_f64`). Silently lowering them to NULL would
+                    // corrupt the round-trip. Surface the corruption so the
+                    // caller can decide rather than pretending it was NULL.
+                    serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| {
+                            format!(
+                                "non-finite REAL in column '{}' ({f}); \
+                                 NaN / ±Inf cannot be represented in JSON/Lua",
+                                col_names[i]
+                            )
+                        })?
+                }
                 ValueRef::Text(b) => {
                     // DB encoding is UTF-8 (SQLite default, PRAGMA encoding
                     // unset). Invalid UTF-8 in a TEXT column means the DB was

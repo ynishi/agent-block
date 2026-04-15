@@ -1,10 +1,13 @@
 mod common;
 
 use predicates::prelude::*;
+use tempfile::tempdir;
 
 #[test]
 fn agent_require_succeeds() {
+    let tmp = tempdir().expect("tempdir");
     common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
         .args(["-s", &common::fixture("agent_require.lua")])
         .assert()
         .success()
@@ -13,7 +16,9 @@ fn agent_require_succeeds() {
 
 #[test]
 fn agent_run_is_function() {
+    let tmp = tempdir().expect("tempdir");
     common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
         .args(["-s", &common::fixture("agent_require.lua")])
         .assert()
         .success()
