@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
@@ -81,6 +81,8 @@ pub struct HostContext {
     pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
+    /// Shared SQLite connection for `sql.*` bridge.
+    pub sql_conn: Arc<Mutex<rusqlite::Connection>>,
 }
 
 pub async fn run(config: BlockConfig) -> BlockResult<()> {
@@ -137,11 +139,33 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 
     let http_client = reqwest::Client::new();
 
+    // ── SQL init ──────────────────────────────────────────────────────────
+    let sql_path = crate::bridge::kv::base_dir()
+        .map_err(BlockError::Runtime)?
+        .join("db.sqlite");
+    if let Some(parent) = sql_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| BlockError::Runtime(format!("sql dir create: {e}")))?;
+    }
+    let conn = rusqlite::Connection::open(&sql_path)
+        .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", sql_path.display())))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| BlockError::Runtime(format!("WAL pragma: {e}")))?;
+    // POC: hardcoded E2E table. Replace with manifest-driven migrate in production.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS test_kv (k TEXT PRIMARY KEY, v TEXT)",
+        [],
+    )
+    .map_err(|e| BlockError::Runtime(format!("bootstrap table: {e}")))?;
+    let sql_conn = Arc::new(Mutex::new(conn));
+    // ── end SQL init ──────────────────────────────────────────────────────
+
     let ctx = HostContext {
         project_root,
         mesh_agent,
         mcp_manager: Arc::clone(&mcp_manager),
         http_client,
+        sql_conn,
     };
 
     let script_path = config.script_path.clone();

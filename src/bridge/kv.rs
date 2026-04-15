@@ -16,7 +16,7 @@ use crate::host::HostContext;
 /// Resolve the base directory for kv storage.
 ///
 /// Priority: `$AGENT_BLOCK_HOME` → `$HOME/.agent-block`
-fn base_dir() -> Result<PathBuf, String> {
+pub(crate) fn base_dir() -> Result<PathBuf, String> {
     if let Some(v) = std::env::var_os("AGENT_BLOCK_HOME") {
         return Ok(PathBuf::from(v));
     }
