@@ -224,5 +224,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let std_ns: LuaTable = lua.globals().get("std")?;
     std_ns.set("sql", sql_tbl)?;
 
+    // Load std.sql.register_tools (LLM-facing helper; requires `tool` global).
+    lua.load(include_str!("sql_tools.lua"))
+        .set_name("std.sql.register_tools")
+        .exec()?;
+
     Ok(())
 }

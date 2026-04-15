@@ -30,16 +30,20 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     )?;
 
     // tool.call(name, input) -> result or error
+    //
+    // Async so that handlers may invoke async stdlib functions (e.g.
+    // `std.sql.query`, `http.request`, `mcp.call`) via coroutine yield.
+    // Purely synchronous handlers still work unchanged.
     tool_tbl.set(
         "call",
-        lua.create_function(|lua, (name, input): (String, LuaValue)| {
+        lua.create_async_function(|lua, (name, input): (String, LuaValue)| async move {
             let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
             let entry: Option<LuaTable> = registry.get(name.clone())?;
             match entry {
                 None => Err(LuaError::external(format!("tool not found: {name}"))),
                 Some(e) => {
                     let handler: LuaFunction = e.get("handler")?;
-                    handler.call::<LuaValue>(input)
+                    handler.call_async::<LuaValue>(input).await
                 }
             }
         })?,

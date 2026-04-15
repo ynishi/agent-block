@@ -184,5 +184,10 @@ pub fn register(lua: &Lua, _ctx: &HostContext) -> LuaResult<()> {
     let std_ns: LuaTable = lua.globals().get("std")?;
     std_ns.set("kv", kv_tbl)?;
 
+    // Load std.kv.register_tools (LLM-facing helper; requires `tool` global).
+    lua.load(include_str!("kv_tools.lua"))
+        .set_name("std.kv.register_tools")
+        .exec()?;
+
     Ok(())
 }
