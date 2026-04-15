@@ -26,3 +26,28 @@ fn task_phase1_fixture() {
                 .and(predicate::str::contains("done")),
         );
 }
+
+#[test]
+fn task_phase2_fixture() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("task_phase2.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("scope_elapsed_ok=true")
+                .and(predicate::str::contains("scope_children_done=true"))
+                .and(predicate::str::contains("scope_name=worker_group"))
+                .and(predicate::str::contains("cooperative_cancel_ok=true"))
+                .and(predicate::str::contains("timeout_raises=true"))
+                .and(predicate::str::contains("timeout_success_val=ok"))
+                .and(predicate::str::contains("token_initial=false"))
+                .and(predicate::str::contains("token_after_cancel=true"))
+                .and(predicate::str::contains("token_check_raises=true"))
+                .and(predicate::str::contains("scope_error_propagated=true"))
+                .and(predicate::str::contains("sibling_cancelled_ok=true"))
+                .and(predicate::str::contains("scope_spawn_join=7"))
+                .and(predicate::str::contains("done")),
+        );
+}
