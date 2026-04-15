@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-15
+
+### Added
+
+- `std.kv` Lua bridge (embedded, agent-private persistent KVS). Async API `std.kv.get/set/delete/list(ns, key?)` backed by SQLite (`__kv` table, `WITHOUT ROWID`). Namespace validated (`^[a-zA-Z0-9_\-]+$`). Shares the bridge's `spawn_blocking` + query-timeout + `sqlite3_interrupt` infrastructure with `std.sql`.
+- `std.sql` Lua bridge (embedded, agent-private SQLite with WAL). Async API `std.sql.query(sql, params?) -> rows` / `std.sql.exec(sql, params?) -> { affected, last_id }`. Runs inside `tokio::task::spawn_blocking`; lock acquisition happens inside the blocking task to avoid `await`-holding-lock. Query timeout via `tokio::time::timeout` races against an `InterruptHandle` so runaway queries free the Mutex promptly.
+- `std.sql.null` sentinel (`mlua::Value::NULL` = `LightUserData(null_ptr)`) exported for SQL-NULL round-trip on the Lua side. NULL columns arrive as the sentinel instead of being silently skipped, preserving the distinction between "column is NULL" and "column absent". The global `json_to_lua` also emits this sentinel for `serde_json::Value::Null`, so `kv` / `sql` / `mcp` / `llm` bridges all agree.
+- `std.kv.register_tools(opts?)` and `std.sql.register_tools(opts?)` — LLM-facing tool registration helpers. Accept `{ allowed, prefix }` and register prefixed tools (`kv_get` / `kv_set` / …, `sql_query` / `sql_exec`) via `tool.register`. Return array of registered tool names.
+- `tool.call(name, input)` is now async; handlers declared with `tool.register` may be async functions (Lua 5.4 coroutine boundary handled by mlua-isle). Sequential execution guaranteed via `RefCell` borrow check in the bridge.
+- ENV-driven config for bridges:
+  - `AGENT_BLOCK_HOME` — base dir for all on-disk state (default `~/.agent-block`).
+  - `AGENT_BLOCK_KV_PATH` — override KV SQLite path (default `{base}/kv.sqlite`).
+  - `AGENT_BLOCK_SQL_PATH` — override SQL SQLite path (default `{base}/db.sqlite`).
+  - `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`, `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS`, `AGENT_BLOCK_SQL_JOURNAL_MODE` — SQLite tuning.
+  - `:memory:` paths short-circuit journal/PRAGMA setup for tests.
+- E2E fixtures and tests: `tests/fixtures/sql_roundtrip.lua`, `tests/fixtures/sql_null.lua`, `tests/e2e_sql.rs` (NULL-sentinel round-trip), plus `examples/agent_with_sql.lua` demonstrating the LLM agent using `sql_query` / `sql_exec` tools.
+
+### Changed
+
+- `std.kv` internal storage migrated from JSON-file-per-namespace (`{base}/kv/{ns}.json`, whole-namespace rewrite on every mutation, no `fsync(parent_dir)`) to a single SQLite table on a dedicated `kv.sqlite` file. Eliminates the cross-process lost-update window and the full-rewrite cost. Lua API is unchanged; legacy `{base}/kv/*.json` data is **not** migrated and should be deleted.
+- SQL param conversion rejects non-finite `f64` (NaN / ±Inf) with an indexed error. `run_query` on `ValueRef::Real` also errors on non-finite instead of silently lowering to NULL — serde_json cannot represent them and the prior path corrupted the round-trip.
+- `e2e_agent` tests isolated via per-test `tempdir()` + `AGENT_BLOCK_HOME` env to prevent WAL init races on shared `~/.agent-block` paths under parallel `cargo test`.
+
+### Security
+
+- `rustls-webpki` 0.103.10 → 0.103.12 via `cargo update`. Fixes RUSTSEC-2026-0098 (name constraints wrongly accepted for URI names) and RUSTSEC-2026-0099 (wildcard certificate name constraints wrongly accepted).
+- `rand` 0.9.2 → 0.9.4 via `cargo update`. Clears RUSTSEC-2026-0097 (unsound with a custom logger using `rand::rng()`) on that version. `rand` 0.8.5 remains via `agent-mesh-core 0.3` and is tracked as an allowed advisory warning pending an upstream bump.
+
 ## [0.3.0] - 2026-04-15
 
 ### Added
