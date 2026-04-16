@@ -164,6 +164,11 @@ mod scope;
 use cancel::CancelToken;
 use scope::Scope;
 
+/// Re-export so sibling bridges (`std.sql`, `std.kv`) can observe the
+/// effective cancel token and short-circuit long operations when the
+/// enclosing `task.scope` / `task.with_timeout` cancels.
+pub(crate) use cancel::effective_token;
+
 /// Lua-visible descriptor returned by `std.task.current()`.  Carried via
 /// the `TASK_INFO` task-local rather than threaded through the Lua function
 /// signature so any frame inside a spawned task can query it.

@@ -18,13 +18,13 @@ use tokio::sync::Notify;
 
 use super::{LOCAL_SCOPE, TASK_TOKEN};
 
-pub(super) struct CancelTokenInner {
+pub(crate) struct CancelTokenInner {
     cancelled: Cell<bool>,
     notify: Notify,
 }
 
 #[derive(Clone)]
-pub(super) struct CancelToken(Rc<CancelTokenInner>);
+pub(crate) struct CancelToken(Rc<CancelTokenInner>);
 
 impl Default for CancelToken {
     fn default() -> Self {
@@ -33,17 +33,17 @@ impl Default for CancelToken {
 }
 
 impl CancelToken {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Rc::new(CancelTokenInner {
             cancelled: Cell::new(false),
             notify: Notify::new(),
         }))
     }
-    pub(super) fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.0.cancelled.set(true);
         self.0.notify.notify_waiters();
     }
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.0.cancelled.get()
     }
     /// Resolve when `cancel()` is called (or immediately if already cancelled).
@@ -52,7 +52,7 @@ impl CancelToken {
     /// `is_cancelled` check, so a `cancel()` racing with this call cannot
     /// be missed — either the flag check sees it, or `notify_waiters()`
     /// wakes the already-queued `Notified`.
-    pub(super) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
         }
@@ -91,7 +91,7 @@ impl UserData for CancelToken {
 ///   caller's task, `TASK_TOKEN` is unset; falls back to
 ///   `LOCAL_SCOPE.token` so the body observes scope cancellation.
 /// - Outside any scope, returns `None` (primitive runs uncancellable).
-pub(super) fn effective_token() -> Option<CancelToken> {
+pub(crate) fn effective_token() -> Option<CancelToken> {
     if let Ok(t) = TASK_TOKEN.try_with(|t| t.clone()) {
         return Some(t);
     }

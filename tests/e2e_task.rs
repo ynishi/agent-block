@@ -113,3 +113,31 @@ fn task_phase4_fixture() {
                 .and(predicate::str::contains("done")),
         );
 }
+
+#[test]
+fn task_phase5_fixture() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("task_phase5.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("sql_cancel_raises=true")
+                .and(predicate::str::contains("sql_cancel_bounded=true"))
+                .and(predicate::str::contains("sql_cancel_raises_b=true"))
+                .and(predicate::str::contains("sql_cancel_err_match=true"))
+                .and(predicate::str::contains("sql_cancel_no_hybrid=true"))
+                .and(predicate::str::contains("kv_cancel_raises=true"))
+                .and(predicate::str::contains("kv_cancel_bounded=true"))
+                .and(predicate::str::contains("kv_cancel_raises_b=true"))
+                .and(predicate::str::contains("kv_cancel_err_match=true"))
+                .and(predicate::str::contains("kv_cancel_no_hybrid=true"))
+                .and(predicate::str::contains("kv_plain_ok=true"))
+                .and(predicate::str::contains("sql_plain_ok=true"))
+                .and(predicate::str::contains("fan_all_joined=true"))
+                .and(predicate::str::contains("fan_values_ok=true"))
+                .and(predicate::str::contains("fan_bounded=true"))
+                .and(predicate::str::contains("done")),
+        );
+}

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-16
+
 ### Added
 
 - `std.task` Lua bridge — structured concurrency primitives on `tokio::task::LocalSet`. Public API: `task.spawn(fn, opts?) -> handle`, `task.scope(name?, fn)`, `task.with_timeout(ms, fn, opts?)`, `task.sleep(ms)`, `task.yield()`, `task.checkpoint()`, `task.cancelled()`, `task.current()`. `handle:join()` / `handle:cancel()` / `scope:spawn()` / `scope:cancel()` surface per-task and per-scope control. Child tasks inherit a `CancelToken` via `tokio::task_local!`, so a parent cancel propagates cooperatively to every descendant at the next suspension point.
@@ -20,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-scope child cap**: `scope:spawn` rejects beyond 32 concurrent children. Long fan-outs must batch or use a worker-pool pattern.
 - **Dropped-handle error suppression**: if a `task.spawn` `handle` is dropped without `handle:join()`, the child's error is recorded via `tracing::error` but is **not** propagated into the surrounding scope body (first-error / `Task.WhenAll` semantics; no `ExceptionGroup`). To surface child errors, keep and join the handle.
 - **ENV parse is silent**: a malformed `AGENT_BLOCK_TASK_GRACE_MS` (non-numeric, negative, overflow) falls back to the built-in default without raising — a bad shell env must not break every `with_timeout` in the VM at call time. Same policy as `AGENT_BLOCK_TASK_DRIVER`.
+
+### Changed
+
+- `std.sql` / `std.kv` now observe the enclosing task's `CancelToken` in `race_timeout` and call `sqlite3_interrupt` as soon as the task scope cancels. Before this change, `task.with_timeout` wrapping a long SQL query had to wait for the per-call `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` to expire; task-driven cancel did not reach the blocking pool. This integration is the primary rationale for building `std.task` — SQL/KV are now task-API-native. The wall-clock `timeout` remains as a safeguard when called outside any task scope (`effective_token()` returns `None`).
 
 #### Usage note — `task.scope` is cooperative-only
 

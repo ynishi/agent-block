@@ -189,13 +189,35 @@ pub(super) fn lock_conn(
     })
 }
 
-/// Race an `spawn_blocking` SQL operation against the configured query timeout.
+/// Race an `spawn_blocking` SQL operation against (a) the enclosing task's
+/// cancel token and (b) the configured query timeout.
 ///
-/// When the timeout fires first we call `sqlite3_interrupt` via the stored
-/// handle so the blocking thread returns quickly, releases the Mutex guard,
-/// and frees the connection for subsequent calls. Without the interrupt the
+/// When either fires first we call `sqlite3_interrupt` via the stored handle
+/// so the blocking thread returns quickly, releases the Mutex guard, and
+/// frees the connection for subsequent calls. Without the interrupt the
 /// Mutex would stay locked for however long the runaway query takes to
 /// finish naturally, freezing the whole `std.sql` namespace.
+///
+/// Task-cancel integration is the primary rationale for `std.task` — a
+/// `task.with_timeout` / `scope:cancel` must reach in-flight SQL even
+/// though the SQL work itself is on the blocking pool, outside the
+/// cooperative checkpoint loop. The wall-clock `timeout` below remains as
+/// a belt-and-braces safeguard when the call runs outside any task scope
+/// (`effective_token()` returns `None`).
+///
+/// # Threading model
+///
+/// The returned future is `!Send`: the cancel token held by
+/// `effective_token()` is `Rc<_>`, and crucially the whole bridge surface
+/// is single-threaded by design — `mlua` under the `NonBlocking` runtime
+/// cannot drive `Function::call_async` on a fully multi-threaded executor,
+/// so every Lua callback is pinned to a `tokio::task::LocalSet`. We
+/// deliberately choose this over the "fully async / `Send` everywhere"
+/// shape (cf. AsyncIsle-style full-wiring) because that wiring would
+/// require moving the whole VM boundary across threads, which the
+/// embedded-SQLite + coroutine-driver design does not support. Callers
+/// must therefore `.await` this future on the same `LocalSet` that owns
+/// the VM; wrapping it in `tokio::spawn` will fail to compile.
 pub(super) async fn race_timeout<T, F>(
     fut: F,
     timeout: Option<std::time::Duration>,
@@ -205,27 +227,53 @@ pub(super) async fn race_timeout<T, F>(
 where
     F: std::future::Future<Output = Result<Result<T, String>, tokio::task::JoinError>>,
 {
-    let joined = match timeout {
-        Some(d) => match tokio::time::timeout(d, fut).await {
-            Ok(joined) => joined,
-            Err(_) => {
+    // Single future expression for the timeout+fut path; consumed once in
+    // whichever match arm the effective-token check selects. No Box::pin —
+    // `tokio::select!` handles `!Unpin` async blocks internally.
+    let wait = async {
+        match timeout {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(j) => Ok(j),
+                Err(_) => Err(d),
+            },
+            None => Ok(fut.await),
+        }
+    };
+
+    let wait_result = match super::task::effective_token() {
+        Some(t) => tokio::select! {
+            biased;
+            _ = t.cancelled() => {
                 interrupt.interrupt();
-                warn!(op, timeout_ms = d.as_millis() as u64, "sql timeout");
+                warn!(op, "cancelled by enclosing task");
                 return Err(LuaError::external(format!(
-                    "sql timeout ({}ms) in {op}",
-                    d.as_millis()
+                    "task cancelled during {op}"
                 )));
             }
+            r = wait => r,
         },
-        None => fut.await,
+        None => wait.await,
     };
+
+    let joined = match wait_result {
+        Ok(j) => j,
+        Err(d) => {
+            interrupt.interrupt();
+            warn!(op, timeout_ms = d.as_millis() as u64, "operation timeout");
+            return Err(LuaError::external(format!(
+                "{op} timeout ({}ms)",
+                d.as_millis()
+            )));
+        }
+    };
+
     joined
         .map_err(|e| {
             warn!(op, error = %e, "spawn_blocking join error");
             LuaError::external(format!("spawn_blocking: {e}"))
         })?
         .map_err(|e| {
-            warn!(op, error = %e, "sql execution error");
+            warn!(op, error = %e, "execution error");
             LuaError::external(e)
         })
 }
