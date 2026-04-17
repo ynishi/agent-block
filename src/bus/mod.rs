@@ -12,12 +12,15 @@ pub mod dispatcher;
 pub mod event;
 pub mod source;
 
-// These re-exports are consumed by Subtask 3 (Lua bridge + mesh adapter).
-// The `#[allow(unused_imports)]` suppresses `unused import` warnings
-// during the Subtask 1 isolated build.
+// Consumed by `bridge::bus` (Lua bridge) and `host::BusRelayHandler`
+// (mesh → bus adapter). `HandlerKey` / `Source` are not yet referenced
+// outside `bus::dispatcher` / `bus::source` — kept public for forthcoming
+// adapters (webhook, WSS, timer).
 #[allow(unused_imports)]
-pub use dispatcher::{EventBus, Handler, HandlerKey};
+pub use dispatcher::HandlerKey;
+pub use dispatcher::{EventBus, Handler};
 #[allow(unused_imports)]
-pub use event::{AckReceiver, AckResult, AckSender, Event};
+pub use event::{AckReceiver, AckSender};
+pub use event::{AckResult, Event};
 #[allow(unused_imports)]
 pub use source::Source;
