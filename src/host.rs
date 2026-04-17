@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use mlua_isle::AsyncIsle;
+use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use tracing::{info, info_span, warn};
 
 use crate::bridge;
@@ -100,6 +100,17 @@ pub struct HostContext {
     /// `isle.coroutine_call("__bus_dispatch", ...)` to invoke Lua handlers
     /// from the EventBus dispatcher task.
     pub isle: Arc<AsyncIsle>,
+    /// Dedicated Isle for EventBus handler execution. Lua handlers
+    /// registered via `bus.on` / `bus.on_any` run here so that CPU-bound
+    /// handler code does not occupy the main Isle's LocalSet and block
+    /// grace timers / shutdown wakers on the main VM side.
+    ///
+    /// Subtask 1 wires this field; Subtask 2 will switch `bridge::bus`
+    /// to dispatch against `handler_isle` instead of `isle`. Until then
+    /// the field is held only to keep the Isle alive and drive shutdown
+    /// from `host::run`.
+    #[allow(dead_code)]
+    pub handler_isle: Arc<AsyncIsle>,
     /// Ingress sender for the EventBus. Adapters (mesh / webhook / …)
     /// clone this and push `Event`s. The ST3 mesh adapter captures its own
     /// clone at `MeshAgent::connect` time, so the field itself is not read
@@ -147,6 +158,90 @@ fn open_sqlite(
     let interrupt = Arc::new(conn.get_interrupt_handle());
     let conn = Arc::new(Mutex::new(conn));
     Ok((conn, interrupt))
+}
+
+/// Build the init closure shared between the main Isle and the handler
+/// Isle.  Sets `_SCRIPT_NAME`, registers `mlua-batteries` `std.*`, and
+/// configures `package.path` / `package.searchers` so `require "agent"`
+/// (and any `blocks/` module) works inside the Lua VM.
+///
+/// Returns an `FnOnce` so each call produces a fresh closure; this lets
+/// both Isles be spawned from the same config without `Clone` bounds on
+/// the captured `HashMap`.
+fn build_isle_init(
+    script_name: String,
+    script_dir: String,
+    blocks_paths: String,
+) -> impl FnOnce(&mlua::Lua) -> mlua::Result<()> + Send + 'static {
+    move |lua| {
+        // Set script name before registering bridges (used by log.* for attribution)
+        lua.globals().set("_SCRIPT_NAME", script_name.as_str())?;
+
+        mlua_batteries::register_all(lua, "std")?;
+
+        // ── package.path ──────────────────────────────────────────────
+        // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
+        let package: mlua::Table = lua.globals().get("package")?;
+        let current_path: String = package.get("path")?;
+        let new_path =
+            format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
+        package.set("path", new_path)?;
+
+        // ── package.searchers — embedded fallback ─────────────────────
+        // Register a custom searcher that loads blocks/ modules from the
+        // sources baked in at compile time.  This is the lowest-priority
+        // searcher so filesystem copies always win.
+        let embedded: HashMap<&'static str, &'static str> =
+            EMBEDDED_BLOCKS.iter().copied().collect();
+
+        let searchers: mlua::Table = package.get("searchers")?;
+        let loader =
+            lua.create_function(move |lua, name: String| match embedded.get(name.as_str()) {
+                Some(source) => {
+                    let chunk = lua
+                        .load(*source)
+                        .set_name(format!("@embedded:blocks/{name}/init.lua"));
+                    let func = chunk.into_function()?;
+                    Ok(mlua::Value::Function(func))
+                }
+                None => {
+                    let msg = lua.create_string(format!("\n\tno embedded block '{name}'"))?;
+                    Ok(mlua::Value::String(msg))
+                }
+            })?;
+        // Append as the last searcher so filesystem paths remain preferred.
+        let next_idx = searchers.raw_len() + 1;
+        searchers.raw_set(next_idx, loader)?;
+
+        Ok(())
+    }
+}
+
+/// Spawn the dedicated handler Isle.
+///
+/// The handler Isle runs Lua bus handlers (`bus.on` / `bus.on_any`) on a
+/// separate OS thread with its own `tokio` current-thread runtime, keeping
+/// CPU-bound handlers from starving the main Isle's grace timers.
+///
+/// Bridge registration is deferred to a follow-up `exec` in `run()` because
+/// `HostContext` is not constructible until both Isles exist (the struct
+/// itself holds `Arc<AsyncIsle>` for both).
+async fn spawn_handler_isle(
+    script_name: String,
+    script_dir: String,
+    blocks_paths: String,
+) -> BlockResult<(Arc<AsyncIsle>, AsyncIsleDriver)> {
+    let init = build_isle_init(script_name, script_dir, blocks_paths);
+    let (isle, driver) = AsyncIsle::builder()
+        .thread_name("agent-block-handler-isle")
+        .spawn(init)
+        .await
+        .map_err(|e| BlockError::Runtime(format!("handler isle spawn failed: {e}")))?;
+    info!(
+        thread_name = "agent-block-handler-isle",
+        "handler Isle spawned"
+    );
+    Ok((Arc::new(isle), driver))
 }
 
 fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
@@ -255,60 +350,30 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // `Arc<AsyncIsle>`, which is available only after `AsyncIsle::spawn`
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
-    let script_name_for_lua = script_name.clone();
     let blocks_paths = build_blocks_path(&project_root);
 
-    let (isle, driver) = AsyncIsle::spawn(move |lua| {
-        // Set script name before registering bridges (used by log.* for attribution)
-        lua.globals()
-            .set("_SCRIPT_NAME", script_name_for_lua.as_str())?;
-
-        mlua_batteries::register_all(lua, "std")?;
-
-        // ── package.path ──────────────────────────────────────────────
-        // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
-        let package: mlua::Table = lua.globals().get("package")?;
-        let current_path: String = package.get("path")?;
-        let new_path =
-            format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
-        package.set("path", new_path)?;
-
-        // ── package.searchers — embedded fallback ─────────────────────
-        // Register a custom searcher that loads blocks/ modules from the
-        // sources baked in at compile time.  This is the lowest-priority
-        // searcher so filesystem copies always win.
-        let embedded: HashMap<&'static str, &'static str> =
-            EMBEDDED_BLOCKS.iter().copied().collect();
-
-        let searchers: mlua::Table = package.get("searchers")?;
-        let loader =
-            lua.create_function(move |lua, name: String| match embedded.get(name.as_str()) {
-                Some(source) => {
-                    let chunk = lua
-                        .load(*source)
-                        .set_name(format!("@embedded:blocks/{name}/init.lua"));
-                    let func = chunk.into_function()?;
-                    Ok(mlua::Value::Function(func))
-                }
-                None => {
-                    let msg = lua.create_string(format!("\n\tno embedded block '{name}'"))?;
-                    Ok(mlua::Value::String(msg))
-                }
-            })?;
-        // Append as the last searcher so filesystem paths remain preferred.
-        let next_idx = searchers.raw_len() + 1;
-        searchers.raw_set(next_idx, loader)?;
-
-        Ok(())
-    })
+    // ── main Isle ─────────────────────────────────────────────────
+    let (isle, driver) = AsyncIsle::spawn(build_isle_init(
+        script_name.clone(),
+        script_dir.clone(),
+        blocks_paths.clone(),
+    ))
     .await
     .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
+    let isle = Arc::new(isle);
+
+    // ── handler Isle (sequential, dependencies are trivial) ────────
+    let (handler_isle, handler_driver) = spawn_handler_isle(
+        script_name.clone(),
+        script_dir.clone(),
+        blocks_paths.clone(),
+    )
+    .await?;
 
     // ── HostContext + bridge registration ──────────────────────────────
     // Wrap the isle in an Arc so `HostContext` can hand it to
     // `bridge::bus` (which uses `AsyncIsle::coroutine_call` to invoke Lua
     // handlers from the EventBus dispatcher task).
-    let isle = Arc::new(isle);
     let ctx = HostContext {
         project_root,
         mesh_agent,
@@ -319,6 +384,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         kv_conn,
         kv_interrupt,
         isle: Arc::clone(&isle),
+        handler_isle: Arc::clone(&handler_isle),
         bus_tx: bus_tx.clone(),
         event_bus: Arc::clone(&event_bus),
     };
@@ -332,6 +398,19 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         })
         .await
         .map_err(|e| BlockError::Runtime(format!("bridge register: {e}")))?;
+    }
+
+    {
+        let ctx = ctx.clone();
+        handler_isle
+            .exec(move |lua| {
+                bridge::register_all_handler_side(lua, &ctx).map_err(|e| {
+                    mlua_isle::IsleError::Lua(format!("handler bridge register failed: {e}"))
+                })?;
+                Ok(String::new())
+            })
+            .await
+            .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
     }
 
     drop(_init_guard);
@@ -358,6 +437,22 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
             .shutdown()
             .await
             .map_err(|e| BlockError::Runtime(format!("AsyncIsle shutdown failed: {e}")))?;
+
+        // Handler Isle shutdown is independent of main shutdown: a failure
+        // here (e.g. ThreadPanic on the handler thread) is logged but does
+        // not poison the main process exit. The main Isle has already
+        // been stopped cleanly above.
+        match handler_driver.shutdown().await {
+            Ok(()) => info!(
+                thread_name = "agent-block-handler-isle",
+                "handler Isle shut down"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                thread_name = "agent-block-handler-isle",
+                "handler Isle shutdown failed"
+            ),
+        }
     }
 
     Ok(())
