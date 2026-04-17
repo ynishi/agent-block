@@ -1435,13 +1435,16 @@ dependencies = [
 
 [[package]]
 name = "mlua-batteries"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c90326f8d759744d08af1ea1268a8f4c991f5243e2ed4177f6a824917a274bb4"
+checksum = "bdffa17da0e0ab86296164c1fea5607f807b24607c40aac797a0bee659fa0cde"
 dependencies = [
  "globset",
  "mlua",
+ "rusqlite",
  "serde_json",
+ "tokio",
+ "tracing",
  "walkdir",
 ]
 

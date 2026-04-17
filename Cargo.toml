@@ -33,7 +33,7 @@ mlua = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"
 agent-mesh-core = "0.3"
 agent-mesh-sdk = "0.3"
 
-mlua-batteries = { version = "0.2", features = ["json", "fs", "env", "path", "time"] }
+mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task", "sql", "kv"] }
 llm-extract = "0.1"
 
 tokio = { version = "1", features = ["full"] }
