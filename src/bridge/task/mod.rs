@@ -14,14 +14,14 @@
 //! - `AGENT_BLOCK_TASK_GRACE_MS` — default grace window (cooperative
 //!   cancel → hard abort) used by `std.task.with_timeout` when the caller
 //!   does not pass `opts.grace_ms`.  Default: 1000 ms.  Set to 0 for
-//!   strict / immediate-abort semantics.
+//!   strict / immediate-abort semantics.  Parsing is delegated to
+//!   [`crate::bridge::config::task_grace_ms`], which `tracing::warn!`s on
+//!   unparseable values and falls back to the default.
 
 use mlua::prelude::*;
 use mlua_batteries::task::{Driver, TaskConfig};
 
-/// Default grace period (ms) when neither the env var nor `opts.grace_ms`
-/// is set.  Mirrors the historical agent-block default before extraction.
-const DEFAULT_GRACE_MS: u64 = 1000;
+use crate::bridge::config;
 
 fn parse_driver_env() -> Driver {
     match std::env::var("AGENT_BLOCK_TASK_DRIVER").ok().as_deref() {
@@ -30,17 +30,10 @@ fn parse_driver_env() -> Driver {
     }
 }
 
-fn parse_grace_ms_env() -> u64 {
-    std::env::var("AGENT_BLOCK_TASK_GRACE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_GRACE_MS)
-}
-
 pub fn register(lua: &Lua) -> LuaResult<()> {
     let cfg = TaskConfig {
         default_driver: parse_driver_env(),
-        grace_ms: parse_grace_ms_env(),
+        grace_ms: config::task_grace_ms(),
     };
     mlua_batteries::task::register_with(lua, cfg)
 }

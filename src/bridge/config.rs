@@ -10,6 +10,8 @@
 //! | `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`  | `5000`                   | both     |
 //! | `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` | `5000`                   | both     |
 //! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | both     |
+//! | `AGENT_BLOCK_BUS_CAPACITY`         | `64`                     | EventBus |
+//! | `AGENT_BLOCK_TASK_GRACE_MS`        | `1000`                   | task/bus |
 //!
 //! `std.kv` and `std.sql` are backed by separate SQLite database files so
 //! that agent-internal KV state and explicit user SQL data don't share WAL,
@@ -26,6 +28,9 @@ use std::time::Duration;
 const DEFAULT_SQL_BUSY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_SQL_QUERY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_SQL_JOURNAL_MODE: &str = "WAL";
+#[allow(dead_code)] // consumed by src/bus/ wiring (follow-up subtask)
+const DEFAULT_BUS_CAPACITY: usize = 64;
+const DEFAULT_TASK_GRACE_MS: u64 = 1000;
 
 /// Base dir for agent-block local state.
 /// `AGENT_BLOCK_HOME` → `$HOME/.agent-block`.
@@ -88,5 +93,41 @@ pub fn sql_query_timeout() -> Option<Duration> {
         None
     } else {
         Some(Duration::from_millis(ms))
+    }
+}
+
+/// EventBus bounded mpsc capacity.
+/// `AGENT_BLOCK_BUS_CAPACITY` → 64. Parse failures warn and fall back.
+#[allow(dead_code)] // wired in follow-up subtask (Lua bridge + mesh adapter)
+pub fn bus_capacity() -> usize {
+    match std::env::var("AGENT_BLOCK_BUS_CAPACITY") {
+        Ok(v) => v.parse::<usize>().unwrap_or_else(|e| {
+            tracing::warn!(
+                value = %v,
+                error = %e,
+                default = DEFAULT_BUS_CAPACITY,
+                "AGENT_BLOCK_BUS_CAPACITY parse failed, using default"
+            );
+            DEFAULT_BUS_CAPACITY
+        }),
+        Err(_) => DEFAULT_BUS_CAPACITY,
+    }
+}
+
+/// SIGTERM/SIGINT grace window (ms) shared by `std.task.with_timeout` and the
+/// EventBus shutdown path.
+/// `AGENT_BLOCK_TASK_GRACE_MS` → 1000. Parse failures warn and fall back.
+pub fn task_grace_ms() -> u64 {
+    match std::env::var("AGENT_BLOCK_TASK_GRACE_MS") {
+        Ok(v) => v.parse::<u64>().unwrap_or_else(|e| {
+            tracing::warn!(
+                value = %v,
+                error = %e,
+                default = DEFAULT_TASK_GRACE_MS,
+                "AGENT_BLOCK_TASK_GRACE_MS parse failed, using default"
+            );
+            DEFAULT_TASK_GRACE_MS
+        }),
+        Err(_) => DEFAULT_TASK_GRACE_MS,
     }
 }
