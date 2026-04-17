@@ -21,12 +21,35 @@
 //!
 //! # Why `std::sync::Mutex`?
 //!
-//! `bus.on` / `bus.on_any` are registered as **sync** Lua functions (not
-//! `create_async_function`), so they run inline on the Isle Lua thread.
-//! A `std::sync::Mutex` can be locked briefly from sync context, and the
-//! `bus.serve` async path also needs to lock it once (to `.take()` the
-//! `EventBus`) — crucially, the lock is released **before** any `.await`,
-//! avoiding the `await-holding-lock` anti-pattern.
+//! `bus.on` / `bus.on_any` are registered as `create_async_function`, but the
+//! only lock acquisition they perform is a brief `std::sync::Mutex::lock()`
+//! that is released (via `drop(guard)`) **before** any `.await`. The
+//! `bus.serve` async path likewise locks the mutex only long enough to
+//! `Option::take()` the `EventBus`, releasing the guard before the long
+//! `run()` await. This avoids the `await-holding-lock` anti-pattern even
+//! though the registration helpers are now async.
+//!
+//! # Handler Isle forwarding (Subtask 2)
+//!
+//! Lua handlers passed to `bus.on` / `bus.on_any` are serialized via
+//! `Function::dump(true)` on the main Isle and reloaded on the dedicated
+//! **handler Isle** via `Lua::load(bytes).set_mode(ChunkMode::Binary)`. The
+//! function is then stored in `__bus_handlers[kind]` / `__bus_on_any` on the
+//! handler Isle. The `LuaHandler` registered on the `EventBus` therefore
+//! dispatches against `ctx.handler_isle`, leaving the main Isle's LocalSet
+//! free to drive `bus.serve` grace timers / signal wake-ups.
+//!
+//! **Upvalue semantics**: bytecode transfer does not preserve upvalue
+//! identity — the handler Isle reloads the chunk in its own Lua state, so
+//! any upvalues captured by the handler closure are re-initialized to `nil`.
+//! State shared between script init and event handlers must go through the
+//! `kv.*`, `sql.*`, or `mesh.*` bridges (or any other bridge registered on
+//! both Isles), not through Lua closure captures.
+//!
+//! **C functions are not dump-able**: `Function::dump` returns an empty
+//! byte string for C functions / Rust-bound callbacks. `bus.on` detects
+//! this via `Function::info().what` and returns a clear error rather than
+//! silently installing a non-callable handler.
 //!
 //! # wf-sim verdict doc comments
 //!
@@ -126,17 +149,45 @@ impl Handler for LuaHandler {
     }
 }
 
-/// Register `bus.on` / `bus.on_any` / `bus.serve` on `lua`.
+/// Register `bus.on` / `bus.on_any` / `bus.serve` on `lua` (the **main Isle**).
 ///
 /// Must be called **before** `mesh::register` because the mesh bridge's
 /// `mesh.on` alias reads the `bus` global produced here (`bridge/mod.rs`).
+///
+/// # Concurrency
+///
+/// Call this function on the main Isle Lua VM only. `bus.on` / `bus.on_any`
+/// are registered via `create_async_function`; they serialize the caller's
+/// Lua handler as bytecode (`Function::dump`) and forward it to the handler
+/// Isle via `handler_isle.exec(...)` before registering a [`LuaHandler`] on
+/// the [`EventBus`].
+///
+/// - The `std::sync::Mutex` guard on `event_bus` is dropped before the
+///   `.await` on `handler_isle.exec` (the lock is acquired **after** the
+///   exec resolves), so no lock is held across any `.await`.
+/// - Cancel safety: if the `bus.on` future is dropped after `Function::dump`
+///   but before `handler_isle.exec` resolves, the handler is never registered
+///   on the handler Isle and never added to the [`EventBus`]. Because
+///   `bus.on` may only be called **before** `bus.serve`, this leaves the
+///   bus in a consistent (handler-absent) state.
+/// - `bus.serve` takes ownership of the `EventBus` from the `Mutex` before
+///   entering the async dispatch loop; no lock is held across any `.await`.
+/// - `Arc<AsyncIsle>` (`handler_isle`) is `Send + Sync` and safe to clone
+///   into async closures on the multi-thread runtime.
+/// - Panic: returns `LuaError::external` on mutex poisoning or Isle forward
+///   failure; never panics.
+///
+/// For the handler Isle, call [`install_bus_dispatcher_on_handler_isle`]
+/// instead; it installs the `__bus_dispatch` / `__bus_handlers` /
+/// `__bus_on_any` globals on the handler Isle and does **not** expose the
+/// `bus.*` Lua table there.
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let bus_tbl = lua.create_table()?;
 
-    // ── Lua-side dispatcher & storage ─────────────────────────────────
-    lua.globals().set(BUS_HANDLERS_TBL, lua.create_table()?)?;
-    lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil)?;
-    install_lua_dispatcher(lua)?;
+    // NOTE: The `__bus_handlers` / `__bus_on_any` globals and the
+    // `__bus_dispatch` function live on the **handler Isle** (installed by
+    // `install_bus_dispatcher_on_handler_isle`). The main Isle only exposes
+    // the `bus.*` Lua table (on / on_any / serve).
 
     // Shared ownership of the event bus. `Option::take` in `bus.serve`
     // moves the `EventBus` out of the mutex before any `.await`, so no
@@ -145,8 +196,8 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let event_bus_for_on_any = Arc::clone(&ctx.event_bus);
     let event_bus_for_serve = Arc::clone(&ctx.event_bus);
 
-    let isle_for_on = Arc::clone(&ctx.isle);
-    let isle_for_on_any = Arc::clone(&ctx.isle);
+    let handler_isle_for_on = Arc::clone(&ctx.handler_isle);
+    let handler_isle_for_on_any = Arc::clone(&ctx.handler_isle);
 
     // ── bus.on ────────────────────────────────────────────────────────
     // Register a handler for the given event `kind`.
@@ -158,35 +209,92 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // rebinding; future revisions may emit a tracing::warn on overwrite.
     //
     // (doc verbatim from subtask-1.md §wf-sim Counter-WF)
+    //
+    // **Upvalue caveat** (Subtask 2): the handler closure is serialized with
+    // `Function::dump(true)` on the main Isle and reloaded on the handler
+    // Isle. Bytecode transfer does not preserve upvalue identity; upvalues
+    // captured by the closure are re-initialized to `nil` on the handler
+    // Isle. Share state via the `kv.*`, `sql.*`, `mesh.*`, or `std.*`
+    // bridges instead of Lua closure captures.
+    //
+    // **C function rejection**: `Function::dump` returns an empty byte
+    // string for C functions / Rust-bound callbacks (the Lua bytecode
+    // encoder cannot serialize native code). `bus.on` detects this case
+    // via `Function::info().what` and returns a clear error message rather
+    // than silently installing a handler that would fail at dispatch time.
     bus_tbl.set(
         "on",
-        lua.create_function(move |lua, (kind, func): (String, LuaFunction)| {
-            // 1. Store the Lua function under __bus_handlers[kind] so the
-            //    Lua-side dispatcher can find it.
-            let tbl: LuaTable = lua.globals().get(BUS_HANDLERS_TBL)?;
-            tbl.set(kind.as_str(), func)?;
-
-            // 2. Register a (or replace the) LuaHandler on the EventBus.
-            //    The EventBus dedupes by kind (last-write-wins), matching
-            //    the Lua-side overwrite above.
-            let handler: Arc<dyn Handler> = Arc::new(LuaHandler {
-                isle: Arc::clone(&isle_for_on),
-            });
-            let mut guard = event_bus_for_on
-                .lock()
-                .map_err(|_| LuaError::external("bus mutex poisoned"))?;
-            match guard.as_mut() {
-                Some(bus) => bus
-                    .on(kind.clone(), handler)
-                    .map_err(|e| LuaError::external(format!("bus.on: {e}")))?,
-                None => {
+        lua.create_async_function(move |_, (kind, func): (String, LuaFunction)| {
+            let handler_isle = Arc::clone(&handler_isle_for_on);
+            let event_bus = Arc::clone(&event_bus_for_on);
+            async move {
+                // 1. Serialize the Lua handler as bytecode. The main Isle
+                //    thread owns `func`; `dump` runs synchronously on that
+                //    thread (we are still inside the create_async_function
+                //    outer layer executed by the Isle).
+                if func.info().what != "Lua" {
                     return Err(LuaError::external(
-                        "bus.on: bus.serve() has already taken ownership; register handlers before calling bus.serve()",
+                        "bus.on: handler must be a pure Lua function (C functions and Rust-bound callbacks are not supported)",
                     ));
                 }
+                let bytecode = func.dump(true);
+                if bytecode.is_empty() {
+                    // Should be unreachable after the `what == "Lua"` check,
+                    // but guard against edge cases (e.g. already-dumped
+                    // closures with no code) with an explicit error rather
+                    // than silently installing a dead handler.
+                    return Err(LuaError::external(
+                        "bus.on: Function::dump returned empty bytecode (handler not serializable)",
+                    ));
+                }
+
+                // 2. Forward the bytecode to the handler Isle.
+                let kind_for_exec = kind.clone();
+                let bytecode_name = format!("@bus_handler[{kind_for_exec}]");
+                handler_isle
+                    .exec(move |lua| {
+                        let loaded: LuaFunction = lua
+                            .load(bytecode.as_slice())
+                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_name(&bytecode_name)
+                            .into_function()
+                            .map_err(|e| IsleError::Lua(format!("bus.on load: {e}")))?;
+                        let tbl: LuaTable = lua
+                            .globals()
+                            .get(BUS_HANDLERS_TBL)
+                            .map_err(|e| IsleError::Lua(format!("bus.on handlers tbl: {e}")))?;
+                        tbl.set(kind_for_exec.as_str(), loaded)
+                            .map_err(|e| IsleError::Lua(format!("bus.on set: {e}")))?;
+                        Ok(String::new())
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(%kind, error = %e, "bus.on: handler isle load failed");
+                        LuaError::external(format!("bus.on: handler isle load failed: {e}"))
+                    })?;
+
+                // 3. Register (or replace) the LuaHandler on the EventBus.
+                //    The EventBus dedupes by kind (last-write-wins), matching
+                //    the handler Isle-side overwrite above.
+                let handler: Arc<dyn Handler> = Arc::new(LuaHandler {
+                    isle: Arc::clone(&handler_isle),
+                });
+                let mut guard = event_bus
+                    .lock()
+                    .map_err(|_| LuaError::external("bus mutex poisoned"))?;
+                match guard.as_mut() {
+                    Some(bus) => bus
+                        .on(kind.clone(), handler)
+                        .map_err(|e| LuaError::external(format!("bus.on: {e}")))?,
+                    None => {
+                        return Err(LuaError::external(
+                            "bus.on: bus.serve() has already taken ownership; register handlers before calling bus.serve()",
+                        ));
+                    }
+                }
+                drop(guard);
+                Ok(())
             }
-            drop(guard);
-            Ok(())
         })?,
     )?;
 
@@ -203,29 +311,65 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // (`bus.tap` or equivalent).
     //
     // (doc verbatim from subtask-1.md §wf-sim R3)
+    //
+    // Same bytecode-transfer / upvalue / C-function caveats as `bus.on`.
     bus_tbl.set(
         "on_any",
-        lua.create_function(move |lua, func: LuaFunction| {
-            lua.globals().set(BUS_ON_ANY_GLOBAL, func)?;
-
-            let handler: Arc<dyn Handler> = Arc::new(LuaHandler {
-                isle: Arc::clone(&isle_for_on_any),
-            });
-            let mut guard = event_bus_for_on_any
-                .lock()
-                .map_err(|_| LuaError::external("bus mutex poisoned"))?;
-            match guard.as_mut() {
-                Some(bus) => bus
-                    .on_any(handler)
-                    .map_err(|e| LuaError::external(format!("bus.on_any: {e}")))?,
-                None => {
+        lua.create_async_function(move |_, func: LuaFunction| {
+            let handler_isle = Arc::clone(&handler_isle_for_on_any);
+            let event_bus = Arc::clone(&event_bus_for_on_any);
+            async move {
+                if func.info().what != "Lua" {
                     return Err(LuaError::external(
-                        "bus.on_any: bus.serve() has already taken ownership; register handlers before calling bus.serve()",
+                        "bus.on_any: handler must be a pure Lua function (C functions and Rust-bound callbacks are not supported)",
                     ));
                 }
+                let bytecode = func.dump(true);
+                if bytecode.is_empty() {
+                    return Err(LuaError::external(
+                        "bus.on_any: Function::dump returned empty bytecode (handler not serializable)",
+                    ));
+                }
+
+                let bytecode_name = "@bus_handler[__on_any]".to_string();
+                handler_isle
+                    .exec(move |lua| {
+                        let loaded: LuaFunction = lua
+                            .load(bytecode.as_slice())
+                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_name(&bytecode_name)
+                            .into_function()
+                            .map_err(|e| IsleError::Lua(format!("bus.on_any load: {e}")))?;
+                        lua.globals()
+                            .set(BUS_ON_ANY_GLOBAL, loaded)
+                            .map_err(|e| IsleError::Lua(format!("bus.on_any set: {e}")))?;
+                        Ok(String::new())
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "bus.on_any: handler isle load failed");
+                        LuaError::external(format!("bus.on_any: handler isle load failed: {e}"))
+                    })?;
+
+                let handler: Arc<dyn Handler> = Arc::new(LuaHandler {
+                    isle: Arc::clone(&handler_isle),
+                });
+                let mut guard = event_bus
+                    .lock()
+                    .map_err(|_| LuaError::external("bus mutex poisoned"))?;
+                match guard.as_mut() {
+                    Some(bus) => bus
+                        .on_any(handler)
+                        .map_err(|e| LuaError::external(format!("bus.on_any: {e}")))?,
+                    None => {
+                        return Err(LuaError::external(
+                            "bus.on_any: bus.serve() has already taken ownership; register handlers before calling bus.serve()",
+                        ));
+                    }
+                }
+                drop(guard);
+                Ok(())
             }
-            drop(guard);
-            Ok(())
         })?,
     )?;
 
@@ -298,10 +442,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     Ok(())
 }
 
-/// Install the `__bus_dispatch(kind, id, payload_json, meta_json)` Lua
-/// function.
+/// Install the `__bus_handlers` table, `__bus_on_any` fallback slot, and
+/// the `__bus_dispatch(kind, id, payload_json, meta_json)` Lua dispatcher on
+/// the **handler Isle**.
 ///
-/// The function:
+/// After Subtask 2 these globals no longer live on the main Isle; the main
+/// Isle exposes only the `bus.*` Lua table (see [`register`]). Callers must
+/// invoke this function from inside the handler Isle's bridge registration
+/// (`bridge::register_all_handler_side`).
+///
+/// The dispatcher function:
 /// 1. Looks up the user-registered handler (`__bus_handlers[kind]` first,
 ///    then `__bus_on_any`).
 /// 2. Decodes `payload_json` and `meta_json` into Lua tables.
@@ -312,7 +462,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 /// Errors are propagated as Lua errors — the Isle converts them into
 /// [`IsleError::Lua`], which [`LuaHandler::call`] wraps into
 /// [`BlockError::Bus`] so the dispatcher can deliver a NACK.
-fn install_lua_dispatcher(lua: &Lua) -> LuaResult<()> {
+///
+/// # Concurrency
+///
+/// Runs synchronously on the handler Isle's Lua thread (called from inside
+/// an `AsyncIsle::exec` closure, which owns exclusive access to the Lua VM).
+pub(crate) fn install_bus_dispatcher_on_handler_isle(lua: &Lua) -> LuaResult<()> {
+    lua.globals().set(BUS_HANDLERS_TBL, lua.create_table()?)?;
+    lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil)?;
     let dispatch = lua.create_function(
         |lua, (kind, id, payload_json, meta_json): (String, String, String, String)| {
             // Resolve handler via __bus_handlers[kind], falling back to
@@ -473,11 +630,7 @@ mod tests {
     fn dispatcher_resolves_kind_and_encodes_return() {
         let lua = Lua::new();
         mlua_batteries::register_all(&lua, "std").unwrap();
-        lua.globals()
-            .set(BUS_HANDLERS_TBL, lua.create_table().unwrap())
-            .unwrap();
-        lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil).unwrap();
-        install_lua_dispatcher(&lua).unwrap();
+        install_bus_dispatcher_on_handler_isle(&lua).unwrap();
 
         // Register a handler that echoes the payload with a field added.
         lua.load(
@@ -505,11 +658,7 @@ mod tests {
     fn dispatcher_falls_back_to_on_any() {
         let lua = Lua::new();
         mlua_batteries::register_all(&lua, "std").unwrap();
-        lua.globals()
-            .set(BUS_HANDLERS_TBL, lua.create_table().unwrap())
-            .unwrap();
-        lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil).unwrap();
-        install_lua_dispatcher(&lua).unwrap();
+        install_bus_dispatcher_on_handler_isle(&lua).unwrap();
 
         lua.load(
             r#"
@@ -531,11 +680,7 @@ mod tests {
     fn dispatcher_errors_when_no_handler_registered() {
         let lua = Lua::new();
         mlua_batteries::register_all(&lua, "std").unwrap();
-        lua.globals()
-            .set(BUS_HANDLERS_TBL, lua.create_table().unwrap())
-            .unwrap();
-        lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil).unwrap();
-        install_lua_dispatcher(&lua).unwrap();
+        install_bus_dispatcher_on_handler_isle(&lua).unwrap();
 
         let dispatch: LuaFunction = lua.globals().get(BUS_DISPATCH_FN).unwrap();
         let err = dispatch
@@ -552,11 +697,7 @@ mod tests {
     fn dispatcher_reports_invalid_payload_json() {
         let lua = Lua::new();
         mlua_batteries::register_all(&lua, "std").unwrap();
-        lua.globals()
-            .set(BUS_HANDLERS_TBL, lua.create_table().unwrap())
-            .unwrap();
-        lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil).unwrap();
-        install_lua_dispatcher(&lua).unwrap();
+        install_bus_dispatcher_on_handler_isle(&lua).unwrap();
 
         lua.load(r#"__bus_handlers["x"] = function() return nil end"#)
             .exec()
@@ -570,5 +711,70 @@ mod tests {
             err.to_string().contains("payload decode"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Round-trip: `Function::dump(true)` on one Lua VM, `Lua::load` with
+    /// `ChunkMode::Binary` on a second Lua VM, then invoke through the
+    /// `__bus_dispatch` path. Exercises the bytecode transfer mechanism
+    /// that `bus.on` uses to forward handlers from the main Isle to the
+    /// handler Isle (without requiring a real `AsyncIsle` spawn).
+    #[test]
+    fn bytecode_round_trip_to_second_lua_vm_dispatches() {
+        // Source VM: compile a Lua handler and dump to bytecode.
+        let src = Lua::new();
+        let func: LuaFunction = src
+            .load(
+                r#"
+                return function(ev)
+                    return { got = ev.payload.value, kind = ev.kind }
+                end
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(func.info().what, "Lua");
+        let bytecode = func.dump(true);
+        assert!(!bytecode.is_empty(), "Lua function dump must be non-empty");
+
+        // Destination VM: stand in for the handler Isle. Load the bytecode
+        // and register it under __bus_handlers[kind].
+        let dst = Lua::new();
+        mlua_batteries::register_all(&dst, "std").unwrap();
+        install_bus_dispatcher_on_handler_isle(&dst).unwrap();
+        let loaded: LuaFunction = dst
+            .load(bytecode.as_slice())
+            .set_mode(mlua::ChunkMode::Binary)
+            .set_name("@bus_handler[mesh]")
+            .into_function()
+            .unwrap();
+        let handlers: LuaTable = dst.globals().get(BUS_HANDLERS_TBL).unwrap();
+        handlers.set("mesh", loaded).unwrap();
+
+        // Dispatch and verify the reconstructed closure ran.
+        let dispatch: LuaFunction = dst.globals().get(BUS_DISPATCH_FN).unwrap();
+        let payload = serde_json::to_string(&json!({"value": 7})).unwrap();
+        let out: String = dispatch
+            .call(("mesh", "evt-rt", payload.as_str(), "{}"))
+            .unwrap();
+        let got: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(got, json!({"got": 7, "kind": "mesh"}));
+    }
+
+    /// `Function::info().what` distinguishes Lua-defined closures (dumpable)
+    /// from Rust-bound C functions (not dumpable). `bus.on` relies on this
+    /// discriminator to reject handlers that would otherwise produce an
+    /// empty bytecode blob and fail at dispatch time.
+    #[test]
+    fn c_function_is_detected_via_info_what() {
+        let lua = Lua::new();
+        let rust_fn: LuaFunction = lua.create_function(|_, ()| Ok(())).unwrap();
+        assert_ne!(
+            rust_fn.info().what,
+            "Lua",
+            "Rust-bound callbacks should not report info().what == \"Lua\""
+        );
+
+        let lua_fn: LuaFunction = lua.load("return function() end").eval().unwrap();
+        assert_eq!(lua_fn.info().what, "Lua");
     }
 }

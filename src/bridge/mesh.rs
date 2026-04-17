@@ -9,13 +9,32 @@ use std::time::Duration;
 
 use crate::host::HostContext;
 
-pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
+/// Register the `mesh.*` Lua table.
+///
+/// `is_handler_side` selects the surface exposed by this bridge:
+///
+/// - `false` (main Isle): registers `send`, `request`, `on`, `agent_id`.
+///   `mesh.on` is a thin alias over `bus.on("mesh", fn)` and therefore
+///   depends on `bus.register` having run first on the same VM
+///   (`bridge::register_all` orders them correctly).
+/// - `true` (handler Isle): registers `send`, `request`, `agent_id` only.
+///   The handler Isle does not expose the `bus.*` global, so installing
+///   `mesh.on` would fail with `bus global missing`. Handlers dispatched on
+///   the handler Isle can still call `mesh.send` / `mesh.request` because
+///   the `MeshAgent` Arc is shared across Isles via `HostContext`.
+pub fn register(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResult<()> {
     let mesh_tbl = lua.create_table()?;
 
     match &ctx.mesh_agent {
         None => {
-            // All functions return error when mesh is not connected
-            for name in &["send", "request", "on", "agent_id"] {
+            // All functions return error when mesh is not connected.
+            // Skip `on` on the handler side because it is not exposed there.
+            let names: &[&str] = if is_handler_side {
+                &["send", "request", "agent_id"]
+            } else {
+                &["send", "request", "on", "agent_id"]
+            };
+            for name in names {
                 let n = name.to_string();
                 mesh_tbl.set(
                     *name,
@@ -74,17 +93,27 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 lua.create_function(move |_, ()| Ok(agent_id_str.clone()))?,
             )?;
 
-            // mesh.on is now a thin alias over bus.on("mesh", fn). The
-            // EventBus (registered in bridge/bus.rs before this function
-            // runs) owns the actual dispatch. Capture `bus.on` at
-            // registration time so subsequent reassignments of the `bus`
-            // global do not hijack the alias.
-            let bus_tbl: LuaTable = lua.globals().get("bus")?;
-            let bus_on: LuaFunction = bus_tbl.get("on")?;
-            mesh_tbl.set(
-                "on",
-                lua.create_function(move |_, func: LuaFunction| bus_on.call::<()>(("mesh", func)))?,
-            )?;
+            if !is_handler_side {
+                // mesh.on is a thin alias over bus.on("mesh", fn). The
+                // EventBus (registered in bridge/bus.rs before this function
+                // runs on the main Isle) owns the actual dispatch. Capture
+                // `bus.on` at registration time so subsequent reassignments
+                // of the `bus` global do not hijack the alias.
+                //
+                // Because `bus.on` is now an async function (it forwards
+                // handler bytecode to the handler Isle), `mesh.on` must be
+                // an async function too and `.call_async().await` the
+                // underlying `bus.on`.
+                let bus_tbl: LuaTable = lua.globals().get("bus")?;
+                let bus_on: LuaFunction = bus_tbl.get("on")?;
+                mesh_tbl.set(
+                    "on",
+                    lua.create_async_function(move |_, func: LuaFunction| {
+                        let bus_on = bus_on.clone();
+                        async move { bus_on.call_async::<()>(("mesh", func)).await }
+                    })?,
+                )?;
+            }
         }
     }
 
