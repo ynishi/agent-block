@@ -13,12 +13,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 use mlua_isle::AsyncIsle;
 use tracing::{info, info_span, warn};
 
 use crate::bridge;
+use crate::bus::{Event, EventBus};
 use crate::error::{BlockError, BlockResult};
 use crate::mcp_client::McpManager;
 
@@ -92,6 +93,21 @@ pub struct HostContext {
     pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the kv connection.
     pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
+    /// Async handle to the Isle Lua VM. `bridge::bus` calls
+    /// `isle.coroutine_call("__bus_dispatch", ...)` to invoke Lua handlers
+    /// from the EventBus dispatcher task.
+    pub isle: Arc<AsyncIsle>,
+    /// Ingress sender for the EventBus. Adapters (mesh / webhook / …)
+    /// clone this and push `Event`s. The ST3 mesh adapter captures its own
+    /// clone at `MeshAgent::connect` time, so the field itself is not read
+    /// elsewhere in the ST3 cut — kept `pub` for ST4+ adapter wiring.
+    #[allow(dead_code)]
+    pub bus_tx: mpsc::Sender<Event>,
+    /// Mutex-wrapped `Option<EventBus>` so `bus.on` / `bus.on_any` can lock
+    /// briefly from sync Lua context, and `bus.serve` can `Option::take`
+    /// ownership before entering the long-lived `run()` await (avoiding the
+    /// await-holding-lock anti-pattern on a `std::sync::Mutex`).
+    pub event_bus: Arc<Mutex<Option<EventBus>>>,
 }
 
 /// Open a SQLite connection at `path` (or `:memory:`) and apply the shared
@@ -153,13 +169,22 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // ── Init ──────────────────────────────────────────────────────
     let _init_guard = info_span!("init").entered();
 
+    // ── EventBus channel ─────────────────────────────────────────────
+    // Construct the bounded mpsc BEFORE MeshAgent::connect so the relay
+    // handler can hold a `bus_tx` clone and forward incoming requests
+    // into the dispatcher. Capacity is ENV-driven (see bridge::config).
+    let bus_capacity = crate::bridge::config::bus_capacity();
+    let (bus_tx, bus_rx) = mpsc::channel::<Event>(bus_capacity);
+    let event_bus = Arc::new(Mutex::new(Some(EventBus::new(bus_rx))));
+
     let mesh_agent = if let Some(ref relay_url) = config.relay_url {
         let keypair = agent_mesh_core::identity::AgentKeypair::generate();
         let acl = agent_mesh_core::acl::AclPolicy {
             default_deny: false,
             rules: vec![],
         };
-        let handler: Arc<dyn agent_mesh_sdk::RequestHandler> = Arc::new(NoopHandler);
+        let handler: Arc<dyn agent_mesh_sdk::RequestHandler> =
+            Arc::new(BusRelayHandler::new(bus_tx.clone()));
         let url = relay_url.clone();
         let agent = agent_mesh_sdk::MeshAgent::connect(keypair, &url, acl, handler)
             .await
@@ -192,37 +217,31 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let kv_path = crate::bridge::config::kv_path().map_err(BlockError::Runtime)?;
     let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
 
-    let ctx = HostContext {
-        project_root,
-        mesh_agent,
-        mcp_manager: Arc::clone(&mcp_manager),
-        http_client,
-        sql_conn,
-        sql_interrupt,
-        kv_conn,
-        kv_interrupt,
-    };
-
     let script_path = config.script_path.clone();
     let script_dir = script_path
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
 
+    // Precompute values captured by the init closure so we don't need to
+    // move the full `HostContext` into it (HostContext now holds
+    // `Arc<AsyncIsle>`, which is available only after `AsyncIsle::spawn`
+    // returns — classic chicken-and-egg). All bridge registrations run in a
+    // second pass via `isle.exec` below.
     let script_name_for_lua = script_name.clone();
+    let blocks_paths = build_blocks_path(&project_root);
+
     let (isle, driver) = AsyncIsle::spawn(move |lua| {
         // Set script name before registering bridges (used by log.* for attribution)
         lua.globals()
             .set("_SCRIPT_NAME", script_name_for_lua.as_str())?;
 
         mlua_batteries::register_all(lua, "std")?;
-        bridge::register_all(lua, &ctx)?;
 
         // ── package.path ──────────────────────────────────────────────
         // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
         let package: mlua::Table = lua.globals().get("package")?;
         let current_path: String = package.get("path")?;
-        let blocks_paths = build_blocks_path(&ctx.project_root);
         let new_path =
             format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
         package.set("path", new_path)?;
@@ -258,6 +277,36 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     .await
     .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
 
+    // ── HostContext + bridge registration ──────────────────────────────
+    // Wrap the isle in an Arc so `HostContext` can hand it to
+    // `bridge::bus` (which uses `AsyncIsle::coroutine_call` to invoke Lua
+    // handlers from the EventBus dispatcher task).
+    let isle = Arc::new(isle);
+    let ctx = HostContext {
+        project_root,
+        mesh_agent,
+        mcp_manager: Arc::clone(&mcp_manager),
+        http_client,
+        sql_conn,
+        sql_interrupt,
+        kv_conn,
+        kv_interrupt,
+        isle: Arc::clone(&isle),
+        bus_tx: bus_tx.clone(),
+        event_bus: Arc::clone(&event_bus),
+    };
+
+    {
+        let ctx = ctx.clone();
+        isle.exec(move |lua| {
+            bridge::register_all(lua, &ctx)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("bridge register failed: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .map_err(|e| BlockError::Runtime(format!("bridge register: {e}")))?;
+    }
+
     drop(_init_guard);
 
     // ── Execute ───────────────────────────────────────────────────
@@ -287,17 +336,75 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     Ok(())
 }
 
-/// No-op request handler (placeholder until mesh.on is implemented).
-struct NoopHandler;
+/// mesh → bus source adapter.
+///
+/// Implements [`agent_mesh_sdk::RequestHandler`] by packaging every incoming
+/// mesh request into an [`Event`] with `kind = "mesh"`, pushing it onto the
+/// bounded `bus_tx` channel, and awaiting the Lua handler's ack over a
+/// oneshot channel carried inside the event.
+///
+/// Error paths (all `tracing::error!`-logged — silent-err-drop policy):
+///
+/// | Failure                   | Return value                           |
+/// |---------------------------|----------------------------------------|
+/// | `bus_tx.send` closed/full | `{"error": "bus channel closed"}`      |
+/// | ack receiver dropped      | `{"error": "ack dropped"}`             |
+/// | Lua handler `BlockError`  | `{"error": "<handler error>"}`         |
+/// | Handler exceeded 30s      | `{"error": "handler timeout"}`         |
+///
+/// The 30s ack timeout mirrors the client-side timeout on `mesh.request`
+/// (see `src/bridge/mesh.rs`).
+struct BusRelayHandler {
+    tx: mpsc::Sender<Event>,
+}
+
+impl BusRelayHandler {
+    fn new(tx: mpsc::Sender<Event>) -> Self {
+        Self { tx }
+    }
+}
+
+/// Bound used for both the mesh-adapter ack wait and other source timeouts.
+const BUS_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait::async_trait]
-impl agent_mesh_sdk::RequestHandler for NoopHandler {
+impl agent_mesh_sdk::RequestHandler for BusRelayHandler {
     async fn handle(
         &self,
-        _from: &agent_mesh_core::identity::AgentId,
-        _payload: &serde_json::Value,
+        from: &agent_mesh_core::identity::AgentId,
+        payload: &serde_json::Value,
         _cancel: agent_mesh_sdk::CancelToken,
     ) -> serde_json::Value {
-        serde_json::json!({"error": "no handler registered"})
+        let id = uuid::Uuid::new_v4().to_string();
+        let meta = serde_json::json!({"from": from.to_string()});
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let event = Event {
+            kind: "mesh".into(),
+            id: id.clone(),
+            payload: payload.clone(),
+            meta,
+            ack_tx: Some(ack_tx),
+        };
+
+        if let Err(e) = self.tx.send(event).await {
+            tracing::error!(error = %e, id = %id, "bus channel closed; rejecting mesh request");
+            return serde_json::json!({"error": "bus channel closed"});
+        }
+
+        match tokio::time::timeout(BUS_ACK_TIMEOUT, ack_rx).await {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => {
+                tracing::error!(id = %id, error = %e, "mesh handler returned error");
+                serde_json::json!({"error": e.to_string()})
+            }
+            Ok(Err(e)) => {
+                tracing::error!(id = %id, error = %e, "mesh ack receiver dropped");
+                serde_json::json!({"error": "ack dropped"})
+            }
+            Err(_) => {
+                tracing::error!(id = %id, timeout_secs = BUS_ACK_TIMEOUT.as_secs(), "mesh handler timeout");
+                serde_json::json!({"error": "handler timeout"})
+            }
+        }
     }
 }

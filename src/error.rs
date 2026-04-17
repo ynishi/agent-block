@@ -26,9 +26,7 @@ pub enum BlockError {
     #[error("runtime error: {0}")]
     Runtime(String),
 
-    // Used by `crate::bus` (dispatcher + event). The surrounding `mod bus;`
-    // in main.rs carries `#[allow(dead_code)]` until Subtask 3 wires bus
-    // into HostContext + Lua bridge; the variant itself is not dead.
+    // Used by `crate::bus` (dispatcher + event) and `bridge::bus`.
     #[error("bus error: {0}")]
     Bus(String),
 }

@@ -28,7 +28,6 @@ use std::time::Duration;
 const DEFAULT_SQL_BUSY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_SQL_QUERY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_SQL_JOURNAL_MODE: &str = "WAL";
-#[allow(dead_code)] // consumed by src/bus/ wiring (follow-up subtask)
 const DEFAULT_BUS_CAPACITY: usize = 64;
 const DEFAULT_TASK_GRACE_MS: u64 = 1000;
 
@@ -98,7 +97,6 @@ pub fn sql_query_timeout() -> Option<Duration> {
 
 /// EventBus bounded mpsc capacity.
 /// `AGENT_BLOCK_BUS_CAPACITY` → 64. Parse failures warn and fall back.
-#[allow(dead_code)] // wired in follow-up subtask (Lua bridge + mesh adapter)
 pub fn bus_capacity() -> usize {
     match std::env::var("AGENT_BLOCK_BUS_CAPACITY") {
         Ok(v) => v.parse::<usize>().unwrap_or_else(|e| {

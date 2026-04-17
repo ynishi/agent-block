@@ -11,6 +11,7 @@
 //! | `http` | `http.*`     | Async HTTP client |
 //! | `log`  | `log.*`, `env.*` | Logging and environment access |
 
+pub mod bus;
 pub mod config;
 pub mod http;
 pub mod kv;
@@ -154,6 +155,9 @@ fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaRes
 /// (registered as `std.*` in host.rs). This function registers only
 /// agent-block-specific APIs.
 pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
+    // bus must register before mesh — the mesh.on alias (see
+    // bridge/mesh.rs) reads the `bus` global produced here.
+    bus::register(lua, ctx)?;
     mesh::register(lua, ctx)?;
     sh::register(lua, ctx)?;
     tool::register(lua)?;

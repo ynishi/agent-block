@@ -74,13 +74,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 lua.create_function(move |_, ()| Ok(agent_id_str.clone()))?,
             )?;
 
-            // TODO: mesh.on — register incoming request handler (Phase 2)
-            // Requires wiring Lua function into RequestHandler trait via Arc<Mutex<LuaFunction>>.
+            // mesh.on is now a thin alias over bus.on("mesh", fn). The
+            // EventBus (registered in bridge/bus.rs before this function
+            // runs) owns the actual dispatch. Capture `bus.on` at
+            // registration time so subsequent reassignments of the `bus`
+            // global do not hijack the alias.
+            let bus_tbl: LuaTable = lua.globals().get("bus")?;
+            let bus_on: LuaFunction = bus_tbl.get("on")?;
             mesh_tbl.set(
                 "on",
-                lua.create_function(|_, _: LuaFunction| {
-                    Err::<(), _>(LuaError::external("mesh.on not yet implemented (Phase 2)"))
-                })?,
+                lua.create_function(move |_, func: LuaFunction| bus_on.call::<()>(("mesh", func)))?,
             )?;
         }
     }

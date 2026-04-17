@@ -22,6 +22,11 @@ use crate::bus::event::Event;
 use crate::error::BlockError;
 
 /// A producer of [`Event`]s.
+///
+/// ST3 uses push-style ingress (`mpsc::Sender<Event>` cloned into each
+/// adapter) and does not exercise this trait. Retained for ST4+ adapters
+/// that prefer a pull interface.
+#[allow(dead_code)]
 #[async_trait]
 pub trait Source: Send + Sync {
     /// Canonical kind string used by this source (e.g. `"mesh"`).
