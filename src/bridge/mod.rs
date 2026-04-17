@@ -149,15 +149,12 @@ fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaRes
     }
 }
 
-/// Register all bridge APIs into the Lua state.
+/// Register bridge APIs shared between main VM and handler VM.
 ///
-/// Note: `fs`, `env`, `json`, `path`, `time` are provided by mlua-batteries
-/// (registered as `std.*` in host.rs). This function registers only
-/// agent-block-specific APIs.
-pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    // bus must register before mesh — the mesh.on alias (see
-    // bridge/mesh.rs) reads the `bus` global produced here.
-    bus::register(lua, ctx)?;
+/// Registers everything except `bus::*`.  Split out from `register_all` so
+/// the handler-side Isle can re-use the same set of bridges without
+/// installing the main-VM-only `bus` global.
+fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     mesh::register(lua, ctx)?;
     sh::register(lua, ctx)?;
     tool::register(lua)?;
@@ -169,4 +166,25 @@ pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     sql::register(lua, ctx)?;
     task::register(lua)?;
     Ok(())
+}
+
+/// Register all bridge APIs into the Lua state (main Isle).
+///
+/// Note: `fs`, `env`, `json`, `path`, `time` are provided by mlua-batteries
+/// (registered as `std.*` in host.rs). This function registers only
+/// agent-block-specific APIs.
+pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
+    // bus must register before mesh — the mesh.on alias (see
+    // bridge/mesh.rs) reads the `bus` global produced here.
+    bus::register(lua, ctx)?;
+    register_non_bus_bridges(lua, ctx)
+}
+
+/// Register bridge APIs for the handler Isle (no `bus::*`).
+///
+/// The handler Isle runs Lua handlers registered via `bus.on` / `bus.on_any`
+/// (installed on the main Isle) and does not expose `bus.*` itself — nested
+/// `bus.on(...)` from inside a handler is intentionally unsupported.
+pub fn register_all_handler_side(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
+    register_non_bus_bridges(lua, ctx)
 }
