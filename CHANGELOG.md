@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- EventBus infrastructure landing (Subtask 1 of 4) — pure-Rust core types for an upcoming reactive / long-running agent mode. New `src/bus/` module: `Event` struct (kind / id / payload / meta + `oneshot` ack sender), `Source` async trait, `EventBus` struct with a serial `run(shutdown: CancellationToken)` dispatcher loop that fans a single bounded-mpsc input out to kind-specific handlers (with an `on_any` fallback), `Handler` / `HandlerKey` trait placeholders, and `panic::catch_unwind` isolation so a faulting handler does not kill the loop. Added `BlockError::Bus(String)` variant for bus-local errors. The module is currently compiled under `#[allow(dead_code)]` in `src/main.rs` — nothing is reachable from Lua yet.
+- **Not user-visible in this release.** The Lua API (`bus.on` / `bus.on_any` / `bus.serve`) and the mesh source adapter are deferred to the follow-up subtasks (2: Cargo/main wiring + config helpers, 3: Lua bridge + mesh adapter, 4: acceptance tests). Expect no behavioural change for existing single-run scripts until those land.
+
 ## [0.5.1] - 2026-04-17
 
 ### Changed
