@@ -154,8 +154,12 @@ fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaRes
 /// Registers everything except `bus::*`.  Split out from `register_all` so
 /// the handler-side Isle can re-use the same set of bridges without
 /// installing the main-VM-only `bus` global.
-fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    mesh::register(lua, ctx)?;
+///
+/// `is_handler_side` is forwarded to `mesh::register` so the handler Isle
+/// can skip the `mesh.on` alias (which depends on `bus.on` and would fail
+/// because the handler Isle does not expose a `bus` global).
+fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResult<()> {
+    mesh::register(lua, ctx, is_handler_side)?;
     sh::register(lua, ctx)?;
     tool::register(lua)?;
     log::register(lua, ctx)?;
@@ -177,14 +181,19 @@ pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // bus must register before mesh — the mesh.on alias (see
     // bridge/mesh.rs) reads the `bus` global produced here.
     bus::register(lua, ctx)?;
-    register_non_bus_bridges(lua, ctx)
+    register_non_bus_bridges(lua, ctx, false)
 }
 
-/// Register bridge APIs for the handler Isle (no `bus::*`).
+/// Register bridge APIs for the handler Isle.
 ///
-/// The handler Isle runs Lua handlers registered via `bus.on` / `bus.on_any`
-/// (installed on the main Isle) and does not expose `bus.*` itself — nested
-/// `bus.on(...)` from inside a handler is intentionally unsupported.
+/// The handler Isle runs Lua handlers forwarded from the main Isle's
+/// `bus.on` / `bus.on_any` via bytecode transfer. It therefore needs the
+/// dispatcher-side globals (`__bus_handlers`, `__bus_on_any`,
+/// `__bus_dispatch`) installed by
+/// [`bus::install_bus_dispatcher_on_handler_isle`], but does **not** expose
+/// the `bus.*` Lua table — nested `bus.on(...)` from inside a handler is
+/// intentionally unsupported.
 pub fn register_all_handler_side(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    register_non_bus_bridges(lua, ctx)
+    bus::install_bus_dispatcher_on_handler_isle(lua)?;
+    register_non_bus_bridges(lua, ctx, true)
 }

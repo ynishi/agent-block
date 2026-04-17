@@ -96,20 +96,23 @@ pub struct HostContext {
     pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the kv connection.
     pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
-    /// Async handle to the Isle Lua VM. `bridge::bus` calls
-    /// `isle.coroutine_call("__bus_dispatch", ...)` to invoke Lua handlers
-    /// from the EventBus dispatcher task.
+    /// Async handle to the main Isle Lua VM that runs the user script via
+    /// `coroutine_eval`. After Subtask 2, `bridge::bus` no longer dispatches
+    /// handlers against this Isle; handlers live on `handler_isle` instead.
+    /// The field is retained because bridge code still keyed to the main
+    /// Isle (future `coroutine_call` back-edges, introspection APIs) may
+    /// need it, and removing it would force another HostContext reshape.
+    #[allow(dead_code)]
     pub isle: Arc<AsyncIsle>,
     /// Dedicated Isle for EventBus handler execution. Lua handlers
     /// registered via `bus.on` / `bus.on_any` run here so that CPU-bound
     /// handler code does not occupy the main Isle's LocalSet and block
     /// grace timers / shutdown wakers on the main VM side.
     ///
-    /// Subtask 1 wires this field; Subtask 2 will switch `bridge::bus`
-    /// to dispatch against `handler_isle` instead of `isle`. Until then
-    /// the field is held only to keep the Isle alive and drive shutdown
-    /// from `host::run`.
-    #[allow(dead_code)]
+    /// Used by `bridge::bus` to forward handler bytecode
+    /// (`Function::dump(true)` → `handler_isle.exec(...)`) and by
+    /// [`LuaHandler::call`](crate::bridge::bus) to dispatch via
+    /// `coroutine_call("__bus_dispatch", ...)`.
     pub handler_isle: Arc<AsyncIsle>,
     /// Ingress sender for the EventBus. Adapters (mesh / webhook / …)
     /// clone this and push `Event`s. The ST3 mesh adapter captures its own
