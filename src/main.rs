@@ -11,6 +11,11 @@ use crate::host::{run, BlockConfig};
 use crate::mcp_client::DEFAULT_RPC_TIMEOUT;
 
 mod bridge;
+// Subtask 1: module is defined but not yet consumed by `host` / `bridge`.
+// Subtask 3 wires `bus` into `HostContext` + Lua bridge and removes this
+// allow.
+#[allow(dead_code)]
+mod bus;
 mod error;
 mod host;
 mod mcp_client;
