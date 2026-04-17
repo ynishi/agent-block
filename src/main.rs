@@ -30,6 +30,11 @@ struct Cli {
     #[arg(short = 'r', long)]
     relay: Option<String>,
 
+    /// Ed25519 secret key (64 hex chars) for mesh identity. If omitted, a
+    /// random keypair is generated. Env: `AGENT_BLOCK_MESH_SECRET_KEY`.
+    #[arg(long, env = "AGENT_BLOCK_MESH_SECRET_KEY")]
+    secret_key: Option<String>,
+
     /// Project root directory
     #[arg(short = 'p', long, default_value = ".")]
     project: PathBuf,
@@ -42,6 +47,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23+ requires an explicit CryptoProvider install when multiple
+    // (or zero) backends are compiled in. tokio-tungstenite + reqwest pull
+    // rustls transitively; without this the first WSS connect panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -60,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         script_path: cli.script,
         project_root: cli.project,
         relay_url: cli.relay,
+        secret_key: cli.secret_key,
         mcp_rpc_timeout,
     };
 

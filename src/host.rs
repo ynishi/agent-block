@@ -69,6 +69,9 @@ pub struct BlockConfig {
     pub script_path: PathBuf,
     pub project_root: PathBuf,
     pub relay_url: Option<String>,
+    /// Ed25519 secret key (64 hex chars). If `None`, a random keypair is
+    /// generated. Required to talk to registry/ACL-gated hosted meshes.
+    pub secret_key: Option<String>,
     /// Per-RPC timeout for every MCP round-trip (connect / list / call).
     /// Defaults to [`crate::mcp_client::DEFAULT_RPC_TIMEOUT`].
     pub mcp_rpc_timeout: Duration,
@@ -146,6 +149,22 @@ fn open_sqlite(
     Ok((conn, interrupt))
 }
 
+fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", s.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = u8::from_str_radix(&s[2 * i..2 * i + 1], 16)
+            .map_err(|e| format!("invalid hex at position {}: {e}", 2 * i))?;
+        let lo = u8::from_str_radix(&s[2 * i + 1..2 * i + 2], 16)
+            .map_err(|e| format!("invalid hex at position {}: {e}", 2 * i + 1))?;
+        *byte = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
 pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let script_name = config
         .script_path
@@ -178,7 +197,15 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let event_bus = Arc::new(Mutex::new(Some(EventBus::new(bus_rx))));
 
     let mesh_agent = if let Some(ref relay_url) = config.relay_url {
-        let keypair = agent_mesh_core::identity::AgentKeypair::generate();
+        let keypair = match &config.secret_key {
+            Some(hex_str) => {
+                let bytes = hex_decode_32(hex_str)
+                    .map_err(|e| BlockError::Runtime(format!("--secret-key: {e}")))?;
+                agent_mesh_core::identity::AgentKeypair::from_bytes(&bytes)
+            }
+            None => agent_mesh_core::identity::AgentKeypair::generate(),
+        };
+        info!(agent_id = %keypair.agent_id(), "mesh identity");
         let acl = agent_mesh_core::acl::AclPolicy {
             default_deny: false,
             rules: vec![],
