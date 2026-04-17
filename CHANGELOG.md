@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-17
+
+### Changed
+
+- `std.task` / `std.sql` / `std.kv` Lua bridge implementation moved upstream to `mlua-batteries` 0.3 (`task` / `sql` / `kv` features). The `bridge/task` / `bridge/sql` / `bridge/kv` modules become thin adapters that translate `AGENT_BLOCK_TASK_DRIVER` / `AGENT_BLOCK_TASK_GRACE_MS` / `AGENT_BLOCK_SQL_*` env vars into `mlua_batteries::task::TaskConfig` / `mlua_batteries::sql::SqlConfig` and delegate to `register_with`. Lua tool helpers (`sql_tools.lua` / `kv_tools.lua`) stay host-side because they require the `tool` global. No behavioural change: all 35 e2e tests pass unchanged. Net diff: −1656 lines.
+
 ## [0.5.0] - 2026-04-16
 
 ### Added
