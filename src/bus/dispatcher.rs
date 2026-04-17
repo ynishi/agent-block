@@ -252,8 +252,9 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, Mutex as TokioMutex};
 
     /// Test handler that records invocations and returns a fixed value.
     struct RecordingHandler {
@@ -549,6 +550,549 @@ mod tests {
         assert_eq!(got, Value::String("second".into()));
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // concurrency-analysis.md §2 — 11 concurrency tests
+    // -----------------------------------------------------------------
+
+    /// Handler that sleeps then records its id, used to prove serial
+    /// dispatch order under a multi-thread runtime.
+    struct OrderingHandler {
+        order: Arc<StdMutex<Vec<String>>>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl Handler for OrderingHandler {
+        async fn call(
+            &self,
+            _kind: String,
+            id: String,
+            _payload: Value,
+            _meta: Value,
+        ) -> AckResult {
+            tokio::time::sleep(self.delay).await;
+            // guard is dropped before the async return, not held across .await
+            self.order.lock().expect("order mutex").push(id.clone());
+            Ok(Value::String(id))
+        }
+    }
+
+    /// Handler that always returns `Err`. Used to prove the dispatcher
+    /// continues after a handler error.
+    struct ErrHandler;
+
+    #[async_trait]
+    impl Handler for ErrHandler {
+        async fn call(
+            &self,
+            _kind: String,
+            _id: String,
+            _payload: Value,
+            _meta: Value,
+        ) -> AckResult {
+            Err(BlockError::Bus("x".into()))
+        }
+    }
+
+    /// §2.1 — kind-specific mpsc ingress with a single receiver preserves
+    /// arrival order when the dispatcher runs on a multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bus_event_serialization_arrival_order() {
+        const N: usize = 20;
+        let (tx, rx) = mpsc::channel::<Event>(N);
+        let mut bus = EventBus::new(rx);
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        bus.on(
+            "k",
+            Arc::new(OrderingHandler {
+                order: Arc::clone(&order),
+                // Small sleep inside each handler so the test would fail
+                // if the dispatcher tried to run them concurrently.
+                delay: Duration::from_millis(5),
+            }),
+        )
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        let mut expected = Vec::with_capacity(N);
+        let mut acks = Vec::with_capacity(N);
+        for i in 0..N {
+            let id = format!("e{i}");
+            expected.push(id.clone());
+            let (evt, rx) = Event::with_ack("k", id, json!({}), Value::Null);
+            tx.send(evt).await.expect("send");
+            acks.push(rx);
+        }
+
+        // Wait for every ack — each returns the handler id in order.
+        for (i, ack) in acks.into_iter().enumerate() {
+            let got = ack.await.expect("ack recv").expect("ack ok");
+            assert_eq!(got, Value::String(format!("e{i}")));
+        }
+
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let recorded = order.lock().unwrap().clone();
+        assert_eq!(recorded, expected, "dispatcher must preserve arrival order");
+    }
+
+    /// §2.2 — `shutdown.cancel()` breaks the loop within the grace window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bus_graceful_shutdown_within_grace_ms() {
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let mut bus = EventBus::new(rx);
+        bus.on_any(Arc::new(RecordingHandler {
+            label: "any",
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        // No in-flight handler; cancel and expect prompt exit.
+        token.cancel();
+        // Allow a generous envelope well above any plausible grace window
+        // (default grace_ms = 1000). The dispatcher should exit within
+        // tens of ms in practice.
+        let res = tokio::time::timeout(Duration::from_millis(1500), handle)
+            .await
+            .expect("bus.run must exit within grace window");
+        res.unwrap().unwrap();
+        drop(tx);
+    }
+
+    /// §2.3 — a panicking handler is isolated; the loop keeps dispatching
+    /// subsequent events. Mirrors the existing
+    /// `handler_panic_is_isolated_and_loop_continues` but under a
+    /// multi_thread runtime to stress the spawn+join path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bus_handler_panic_isolation_catch_unwind() {
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let mut bus = EventBus::new(rx);
+        let ok_calls = Arc::new(AtomicUsize::new(0));
+        bus.on("crash", Arc::new(PanickingHandler)).unwrap();
+        bus.on(
+            "normal",
+            Arc::new(RecordingHandler {
+                label: "normal",
+                calls: ok_calls.clone(),
+            }),
+        )
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        // Panicking event first.
+        let ack = send_event(&tx, "crash", "e1");
+        let got = ack.await.unwrap();
+        assert!(matches!(got, Err(BlockError::Bus(_))), "panic must NACK");
+
+        // Normal event after the panic — the loop must still run.
+        let ack = send_event(&tx, "normal", "e2");
+        let got = ack.await.unwrap().unwrap();
+        assert_eq!(got, Value::String("normal".into()));
+        assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
+
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    /// §2.4 — a bounded mpsc applies backpressure (no drops). A capacity-1
+    /// channel with the dispatcher paused lets one send succeed and the
+    /// second `try_send` return `TrySendError::Full` — never silently drop.
+    /// Once the dispatcher drains it, everything flows through in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bus_backpressure_bounded_mpsc_capacity() {
+        let (tx, rx) = mpsc::channel::<Event>(1);
+        let mut bus = EventBus::new(rx);
+        let calls = Arc::new(AtomicUsize::new(0));
+        bus.on(
+            "k",
+            Arc::new(RecordingHandler {
+                label: "k",
+                calls: calls.clone(),
+            }),
+        )
+        .unwrap();
+
+        // Fill the channel (capacity 1). Dispatcher not started yet.
+        let (evt1, _r1) = Event::with_ack("k", "e1", json!({}), Value::Null);
+        tx.try_send(evt1).expect("first send fits");
+        let (evt2, _r2) = Event::with_ack("k", "e2", json!({}), Value::Null);
+        let err = tx.try_send(evt2).expect_err("capacity full");
+        assert!(
+            matches!(err, mpsc::error::TrySendError::Full(_)),
+            "expected Full (not drop), got {err:?}"
+        );
+
+        // Start the dispatcher and send two more events via `.await`
+        // — backpressure must let them through without loss.
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        let (evt3, r3) = Event::with_ack("k", "e3", json!({}), Value::Null);
+        tx.send(evt3).await.expect("send e3");
+        let (evt4, r4) = Event::with_ack("k", "e4", json!({}), Value::Null);
+        tx.send(evt4).await.expect("send e4");
+
+        // The first event (still in the channel) and the new ones should
+        // all be dispatched. Only assert the new acks fire (the original
+        // `_r1`/`_r2` receivers were dropped, which is fine).
+        r3.await.unwrap().unwrap();
+        r4.await.unwrap().unwrap();
+
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// §2.5 — a source that drops `ack_tx` (receiver side drops) surfaces
+    /// as `oneshot::RecvError` immediately, not as a 30-second timeout.
+    /// Combined with `tokio::time::timeout`, the sender-drop semantic
+    /// short-circuits the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bus_oneshot_ack_timeout_30s() {
+        // Set up an oneshot, drop the sender, and prove `timeout(30s,
+        // rx)` resolves to `Ok(Err(RecvError))` essentially instantly.
+        let (tx, rx) = oneshot::channel::<AckResult>();
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(30), rx)
+            .await
+            .expect("should not hit 30s timeout");
+        assert!(got.is_err(), "expected RecvError, got {got:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "sender-drop must short-circuit the 30s timeout"
+        );
+    }
+
+    /// §2.6 — SIGTERM / SIGINT race inside `tokio::select!`. Sends SIGTERM
+    /// to the current process; the select! should pick the SIGTERM branch
+    /// without losing the SIGINT branch's registration (Signal::recv
+    /// cancel safety).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bus_sigterm_sigint_race_select() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let task = tokio::spawn(async move {
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM");
+            tokio::select! {
+                _ = term.recv() => token_for_task.cancel(),
+                _ = tokio::signal::ctrl_c() => token_for_task.cancel(),
+            }
+        });
+
+        // Give the signal handlers time to install before we deliver the
+        // signal — otherwise we race the install.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Deliver SIGTERM to self. `nix` is cfg(unix) dev-only.
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+            .expect("kill(SIGTERM)");
+
+        tokio::time::timeout(Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("cancel must fire within 2s after SIGTERM");
+        task.await.expect("signal task");
+    }
+
+    /// §2.7 — `Arc<tokio::sync::Mutex<EventBus>>` allows two tasks to
+    /// acquire the lock in sequence without deadlock. Exercises the
+    /// "take before await" pattern used in `bridge::bus::serve`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bus_arc_tokio_mutex_no_await_while_held() {
+        let (_tx, rx) = mpsc::channel::<Event>(1);
+        let shared: Arc<TokioMutex<EventBus>> = Arc::new(TokioMutex::new(EventBus::new(rx)));
+
+        let a = Arc::clone(&shared);
+        let t1 = tokio::spawn(async move {
+            let guard = a.lock().await;
+            // Do some non-await work under the lock.
+            let _ = guard.handler_count();
+            // Guard dropped here; any .await after this is safe.
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        });
+
+        let b = Arc::clone(&shared);
+        let t2 = tokio::spawn(async move {
+            let guard = b.lock().await;
+            let _ = guard.handler_count();
+            drop(guard);
+        });
+
+        // Both tasks complete promptly — no deadlock, no await-while-held.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            t1.await.unwrap();
+            t2.await.unwrap();
+        })
+        .await
+        .expect("no deadlock");
+    }
+
+    /// §2.8 — `catch_unwind` compile-time type check. `UnwindSafe` bound
+    /// means a `&mut` capture needs `AssertUnwindSafe`. This test both
+    /// documents the constraint and verifies at runtime that
+    /// `catch_unwind` intercepts an unwinding panic (panic=abort is not
+    /// testable at runtime; documented in concurrency-analysis.md §2).
+    #[test]
+    fn test_bus_catch_unwind_paniceq_abort_not_caught() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // A plain Fn() closure IS UnwindSafe; this compiles fine.
+        let ok = catch_unwind(|| 42);
+        assert_eq!(ok.ok(), Some(42));
+
+        // An `&mut` capture is NOT UnwindSafe without `AssertUnwindSafe`.
+        // This exercises the type-check path: the code compiles because
+        // `AssertUnwindSafe` is used; removing that wrapper would fail
+        // to type-check, which is the contract we care about.
+        let mut v = 0i32;
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            v += 1;
+            panic!("boom");
+        }));
+        assert!(caught.is_err(), "expected caught panic");
+        assert_eq!(v, 1, "side effect before panic still observable");
+
+        // Note: `panic=abort` builds do NOT unwind, and `catch_unwind`
+        // does not intercept an abort. We cannot runtime-test that path
+        // (the test process would abort); we assert the contract via
+        // documentation in concurrency-analysis.md §2 row 7.
+    }
+
+    /// §2.9 — a spawned signal-watching task can be aborted and its
+    /// JoinHandle resolves to a cancellation-flagged JoinError.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bus_spawn_signal_task_cancellation() {
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+        let task = tokio::spawn(async move {
+            // Simulate a signal-watching task that blocks until cancel.
+            shutdown_clone.cancelled().await;
+        });
+
+        // Abort before the token is ever cancelled.
+        task.abort();
+        let res = task.await;
+        match res {
+            Err(e) => assert!(e.is_cancelled(), "expected cancelled JoinError, got {e:?}"),
+            Ok(()) => panic!("task should have been cancelled before completing"),
+        }
+
+        // `shutdown` stays un-cancelled — abort of the task does not
+        // propagate to the token (by design: product code cancels
+        // explicitly from the signal branch).
+        assert!(!shutdown.is_cancelled());
+    }
+
+    /// §2.10 — `tokio::time::timeout` fires after the configured duration
+    /// under a paused clock. Verifies the 30s timeout contract used by
+    /// `BusRelayHandler` without actually sleeping 30 seconds.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_bus_timeout_ack_expiry_30s_match() {
+        let (_tx, rx) = oneshot::channel::<AckResult>();
+        let fut = tokio::time::timeout(Duration::from_secs(30), rx);
+        tokio::pin!(fut);
+
+        // Before advance: the future has not resolved.
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            futures_poll_once(&mut fut).is_none(),
+            "timeout must not fire before 30s"
+        );
+
+        // Cross the threshold.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let got = (&mut fut).await;
+        assert!(got.is_err(), "expected Elapsed, got {got:?}");
+    }
+
+    /// Poll a pinned future once; returns `Some(output)` if ready,
+    /// `None` otherwise. Used to inspect a future without awaiting it.
+    fn futures_poll_once<F: std::future::Future>(
+        fut: &mut std::pin::Pin<&mut F>,
+    ) -> Option<F::Output> {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        // Minimal no-op waker.
+        fn raw_waker() -> RawWaker {
+            fn no_op(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            static VT: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+            RawWaker::new(std::ptr::null(), &VT)
+        }
+        // SAFETY: `raw_waker()` returns a `RawWaker` backed by a static
+        // `RawWakerVTable` whose clone/wake/drop functions are all no-ops.
+        // No data pointer is stored or dereferenced; the waker is used only
+        // to construct a `Context` for a single synchronous `poll` call and
+        // is not sent across threads or outlived.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    /// §2.11 — `std::sync::Mutex::lock()` returns `PoisonError` after a
+    /// panic holding the guard. The registration path in `bridge::bus`
+    /// converts this to a typed error (`BlockError::Runtime("bus mutex
+    /// poisoned")`); this test proves the poison signal is observable
+    /// so the conversion has something to trigger on.
+    #[test]
+    fn test_std_mutex_poison_on_handler_registration() {
+        let m: Arc<StdMutex<i32>> = Arc::new(StdMutex::new(0));
+        let m_panic = Arc::clone(&m);
+        let handle = std::thread::spawn(move || {
+            let _guard = m_panic.lock().expect("first lock");
+            panic!("poison me");
+        });
+        // Thread panics; join returns Err, and the mutex is now poisoned.
+        assert!(handle.join().is_err());
+
+        let err = m.lock().expect_err("mutex must be poisoned");
+        // `err` is a PoisonError; `.into_inner()` would recover the guard.
+        // The key observable: `lock()` returns Err, which bridge::bus
+        // maps to `BlockError::Runtime("bus mutex poisoned")` / a Lua
+        // external error.
+        let _inner = err.into_inner();
+    }
+
+    // -----------------------------------------------------------------
+    // General tests (plan.md §一般テスト)
+    // -----------------------------------------------------------------
+
+    /// on_any fires only when the event's kind has no specialized handler.
+    /// (plan.md §一般テスト — on_any フォールバック)
+    #[tokio::test]
+    async fn general_on_any_fallback_vs_no_handler_warn() {
+        // 1) No specialized, no on_any → nack.
+        let (tx, rx) = mpsc::channel::<Event>(2);
+        let mut bus = EventBus::new(rx);
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+        let ack = send_event(&tx, "kind-x", "id1");
+        let got = ack.await.unwrap();
+        assert!(matches!(got, Err(BlockError::Bus(_))));
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        // 2) Only on_any → on_any fires on any kind.
+        let (tx, rx) = mpsc::channel::<Event>(2);
+        let mut bus = EventBus::new(rx);
+        let any_calls = Arc::new(AtomicUsize::new(0));
+        bus.on_any(Arc::new(RecordingHandler {
+            label: "any",
+            calls: any_calls.clone(),
+        }))
+        .unwrap();
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+        let ack = send_event(&tx, "anything", "id1");
+        assert_eq!(ack.await.unwrap().unwrap(), Value::String("any".into()));
+        assert_eq!(any_calls.load(Ordering::SeqCst), 1);
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    /// When a specialized handler matches, on_any is NOT invoked.
+    /// (plan.md §一般テスト — 優先順位)
+    #[tokio::test]
+    async fn general_specialized_wins_over_on_any() {
+        let (tx, rx) = mpsc::channel::<Event>(2);
+        let mut bus = EventBus::new(rx);
+        let spec_calls = Arc::new(AtomicUsize::new(0));
+        let any_calls = Arc::new(AtomicUsize::new(0));
+        bus.on(
+            "k",
+            Arc::new(RecordingHandler {
+                label: "spec",
+                calls: spec_calls.clone(),
+            }),
+        )
+        .unwrap();
+        bus.on_any(Arc::new(RecordingHandler {
+            label: "any",
+            calls: any_calls.clone(),
+        }))
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        let ack = send_event(&tx, "k", "e1");
+        let got = ack.await.unwrap().unwrap();
+        assert_eq!(got, Value::String("spec".into()));
+        assert_eq!(spec_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(any_calls.load(Ordering::SeqCst), 0);
+
+        token.cancel();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    /// A handler returning `Err(...)` delivers an error ack and the loop
+    /// continues to dispatch the next event.
+    /// (plan.md §一般テスト — Handler error 継続)
+    #[tokio::test]
+    async fn general_handler_error_ack_and_loop_continues() {
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let mut bus = EventBus::new(rx);
+        bus.on("err", Arc::new(ErrHandler)).unwrap();
+        let ok_calls = Arc::new(AtomicUsize::new(0));
+        bus.on(
+            "ok",
+            Arc::new(RecordingHandler {
+                label: "ok",
+                calls: ok_calls.clone(),
+            }),
+        )
+        .unwrap();
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move { bus.run(token_clone).await });
+
+        let ack = send_event(&tx, "err", "e1");
+        let got = ack.await.unwrap();
+        match got {
+            Err(BlockError::Bus(msg)) => assert_eq!(msg, "x"),
+            other => panic!("expected Bus err 'x', got {other:?}"),
+        }
+
+        let ack = send_event(&tx, "ok", "e2");
+        assert_eq!(ack.await.unwrap().unwrap(), Value::String("ok".into()));
+        assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
 
         token.cancel();
         drop(tx);

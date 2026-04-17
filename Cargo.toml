@@ -59,3 +59,10 @@ tempfile = "3"
 # Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
 rmcp = { version = "1.4.0", features = ["server"] }
+# `test-util` enables `tokio::time::pause`/`advance`/`resume` and the
+# `start_paused` flavor used by concurrency tests in `src/bus/dispatcher.rs`.
+tokio = { version = "1", features = ["full", "test-util"] }
+# SIGTERM / SIGINT delivery for EventBus e2e tests (tests/e2e_bus.rs).
+# `signal` for `kill(2)` + Signal enum, `process` for `Pid::from_raw`.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }

@@ -36,6 +36,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mlua::prelude::*;
@@ -44,7 +45,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{json_to_lua, lua_to_json};
-use crate::bus::{AckResult, Handler};
+use crate::bus::{AckResult, EventBus, Handler};
 use crate::error::BlockError;
 use crate::host::HostContext;
 
@@ -244,7 +245,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 }
 
                 // Take the EventBus out of the mutex BEFORE any await.
-                let mut bus = {
+                let bus = {
                     let mut guard = event_bus
                         .lock()
                         .map_err(|_| LuaError::external("bus mutex poisoned"))?;
@@ -269,9 +270,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 // to Ctrl+C only.
                 let signal_task = spawn_signal_task(shutdown.clone());
 
-                // Drive the dispatcher loop. This is the long-lived await
-                // point; the std Mutex is NOT held across it.
-                let run_result = bus.run(shutdown.clone()).await;
+                // Grace window: once `shutdown` has been cancelled, the
+                // dispatcher loop is expected to exit promptly after the
+                // current in-flight handler finishes. We cap this wait at
+                // `AGENT_BLOCK_TASK_GRACE_MS` so a misbehaving handler can
+                // never block process exit indefinitely.
+                let grace_ms = crate::bridge::config::task_grace_ms();
+                let run_result =
+                    run_with_grace(bus, shutdown.clone(), Duration::from_millis(grace_ms)).await;
 
                 // Best-effort cleanup of the signal task. If `shutdown`
                 // was cancelled via the signal branch, the task has
@@ -361,6 +367,44 @@ fn install_lua_dispatcher(lua: &Lua) -> LuaResult<()> {
     )?;
     lua.globals().set(BUS_DISPATCH_FN, dispatch)?;
     Ok(())
+}
+
+/// Drive the dispatcher loop with a bounded grace window.
+///
+/// Under normal operation `bus.run(shutdown)` returns as soon as `shutdown`
+/// is cancelled (after the current in-flight handler finishes, see
+/// `bus::dispatcher`). `run_with_grace` adds a hard cap on how long we wait
+/// after the cancel signal: once `shutdown.cancelled()` fires, the
+/// dispatcher has at most `grace` to finish. A misbehaving handler that
+/// refuses to yield cannot block process exit indefinitely.
+///
+/// `grace` comes from `AGENT_BLOCK_TASK_GRACE_MS` (default 1000ms, see
+/// `bridge::config::task_grace_ms`).
+async fn run_with_grace(
+    mut bus: EventBus,
+    shutdown: CancellationToken,
+    grace: Duration,
+) -> Result<(), BlockError> {
+    let run_fut = bus.run(shutdown.clone());
+    tokio::pin!(run_fut);
+    tokio::select! {
+        res = &mut run_fut => res,
+        _ = shutdown.cancelled() => {
+            // Shutdown fired first; the dispatcher is either about to
+            // break out of `select!` in `bus.run`, or it is still inside
+            // a handler's await. Bound the remaining wait by `grace`.
+            match tokio::time::timeout(grace, &mut run_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(
+                        grace_ms = grace.as_millis() as u64,
+                        "bus.serve: grace window exceeded; forcing exit"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 /// Spawn a task that cancels `shutdown` on SIGTERM or Ctrl+C.
