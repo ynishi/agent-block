@@ -10,24 +10,27 @@
 -- not be polled and the process waited for the handler to finish (~10s).
 -- After the split, the handler runs on a dedicated OS thread so the main
 -- runtime stays responsive and exits within ~grace + overhead.
+--
+-- IMPORTANT — upvalue-free handler:
+-- bus.on serializes the handler closure via Function::dump(true) and
+-- reloads it on the handler Isle VM. Lua bytecode transfer re-binds only
+-- the _ENV upvalue (globals); every other upvalue becomes nil on the new
+-- VM. The busy-wait is therefore inlined inside the closure body — if we
+-- referenced a file-scope `local function block_sync` it would be nil on
+-- the Isle, the handler would crash on the first call, and this whole
+-- grace-window test would silently false-positive.
 
 local my_id = mesh.agent_id()
 log.info("receiver agent_id=" .. my_id)
 
--- Synchronous busy-wait using os.clock() to avoid coroutine yield.
--- os.clock() returns CPU time, so this spins the CPU, which is the
--- pathological case the grace window is designed to bound.
-local function block_sync(seconds)
-    local deadline = os.time() + seconds
-    while os.time() < deadline do
-        -- tight spin; intentional to simulate a misbehaving handler
-        for _ = 1, 1000000 do end
-    end
-end
-
 bus.on("mesh", function(ev)
     log.info("handler START id=" .. tostring(ev.id))
-    block_sync(10)
+    -- Inline CPU-bound busy-wait. `os` is a Lua global (accessed via
+    -- _ENV), so it survives bytecode transfer. No user-defined upvalues.
+    local deadline = os.time() + 10
+    while os.time() < deadline do
+        for _ = 1, 1000000 do end
+    end
     log.info("handler END id=" .. tostring(ev.id))
     return { ok = true }
 end)

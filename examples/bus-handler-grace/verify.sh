@@ -125,6 +125,16 @@ echo "grace_ms:     $GRACE_MS"
 echo "threshold_ms: 3000"
 
 # 8. Assertions.
+#
+# A naive check on "handler START" + elapsed < threshold is NOT enough: a
+# handler that crashes immediately after logging START (e.g. due to a lost
+# upvalue after bytecode transfer to the Isle) would pass in ~100ms and
+# hide the real grace-window behaviour. We therefore also require:
+#   - no "Lua dispatch failed" line in the log (handler did not crash)
+#   - no "handler END" before SIGTERM (handler was genuinely in-flight
+#     when the signal arrived, so the grace window is what bounded exit)
+#   - elapsed >= grace_ms (if it's lower, the handler never actually held
+#     execution for the grace window — another false-positive signature)
 FAIL=0
 if [ "$EXIT" -ne 0 ]; then
     echo "FAIL: exit code $EXIT (expected 0)" >&2
@@ -132,6 +142,22 @@ if [ "$EXIT" -ne 0 ]; then
 fi
 if [ "$ELAPSED_MS" -ge 3000 ]; then
     echo "FAIL: elapsed ${ELAPSED_MS}ms >= 3000ms threshold" >&2
+    FAIL=1
+fi
+if grep -q "Lua dispatch failed" "$LOG"; then
+    echo "FAIL: handler crashed (Lua dispatch failed in log) — grace window was never tested" >&2
+    FAIL=1
+fi
+if grep -q "handler END" "$LOG"; then
+    echo "FAIL: handler END appeared in log — handler completed before SIGTERM, grace window was never tested" >&2
+    FAIL=1
+fi
+# Lower bound: if elapsed is well below grace_ms, the handler was not
+# actually blocking — shutdown returned immediately, which means nothing
+# was being bounded.
+LOWER_BOUND=$(( GRACE_MS / 2 ))
+if [ "$ELAPSED_MS" -lt "$LOWER_BOUND" ]; then
+    echo "FAIL: elapsed ${ELAPSED_MS}ms < ${LOWER_BOUND}ms (half of grace_ms=${GRACE_MS}) — handler likely never ran" >&2
     FAIL=1
 fi
 

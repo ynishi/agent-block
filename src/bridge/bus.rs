@@ -63,11 +63,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mlua::prelude::*;
-use mlua_isle::{AsyncIsle, IsleError};
+use mlua_isle::{AsyncIsle, CancelToken, IsleError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::{json_to_lua, lua_to_json};
 use crate::bus::{AckResult, EventBus, Handler};
 use crate::error::BlockError;
 use crate::host::HostContext;
@@ -115,18 +114,33 @@ impl Handler for LuaHandler {
         })?;
 
         let args: [&str; 4] = [&kind, &id, &payload_str, &meta_str];
-        let result_str = self
-            .isle
-            .coroutine_call(BUS_DISPATCH_FN, &args)
-            .await
-            .map_err(|e| {
-                tracing::error!(%kind, %id, error = %e, "bus: Lua dispatch failed");
-                match e {
-                    IsleError::Cancelled => BlockError::Bus("handler cancelled".into()),
-                    IsleError::Shutdown => BlockError::Bus("isle shut down".into()),
-                    other => BlockError::Bus(format!("isle error: {other}")),
-                }
-            })?;
+        // Spawn the coroutine call as an AsyncTask so we retain a cancel
+        // handle. If this future is dropped (e.g. `run_with_grace` timed
+        // out and is dropping the dispatcher chain), the Drop guard fires
+        // the cancel token, which the Isle's debug hook picks up at the
+        // next HOOK_INTERVAL. Without this guard the Isle thread would
+        // run the Lua handler to completion — defeating the grace window
+        // (see Bug A in workspace/tasks/bus-isle-handler/scratch/).
+        let task = self.isle.spawn_coroutine_call(BUS_DISPATCH_FN, &args);
+        struct CancelOnDrop(CancelToken);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let guard = CancelOnDrop(task.cancel_token().clone());
+        let result_str = task.await.map_err(|e| {
+            tracing::error!(%kind, %id, error = %e, "bus: Lua dispatch failed");
+            match e {
+                IsleError::Cancelled => BlockError::Bus("handler cancelled".into()),
+                IsleError::Shutdown => BlockError::Bus("isle shut down".into()),
+                other => BlockError::Bus(format!("isle error: {other}")),
+            }
+        })?;
+        // Normal completion: the coroutine already finished, so cancelling
+        // is a no-op but sends a spurious signal to the next caller if the
+        // CancelToken is later reused. Forget the guard to skip cancel.
+        std::mem::forget(guard);
 
         // Empty string ≈ Lua nil (see `lua_value_to_string` in mlua-isle).
         if result_str.is_empty() {
@@ -470,58 +484,51 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 pub(crate) fn install_bus_dispatcher_on_handler_isle(lua: &Lua) -> LuaResult<()> {
     lua.globals().set(BUS_HANDLERS_TBL, lua.create_table()?)?;
     lua.globals().set(BUS_ON_ANY_GLOBAL, LuaValue::Nil)?;
-    let dispatch = lua.create_function(
-        |lua, (kind, id, payload_json, meta_json): (String, String, String, String)| {
-            // Resolve handler via __bus_handlers[kind], falling back to
-            // __bus_on_any. Mirrors EventBus::dispatch on the Rust side.
-            let handlers: LuaTable = lua.globals().get(BUS_HANDLERS_TBL)?;
-            let handler: LuaValue = handlers.get(kind.as_str())?;
-            let handler: LuaFunction = match handler {
-                LuaValue::Function(f) => f,
-                _ => {
-                    let any: LuaValue = lua.globals().get(BUS_ON_ANY_GLOBAL)?;
-                    match any {
-                        LuaValue::Function(f) => f,
-                        _ => {
-                            // No handler at all — shouldn't happen because
-                            // the Rust EventBus also checks, but return an
-                            // explicit error so the ack surfaces the issue.
-                            return Err(LuaError::external(format!(
-                                "no Lua handler for kind `{kind}`"
-                            )));
-                        }
-                    }
-                }
-            };
 
-            // Decode payload / meta JSON strings into Lua values.
-            let payload_val: Value = serde_json::from_str(&payload_json)
-                .map_err(|e| LuaError::external(format!("payload decode: {e}")))?;
-            let meta_val: Value = serde_json::from_str(&meta_json)
-                .map_err(|e| LuaError::external(format!("meta decode: {e}")))?;
-            let payload_lua = json_to_lua(lua, payload_val)?;
-            let meta_lua = json_to_lua(lua, meta_val)?;
-
-            // Build the event table the Lua handler sees.
-            let ev_tbl = lua.create_table()?;
-            ev_tbl.set("kind", kind.as_str())?;
-            ev_tbl.set("id", id.as_str())?;
-            ev_tbl.set("payload", payload_lua)?;
-            ev_tbl.set("meta", meta_lua)?;
-
-            // Invoke. The handler may yield (e.g. call `mesh.request`)
-            // because __bus_dispatch is reached via `coroutine_call`, so
-            // the entire call chain is already inside a Lua coroutine.
-            let ret: LuaValue = handler.call(ev_tbl)?;
-
-            // Convert the return value back to a JSON string. `LuaHandler`
-            // on the Rust side parses it.
-            let ret_json = lua_to_json(lua, ret)?;
-            let s = serde_json::to_string(&ret_json)
-                .map_err(|e| LuaError::external(format!("return encode: {e}")))?;
-            Ok(s)
-        },
-    )?;
+    // __bus_dispatch must be a pure-Lua function (not a Rust C function).
+    // The Isle invokes it via `coroutine_call`, which wraps it in a Lua
+    // thread. The user handler inside is expected to be able to yield
+    // (e.g. await `sh.exec`, `http.get`, `mesh.request`). If __bus_dispatch
+    // were a `create_function` C closure, the yield inside the handler
+    // would cross the C-call boundary and Lua would raise
+    // "attempt to yield across a C-call boundary" immediately, making
+    // every async bridge unusable from bus handlers. Writing the
+    // dispatcher in Lua removes that boundary: yields from the user
+    // handler propagate up through pure Lua frames into the enclosing
+    // coroutine managed by the Isle.
+    //
+    // JSON encode/decode relies on `std.json` from `mlua-batteries`,
+    // registered in `build_isle_init` (host.rs) on both the main Isle
+    // and the handler Isle.
+    let src = r#"
+        local BUS_HANDLERS_TBL = "__bus_handlers"
+        local BUS_ON_ANY_GLOBAL = "__bus_on_any"
+        return function(kind, id, payload_json, meta_json)
+            local handlers = _G[BUS_HANDLERS_TBL]
+            local h = handlers and handlers[kind]
+            if type(h) ~= "function" then
+                h = _G[BUS_ON_ANY_GLOBAL]
+            end
+            if type(h) ~= "function" then
+                error("no Lua handler for kind `" .. tostring(kind) .. "`")
+            end
+            local ev = {
+                kind = kind,
+                id = id,
+                payload = std.json.decode(payload_json),
+                meta = std.json.decode(meta_json),
+            }
+            local ret = h(ev)
+            if ret == nil then
+                return ""
+            end
+            return std.json.encode(ret)
+        end
+    "#;
+    let dispatch: LuaFunction = lua
+        .load(src)
+        .set_name("@agent_block:__bus_dispatch")
+        .eval()?;
     lua.globals().set(BUS_DISPATCH_FN, dispatch)?;
     Ok(())
 }
