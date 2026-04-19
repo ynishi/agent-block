@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-19
+
 ### Added
 
 - `blocks/agent` ReAct loop now enables Anthropic server-side context editing by default (`clear_tool_uses_20250919`, beta header `context-management-2025-06-27`). Default config: `trigger = 80_000` input tokens, `keep = 3` most-recent tool uses, `clear_at_least = 10_000` input tokens. Rationale: prior behaviour hit the model input-tokens ceiling and the ReAct loop stopped with a plain API error; with rolling tool-use eviction the loop continues past the trigger threshold. Works on Claude Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5 per Anthropic's context-management docs.
