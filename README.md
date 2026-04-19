@@ -113,8 +113,24 @@ local result = agent.run({
     mcp_servers = {                                     -- optional MCP servers to connect
         { name = "outline", command = "outline-mcp", args = {} },
     },
+    -- Anthropic server-side context editing (default ON). Pass `false` to opt out,
+    -- or pass a table to override the default config keys individually.
+    context_management        = true,                   -- default true; false disables beta header + body
+    context_management_config = {                       -- default: trigger 80K, keep 3, clear_at_least 10K
+        type = "clear_tool_uses_20250919",
+        triggers       = { { type = "input_tokens", value = 80000 } },
+        keep           = { type = "tool_uses",     value = 3 },
+        clear_at_least = { type = "input_tokens",  value = 10000 },
+    },
     on_turn = function(info)                            -- optional per-turn callback
         print("turn", info.turn_number, "#tools", #info.tool_calls)
+        -- info.context_management is present only on turns where the server fired
+        -- an edit; nil-guard before indexing applied_edits.
+        if info.context_management and info.context_management.applied_edits then
+            for _, edit in ipairs(info.context_management.applied_edits) do
+                print("  edit:", edit.type, "cleared", edit.cleared_tool_uses, "tool_uses")
+            end
+        end
     end,
     extra_tools = {},                                   -- optional extra Anthropic tool defs
 })
@@ -132,6 +148,8 @@ Key behaviours:
 - MCP tool names are namespaced as `server_name__tool_name` to avoid collisions.
 - Tool dispatch: MCP tools via `mcp.call()`, registered Lua tools via `tool.call()`.
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
+- Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { ... }` to override individual fields.
+- `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
 - The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
 
 ### log.*
