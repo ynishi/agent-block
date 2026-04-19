@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `blocks/agent` ReAct loop now enables Anthropic server-side context editing by default (`clear_tool_uses_20250919`, beta header `context-management-2025-06-27`). Default config: `trigger = 80_000` input tokens, `keep = 3` most-recent tool uses, `clear_at_least = 10_000` input tokens. Rationale: prior behaviour hit the model input-tokens ceiling and the ReAct loop stopped with a plain API error; with rolling tool-use eviction the loop continues past the trigger threshold. Works on Claude Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5 per Anthropic's context-management docs.
+- `agent.run()` gains two additive opts for controlling the above:
+  - `context_management` (bool, default on) — pass `false` to opt out completely (no beta header and no `body.context_management` is sent).
+  - `context_management_config` (table) — overrides any subset of the default config; shape matches the Anthropic request body (`type`, `triggers`, `keep`, `clear_at_least`, `exclude_tools`). Missing keys fall through to the default.
+- `on_turn` callback payload gains an additive `context_management` key that forwards `response.context_management` from the Anthropic API (shape: `{ applied_edits = { { type = "clear_tool_uses_20250919", cleared_tool_uses = N, cleared_input_tokens = N }, ... } }`). When the server did not fire any edit on a given turn the key is absent; callbacks should nil-guard before indexing `applied_edits`. Existing callbacks that ignore unknown keys are unaffected.
+
 ## [0.6.0] - 2026-04-18
 
 ### Added

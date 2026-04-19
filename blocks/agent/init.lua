@@ -13,6 +13,11 @@
 --       mcp_servers = { { name = "outline", command = "outline-mcp", args = {} } },
 --       on_turn = function(turn_info) end,
 --       extra_tools = {},
+--       -- Anthropic server-side context editing (default ON).
+--       -- Set to false to opt out entirely (no beta header, no body field).
+--       context_management = true,
+--       -- Optional override for the default edits table (clear_tool_uses_20250919).
+--       context_management_config = { edits = { ... } },
 --   })
 --
 -- result: { ok, content, usage, num_turns, error, messages }
@@ -22,8 +27,31 @@
 --     called inside isle.coroutine_eval() or equivalent async context.
 --   - tool.call() is sync. tool.schema() is sync.
 --   - NEVER throws. All errors returned as { ok=false, error=... }.
+--   - on_turn payload keys: turn_number, content, tool_calls, usage,
+--     context_management (additive; absent when the server reports no edits
+--     this turn, i.e. response.context_management is nil).
 
 local M = {}
+
+-- ============================================================
+-- Default context management config (Anthropic server-side
+-- rolling history via clear_tool_uses_20250919).
+-- Trigger at 80K input_tokens, keep last 3 tool_uses,
+-- clear at least 10K input_tokens worth.
+-- Opt-out via opts.context_management = false.
+-- Override via opts.context_management_config = { ... }.
+-- ============================================================
+
+local DEFAULT_CONTEXT_MANAGEMENT = {
+    edits = {
+        {
+            type = "clear_tool_uses_20250919",
+            trigger = { type = "input_tokens", value = 80000 },
+            keep   = { type = "tool_uses",    value = 3 },
+            clear_at_least = { type = "input_tokens", value = 10000 },
+        },
+    },
+}
 
 -- ============================================================
 -- Internal: LLM API call (Anthropic Messages API)
@@ -31,7 +59,10 @@ local M = {}
 
 --- Call Anthropic Messages API via http.request.
 --- @param messages table  Messages array
---- @param opts table      Options: system, model, max_tokens, tools, timeout
+--- @param opts table      Options: system, model, max_tokens, tools, timeout,
+---                        context_management (table|nil — table enables the
+---                        context-management beta header and body field; nil
+---                        means opt-out, no header and no body field).
 --- @return table|nil      Parsed response JSON on success, nil on error
 --- @return string|nil     Error string on failure
 local function llm_call(messages, opts)
@@ -54,13 +85,23 @@ local function llm_call(messages, opts)
         body.tools = opts.tools
     end
 
+    local headers = {
+        ["x-api-key"] = api_key,
+        ["anthropic-version"] = "2023-06-01",
+        ["content-type"] = "application/json",
+    }
+
+    -- Anthropic context-management (beta): add header + body only when enabled.
+    -- call_opts normalization in M.run() makes opts.context_management either
+    -- nil (opt-out) or a table (enabled: default or user-provided override).
+    if opts.context_management ~= nil then
+        headers["anthropic-beta"] = "context-management-2025-06-27"
+        body.context_management = opts.context_management
+    end
+
     local resp = http.request("https://api.anthropic.com/v1/messages", {
         method = "POST",
-        headers = {
-            ["x-api-key"] = api_key,
-            ["anthropic-version"] = "2023-06-01",
-            ["content-type"] = "application/json",
-        },
+        headers = headers,
         body = std.json.encode(body),
         timeout = opts.timeout or 120,
     })
@@ -294,8 +335,19 @@ end
 ---   max_iterations  (optional) Max tool-use loop iterations (default: 20)
 ---   max_tokens_budget (optional) Total token budget across all iterations (default: nil = unlimited)
 ---   mcp_servers     (optional) Array of { name, command, args? }
----   on_turn         (optional) Callback function(turn_info)
+---   on_turn         (optional) Callback function(turn_info). turn_info has
+---                   keys: turn_number, content, tool_calls, usage, and
+---                   context_management (passed through from the Anthropic
+---                   response; absent when no edits fired this turn).
 ---   extra_tools     (optional) Extra Anthropic tool definitions to include
+---   context_management        (optional, default true) When false, opt out of
+---                   Anthropic server-side context editing entirely (no beta
+---                   header, no body field). Any non-false value (nil, true,
+---                   table) keeps it enabled.
+---   context_management_config (optional) Full override table passed as
+---                   body.context_management. Defaults to DEFAULT_CONTEXT_MANAGEMENT
+---                   (clear_tool_uses_20250919 with 80K/keep=3/clear>=10K).
+---                   Ignored when context_management == false.
 --- }
 ---
 --- @return table  {
@@ -342,6 +394,17 @@ function M.run(opts)
     -- Build unified tools array
     local tools = build_tools(mcp_tool_map, opts.extra_tools)
 
+    -- Normalize context_management opts once:
+    --   opts.context_management == false                   → cm_final = nil (opt-out)
+    --   opts.context_management_config = { ... } (or nil)  → cm_final = override or DEFAULT
+    -- Strict equality (~= false) is used so nil (unset) is treated as default-on.
+    local cm_final
+    if opts.context_management == false then
+        cm_final = nil
+    else
+        cm_final = opts.context_management_config or DEFAULT_CONTEXT_MANAGEMENT
+    end
+
     -- Build call options for llm_call
     local call_opts = {
         model = opts.model,
@@ -349,6 +412,7 @@ function M.run(opts)
         timeout = opts.timeout or 120,
         system = opts.system,
         tools = tools,
+        context_management = cm_final,  -- nil = opt-out, table = enabled
     }
 
     -- Initialize message history
@@ -401,6 +465,11 @@ function M.run(opts)
                     content = response.content,
                     tool_calls = tool_calls,
                     usage = response.usage,
+                    -- Pass-through of Anthropic response.context_management.
+                    -- When the server didn't apply any edits this turn the
+                    -- field is nil and Lua removes the key from the payload,
+                    -- preserving the historical 4-key shape for existing callbacks.
+                    context_management = response.context_management,
                 })
                 if not cb_ok then
                     log.warn("agent: on_turn callback error: " .. tostring(cb_err))
