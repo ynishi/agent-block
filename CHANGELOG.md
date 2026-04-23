@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works out of the box in agent scripts, including `lshape.luacats` codegen.
 - New E2E coverage `tests/e2e_lshape.rs` + fixture `tests/fixtures/lshape_require.lua`
   to verify the vendored module loads and basic schema + LuaCATS paths execute.
+- Trace context design docs and rollout checklist:
+  - `docs/architecture/trace-context.md`
+  - `docs/runbooks/trace-rollout-checklist.md`
 
 ## [0.7.1] - 2026-04-23
 
