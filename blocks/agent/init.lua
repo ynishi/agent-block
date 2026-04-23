@@ -111,7 +111,8 @@ local function llm_dump(mode, msg)
     end
 end
 
-local LLM_DUMP_PREFIX = "ab.llm"
+local LLM_DUMP_PREFIX = "ab.obs"
+local LLM_DUMP_LEGACY_PREFIX = "ab.llm"
 
 local function kv_escape(v)
     if v == nil then return "nil" end
@@ -139,11 +140,22 @@ local function llm_dump_event(mode, event_name, fields)
     local pairs = {
         { "prefix", LLM_DUMP_PREFIX },
         { "event", event_name },
+        { "component", "llm" },
     }
     for _, f in ipairs(fields or {}) do
         table.insert(pairs, f)
     end
     llm_dump(mode, format_kv(pairs))
+
+    -- Backward-compatible legacy line for existing log consumers.
+    local legacy_pairs = {
+        { "prefix", LLM_DUMP_LEGACY_PREFIX },
+        { "event", event_name },
+    }
+    for _, f in ipairs(fields or {}) do
+        table.insert(legacy_pairs, f)
+    end
+    llm_dump(mode, format_kv(legacy_pairs))
 end
 
 -- Build fixed-order external metadata fields for dump logs.
@@ -261,9 +273,9 @@ local function llm_call(messages, opts, trace)
         { "turn", turn },
         { "iter", iteration },
         { "trace_id", trace and trace.trace_id or nil },
+        { "run_id", trace and trace.run_id or nil },
         { "agent_id", trace and trace.agent_id or nil },
         { "agent_name", trace and trace.agent_name or nil },
-        { "run_id", trace and trace.run_id or nil },
         { "model", body.model },
         { "messages", #messages },
         { "tools", #(body.tools or {}) },
@@ -300,9 +312,9 @@ local function llm_call(messages, opts, trace)
         { "turn", turn },
         { "iter", iteration },
         { "trace_id", trace and trace.trace_id or nil },
+        { "run_id", trace and trace.run_id or nil },
         { "agent_id", trace and trace.agent_id or nil },
         { "agent_name", trace and trace.agent_name or nil },
-        { "run_id", trace and trace.run_id or nil },
         { "status", resp.status },
         { "latency_ms", elapsed_ms },
     })
@@ -345,9 +357,9 @@ local function llm_call(messages, opts, trace)
             { "turn", turn },
             { "iter", iteration },
             { "trace_id", trace and trace.trace_id or nil },
+            { "run_id", trace and trace.run_id or nil },
             { "agent_id", trace and trace.agent_id or nil },
             { "agent_name", trace and trace.agent_name or nil },
-            { "run_id", trace and trace.run_id or nil },
             { "stop_reason", stop_reason },
             { "blocks", content_blocks },
             { "tool_uses", tool_uses },

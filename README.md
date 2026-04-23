@@ -160,7 +160,7 @@ Key behaviours:
   - when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
   - `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
   - request auth headers (`x-api-key` / `authorization`) are always redacted in dump logs
-  - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.llm`)
+  - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.obs component=llm`); legacy `prefix=ab.llm` lines are also emitted for compatibility
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
 
