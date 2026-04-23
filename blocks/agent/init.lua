@@ -112,7 +112,6 @@ local function llm_dump(mode, msg)
 end
 
 local LLM_DUMP_PREFIX = "ab.obs"
-local LLM_DUMP_LEGACY_PREFIX = "ab.llm"
 
 local function kv_escape(v)
     if v == nil then return "nil" end
@@ -146,16 +145,6 @@ local function llm_dump_event(mode, event_name, fields)
         table.insert(pairs, f)
     end
     llm_dump(mode, format_kv(pairs))
-
-    -- Backward-compatible legacy line for existing log consumers.
-    local legacy_pairs = {
-        { "prefix", LLM_DUMP_LEGACY_PREFIX },
-        { "event", event_name },
-    }
-    for _, f in ipairs(fields or {}) do
-        table.insert(legacy_pairs, f)
-    end
-    llm_dump(mode, format_kv(legacy_pairs))
 end
 
 -- Build fixed-order external metadata fields for dump logs.

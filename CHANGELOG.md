@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - LLM structured dump lines now emit unified `ab.obs component=llm` entries.
-  Legacy `prefix=ab.llm` lines are still emitted for compatibility with
-  existing log consumers.
+
+### Breaking Changes
+
+- BREAKING(obs): remove `ab.llm` legacy log line; all LLM traces now emit as `ab.obs component=llm`. The legacy line was introduced just before v0.1 and is superseded before external consumers could depend on it.
 
 ## [0.7.1] - 2026-04-23
 
