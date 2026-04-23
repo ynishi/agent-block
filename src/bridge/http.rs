@@ -31,6 +31,10 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let http_tbl = lua.create_table()?;
 
+    let script_name: String = lua
+        .globals()
+        .get::<Option<String>>("_SCRIPT_NAME")?
+        .unwrap_or_else(|| "unknown".to_string());
     let client = ctx.http_client.clone();
     let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
     http_tbl.set(
@@ -38,6 +42,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         lua.create_async_function(move |lua, (url, opts): (String, Option<LuaTable>)| {
             let client = client.clone();
             let fallback_agent_id = fallback_agent_id.clone();
+            let script_name = script_name.clone();
             async move {
                 // ── Parse options ─────────────────────────────────
                 let method = opts
@@ -115,6 +120,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 }
 
                 // ── Send (yields here) ────────────────────────────
+                tracing::info!(
+                    target: "lua",
+                    script = %script_name,
+                    "{}",
+                    obs_line(
+                        "http_request",
+                        &obs_context(fallback_agent_id.as_deref()),
+                        &[("method", method.as_str()), ("url", url.as_str())],
+                    )
+                );
                 let resp = req.send().await.map_err(|e| {
                     if e.is_timeout() {
                         LuaError::external(format!("http timeout after {timeout_secs}s: {e}"))
@@ -126,6 +141,17 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 })?;
 
                 let status = resp.status().as_u16();
+                let status_s = status.to_string();
+                tracing::info!(
+                    target: "lua",
+                    script = %script_name,
+                    "{}",
+                    obs_line(
+                        "http_response",
+                        &obs_context(fallback_agent_id.as_deref()),
+                        &[("method", method.as_str()), ("url", url.as_str()), ("status", status_s.as_str())],
+                    )
+                );
 
                 let resp_headers = lua.create_table()?;
                 for (k, v) in resp.headers() {
@@ -170,6 +196,44 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
     lua.globals().set("http", http_tbl)?;
     Ok(())
+}
+
+fn obs_context(fallback_agent_id: Option<&str>) -> (String, String, String, String) {
+    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
+    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
+    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| fallback_agent_id.map(ToString::to_string))
+        .unwrap_or_default();
+    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
+    (trace_id, run_id, agent_id, agent_name)
+}
+
+fn obs_line(event: &str, ctx: &(String, String, String, String), extra: &[(&str, &str)]) -> String {
+    let mut parts = vec![
+        "prefix=ab.obs".to_string(),
+        format!("event={}", event),
+        "component=http".to_string(),
+        format!("trace_id={}", kv_escape(&ctx.0)),
+        format!("run_id={}", kv_escape(&ctx.1)),
+        format!("agent_id={}", kv_escape(&ctx.2)),
+        format!("agent_name={}", kv_escape(&ctx.3)),
+    ];
+    for (k, v) in extra {
+        parts.push(format!("{}={}", k, kv_escape(v)));
+    }
+    parts.join(" ")
+}
+
+fn kv_escape(v: &str) -> String {
+    if v.is_empty() {
+        "\"\"".to_string()
+    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
+        serde_json::Value::String(v.to_string()).to_string()
+    } else {
+        v.to_string()
+    }
 }
 
 /// Read SSE stream and dispatch `data:` lines to the Lua callback.

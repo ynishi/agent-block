@@ -23,6 +23,10 @@ use super::{json_to_lua, lua_to_json};
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let manager = &ctx.mcp_manager;
     let mcp_tbl = lua.create_table()?;
+    let script_name: String = lua
+        .globals()
+        .get::<Option<String>>("_SCRIPT_NAME")?
+        .unwrap_or_else(|| "unknown".to_string());
     let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
 
     // mcp.connect(name, command, args)
@@ -98,12 +102,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     {
         let mgr = Arc::clone(manager);
         let fallback_agent_id = fallback_agent_id.clone();
+        let script_name = script_name.clone();
         mcp_tbl.set(
             "call",
             lua.create_async_function(
                 move |lua, (name, tool_name, arguments): (String, String, Option<LuaValue>)| {
                     let mgr = Arc::clone(&mgr);
                     let fallback_agent_id = fallback_agent_id.clone();
+                    let script_name = script_name.clone();
                     async move {
                         // None → Null (mcp_client treats Null as "no arguments").
                         let mut args_json = match arguments {
@@ -111,6 +117,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             None => serde_json::Value::Null,
                         };
                         inject_obs_context(&mut args_json, fallback_agent_id.as_deref());
+                        tracing::info!(
+                            target: "lua",
+                            script = %script_name,
+                            "{}",
+                            obs_line(
+                                "mcp_call",
+                                &obs_context(fallback_agent_id.as_deref()),
+                                &[("server", name.as_str()), ("tool", tool_name.as_str())],
+                            )
+                        );
 
                         let result = mgr
                             .read()
@@ -121,6 +137,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                         let tbl = lua.create_table()?;
                         match result {
                             Ok(val) => {
+                                tracing::info!(
+                                    target: "lua",
+                                    script = %script_name,
+                                    "{}",
+                                    obs_line(
+                                        "mcp_result",
+                                        &obs_context(fallback_agent_id.as_deref()),
+                                        &[("server", name.as_str()), ("tool", tool_name.as_str()), ("ok", "true")],
+                                    )
+                                );
                                 tbl.set("ok", true)?;
                                 let content = val
                                     .get("content")
@@ -137,6 +163,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                 }
                             }
                             Err(e) => {
+                                tracing::warn!(
+                                    target: "lua",
+                                    script = %script_name,
+                                    "{}",
+                                    obs_line(
+                                        "mcp_result",
+                                        &obs_context(fallback_agent_id.as_deref()),
+                                        &[("server", name.as_str()), ("tool", tool_name.as_str()), ("ok", "false")],
+                                    )
+                                );
                                 tbl.set("ok", false)?;
                                 tbl.set("error", e.to_string())?;
                             }
@@ -213,5 +249,43 @@ fn inject_obs_context(args_json: &mut serde_json::Value, fallback_agent_id: Opti
             }
         }
         _ => {}
+    }
+}
+
+fn obs_context(fallback_agent_id: Option<&str>) -> (String, String, String, String) {
+    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
+    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
+    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| fallback_agent_id.map(ToString::to_string))
+        .unwrap_or_default();
+    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
+    (trace_id, run_id, agent_id, agent_name)
+}
+
+fn obs_line(event: &str, ctx: &(String, String, String, String), extra: &[(&str, &str)]) -> String {
+    let mut parts = vec![
+        "prefix=ab.obs".to_string(),
+        format!("event={}", event),
+        "component=mcp".to_string(),
+        format!("trace_id={}", kv_escape(&ctx.0)),
+        format!("run_id={}", kv_escape(&ctx.1)),
+        format!("agent_id={}", kv_escape(&ctx.2)),
+        format!("agent_name={}", kv_escape(&ctx.3)),
+    ];
+    for (k, v) in extra {
+        parts.push(format!("{}={}", k, kv_escape(v)));
+    }
+    parts.join(" ")
+}
+
+fn kv_escape(v: &str) -> String {
+    if v.is_empty() {
+        "\"\"".to_string()
+    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
+        serde_json::Value::String(v.to_string()).to_string()
+    } else {
+        v.to_string()
     }
 }
