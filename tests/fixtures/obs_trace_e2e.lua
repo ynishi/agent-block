@@ -25,3 +25,23 @@ if mcp_res.ok then
 else
     print("mcp_error_ok")
 end
+
+-- Tool: trigger tool_register + tool_call + tool_result logs.
+tool.register("obs_echo", {
+    description = "echo tool for obs e2e",
+    input_schema = {
+        type = "object",
+        properties = {
+            message = { type = "string" },
+        },
+    },
+}, function(input)
+    return input.message
+end)
+
+local echoed = tool.call("obs_echo", { message = "ok" })
+if echoed == "ok" then
+    print("tool_ok")
+else
+    print("tool_unexpected")
+end

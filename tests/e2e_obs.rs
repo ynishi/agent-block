@@ -14,6 +14,7 @@ fn obs_trace_is_consistent_across_http_and_mcp() {
         .success()
         .stdout(predicate::str::contains("http_error_ok"))
         .stdout(predicate::str::contains("mcp_error_ok"))
+        .stdout(predicate::str::contains("tool_ok"))
         .stdout(predicate::str::contains(
             "prefix=ab.obs event=http_request component=http trace_id=e2e-trace-obs-01",
         ))
@@ -22,5 +23,14 @@ fn obs_trace_is_consistent_across_http_and_mcp() {
         ))
         .stdout(predicate::str::contains(
             "prefix=ab.obs event=mcp_result component=mcp trace_id=e2e-trace-obs-01",
+        ))
+        .stdout(predicate::str::contains(
+            "prefix=ab.obs event=tool_register component=tool trace_id=e2e-trace-obs-01",
+        ))
+        .stdout(predicate::str::contains(
+            "prefix=ab.obs event=tool_call component=tool trace_id=e2e-trace-obs-01",
+        ))
+        .stdout(predicate::str::contains(
+            "prefix=ab.obs event=tool_result component=tool trace_id=e2e-trace-obs-01",
         ));
 }

@@ -7,6 +7,11 @@ use mlua::prelude::*;
 /// Tool registry is maintained in Lua globals (_TOOL_REGISTRY table).
 /// Rust provides thin helpers: register/call/list/schema.
 pub fn register(lua: &Lua) -> LuaResult<()> {
+    let script_name: String = lua
+        .globals()
+        .get::<Option<String>>("_SCRIPT_NAME")?
+        .unwrap_or_else(|| "unknown".to_string());
+
     // Initialize registry in Lua globals
     let registry = lua.create_table()?;
     lua.globals().set("_TOOL_REGISTRY", registry)?;
@@ -14,16 +19,23 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     let tool_tbl = lua.create_table()?;
 
     // tool.register(name, schema, handler_fn)
+    let script_name_register = script_name.clone();
     tool_tbl.set(
         "register",
         lua.create_function(
-            |lua, (name, schema, handler): (String, LuaValue, LuaFunction)| {
+            move |lua, (name, schema, handler): (String, LuaValue, LuaFunction)| {
                 let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
                 let entry = lua.create_table()?;
                 entry.set("name", name.clone())?;
                 entry.set("schema", schema)?;
                 entry.set("handler", handler)?;
-                registry.set(name, entry)?;
+                registry.set(name.clone(), entry)?;
+                tracing::info!(
+                    target: "lua",
+                    script = %script_name_register,
+                    "{}",
+                    obs_line("tool_register", &[("tool", name.as_str())]),
+                );
                 Ok(())
             },
         )?,
@@ -34,18 +46,55 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     // Async so that handlers may invoke async stdlib functions (e.g.
     // `std.sql.query`, `http.request`, `mcp.call`) via coroutine yield.
     // Purely synchronous handlers still work unchanged.
+    let script_name_call = script_name.clone();
     tool_tbl.set(
         "call",
-        lua.create_async_function(|lua, (name, input): (String, LuaValue)| async move {
+        lua.create_async_function(move |lua, (name, input): (String, LuaValue)| {
+            let script_name = script_name_call.clone();
+            async move {
+                tracing::info!(
+                    target: "lua",
+                    script = %script_name,
+                    "{}",
+                    obs_line("tool_call", &[("tool", name.as_str())]),
+                );
             let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
             let entry: Option<LuaTable> = registry.get(name.clone())?;
             match entry {
-                None => Err(LuaError::external(format!("tool not found: {name}"))),
+                None => {
+                    tracing::warn!(
+                        target: "lua",
+                        script = %script_name,
+                        "{}",
+                        obs_line("tool_result", &[("tool", name.as_str()), ("ok", "false")]),
+                    );
+                    Err(LuaError::external(format!("tool not found: {name}")))
+                }
                 Some(e) => {
                     let handler: LuaFunction = e.get("handler")?;
-                    handler.call_async::<LuaValue>(input).await
+                    match handler.call_async::<LuaValue>(input).await {
+                        Ok(v) => {
+                            tracing::info!(
+                                target: "lua",
+                                script = %script_name,
+                                "{}",
+                                obs_line("tool_result", &[("tool", name.as_str()), ("ok", "true")]),
+                            );
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "lua",
+                                script = %script_name,
+                                "{}",
+                                obs_line("tool_result", &[("tool", name.as_str()), ("ok", "false")]),
+                            );
+                            Err(e)
+                        }
+                    }
                 }
             }
+        }
         })?,
     )?;
 
@@ -93,4 +142,39 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
 
     lua.globals().set("tool", tool_tbl)?;
     Ok(())
+}
+
+fn obs_line(event: &str, extra: &[(&str, &str)]) -> String {
+    let (trace_id, run_id, agent_id, agent_name) = obs_context();
+    let mut parts = vec![
+        "prefix=ab.obs".to_string(),
+        format!("event={}", event),
+        "component=tool".to_string(),
+        format!("trace_id={}", kv_escape(&trace_id)),
+        format!("run_id={}", kv_escape(&run_id)),
+        format!("agent_id={}", kv_escape(&agent_id)),
+        format!("agent_name={}", kv_escape(&agent_name)),
+    ];
+    for (k, v) in extra {
+        parts.push(format!("{}={}", k, kv_escape(v)));
+    }
+    parts.join(" ")
+}
+
+fn obs_context() -> (String, String, String, String) {
+    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
+    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
+    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID").unwrap_or_default();
+    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
+    (trace_id, run_id, agent_id, agent_name)
+}
+
+fn kv_escape(v: &str) -> String {
+    if v.is_empty() {
+        "\"\"".to_string()
+    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
+        serde_json::Value::String(v.to_string()).to_string()
+    } else {
+        v.to_string()
+    }
 }
