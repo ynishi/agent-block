@@ -13,15 +13,17 @@
 //!   internally over a channel-based peer.
 
 use mlua::prelude::*;
+use serde_json::Map;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::mcp_client::McpManager;
+use crate::host::HostContext;
 
 use super::{json_to_lua, lua_to_json};
 
-pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
+pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
+    let manager = &ctx.mcp_manager;
     let mcp_tbl = lua.create_table()?;
+    let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
 
     // mcp.connect(name, command, args)
     {
@@ -95,17 +97,20 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
     // so tool-execution errors reach the LLM unchanged (MCP spec intent).
     {
         let mgr = Arc::clone(manager);
+        let fallback_agent_id = fallback_agent_id.clone();
         mcp_tbl.set(
             "call",
             lua.create_async_function(
                 move |lua, (name, tool_name, arguments): (String, String, Option<LuaValue>)| {
                     let mgr = Arc::clone(&mgr);
+                    let fallback_agent_id = fallback_agent_id.clone();
                     async move {
                         // None → Null (mcp_client treats Null as "no arguments").
-                        let args_json = match arguments {
+                        let mut args_json = match arguments {
                             Some(v) => lua_to_json(&lua, v)?,
                             None => serde_json::Value::Null,
                         };
+                        inject_obs_context(&mut args_json, fallback_agent_id.as_deref());
 
                         let result = mgr
                             .read()
@@ -163,4 +168,50 @@ pub fn register(lua: &Lua, manager: &Arc<RwLock<McpManager>>) -> LuaResult<()> {
 
     lua.globals().set("mcp", mcp_tbl)?;
     Ok(())
+}
+
+fn inject_obs_context(args_json: &mut serde_json::Value, fallback_agent_id: Option<&str>) {
+    fn insert_obs(into: &mut Map<String, serde_json::Value>, fallback_agent_id: Option<&str>) {
+        if into.contains_key("__ab_obs") {
+            return;
+        }
+        let mut obs = Map::<String, serde_json::Value>::new();
+        if let Ok(v) = std::env::var("AGENT_BLOCK_TRACE_ID") {
+            if !v.is_empty() {
+                obs.insert("trace_id".to_string(), serde_json::Value::String(v));
+            }
+        }
+        if let Ok(v) = std::env::var("AGENT_BLOCK_RUN_ID") {
+            if !v.is_empty() {
+                obs.insert("run_id".to_string(), serde_json::Value::String(v));
+            }
+        }
+        let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| fallback_agent_id.map(ToString::to_string));
+        if let Some(v) = agent_id {
+            obs.insert("agent_id".to_string(), serde_json::Value::String(v));
+        }
+        if let Ok(v) = std::env::var("AGENT_BLOCK_AGENT_NAME") {
+            if !v.is_empty() {
+                obs.insert("agent_name".to_string(), serde_json::Value::String(v));
+            }
+        }
+        if !obs.is_empty() {
+            into.insert("__ab_obs".to_string(), serde_json::Value::Object(obs));
+        }
+    }
+
+    match args_json {
+        serde_json::Value::Object(obj) => insert_obs(obj, fallback_agent_id),
+        serde_json::Value::Null => {
+            let mut obj = Map::<String, serde_json::Value>::new();
+            insert_obs(&mut obj, fallback_agent_id);
+            if !obj.is_empty() {
+                *args_json = serde_json::Value::Object(obj);
+            }
+        }
+        _ => {}
+    }
 }

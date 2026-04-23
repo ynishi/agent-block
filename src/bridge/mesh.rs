@@ -4,6 +4,7 @@
 //! Lua coroutines yield while waiting for mesh I/O.
 
 use mlua::prelude::*;
+use serde_json::Map;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,7 +56,8 @@ pub fn register(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResul
                         let agent = Arc::clone(&agent_send);
                         async move {
                             use crate::bridge::lua_to_json;
-                            let payload_json = lua_to_json(&lua, payload)?;
+                            let mut payload_json = lua_to_json(&lua, payload)?;
+                            inject_obs_context(&mut payload_json, Some(agent.agent_id().to_string()));
                             let target = agent_mesh_core::identity::AgentId::from_raw(agent_id_str);
                             agent
                                 .request(&target, payload_json, Duration::from_secs(10))
@@ -75,7 +77,8 @@ pub fn register(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResul
                         let agent = Arc::clone(&agent_req);
                         async move {
                             use crate::bridge::{json_to_lua, lua_to_json};
-                            let payload_json = lua_to_json(&lua, payload)?;
+                            let mut payload_json = lua_to_json(&lua, payload)?;
+                            inject_obs_context(&mut payload_json, Some(agent.agent_id().to_string()));
                             let target = agent_mesh_core::identity::AgentId::from_raw(agent_id_str);
                             let resp = agent
                                 .request(&target, payload_json, Duration::from_secs(30))
@@ -119,4 +122,39 @@ pub fn register(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResul
 
     lua.globals().set("mesh", mesh_tbl)?;
     Ok(())
+}
+
+fn inject_obs_context(payload_json: &mut serde_json::Value, fallback_agent_id: Option<String>) {
+    let serde_json::Value::Object(obj) = payload_json else {
+        return;
+    };
+    if obj.contains_key("__ab_obs") {
+        return;
+    }
+    let mut obs = Map::<String, serde_json::Value>::new();
+    if let Ok(v) = std::env::var("AGENT_BLOCK_TRACE_ID") {
+        if !v.is_empty() {
+            obs.insert("trace_id".to_string(), serde_json::Value::String(v));
+        }
+    }
+    if let Ok(v) = std::env::var("AGENT_BLOCK_RUN_ID") {
+        if !v.is_empty() {
+            obs.insert("run_id".to_string(), serde_json::Value::String(v));
+        }
+    }
+    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(fallback_agent_id);
+    if let Some(v) = agent_id {
+        obs.insert("agent_id".to_string(), serde_json::Value::String(v));
+    }
+    if let Ok(v) = std::env::var("AGENT_BLOCK_AGENT_NAME") {
+        if !v.is_empty() {
+            obs.insert("agent_name".to_string(), serde_json::Value::String(v));
+        }
+    }
+    if !obs.is_empty() {
+        obj.insert("__ab_obs".to_string(), serde_json::Value::Object(obs));
+    }
 }

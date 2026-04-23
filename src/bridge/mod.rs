@@ -163,7 +163,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     sh::register(lua, ctx)?;
     tool::register(lua)?;
     log::register(lua, ctx)?;
-    mcp::register(lua, &ctx.mcp_manager)?;
+    mcp::register(lua, ctx)?;
     http::register(lua, ctx)?;
     llm::register(lua)?;
     kv::register(lua, ctx)?;

@@ -17,6 +17,7 @@
 //! separately before production use.
 
 use mlua::prelude::*;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::host::HostContext;
@@ -31,10 +32,12 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let http_tbl = lua.create_table()?;
 
     let client = ctx.http_client.clone();
+    let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
     http_tbl.set(
         "request",
         lua.create_async_function(move |lua, (url, opts): (String, Option<LuaTable>)| {
             let client = client.clone();
+            let fallback_agent_id = fallback_agent_id.clone();
             async move {
                 // ── Parse options ─────────────────────────────────
                 let method = opts
@@ -72,11 +75,37 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .request(reqwest_method, &url)
                     .timeout(Duration::from_secs(timeout_secs));
 
+                let mut explicit_headers = HashSet::<String>::new();
                 if let Some(ref opts_tbl) = opts {
                     if let Some(headers_tbl) = opts_tbl.get::<Option<LuaTable>>("headers")? {
                         for pair in headers_tbl.pairs::<String, String>() {
                             let (k, v) = pair?;
+                            explicit_headers.insert(k.to_ascii_lowercase());
                             req = req.header(&k, &v);
+                        }
+                    }
+                }
+
+                // Auto-propagate trace context to outbound HTTP requests.
+                // User-provided headers always win (no override).
+                let trace_headers = [
+                    ("x-trace-id", std::env::var("AGENT_BLOCK_TRACE_ID").ok()),
+                    ("x-run-id", std::env::var("AGENT_BLOCK_RUN_ID").ok()),
+                    (
+                        "x-agent-id",
+                        std::env::var("AGENT_BLOCK_AGENT_ID")
+                            .ok()
+                            .or_else(|| fallback_agent_id.clone()),
+                    ),
+                    ("x-agent-name", std::env::var("AGENT_BLOCK_AGENT_NAME").ok()),
+                ];
+                for (name, val_opt) in trace_headers {
+                    if explicit_headers.contains(name) {
+                        continue;
+                    }
+                    if let Some(v) = val_opt {
+                        if !v.is_empty() {
+                            req = req.header(name, v);
                         }
                     }
                 }
