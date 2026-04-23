@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-24
+
 ### Added
 
 - Vendored `lshape` package under `blocks/lshape/` so `require("lshape")`
@@ -29,10 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New cross-bridge trace correlation E2E:
   - `tests/e2e_obs.rs`
   - `tests/fixtures/obs_trace_e2e.lua`
+- Process-scoped auto-generated `agent_id` (UUID v4) fallback in
+  `obs_context` when neither `AGENT_BLOCK_AGENT_ID` ENV nor a caller-provided
+  fallback is present. Semantic scope "one agent-block execution = one
+  agent_id" is documented in RustDoc, conceptually coarser than `run_id`.
 
 ### Changed
 
 - LLM structured dump lines now emit unified `ab.obs component=llm` entries.
+
+### Fixed
+
+- `sanitize_url` now returns `"[UNPARSEABLE]"` on `Url::parse` failure
+  instead of echoing the raw input, closing a potential secret-leak path
+  for malformed URLs with embedded credentials.
 
 ### Breaking Changes
 
