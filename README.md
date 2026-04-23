@@ -162,7 +162,20 @@ Key behaviours:
   - request auth headers (`x-api-key` / `authorization`) are always redacted in dump logs
   - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.llm`)
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
-  - optional `agent.run({ log_meta = { agent_id, agent_name, task_id, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_TASK_ID`, `AGENT_BLOCK_RUN_ID`)
+  - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
+
+### lshape (Vendored package — `require("lshape")`)
+
+`lshape` is vendored under `blocks/lshape/` so scripts can use schema validation
+and LuaCATS generation without external installation.
+
+```lua
+local lshape = require("lshape")
+local T = lshape.t
+local User = T.shape({ name = T.string, age = T.number })
+local ok, why = lshape.check.check({ name = "Ada", age = 36 }, User)
+assert(ok, why)
+```
 
 ### log.*
 - `log.info/warn/error/debug(msg)`

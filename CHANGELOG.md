@@ -7,13 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Vendored `lshape` package under `blocks/lshape/` so `require("lshape")`
+  works out of the box in agent scripts, including `lshape.luacats` codegen.
+- New E2E coverage `tests/e2e_lshape.rs` + fixture `tests/fixtures/lshape_require.lua`
+  to verify the vendored module loads and basic schema + LuaCATS paths execute.
+
 ## [0.7.1] - 2026-04-23
 
 ### Added
 
 - Structured LLM dump logging controls in `blocks/agent`: `AGENT_BLOCK_LLM_DUMP=off|meta|full`, `RUST_LOG` fallback to `meta`, production downgrade guard via `AGENT_BLOCK_ENV` (`full` → `meta` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`), and always-redacted auth headers (`x-api-key` / `authorization`) in dump payloads.
 - Fixed-order `key=value` LLM dump lines with a unique marker (`prefix=ab.llm`) and per-call events (`request` / `response` / `summary`) including correlation fields (`call`, `turn`, `iter`) and runtime signals (`latency_ms`, `stop_reason`, usage totals, tool-use count, context edit count).
-- External log metadata injection for `agent.run()` via `log_meta = { agent_id, agent_name, task_id, run_id }` with ENV fallbacks (`AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_TASK_ID`, `AGENT_BLOCK_RUN_ID`).
+- External log metadata injection for `agent.run()` via `log_meta = { trace_id, agent_id, agent_name, run_id }` with ENV fallbacks (`AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`). Deprecated compatibility fallback maps `task_id` / `AGENT_BLOCK_TASK_ID` to `trace_id`.
 - New runnable example `examples/test_agent_log_meta.lua` and ignored E2E coverage `agent_run_emits_structured_meta_logs` to verify structured meta-log output.
 - Maintainer convenience recipes in `justfile`: `demo-llm-meta` and `e2e-llm-meta`.
 
