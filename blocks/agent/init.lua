@@ -34,6 +34,151 @@
 local M = {}
 
 -- ============================================================
+-- Internal: LLM dump controls (safe-by-default)
+-- ============================================================
+--
+-- AGENT_BLOCK_LLM_DUMP:
+--   "off"  (default) : no dump logs
+--   "meta"           : status/model/usage/tool counts
+--   "full"           : request/response body dump (API key is always redacted)
+--
+-- RUST_LOG fallback:
+--   When AGENT_BLOCK_LLM_DUMP is unset and RUST_LOG contains "debug"/"trace",
+--   dump mode becomes "meta".
+--
+-- Production guard:
+--   When AGENT_BLOCK_ENV is "prod" or "production", "full" is downgraded to
+--   "meta" unless AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true.
+--
+-- NOTE:
+--   This guards transport/auth secrets (x-api-key), not model-generated text.
+--   In production, prefer AGENT_BLOCK_LLM_DUMP=off.
+
+local function env_true(name)
+    local v = std.env.get(name)
+    if not v then return false end
+    v = string.lower(tostring(v))
+    return v == "1" or v == "true" or v == "yes" or v == "on"
+end
+
+local function normalize_dump_mode(v)
+    if not v or v == "" then return nil end
+    v = string.lower(tostring(v))
+    if v == "off" or v == "none" then return "off" end
+    if v == "meta" then return "meta" end
+    if v == "full" then return "full" end
+    return "off"
+end
+
+local function resolve_dump_mode()
+    local mode = normalize_dump_mode(std.env.get("AGENT_BLOCK_LLM_DUMP"))
+    if not mode then
+        local rust_log = string.lower(std.env.get_or("RUST_LOG", ""))
+        if rust_log:find("trace", 1, true) or rust_log:find("debug", 1, true) then
+            mode = "meta"
+        else
+            mode = "off"
+        end
+    end
+
+    if mode == "full" then
+        local env_name = string.lower(std.env.get_or("AGENT_BLOCK_ENV", ""))
+        local is_prod = env_name == "prod" or env_name == "production"
+        if is_prod and not env_true("AGENT_BLOCK_LLM_DUMP_ALLOW_PROD") then
+            log.warn("agent: AGENT_BLOCK_LLM_DUMP=full blocked in production env; downgraded to meta")
+            mode = "meta"
+        end
+    end
+    return mode
+end
+
+local function sanitize_headers_for_dump(headers)
+    local out = {}
+    for k, v in pairs(headers or {}) do
+        local lk = string.lower(tostring(k))
+        if lk == "x-api-key" or lk == "authorization" then
+            out[k] = "***REDACTED***"
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function llm_dump(mode, msg)
+    if mode ~= "off" then
+        log.info("agent.llm_dump " .. msg)
+    end
+end
+
+local LLM_DUMP_PREFIX = "ab.llm"
+
+local function kv_escape(v)
+    if v == nil then return "nil" end
+    if type(v) == "boolean" or type(v) == "number" then
+        return tostring(v)
+    end
+    local s = tostring(v)
+    if s == "" then return '""' end
+    if s:find("[%s=]") then
+        return std.json.encode(s)
+    end
+    return s
+end
+
+local function format_kv(parts)
+    local out = {}
+    for i, pair in ipairs(parts) do
+        out[i] = tostring(pair[1]) .. "=" .. kv_escape(pair[2])
+    end
+    return table.concat(out, " ")
+end
+
+local function llm_dump_event(mode, event_name, fields)
+    if mode == "off" then return end
+    local pairs = {
+        { "prefix", LLM_DUMP_PREFIX },
+        { "event", event_name },
+    }
+    for _, f in ipairs(fields or {}) do
+        table.insert(pairs, f)
+    end
+    llm_dump(mode, format_kv(pairs))
+end
+
+-- Build fixed-order external metadata fields for dump logs.
+-- Priority: opts.log_meta.* -> environment fallback -> nil.
+local function build_log_meta(opts)
+    local meta = opts and opts.log_meta or {}
+    return {
+        agent_id = meta.agent_id or std.env.get("AGENT_BLOCK_AGENT_ID") or std.env.agent_id(),
+        agent_name = meta.agent_name or std.env.get("AGENT_BLOCK_AGENT_NAME"),
+        task_id = meta.task_id or std.env.get("AGENT_BLOCK_TASK_ID"),
+        run_id = meta.run_id or std.env.get("AGENT_BLOCK_RUN_ID"),
+    }
+end
+
+local function count_tool_use_blocks(content)
+    local n = 0
+    for _, block in ipairs(content or {}) do
+        if block.type == "tool_use" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function count_text_chars(content)
+    local n = 0
+    for _, block in ipairs(content or {}) do
+        if block.type == "text" and block.text then
+            n = n + #tostring(block.text)
+        end
+    end
+    return n
+end
+
+-- ============================================================
 -- Default context management config (Anthropic server-side
 -- rolling history via clear_tool_uses_20250919).
 -- Trigger at 80K input_tokens, keep last 3 tool_uses,
@@ -63,9 +208,10 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
 ---                        context_management (table|nil — table enables the
 ---                        context-management beta header and body field; nil
 ---                        means opt-out, no header and no body field).
+--- @param trace table|nil Optional call metadata for dump logs.
 --- @return table|nil      Parsed response JSON on success, nil on error
 --- @return string|nil     Error string on failure
-local function llm_call(messages, opts)
+local function llm_call(messages, opts, trace)
     local api_key = std.env.get("ANTHROPIC_API_KEY")
     if not api_key then
         return nil, "ANTHROPIC_API_KEY not set"
@@ -99,18 +245,112 @@ local function llm_call(messages, opts)
         body.context_management = opts.context_management
     end
 
+    local dump_mode = resolve_dump_mode()
+    local call_index = trace and trace.call_index or "?"
+    local turn = trace and trace.turn or "?"
+    local iteration = trace and trace.iteration or "?"
+    llm_dump_event(dump_mode, "request", {
+        { "call", call_index },
+        { "turn", turn },
+        { "iter", iteration },
+        { "agent_id", trace and trace.agent_id or nil },
+        { "agent_name", trace and trace.agent_name or nil },
+        { "task_id", trace and trace.task_id or nil },
+        { "run_id", trace and trace.run_id or nil },
+        { "model", body.model },
+        { "messages", #messages },
+        { "tools", #(body.tools or {}) },
+        { "max_tokens", tonumber(body.max_tokens) or 0 },
+        { "timeout", tonumber(opts.timeout or 120) or 120 },
+        { "context_mgmt", opts.context_management ~= nil },
+    })
+    if dump_mode == "full" then
+        llm_dump_event(dump_mode, "request_headers", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(sanitize_headers_for_dump(headers)) },
+        })
+        llm_dump_event(dump_mode, "request_body", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(body) },
+        })
+    end
+
+    local start_ts = std.time.now()
     local resp = http.request("https://api.anthropic.com/v1/messages", {
         method = "POST",
         headers = headers,
         body = std.json.encode(body),
         timeout = opts.timeout or 120,
     })
+    local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
+
+    llm_dump_event(dump_mode, "response", {
+        { "call", call_index },
+        { "turn", turn },
+        { "iter", iteration },
+        { "agent_id", trace and trace.agent_id or nil },
+        { "agent_name", trace and trace.agent_name or nil },
+        { "task_id", trace and trace.task_id or nil },
+        { "run_id", trace and trace.run_id or nil },
+        { "status", resp.status },
+        { "latency_ms", elapsed_ms },
+    })
+    if dump_mode == "full" then
+        llm_dump_event(dump_mode, "response_headers", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(resp.headers or {}) },
+        })
+        llm_dump_event(dump_mode, "response_body", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", tostring(resp.body or "") },
+        })
+    end
 
     if resp.status ~= 200 then
-        return nil, "API error " .. resp.status .. ": " .. resp.body
+        -- Do not include raw body in the returned error string; caller-side
+        -- logs often propagate this message verbatim.
+        return nil, "API error " .. resp.status
     end
 
     local decoded = std.json.decode(resp.body)
+    if dump_mode ~= "off" then
+        local usage = decoded.usage or {}
+        local in_tok = tonumber(usage.input_tokens) or 0
+        local out_tok = tonumber(usage.output_tokens) or 0
+        local stop_reason = tostring(decoded.stop_reason or "unknown")
+        local content_blocks = #(decoded.content or {})
+        local tool_uses = count_tool_use_blocks(decoded.content)
+        local text_chars = count_text_chars(decoded.content)
+        local cm_applied = 0
+        if decoded.context_management and decoded.context_management.applied_edits then
+            cm_applied = #decoded.context_management.applied_edits
+        end
+        llm_dump_event(dump_mode, "summary", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "agent_id", trace and trace.agent_id or nil },
+            { "agent_name", trace and trace.agent_name or nil },
+            { "task_id", trace and trace.task_id or nil },
+            { "run_id", trace and trace.run_id or nil },
+            { "stop_reason", stop_reason },
+            { "blocks", content_blocks },
+            { "tool_uses", tool_uses },
+            { "text_chars", text_chars },
+            { "usage_in", in_tok },
+            { "usage_out", out_tok },
+            { "usage_total", in_tok + out_tok },
+            { "context_edits", cm_applied },
+        })
+    end
     return decoded, nil
 end
 
@@ -339,6 +579,11 @@ end
 ---                   keys: turn_number, content, tool_calls, usage, and
 ---                   context_management (passed through from the Anthropic
 ---                   response; absent when no edits fired this turn).
+---   log_meta        (optional) External metadata for structured dump logs.
+---                   Keys: `agent_id`, `agent_name`, `task_id`, `run_id`.
+---                   Values are attached to `ab.llm` request/response/summary lines.
+---                   Fallback env vars: AGENT_BLOCK_AGENT_ID / AGENT_BLOCK_AGENT_NAME
+---                   / AGENT_BLOCK_TASK_ID / AGENT_BLOCK_RUN_ID.
 ---   extra_tools     (optional) Extra Anthropic tool definitions to include
 ---   context_management        (optional, default true) When false, opt out of
 ---                   Anthropic server-side context editing entirely (no beta
@@ -414,6 +659,7 @@ function M.run(opts)
         tools = tools,
         context_management = cm_final,  -- nil = opt-out, table = enabled
     }
+    local log_meta = build_log_meta(opts)
 
     -- Initialize message history
     local messages = {
@@ -422,6 +668,7 @@ function M.run(opts)
 
     -- ReAct loop state
     local num_turns = 0
+    local llm_call_index = 0
     local final_content = ""
     local loop_error = nil
 
@@ -431,7 +678,18 @@ function M.run(opts)
 
         while true do
             -- Call LLM
-            local response, api_err = llm_call(messages, call_opts)
+            llm_call_index = llm_call_index + 1
+            local response, api_err = llm_call(messages, call_opts, {
+                call_index = llm_call_index,
+                -- num_turns increments after a successful assistant response append.
+                -- For request-side correlation, report the upcoming turn number.
+                turn = num_turns + 1,
+                iteration = iter + 1,
+                agent_id = log_meta.agent_id,
+                agent_name = log_meta.agent_name,
+                task_id = log_meta.task_id,
+                run_id = log_meta.run_id,
+            })
             if not response then
                 loop_error = api_err
                 return

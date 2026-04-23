@@ -155,6 +155,14 @@ Key behaviours:
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
 - The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
+- LLM dump logging is safe-by-default and ENV-driven:
+  - `AGENT_BLOCK_LLM_DUMP=off|meta|full` (default `off`)
+  - when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
+  - `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
+  - request auth headers (`x-api-key` / `authorization`) are always redacted in dump logs
+  - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.llm`)
+  - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
+  - optional `agent.run({ log_meta = { agent_id, agent_name, task_id, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_TASK_ID`, `AGENT_BLOCK_RUN_ID`)
 
 ### log.*
 - `log.info/warn/error/debug(msg)`
