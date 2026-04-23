@@ -150,10 +150,17 @@ end
 -- Priority: opts.log_meta.* -> environment fallback -> nil.
 local function build_log_meta(opts)
     local meta = opts and opts.log_meta or {}
+    local trace_id = meta.trace_id or std.env.get("AGENT_BLOCK_TRACE_ID")
+    if not trace_id then
+        trace_id = meta.task_id or std.env.get("AGENT_BLOCK_TASK_ID")
+        if trace_id then
+            log.warn("agent: log_meta.task_id / AGENT_BLOCK_TASK_ID is deprecated; use trace_id / AGENT_BLOCK_TRACE_ID")
+        end
+    end
     return {
+        trace_id = trace_id,
         agent_id = meta.agent_id or std.env.get("AGENT_BLOCK_AGENT_ID") or std.env.agent_id(),
         agent_name = meta.agent_name or std.env.get("AGENT_BLOCK_AGENT_NAME"),
-        task_id = meta.task_id or std.env.get("AGENT_BLOCK_TASK_ID"),
         run_id = meta.run_id or std.env.get("AGENT_BLOCK_RUN_ID"),
     }
 end
@@ -253,9 +260,9 @@ local function llm_call(messages, opts, trace)
         { "call", call_index },
         { "turn", turn },
         { "iter", iteration },
+        { "trace_id", trace and trace.trace_id or nil },
         { "agent_id", trace and trace.agent_id or nil },
         { "agent_name", trace and trace.agent_name or nil },
-        { "task_id", trace and trace.task_id or nil },
         { "run_id", trace and trace.run_id or nil },
         { "model", body.model },
         { "messages", #messages },
@@ -292,9 +299,9 @@ local function llm_call(messages, opts, trace)
         { "call", call_index },
         { "turn", turn },
         { "iter", iteration },
+        { "trace_id", trace and trace.trace_id or nil },
         { "agent_id", trace and trace.agent_id or nil },
         { "agent_name", trace and trace.agent_name or nil },
-        { "task_id", trace and trace.task_id or nil },
         { "run_id", trace and trace.run_id or nil },
         { "status", resp.status },
         { "latency_ms", elapsed_ms },
@@ -337,9 +344,9 @@ local function llm_call(messages, opts, trace)
             { "call", call_index },
             { "turn", turn },
             { "iter", iteration },
+            { "trace_id", trace and trace.trace_id or nil },
             { "agent_id", trace and trace.agent_id or nil },
             { "agent_name", trace and trace.agent_name or nil },
-            { "task_id", trace and trace.task_id or nil },
             { "run_id", trace and trace.run_id or nil },
             { "stop_reason", stop_reason },
             { "blocks", content_blocks },
@@ -580,10 +587,11 @@ end
 ---                   context_management (passed through from the Anthropic
 ---                   response; absent when no edits fired this turn).
 ---   log_meta        (optional) External metadata for structured dump logs.
----                   Keys: `agent_id`, `agent_name`, `task_id`, `run_id`.
+---                   Keys: `trace_id`, `agent_id`, `agent_name`, `run_id`.
 ---                   Values are attached to `ab.llm` request/response/summary lines.
----                   Fallback env vars: AGENT_BLOCK_AGENT_ID / AGENT_BLOCK_AGENT_NAME
----                   / AGENT_BLOCK_TASK_ID / AGENT_BLOCK_RUN_ID.
+---                   Fallback env vars: AGENT_BLOCK_TRACE_ID / AGENT_BLOCK_AGENT_ID
+---                   / AGENT_BLOCK_AGENT_NAME / AGENT_BLOCK_RUN_ID.
+---                   Deprecated fallback: `task_id` / AGENT_BLOCK_TASK_ID maps to `trace_id`.
 ---   extra_tools     (optional) Extra Anthropic tool definitions to include
 ---   context_management        (optional, default true) When false, opt out of
 ---                   Anthropic server-side context editing entirely (no beta
@@ -685,9 +693,9 @@ function M.run(opts)
                 -- For request-side correlation, report the upcoming turn number.
                 turn = num_turns + 1,
                 iteration = iter + 1,
+                trace_id = log_meta.trace_id,
                 agent_id = log_meta.agent_id,
                 agent_name = log_meta.agent_name,
-                task_id = log_meta.task_id,
                 run_id = log_meta.run_id,
             })
             if not response then

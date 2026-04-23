@@ -45,14 +45,14 @@ fn agent_run_emits_structured_meta_logs() {
         .args(["-s", "examples/test_agent_log_meta.lua"])
         .env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
         .env("AGENT_BLOCK_LLM_DUMP", "meta")
+        .env("AGENT_BLOCK_TRACE_ID", "e2e-trace-01")
         .env("AGENT_BLOCK_AGENT_ID", "e2e-agent-01")
         .env("AGENT_BLOCK_AGENT_NAME", "e2e-agent")
-        .env("AGENT_BLOCK_TASK_ID", "e2e-task-01")
         .env("AGENT_BLOCK_RUN_ID", "e2e-run-01")
         .assert()
         .success()
         .stdout(predicate::str::contains("prefix=ab.llm event=request"))
+        .stdout(predicate::str::contains("trace_id=e2e-trace-01"))
         .stdout(predicate::str::contains("agent_id=e2e-agent-01"))
-        .stdout(predicate::str::contains("task_id=e2e-task-01"))
         .stdout(predicate::str::contains("run_id=e2e-run-01"));
 }

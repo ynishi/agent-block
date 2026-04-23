@@ -28,9 +28,9 @@ lint:
 # Requires ANTHROPIC_API_KEY.
 demo-llm-meta:
     AGENT_BLOCK_LLM_DUMP=meta \
+    AGENT_BLOCK_TRACE_ID=${AGENT_BLOCK_TRACE_ID:-maint-trace-001} \
     AGENT_BLOCK_AGENT_ID=${AGENT_BLOCK_AGENT_ID:-maint-agent-01} \
     AGENT_BLOCK_AGENT_NAME=${AGENT_BLOCK_AGENT_NAME:-maintainer} \
-    AGENT_BLOCK_TASK_ID=${AGENT_BLOCK_TASK_ID:-maint-task-001} \
     AGENT_BLOCK_RUN_ID=${AGENT_BLOCK_RUN_ID:-maint-run-001} \
     cargo run -- --script examples/test_agent_log_meta.lua
 
