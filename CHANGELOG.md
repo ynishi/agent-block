@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Trace context design docs and rollout checklist:
   - `docs/architecture/trace-context.md`
   - `docs/runbooks/trace-rollout-checklist.md`
+- Trace context propagation across runtime bridges:
+  - `http.request` auto-injects `x-trace-id` / `x-run-id` / `x-agent-id` / `x-agent-name`
+    (user-provided headers win; no override).
+  - `mcp.call` and `mesh.send` / `mesh.request` inject `__ab_obs` metadata
+    (`trace_id`, `run_id`, `agent_id`, `agent_name`) when not already provided.
+- Unified structured observability logs (`prefix=ab.obs`) for bridge events:
+  - `component=http`: `http_request`, `http_response`
+  - `component=mcp`: `mcp_call`, `mcp_result`
+  - `component=mesh`: `mesh_send`, `mesh_request`
+  - `component=tool`: `tool_register`, `tool_call`, `tool_result`
+- New cross-bridge trace correlation E2E:
+  - `tests/e2e_obs.rs`
+  - `tests/fixtures/obs_trace_e2e.lua`
+
+### Changed
+
+- LLM structured dump lines now emit unified `ab.obs component=llm` entries.
+  Legacy `prefix=ab.llm` lines are still emitted for compatibility with
+  existing log consumers.
 
 ## [0.7.1] - 2026-04-23
 
