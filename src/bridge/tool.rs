@@ -1,5 +1,6 @@
 //! tool.* — Lua-side tool registry for LLM function calling.
 
+use crate::bridge::obs;
 use mlua::prelude::*;
 
 /// Register tool.* Lua API.
@@ -34,7 +35,12 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
                     target: "lua",
                     script = %script_name_register,
                     "{}",
-                    obs_line("tool_register", &[("tool", name.as_str())]),
+                    obs::obs_line(
+                        "tool",
+                        "tool_register",
+                        &obs::obs_context(None),
+                        &[("tool", name.as_str())],
+                    ),
                 );
                 Ok(())
             },
@@ -56,45 +62,65 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
                     target: "lua",
                     script = %script_name,
                     "{}",
-                    obs_line("tool_call", &[("tool", name.as_str())]),
+                    obs::obs_line(
+                        "tool",
+                        "tool_call",
+                        &obs::obs_context(None),
+                        &[("tool", name.as_str())],
+                    ),
                 );
-            let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
-            let entry: Option<LuaTable> = registry.get(name.clone())?;
-            match entry {
-                None => {
-                    tracing::warn!(
-                        target: "lua",
-                        script = %script_name,
-                        "{}",
-                        obs_line("tool_result", &[("tool", name.as_str()), ("ok", "false")]),
-                    );
-                    Err(LuaError::external(format!("tool not found: {name}")))
-                }
-                Some(e) => {
-                    let handler: LuaFunction = e.get("handler")?;
-                    match handler.call_async::<LuaValue>(input).await {
-                        Ok(v) => {
-                            tracing::info!(
-                                target: "lua",
-                                script = %script_name,
-                                "{}",
-                                obs_line("tool_result", &[("tool", name.as_str()), ("ok", "true")]),
-                            );
-                            Ok(v)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "lua",
-                                script = %script_name,
-                                "{}",
-                                obs_line("tool_result", &[("tool", name.as_str()), ("ok", "false")]),
-                            );
-                            Err(e)
+                let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
+                let entry: Option<LuaTable> = registry.get(name.clone())?;
+                match entry {
+                    None => {
+                        tracing::warn!(
+                            target: "lua",
+                            script = %script_name,
+                            "{}",
+                            obs::obs_line(
+                                "tool",
+                                "tool_result",
+                                &obs::obs_context(None),
+                                &[("tool", name.as_str()), ("ok", "false")],
+                            ),
+                        );
+                        Err(LuaError::external(format!("tool not found: {name}")))
+                    }
+                    Some(e) => {
+                        let handler: LuaFunction = e.get("handler")?;
+                        match handler.call_async::<LuaValue>(input).await {
+                            Ok(v) => {
+                                tracing::info!(
+                                    target: "lua",
+                                    script = %script_name,
+                                    "{}",
+                                    obs::obs_line(
+                                        "tool",
+                                        "tool_result",
+                                        &obs::obs_context(None),
+                                        &[("tool", name.as_str()), ("ok", "true")],
+                                    ),
+                                );
+                                Ok(v)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "lua",
+                                    script = %script_name,
+                                    "{}",
+                                    obs::obs_line(
+                                        "tool",
+                                        "tool_result",
+                                        &obs::obs_context(None),
+                                        &[("tool", name.as_str()), ("ok", "false")],
+                                    ),
+                                );
+                                Err(e)
+                            }
                         }
                     }
                 }
             }
-        }
         })?,
     )?;
 
@@ -142,39 +168,4 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
 
     lua.globals().set("tool", tool_tbl)?;
     Ok(())
-}
-
-fn obs_line(event: &str, extra: &[(&str, &str)]) -> String {
-    let (trace_id, run_id, agent_id, agent_name) = obs_context();
-    let mut parts = vec![
-        "prefix=ab.obs".to_string(),
-        format!("event={}", event),
-        "component=tool".to_string(),
-        format!("trace_id={}", kv_escape(&trace_id)),
-        format!("run_id={}", kv_escape(&run_id)),
-        format!("agent_id={}", kv_escape(&agent_id)),
-        format!("agent_name={}", kv_escape(&agent_name)),
-    ];
-    for (k, v) in extra {
-        parts.push(format!("{}={}", k, kv_escape(v)));
-    }
-    parts.join(" ")
-}
-
-fn obs_context() -> (String, String, String, String) {
-    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
-    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
-    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID").unwrap_or_default();
-    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
-    (trace_id, run_id, agent_id, agent_name)
-}
-
-fn kv_escape(v: &str) -> String {
-    if v.is_empty() {
-        "\"\"".to_string()
-    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
-        serde_json::Value::String(v.to_string()).to_string()
-    } else {
-        v.to_string()
-    }
 }

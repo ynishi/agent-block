@@ -512,11 +512,19 @@ pub(crate) fn install_bus_dispatcher_on_handler_isle(lua: &Lua) -> LuaResult<()>
             if type(h) ~= "function" then
                 error("no Lua handler for kind `" .. tostring(kind) .. "`")
             end
+            local ok_payload, payload = pcall(std.json.decode, payload_json)
+            if not ok_payload then
+                error("payload decode: " .. tostring(payload))
+            end
+            local ok_meta, meta = pcall(std.json.decode, meta_json)
+            if not ok_meta then
+                error("meta decode: " .. tostring(meta))
+            end
             local ev = {
                 kind = kind,
                 id = id,
-                payload = std.json.decode(payload_json),
-                meta = std.json.decode(meta_json),
+                payload = payload,
+                meta = meta,
             }
             local ret = h(ev)
             if ret == nil then

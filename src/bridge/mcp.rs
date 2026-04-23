@@ -16,6 +16,7 @@ use mlua::prelude::*;
 use serde_json::Map;
 use std::sync::Arc;
 
+use crate::bridge::obs;
 use crate::host::HostContext;
 
 use super::{json_to_lua, lua_to_json};
@@ -121,9 +122,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             target: "lua",
                             script = %script_name,
                             "{}",
-                            obs_line(
+                            obs::obs_line(
+                                "mcp",
                                 "mcp_call",
-                                &obs_context(fallback_agent_id.as_deref()),
+                                &obs::obs_context(fallback_agent_id.as_deref()),
                                 &[("server", name.as_str()), ("tool", tool_name.as_str())],
                             )
                         );
@@ -141,9 +143,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                     target: "lua",
                                     script = %script_name,
                                     "{}",
-                                    obs_line(
+                                    obs::obs_line(
+                                        "mcp",
                                         "mcp_result",
-                                        &obs_context(fallback_agent_id.as_deref()),
+                                        &obs::obs_context(fallback_agent_id.as_deref()),
                                         &[("server", name.as_str()), ("tool", tool_name.as_str()), ("ok", "true")],
                                     )
                                 );
@@ -167,9 +170,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                     target: "lua",
                                     script = %script_name,
                                     "{}",
-                                    obs_line(
+                                    obs::obs_line(
+                                        "mcp",
                                         "mcp_result",
-                                        &obs_context(fallback_agent_id.as_deref()),
+                                        &obs::obs_context(fallback_agent_id.as_deref()),
                                         &[("server", name.as_str()), ("tool", tool_name.as_str()), ("ok", "false")],
                                     )
                                 );
@@ -249,43 +253,5 @@ fn inject_obs_context(args_json: &mut serde_json::Value, fallback_agent_id: Opti
             }
         }
         _ => {}
-    }
-}
-
-fn obs_context(fallback_agent_id: Option<&str>) -> (String, String, String, String) {
-    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
-    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
-    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| fallback_agent_id.map(ToString::to_string))
-        .unwrap_or_default();
-    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
-    (trace_id, run_id, agent_id, agent_name)
-}
-
-fn obs_line(event: &str, ctx: &(String, String, String, String), extra: &[(&str, &str)]) -> String {
-    let mut parts = vec![
-        "prefix=ab.obs".to_string(),
-        format!("event={}", event),
-        "component=mcp".to_string(),
-        format!("trace_id={}", kv_escape(&ctx.0)),
-        format!("run_id={}", kv_escape(&ctx.1)),
-        format!("agent_id={}", kv_escape(&ctx.2)),
-        format!("agent_name={}", kv_escape(&ctx.3)),
-    ];
-    for (k, v) in extra {
-        parts.push(format!("{}={}", k, kv_escape(v)));
-    }
-    parts.join(" ")
-}
-
-fn kv_escape(v: &str) -> String {
-    if v.is_empty() {
-        "\"\"".to_string()
-    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
-        serde_json::Value::String(v.to_string()).to_string()
-    } else {
-        v.to_string()
     }
 }

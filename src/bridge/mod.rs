@@ -19,6 +19,7 @@ pub mod llm;
 pub mod log;
 pub mod mcp;
 pub mod mesh;
+pub mod obs;
 pub mod sh;
 pub mod sql;
 pub mod task;

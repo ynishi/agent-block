@@ -20,6 +20,7 @@ use mlua::prelude::*;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::bridge::obs;
 use crate::host::HostContext;
 
 /// Default request timeout in seconds.
@@ -124,9 +125,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     target: "lua",
                     script = %script_name,
                     "{}",
-                    obs_line(
+                    obs::obs_line(
+                        "http",
                         "http_request",
-                        &obs_context(fallback_agent_id.as_deref()),
+                        &obs::obs_context(fallback_agent_id.as_deref()),
                         &[("method", method.as_str()), ("url", url.as_str())],
                     )
                 );
@@ -146,9 +148,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     target: "lua",
                     script = %script_name,
                     "{}",
-                    obs_line(
+                    obs::obs_line(
+                        "http",
                         "http_response",
-                        &obs_context(fallback_agent_id.as_deref()),
+                        &obs::obs_context(fallback_agent_id.as_deref()),
                         &[("method", method.as_str()), ("url", url.as_str()), ("status", status_s.as_str())],
                     )
                 );
@@ -196,44 +199,6 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
     lua.globals().set("http", http_tbl)?;
     Ok(())
-}
-
-fn obs_context(fallback_agent_id: Option<&str>) -> (String, String, String, String) {
-    let trace_id = std::env::var("AGENT_BLOCK_TRACE_ID").unwrap_or_default();
-    let run_id = std::env::var("AGENT_BLOCK_RUN_ID").unwrap_or_default();
-    let agent_id = std::env::var("AGENT_BLOCK_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| fallback_agent_id.map(ToString::to_string))
-        .unwrap_or_default();
-    let agent_name = std::env::var("AGENT_BLOCK_AGENT_NAME").unwrap_or_default();
-    (trace_id, run_id, agent_id, agent_name)
-}
-
-fn obs_line(event: &str, ctx: &(String, String, String, String), extra: &[(&str, &str)]) -> String {
-    let mut parts = vec![
-        "prefix=ab.obs".to_string(),
-        format!("event={}", event),
-        "component=http".to_string(),
-        format!("trace_id={}", kv_escape(&ctx.0)),
-        format!("run_id={}", kv_escape(&ctx.1)),
-        format!("agent_id={}", kv_escape(&ctx.2)),
-        format!("agent_name={}", kv_escape(&ctx.3)),
-    ];
-    for (k, v) in extra {
-        parts.push(format!("{}={}", k, kv_escape(v)));
-    }
-    parts.join(" ")
-}
-
-fn kv_escape(v: &str) -> String {
-    if v.is_empty() {
-        "\"\"".to_string()
-    } else if v.chars().any(|c| c.is_whitespace() || c == '=') {
-        serde_json::Value::String(v.to_string()).to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 /// Read SSE stream and dispatch `data:` lines to the Lua callback.
