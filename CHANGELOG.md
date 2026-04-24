@@ -25,6 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on each progress notification from the named server. The handler must be a pure Lua
   function (C functions / Rust closures are rejected). Handler execution errors are
   logged at `warn` level and the notification is dropped rather than crashing the runtime.
+- `mcp.on_log(name, handler)` — register a per-server Lua callback for
+  `notifications/message` (MCP log) events. `handler(level, logger, data)` is called for
+  each log notification from the named server. When no handler is registered the
+  notification is forwarded to the Rust `tracing` target `"lua"` (same target as `log.*`)
+  at the mapped level (debug → DEBUG, info/notice → INFO, warning → WARN,
+  error/critical/alert/emergency → ERROR). Handler must be a pure Lua function;
+  execution errors are logged at `warn` level and the notification is dropped.
+- `mcp.cancel(name, request_id)` — send a `notifications/cancelled` notification to the
+  named server for the given `request_id`. This is also fired automatically when
+  `mcp.call` times out, so explicit use is only needed for manual cancellation flows.
+  Failures are logged at `warn` level (fire-and-forget contract).
+- `mcp.set_sampling_handler(server_name, handler)` — register a per-server Lua function
+  to respond to `sampling/createMessage` requests from MCP servers. The runtime calls
+  `handler(params)` where `params` matches the MCP `CreateMessageRequest` shape; the
+  return value must be a table matching `CreateMessageResult`
+  (`{ model, stop_reason, role, content }`). When no handler is registered the server
+  receives `method_not_found` (existing default behaviour). Handler errors are returned
+  to the server as `internal_error`. The signature takes `server_name` so each server
+  can use a different LLM policy; a global singleton form is intentionally not provided
+  to avoid multi-server dispatch collisions.
+- `agent.run()` `mcp_servers` entries now accept an HTTP form:
+  `{ name = "myserver", url = "https://…/mcp", transport_opts = { transport = "sse" } }`.
+  When `url` is present `mcp.connect_http` is used; when `command` is present the
+  existing stdio path is used. Both forms coexist in the same `mcp_servers` list.
+- `agent.run({ sampling = fn })` — pass a Lua function as `opts.sampling` to
+  automatically register it as the sampling handler for every MCP server connected in
+  that `agent.run` call (calls `mcp.set_sampling_handler(srv.name, fn)` per server).
 
 ### Changed
 

@@ -83,6 +83,19 @@ ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9
 - `mcp.on_progress(name, handler)` — Register a per-server progress notification callback.
   `handler(token, progress, total, message)` is called for each `notifications/progress`
   event from the named server. Handler must be a pure Lua function.
+- `mcp.on_log(name, handler)` — Register a per-server log notification callback.
+  `handler(level, logger, data)` is called for each `notifications/message` event from
+  the named server. When no handler is registered the notification is forwarded to the
+  Rust `tracing` target `"lua"` at the corresponding level (debug/info/notice/warning/
+  error/critical/alert/emergency). Handler must be a pure Lua function.
+- `mcp.cancel(name, request_id)` — Send a `notifications/cancelled` notification to the
+  named server for the given `request_id`. Also fired automatically when `mcp.call` times
+  out. Explicit use is only needed for manual cancellation flows.
+- `mcp.set_sampling_handler(server_name, handler)` — Register a per-server Lua function
+  to respond to `sampling/createMessage` requests from the MCP server.
+  `handler(params)` receives the `CreateMessageRequest` table and must return a table
+  matching `CreateMessageResult` (`{ model, stop_reason, role, content }`).
+  When no handler is registered the server receives `method_not_found`.
 - `mcp.disconnect(name)` — Disconnect server
 
 ### mesh.*
@@ -126,7 +139,12 @@ local result = agent.run({
     timeout          = 120,                             -- HTTP timeout in seconds
     mcp_servers = {                                     -- optional MCP servers to connect
         { name = "outline", command = "outline-mcp", args = {} },
+        -- HTTP/SSE form: use `url` instead of `command`
+        { name = "remote", url = "https://example.com/mcp",
+          transport_opts = { transport = "sse" } },     -- transport = "sse" | "http" (default "http")
     },
+    sampling = function(params) ... end,                -- optional: called for sampling/createMessage
+                                                        -- from every connected MCP server
     -- Anthropic server-side context editing (default ON). Pass `false` to opt out,
     -- or pass a full override table (replaces the default entirely).
     context_management        = true,                   -- default true; false disables beta header + body
@@ -163,6 +181,8 @@ end
 
 Key behaviours:
 - MCP servers listed in `mcp_servers` are connected automatically and disconnected on exit (even on error).
+- Each entry may use the stdio form `{ name, command, args }` or the HTTP form `{ name, url, transport_opts }`. Both forms can coexist in the same list.
+- Pass `sampling = fn` in `agent.run` opts to register a single Lua function as the `sampling/createMessage` handler for every connected MCP server (`mcp.set_sampling_handler` is called per server automatically).
 - MCP tool names are namespaced as `server_name__tool_name` to avoid collisions.
 - Tool dispatch: MCP tools via `mcp.call()`, registered Lua tools via `tool.call()`.
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
