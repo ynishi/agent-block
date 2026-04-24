@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mcp.connect_http(name, url, opts)` — connect to an MCP server over HTTP/SSE transport.
+  `opts.transport = "sse" | "http"` selects SSE or Streamable HTTP (default `"http"`).
+  `opts.headers` table is forwarded as request headers.
+- `mcp.list_resources(name)` — list resources exposed by an MCP server.
+  Returns `{ ok=true, resources=[{uri, name, description, mimeType, ...}] }`.
+- `mcp.read_resource(name, uri)` — read a single resource by URI.
+  Returns `{ ok=true, contents=[{uri, mimeType, text|blob}] }`.
+- `mcp.list_prompts(name)` — list prompt templates exposed by an MCP server.
+  Returns `{ ok=true, prompts=[{name, description, arguments}] }`.
+- `mcp.get_prompt(name, prompt_name, args)` — retrieve a rendered prompt.
+  Returns `{ ok=true, description, messages=[{role, content}] }`.
+- `mcp.on_progress(name, handler)` — register a per-server Lua callback for
+  `notifications/progress` events. `handler(token, progress, total, message)` is called
+  on each progress notification from the named server. The handler must be a pure Lua
+  function (C functions / Rust closures are rejected). Handler execution errors are
+  logged at `warn` level and the notification is dropped rather than crashing the runtime.
+
 ### Changed
 
 - `src/mcp_client.rs` split into `src/mcp_client/mod.rs` + `src/mcp_client/handler.rs` module.
@@ -18,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   progress / log / sampling callback wiring is deferred to subsequent subtasks.
 - `rmcp` feature flags expanded: `client-side-sse` and `transport-streamable-http-client`
   added to `Cargo.toml` (no transport code activated yet; enables Subtask 2 HTTP connect).
+- `mcp.call_tool` now auto-injects `_meta.progressToken` (UUID v4) into every tool call
+  request. Servers that support progress notifications will use this token; servers that
+  do not will ignore it. Existing calls that did not set `_meta` are unaffected.
+
+### Security
+
+- `sanitize_url` path: URL redaction now handles edge cases where embedded credentials
+  appear in non-standard positions. The existing `[UNPARSEABLE]` fallback on `Url::parse`
+  failure (introduced in 0.8.0) is retained.
 
 ## [0.8.0] - 2026-04-24
 

@@ -50,7 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
-rmcp = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client"] }
+rmcp = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
@@ -59,10 +59,17 @@ predicates = "3"
 tempfile = "3"
 # Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
-rmcp = { version = "1.4.0", features = ["server"] }
+# `transport-streamable-http-server` enables the axum-backed in-process HTTP
+# server used by `tests/e2e_mcp_rich.rs` to round-trip `connect_http` + `list_tools`.
+rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server"] }
 # `test-util` enables `tokio::time::pause`/`advance`/`resume` and the
 # `start_paused` flavor used by concurrency tests in `src/bus/dispatcher.rs`.
 tokio = { version = "1", features = ["full", "test-util"] }
+# axum is needed by `tests/e2e_mcp_rich.rs` to serve the in-process
+# StreamableHttpService on an ephemeral port.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio-util = { version = "0.7" }
+
 # SIGTERM / SIGINT delivery for EventBus e2e tests (tests/e2e_bus.rs).
 # `signal` for `kill(2)` + Signal enum, `process` for `Pid::from_raw`.
 [target.'cfg(unix)'.dev-dependencies]
