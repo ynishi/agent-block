@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/echo_mcp_server` — standalone MCP reference server (stdio + HTTP) exposing tools
+  (`echo`, `slow_echo`), resources, prompts, logging, and sampling for smoke-testing the
+  agent-block MCP bridge. Run with `cargo run --example echo_mcp_server -- --help`.
 - `mcp.connect_http(name, url, opts)` — connect to an MCP server over HTTP/SSE transport.
   `opts.transport = "sse" | "http"` selects SSE or Streamable HTTP (default `"http"`).
   `opts.headers` table is forwarded as request headers.
