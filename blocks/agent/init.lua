@@ -227,16 +227,50 @@ local function llm_call(messages, opts, trace)
 
     local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
+    -- Prompt caching: default ON.  Attach `cache_control: ephemeral` markers
+    -- to the stable prefix (system + last tool) so turn-2+ reads the cached
+    -- prefix at ~10% input-token unit cost.  Disable with `opts.cache_control
+    -- = false` (A/B test, or when system < 1024 tokens so caching cannot
+    -- activate and the marker is wasted).
+    -- https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+    local cache_on = opts.cache_control ~= false
+
     local body = {
         model = model,
         max_tokens = opts.max_tokens or 4096,
         messages = messages,
     }
     if opts.system and opts.system ~= "" then
-        body.system = opts.system
+        if cache_on then
+            body.system = {
+                {
+                    type = "text",
+                    text = opts.system,
+                    cache_control = { type = "ephemeral" },
+                },
+            }
+        else
+            body.system = opts.system
+        end
     end
     if opts.tools and #opts.tools > 0 then
-        body.tools = opts.tools
+        if cache_on then
+            -- Shallow-clone list + last entry so we don't mutate opts.tools
+            -- across calls (caller's reference is preserved intact).
+            local tools = {}
+            for i = 1, #opts.tools - 1 do
+                tools[i] = opts.tools[i]
+            end
+            local last = {}
+            for k, v in pairs(opts.tools[#opts.tools]) do
+                last[k] = v
+            end
+            last.cache_control = { type = "ephemeral" }
+            tools[#opts.tools] = last
+            body.tools = tools
+        else
+            body.tools = opts.tools
+        end
     end
 
     local headers = {
@@ -333,6 +367,12 @@ local function llm_call(messages, opts, trace)
         local usage = decoded.usage or {}
         local in_tok = tonumber(usage.input_tokens) or 0
         local out_tok = tonumber(usage.output_tokens) or 0
+        -- Prompt-cache accounting (Anthropic: cache_* are disjoint from input_tokens).
+        --   cache_create = bytes written to the cache on this call (~1.25x input price)
+        --   cache_read   = bytes read from the cache on this call (~0.1x input price)
+        -- hit_rate ≈ cache_read / (cache_read + in_tok).
+        local cache_create = tonumber(usage.cache_creation_input_tokens) or 0
+        local cache_read = tonumber(usage.cache_read_input_tokens) or 0
         local stop_reason = tostring(decoded.stop_reason or "unknown")
         local content_blocks = #(decoded.content or {})
         local tool_uses = count_tool_use_blocks(decoded.content)
@@ -356,6 +396,8 @@ local function llm_call(messages, opts, trace)
             { "usage_in", in_tok },
             { "usage_out", out_tok },
             { "usage_total", in_tok + out_tok },
+            { "cache_create", cache_create },
+            { "cache_read", cache_read },
             { "context_edits", cm_applied },
         })
     end
