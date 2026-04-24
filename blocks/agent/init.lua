@@ -227,12 +227,71 @@ local function llm_call(messages, opts, trace)
 
     local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-    -- Prompt caching: default ON.  Attach `cache_control: ephemeral` markers
-    -- to the stable prefix (system + last tool) so turn-2+ reads the cached
-    -- prefix at ~10% input-token unit cost.  Disable with `opts.cache_control
-    -- = false` (A/B test, or when system < 1024 tokens so caching cannot
-    -- activate and the marker is wasted).
-    -- https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+    -- ============================================================
+    -- Prompt caching (Anthropic Messages API)
+    -- ------------------------------------------------------------
+    -- Default: ON. `cache_control: {type=ephemeral}` markers are placed on
+    -- the stable prefix so turn-2+ reads the cached prefix at ~10% input-
+    -- token unit cost. Disable with `opts.cache_control = false` for A/B.
+    --
+    -- Breakpoint placement (2 of 4 budget used):
+    --   1. system block (content-array form)         → caches [tools + system]
+    --   2. tools[#opts.tools] (= last tool entry)    → caches [tools]
+    -- Messages-level marker (3rd slot) is a planned follow-up to cache the
+    -- conversation tail as well; leaving the last 2 slots free lets callers
+    -- add their own markers if needed.
+    --
+    -- API ordering contract (docs.claude.com/en/docs/build-with-claude/prompt-caching):
+    --   API processes prefix as  tools → system → messages
+    --   cache_control on block X caches the prefix up to AND INCLUDING X.
+    --   So marker on system caches [tools + system] regardless of how the
+    --   messages array grows. Messages appended across ReAct turns do not
+    --   invalidate the tools+system cache.
+    --
+    -- Minimum cacheable prefix size (Anthropic official):
+    --   Sonnet / Opus: 1024 tokens
+    --   Haiku:         2048 tokens
+    -- Below the minimum the marker is silently ignored (no cache_creation,
+    -- no cache_read, standard input-token billing).
+    --
+    -- PRACTICAL MARGIN (empirical, not documented):
+    --   At exactly ~1264 tokens on Sonnet (well above the 1024 line) we
+    --   observed stochastic cache misses — turn 1 cache_create = 0 AND
+    --   cache_read = 0 despite the prefix exceeding the documented minimum.
+    --   At ~1679 tokens the cache fires deterministically (turn 1 creates,
+    --   turn 2+ reads). The effective threshold appears to include an
+    --   undocumented safety margin.
+    --   Recommendation: aim for ≥1.5× the published minimum
+    --     (~1500 tokens for Sonnet/Opus, ~3000 tokens for Haiku)
+    --   before relying on cache hits in production.
+    --
+    -- Byte-exact keying:
+    --   The cache key is a hash of the prefix BYTES up to the marker.
+    --   Any whitespace / key-ordering / extra-field drift in tools or
+    --   system invalidates the key. `std.json.encode` orders keys
+    --   alphabetically which keeps serialization stable across runs;
+    --   avoid injecting per-turn timestamps / UUIDs / counters into
+    --   system or tool schemas.
+    --
+    -- Non-standard fields in messages:
+    --   Anthropic returns a non-spec `caller` field in tool_use blocks
+    --   (`{"type":"direct"}`) which agent-block echoes back in turn 2+
+    --   assistant messages. This does NOT affect cache matching because
+    --   cache_control is placed before the messages array (tools + system
+    --   prefix only); messages content is outside the cache scope.
+    --
+    -- Observability:
+    --   Response `usage.cache_creation_input_tokens` → `cache_create`
+    --   Response `usage.cache_read_input_tokens`     → `cache_read`
+    --   Both are emitted to the "summary" dump event and the `on_turn`
+    --   callback receives them via `info.usage`.
+    --   Hit rate ≈ cache_read / (cache_read + input_tokens).
+    --
+    -- Disabling (`opts.cache_control = false`) is useful when:
+    --   - A/B comparing with/without caching
+    --   - system + tools is known to be < minimum (marker would be wasted)
+    --   - caller wants strict byte-exact requests (no cache_control drift)
+    -- ============================================================
     local cache_on = opts.cache_control ~= false
 
     local body = {

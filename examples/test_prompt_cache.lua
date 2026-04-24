@@ -1,15 +1,34 @@
 -- test_prompt_cache.lua — Anthropic prompt-cache verification run.
 --
--- Requires ANTHROPIC_API_KEY.
+-- Requires ANTHROPIC_API_KEY (auto-loaded from project_root/.env).
 --
--- Purpose: exercise the ReAct loop with a system prompt large enough to
--- exceed the 1024-token cache-activation threshold (Sonnet/Opus) so that
--- cache_create / cache_read appear in dump "summary" events.
+-- Purpose: exercise the ReAct loop with a system prompt sized well above
+-- the 1024-token cache-activation threshold (Sonnet/Opus) so that
+-- cache_create / cache_read reliably appear in dump "summary" events.
 --
--- Run:
---   AGENT_BLOCK_LLM_DUMP=meta agent-block -s examples/test_prompt_cache.lua
+-- Run (Sonnet 4.5 recommended; Haiku's 2048-token minimum makes this
+-- example marginal on Haiku):
+--   ANTHROPIC_MODEL=claude-sonnet-4-5-20250929 \
+--   AGENT_BLOCK_LLM_DUMP=meta \
+--   agent-block -s examples/test_prompt_cache.lua
 --
--- Observe: turn 1 emits cache_create > 0, turn 2+ emits cache_read > 0.
+-- Expected (two consecutive runs with the same trace_id within 5 min TTL):
+--   Run 1 turn 1: cache_create=~1679, cache_read=0       (creates cache)
+--   Run 1 turn 2: cache_create=0,     cache_read=~1679   (reads within run)
+--   Run 2 turn 1: cache_create=0,     cache_read=~1679   (reads prior run)
+--   Run 2 turn 2: cache_create=0,     cache_read=~1679
+--
+-- Caveats observed during development:
+--   - At ~1264 tokens (just above the 1024 minimum) cache behavior was
+--     stochastic; cache_create occasionally stayed at 0 despite the
+--     prefix exceeding the documented threshold. Increasing the system
+--     prompt to ~1679 tokens made cache firing deterministic.
+--     Empirical rule of thumb: target ≥1.5× the published minimum.
+--   - context_management = false is set below to eliminate cm beta
+--     edits from the byte-exact cache key. When caching is primary,
+--     run without the cm beta.
+--
+-- See blocks/agent/init.lua `llm_call` for the full caching spec notes.
 
 local agent = require("agent")
 
@@ -36,9 +55,9 @@ tool.register("get_weather", {
     return "Sunny, 22C in " .. tostring(input.city or "unknown")
 end)
 
--- Long, deterministic system prompt to cross the 1024-token minimum.
--- ~2.5KB of stable text; repeated byte-exact content across turns is
--- essential for cache hits.
+-- Long, deterministic system prompt to cross the 1024-token minimum
+-- with a safe margin (~3000+ tokens).  Byte-exact content across turns
+-- is essential for cache hits.
 local LONG_SYSTEM = [[
 You are an operations assistant specialized in reporting current conditions.
 Respond concisely and use available tools when they provide more accurate
@@ -93,6 +112,60 @@ Behavior on tool-call errors:
 Closing:
 - Finish each response with a single period.
 - Do not append trailing whitespace or additional blank lines.
+
+Extended operational reference (kept stable across turns so the cached
+prefix is large enough to exceed the 1024-token minimum comfortably):
+
+Reference A — runtime model:
+The agent-block runtime hosts a Lua 5.4 virtual machine via mlua with a
+pool of worker isolates (Isles).  Each Isle owns its own Lua state; the
+main Isle runs user scripts, and auxiliary Isles host handlers for
+MCP notification dispatch and sampling callbacks.  The isle separation
+ensures that long-running user callbacks cannot block the rmcp client
+loop.  The handler-to-main exec bridge serializes Lua state changes by
+sending closures across isle boundaries.  Upvalues are preserved
+because closures are invoked directly rather than dumped-and-reloaded
+across VM instances.
+
+Reference B — observability:
+Structured dump events are emitted via `log.info` with a fixed prefix
+`ab.obs` and event types including `request`, `response`, `summary`,
+`tool_call`, `tool_result`, `http_request`, `http_response`, and
+`tool_register`.  Each event carries `trace_id`, `run_id`, `agent_id`,
+`agent_name`, and component-specific fields.  The `summary` event
+includes per-turn token usage (input, output, cache_create, cache_read)
+so hit rate can be computed offline by dividing cache_read by the sum
+of cache_read and non-cached input tokens.
+
+Reference C — MCP integration:
+Model Context Protocol servers are attached via `mcp.attach` with per-
+server configuration controlling transport (stdio, http, websocket),
+capabilities (tools, resources, prompts, sampling, logging), trace
+context injection (opt-in, default off), and notification callbacks
+(`on_progress`, `on_log`, `on_resource_updated`).  Notifications are
+dispatched through a bounded mpsc channel (capacity 128) to a single
+drain task that forwards events to the main isle via `exec`.  When the
+channel is full, notifications are dropped with a warn-level log entry
+rather than growing memory unbounded.
+
+Reference D — error handling:
+User callbacks installed on the main isle are invoked with pcall
+semantics: a Lua error inside the callback is absorbed and logged at
+warn level (`target=mcp_client`, fields `server`, `caller`, `error`)
+but does not propagate into the main isle runtime.  This guarantees
+that a buggy user callback cannot crash the agent loop or the rmcp
+client loop.  The warn-level log entry provides observability so the
+silent-drop anti-pattern is avoided.
+
+Reference E — prompt caching:
+Prompt caching is enabled by default by placing `cache_control:
+ephemeral` markers on the stable prefix (system and the last tool).
+The cache TTL is 5 minutes in the ephemeral tier, sliding with each
+use.  Byte-exact prefix equality is required for cache matches; any
+drift in whitespace, field ordering, or extra metadata in the cached
+region will force a cache miss.  Responses include
+cache_creation_input_tokens and cache_read_input_tokens in the usage
+block so the cache hit rate can be monitored per turn.
 ]]
 
 local result = agent.run({
