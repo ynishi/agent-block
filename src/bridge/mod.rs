@@ -196,5 +196,6 @@ pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 /// intentionally unsupported.
 pub fn register_all_handler_side(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     bus::install_bus_dispatcher_on_handler_isle(lua)?;
+    crate::mcp_client::handler::install_mcp_dispatcher_on_handler_isle(lua)?;
     register_non_bus_bridges(lua, ctx, true)
 }
