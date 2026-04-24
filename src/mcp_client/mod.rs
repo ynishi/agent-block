@@ -300,6 +300,17 @@ impl McpManager {
         self.handler.handler_isle = Some(isle);
     }
 
+    /// Wire the main Isle into the shared `AgentBlockClientHandler`.
+    ///
+    /// Must be called after construction and before `connect` / `connect_http`
+    /// so that progress/log notification dispatchers can call user Lua callbacks
+    /// stored in the main Isle's globals (upvalue-safe path).
+    ///
+    /// Idempotent: a second call replaces the previous Isle reference.
+    pub fn set_main_isle(&mut self, isle: Arc<AsyncIsle>) {
+        self.handler.main_isle = Some(isle);
+    }
+
     /// Connect to an MCP server via Streamable HTTP transport.
     ///
     /// `opts` may contain `auth_header` (string) for bearer-token authentication.

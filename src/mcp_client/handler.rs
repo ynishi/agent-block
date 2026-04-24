@@ -19,37 +19,26 @@ use rmcp::{
     ErrorData as McpError,
 };
 
-/// Constant name of the Lua global table used to store per-server progress handlers
+/// Constant name of the Lua global table used to store per-server sampling handlers
 /// on the handler Isle.
-pub(crate) const MCP_PROGRESS_HANDLERS: &str = "__mcp_progress_handlers";
-
-/// Constant name of the Lua global table used to store per-server log handlers.
-pub(crate) const MCP_LOG_HANDLERS: &str = "__mcp_log_handlers";
-
-/// Constant name of the Lua global table used to store per-server sampling handlers.
 pub(crate) const MCP_SAMPLING_HANDLERS: &str = "__mcp_sampling_handlers";
-
-/// Constant name of the Lua dispatcher function called when a progress notification arrives.
-const MCP_DISPATCH_PROGRESS: &str = "__mcp_dispatch_progress";
-
-/// Constant name of the Lua dispatcher function called when a log notification arrives.
-const MCP_DISPATCH_LOG: &str = "__mcp_dispatch_log";
-
-/// Global table that holds user-provided progress callbacks stored by server name.
-///
-/// Written by `mcp._store_progress_ucb` so that the self-contained envelope
-/// wrapper registered by `blocks/agent/init.lua` can retrieve the callback on
-/// the handler Isle without capturing it as an upvalue (which would be nil after
-/// bytecode dump/reload across Lua VMs).
-pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
-
-/// Global table that holds user-provided log callbacks stored by server name.
-///
-/// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
 
 /// Constant name of the Lua dispatcher function called for sampling/createMessage.
 const MCP_DISPATCH_SAMPLING: &str = "__mcp_dispatch_sampling";
+
+/// Global table that holds user-provided progress callbacks stored by server name
+/// on the **main Isle**.
+///
+/// Written by `mcp.on_progress` (main Isle bridge) so that `on_progress`
+/// notifications dispatched via `main_isle.exec` can call the closure with its
+/// upvalues intact (no bytecode dump/reload across Lua VMs).
+pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
+
+/// Global table that holds user-provided log callbacks stored by server name
+/// on the **main Isle**.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
 
 /// Per-server registry of optional Lua callbacks.
 ///
@@ -95,14 +84,21 @@ impl ServerHandlerRegistry {
 /// - Subtask 1: skeleton — all notification methods are the default no-ops from rmcp.
 /// - Subtask 2: `on_progress` wired to `handler_isle` bytecode forwarding.
 /// - Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
+/// - Subtask 4: progress/log notifications dispatched to main Isle via `exec` so user
+///   callbacks run with their upvalues intact (no bytecode dump/reload across VMs).
 #[derive(Clone)]
 pub struct AgentBlockClientHandler {
     /// Keyed by server name so a single handler instance can serve multiple servers
     /// when the registry is shared across connections.
     pub(crate) registry: Arc<Mutex<HashMap<String, ServerHandlerRegistry>>>,
-    /// Optional handler Isle for Lua callback dispatch.
-    /// `None` in unit-test mode (no notification dispatch needed).
+    /// Optional handler Isle for sampling (`create_message`) dispatch via `exec`.
+    /// `None` in unit-test mode.
     pub(crate) handler_isle: Option<Arc<AsyncIsle>>,
+    /// Optional main Isle for progress/log notification dispatch via `exec`.
+    /// User callbacks (`on_progress`, `on_log`) are stored in the main Isle's
+    /// globals so upvalues are preserved across calls (no bytecode dump needed).
+    /// `None` in unit-test mode.
+    pub(crate) main_isle: Option<Arc<AsyncIsle>>,
     /// Server name for this connection — set before clone() in connect/connect_http.
     /// `None` for the shared template handler (before per-server clone).
     pub(crate) server_name: Option<String>,
@@ -111,13 +107,14 @@ pub struct AgentBlockClientHandler {
 impl AgentBlockClientHandler {
     /// Create a handler with an empty registry (no notification dispatch).
     ///
-    /// Used in concurrency tests and contexts where no `handler_isle` is available.
-    /// Notifications received while `handler_isle` is `None` are silently dropped
+    /// Used in concurrency tests and contexts where no Isle is available.
+    /// Notifications received while `main_isle` is `None` are silently dropped
     /// (no Lua callback can execute without an Isle).
     pub fn new() -> Self {
         Self {
             registry: Arc::new(Mutex::new(HashMap::new())),
             handler_isle: None,
+            main_isle: None,
             server_name: None,
         }
     }
@@ -169,73 +166,20 @@ impl Default for AgentBlockClientHandler {
     }
 }
 
-/// Install all MCP dispatcher tables and functions on the handler Isle.
+/// Install MCP dispatcher tables and functions on the handler Isle.
 ///
 /// Sets up:
-/// - `__mcp_progress_handlers` table + `__mcp_dispatch_progress` function
-/// - `__mcp_log_handlers` table + `__mcp_dispatch_log` function
 /// - `__mcp_sampling_handlers` table + `__mcp_dispatch_sampling` function
+///
+/// Progress and log notifications are now dispatched directly to the main Isle
+/// via `main_isle.exec` in `AgentBlockClientHandler::on_progress` /
+/// `on_logging_message`, so the handler Isle no longer needs those dispatcher
+/// globals.
 ///
 /// Must be called inside an `AsyncIsle::exec` on the handler Isle during bridge
 /// registration.
 pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<()> {
     use mlua::prelude::*;
-
-    // ── user-callback storage tables (populated by _store_progress_ucb / _store_log_ucb) ──
-    lua.globals()
-        .set(MCP_USER_PROGRESS_CBS, lua.create_table()?)?;
-    lua.globals().set(MCP_USER_LOG_CBS, lua.create_table()?)?;
-
-    // ── progress ──────────────────────────────────────────────────────────────
-    lua.globals()
-        .set(MCP_PROGRESS_HANDLERS, lua.create_table()?)?;
-
-    let progress_src = r#"
-        local HANDLERS = "__mcp_progress_handlers"
-        return function(server_name, progress_token, progress, total, message)
-            local handlers = _G[HANDLERS]
-            local h = handlers and handlers[server_name]
-            if type(h) ~= "function" then
-                return
-            end
-            -- Belt-and-suspenders nil-guards: Rust normalises these before push,
-            -- but guard here in case the dispatcher path changes in the future.
-            local total_n = total or "0"
-            local message_s = message or ""
-            h(server_name, progress_token, tonumber(progress), tonumber(total_n), message_s)
-        end
-    "#;
-    let dispatch_progress: LuaFunction = lua
-        .load(progress_src)
-        .set_name("@agent_block:__mcp_dispatch_progress")
-        .eval()?;
-    lua.globals()
-        .set(MCP_DISPATCH_PROGRESS, dispatch_progress)?;
-
-    // ── log ───────────────────────────────────────────────────────────────────
-    lua.globals().set(MCP_LOG_HANDLERS, lua.create_table()?)?;
-
-    let log_src = r#"
-        local HANDLERS = "__mcp_log_handlers"
-        return function(server_name, level, logger, data_json)
-            local handlers = _G[HANDLERS]
-            local h = handlers and handlers[server_name]
-            if type(h) ~= "function" then
-                return nil  -- signal: no handler, caller should use tracing fallback
-            end
-            -- Belt-and-suspenders nil-guards: Rust normalises these before push,
-            -- but guard here in case the dispatcher path changes in the future.
-            local logger_s = logger or ""
-            local data_s = data_json or ""
-            h(server_name, level, logger_s, data_s)
-            return true
-        end
-    "#;
-    let dispatch_log: LuaFunction = lua
-        .load(log_src)
-        .set_name("@agent_block:__mcp_dispatch_log")
-        .eval()?;
-    lua.globals().set(MCP_DISPATCH_LOG, dispatch_log)?;
 
     // ── sampling ──────────────────────────────────────────────────────────────
     lua.globals()
@@ -270,13 +214,13 @@ impl ClientHandler for AgentBlockClientHandler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         // Clone Arc refs BEFORE the async block to avoid holding the Mutex
         // guard across any await (await-holding-lock anti-pattern).
-        let isle = self.handler_isle.clone();
+        let main_isle = self.main_isle.clone();
         let registry = Arc::clone(&self.registry);
 
         async move {
-            let isle = match isle {
+            let main_isle = match main_isle {
                 Some(i) => i,
-                None => return, // no isle configured — drop notification
+                None => return, // no Isle configured — drop notification
             };
 
             // Collect server names that have an on_progress handler registered.
@@ -299,38 +243,57 @@ impl ClientHandler for AgentBlockClientHandler {
                 rmcp::model::NumberOrString::Number(n) => n.to_string(),
                 rmcp::model::NumberOrString::String(s) => s.to_string(),
             };
-            let progress_str = params.progress.to_string();
-            let total_str = params
-                .total
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "0".to_string());
-            let message_str = params.message.unwrap_or_default();
+            let progress_f64: f64 = params.progress;
+            let total_opt: Option<f64> = params.total;
+            let message_opt: Option<String> = params.message;
 
             for server_name in server_names {
                 let server_for_task = server_name.clone();
                 let token_for_task = token_str.clone();
-                let progress_for_task = progress_str.clone();
-                let total_for_task = total_str.clone();
-                let message_for_task = message_str.clone();
-                let isle_ref = Arc::clone(&isle);
+                let progress_for_task = progress_f64;
+                let total_for_task = total_opt;
+                let message_for_task = message_opt.clone();
+                let isle_ref = Arc::clone(&main_isle);
 
-                // Spawn each dispatch as a separate task so a slow Lua handler
+                // Spawn each dispatch as a separate task so a slow Lua callback
                 // does not block the rmcp notification loop.
                 tokio::spawn(async move {
-                    let args = [
-                        server_for_task.as_str(),
-                        token_for_task.as_str(),
-                        progress_for_task.as_str(),
-                        total_for_task.as_str(),
-                        message_for_task.as_str(),
-                    ];
-                    let task = isle_ref.spawn_coroutine_call(MCP_DISPATCH_PROGRESS, &args);
-                    if let Err(e) = task.await {
+                    let result = isle_ref
+                        .exec(move |lua| {
+                            use mlua::prelude::*;
+                            // Look up __mcp_user_progress_cbs on the main Isle.
+                            let cbs: LuaTable = match lua.globals().get(MCP_USER_PROGRESS_CBS) {
+                                Ok(t) => t,
+                                Err(_) => return Ok(String::new()), // table not yet initialised
+                            };
+                            let cb: LuaFunction = match cbs.get(server_for_task.as_str()) {
+                                Ok(f) => f,
+                                Err(_) => return Ok(String::new()), // no handler for this server
+                            };
+                            // Build the event table passed to the user callback.
+                            let ev = lua.create_table()?;
+                            ev.set("type", "progress")?;
+                            ev.set("server", server_for_task.as_str())?;
+                            ev.set("token", token_for_task.as_str())?;
+                            ev.set("progress", progress_for_task)?;
+                            if let Some(t) = total_for_task {
+                                ev.set("total", t)?;
+                            }
+                            if let Some(ref m) = message_for_task {
+                                ev.set("message", m.as_str())?;
+                            }
+                            // pcall semantics: absorb errors so a user callback crash
+                            // does not propagate into the main Isle runtime.
+                            let _ = cb.call::<()>(ev);
+                            Ok(String::new())
+                        })
+                        .await;
+                    if let Err(e) = result {
                         tracing::warn!(
                             target: "mcp_client",
                             server = %server_name,
                             error = %e,
-                            "progress handler failed"
+                            "on_progress: main isle exec failed"
                         );
                     }
                 });
@@ -343,14 +306,14 @@ impl ClientHandler for AgentBlockClientHandler {
         params: LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        let isle = self.handler_isle.clone();
+        let main_isle = self.main_isle.clone();
         let registry = Arc::clone(&self.registry);
         let server_name = self.server_name.clone();
 
         async move {
             let level = &params.level;
-            let logger = params.logger.as_deref().unwrap_or("");
-            // Serialize data as JSON string for transport to Lua
+            let logger = params.logger.as_deref().unwrap_or("").to_string();
+            // Serialize data as JSON string for Lua.
             let data_str = match serde_json::to_string(&params.data) {
                 Ok(s) => s,
                 Err(e) => {
@@ -371,12 +334,13 @@ impl ClientHandler for AgentBlockClientHandler {
                 | LoggingLevel::Critical
                 | LoggingLevel::Alert
                 | LoggingLevel::Emergency => "error",
-            };
+            }
+            .to_string();
 
             // Save name string early so we can use it after the optional move.
             let sn_str = server_name.as_deref().unwrap_or("unknown").to_string();
 
-            // Check if a Lua handler is registered for this server
+            // Check if a Lua handler is registered for this server.
             let has_lua_handler = server_name.as_deref().is_some_and(|sn| {
                 registry
                     .lock()
@@ -386,26 +350,40 @@ impl ClientHandler for AgentBlockClientHandler {
             });
 
             if has_lua_handler {
-                if let (Some(isle), Some(sn)) = (isle, server_name) {
+                if let (Some(isle), Some(sn)) = (main_isle, server_name) {
                     let sn_task = sn.clone();
-                    let level_task = level_str.to_string();
-                    let logger_task = logger.to_string();
+                    let level_task = level_str.clone();
+                    let logger_task = logger.clone();
                     let data_task = data_str.clone();
 
                     tokio::spawn(async move {
-                        let args = [
-                            sn_task.as_str(),
-                            level_task.as_str(),
-                            logger_task.as_str(),
-                            data_task.as_str(),
-                        ];
-                        let task = isle.spawn_coroutine_call(MCP_DISPATCH_LOG, &args);
-                        if let Err(e) = task.await {
+                        let result = isle
+                            .exec(move |lua| {
+                                use mlua::prelude::*;
+                                let cbs: LuaTable = match lua.globals().get(MCP_USER_LOG_CBS) {
+                                    Ok(t) => t,
+                                    Err(_) => return Ok(String::new()),
+                                };
+                                let cb: LuaFunction = match cbs.get(sn_task.as_str()) {
+                                    Ok(f) => f,
+                                    Err(_) => return Ok(String::new()),
+                                };
+                                let ev = lua.create_table()?;
+                                ev.set("type", "log")?;
+                                ev.set("server", sn_task.as_str())?;
+                                ev.set("level", level_task.as_str())?;
+                                ev.set("logger", logger_task.as_str())?;
+                                ev.set("data", data_task.as_str())?;
+                                let _ = cb.call::<()>(ev);
+                                Ok(String::new())
+                            })
+                            .await;
+                        if let Err(e) = result {
                             tracing::warn!(
                                 target: "mcp_client",
                                 server = %sn,
                                 error = %e,
-                                "log handler dispatch failed"
+                                "on_logging_message: main isle exec failed"
                             );
                         }
                     });
@@ -413,7 +391,7 @@ impl ClientHandler for AgentBlockClientHandler {
                 }
             }
 
-            // No Lua handler or no isle — emit directly via tracing to "lua" target
+            // No Lua handler or no Isle — emit directly via tracing to "lua" target
             // so it appears in the same log stream as Lua log.* calls.
             match level {
                 LoggingLevel::Debug => {
@@ -704,141 +682,121 @@ mod tests {
         assert!(guard.get("srv").unwrap().sampling);
     }
 
+    /// Verify that `install_mcp_dispatcher_on_handler_isle` now only installs the
+    /// sampling dispatcher (progress/log dispatchers were removed in favour of
+    /// main-Isle-direct exec).
     #[test]
-    fn install_dispatcher_creates_all_globals() {
+    fn install_dispatcher_creates_sampling_globals() {
         let lua = mlua::Lua::new();
         install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
 
-        let _: mlua::Table = lua.globals().get(MCP_PROGRESS_HANDLERS).unwrap();
-        let _: mlua::Function = lua.globals().get(MCP_DISPATCH_PROGRESS).unwrap();
-        let _: mlua::Table = lua.globals().get(MCP_LOG_HANDLERS).unwrap();
-        let _: mlua::Function = lua.globals().get(MCP_DISPATCH_LOG).unwrap();
         let _: mlua::Table = lua.globals().get(MCP_SAMPLING_HANDLERS).unwrap();
         let _: mlua::Function = lua.globals().get(MCP_DISPATCH_SAMPLING).unwrap();
-        // User-callback storage tables.
-        let _: mlua::Table = lua.globals().get(MCP_USER_PROGRESS_CBS).unwrap();
-        let _: mlua::Table = lua.globals().get(MCP_USER_LOG_CBS).unwrap();
-    }
 
-    /// Verify that the progress glue normalises a nil `total` and nil `message`
-    /// to safe defaults before forwarding to the handler.
-    #[test]
-    fn progress_dispatcher_nil_guards_normalize_total_and_message() {
-        let lua = mlua::Lua::new();
-        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
-
-        lua.load(
-            r#"
-            local got = {}
-            __mcp_progress_handlers["srv"] = function(sn, tok, prog, total, msg)
-                got.total = total
-                got.msg = msg
-            end
-            -- Pass nil for total and message (simulates missing optional fields).
-            __mcp_dispatch_progress("srv", "tok-1", "0.5", nil, nil)
-            assert(got.total == 0, "total nil should be normalised to 0, got: " .. tostring(got.total))
-            assert(got.msg == "", "message nil should be normalised to '', got: " .. tostring(got.msg))
-        "#,
-        )
-        .exec()
-        .unwrap();
-    }
-
-    /// Verify that the log glue normalises nil `logger` and nil `data_json`
-    /// to empty strings before forwarding to the handler.
-    #[test]
-    fn log_dispatcher_nil_guards_normalize_logger_and_data() {
-        let lua = mlua::Lua::new();
-        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
-
-        lua.load(
-            r#"
-            local got = {}
-            __mcp_log_handlers["srv"] = function(sn, level, logger, data)
-                got.logger = logger
-                got.data = data
-            end
-            -- Pass nil for logger and data_json.
-            __mcp_dispatch_log("srv", "info", nil, nil)
-            assert(got.logger == "", "logger nil should be normalised to '', got: " .. tostring(got.logger))
-            assert(got.data == "", "data nil should be normalised to '', got: " .. tostring(got.data))
-        "#,
-        )
-        .exec()
-        .unwrap();
-    }
-
-    #[test]
-    fn dispatcher_calls_handler_with_progress() {
-        let lua = mlua::Lua::new();
-        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
-
-        lua.load(
-            r#"
-            local results = {}
-            __mcp_progress_handlers["my-srv"] = function(srv, tok, prog, total)
-                results[#results+1] = { srv=srv, tok=tok, prog=prog, total=total }
-            end
-            __mcp_dispatch_progress("my-srv", "tok-1", "0.5", "1.0")
-            assert(#results == 1)
-            assert(results[1].srv == "my-srv")
-            assert(results[1].tok == "tok-1")
-            assert(math.abs(results[1].prog - 0.5) < 0.001)
-        "#,
-        )
-        .exec()
-        .unwrap();
-    }
-
-    #[test]
-    fn dispatcher_no_op_when_no_handler() {
-        let lua = mlua::Lua::new();
-        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
-        // Should not error when no handler is registered.
-        let dispatch: mlua::Function = lua.globals().get(MCP_DISPATCH_PROGRESS).unwrap();
-        dispatch
-            .call::<()>(("no-srv", "tok", "0.5", "1.0"))
-            .unwrap();
-    }
-
-    #[test]
-    fn log_dispatcher_returns_nil_when_no_handler() {
-        let lua = mlua::Lua::new();
-        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
-        let dispatch: mlua::Function = lua.globals().get(MCP_DISPATCH_LOG).unwrap();
-        // No handler registered — should return nil (not error).
-        let result: mlua::Value = dispatch
-            .call(("no-srv", "info", "logger", r#""some message""#))
-            .unwrap();
+        // Progress/log dispatcher globals are no longer installed on the handler
+        // Isle — they live on the main Isle (via MCP_USER_PROGRESS_CBS /
+        // MCP_USER_LOG_CBS) instead.
+        let progress_handlers: mlua::Value = lua.globals().get("__mcp_progress_handlers").unwrap();
         assert!(
-            matches!(result, mlua::Value::Nil),
-            "expected nil when no handler"
+            matches!(progress_handlers, mlua::Value::Nil),
+            "__mcp_progress_handlers must not be installed on handler Isle"
+        );
+        let log_handlers: mlua::Value = lua.globals().get("__mcp_log_handlers").unwrap();
+        assert!(
+            matches!(log_handlers, mlua::Value::Nil),
+            "__mcp_log_handlers must not be installed on handler Isle"
         );
     }
 
+    /// Verify that user-callback storage tables for progress/log are NOT created
+    /// on the handler Isle (they now live on the main Isle).
     #[test]
-    fn log_dispatcher_calls_registered_handler() {
+    fn handler_isle_has_no_user_callback_tables() {
         let lua = mlua::Lua::new();
         install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
 
-        lua.load(
-            r#"
-            local called = {}
-            __mcp_log_handlers["srv"] = function(sn, level, logger, data)
-                called.sn = sn
-                called.level = level
-                called.logger = logger
-                called.data = data
-            end
-            __mcp_dispatch_log("srv", "warn", "mylogger", '"hello"')
-            assert(called.sn == "srv")
-            assert(called.level == "warn")
-            assert(called.logger == "mylogger")
-            assert(called.data == '"hello"')
-        "#,
-        )
-        .exec()
-        .unwrap();
+        let progress_cbs: mlua::Value = lua.globals().get(MCP_USER_PROGRESS_CBS).unwrap();
+        assert!(
+            matches!(progress_cbs, mlua::Value::Nil),
+            "__mcp_user_progress_cbs must not be on handler Isle"
+        );
+        let log_cbs: mlua::Value = lua.globals().get(MCP_USER_LOG_CBS).unwrap();
+        assert!(
+            matches!(log_cbs, mlua::Value::Nil),
+            "__mcp_user_log_cbs must not be on handler Isle"
+        );
+    }
+
+    /// Verify that user callbacks stored in `__mcp_user_progress_cbs` on the main
+    /// Isle can capture upvalues (the root cause of the original bug).
+    #[tokio::test]
+    async fn main_isle_progress_cb_preserves_upvalue() {
+        use mlua_isle::AsyncIsle;
+
+        let (isle, driver) = AsyncIsle::spawn(|_lua: &mlua::Lua| Ok(()))
+            .await
+            .expect("AsyncIsle::spawn should succeed");
+
+        // Initialise the callback table and register a closure that captures
+        // a local counter — mirroring what `mcp.on_progress` does on main Isle.
+        isle.exec(|lua| {
+            lua.load(
+                r#"
+                __mcp_user_progress_cbs = {}
+                local hits = 0
+                __mcp_user_progress_cbs["test-srv"] = function(ev)
+                    hits = hits + 1
+                end
+                _G.get_hits = function() return hits end
+            "#,
+            )
+            .exec()
+            .map_err(|e| mlua_isle::IsleError::Lua(format!("setup: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .expect("setup exec");
+
+        // Simulate three on_progress dispatches (as on_progress handler does).
+        for _ in 0..3 {
+            isle.exec(|lua| {
+                use mlua::prelude::*;
+                let cbs: LuaTable = lua
+                    .globals()
+                    .get(MCP_USER_PROGRESS_CBS)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cbs: {e}")))?;
+                let cb: LuaFunction = cbs
+                    .get("test-srv")
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cb: {e}")))?;
+                let ev = lua
+                    .create_table()
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create ev: {e}")))?;
+                let _ = cb.call::<()>(ev);
+                Ok(String::new())
+            })
+            .await
+            .expect("dispatch exec");
+        }
+
+        // Verify the upvalue was incremented 3 times.
+        let hits_str = isle
+            .exec(|lua| {
+                use mlua::prelude::*;
+                let get_hits: LuaFunction = lua
+                    .globals()
+                    .get("get_hits")
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get_hits: {e}")))?;
+                let n: i64 = get_hits
+                    .call(())
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("call get_hits: {e}")))?;
+                Ok(n.to_string())
+            })
+            .await
+            .expect("read hits exec");
+        let hits: i64 = hits_str.parse().expect("hits must be integer");
+        assert_eq!(hits, 3, "upvalue counter must reach 3");
+
+        driver.shutdown().await.expect("shutdown");
     }
 
     #[test]

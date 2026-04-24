@@ -519,6 +519,9 @@ async fn on_progress_callback_receives_envelope() {
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("CALL_OK"))
             .stdout(predicate::str::contains("PROGRESS_EV_OK"))
+            // Upvalue preservation: the outer-local counter must have been
+            // incremented inside the callback (>= 1 hit).
+            .stdout(predicate::str::is_match(r"PROGRESS_HITS=[1-9][0-9]*").unwrap())
             .stdout(predicate::str::contains("FIXTURE_DONE"));
     })
     .await
@@ -549,6 +552,9 @@ async fn on_log_callback_receives_envelope() {
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("CALL_OK"))
             .stdout(predicate::str::contains("LOG_EV_OK"))
+            // Upvalue preservation: the outer-local counter must have been
+            // incremented inside the callback (>= 1 hit).
+            .stdout(predicate::str::is_match(r"LOG_HITS=[1-9][0-9]*").unwrap())
             .stdout(predicate::str::contains("FIXTURE_DONE"));
     })
     .await
@@ -614,6 +620,9 @@ async fn on_progress_nil_fields_do_not_crash_callback() {
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("CALL_OK"))
             .stdout(predicate::str::contains("PROGRESS_EV_OK"))
+            // Upvalue preservation: the outer-local counter must have been
+            // incremented inside the callback (>= 1 hit).
+            .stdout(predicate::str::is_match(r"PROGRESS_HITS=[1-9][0-9]*").unwrap())
             // Must NOT see the handler-failed warning that would appear if the
             // callback crashed with a nil-concat error.
             .stdout(predicate::str::contains("progress handler failed").not())
@@ -648,6 +657,9 @@ async fn on_log_nil_fields_do_not_crash_callback() {
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("CALL_OK"))
             .stdout(predicate::str::contains("LOG_EV_OK"))
+            // Upvalue preservation: the outer-local counter must have been
+            // incremented inside the callback (>= 1 hit).
+            .stdout(predicate::str::is_match(r"LOG_HITS=[1-9][0-9]*").unwrap())
             // Must NOT see the handler-failed warning.
             .stdout(predicate::str::contains("log handler dispatch failed").not())
             .stdout(predicate::str::contains("FIXTURE_DONE"));

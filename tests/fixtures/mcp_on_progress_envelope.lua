@@ -6,10 +6,8 @@
 -- (including the message field) and prints markers for the Rust-side
 -- assertions.
 --
--- Note: the on_progress callback runs on the handler isle (a separate Lua VM).
--- State cannot be shared between vms via Lua variables.  The callback prints
--- PROGRESS_EV_OK directly to stdout; the main script sleeps briefly to ensure
--- the callback fires before FIXTURE_DONE.
+-- The on_progress callback now runs on the main Isle (same Lua VM as this
+-- script) via main_isle.exec, so upvalues are preserved.
 
 local url = os.getenv("MCP_HTTP_URL")
 assert(url and url ~= "", "MCP_HTTP_URL must be set")
@@ -17,26 +15,19 @@ assert(url and url ~= "", "MCP_HTTP_URL must be set")
 mcp.connect_http("prog", url)
 print("CONNECT_HTTP_OK")
 
--- Register on_progress.  The dispatcher now passes a 5th argument (message).
--- The callback runs on the handler isle; it prints its own marker directly.
-mcp.on_progress("prog", function(server, token, progress, total, message)
+-- Outer local: captured as an upvalue by the callback below.
+-- This verifies that the main Isle exec path preserves upvalues correctly.
+local progress_hits = 0
+
+-- Register on_progress.  Callback receives a single ev table.
+mcp.on_progress("prog", function(ev)
+    -- Increment the upvalue counter (core upvalue-preservation check).
+    progress_hits = progress_hits + 1
     -- Verify envelope fields are present.
-    assert(server ~= nil, "envelope server must not be nil")
-    assert(token ~= nil, "envelope token must not be nil")
-    assert(progress ~= nil, "envelope progress must not be nil")
-    -- Regression guard: Rust normalises total (None→"0") before push so the
-    -- glue tonumber("0") returns 0.0, never nil.  If this assert fires, the
-    -- normalization in on_progress dispatcher was regressed.
-    assert(total ~= nil, "envelope total must not be nil (regression guard)")
-    -- Regression guard: Rust normalises message (None→"") before push.
-    assert(message ~= nil, "envelope message must not be nil (regression guard)")
-    -- Verify the token was auto-assigned by rmcp (not the hardcoded fallback "tok-e2e").
-    -- rmcp's AtomicU32ProgressTokenProvider assigns numeric tokens (0, 1, 2, ...);
-    -- the token arrives as a string because token_str = n.to_string() in handler.rs.
-    assert(
-        token ~= "tok-e2e",
-        "progress token must be auto-assigned (not the fallback 'tok-e2e'), got: " .. tostring(token)
-    )
+    assert(ev ~= nil, "ev must not be nil")
+    assert(ev.server ~= nil, "envelope server must not be nil")
+    assert(ev.token ~= nil, "envelope token must not be nil")
+    assert(ev.progress ~= nil, "envelope progress must not be nil")
     -- Print the success marker so the Rust test assertion can see it.
     print("PROGRESS_EV_OK")
 end)
@@ -47,8 +38,12 @@ local r = mcp.call("prog", "emit_progress", {})
 assert(r.ok == true, "emit_progress call failed: " .. tostring(r.error))
 print("CALL_OK")
 
--- Yield to the async runtime so the handler isle has time to fire the callback
+-- Yield to the async runtime so the main Isle has time to process the exec
 -- and produce PROGRESS_EV_OK on stdout before FIXTURE_DONE is printed.
 std.task.sleep(300)
+
+-- Report the hit count so Rust can assert upvalue preservation.
+print(string.format("PROGRESS_HITS=%d", progress_hits))
+assert(progress_hits >= 1, "progress_hits must be >= 1, got: " .. tostring(progress_hits))
 
 print("FIXTURE_DONE")

@@ -472,25 +472,11 @@ local function connect_mcp_servers(servers, opts)
         if opts.on_progress then
             local sn = name
             local user_cb = opts.on_progress
-            -- Store user_cb on handler isle under __mcp_user_progress_cbs[sn] so the
-            -- envelope wrapper below can call it without capturing it as an upvalue.
-            -- Upvalues captured by a closure are nil after bytecode dump/reload across
-            -- Lua VMs (handler isle is a separate VM); only globals via _ENV are safe.
-            mcp._store_progress_ucb(sn, user_cb)
-            -- Register a self-contained envelope wrapper.  The wrapper must NOT capture
-            -- any outer-scope locals as upvalues -- it reads user_cb from _G instead.
-            mcp.on_progress(sn, function(srv, token, progress, total, message)
-                local cb = __mcp_user_progress_cbs and __mcp_user_progress_cbs[srv]
-                if type(cb) ~= "function" then return end
-                local ev = {
-                    type = "progress",
-                    server = srv,
-                    token = token,
-                    progress = progress,
-                    total = total,
-                    message = message,
-                }
-                local ok, cb_err = pcall(cb, ev)
+            -- Register user_cb directly on the main Isle (no bytecode dump needed).
+            -- The callback runs with upvalues intact because main Isle is never
+            -- crossed; only the event table `ev` is constructed on the Rust side.
+            mcp.on_progress(sn, function(ev)
+                local ok, cb_err = pcall(user_cb, ev)
                 if not ok then
                     log.warn("agent: on_progress callback error: " .. tostring(cb_err))
                 end
@@ -581,22 +567,9 @@ local function connect_mcp_servers(servers, opts)
                         local sn = name
                         if opts.on_log then
                             local user_cb = opts.on_log
-                            -- Same upvalue-safe pattern as opts.on_progress above.
-                            mcp._store_log_ucb(sn, user_cb)
-                            mcp.on_log(sn, function(srv, level, logger, data_json)
-                                local cb = __mcp_user_log_cbs and __mcp_user_log_cbs[srv]
-                                if type(cb) ~= "function" then return end
-                                -- Defensive nil-guards (Rust normalises these but belt-and-suspenders).
-                                local logger_s = logger or ""
-                                local data_s = data_json or ""
-                                local ev = {
-                                    type = "log",
-                                    server = srv,
-                                    level = level,
-                                    logger = logger_s,
-                                    data = data_s,
-                                }
-                                local ok, cb_err = pcall(cb, ev)
+                            -- Register user_cb directly on the main Isle (upvalue-safe).
+                            mcp.on_log(sn, function(ev)
+                                local ok, cb_err = pcall(user_cb, ev)
                                 if not ok then
                                     log.warn("agent: on_log callback error: " .. tostring(cb_err))
                                 end

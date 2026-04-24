@@ -373,12 +373,16 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     )
     .await?;
 
-    // Wire the handler Isle into McpManager so Lua notification callbacks
-    // (on_progress etc.) can be dispatched from the rmcp task thread.
-    mcp_manager
-        .write()
-        .await
-        .set_handler_isle(Arc::clone(&handler_isle));
+    // Wire both Isles into McpManager so Lua notification callbacks can be
+    // dispatched from the rmcp task thread.
+    // - handler_isle: sampling/createMessage dispatch (exec on handler Isle)
+    // - main_isle: progress/log notification dispatch (exec on main Isle so
+    //   user callback upvalues are preserved — no bytecode dump/reload needed)
+    {
+        let mut mgr = mcp_manager.write().await;
+        mgr.set_handler_isle(Arc::clone(&handler_isle));
+        mgr.set_main_isle(Arc::clone(&isle));
+    }
 
     // ── HostContext + bridge registration ──────────────────────────────
     // Wrap the isle in an Arc so `HostContext` can hand it to

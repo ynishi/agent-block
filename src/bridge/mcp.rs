@@ -27,6 +27,21 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let manager = &ctx.mcp_manager;
     let handler_isle = Arc::clone(&ctx.handler_isle);
     let mcp_tbl = lua.create_table()?;
+
+    // Initialise the user-callback global tables on the main Isle so that
+    // `on_progress` / `on_log` can store closures directly (upvalue-safe: no
+    // bytecode dump/reload across VMs required).
+    if lua
+        .globals()
+        .get::<mlua::Value>(MCP_USER_PROGRESS_CBS)?
+        .is_nil()
+    {
+        lua.globals()
+            .set(MCP_USER_PROGRESS_CBS, lua.create_table()?)?;
+    }
+    if lua.globals().get::<mlua::Value>(MCP_USER_LOG_CBS)?.is_nil() {
+        lua.globals().set(MCP_USER_LOG_CBS, lua.create_table()?)?;
+    }
     let script_name: String = lua
         .globals()
         .get::<Option<String>>("_SCRIPT_NAME")?
@@ -372,250 +387,51 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
     // mcp.on_progress(server_name, fn)
     // Registers a Lua callback for progress notifications from `server_name`.
-    // The callback signature: function(server_name, progress_token, progress, total, message)
-    // `message` is an optional human-readable description (empty string when absent).
-    // `fn` must be a pure Lua function (C functions are not supported).
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server, token, progress, total (optional), message (optional)
+    // `fn` is stored directly in the main Isle's `__mcp_user_progress_cbs[server_name]`
+    // so upvalues are preserved (no bytecode dump/reload across Lua VMs).
     {
         let mgr = Arc::clone(manager);
-        let isle = Arc::clone(&handler_isle);
         mcp_tbl.set(
             "on_progress",
-            lua.create_async_function(
-                move |_, (server_name, func): (String, LuaFunction)| {
-                    let mgr = Arc::clone(&mgr);
-                    let isle = Arc::clone(&isle);
-                    async move {
-                        if func.info().what != "Lua" {
-                            return Err(LuaError::external(
-                                "mcp.on_progress: handler must be a pure Lua function \
-                                 (C functions and Rust-bound callbacks are not supported)",
-                            ));
-                        }
-                        let bytecode = func.dump(true);
-                        if bytecode.is_empty() {
-                            return Err(LuaError::external(
-                                "mcp.on_progress: Function::dump returned empty bytecode",
-                            ));
-                        }
-
-                        // Forward bytecode to handler Isle: register in __mcp_progress_handlers
-                        let server_for_exec = server_name.clone();
-                        let bytecode_name = format!("@mcp_progress[{server_name}]");
-                        isle.exec(move |lua| {
-                            use mlua::prelude::*;
-                            let loaded: LuaFunction = lua
-                                .load(bytecode.as_slice())
-                                .set_mode(mlua::ChunkMode::Binary)
-                                .set_name(&bytecode_name)
-                                .into_function()
-                                .map_err(|e| IsleError::Lua(format!("on_progress load: {e}")))?;
-                            let tbl: LuaTable = lua
-                                .globals()
-                                .get("__mcp_progress_handlers")
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("on_progress get table: {e}"))
-                                })?;
-                            tbl.set(server_for_exec.as_str(), loaded)
-                                .map_err(|e| IsleError::Lua(format!("on_progress set: {e}")))?;
-                            Ok(String::new())
-                        })
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(server = %server_name, error = %e, "mcp.on_progress: handler isle load failed");
-                            LuaError::external(format!(
-                                "mcp.on_progress: handler isle load failed: {e}"
-                            ))
-                        })?;
-
-                        // Mark the registry so AgentBlockClientHandler::on_progress
-                        // knows to dispatch notifications for this server.
-                        mgr.read().await.handler.mark_on_progress(&server_name);
-
-                        Ok(())
-                    }
-                },
-            )?,
-        )?;
-    }
-
-    // mcp.on_log(server_name, fn)
-    // Registers a Lua callback for logging notifications from `server_name`.
-    // The callback signature: function(server_name, level, logger, data_json)
-    // `fn` must be a pure Lua function (C functions are not supported).
-    {
-        let mgr = Arc::clone(manager);
-        let isle = Arc::clone(&handler_isle);
-        mcp_tbl.set(
-            "on_log",
-            lua.create_async_function(
-                move |_, (server_name, func): (String, LuaFunction)| {
-                    let mgr = Arc::clone(&mgr);
-                    let isle = Arc::clone(&isle);
-                    async move {
-                        if func.info().what != "Lua" {
-                            return Err(LuaError::external(
-                                "mcp.on_log: handler must be a pure Lua function \
-                                 (C functions and Rust-bound callbacks are not supported)",
-                            ));
-                        }
-                        let bytecode = func.dump(true);
-                        if bytecode.is_empty() {
-                            return Err(LuaError::external(
-                                "mcp.on_log: Function::dump returned empty bytecode",
-                            ));
-                        }
-
-                        let server_for_exec = server_name.clone();
-                        let bytecode_name = format!("@mcp_log[{server_name}]");
-                        isle.exec(move |lua| {
-                            use mlua::prelude::*;
-                            let loaded: LuaFunction = lua
-                                .load(bytecode.as_slice())
-                                .set_mode(mlua::ChunkMode::Binary)
-                                .set_name(&bytecode_name)
-                                .into_function()
-                                .map_err(|e| IsleError::Lua(format!("on_log load: {e}")))?;
-                            let tbl: LuaTable = lua
-                                .globals()
-                                .get("__mcp_log_handlers")
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("on_log get table: {e}"))
-                                })?;
-                            tbl.set(server_for_exec.as_str(), loaded)
-                                .map_err(|e| IsleError::Lua(format!("on_log set: {e}")))?;
-                            Ok(String::new())
-                        })
-                        .await
-                        .map_err(|e| {
-                            tracing::error!(server = %server_name, error = %e, "mcp.on_log: handler isle load failed");
-                            LuaError::external(format!(
-                                "mcp.on_log: handler isle load failed: {e}"
-                            ))
-                        })?;
-
-                        mgr.read().await.handler.mark_on_log(&server_name);
-
-                        Ok(())
-                    }
-                },
-            )?,
-        )?;
-    }
-
-    // mcp._store_progress_ucb(server_name, fn)
-    // Internal: store a user-provided progress callback on the handler Isle in
-    // `__mcp_user_progress_cbs[server_name]` WITHOUT marking the dispatch registry.
-    //
-    // Used by `blocks/agent/init.lua` `connect_mcp_servers` so that the
-    // self-contained envelope wrapper can call `user_cb` via a global lookup
-    // instead of capturing it as an upvalue (upvalues are nil after bytecode
-    // dump/reload across Lua VMs).
-    {
-        let isle = Arc::clone(&handler_isle);
-        mcp_tbl.set(
-            "_store_progress_ucb",
-            lua.create_async_function(move |_, (server_name, func): (String, LuaFunction)| {
-                let isle = Arc::clone(&isle);
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
                 async move {
-                    if func.info().what != "Lua" {
-                        return Err(LuaError::external(
-                            "mcp._store_progress_ucb: handler must be a pure Lua function",
-                        ));
-                    }
-                    let bytecode = func.dump(true);
-                    if bytecode.is_empty() {
-                        return Err(LuaError::external(
-                            "mcp._store_progress_ucb: Function::dump returned empty bytecode",
-                        ));
-                    }
-                    let server_for_exec = server_name.clone();
-                    let bytecode_name = format!("@mcp_progress_ucb[{server_name}]");
-                    isle.exec(move |lua| {
-                        use mlua::prelude::*;
-                        let loaded: LuaFunction = lua
-                            .load(bytecode.as_slice())
-                            .set_mode(mlua::ChunkMode::Binary)
-                            .set_name(&bytecode_name)
-                            .into_function()
-                            .map_err(|e| {
-                                IsleError::Lua(format!("_store_progress_ucb load: {e}"))
-                            })?;
-                        let tbl: LuaTable =
-                            lua.globals().get(MCP_USER_PROGRESS_CBS).map_err(|e| {
-                                IsleError::Lua(format!("_store_progress_ucb get table: {e}"))
-                            })?;
-                        tbl.set(server_for_exec.as_str(), loaded)
-                            .map_err(|e| IsleError::Lua(format!("_store_progress_ucb set: {e}")))?;
-                        Ok(String::new())
-                    })
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            server = %server_name,
-                            error = %e,
-                            "mcp._store_progress_ucb: handler isle load failed"
-                        );
-                        LuaError::external(format!(
-                            "mcp._store_progress_ucb: handler isle load failed: {e}"
-                        ))
-                    })?;
+                    // Store the closure directly in the main Isle's global table.
+                    // `lua` here IS the main Isle (this bridge runs on the main Isle).
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_PROGRESS_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+
+                    // Mark the registry so AgentBlockClientHandler::on_progress
+                    // knows to dispatch notifications for this server.
+                    mgr.read().await.handler.mark_on_progress(&server_name);
+
                     Ok(())
                 }
             })?,
         )?;
     }
 
-    // mcp._store_log_ucb(server_name, fn)
-    // Internal: store a user-provided log callback on the handler Isle in
-    // `__mcp_user_log_cbs[server_name]` WITHOUT marking the dispatch registry.
-    //
-    // Same rationale as `_store_progress_ucb`.
+    // mcp.on_log(server_name, fn)
+    // Registers a Lua callback for logging notifications from `server_name`.
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server, level, logger, data
+    // `fn` is stored directly in the main Isle's `__mcp_user_log_cbs[server_name]`
+    // so upvalues are preserved (no bytecode dump/reload across Lua VMs).
     {
-        let isle = Arc::clone(&handler_isle);
+        let mgr = Arc::clone(manager);
         mcp_tbl.set(
-            "_store_log_ucb",
-            lua.create_async_function(move |_, (server_name, func): (String, LuaFunction)| {
-                let isle = Arc::clone(&isle);
+            "on_log",
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
                 async move {
-                    if func.info().what != "Lua" {
-                        return Err(LuaError::external(
-                            "mcp._store_log_ucb: handler must be a pure Lua function",
-                        ));
-                    }
-                    let bytecode = func.dump(true);
-                    if bytecode.is_empty() {
-                        return Err(LuaError::external(
-                            "mcp._store_log_ucb: Function::dump returned empty bytecode",
-                        ));
-                    }
-                    let server_for_exec = server_name.clone();
-                    let bytecode_name = format!("@mcp_log_ucb[{server_name}]");
-                    isle.exec(move |lua| {
-                        use mlua::prelude::*;
-                        let loaded: LuaFunction = lua
-                            .load(bytecode.as_slice())
-                            .set_mode(mlua::ChunkMode::Binary)
-                            .set_name(&bytecode_name)
-                            .into_function()
-                            .map_err(|e| IsleError::Lua(format!("_store_log_ucb load: {e}")))?;
-                        let tbl: LuaTable = lua.globals().get(MCP_USER_LOG_CBS).map_err(|e| {
-                            IsleError::Lua(format!("_store_log_ucb get table: {e}"))
-                        })?;
-                        tbl.set(server_for_exec.as_str(), loaded)
-                            .map_err(|e| IsleError::Lua(format!("_store_log_ucb set: {e}")))?;
-                        Ok(String::new())
-                    })
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            server = %server_name,
-                            error = %e,
-                            "mcp._store_log_ucb: handler isle load failed"
-                        );
-                        LuaError::external(format!(
-                            "mcp._store_log_ucb: handler isle load failed: {e}"
-                        ))
-                    })?;
+                    // Store the closure directly in the main Isle's global table.
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_LOG_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+
+                    mgr.read().await.handler.mark_on_log(&server_name);
+
                     Ok(())
                 }
             })?,
