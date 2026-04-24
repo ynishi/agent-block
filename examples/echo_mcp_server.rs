@@ -227,8 +227,10 @@ impl ServerHandler for EchoServer {
                     .max(1);
 
                 // Extract progress token from _meta if provided.
-                let token_opt: Option<ProgressToken> =
-                    params.meta.as_ref().and_then(|m| m.get_progress_token());
+                // In rmcp 1.4.0, `_meta` is deserialized into `ctx.meta` (via
+                // extensions), not `params.meta` which is always None after the
+                // wire round-trip.
+                let token_opt: Option<ProgressToken> = ctx.meta.get_progress_token();
 
                 for step in 1..=steps {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

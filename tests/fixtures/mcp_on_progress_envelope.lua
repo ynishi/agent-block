@@ -24,6 +24,13 @@ mcp.on_progress("prog", function(server, token, progress, total, message)
     assert(server ~= nil, "envelope server must not be nil")
     assert(token ~= nil, "envelope token must not be nil")
     assert(progress ~= nil, "envelope progress must not be nil")
+    -- Verify the token was auto-assigned by rmcp (not the hardcoded fallback "tok-e2e").
+    -- rmcp's AtomicU32ProgressTokenProvider assigns numeric tokens (0, 1, 2, ...);
+    -- the token arrives as a string because token_str = n.to_string() in handler.rs.
+    assert(
+        token ~= "tok-e2e",
+        "progress token must be auto-assigned (not the fallback 'tok-e2e'), got: " .. tostring(token)
+    )
     -- Print the success marker so the Rust test assertion can see it.
     print("PROGRESS_EV_OK")
 end)

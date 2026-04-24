@@ -209,11 +209,21 @@ impl ServerHandler for ProgressTestServer {
         _params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // Push a progress notification before returning the result.
+        // Extract the progressToken that the client auto-attached in _meta.
+        // In rmcp 1.4.0, _meta is deserialized into ctx.meta (not params.meta).
+        // rmcp's Peer::send_request assigns a counter-based token via
+        // AtomicU32ProgressTokenProvider; the fallback "tok-e2e" is never used
+        // in practice but keeps the test server robust.
+        let token = ctx
+            .meta
+            .get_progress_token()
+            .map(|t| t.0.clone())
+            .unwrap_or(NumberOrString::String("tok-e2e".into()));
+        // Push a progress notification echoing the token back to the client.
         let _ = ctx
             .peer
             .notify_progress(ProgressNotificationParam {
-                progress_token: ProgressToken(NumberOrString::String("tok-e2e".into())),
+                progress_token: ProgressToken(token),
                 progress: 1.0,
                 total: Some(1.0),
                 message: Some("done".into()),

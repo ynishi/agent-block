@@ -573,6 +573,10 @@ local function connect_mcp_servers(servers, opts)
                         if opts.on_log then
                             local user_cb = opts.on_log
                             mcp.on_log(sn, function(srv, level, logger, data_json)
+                                -- Nil-guard: Rust always sends "" for None fields but be
+                                -- defensive in case arg positions shift in future refactors.
+                                logger = logger or ""
+                                data_json = data_json or ""
                                 local ev = {
                                     type = "log",
                                     server = srv,

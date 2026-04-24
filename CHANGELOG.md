@@ -81,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `log.debug|info|warn|error` by severity. Ignored when `on_log` is set. Logging
   capability gate applies. Default `false`.
 
+### Fixed
+
+- `on_log` callback wrapper in `blocks/agent/init.lua`: added `logger = logger or ""`
+  and `data_json = data_json or ""` nil-guards before envelope construction to prevent
+  nil-concat crashes if argument positions shift in future refactors.
+- `McpManager::call_tool` now enables progress notifications by relying on rmcp's
+  `AtomicU32ProgressTokenProvider`, which auto-attaches a counter-based `progressToken`
+  when an `on_progress` handler is registered for the target server.
+
 ### Changed
 
 - `src/mcp_client.rs` split into `src/mcp_client/mod.rs` + `src/mcp_client/handler.rs` module.
@@ -92,9 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   progress / log / sampling callback wiring is deferred to subsequent subtasks.
 - `rmcp` feature flags expanded: `client-side-sse` and `transport-streamable-http-client`
   added to `Cargo.toml` (no transport code activated yet; enables Subtask 2 HTTP connect).
-- `mcp.call_tool` now auto-injects `_meta.progressToken` (UUID v4) into every tool call
-  request. Servers that support progress notifications will use this token; servers that
-  do not will ignore it. Existing calls that did not set `_meta` are unaffected.
+- Progress notifications now carry the rmcp-assigned counter `progressToken`; the
+  `on_progress` callback receives it in `ev.token`. Calls to servers without a
+  registered handler are unaffected.
 
 ### Security
 
