@@ -105,6 +105,34 @@ async fn spawn_counter_http_server() -> (String, CancellationToken) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Round-trip: `mcp.connect_http` → `mcp.cancel` against an in-process
+/// `StreamableHttpService` (stateless mode).
+///
+/// Verifies that `mcp.cancel(server_name, request_id)` does not throw even
+/// when the server does not recognise the (sentinel) request ID.
+#[tokio::test]
+async fn connect_http_then_cancel_roundtrip() {
+    let (url, ct) = spawn_counter_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_http_cancel.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CANCEL_OK"))
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
 /// Round-trip: `mcp.connect_http` → `mcp.list_tools` against an in-process
 /// `StreamableHttpService` (stateless / SSE mode).
 ///

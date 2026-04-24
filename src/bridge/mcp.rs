@@ -436,6 +436,155 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.on_log(server_name, fn)
+    // Registers a Lua callback for logging notifications from `server_name`.
+    // The callback signature: function(server_name, level, logger, data_json)
+    // `fn` must be a pure Lua function (C functions are not supported).
+    {
+        let mgr = Arc::clone(manager);
+        let isle = Arc::clone(&handler_isle);
+        mcp_tbl.set(
+            "on_log",
+            lua.create_async_function(
+                move |_, (server_name, func): (String, LuaFunction)| {
+                    let mgr = Arc::clone(&mgr);
+                    let isle = Arc::clone(&isle);
+                    async move {
+                        if func.info().what != "Lua" {
+                            return Err(LuaError::external(
+                                "mcp.on_log: handler must be a pure Lua function \
+                                 (C functions and Rust-bound callbacks are not supported)",
+                            ));
+                        }
+                        let bytecode = func.dump(true);
+                        if bytecode.is_empty() {
+                            return Err(LuaError::external(
+                                "mcp.on_log: Function::dump returned empty bytecode",
+                            ));
+                        }
+
+                        let server_for_exec = server_name.clone();
+                        let bytecode_name = format!("@mcp_log[{server_name}]");
+                        isle.exec(move |lua| {
+                            use mlua::prelude::*;
+                            let loaded: LuaFunction = lua
+                                .load(bytecode.as_slice())
+                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_name(&bytecode_name)
+                                .into_function()
+                                .map_err(|e| IsleError::Lua(format!("on_log load: {e}")))?;
+                            let tbl: LuaTable = lua
+                                .globals()
+                                .get("__mcp_log_handlers")
+                                .map_err(|e| {
+                                    IsleError::Lua(format!("on_log get table: {e}"))
+                                })?;
+                            tbl.set(server_for_exec.as_str(), loaded)
+                                .map_err(|e| IsleError::Lua(format!("on_log set: {e}")))?;
+                            Ok(String::new())
+                        })
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(server = %server_name, error = %e, "mcp.on_log: handler isle load failed");
+                            LuaError::external(format!(
+                                "mcp.on_log: handler isle load failed: {e}"
+                            ))
+                        })?;
+
+                        mgr.read().await.handler.mark_on_log(&server_name);
+
+                        Ok(())
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // mcp.cancel(server_name, request_id)
+    // Send a notifications/cancelled to the named server.
+    // request_id is a number. Pass 0 if you do not have a specific ID.
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "cancel",
+            lua.create_async_function(move |_, (server_name, request_id): (String, i64)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    mgr.read().await.send_cancelled(&server_name, request_id);
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.set_sampling_handler(server_name, fn)
+    // Register a Lua callback for sampling/createMessage requests from `server_name`.
+    // The callback signature: function(server_name, params_json) -> table
+    //   where the returned table has fields: model, stop_reason, role, content
+    // `fn` must be a pure Lua function.
+    {
+        let mgr = Arc::clone(manager);
+        let isle = Arc::clone(&handler_isle);
+        mcp_tbl.set(
+            "set_sampling_handler",
+            lua.create_async_function(
+                move |_, (server_name, func): (String, LuaFunction)| {
+                    let mgr = Arc::clone(&mgr);
+                    let isle = Arc::clone(&isle);
+                    async move {
+                        if func.info().what != "Lua" {
+                            return Err(LuaError::external(
+                                "mcp.set_sampling_handler: handler must be a pure Lua function \
+                                 (C functions and Rust-bound callbacks are not supported)",
+                            ));
+                        }
+                        let bytecode = func.dump(true);
+                        if bytecode.is_empty() {
+                            return Err(LuaError::external(
+                                "mcp.set_sampling_handler: Function::dump returned empty bytecode",
+                            ));
+                        }
+
+                        let server_for_exec = server_name.clone();
+                        let bytecode_name = format!("@mcp_sampling[{server_name}]");
+                        isle.exec(move |lua| {
+                            use mlua::prelude::*;
+                            let loaded: LuaFunction = lua
+                                .load(bytecode.as_slice())
+                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_name(&bytecode_name)
+                                .into_function()
+                                .map_err(|e| {
+                                    IsleError::Lua(format!("set_sampling_handler load: {e}"))
+                                })?;
+                            let tbl: LuaTable = lua
+                                .globals()
+                                .get("__mcp_sampling_handlers")
+                                .map_err(|e| {
+                                    IsleError::Lua(format!("set_sampling_handler get table: {e}"))
+                                })?;
+                            tbl.set(server_for_exec.as_str(), loaded).map_err(|e| {
+                                IsleError::Lua(format!("set_sampling_handler set: {e}"))
+                            })?;
+                            Ok(String::new())
+                        })
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(server = %server_name, error = %e, "mcp.set_sampling_handler: handler isle load failed");
+                            LuaError::external(format!(
+                                "mcp.set_sampling_handler: handler isle load failed: {e}"
+                            ))
+                        })?;
+
+                        mgr.read().await.handler.mark_sampling(&server_name);
+
+                        Ok(())
+                    }
+                },
+            )?,
+        )?;
+    }
+
     lua.globals().set("mcp", mcp_tbl)?;
     Ok(())
 }

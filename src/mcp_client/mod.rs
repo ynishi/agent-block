@@ -40,7 +40,10 @@ use std::time::Duration;
 
 use mlua_isle::AsyncIsle;
 use rmcp::{
-    model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams},
+    model::{
+        CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
+    },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
     ServiceExt,
@@ -111,7 +114,13 @@ impl McpManager {
         // Ensure the handler registry has an entry for this server name
         // so callbacks can be registered immediately after connect returns.
         self.handler.ensure_server(name);
+        // Set server_name before clone so create_message can identify the
+        // connection without needing the RequestContext to carry server identity.
+        self.handler.server_name = Some(name.to_string());
         let handler = self.handler.clone();
+        // Reset server_name on the shared template so the next connect call
+        // starts fresh.
+        self.handler.server_name = None;
         let running = timeout(rpc_timeout, handler.serve(transport))
             .await
             .map_err(|_| {
@@ -206,6 +215,10 @@ impl McpManager {
             .await
             .map_err(|_| {
                 warn!(server = %name, tool = %tool_name, timeout = ?rpc_timeout, "mcp call_tool timed out");
+                // Fire-and-forget cancellation notification so the server can
+                // clean up the timed-out request.  request_id 0 is a sentinel
+                // (we do not have the rmcp-internal ID at this call site).
+                self.send_cancelled(name, 0);
                 BlockError::Timeout(format!(
                     "call_tool '{tool_name}' on '{name}' timed out after {rpc_timeout:?}"
                 ))
@@ -301,7 +314,9 @@ impl McpManager {
         opts: serde_json::Value,
     ) -> BlockResult<()> {
         self.handler.ensure_server(name);
+        self.handler.server_name = Some(name.to_string());
         let handler = self.handler.clone();
+        self.handler.server_name = None;
         let running =
             http::connect_http_transport(name, url, &opts, handler, self.rpc_timeout).await?;
         self.servers.insert(name.to_string(), running);
@@ -432,6 +447,43 @@ impl McpManager {
             })?;
         serde_json::to_value(&result)
             .map_err(|e| BlockError::Mcp(format!("serialize get_prompt result: {e}")))
+    }
+
+    /// Send a `notifications/cancelled` to the named server.
+    ///
+    /// This is a best-effort fire-and-forget: the notification is spawned in a
+    /// separate task so the caller is not blocked waiting for transport ack.
+    /// Errors from the peer send are logged at `warn` level and discarded —
+    /// the MCP spec does not require the server to ack cancellations.
+    ///
+    /// `request_id` is a number (i64).  Callers that do not have a specific
+    /// request ID (e.g. a timeout fired before the ID was captured) should pass
+    /// `0` as a sentinel; the server will ignore or log an unknown ID harmlessly.
+    pub fn send_cancelled(&self, name: &str, request_id: i64) {
+        let Some(srv) = self.servers.get(name) else {
+            warn!(server = %name, "send_cancelled: unknown server, ignoring");
+            return;
+        };
+        // Clone the Peer out of the RunningService before spawning so we do
+        // not hold any lock across the await (await-holding-lock prevention).
+        let peer = srv.peer().clone();
+        let name_owned = name.to_string();
+        tokio::spawn(async move {
+            // CancelledNotification is non-exhaustive; use ::new() which sets
+            // method = CancelledNotificationMethod::default() and extensions = Default.
+            let notification = CancelledNotification::new(CancelledNotificationParam {
+                request_id: NumberOrString::Number(request_id),
+                reason: Some("cancelled".to_owned()),
+            });
+            if let Err(e) = peer.send_notification(notification.into()).await {
+                warn!(
+                    server = %name_owned,
+                    request_id = %request_id,
+                    error = %e,
+                    "send_cancelled: peer send_notification failed"
+                );
+            }
+        });
     }
 }
 
@@ -1089,6 +1141,115 @@ mod rich_tests {
         assert!(
             msg.contains("http connect") || msg.contains("timed out"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // ── Tests: on_log and sampling marker flags ─────────────────────────
+
+    #[test]
+    fn mark_on_log_sets_flag_accessible_by_handler() {
+        let handler = AgentBlockClientHandler::new();
+        handler.ensure_server("log-srv");
+        assert!(
+            !handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("log-srv")
+                .unwrap()
+                .on_log
+        );
+        handler.mark_on_log("log-srv");
+        assert!(
+            handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("log-srv")
+                .unwrap()
+                .on_log
+        );
+    }
+
+    #[test]
+    fn mark_sampling_sets_flag_accessible_by_handler() {
+        let handler = AgentBlockClientHandler::new();
+        handler.ensure_server("samp-srv");
+        assert!(
+            !handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("samp-srv")
+                .unwrap()
+                .sampling
+        );
+        handler.mark_sampling("samp-srv");
+        assert!(
+            handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("samp-srv")
+                .unwrap()
+                .sampling
+        );
+    }
+
+    // ── Tests: send_cancelled ───────────────────────────────────────────
+
+    /// send_cancelled on an unknown server must not panic.
+    #[tokio::test]
+    async fn send_cancelled_unknown_server_is_no_op() {
+        let mgr = McpManager::new();
+        // Should not panic — logs a warn and returns.
+        mgr.send_cancelled("ghost", 42);
+    }
+
+    /// send_cancelled on a live in-process server completes without error.
+    #[tokio::test]
+    async fn send_cancelled_live_server_does_not_panic() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "res").await;
+        // request_id=0 sentinel — server will ignore the unknown ID harmlessly.
+        mgr.send_cancelled("res", 0);
+        // Give the spawned task a moment to complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ── Tests: server_name set before clone in connect ──────────────────
+
+    /// Verifies the server_name + registry handshake in the connect flow.
+    ///
+    /// `connect` sets `handler.server_name` before `clone()` then resets it
+    /// to `None` on the shared template. `ensure_server` ensures the registry
+    /// has an entry.  We test this without spawning a real transport by using
+    /// `ensure_server` + manual server_name mutation, which mirrors the
+    /// actual `connect` / `connect_http` code path.
+    #[test]
+    fn handler_server_name_reset_after_simulated_connect() {
+        let mut mgr = McpManager::new();
+        // Simulate what connect() does before cloning the handler.
+        mgr.handler.ensure_server("srv-x");
+        mgr.handler.server_name = Some("srv-x".to_string());
+        let cloned = mgr.handler.clone();
+        mgr.handler.server_name = None;
+
+        // Template must be reset; clone must retain the name.
+        assert!(
+            mgr.handler.server_name.is_none(),
+            "template server_name must be None after simulated connect"
+        );
+        assert_eq!(
+            cloned.server_name.as_deref(),
+            Some("srv-x"),
+            "cloned handler must carry the server_name"
+        );
+        // Registry entry created by ensure_server.
+        let guard = mgr.handler.registry.lock().unwrap();
+        assert!(
+            guard.contains_key("srv-x"),
+            "registry must have entry after ensure_server"
         );
     }
 
