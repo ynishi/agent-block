@@ -425,12 +425,18 @@ local function connect_mcp_servers(servers, opts)
         -- otherwise fall back to stdio (srv.command / srv.args).
         local ok, err
         if srv.url then
-            local transport_opts = srv.transport_opts or {}
+            -- Merge server-level trace_context into transport_opts when not already set.
+            local transport_opts = {}
+            for k, v in pairs(srv.transport_opts or {}) do transport_opts[k] = v end
+            if transport_opts.trace_context == nil then
+                transport_opts.trace_context = not not srv.trace_context
+            end
             ok, err = pcall(mcp.connect_http, name, srv.url, transport_opts)
         else
             local command = srv.command
             local args = srv.args or {}
-            ok, err = pcall(mcp.connect, name, command, args)
+            local connect_opts = { trace_context = not not srv.trace_context }
+            ok, err = pcall(mcp.connect, name, command, args, connect_opts)
         end
         if not ok then
             return nil, "mcp connect failed for '" .. name .. "': " .. tostring(err), connected
@@ -483,12 +489,12 @@ local function connect_mcp_servers(servers, opts)
             end)
         elseif opts.progress_to_log then
             local sn = name
-            mcp.on_progress(sn, function(srv, token, progress, total, message)
-                local msg = "mcp progress: server=" .. tostring(srv)
-                    .. " token=" .. tostring(token)
-                    .. " p=" .. tostring(progress) .. "/" .. tostring(total)
-                if message and message ~= "" then
-                    msg = msg .. " msg=" .. message
+            mcp.on_progress(sn, function(ev)
+                local msg = "mcp progress: server=" .. tostring(ev.server)
+                    .. " token=" .. tostring(ev.token)
+                    .. " p=" .. tostring(ev.progress) .. "/" .. tostring(ev.total or "")
+                if ev.message and ev.message ~= "" then
+                    msg = msg .. " msg=" .. ev.message
                 end
                 log.info(msg)
             end)
@@ -576,15 +582,15 @@ local function connect_mcp_servers(servers, opts)
                             end)
                         else
                             -- log_to_stderr=true: bridge to log.* by level
-                            mcp.on_log(sn, function(srv, level, logger, data_json)
-                                local msg = "mcp log: server=" .. tostring(srv)
-                                    .. " logger=" .. tostring(logger)
-                                    .. " data=" .. tostring(data_json)
-                                if level == "debug" then
+                            mcp.on_log(sn, function(ev)
+                                local msg = "mcp log: server=" .. tostring(ev.server)
+                                    .. " logger=" .. tostring(ev.logger)
+                                    .. " data=" .. tostring(ev.data)
+                                if ev.level == "debug" then
                                     log.debug(msg)
-                                elseif level == "warning" then
+                                elseif ev.level == "warning" then
                                     log.warn(msg)
-                                elseif level == "error" then
+                                elseif ev.level == "error" then
                                     log.error(msg)
                                 else
                                     log.info(msg)

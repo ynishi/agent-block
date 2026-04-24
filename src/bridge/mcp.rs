@@ -48,20 +48,28 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         .unwrap_or_else(|| "unknown".to_string());
     let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
 
-    // mcp.connect(name, command, args)
+    // mcp.connect(name, command, args, opts)
+    // opts is an optional table. Supported keys:
+    //   trace_context (bool): if true, inject __ab_obs into call_tool args (default: false)
     {
         let mgr = Arc::clone(manager);
         mcp_tbl.set(
             "connect",
             lua.create_async_function(
-                move |_, (name, command, args): (String, String, Option<LuaTable>)| {
+                move |lua,
+                      (name, command, args, opts): (
+                    String,
+                    String,
+                    Option<LuaValue>,
+                    Option<LuaValue>,
+                )| {
                     let mgr = Arc::clone(&mgr);
                     async move {
                         // Iterate by integer index (1..=len) so argv order is
                         // preserved regardless of table layout. `pairs` gives
                         // no ordering guarantee for integer-keyed tables.
                         let args: Vec<String> = match args {
-                            Some(tbl) => {
+                            Some(LuaValue::Table(tbl)) => {
                                 let len = tbl.raw_len();
                                 let mut v = Vec::with_capacity(len);
                                 for i in 1..=len {
@@ -69,11 +77,22 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                 }
                                 v
                             }
-                            None => Vec::new(),
+                            _ => Vec::new(),
+                        };
+                        // Parse opts for trace_context flag.
+                        let trace_context = match opts {
+                            Some(v) => {
+                                let opts_json = lua_to_json(&lua, v)?;
+                                opts_json
+                                    .get("trace_context")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false)
+                            }
+                            None => false,
                         };
                         mgr.write()
                             .await
-                            .connect(&name, &command, &args)
+                            .connect(&name, &command, &args, trace_context)
                             .await
                             .map_err(LuaError::external)
                     }
@@ -135,7 +154,18 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             Some(v) => lua_to_json(&lua, v)?,
                             None => serde_json::Value::Null,
                         };
-                        inject_obs_context(&mut args_json, fallback_agent_id.as_deref());
+                        // Inject observability context only when the server was
+                        // connected with trace_context=true (opt-in, default false).
+                        // Unconditional injection leaks agent identity to untrusted
+                        // or third-party MCP servers.
+                        let should_inject = mgr
+                            .read()
+                            .await
+                            .handler
+                            .trace_context_enabled(&name);
+                        if should_inject {
+                            inject_obs_context(&mut args_json, fallback_agent_id.as_deref());
+                        }
                         tracing::info!(
                             target: "lua",
                             script = %script_name,
@@ -448,7 +478,9 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
             lua.create_async_function(move |_, (server_name, request_id): (String, i64)| {
                 let mgr = Arc::clone(&mgr);
                 async move {
-                    mgr.read().await.send_cancelled(&server_name, request_id);
+                    mgr.read()
+                        .await
+                        .send_cancelled(&server_name, Some(request_id));
                     Ok(())
                 }
             })?,

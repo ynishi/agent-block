@@ -103,7 +103,18 @@ impl McpManager {
     }
 
     /// Spawn the MCP server process and complete the MCP initialize handshake.
-    pub async fn connect(&mut self, name: &str, command: &str, args: &[String]) -> BlockResult<()> {
+    ///
+    /// `trace_context`: if `true`, `__ab_obs` observability context will be
+    /// injected into `call_tool` arguments for this server.  Defaults to `false`
+    /// (opt-in) so that third-party / untrusted stdio servers do not receive agent
+    /// identity metadata unless explicitly enabled.
+    pub async fn connect(
+        &mut self,
+        name: &str,
+        command: &str,
+        args: &[String],
+        trace_context: bool,
+    ) -> BlockResult<()> {
         let mut cmd = Command::new(command);
         cmd.args(args).stderr(Stdio::inherit());
         let transport = TokioChildProcess::new(cmd).map_err(|e| {
@@ -114,8 +125,15 @@ impl McpManager {
         // Ensure the handler registry has an entry for this server name
         // so callbacks can be registered immediately after connect returns.
         self.handler.ensure_server(name);
+        self.handler.set_trace_context(name, trace_context);
         // Set server_name before clone so create_message can identify the
         // connection without needing the RequestContext to carry server identity.
+        // The mutate-template → clone → reset dance is required because
+        // AgentBlockClientHandler is shared across all connections via Arc<Mutex>
+        // for the registry, but create_message needs per-connection server identity
+        // that is NOT shared.  Cloning after setting server_name gives each
+        // RunningService its own immutable copy of the name while the registry Arc
+        // continues to be shared.  Both connect() and connect_http() use this pattern.
         self.handler.server_name = Some(name.to_string());
         let handler = self.handler.clone();
         // Reset server_name on the shared template so the next connect call
@@ -218,7 +236,10 @@ impl McpManager {
                 // Fire-and-forget cancellation notification so the server can
                 // clean up the timed-out request.  request_id 0 is a sentinel
                 // (we do not have the rmcp-internal ID at this call site).
-                self.send_cancelled(name, 0);
+                // Pass None: we do not have the rmcp-internal request ID at
+                // this call site, and sending ID=0 risks matching a real
+                // in-flight request on a server that allocates from zero.
+                self.send_cancelled(name, None);
                 BlockError::Timeout(format!(
                     "call_tool '{tool_name}' on '{name}' timed out after {rpc_timeout:?}"
                 ))
@@ -306,15 +327,22 @@ impl McpManager {
     /// so that progress/log notification dispatchers can call user Lua callbacks
     /// stored in the main Isle's globals (upvalue-safe path).
     ///
-    /// Idempotent: a second call replaces the previous Isle reference.
+    /// Also starts the bounded notification dispatch task (M-3: capacity-128 channel
+    /// that prevents unbounded memory growth from chatty notification sources).
+    ///
+    /// Idempotent: a second call replaces the previous Isle reference and restarts
+    /// the dispatch task on the new channel.
     pub fn set_main_isle(&mut self, isle: Arc<AsyncIsle>) {
         self.handler.main_isle = Some(isle);
+        self.handler.start_dispatch_task();
     }
 
     /// Connect to an MCP server via Streamable HTTP transport.
     ///
-    /// `opts` may contain `auth_header` (string) for bearer-token authentication.
-    /// Other transport options are reserved for future use.
+    /// `opts` may contain:
+    /// - `auth_header` (string): bearer-token authentication header value.
+    /// - `trace_context` (bool): if `true`, inject `__ab_obs` observability
+    ///   context into `call_tool` arguments. Default: `false` (opt-in).
     ///
     /// The handler Isle must be wired via `set_handler_isle` before calling
     /// this method if `on_progress` callbacks are needed.
@@ -324,7 +352,14 @@ impl McpManager {
         url: &str,
         opts: serde_json::Value,
     ) -> BlockResult<()> {
+        let trace_context = opts
+            .get("trace_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         self.handler.ensure_server(name);
+        self.handler.set_trace_context(name, trace_context);
+        // Same mutate-template → clone → reset dance as connect(); see the comment
+        // there for the rationale (per-connection server_name, shared registry Arc).
         self.handler.server_name = Some(name.to_string());
         let handler = self.handler.clone();
         self.handler.server_name = None;
@@ -484,12 +519,21 @@ impl McpManager {
     /// This is a best-effort fire-and-forget: the notification is spawned in a
     /// separate task so the caller is not blocked waiting for transport ack.
     /// Errors from the peer send are logged at `warn` level and discarded —
-    /// the MCP spec does not require the server to ack cancellations.
+    /// the MCP spec does not require the server to ack cancellations (fire-and-forget
+    /// by design; warn-level logging is intentional).
     ///
-    /// `request_id` is a number (i64).  Callers that do not have a specific
-    /// request ID (e.g. a timeout fired before the ID was captured) should pass
-    /// `0` as a sentinel; the server will ignore or log an unknown ID harmlessly.
-    pub fn send_cancelled(&self, name: &str, request_id: i64) {
+    /// `request_id` is `Some(id)` when the caller has captured the rmcp-internal
+    /// request ID, or `None` when the ID is not available (e.g. a timeout fired
+    /// before the ID was obtained). When `None` the notification is **skipped
+    /// entirely** to avoid accidentally matching request ID 0 on a server that
+    /// allocates IDs starting from zero.
+    pub fn send_cancelled(&self, name: &str, request_id: Option<i64>) {
+        // Skip silently when no ID is available; sending a bogus sentinel value
+        // risks matching a real in-flight request (rmcp allocates from 0).
+        let id = match request_id {
+            Some(id) => id,
+            None => return,
+        };
         let Some(srv) = self.servers.get(name) else {
             warn!(server = %name, "send_cancelled: unknown server, ignoring");
             return;
@@ -502,13 +546,13 @@ impl McpManager {
             // CancelledNotification is non-exhaustive; use ::new() which sets
             // method = CancelledNotificationMethod::default() and extensions = Default.
             let notification = CancelledNotification::new(CancelledNotificationParam {
-                request_id: NumberOrString::Number(request_id),
+                request_id: NumberOrString::Number(id),
                 reason: Some("cancelled".to_owned()),
             });
             if let Err(e) = peer.send_notification(notification.into()).await {
                 warn!(
                     server = %name_owned,
-                    request_id = %request_id,
+                    request_id = %id,
                     error = %e,
                     "send_cancelled: peer send_notification failed"
                 );
@@ -1233,7 +1277,7 @@ mod rich_tests {
     async fn send_cancelled_unknown_server_is_no_op() {
         let mgr = McpManager::new();
         // Should not panic — logs a warn and returns.
-        mgr.send_cancelled("ghost", 42);
+        mgr.send_cancelled("ghost", Some(42));
     }
 
     /// send_cancelled on a live in-process server completes without error.
@@ -1241,8 +1285,8 @@ mod rich_tests {
     async fn send_cancelled_live_server_does_not_panic() {
         let mut mgr = McpManager::new();
         attach_resource_server(&mut mgr, "res").await;
-        // request_id=0 sentinel — server will ignore the unknown ID harmlessly.
-        mgr.send_cancelled("res", 0);
+        // Pass Some(0) as a concrete request_id (live server will ignore unknown IDs).
+        mgr.send_cancelled("res", Some(0));
         // Give the spawned task a moment to complete.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

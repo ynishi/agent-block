@@ -18,6 +18,7 @@ use rmcp::{
     service::{NotificationContext, RequestContext, RoleClient},
     ErrorData as McpError,
 };
+use tokio::sync::mpsc;
 
 /// Constant name of the Lua global table used to store per-server sampling handlers
 /// on the handler Isle.
@@ -40,6 +41,29 @@ pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
 pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
 
+/// Capacity of the bounded notification dispatch channel.
+///
+/// A chatty server emitting progress faster than Lua can consume will fill
+/// the channel; notifications beyond this limit are dropped with a warning
+/// rather than growing memory without bound.
+const NOTIFY_CHANNEL_CAPACITY: usize = 128;
+
+/// Type alias for the event-builder closure used in `NotificationItem`.
+type BuildEvFn = Box<dyn FnOnce(&mlua::Lua, &str) -> mlua::Result<mlua::Table> + Send + 'static>;
+
+/// A single notification item routed through the bounded dispatch channel.
+///
+/// Carries everything the dispatch task needs to call the user Lua callback
+/// on the main Isle: the server name, the callback table key, the event builder
+/// closure, and a label for log messages.
+pub(crate) struct NotificationItem {
+    pub(crate) isle: Arc<AsyncIsle>,
+    pub(crate) server_name: String,
+    pub(crate) cbs_table: &'static str,
+    pub(crate) build_ev: BuildEvFn,
+    pub(crate) caller: &'static str,
+}
+
 /// Per-server registry of optional Lua callbacks.
 ///
 /// Boolean markers: `true` means a handler function has been registered on the
@@ -55,6 +79,10 @@ pub(crate) struct ServerHandlerRegistry {
     pub(crate) on_resource_updated: bool,
     /// Whether a Lua sampling callback is installed on the handler Isle.
     pub(crate) sampling: bool,
+    /// Whether to inject `__ab_obs` trace context into `call_tool` arguments
+    /// for this server. Opt-in (default: `false`) to avoid leaking agent
+    /// identity to untrusted or third-party MCP servers.
+    pub(crate) trace_context: bool,
 }
 
 impl ServerHandlerRegistry {
@@ -64,6 +92,7 @@ impl ServerHandlerRegistry {
             on_log: false,
             on_resource_updated: false,
             sampling: false,
+            trace_context: false,
         }
     }
 }
@@ -86,6 +115,9 @@ impl ServerHandlerRegistry {
 /// - Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
 /// - Subtask 4: progress/log notifications dispatched to main Isle via `exec` so user
 ///   callbacks run with their upvalues intact (no bytecode dump/reload across VMs).
+/// - Subtask 5 (M-3): bounded notification channel replaces per-notification spawns
+///   to cap memory growth when a chatty server floods notifications faster than Lua
+///   can consume them.
 #[derive(Clone)]
 pub struct AgentBlockClientHandler {
     /// Keyed by server name so a single handler instance can serve multiple servers
@@ -102,6 +134,18 @@ pub struct AgentBlockClientHandler {
     /// Server name for this connection — set before clone() in connect/connect_http.
     /// `None` for the shared template handler (before per-server clone).
     pub(crate) server_name: Option<String>,
+    /// Bounded sender for the per-handler notification dispatch channel.
+    ///
+    /// `on_progress` and `on_logging_message` send items here instead of spawning
+    /// an unbounded `tokio::spawn` per notification.  A single dispatch task
+    /// (started via `start_dispatch_task`) drains the channel and calls
+    /// `isle.exec` sequentially, preserving the rmcp-loop-non-blocking property
+    /// while capping queue depth at `NOTIFY_CHANNEL_CAPACITY`.
+    ///
+    /// `mpsc::Sender` is cheap to clone (Arc-backed), so `#[derive(Clone)]`
+    /// on the handler just clones the sender end — all handler clones share the
+    /// same channel and dispatch task.
+    pub(crate) notify_tx: Option<mpsc::Sender<NotificationItem>>,
 }
 
 impl AgentBlockClientHandler {
@@ -116,7 +160,53 @@ impl AgentBlockClientHandler {
             handler_isle: None,
             main_isle: None,
             server_name: None,
+            notify_tx: None,
         }
+    }
+
+    /// Create and start the bounded notification dispatch task.
+    ///
+    /// Must be called after `main_isle` is wired.  Idempotent: a second call
+    /// replaces the channel (the previous dispatch task drains to completion).
+    ///
+    /// Returns a clone of the sender so `McpManager::set_main_isle` can store it
+    /// back onto the shared template handler.
+    pub(crate) fn start_dispatch_task(&mut self) {
+        let (tx, mut rx) = mpsc::channel::<NotificationItem>(NOTIFY_CHANNEL_CAPACITY);
+        self.notify_tx = Some(tx);
+        // Spawn the single dispatch task.  It runs for the lifetime of the channel.
+        tokio::spawn(async move {
+            while let Some(item) = rx.recv().await {
+                let sn = item.server_name.clone();
+                let result = item
+                    .isle
+                    .exec(move |lua| {
+                        use mlua::prelude::*;
+                        let cbs: LuaTable = match lua.globals().get(item.cbs_table) {
+                            Ok(t) => t,
+                            Err(_) => return Ok(String::new()),
+                        };
+                        let cb: LuaFunction = match cbs.get(item.server_name.as_str()) {
+                            Ok(f) => f,
+                            Err(_) => return Ok(String::new()),
+                        };
+                        let ev = (item.build_ev)(lua, item.server_name.as_str()).map_err(|e| {
+                            mlua_isle::IsleError::Lua(format!("{}: build_ev: {e}", item.caller))
+                        })?;
+                        let _ = cb.call::<()>(ev);
+                        Ok(String::new())
+                    })
+                    .await;
+                if let Err(e) = result {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        server = %sn,
+                        error = %e,
+                        "notification dispatch: main isle exec failed"
+                    );
+                }
+            }
+        });
     }
 
     /// Ensure a `ServerHandlerRegistry` entry exists for `server_name`.
@@ -148,6 +238,22 @@ impl AgentBlockClientHandler {
             .entry(server_name.to_string())
             .or_insert_with(ServerHandlerRegistry::new);
         entry.on_log = true;
+    }
+
+    /// Set whether trace context (`__ab_obs`) should be injected into `call_tool`
+    /// arguments for the named server.  Defaults to `false` (opt-in).
+    pub(crate) fn set_trace_context(&self, server_name: &str, enabled: bool) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.trace_context = enabled;
+    }
+
+    /// Return whether trace context injection is enabled for the named server.
+    pub(crate) fn trace_context_enabled(&self, server_name: &str) -> bool {
+        let guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(server_name).is_some_and(|r| r.trace_context)
     }
 
     /// Mark that a Lua sampling handler has been installed on the handler Isle.
@@ -206,16 +312,80 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
     Ok(())
 }
 
+/// Dispatch a notification to the Lua callback stored under `cbs_table[server_name]`
+/// on the provided main Isle.
+///
+/// This helper encapsulates the common "look up cb in globals table → build ev →
+/// spawn → isle.exec → pcall → log error" pattern shared by `on_progress` and
+/// `on_logging_message`. Extracting it here mechanically prevents the H-1-style
+/// divergence where independently-edited methods drift apart.
+///
+/// `build_ev` receives the Lua state and the server name (already moved into the
+/// closure) and must return the event table to pass to the callback. The callback
+/// is invoked with pcall semantics: a Lua error inside the callback is logged at
+/// warn level but does not propagate into the main Isle runtime.
+///
+/// `create_message` is intentionally kept out of scope — it has a different
+/// shape (it returns a value rather than being fire-and-forget).
+fn isle_dispatch<F>(
+    isle: Arc<AsyncIsle>,
+    server_name: String,
+    cbs_table: &'static str,
+    build_ev: F,
+    caller: &'static str,
+) where
+    F: FnOnce(&mlua::Lua, &str) -> mlua::Result<mlua::Table> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let sn = server_name.clone();
+        let result = isle
+            .exec(move |lua| {
+                use mlua::prelude::*;
+                // Look up the per-server callback table on the main Isle.
+                let cbs: LuaTable = match lua.globals().get(cbs_table) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(String::new()), // table not yet initialised
+                };
+                let cb: LuaFunction = match cbs.get(server_name.as_str()) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(String::new()), // no handler for this server
+                };
+                // Build the event table and invoke the user callback.
+                // pcall semantics: absorb errors so a user callback crash
+                // does not propagate into the main Isle runtime.
+                let ev = build_ev(lua, server_name.as_str())
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("{caller}: build_ev: {e}")))?;
+                let _ = cb.call::<()>(ev);
+                Ok(String::new())
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "mcp_client",
+                server = %sn,
+                error = %e,
+                "{}: main isle exec failed",
+                caller
+            );
+        }
+    });
+}
+
 impl ClientHandler for AgentBlockClientHandler {
     fn on_progress(
         &self,
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        // Clone Arc refs BEFORE the async block to avoid holding the Mutex
-        // guard across any await (await-holding-lock anti-pattern).
+        // Clone Arc refs and server_name BEFORE the async block to avoid holding
+        // the Mutex guard across any await (await-holding-lock anti-pattern).
         let main_isle = self.main_isle.clone();
         let registry = Arc::clone(&self.registry);
+        // Clone server_name here (before async move) so the originating server
+        // identity is available inside the future without capturing &self.
+        let server_name_opt = self.server_name.clone();
+        // Clone the notification channel sender (cheap: mpsc::Sender is Arc-backed).
+        let notify_tx = self.notify_tx.clone();
 
         async move {
             let main_isle = match main_isle {
@@ -223,21 +393,23 @@ impl ClientHandler for AgentBlockClientHandler {
                 None => return, // no Isle configured — drop notification
             };
 
-            // Collect server names that have an on_progress handler registered.
-            let server_names: Vec<String> = {
+            // Mirror on_logging_message: dispatch only for the originating server.
+            // The registry-wide fan-out that was here previously was a bug: every
+            // server with on_progress=true would receive every other server's
+            // notification, causing bogus ev.server attributions and callback
+            // over-counting proportional to N_servers.
+            let server_name = match server_name_opt {
+                Some(s) => s,
+                None => return, // no server identity — cannot route notification
+            };
+            let has_cb = {
                 let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .iter()
-                    .filter_map(|(name, reg)| {
-                        if reg.on_progress {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                guard.get(&server_name).is_some_and(|r| r.on_progress)
             };
             // guard is dropped here — no await held
+            if !has_cb {
+                return;
+            }
 
             let token_str = match &params.progress_token.0 {
                 rmcp::model::NumberOrString::Number(n) => n.to_string(),
@@ -247,56 +419,60 @@ impl ClientHandler for AgentBlockClientHandler {
             let total_opt: Option<f64> = params.total;
             let message_opt: Option<String> = params.message;
 
-            for server_name in server_names {
-                let server_for_task = server_name.clone();
-                let token_for_task = token_str.clone();
-                let progress_for_task = progress_f64;
-                let total_for_task = total_opt;
-                let message_for_task = message_opt.clone();
-                let isle_ref = Arc::clone(&main_isle);
-
-                // Spawn each dispatch as a separate task so a slow Lua callback
-                // does not block the rmcp notification loop.
-                tokio::spawn(async move {
-                    let result = isle_ref
-                        .exec(move |lua| {
-                            use mlua::prelude::*;
-                            // Look up __mcp_user_progress_cbs on the main Isle.
-                            let cbs: LuaTable = match lua.globals().get(MCP_USER_PROGRESS_CBS) {
-                                Ok(t) => t,
-                                Err(_) => return Ok(String::new()), // table not yet initialised
-                            };
-                            let cb: LuaFunction = match cbs.get(server_for_task.as_str()) {
-                                Ok(f) => f,
-                                Err(_) => return Ok(String::new()), // no handler for this server
-                            };
-                            // Build the event table passed to the user callback.
-                            let ev = lua.create_table()?;
-                            ev.set("type", "progress")?;
-                            ev.set("server", server_for_task.as_str())?;
-                            ev.set("token", token_for_task.as_str())?;
-                            ev.set("progress", progress_for_task)?;
-                            if let Some(t) = total_for_task {
-                                ev.set("total", t)?;
-                            }
-                            if let Some(ref m) = message_for_task {
-                                ev.set("message", m.as_str())?;
-                            }
-                            // pcall semantics: absorb errors so a user callback crash
-                            // does not propagate into the main Isle runtime.
-                            let _ = cb.call::<()>(ev);
-                            Ok(String::new())
-                        })
-                        .await;
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            target: "mcp_client",
-                            server = %server_name,
-                            error = %e,
-                            "on_progress: main isle exec failed"
-                        );
-                    }
-                });
+            // Route through the bounded channel when available; fall back to the
+            // legacy direct-spawn path (unit-test mode, no channel started yet).
+            if let Some(tx) = notify_tx {
+                let item = NotificationItem {
+                    isle: main_isle,
+                    server_name,
+                    cbs_table: MCP_USER_PROGRESS_CBS,
+                    build_ev: Box::new(move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "progress")?;
+                        ev.set("server", server_for_task)?;
+                        ev.set("token", token_str.as_str())?;
+                        ev.set("progress", progress_f64)?;
+                        if let Some(t) = total_opt {
+                            ev.set("total", t)?;
+                        }
+                        if let Some(ref m) = message_opt {
+                            ev.set("message", m.as_str())?;
+                        }
+                        Ok(ev)
+                    }),
+                    caller: "on_progress",
+                };
+                if let Err(e) = tx.try_send(item) {
+                    // Channel full: drop this notification and warn.
+                    tracing::warn!(
+                        target: "mcp_client",
+                        error = %e,
+                        "on_progress: notification channel full, dropping notification \
+                         (server is emitting faster than Lua can consume)"
+                    );
+                }
+            } else {
+                // Fallback: legacy unbounded spawn (unit-test mode / no channel).
+                isle_dispatch(
+                    main_isle,
+                    server_name,
+                    MCP_USER_PROGRESS_CBS,
+                    move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "progress")?;
+                        ev.set("server", server_for_task)?;
+                        ev.set("token", token_str.as_str())?;
+                        ev.set("progress", progress_f64)?;
+                        if let Some(t) = total_opt {
+                            ev.set("total", t)?;
+                        }
+                        if let Some(ref m) = message_opt {
+                            ev.set("message", m.as_str())?;
+                        }
+                        Ok(ev)
+                    },
+                    "on_progress",
+                );
             }
         }
     }
@@ -309,6 +485,7 @@ impl ClientHandler for AgentBlockClientHandler {
         let main_isle = self.main_isle.clone();
         let registry = Arc::clone(&self.registry);
         let server_name = self.server_name.clone();
+        let notify_tx = self.notify_tx.clone();
 
         async move {
             let level = &params.level;
@@ -351,42 +528,51 @@ impl ClientHandler for AgentBlockClientHandler {
 
             if has_lua_handler {
                 if let (Some(isle), Some(sn)) = (main_isle, server_name) {
-                    let sn_task = sn.clone();
                     let level_task = level_str.clone();
                     let logger_task = logger.clone();
                     let data_task = data_str.clone();
 
-                    tokio::spawn(async move {
-                        let result = isle
-                            .exec(move |lua| {
-                                use mlua::prelude::*;
-                                let cbs: LuaTable = match lua.globals().get(MCP_USER_LOG_CBS) {
-                                    Ok(t) => t,
-                                    Err(_) => return Ok(String::new()),
-                                };
-                                let cb: LuaFunction = match cbs.get(sn_task.as_str()) {
-                                    Ok(f) => f,
-                                    Err(_) => return Ok(String::new()),
-                                };
+                    if let Some(tx) = notify_tx {
+                        let item = NotificationItem {
+                            isle,
+                            server_name: sn,
+                            cbs_table: MCP_USER_LOG_CBS,
+                            build_ev: Box::new(move |lua, server_for_task| {
                                 let ev = lua.create_table()?;
                                 ev.set("type", "log")?;
-                                ev.set("server", sn_task.as_str())?;
+                                ev.set("server", server_for_task)?;
                                 ev.set("level", level_task.as_str())?;
                                 ev.set("logger", logger_task.as_str())?;
                                 ev.set("data", data_task.as_str())?;
-                                let _ = cb.call::<()>(ev);
-                                Ok(String::new())
-                            })
-                            .await;
-                        if let Err(e) = result {
+                                Ok(ev)
+                            }),
+                            caller: "on_logging_message",
+                        };
+                        if let Err(e) = tx.try_send(item) {
                             tracing::warn!(
                                 target: "mcp_client",
-                                server = %sn,
                                 error = %e,
-                                "on_logging_message: main isle exec failed"
+                                "on_logging_message: notification channel full, dropping notification"
                             );
                         }
-                    });
+                    } else {
+                        // Fallback: legacy unbounded spawn (unit-test mode / no channel).
+                        isle_dispatch(
+                            isle,
+                            sn,
+                            MCP_USER_LOG_CBS,
+                            move |lua, server_for_task| {
+                                let ev = lua.create_table()?;
+                                ev.set("type", "log")?;
+                                ev.set("server", server_for_task)?;
+                                ev.set("level", level_task.as_str())?;
+                                ev.set("logger", logger_task.as_str())?;
+                                ev.set("data", data_task.as_str())?;
+                                Ok(ev)
+                            },
+                            "on_logging_message",
+                        );
+                    }
                     return;
                 }
             }

@@ -108,8 +108,38 @@ pub(crate) fn sanitize_url(raw: &str) -> String {
             u.set_fragment(None);
             u.to_string()
         }
-        Err(_) => "[UNPARSEABLE]".to_string(),
+        Err(_) => {
+            // URL is not parseable: preserve the first 16 characters so a human
+            // can identify the target from logs (e.g. a typo like "htps://...").
+            // Strip obvious "scheme://user:pass@" patterns by simple substring
+            // detection so credentials are not leaked even in the truncated form.
+            let sanitized = redact_userinfo(raw);
+            if sanitized.len() <= 16 {
+                sanitized
+            } else {
+                format!("{}...", &sanitized[..16])
+            }
+        }
     }
+}
+
+/// Remove `user:pass@` userinfo from an unparseable URL string.
+///
+/// Uses simple substring heuristics: looks for `://` (scheme separator) then
+/// `@` within the authority. If found, replaces the `user:pass@` span with
+/// an empty string. If not found, returns the input unchanged.
+fn redact_userinfo(raw: &str) -> String {
+    if let Some(scheme_end) = raw.find("://") {
+        let after_scheme = scheme_end + 3;
+        let authority = &raw[after_scheme..];
+        if let Some(at_pos) = authority.find('@') {
+            // Reconstruct: scheme + "://" + everything after "@"
+            let scheme_and_sep = &raw[..after_scheme];
+            let host_and_rest = &authority[at_pos + 1..];
+            return format!("{}{}", scheme_and_sep, host_and_rest);
+        }
+    }
+    raw.to_string()
 }
 
 #[cfg(test)]
@@ -155,15 +185,42 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_url_malformed_returns_unparseable() {
+    fn sanitize_url_malformed_truncates_to_16_chars() {
+        // Previously returned "[UNPARSEABLE]"; now returns the first 16 chars
+        // of the input so log readers can identify the target.
         let raw = "not a valid url ://::garbage";
         let got = sanitize_url(raw);
-        assert_eq!(got, "[UNPARSEABLE]");
+        // First 16 chars of "not a valid url " are "not a valid url " — truncated with "..."
+        assert_eq!(got, "not a valid url ...");
     }
 
     #[test]
-    fn sanitize_url_empty_string_returns_unparseable() {
+    fn sanitize_url_empty_string_returns_empty() {
         let got = sanitize_url("");
-        assert_eq!(got, "[UNPARSEABLE]");
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn sanitize_url_short_unparseable_returns_as_is() {
+        // A short but unparseable URL (≤16 chars) is returned without truncation.
+        let raw = "htps://x.com";
+        let got = sanitize_url(raw);
+        assert_eq!(got, "htps://x.com");
+    }
+
+    #[test]
+    fn sanitize_url_unparseable_strips_userinfo() {
+        // Even for unparseable URLs, obvious user:pass@ patterns are stripped.
+        let raw = "htps://user:pass@example.com/path";
+        let got = sanitize_url(raw);
+        // After stripping: "htps://example.com/path" → first 16: "htps://example.c" + "..."
+        assert!(
+            !got.contains("pass"),
+            "password must be stripped from unparseable URL: {got}"
+        );
+        assert!(
+            !got.contains("user"),
+            "username must be stripped from unparseable URL: {got}"
+        );
     }
 }
