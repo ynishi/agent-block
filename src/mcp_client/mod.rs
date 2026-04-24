@@ -449,6 +449,25 @@ impl McpManager {
             .map_err(|e| BlockError::Mcp(format!("serialize get_prompt result: {e}")))
     }
 
+    /// Return the server's `InitializeResult` serialized as JSON.
+    ///
+    /// `peer_info()` is sync (no I/O). It returns `Some` after a successful
+    /// MCP handshake and `None` before initialization completes.
+    ///
+    /// Immutable receiver — usable under `RwLock::read`.
+    pub fn server_info(&self, name: &str) -> BlockResult<serde_json::Value> {
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, "mcp server_info on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let info = srv.peer_info().ok_or_else(|| {
+            warn!(server = %name, "mcp server_info: server not yet initialized");
+            BlockError::Mcp(format!("server '{name}' not yet initialized"))
+        })?;
+        serde_json::to_value(info)
+            .map_err(|e| BlockError::Mcp(format!("serialize server_info '{name}': {e}")))
+    }
+
     /// Send a `notifications/cancelled` to the named server.
     ///
     /// This is a best-effort fire-and-forget: the notification is spawned in a
@@ -1286,5 +1305,55 @@ mod rich_tests {
         // The handler's on_progress is async; with no isle it short-circuits.
         // We exercise it via a minimal timeout-wrapped call.
         let _ = params;
+    }
+
+    // ── Tests: server_info ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_info_unknown_server_returns_error() {
+        let mgr = McpManager::new();
+        let err = mgr
+            .server_info("ghost")
+            .expect_err("unknown server must error");
+        assert!(
+            err.to_string().contains("no server named"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_info_returns_capabilities_for_resource_server() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "res").await;
+
+        let info = mgr
+            .server_info("res")
+            .expect("server_info should succeed after handshake");
+
+        let caps = info
+            .get("capabilities")
+            .expect("InitializeResult must have capabilities field");
+        assert!(
+            caps.get("resources").is_some(),
+            "resource server must advertise resources capability: {caps}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_info_returns_capabilities_for_prompt_server() {
+        let mut mgr = McpManager::new();
+        attach_prompt_server(&mut mgr, "prm").await;
+
+        let info = mgr
+            .server_info("prm")
+            .expect("server_info should succeed after handshake");
+
+        let caps = info
+            .get("capabilities")
+            .expect("InitializeResult must have capabilities field");
+        assert!(
+            caps.get("prompts").is_some(),
+            "prompt server must advertise prompts capability: {caps}"
+        );
     }
 }

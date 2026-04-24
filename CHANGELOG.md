@@ -52,6 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent.run({ sampling = fn })` — pass a Lua function as `opts.sampling` to
   automatically register it as the sampling handler for every MCP server connected in
   that `agent.run` call (calls `mcp.set_sampling_handler(srv.name, fn)` per server).
+- `mcp.server_info(name)` — return the server's `InitializeResult` as a Lua table
+  (`{ ok=true, server_info={...} }`). Exposes `capabilities`, `serverInfo`, and protocol
+  version fields from the MCP handshake result.
+- `agent.run({ enable_resources = true })` — automatically register
+  `{server}__mcp_list_resources` and `{server}__mcp_read_resource` as LLM-callable tools
+  for each connected server that declares the `resources` capability. Default `false`;
+  capability-absent servers are silently skipped (logged at `info`).
+- `agent.run({ enable_prompts = true })` — automatically register
+  `{server}__mcp_list_prompts` and `{server}__mcp_get_prompt` as LLM-callable tools for
+  each connected server that declares the `prompts` capability. Default `false`; same
+  silent-skip behaviour as `enable_resources`.
 
 ### Changed
 
