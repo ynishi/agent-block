@@ -174,13 +174,13 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
 
     let progress_src = r#"
         local HANDLERS = "__mcp_progress_handlers"
-        return function(server_name, progress_token, progress, total)
+        return function(server_name, progress_token, progress, total, message)
             local handlers = _G[HANDLERS]
             local h = handlers and handlers[server_name]
             if type(h) ~= "function" then
                 return
             end
-            h(server_name, progress_token, tonumber(progress), tonumber(total))
+            h(server_name, progress_token, tonumber(progress), tonumber(total), message)
         end
     "#;
     let dispatch_progress: LuaFunction = lua
@@ -278,12 +278,14 @@ impl ClientHandler for AgentBlockClientHandler {
                 .total
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "0".to_string());
+            let message_str = params.message.unwrap_or_default();
 
             for server_name in server_names {
                 let server_for_task = server_name.clone();
                 let token_for_task = token_str.clone();
                 let progress_for_task = progress_str.clone();
                 let total_for_task = total_str.clone();
+                let message_for_task = message_str.clone();
                 let isle_ref = Arc::clone(&isle);
 
                 // Spawn each dispatch as a separate task so a slow Lua handler
@@ -294,6 +296,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         token_for_task.as_str(),
                         progress_for_task.as_str(),
                         total_for_task.as_str(),
+                        message_for_task.as_str(),
                     ];
                     let task = isle_ref.spawn_coroutine_call(MCP_DISPATCH_PROGRESS, &args);
                     if let Err(e) = task.await {

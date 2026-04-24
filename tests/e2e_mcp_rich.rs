@@ -15,8 +15,9 @@ mod common;
 use predicates::prelude::*;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, Content, ListToolsResult, LoggingLevel,
+        LoggingMessageNotificationParam, NumberOrString, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo, Tool,
     },
     service::{MaybeSendFuture, RequestContext},
     transport::streamable_http_server::{
@@ -169,6 +170,250 @@ async fn connect_http_then_list_tools_roundtrip() {
             .success()
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("LIST_TOOLS_OK"))
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
+// ── on_progress / on_log notification servers ─────────────────────────────────
+
+/// A server that sends a progress notification during `call_tool("emit_progress")`,
+/// then returns a success result. Used to test the on_progress callback path.
+#[derive(Clone)]
+struct ProgressTestServer;
+
+impl ServerHandler for ProgressTestServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_
+    {
+        let tools = vec![Tool::new(
+            "emit_progress",
+            "Emit a progress notification then return ok",
+            Arc::new(serde_json::Map::new()),
+        )];
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+    }
+
+    async fn call_tool(
+        &self,
+        _params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Push a progress notification before returning the result.
+        let _ = ctx
+            .peer
+            .notify_progress(ProgressNotificationParam {
+                progress_token: ProgressToken(NumberOrString::String("tok-e2e".into())),
+                progress: 1.0,
+                total: Some(1.0),
+                message: Some("done".into()),
+            })
+            .await;
+        Ok(CallToolResult::success(vec![Content::text(
+            "progress_sent",
+        )]))
+    }
+}
+
+/// A server with logging capability that emits a log notification during
+/// `call_tool("emit_log")`. Used to test the on_log callback path.
+#[derive(Clone)]
+struct LoggingTestServer;
+
+impl ServerHandler for LoggingTestServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_logging()
+                .build(),
+        )
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_
+    {
+        let tools = vec![Tool::new(
+            "emit_log",
+            "Emit a log notification then return ok",
+            Arc::new(serde_json::Map::new()),
+        )];
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+    }
+
+    async fn call_tool(
+        &self,
+        _params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Push a log notification before returning the result.
+        let _ = ctx
+            .peer
+            .notify_logging_message(LoggingMessageNotificationParam {
+                level: LoggingLevel::Info,
+                logger: Some("test-logger".into()),
+                data: serde_json::json!("e2e log message"),
+            })
+            .await;
+        Ok(CallToolResult::success(vec![Content::text("log_sent")]))
+    }
+}
+
+/// Spawn a `ProgressTestServer` behind a stateful `StreamableHttpService`.
+///
+/// Returns the base URL and a `CancellationToken` that stops the server.
+async fn spawn_progress_http_server() -> (String, CancellationToken) {
+    let ct = CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<ProgressTestServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(ProgressTestServer), Default::default(), config);
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let ct_shutdown = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+            .await;
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+/// Spawn a `LoggingTestServer` behind a stateful `StreamableHttpService`.
+///
+/// Returns the base URL and a `CancellationToken` that stops the server.
+async fn spawn_logging_http_server() -> (String, CancellationToken) {
+    let ct = CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<LoggingTestServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(LoggingTestServer), Default::default(), config);
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let ct_shutdown = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+            .await;
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+// ── Tests: on_progress / on_log / capability gate ─────────────────────────────
+
+/// Case (a): `mcp.on_progress` callback is registered and the envelope is
+/// dispatched when the server sends a progress notification during `call_tool`.
+///
+/// The fixture (`mcp_on_progress_envelope.lua`) registers an `on_progress`
+/// handler with the same wrapper pattern that `connect_mcp_servers` uses for
+/// `opts.on_progress`, calls `mcp.call("prog", "emit_progress", {})`, and
+/// asserts that the callback received an event with `type="progress"`.
+#[tokio::test]
+async fn on_progress_callback_receives_envelope() {
+    let (url, ct) = spawn_progress_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_on_progress_envelope.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CALL_OK"))
+            .stdout(predicate::str::contains("PROGRESS_EV_OK"))
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
+/// Case (b): `mcp.on_log` callback is registered and the envelope is dispatched
+/// when a server with logging capability sends a log notification.
+///
+/// The fixture (`mcp_on_log_callback.lua`) registers an `on_log` handler,
+/// calls `mcp.call("logserver", "emit_log", {})`, and asserts that the callback
+/// received an event with `type="log"`.
+#[tokio::test]
+async fn on_log_callback_receives_envelope() {
+    let (url, ct) = spawn_logging_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_on_log_callback.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CALL_OK"))
+            .stdout(predicate::str::contains("LOG_EV_OK"))
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
+/// Case (c): When a server has no logging capability, the `connect_mcp_servers`
+/// gate skips `mcp.on_log` registration and the callback is never fired.
+///
+/// The fixture (`mcp_log_capability_skip.lua`) connects to the `CounterServer`
+/// (which declares only `tools`, not `logging`), verifies via `server_info`
+/// that `capabilities.logging` is absent, and asserts that the on_log callback
+/// is never invoked.
+#[tokio::test]
+async fn log_capability_absent_skips_on_log_registration() {
+    // CounterServer has no logging capability — reuse the existing helper.
+    let (url, ct) = spawn_counter_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_log_capability_skip.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("SKIP_OK"))
             .stdout(predicate::str::contains("FIXTURE_DONE"));
     })
     .await

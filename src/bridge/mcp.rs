@@ -371,7 +371,8 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
     // mcp.on_progress(server_name, fn)
     // Registers a Lua callback for progress notifications from `server_name`.
-    // The callback signature: function(server_name, progress_token, progress, total)
+    // The callback signature: function(server_name, progress_token, progress, total, message)
+    // `message` is an optional human-readable description (empty string when absent).
     // `fn` must be a pure Lua function (C functions are not supported).
     {
         let mgr = Arc::clone(manager);

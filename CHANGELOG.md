@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{server}__mcp_list_prompts` and `{server}__mcp_get_prompt` as LLM-callable tools for
   each connected server that declares the `prompts` capability. Default `false`; same
   silent-skip behaviour as `enable_resources`.
+- `agent.run({ on_progress = fn(ev) })` — register a Lua callback for progress
+  notifications from all connected MCP servers. The callback receives an envelope table
+  `{ type="progress", server, token, progress, total, message }`. No capability gate.
+  Callback errors are swallowed and logged at `warn`.
+- `agent.run({ progress_to_log = true })` — bridge progress notifications to `log.info`
+  automatically. Ignored when `on_progress` is set (callback takes priority). Default
+  `false`.
+- `agent.run({ on_log = fn(ev) })` — register a Lua callback for log notifications from
+  servers that declare the `logging` capability. Envelope:
+  `{ type="log", server, level, logger, data }`. Servers without logging capability are
+  silently skipped (logged at `info`). Callback errors are swallowed and logged at `warn`.
+- `agent.run({ log_to_stderr = true })` — bridge server log notifications to
+  `log.debug|info|warn|error` by severity. Ignored when `on_log` is set. Logging
+  capability gate applies. Default `false`.
 
 ### Changed
 

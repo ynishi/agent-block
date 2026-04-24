@@ -1356,4 +1356,76 @@ mod rich_tests {
             "prompt server must advertise prompts capability: {caps}"
         );
     }
+
+    // ── Tests: logging capability gate (case c) ─────────────────────────
+
+    /// A server that declares logging capability.
+    #[derive(Clone)]
+    struct LoggingCapableServer;
+
+    impl ServerHandler for LoggingCapableServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_logging()
+                    .build(),
+            )
+        }
+    }
+
+    async fn attach_logging_server(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = LoggingCapableServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let handler = AgentBlockClientHandler::new();
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    /// Verifies that `server_info` for a server with logging capability
+    /// returns `capabilities.logging` as a non-null field.  This is the
+    /// Rust-side condition that the Lua `connect_mcp_servers` gate checks:
+    /// `caps.logging ~= nil`.
+    #[tokio::test]
+    async fn server_info_returns_logging_capability_when_declared() {
+        let mut mgr = McpManager::new();
+        attach_logging_server(&mut mgr, "log").await;
+
+        let info = mgr
+            .server_info("log")
+            .expect("server_info should succeed after handshake");
+
+        let caps = info
+            .get("capabilities")
+            .expect("InitializeResult must have capabilities field");
+        assert!(
+            caps.get("logging").is_some(),
+            "logging-capable server must advertise logging capability: {caps}"
+        );
+    }
+
+    /// Verifies that `server_info` for a server WITHOUT logging capability
+    /// returns no `capabilities.logging` field, confirming the gate condition
+    /// correctly evaluates to `caps.logging == nil` in Lua.
+    #[tokio::test]
+    async fn server_info_has_no_logging_capability_for_tool_only_server() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "res").await;
+
+        let info = mgr
+            .server_info("res")
+            .expect("server_info should succeed after handshake");
+
+        let caps = info
+            .get("capabilities")
+            .expect("InitializeResult must have capabilities field");
+        assert!(
+            caps.get("logging").is_none(),
+            "resource-only server must not advertise logging capability: {caps}"
+        );
+    }
 }
