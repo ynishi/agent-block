@@ -35,6 +35,19 @@ const MCP_DISPATCH_PROGRESS: &str = "__mcp_dispatch_progress";
 /// Constant name of the Lua dispatcher function called when a log notification arrives.
 const MCP_DISPATCH_LOG: &str = "__mcp_dispatch_log";
 
+/// Global table that holds user-provided progress callbacks stored by server name.
+///
+/// Written by `mcp._store_progress_ucb` so that the self-contained envelope
+/// wrapper registered by `blocks/agent/init.lua` can retrieve the callback on
+/// the handler Isle without capturing it as an upvalue (which would be nil after
+/// bytecode dump/reload across Lua VMs).
+pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
+
+/// Global table that holds user-provided log callbacks stored by server name.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
+
 /// Constant name of the Lua dispatcher function called for sampling/createMessage.
 const MCP_DISPATCH_SAMPLING: &str = "__mcp_dispatch_sampling";
 
@@ -168,6 +181,11 @@ impl Default for AgentBlockClientHandler {
 pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<()> {
     use mlua::prelude::*;
 
+    // ── user-callback storage tables (populated by _store_progress_ucb / _store_log_ucb) ──
+    lua.globals()
+        .set(MCP_USER_PROGRESS_CBS, lua.create_table()?)?;
+    lua.globals().set(MCP_USER_LOG_CBS, lua.create_table()?)?;
+
     // ── progress ──────────────────────────────────────────────────────────────
     lua.globals()
         .set(MCP_PROGRESS_HANDLERS, lua.create_table()?)?;
@@ -180,7 +198,11 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
             if type(h) ~= "function" then
                 return
             end
-            h(server_name, progress_token, tonumber(progress), tonumber(total), message)
+            -- Belt-and-suspenders nil-guards: Rust normalises these before push,
+            -- but guard here in case the dispatcher path changes in the future.
+            local total_n = total or "0"
+            local message_s = message or ""
+            h(server_name, progress_token, tonumber(progress), tonumber(total_n), message_s)
         end
     "#;
     let dispatch_progress: LuaFunction = lua
@@ -201,7 +223,11 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
             if type(h) ~= "function" then
                 return nil  -- signal: no handler, caller should use tracing fallback
             end
-            h(server_name, level, logger, data_json)
+            -- Belt-and-suspenders nil-guards: Rust normalises these before push,
+            -- but guard here in case the dispatcher path changes in the future.
+            local logger_s = logger or ""
+            local data_s = data_json or ""
+            h(server_name, level, logger_s, data_s)
             return true
         end
     "#;
@@ -689,6 +715,57 @@ mod tests {
         let _: mlua::Function = lua.globals().get(MCP_DISPATCH_LOG).unwrap();
         let _: mlua::Table = lua.globals().get(MCP_SAMPLING_HANDLERS).unwrap();
         let _: mlua::Function = lua.globals().get(MCP_DISPATCH_SAMPLING).unwrap();
+        // User-callback storage tables.
+        let _: mlua::Table = lua.globals().get(MCP_USER_PROGRESS_CBS).unwrap();
+        let _: mlua::Table = lua.globals().get(MCP_USER_LOG_CBS).unwrap();
+    }
+
+    /// Verify that the progress glue normalises a nil `total` and nil `message`
+    /// to safe defaults before forwarding to the handler.
+    #[test]
+    fn progress_dispatcher_nil_guards_normalize_total_and_message() {
+        let lua = mlua::Lua::new();
+        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
+
+        lua.load(
+            r#"
+            local got = {}
+            __mcp_progress_handlers["srv"] = function(sn, tok, prog, total, msg)
+                got.total = total
+                got.msg = msg
+            end
+            -- Pass nil for total and message (simulates missing optional fields).
+            __mcp_dispatch_progress("srv", "tok-1", "0.5", nil, nil)
+            assert(got.total == 0, "total nil should be normalised to 0, got: " .. tostring(got.total))
+            assert(got.msg == "", "message nil should be normalised to '', got: " .. tostring(got.msg))
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    /// Verify that the log glue normalises nil `logger` and nil `data_json`
+    /// to empty strings before forwarding to the handler.
+    #[test]
+    fn log_dispatcher_nil_guards_normalize_logger_and_data() {
+        let lua = mlua::Lua::new();
+        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
+
+        lua.load(
+            r#"
+            local got = {}
+            __mcp_log_handlers["srv"] = function(sn, level, logger, data)
+                got.logger = logger
+                got.data = data
+            end
+            -- Pass nil for logger and data_json.
+            __mcp_dispatch_log("srv", "info", nil, nil)
+            assert(got.logger == "", "logger nil should be normalised to '', got: " .. tostring(got.logger))
+            assert(got.data == "", "data nil should be normalised to '', got: " .. tostring(got.data))
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]
