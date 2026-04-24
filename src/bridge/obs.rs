@@ -99,7 +99,7 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
-fn sanitize_url(raw: &str) -> String {
+pub(crate) fn sanitize_url(raw: &str) -> String {
     match Url::parse(raw) {
         Ok(mut u) => {
             let _ = u.set_username("");

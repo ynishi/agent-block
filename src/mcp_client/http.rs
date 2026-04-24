@@ -11,6 +11,7 @@ use rmcp::{
     ServiceExt,
 };
 
+use crate::bridge::obs::sanitize_url;
 use crate::error::{BlockError, BlockResult};
 use crate::mcp_client::handler::AgentBlockClientHandler;
 
@@ -40,16 +41,17 @@ pub(super) async fn connect_http_transport(
     // reqwest::Client (0.13), which correctly implements StreamableHttpClient.
     let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
 
+    let safe_url = sanitize_url(url);
     tokio::time::timeout(rpc_timeout, handler.serve(transport))
         .await
         .map_err(|_| {
-            tracing::warn!(server = %name, url = %url, timeout = ?rpc_timeout, "mcp http initialize timed out");
+            tracing::warn!(server = %name, url = %safe_url, timeout = ?rpc_timeout, "mcp http initialize timed out");
             BlockError::Timeout(format!(
-                "http connect '{name}' to {url} timed out after {rpc_timeout:?}"
+                "http connect '{name}' to {safe_url} timed out after {rpc_timeout:?}"
             ))
         })?
         .map_err(|e| {
-            tracing::warn!(server = %name, url = %url, error = %e, "mcp http initialize failed");
-            BlockError::Mcp(format!("http connect '{name}' to {url}: {e}"))
+            tracing::warn!(server = %name, url = %safe_url, error = %e, "mcp http initialize failed");
+            BlockError::Mcp(format!("http connect '{name}' to {safe_url}: {e}"))
         })
 }
