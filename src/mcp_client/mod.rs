@@ -1,8 +1,8 @@
 //! MCP Client — manages MCP server child processes via rmcp.
 //!
-//! Uses `rmcp` (1.4.x) `RunningService<RoleClient, ()>` internally.
-//! The `()` unit type provides the default `ClientHandler` implementation
-//! which returns `method_not_found` for `create_message` (sampling not advertised).
+//! Uses `rmcp` (1.4.x) `RunningService<RoleClient, AgentBlockClientHandler>` internally.
+//! `AgentBlockClientHandler` provides custom notification handling via Lua callbacks
+//! (wired in Subtask 2/3). For Subtask 1, all notification methods are default no-ops.
 //!
 //! All rmcp round-trips are wrapped in a per-call timeout so a hung child
 //! cannot block a Lua coroutine indefinitely.
@@ -30,6 +30,8 @@
 //! mcp.disconnect("outline")
 //! ```
 
+pub mod handler;
+
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
@@ -46,12 +48,16 @@ use tracing::warn;
 
 use crate::error::{BlockError, BlockResult};
 
+pub use handler::AgentBlockClientHandler;
+
 /// Default RPC round-trip timeout when no explicit value is provided.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct McpManager {
-    servers: HashMap<String, RunningService<RoleClient, ()>>,
+    servers: HashMap<String, RunningService<RoleClient, AgentBlockClientHandler>>,
     rpc_timeout: Duration,
+    /// Shared handler instance — all connections share the same registry Arc.
+    handler: AgentBlockClientHandler,
 }
 
 impl McpManager {
@@ -59,6 +65,7 @@ impl McpManager {
         Self {
             servers: HashMap::new(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            handler: AgentBlockClientHandler::new(),
         }
     }
 
@@ -82,6 +89,7 @@ impl McpManager {
         Ok(Self {
             servers: HashMap::new(),
             rpc_timeout,
+            handler: AgentBlockClientHandler::new(),
         })
     }
 
@@ -94,7 +102,11 @@ impl McpManager {
             BlockError::Mcp(format!("spawn '{command}': {e}"))
         })?;
         let rpc_timeout = self.rpc_timeout;
-        let running = timeout(rpc_timeout, ().serve(transport))
+        // Ensure the handler registry has an entry for this server name
+        // so callbacks can be registered immediately after connect returns.
+        self.handler.ensure_server(name);
+        let handler = self.handler.clone();
+        let running = timeout(rpc_timeout, handler.serve(transport))
             .await
             .map_err(|_| {
                 warn!(server = %name, timeout = ?rpc_timeout, "mcp initialize timed out");
@@ -437,10 +449,11 @@ mod concurrency_tests {
             }
         });
 
-        let running =
-            ().serve(client_side)
-                .await
-                .expect("client handshake should succeed over duplex");
+        let handler = AgentBlockClientHandler::new();
+        let running = handler
+            .serve(client_side)
+            .await
+            .expect("client handshake should succeed over duplex");
         mgr.servers.insert(name.to_string(), running);
     }
 
@@ -537,7 +550,8 @@ mod concurrency_tests {
                 let _ = running.waiting().await;
             }
         });
-        let running = ().serve(client_side).await.expect("handshake");
+        let handler = AgentBlockClientHandler::new();
+        let running = handler.serve(client_side).await.expect("handshake");
         mgr.servers.insert(name.to_string(), running);
     }
 

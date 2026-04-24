@@ -50,7 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
-rmcp = { version = "1.4.0", features = ["client", "transport-child-process"] }
+rmcp = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
