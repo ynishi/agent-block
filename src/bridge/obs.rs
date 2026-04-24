@@ -111,13 +111,17 @@ pub(crate) fn sanitize_url(raw: &str) -> String {
         Err(_) => {
             // URL is not parseable: preserve the first 16 characters so a human
             // can identify the target from logs (e.g. a typo like "htps://...").
-            // Strip obvious "scheme://user:pass@" patterns by simple substring
-            // detection so credentials are not leaked even in the truncated form.
+            // Strip both `user:pass@` userinfo AND `?query` / `#fragment` so
+            // credentials or tokens embedded anywhere in the authority / query /
+            // fragment cannot leak even in the truncated form.  Path remains
+            // (truncated) so the host/path prefix is still identifiable.
             let sanitized = redact_userinfo(raw);
-            if sanitized.len() <= 16 {
-                sanitized
+            let cut_end = sanitized.find(['?', '#']).unwrap_or(sanitized.len());
+            let trimmed = &sanitized[..cut_end];
+            if trimmed.len() <= 16 {
+                trimmed.to_string()
             } else {
-                format!("{}...", &sanitized[..16])
+                format!("{}...", &trimmed[..16])
             }
         }
     }
@@ -221,6 +225,31 @@ mod tests {
         assert!(
             !got.contains("user"),
             "username must be stripped from unparseable URL: {got}"
+        );
+    }
+
+    #[test]
+    fn sanitize_url_unparseable_strips_query_and_fragment() {
+        // Even for unparseable URLs, secrets embedded in ?query or #fragment
+        // must be stripped before truncation.  Previously the 16-char truncate
+        // could leak a partial token when the secret sat within the first 16
+        // bytes of the input.
+        let raw = "htps://api.x/?token=SUPER_SECRET_VALUE_XYZ";
+        let got = sanitize_url(raw);
+        assert!(
+            !got.contains("SECRET"),
+            "query secret must be stripped: {got}"
+        );
+        assert!(
+            !got.contains("token"),
+            "query key must also be stripped: {got}"
+        );
+
+        let raw2 = "htps://api.x/#token=SECRET";
+        let got2 = sanitize_url(raw2);
+        assert!(
+            !got2.contains("SECRET"),
+            "fragment secret must be stripped: {got2}"
         );
     }
 }

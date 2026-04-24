@@ -193,7 +193,15 @@ impl AgentBlockClientHandler {
                         let ev = (item.build_ev)(lua, item.server_name.as_str()).map_err(|e| {
                             mlua_isle::IsleError::Lua(format!("{}: build_ev: {e}", item.caller))
                         })?;
-                        let _ = cb.call::<()>(ev);
+                        if let Err(e) = cb.call::<()>(ev) {
+                            tracing::warn!(
+                                target: "mcp_client",
+                                server = %item.server_name,
+                                caller = %item.caller,
+                                error = %e,
+                                "user callback returned error"
+                            );
+                        }
                         Ok(String::new())
                     })
                     .await;
@@ -355,7 +363,15 @@ fn isle_dispatch<F>(
                 // does not propagate into the main Isle runtime.
                 let ev = build_ev(lua, server_name.as_str())
                     .map_err(|e| mlua_isle::IsleError::Lua(format!("{caller}: build_ev: {e}")))?;
-                let _ = cb.call::<()>(ev);
+                if let Err(e) = cb.call::<()>(ev) {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        server = %server_name,
+                        caller = %caller,
+                        error = %e,
+                        "user callback returned error"
+                    );
+                }
                 Ok(String::new())
             })
             .await;
