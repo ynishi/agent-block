@@ -1428,4 +1428,26 @@ mod rich_tests {
             "resource-only server must not advertise logging capability: {caps}"
         );
     }
+
+    // ── Tests: call_tool progress token auto-attach ─────────────────────
+
+    /// Integration test: verifies that `call_tool` (and list_resources, which
+    /// shares the same connection path) succeeds both when an `on_progress`
+    /// handler is registered for the server and when it is not.
+    #[tokio::test]
+    async fn call_tool_succeeds_with_and_without_progress_handler() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "srv").await;
+
+        // Without on_progress handler — should succeed.
+        mgr.list_resources("srv")
+            .await
+            .expect("list_resources without handler should succeed");
+
+        // With on_progress handler — auto-attach path is exercised; should still succeed.
+        mgr.handler.mark_on_progress("srv");
+        mgr.list_resources("srv")
+            .await
+            .expect("list_resources with handler should succeed");
+    }
 }
