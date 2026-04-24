@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `src/mcp_client.rs` split into `src/mcp_client/mod.rs` + `src/mcp_client/handler.rs` module.
+  All existing public API (`connect`, `list_tools`, `call_tool`, `disconnect`, `disconnect_all`,
+  `new`, `with_rpc_timeout`) is unchanged. No Lua-visible behaviour change.
+- `RunningService<RoleClient, ()>` unit handler replaced with
+  `RunningService<RoleClient, AgentBlockClientHandler>` across all server connections.
+  For this release all notification methods remain the default no-ops from rmcp;
+  progress / log / sampling callback wiring is deferred to subsequent subtasks.
+- `rmcp` feature flags expanded: `client-side-sse` and `transport-streamable-http-client`
+  added to `Cargo.toml` (no transport code activated yet; enables Subtask 2 HTTP connect).
+
 ## [0.8.0] - 2026-04-24
 
 ### Added
