@@ -42,8 +42,7 @@ use mlua_isle::AsyncIsle;
 use rmcp::{
     model::{
         CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-        GetPromptRequestParams, NumberOrString, ProgressToken, ReadResourceRequestParams,
-        RequestParamsMeta,
+        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
     },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
@@ -205,23 +204,6 @@ impl McpManager {
                     "call_tool '{tool_name}' on '{name}': arguments must be a JSON object \
                      (got {kind})"
                 )));
-            }
-        }
-        // Auto-attach a progress token when an on_progress handler is registered for
-        // this server. The lock is held only for the registry read and dropped before
-        // the async srv.call_tool await to avoid holding a Mutex across an await point.
-        {
-            let has_progress = {
-                let guard = self
-                    .handler
-                    .registry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                guard.get(name).is_some_and(|r| r.on_progress)
-            };
-            if has_progress {
-                let token = uuid::Uuid::new_v4().to_string();
-                params.set_progress_token(ProgressToken(NumberOrString::String(token.into())));
             }
         }
         let srv = self.servers.get(name).ok_or_else(|| {
@@ -843,11 +825,10 @@ mod rich_tests {
     use super::*;
     use rmcp::{
         model::{
-            CallToolRequestParams, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-            ListResourcesResult, NumberOrString, PaginatedRequestParams, ProgressNotificationParam,
-            ProgressToken, Prompt, PromptMessage, PromptMessageRole, RawResource,
-            ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-            ServerInfo,
+            GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
+            NumberOrString, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+            Prompt, PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
+            ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
         },
         service::{MaybeSendFuture, RequestContext},
         ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -1449,42 +1430,6 @@ mod rich_tests {
     }
 
     // ── Tests: call_tool progress token auto-attach ─────────────────────
-
-    /// Unit test: verifies that `set_progress_token` on `CallToolRequestParams`
-    /// correctly stores a UUID v4 token in `params.meta` that can be read back.
-    ///
-    /// This exercises the same API path that `call_tool` uses when auto-attaching
-    /// a token, without going through the rmcp wire protocol (where extensions
-    /// override params.meta during serialisation).
-    #[test]
-    fn call_tool_params_set_progress_token_via_set_progress_token() {
-        let mut params = CallToolRequestParams::new("my_tool".to_string());
-        assert!(
-            params.meta.is_none(),
-            "params.meta must be None before auto-attach"
-        );
-        let token_str = uuid::Uuid::new_v4().to_string();
-        params.set_progress_token(ProgressToken(NumberOrString::String(
-            token_str.clone().into(),
-        )));
-        let meta = params
-            .meta
-            .as_ref()
-            .expect("meta must be Some after set_progress_token");
-        let captured = meta
-            .get_progress_token()
-            .expect("progressToken must be set in meta");
-        let captured_str = match &captured.0 {
-            NumberOrString::String(s) => s.to_string(),
-            NumberOrString::Number(n) => n.to_string(),
-        };
-        assert_eq!(
-            captured_str, token_str,
-            "captured token must match the UUID we set"
-        );
-        // UUID v4: 8-4-4-4-12 hex chars, 36 chars total with dashes.
-        assert_eq!(token_str.len(), 36, "token must be UUID v4 (36 chars)");
-    }
 
     /// Integration test: verifies that `call_tool` (and list_resources, which
     /// shares the same connection path) succeeds both when an `on_progress`
