@@ -86,6 +86,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `on_log` callback wrapper in `blocks/agent/init.lua`: added `logger = logger or ""`
   and `data_json = data_json or ""` nil-guards before envelope construction to prevent
   nil-concat crashes if argument positions shift in future refactors.
+- Nil-concat crash in `__mcp_dispatch_progress` / `__mcp_dispatch_log` glue when
+  `opts.on_progress` / `opts.on_log` is passed to `agent.run()`.
+  Root cause: the wrapper closures registered by `connect_mcp_servers` captured `user_cb`
+  and `sn` as Lua upvalues; after bytecode dump/reload across the handler Isle VM boundary
+  all captured upvalues are reset to nil, so `pcall(nil, ev)` always failed and the
+  subsequent `.. sn ..` concat in the error path crashed with
+  `attempt to concatenate a nil value (upvalue '?')`.
+  Fix: two new internal bridge functions (`mcp._store_progress_ucb` /
+  `mcp._store_log_ucb`) load the user callback onto handler Isle under dedicated
+  `__mcp_user_progress_cbs` / `__mcp_user_log_cbs` globals (no dispatch-registry entry).
+  The envelope wrappers now read `user_cb` from those globals using only function
+  parameters and `_ENV` globals — no captured upvalues.
+- Belt-and-suspenders nil-guards added to the `__mcp_dispatch_progress` and
+  `__mcp_dispatch_log` Lua glue strings (handler.rs): `total or "0"`, `message or ""`,
+  `logger or ""`, `data_json or ""` are applied before forwarding to the handler so that
+  any future regression in the Rust-side normalisation path cannot reach user callbacks
+  with nil values.
 - `McpManager::call_tool` now enables progress notifications by relying on rmcp's
   `AtomicU32ProgressTokenProvider`, which auto-attaches a counter-based `progressToken`
   when an `on_progress` handler is registered for the target server.

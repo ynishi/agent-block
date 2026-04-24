@@ -21,6 +21,10 @@ mcp.on_log("logserver", function(server, level, logger, data_json)
     -- Verify envelope fields are present.
     assert(server ~= nil, "envelope server must not be nil")
     assert(level ~= nil, "envelope level must not be nil")
+    -- Regression guard: Rust normalises logger (None→"") before push.
+    assert(logger ~= nil, "envelope logger must not be nil (regression guard)")
+    -- Regression guard: Rust serialises data to JSON so data_json is never nil.
+    assert(data_json ~= nil, "envelope data_json must not be nil (regression guard)")
     -- Print the success marker so the Rust test assertion can see it.
     print("LOG_EV_OK")
 end)

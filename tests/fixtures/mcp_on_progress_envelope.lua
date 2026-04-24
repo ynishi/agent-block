@@ -24,6 +24,12 @@ mcp.on_progress("prog", function(server, token, progress, total, message)
     assert(server ~= nil, "envelope server must not be nil")
     assert(token ~= nil, "envelope token must not be nil")
     assert(progress ~= nil, "envelope progress must not be nil")
+    -- Regression guard: Rust normalises total (None→"0") before push so the
+    -- glue tonumber("0") returns 0.0, never nil.  If this assert fires, the
+    -- normalization in on_progress dispatcher was regressed.
+    assert(total ~= nil, "envelope total must not be nil (regression guard)")
+    -- Regression guard: Rust normalises message (None→"") before push.
+    assert(message ~= nil, "envelope message must not be nil (regression guard)")
     -- Verify the token was auto-assigned by rmcp (not the hardcoded fallback "tok-e2e").
     -- rmcp's AtomicU32ProgressTokenProvider assigns numeric tokens (0, 1, 2, ...);
     -- the token arrives as a string because token_str = n.to_string() in handler.rs.
