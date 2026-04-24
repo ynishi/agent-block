@@ -413,21 +413,37 @@ end
 --- @return table|nil     mcp_tool_map { ["server__tool"] = { server, tool, def } }
 --- @return string|nil    Error string on failure
 --- @return table         List of connected server names (for cleanup on failure)
-local function connect_mcp_servers(servers)
+local function connect_mcp_servers(servers, opts)
     local mcp_tool_map = {}
     local connected = {}
+    opts = opts or {}
 
     for _, srv in ipairs(servers) do
         local name = srv.name
-        local command = srv.command
-        local args = srv.args or {}
 
-        -- Connect to MCP server (async)
-        local ok, err = pcall(mcp.connect, name, command, args)
+        -- Connect to MCP server: use HTTP transport when srv.url is set,
+        -- otherwise fall back to stdio (srv.command / srv.args).
+        local ok, err
+        if srv.url then
+            local transport_opts = srv.transport_opts or {}
+            ok, err = pcall(mcp.connect_http, name, srv.url, transport_opts)
+        else
+            local command = srv.command
+            local args = srv.args or {}
+            ok, err = pcall(mcp.connect, name, command, args)
+        end
         if not ok then
             return nil, "mcp connect failed for '" .. name .. "': " .. tostring(err), connected
         end
         table.insert(connected, name)
+
+        -- Auto-register sampling handler if opts.sampling is set.
+        if opts.sampling then
+            local sampling_ok, sampling_err = pcall(mcp.set_sampling_handler, name, opts.sampling)
+            if not sampling_ok then
+                log.warn("agent: mcp set_sampling_handler failed for '" .. name .. "': " .. tostring(sampling_err))
+            end
+        end
 
         -- List tools (async)
         local list_result = mcp.list_tools(name)
@@ -629,7 +645,7 @@ function M.run(opts)
     local connected_servers = {}
 
     if opts.mcp_servers and #opts.mcp_servers > 0 then
-        local tool_map, err, partial_connected = connect_mcp_servers(opts.mcp_servers)
+        local tool_map, err, partial_connected = connect_mcp_servers(opts.mcp_servers, opts)
         if err then
             -- Disconnect any servers that did connect before the failure
             disconnect_mcp_servers(partial_connected)
