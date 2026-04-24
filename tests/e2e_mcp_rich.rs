@@ -338,6 +338,162 @@ async fn spawn_logging_http_server() -> (String, CancellationToken) {
     (format!("http://{addr}/mcp"), ct)
 }
 
+// ── Nil-field pattern servers ────────────────────────────────────────���─────────
+
+/// A server that sends a progress notification with `total: None` and
+/// `message: None` during `call_tool("emit_progress_nil")`.
+///
+/// Used to verify that the glue nil-guards normalise missing optional fields
+/// (`total → 0.0`, `message → ""`) so that `on_progress` callbacks do not
+/// crash with nil-concat errors.
+#[derive(Clone)]
+struct NilPatternProgressServer;
+
+impl ServerHandler for NilPatternProgressServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_
+    {
+        let tools = vec![Tool::new(
+            "emit_progress_nil",
+            "Emit a progress notification with total=None and message=None",
+            Arc::new(serde_json::Map::new()),
+        )];
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+    }
+
+    async fn call_tool(
+        &self,
+        _params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let token = ctx
+            .meta
+            .get_progress_token()
+            .map(|t| t.0.clone())
+            .unwrap_or(NumberOrString::String("tok-nil".into()));
+        let _ = ctx
+            .peer
+            .notify_progress(ProgressNotificationParam {
+                progress_token: ProgressToken(token),
+                progress: 1.0,
+                total: None,   // triggers total=0.0 normalisation in glue
+                message: None, // triggers message="" normalisation in glue
+            })
+            .await;
+        Ok(CallToolResult::success(vec![Content::text(
+            "nil_progress_sent",
+        )]))
+    }
+}
+
+/// A server that sends a log notification with `logger: None` and
+/// `data: Value::Null` during `call_tool("emit_log_nil")`.
+///
+/// Used to verify that the glue nil-guards normalise missing optional fields
+/// so that `on_log` callbacks do not crash with nil-concat errors.
+#[derive(Clone)]
+struct NilPatternLoggingServer;
+
+impl ServerHandler for NilPatternLoggingServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_logging()
+                .build(),
+        )
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_
+    {
+        let tools = vec![Tool::new(
+            "emit_log_nil",
+            "Emit a log notification with logger=None and data=Null",
+            Arc::new(serde_json::Map::new()),
+        )];
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
+    }
+
+    async fn call_tool(
+        &self,
+        _params: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let _ = ctx
+            .peer
+            .notify_logging_message(LoggingMessageNotificationParam {
+                level: LoggingLevel::Info,
+                logger: None,                  // triggers logger="" normalisation
+                data: serde_json::Value::Null, // serialises to "null" string
+            })
+            .await;
+        Ok(CallToolResult::success(vec![Content::text("nil_log_sent")]))
+    }
+}
+
+/// Spawn a `NilPatternProgressServer` behind a stateful `StreamableHttpService`.
+async fn spawn_nil_progress_http_server() -> (String, CancellationToken) {
+    let ct = CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<NilPatternProgressServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(NilPatternProgressServer), Default::default(), config);
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let ct_shutdown = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+            .await;
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+/// Spawn a `NilPatternLoggingServer` behind a stateful `StreamableHttpService`.
+async fn spawn_nil_logging_http_server() -> (String, CancellationToken) {
+    let ct = CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<NilPatternLoggingServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(NilPatternLoggingServer), Default::default(), config);
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let ct_shutdown = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+            .await;
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
 // ── Tests: on_progress / on_log / capability gate ─────────────────────────────
 
 /// Case (a): `mcp.on_progress` callback is registered and the envelope is
@@ -424,6 +580,76 @@ async fn log_capability_absent_skips_on_log_registration() {
             .success()
             .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
             .stdout(predicate::str::contains("SKIP_OK"))
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
+// ── Nil-field regression tests ────────────────────────────────────────────────
+
+/// Nil-field regression (progress): the `on_progress` callback must fire and
+/// must NOT emit `"progress handler failed"` when the server sends a progress
+/// notification with `total=None` and `message=None`.
+///
+/// The `NilPatternProgressServer` sends exactly this payload.  The fixture
+/// asserts that the callback receives non-nil `total` (normalised to `0`) and
+/// non-nil `message` (normalised to `""`), confirming the glue nil-guards in
+/// `__mcp_dispatch_progress` (handler.rs) are active.
+#[tokio::test]
+async fn on_progress_nil_fields_do_not_crash_callback() {
+    let (url, ct) = spawn_nil_progress_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_on_progress_nil_fields.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CALL_OK"))
+            .stdout(predicate::str::contains("PROGRESS_EV_OK"))
+            // Must NOT see the handler-failed warning that would appear if the
+            // callback crashed with a nil-concat error.
+            .stdout(predicate::str::contains("progress handler failed").not())
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
+/// Nil-field regression (log): the `on_log` callback must fire and must NOT
+/// emit `"log handler dispatch failed"` when the server sends a log
+/// notification with `logger=None` and `data=Value::Null`.
+///
+/// The `NilPatternLoggingServer` sends exactly this payload.  The fixture
+/// asserts that the callback receives non-nil `logger` (normalised to `""`)
+/// and non-nil `data_json` (serialised to the JSON literal `"null"`).
+#[tokio::test]
+async fn on_log_nil_fields_do_not_crash_callback() {
+    let (url, ct) = spawn_nil_logging_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_on_log_nil_fields.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CALL_OK"))
+            .stdout(predicate::str::contains("LOG_EV_OK"))
+            // Must NOT see the handler-failed warning.
+            .stdout(predicate::str::contains("log handler dispatch failed").not())
             .stdout(predicate::str::contains("FIXTURE_DONE"));
     })
     .await

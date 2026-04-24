@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::bridge::obs;
 use crate::host::HostContext;
+use crate::mcp_client::handler::{MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS};
 
 use super::{json_to_lua, lua_to_json};
 
@@ -498,6 +499,126 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     }
                 },
             )?,
+        )?;
+    }
+
+    // mcp._store_progress_ucb(server_name, fn)
+    // Internal: store a user-provided progress callback on the handler Isle in
+    // `__mcp_user_progress_cbs[server_name]` WITHOUT marking the dispatch registry.
+    //
+    // Used by `blocks/agent/init.lua` `connect_mcp_servers` so that the
+    // self-contained envelope wrapper can call `user_cb` via a global lookup
+    // instead of capturing it as an upvalue (upvalues are nil after bytecode
+    // dump/reload across Lua VMs).
+    {
+        let isle = Arc::clone(&handler_isle);
+        mcp_tbl.set(
+            "_store_progress_ucb",
+            lua.create_async_function(move |_, (server_name, func): (String, LuaFunction)| {
+                let isle = Arc::clone(&isle);
+                async move {
+                    if func.info().what != "Lua" {
+                        return Err(LuaError::external(
+                            "mcp._store_progress_ucb: handler must be a pure Lua function",
+                        ));
+                    }
+                    let bytecode = func.dump(true);
+                    if bytecode.is_empty() {
+                        return Err(LuaError::external(
+                            "mcp._store_progress_ucb: Function::dump returned empty bytecode",
+                        ));
+                    }
+                    let server_for_exec = server_name.clone();
+                    let bytecode_name = format!("@mcp_progress_ucb[{server_name}]");
+                    isle.exec(move |lua| {
+                        use mlua::prelude::*;
+                        let loaded: LuaFunction = lua
+                            .load(bytecode.as_slice())
+                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_name(&bytecode_name)
+                            .into_function()
+                            .map_err(|e| {
+                                IsleError::Lua(format!("_store_progress_ucb load: {e}"))
+                            })?;
+                        let tbl: LuaTable =
+                            lua.globals().get(MCP_USER_PROGRESS_CBS).map_err(|e| {
+                                IsleError::Lua(format!("_store_progress_ucb get table: {e}"))
+                            })?;
+                        tbl.set(server_for_exec.as_str(), loaded)
+                            .map_err(|e| IsleError::Lua(format!("_store_progress_ucb set: {e}")))?;
+                        Ok(String::new())
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            server = %server_name,
+                            error = %e,
+                            "mcp._store_progress_ucb: handler isle load failed"
+                        );
+                        LuaError::external(format!(
+                            "mcp._store_progress_ucb: handler isle load failed: {e}"
+                        ))
+                    })?;
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp._store_log_ucb(server_name, fn)
+    // Internal: store a user-provided log callback on the handler Isle in
+    // `__mcp_user_log_cbs[server_name]` WITHOUT marking the dispatch registry.
+    //
+    // Same rationale as `_store_progress_ucb`.
+    {
+        let isle = Arc::clone(&handler_isle);
+        mcp_tbl.set(
+            "_store_log_ucb",
+            lua.create_async_function(move |_, (server_name, func): (String, LuaFunction)| {
+                let isle = Arc::clone(&isle);
+                async move {
+                    if func.info().what != "Lua" {
+                        return Err(LuaError::external(
+                            "mcp._store_log_ucb: handler must be a pure Lua function",
+                        ));
+                    }
+                    let bytecode = func.dump(true);
+                    if bytecode.is_empty() {
+                        return Err(LuaError::external(
+                            "mcp._store_log_ucb: Function::dump returned empty bytecode",
+                        ));
+                    }
+                    let server_for_exec = server_name.clone();
+                    let bytecode_name = format!("@mcp_log_ucb[{server_name}]");
+                    isle.exec(move |lua| {
+                        use mlua::prelude::*;
+                        let loaded: LuaFunction = lua
+                            .load(bytecode.as_slice())
+                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_name(&bytecode_name)
+                            .into_function()
+                            .map_err(|e| IsleError::Lua(format!("_store_log_ucb load: {e}")))?;
+                        let tbl: LuaTable = lua.globals().get(MCP_USER_LOG_CBS).map_err(|e| {
+                            IsleError::Lua(format!("_store_log_ucb get table: {e}"))
+                        })?;
+                        tbl.set(server_for_exec.as_str(), loaded)
+                            .map_err(|e| IsleError::Lua(format!("_store_log_ucb set: {e}")))?;
+                        Ok(String::new())
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            server = %server_name,
+                            error = %e,
+                            "mcp._store_log_ucb: handler isle load failed"
+                        );
+                        LuaError::external(format!(
+                            "mcp._store_log_ucb: handler isle load failed: {e}"
+                        ))
+                    })?;
+                    Ok(())
+                }
+            })?,
         )?;
     }
 
