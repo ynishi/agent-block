@@ -54,6 +54,39 @@ agent-block --script scripts/test_fcloop.lua --project .
 ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9090/ws
 ```
 
+## MCP Echo Harness
+
+A self-contained reference MCP server for smoke-testing the agent-block MCP client bridge.
+Exposes tools, resources, prompts, logging, and sampling over stdio or HTTP.
+
+```sh
+# stdio (default) — connect via mcp.connect("echo", "target/debug/examples/echo_mcp_server", {})
+cargo run --example echo_mcp_server
+
+# HTTP on an ephemeral port — prints ECHO_MCP_URL=http://127.0.0.1:<port>/mcp
+cargo run --example echo_mcp_server -- --transport http --port 0
+
+# Also emit 5 log notifications (1-second intervals) and attempt a sampling round-trip
+cargo run --example echo_mcp_server -- --transport http --port 0 --emit-logs --request-sampling
+```
+
+Verify from Lua (requires the server to be running with `--transport http`):
+
+```lua
+local url = os.getenv("ECHO_MCP_URL")
+mcp.connect_http("echo", url)
+print(mcp.list_tools("echo"))         -- 2 tools: echo, slow_echo
+print(mcp.list_resources("echo"))     -- 2 resources: text://hello, text://note
+print(mcp.list_prompts("echo"))       -- 1 prompt: greet
+-- call slow_echo to exercise progress notifications
+mcp.on_progress("echo", function(tok, prog, total, msg)
+    print("progress", prog, total, msg)
+end)
+print(mcp.call("echo", "slow_echo", { msg = "hi", steps = 3 }))
+```
+
+See `examples/verify_echo_harness.lua` for the full verification script.
+
 ## Lua API
 
 ### llm.*
