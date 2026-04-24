@@ -467,8 +467,41 @@ local function connect_mcp_servers(servers, opts)
             }
         end
 
-        -- Opt-in: register resources / prompts meta-tools if capability present
-        if opts.enable_resources or opts.enable_prompts then
+        -- Register on_progress / progress_to_log (no capability gate; all servers).
+        -- Callback priority: opts.on_progress wins over progress_to_log bool.
+        if opts.on_progress then
+            local sn = name
+            local user_cb = opts.on_progress
+            mcp.on_progress(sn, function(srv, token, progress, total, message)
+                local ev = {
+                    type = "progress",
+                    server = srv,
+                    token = token,
+                    progress = progress,
+                    total = total,
+                    message = message,
+                }
+                local ok, cb_err = pcall(user_cb, ev)
+                if not ok then
+                    log.warn("agent: on_progress callback error for '" .. sn .. "': " .. tostring(cb_err))
+                end
+            end)
+        elseif opts.progress_to_log then
+            local sn = name
+            mcp.on_progress(sn, function(srv, token, progress, total, message)
+                local msg = "mcp progress: server=" .. tostring(srv)
+                    .. " token=" .. tostring(token)
+                    .. " p=" .. tostring(progress) .. "/" .. tostring(total)
+                if message and message ~= "" then
+                    msg = msg .. " msg=" .. message
+                end
+                log.info(msg)
+            end)
+        end
+
+        -- Opt-in: register resources / prompts meta-tools + on_log/log_to_stderr
+        -- if capability present (server_info call shared for all capability-gated opts).
+        if opts.enable_resources or opts.enable_prompts or opts.on_log or opts.log_to_stderr then
             local si_result = mcp.server_info(name)
             if si_result.ok then
                 local caps = (si_result.server_info and si_result.server_info.capabilities) or {}
@@ -529,6 +562,48 @@ local function connect_mcp_servers(servers, opts)
                         end)
                     else
                         log.info("agent: server '" .. name .. "' has no prompts capability; skipping register")
+                    end
+                end
+
+                -- Register on_log / log_to_stderr (logging capability gate).
+                -- Callback priority: opts.on_log wins over log_to_stderr bool.
+                if opts.on_log or opts.log_to_stderr then
+                    if caps.logging ~= nil then
+                        local sn = name
+                        if opts.on_log then
+                            local user_cb = opts.on_log
+                            mcp.on_log(sn, function(srv, level, logger, data_json)
+                                local ev = {
+                                    type = "log",
+                                    server = srv,
+                                    level = level,
+                                    logger = logger,
+                                    data = data_json,
+                                }
+                                local ok, cb_err = pcall(user_cb, ev)
+                                if not ok then
+                                    log.warn("agent: on_log callback error for '" .. sn .. "': " .. tostring(cb_err))
+                                end
+                            end)
+                        else
+                            -- log_to_stderr=true: bridge to log.* by level
+                            mcp.on_log(sn, function(srv, level, logger, data_json)
+                                local msg = "mcp log: server=" .. tostring(srv)
+                                    .. " logger=" .. tostring(logger)
+                                    .. " data=" .. tostring(data_json)
+                                if level == "debug" then
+                                    log.debug(msg)
+                                elseif level == "warning" then
+                                    log.warn(msg)
+                                elseif level == "error" then
+                                    log.error(msg)
+                                else
+                                    log.info(msg)
+                                end
+                            end)
+                        end
+                    else
+                        log.info("agent: server '" .. name .. "' has no logging capability; on_log/log_to_stderr skipped")
                     end
                 end
             else
