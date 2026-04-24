@@ -66,9 +66,23 @@ ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9
 - `tool.schema()` — Anthropic tools-format schema array
 
 ### mcp.*
-- `mcp.connect(name, command, args)` — Spawn MCP server + initialize handshake
+- `mcp.connect(name, command, args)` — Spawn MCP server over stdio + initialize handshake
+- `mcp.connect_http(name, url, opts)` — Connect to an MCP server over HTTP transport.
+  `opts.transport = "sse" | "http"` (default `"http"` = Streamable HTTP; `"sse"` = SSE).
+  `opts.headers` table is forwarded as request headers.
 - `mcp.call(name, tool_name, arguments)` — Call an MCP tool
 - `mcp.list_tools(name)` — List available tools
+- `mcp.list_resources(name)` — List resources exposed by the server.
+  Returns `{ ok=true, resources=[{uri, name, description, mimeType, ...}] }`.
+- `mcp.read_resource(name, uri)` — Read a resource by URI.
+  Returns `{ ok=true, contents=[{uri, mimeType, text|blob}] }`.
+- `mcp.list_prompts(name)` — List prompt templates exposed by the server.
+  Returns `{ ok=true, prompts=[{name, description, arguments}] }`.
+- `mcp.get_prompt(name, prompt_name, args)` — Retrieve a rendered prompt template.
+  Returns `{ ok=true, description, messages=[{role, content}] }`.
+- `mcp.on_progress(name, handler)` — Register a per-server progress notification callback.
+  `handler(token, progress, total, message)` is called for each `notifications/progress`
+  event from the named server. Handler must be a pure Lua function.
 - `mcp.disconnect(name)` — Disconnect server
 
 ### mesh.*
