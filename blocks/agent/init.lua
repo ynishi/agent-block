@@ -466,6 +466,75 @@ local function connect_mcp_servers(servers, opts)
                 },
             }
         end
+
+        -- Opt-in: register resources / prompts meta-tools if capability present
+        if opts.enable_resources or opts.enable_prompts then
+            local si_result = mcp.server_info(name)
+            if si_result.ok then
+                local caps = (si_result.server_info and si_result.server_info.capabilities) or {}
+
+                if opts.enable_resources then
+                    if caps.resources ~= nil then
+                        local sn = name
+                        tool.register(sn .. "__mcp_list_resources", {
+                            description = "List available resources on MCP server '" .. sn .. "'",
+                            input_schema = { type = "object", properties = {} },
+                        }, function(_input)
+                            local r = mcp.list_resources(sn)
+                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            return std.json.encode(r.resources)
+                        end)
+                        tool.register(sn .. "__mcp_read_resource", {
+                            description = "Read a resource by URI from MCP server '" .. sn .. "'",
+                            input_schema = {
+                                type = "object",
+                                properties = { uri = { type = "string" } },
+                                required = { "uri" },
+                            },
+                        }, function(input)
+                            local r = mcp.read_resource(sn, input.uri)
+                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            return std.json.encode(r.contents)
+                        end)
+                    else
+                        log.info("agent: server '" .. name .. "' has no resources capability; skipping register")
+                    end
+                end
+
+                if opts.enable_prompts then
+                    if caps.prompts ~= nil then
+                        local sn = name
+                        tool.register(sn .. "__mcp_list_prompts", {
+                            description = "List available prompts on MCP server '" .. sn .. "'",
+                            input_schema = { type = "object", properties = {} },
+                        }, function(_input)
+                            local r = mcp.list_prompts(sn)
+                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            return std.json.encode(r.prompts)
+                        end)
+                        tool.register(sn .. "__mcp_get_prompt", {
+                            description = "Get a prompt by name from MCP server '" .. sn .. "'",
+                            input_schema = {
+                                type = "object",
+                                properties = {
+                                    name = { type = "string" },
+                                    args = { type = "object" },
+                                },
+                                required = { "name" },
+                            },
+                        }, function(input)
+                            local r = mcp.get_prompt(sn, input.name, input.args or {})
+                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            return std.json.encode(r.messages)
+                        end)
+                    else
+                        log.info("agent: server '" .. name .. "' has no prompts capability; skipping register")
+                    end
+                end
+            else
+                log.warn("agent: mcp.server_info failed for '" .. name .. "': " .. tostring(si_result.error))
+            end
+        end
     end
 
     return mcp_tool_map, nil, connected
