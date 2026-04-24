@@ -585,6 +585,34 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.server_info(name)
+    // Return the server's InitializeResult as a Lua table.
+    // Shape: { ok=true, server_info={...} } | { ok=false, error=... }
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "server_info",
+            lua.create_async_function(move |lua, name: String| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let result = mgr.read().await.server_info(&name);
+                    let tbl = lua.create_table()?;
+                    match result {
+                        Ok(val) => {
+                            tbl.set("ok", true)?;
+                            tbl.set("server_info", json_to_lua(&lua, val)?)?;
+                        }
+                        Err(e) => {
+                            tbl.set("ok", false)?;
+                            tbl.set("error", e.to_string())?;
+                        }
+                    }
+                    Ok(tbl)
+                }
+            })?,
+        )?;
+    }
+
     lua.globals().set("mcp", mcp_tbl)?;
     Ok(())
 }

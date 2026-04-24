@@ -96,6 +96,10 @@ ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9
   `handler(params)` receives the `CreateMessageRequest` table and must return a table
   matching `CreateMessageResult` (`{ model, stop_reason, role, content }`).
   When no handler is registered the server receives `method_not_found`.
+- `mcp.server_info(name)` — Return the server's `InitializeResult` as a Lua table.
+  Returns `{ ok=true, server_info={serverInfo, capabilities, ...} }` on success.
+  Useful for inspecting which MCP capability groups (resources, prompts, tools, etc.)
+  a server declares. Returns `{ ok=false, error="..." }` if the server is not connected.
 - `mcp.disconnect(name)` — Disconnect server
 
 ### mesh.*
@@ -183,6 +187,8 @@ Key behaviours:
 - MCP servers listed in `mcp_servers` are connected automatically and disconnected on exit (even on error).
 - Each entry may use the stdio form `{ name, command, args }` or the HTTP form `{ name, url, transport_opts }`. Both forms can coexist in the same list.
 - Pass `sampling = fn` in `agent.run` opts to register a single Lua function as the `sampling/createMessage` handler for every connected MCP server (`mcp.set_sampling_handler` is called per server automatically).
+- Pass `enable_resources = true` in `agent.run` opts to automatically register `{server}__mcp_list_resources` and `{server}__mcp_read_resource` as LLM-callable tools for each connected server that declares the `resources` capability. Default `false`. If a server does not declare `resources`, the opt-in is silently skipped (logged at `info`).
+- Pass `enable_prompts = true` in `agent.run` opts to automatically register `{server}__mcp_list_prompts` and `{server}__mcp_get_prompt` as LLM-callable tools for each connected server that declares the `prompts` capability. Default `false`. Capability check and silent skip apply the same way as `enable_resources`.
 - MCP tool names are namespaced as `server_name__tool_name` to avoid collisions.
 - Tool dispatch: MCP tools via `mcp.call()`, registered Lua tools via `tool.call()`.
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
