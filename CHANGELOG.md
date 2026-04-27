@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-process axum mock server returns a well-formed OpenAI completion with a
   single tool call, verifying that the ReAct loop dispatches the tool and
   collects the result correctly end-to-end. Runs in CI without `#[ignore]`.
+- `examples/test_qwen_openai.lua` — OpenAI-compat smoke test against a self-hosted
+  Qwen vLLM endpoint (`QWEN_BASE_URL` / `OPENAI_API_KEY` from env). Verifies
+  ReAct tool dispatch + final content end-to-end on real hardware.
+- `examples/test_provider_switch.lua` — single `agent.run()` block that flips
+  between Anthropic (Haiku) and OpenAI-compat (Qwen vLLM) via `AGENT_PROVIDER`
+  env, demonstrating that `tool.register` handlers and the ReAct loop are
+  zero-modified across providers.
 
 - `examples/echo_mcp_server` — standalone MCP reference server (stdio + HTTP) exposing tools
   (`echo`, `slow_echo`), resources, prompts, logging, and sampling for smoke-testing the
