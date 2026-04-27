@@ -216,6 +216,42 @@ end
 -- result fields: ok, content, usage{input_tokens,output_tokens,total_tokens}, num_turns, error, messages
 ```
 
+**Provider Switching**
+
+By default `agent.run` uses the Anthropic Messages API. Pass `provider = "openai"` to route to any OpenAI-compatible endpoint (vLLM, llama.cpp, OpenRouter, RunPod, etc.):
+
+```lua
+-- Anthropic (default) — requires ANTHROPIC_API_KEY
+local result = agent.run({ prompt = "Hello", model = "claude-haiku-4-5-20251001" })
+
+-- OpenAI — requires OPENAI_API_KEY (or opts.api_key)
+local result = agent.run({
+    prompt  = "Hello",
+    provider = "openai",
+    model   = "gpt-4o-mini",
+})
+
+-- Local vLLM / llama.cpp / RunPod — custom base_url
+local result = agent.run({
+    prompt   = "Hello",
+    provider = "openai",
+    base_url = "http://localhost:8080/v1",
+    model    = "Qwen/Qwen3-0.6B",
+    api_key  = "token-abc123",           -- or api_key_env = "MY_KEY"
+})
+```
+
+Environment variables used per provider:
+
+| provider     | default key env     | override via           |
+|--------------|---------------------|------------------------|
+| `anthropic`  | `ANTHROPIC_API_KEY` | `opts.api_key` / `opts.api_key_env` |
+| `openai`     | `OPENAI_API_KEY`    | `opts.api_key` / `opts.api_key_env` |
+
+`opts.base_url` overrides the endpoint root. Default for `openai` is `https://api.openai.com/v1`.
+
+`cache_control`, `context_management`, and `context_management_config` are Anthropic-only: they are operative when `provider="anthropic"` (or unset) and emit a `warn`-level log message then are ignored when `provider="openai"`.
+
 Key behaviours:
 - MCP servers listed in `mcp_servers` are connected automatically and disconnected on exit (even on error).
 - Each entry may use the stdio form `{ name, command, args }` or the HTTP form `{ name, url, transport_opts }`. Both forms can coexist in the same list.

@@ -13,8 +13,19 @@
 --       mcp_servers = { { name = "outline", command = "outline-mcp", args = {} } },
 --       on_turn = function(turn_info) end,
 --       extra_tools = {},
+--       -- Provider selection (default "anthropic"). Use "openai" for OpenAI-compatible
+--       -- endpoints (vLLM, llama.cpp, OpenRouter, RunPod, etc.).
+--       provider = "anthropic",  -- "anthropic" | "openai"
+--       -- Base URL override for OpenAI-compatible endpoints.
+--       -- Default for openai: "https://api.openai.com/v1"
+--       base_url = "http://localhost:8080/v1",
+--       -- Per-call API key override (avoids env var conflicts with multiple providers).
+--       api_key = "sk-...",
+--       -- Custom env var name for the API key (default: ANTHROPIC_API_KEY / OPENAI_API_KEY).
+--       api_key_env = "MY_OPENAI_KEY",
 --       -- Anthropic server-side context editing (default ON).
 --       -- Set to false to opt out entirely (no beta header, no body field).
+--       -- Anthropic-only: warn+ignored when provider="openai".
 --       context_management = true,
 --       -- Optional override for the default edits table (clear_tool_uses_20250919).
 --       context_management_config = { edits = { ... } },
@@ -219,7 +230,7 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
 --- @param trace table|nil Optional call metadata for dump logs.
 --- @return table|nil      Parsed response JSON on success, nil on error
 --- @return string|nil     Error string on failure
-local function llm_call(messages, opts, trace)
+local function llm_call_anthropic(messages, opts, trace)
     local api_key = std.env.get("ANTHROPIC_API_KEY")
     if not api_key then
         return nil, "ANTHROPIC_API_KEY not set"
@@ -461,6 +472,374 @@ local function llm_call(messages, opts, trace)
         })
     end
     return decoded, nil
+end
+
+-- ============================================================
+-- Internal: OpenAI provider helpers
+-- ============================================================
+
+--- Map OpenAI finish_reason to Anthropic stop_reason.
+--- @param finish_reason string|nil
+--- @return string
+local function map_finish_reason(finish_reason)
+    if finish_reason == "stop" then
+        return "end_turn"
+    elseif finish_reason == "tool_calls" then
+        return "tool_use"
+    elseif finish_reason == "length" then
+        return "max_tokens"
+    else
+        return tostring(finish_reason or "end_turn")
+    end
+end
+
+--- Normalize an OpenAI chat completion response into Anthropic-shape decoded table.
+--- @param raw table  Parsed OpenAI response JSON
+--- @return table|nil  Anthropic-shape decoded table on success
+--- @return string|nil Error string on failure
+local function normalize_openai_response(raw)
+    if not raw or not raw.choices or #raw.choices == 0 then
+        return nil, "invalid OpenAI response: missing choices"
+    end
+    local choice = raw.choices[1]
+    local message = choice and choice.message
+    if not message then
+        return nil, "invalid OpenAI response: missing choices[0].message"
+    end
+
+    local content = {}
+
+    -- Text block — skip when content is null/empty (tool-only turns)
+    local text = message.content
+    if text and text ~= "" then
+        table.insert(content, { type = "text", text = text })
+    end
+
+    -- Tool use blocks from tool_calls[]
+    for _, tc in ipairs(message.tool_calls or {}) do
+        local fn = tc["function"] or {}
+        local input = {}
+        local ok, parsed = pcall(std.json.decode, fn.arguments or "{}")
+        if ok and type(parsed) == "table" then
+            input = parsed
+        else
+            log.warn("agent: OpenAI tool_call arguments JSON parse failed for tool '" .. tostring(fn.name) .. "'; using empty input")
+            -- Acceptance Criteria #7: input={}, is_error_hint mark, loop continues
+            table.insert(content, {
+                type = "tool_use",
+                id = tc.id,
+                name = fn.name or "",
+                input = {},
+                is_error_hint = "arguments_parse_failed",
+            })
+            goto continue_tc
+        end
+        table.insert(content, {
+            type = "tool_use",
+            id = tc.id,
+            name = fn.name or "",
+            input = input,
+        })
+        ::continue_tc::
+    end
+
+    local usage_raw = raw.usage or {}
+    local decoded = {
+        content = content,
+        stop_reason = map_finish_reason(choice.finish_reason),
+        usage = {
+            input_tokens = tonumber(usage_raw.prompt_tokens) or 0,
+            output_tokens = tonumber(usage_raw.completion_tokens) or 0,
+            cache_creation_input_tokens = 0,
+            cache_read_input_tokens = 0,
+        },
+        context_management = nil,
+    }
+    return decoded, nil
+end
+
+--- Convert Anthropic-shaped messages history to OpenAI-shaped messages.
+--- Anthropic uses content-block arrays; OpenAI uses flat message list with
+--- tool_calls on assistant messages and role="tool" for tool results.
+--- @param messages table   Anthropic-shaped messages array
+--- @param system string|nil  Optional system prompt
+--- @return table            OpenAI-shaped messages array
+local function convert_messages_to_openai(messages, system)
+    local out = {}
+
+    -- Insert system message first if provided
+    if system and system ~= "" then
+        table.insert(out, { role = "system", content = system })
+    end
+
+    for _, msg in ipairs(messages) do
+        if type(msg.content) == "string" then
+            -- Simple string content (user prompt turns)
+            table.insert(out, { role = msg.role, content = msg.content })
+        elseif type(msg.content) == "table" then
+            if msg.role == "assistant" then
+                -- Assistant messages may have text + tool_use blocks
+                local text_parts = {}
+                local tool_calls = {}
+                for _, block in ipairs(msg.content) do
+                    if block.type == "text" then
+                        table.insert(text_parts, block.text or "")
+                    elseif block.type == "tool_use" then
+                        table.insert(tool_calls, {
+                            id = block.id,
+                            type = "function",
+                            ["function"] = {
+                                name = block.name,
+                                arguments = std.json.encode(block.input or {}),
+                            },
+                        })
+                    end
+                end
+                local text_content = #text_parts > 0 and table.concat(text_parts, "\n") or nil
+                local oai_msg = { role = "assistant" }
+                if text_content then oai_msg.content = text_content end
+                if #tool_calls > 0 then oai_msg.tool_calls = tool_calls end
+                table.insert(out, oai_msg)
+            elseif msg.role == "user" then
+                -- User messages with tool_result blocks → expand to role="tool" messages
+                local has_tool_result = false
+                for _, block in ipairs(msg.content) do
+                    if block.type == "tool_result" then
+                        has_tool_result = true
+                        break
+                    end
+                end
+                if has_tool_result then
+                    for _, block in ipairs(msg.content) do
+                        if block.type == "tool_result" then
+                            table.insert(out, {
+                                role = "tool",
+                                tool_call_id = block.tool_use_id,
+                                content = tostring(block.content or ""),
+                            })
+                        end
+                    end
+                else
+                    -- Regular user message with content array (e.g. text blocks)
+                    local parts = {}
+                    for _, block in ipairs(msg.content) do
+                        if block.type == "text" then
+                            table.insert(parts, block.text or "")
+                        end
+                    end
+                    table.insert(out, { role = "user", content = table.concat(parts, "\n") })
+                end
+            else
+                -- Other roles: pass content as-is (fallback)
+                table.insert(out, { role = msg.role, content = msg.content })
+            end
+        end
+    end
+
+    return out
+end
+
+--- Call OpenAI-compatible Chat Completions API via http.request.
+--- Returns Anthropic-shape decoded table (no change to dispatch_tool call sites).
+--- @param messages table  Anthropic-shaped messages array
+--- @param opts table      Options: provider, base_url, api_key, api_key_env, model,
+---                        max_tokens, timeout, system, tools.
+---                        Anthropic-only opts (cache_control, context_management,
+---                        context_management_config) are warn+ignored.
+--- @param trace table|nil Optional call metadata for dump logs.
+--- @return table|nil      Anthropic-shape decoded table on success, nil on error
+--- @return string|nil     Error string on failure
+local function llm_call_openai(messages, opts, trace)
+    -- Warn on anthropic-only opts (crux #2: warn+ignore, not silent drop or error)
+    if opts.cache_control ~= nil then
+        log.warn("agent: cache_control is anthropic-only; ignored for provider=openai")
+    end
+    if opts.context_management ~= nil then
+        log.warn("agent: context_management is anthropic-only; ignored for provider=openai")
+    end
+    if opts.context_management_config ~= nil then
+        log.warn("agent: context_management_config is anthropic-only; ignored for provider=openai")
+    end
+
+    -- Auth: opts.api_key > opts.api_key_env > OPENAI_API_KEY
+    local api_key = opts.api_key
+    if not api_key then
+        local key_env = opts.api_key_env or "OPENAI_API_KEY"
+        api_key = std.env.get(key_env)
+        if not api_key then
+            return nil, "API key not set: env=" .. key_env
+        end
+    end
+
+    local model = opts.model or std.env.get_or("OPENAI_MODEL", "gpt-4o-mini")
+    local base_url = opts.base_url or "https://api.openai.com/v1"
+    local endpoint = base_url .. "/chat/completions"
+
+    -- Convert messages to OpenAI shape (handles tool_use/tool_result blocks)
+    local oai_messages = convert_messages_to_openai(messages, opts.system)
+
+    -- Convert tools from Anthropic format to OpenAI format
+    local oai_tools = nil
+    if opts.tools and #opts.tools > 0 then
+        oai_tools = {}
+        for _, t in ipairs(opts.tools) do
+            -- Strip cache_control (defensive: build_tools may not add it but be safe)
+            local fn_def = {
+                name = t.name,
+                description = t.description or "",
+                parameters = t.input_schema or { type = "object", properties = {} },
+            }
+            table.insert(oai_tools, { type = "function", ["function"] = fn_def })
+        end
+    end
+
+    local body = {
+        model = model,
+        messages = oai_messages,
+        max_tokens = opts.max_tokens or 4096,
+    }
+    if oai_tools and #oai_tools > 0 then
+        body.tools = oai_tools
+    end
+
+    local headers = {
+        ["Authorization"] = "Bearer " .. api_key,
+        ["Content-Type"] = "application/json",
+    }
+
+    local dump_mode = resolve_dump_mode()
+    local call_index = trace and trace.call_index or "?"
+    local turn = trace and trace.turn or "?"
+    local iteration = trace and trace.iteration or "?"
+    llm_dump_event(dump_mode, "request", {
+        { "call", call_index },
+        { "turn", turn },
+        { "iter", iteration },
+        { "trace_id", trace and trace.trace_id or nil },
+        { "run_id", trace and trace.run_id or nil },
+        { "agent_id", trace and trace.agent_id or nil },
+        { "agent_name", trace and trace.agent_name or nil },
+        { "model", body.model },
+        { "messages", #messages },
+        { "tools", #(body.tools or {}) },
+        { "max_tokens", tonumber(body.max_tokens) or 0 },
+        { "timeout", tonumber(opts.timeout or 120) or 120 },
+        { "context_mgmt", false },
+        { "provider", "openai" },
+    })
+    if dump_mode == "full" then
+        llm_dump_event(dump_mode, "request_headers", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(sanitize_headers_for_dump(headers)) },
+        })
+        llm_dump_event(dump_mode, "request_body", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(body) },
+        })
+    end
+
+    local start_ts = std.time.now()
+    local resp = http.request(endpoint, {
+        method = "POST",
+        headers = headers,
+        body = std.json.encode(body),
+        timeout = opts.timeout or 120,
+    })
+    local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
+
+    llm_dump_event(dump_mode, "response", {
+        { "call", call_index },
+        { "turn", turn },
+        { "iter", iteration },
+        { "trace_id", trace and trace.trace_id or nil },
+        { "run_id", trace and trace.run_id or nil },
+        { "agent_id", trace and trace.agent_id or nil },
+        { "agent_name", trace and trace.agent_name or nil },
+        { "status", resp.status },
+        { "latency_ms", elapsed_ms },
+        { "provider", "openai" },
+    })
+    if dump_mode == "full" then
+        llm_dump_event(dump_mode, "response_headers", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", std.json.encode(resp.headers or {}) },
+        })
+        llm_dump_event(dump_mode, "response_body", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "payload", tostring(resp.body or "") },
+        })
+    end
+
+    if resp.status ~= 200 then
+        return nil, "API error " .. resp.status
+    end
+
+    local ok_parse, raw = pcall(std.json.decode, resp.body)
+    if not ok_parse then
+        log.warn("agent: OpenAI response JSON decode failed: " .. tostring(raw))
+        return nil, "OpenAI response JSON decode failed"
+    end
+
+    local decoded, norm_err = normalize_openai_response(raw)
+    if not decoded then
+        log.warn("agent: OpenAI response normalization failed: " .. tostring(norm_err))
+        return nil, norm_err
+    end
+
+    if dump_mode ~= "off" then
+        local usage = decoded.usage or {}
+        local in_tok = tonumber(usage.input_tokens) or 0
+        local out_tok = tonumber(usage.output_tokens) or 0
+        local stop_reason = tostring(decoded.stop_reason or "unknown")
+        local content_blocks = #(decoded.content or {})
+        local tool_uses = count_tool_use_blocks(decoded.content)
+        local text_chars = count_text_chars(decoded.content)
+        llm_dump_event(dump_mode, "summary", {
+            { "call", call_index },
+            { "turn", turn },
+            { "iter", iteration },
+            { "trace_id", trace and trace.trace_id or nil },
+            { "run_id", trace and trace.run_id or nil },
+            { "agent_id", trace and trace.agent_id or nil },
+            { "agent_name", trace and trace.agent_name or nil },
+            { "stop_reason", stop_reason },
+            { "blocks", content_blocks },
+            { "tool_uses", tool_uses },
+            { "text_chars", text_chars },
+            { "usage_in", in_tok },
+            { "usage_out", out_tok },
+            { "usage_total", in_tok + out_tok },
+            { "cache_create", 0 },
+            { "cache_read", 0 },
+            { "context_edits", 0 },
+            { "provider", "openai" },
+        })
+    end
+
+    return decoded, nil
+end
+
+--- Dispatcher: route to llm_call_anthropic or llm_call_openai based on opts.provider.
+--- Default is "anthropic" for full backward compatibility.
+--- @param messages table  Messages array
+--- @param opts table      Options (provider, base_url, api_key, api_key_env, ...)
+--- @param trace table|nil Optional call metadata for dump logs.
+--- @return table|nil      Parsed response on success, nil on error
+--- @return string|nil     Error string on failure
+local function llm_call(messages, opts, trace)
+    if (opts.provider or "anthropic") == "openai" then
+        return llm_call_openai(messages, opts, trace)
+    else
+        return llm_call_anthropic(messages, opts, trace)
+    end
 end
 
 -- ============================================================
@@ -850,14 +1229,28 @@ end
 ---                   / AGENT_BLOCK_AGENT_NAME / AGENT_BLOCK_RUN_ID.
 ---                   Deprecated fallback: `task_id` / AGENT_BLOCK_TASK_ID maps to `trace_id`.
 ---   extra_tools     (optional) Extra Anthropic tool definitions to include
+---   provider        (optional) LLM provider: "anthropic" (default) | "openai".
+---                   When "openai", routes to the OpenAI Chat Completions API shape
+---                   (compatible with vLLM, llama.cpp, OpenRouter, RunPod, etc.).
+---                   Default "anthropic" preserves full backward compatibility.
+---   base_url        (optional) Base URL override for OpenAI-compatible endpoints.
+---                   Only used when provider="openai".
+---                   Default: "https://api.openai.com/v1"
+---   api_key         (optional) Per-call API key override. When set, takes precedence
+---                   over env var lookup. Useful for multi-provider setups where env
+---                   variable names would collide.
+---   api_key_env     (optional) Custom env var name for the API key.
+---                   Default: "ANTHROPIC_API_KEY" (anthropic) / "OPENAI_API_KEY" (openai).
 ---   context_management        (optional, default true) When false, opt out of
 ---                   Anthropic server-side context editing entirely (no beta
 ---                   header, no body field). Any non-false value (nil, true,
 ---                   table) keeps it enabled.
+---                   Anthropic-only: warn+ignored when provider="openai".
 ---   context_management_config (optional) Full override table passed as
 ---                   body.context_management. Defaults to DEFAULT_CONTEXT_MANAGEMENT
 ---                   (clear_tool_uses_20250919 with 80K/keep=3/clear>=10K).
 ---                   Ignored when context_management == false.
+---                   Anthropic-only: warn+ignored when provider="openai".
 --- }
 ---
 --- @return table  {
@@ -923,6 +1316,15 @@ function M.run(opts)
         system = opts.system,
         tools = tools,
         context_management = cm_final,  -- nil = opt-out, table = enabled
+        -- Provider routing (new — additive, default nil = anthropic path)
+        provider = opts.provider,
+        base_url = opts.base_url,
+        api_key = opts.api_key,
+        api_key_env = opts.api_key_env,
+        -- Pass through cache_control so llm_call_openai can warn on it
+        cache_control = opts.cache_control,
+        -- Pass through context_management_config so llm_call_openai can warn on it
+        context_management_config = opts.context_management_config,
     }
     local log_meta = build_log_meta(opts)
 

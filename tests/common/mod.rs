@@ -1,3 +1,5 @@
+pub mod openai_mock;
+
 use assert_cmd::Command;
 
 /// Build and return a Command pointing at the `agent-block` binary.

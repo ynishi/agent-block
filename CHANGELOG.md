@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent.run()` now accepts `provider = "openai"` to route LLM calls to any
+  OpenAI-compatible endpoint (vLLM, llama.cpp, OpenRouter, RunPod, etc.) while
+  keeping `provider = "anthropic"` (or absent) as the unchanged default path.
+  New opts: `provider` (`"anthropic" | "openai"`, default `"anthropic"`),
+  `base_url` (per-call endpoint override; default for openai is
+  `https://api.openai.com/v1`), `api_key` (inline key, bypasses env lookup),
+  `api_key_env` (custom env-variable name; defaults: `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY`).
+- OpenAI response normalizer converts `choices[0].message.tool_calls[]` to the
+  internal Anthropic-shape `tool_use` content-block format so the ReAct loop
+  and all `dispatch_tool` call sites require zero modification.
+- `cache_control`, `context_management`, and `context_management_config` are
+  Anthropic-only: when `provider = "openai"` any of these opts emit a single
+  `warn`-level log line (`agent: <field> is anthropic-only; ignored for
+  provider=openai`) and are silently excluded from the request body / headers.
+  They remain fully operative for the Anthropic provider.
+- `tool_calls[].function.arguments` JSON-parse failures in OpenAI responses are
+  surfaced as `is_error = true` tool-result blocks fed back to the model for
+  self-correction rather than silently dropped or causing a loop abort.
+- E2E test `openai_provider_mock_tool_dispatch` in `tests/e2e_agent.rs`:
+  in-process axum mock server returns a well-formed OpenAI completion with a
+  single tool call, verifying that the ReAct loop dispatches the tool and
+  collects the result correctly end-to-end. Runs in CI without `#[ignore]`.
+
 - `examples/echo_mcp_server` — standalone MCP reference server (stdio + HTTP) exposing tools
   (`echo`, `slow_echo`), resources, prompts, logging, and sampling for smoke-testing the
   agent-block MCP bridge. Run with `cargo run --example echo_mcp_server -- --help`.
