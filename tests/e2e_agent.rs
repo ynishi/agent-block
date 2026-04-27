@@ -1,6 +1,7 @@
 mod common;
 
 use predicates::prelude::*;
+use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
 #[test]
@@ -55,4 +56,42 @@ fn agent_run_emits_structured_meta_logs() {
         .stdout(predicate::str::contains("trace_id=e2e-trace-01"))
         .stdout(predicate::str::contains("agent_id=e2e-agent-01"))
         .stdout(predicate::str::contains("run_id=e2e-run-01"));
+}
+
+/// Verifies the OpenAI provider path with an in-process mock server.
+///
+/// Spawns a minimal axum HTTP server that simulates a 2-turn Chat Completions
+/// exchange:
+///   - Turn 1: assistant returns `tool_calls` → agent dispatches the `echo` tool
+///   - Turn 2: assistant returns `finish_reason="stop"` with final content
+///
+/// The mock URL is passed to the fixture via `OPENAI_BASE_URL_TEST`.
+/// No external API key is required.
+#[tokio::test]
+async fn agent_run_openai_mock_dispatches_tool() {
+    let (base_url, call_count, ct) = common::openai_mock::spawn_openai_mock_server().await;
+    // Give the server a moment to start accepting connections.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("agent_openai_mock.lua")])
+            .env("OPENAI_BASE_URL_TEST", &url_clone)
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("OPENAI_MOCK_TOOL_DISPATCHED_OK"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls to the mock (turn 1: tool_calls, turn 2: stop)"
+    );
+    ct.cancel();
 }
