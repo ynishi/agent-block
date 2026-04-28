@@ -1,10 +1,10 @@
--- test_anthropic_coding_react.lua — CodingReact loop e2e (Anthropic)
+-- test_anthropic_compile_loop.lua — compile_loop e2e (Anthropic)
 --
 -- Demonstrates blocks/coding_agent: structural Edit→Run→Feedback loop
 -- using the Anthropic Messages API (claude-haiku) as the LLM backend.
 --
 -- Run:
---   agent-block -s examples/test_anthropic_coding_react.lua
+--   agent-block -s examples/test_anthropic_compile_loop.lua
 --   (.env is auto-loaded by agent-block; no manual source needed)
 --
 -- Exit codes:
@@ -24,7 +24,7 @@ local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 local TARGET = "/tmp/coding_agent_anthropic_smoke.lua"
 
 -- Runner: invoke the local lua interpreter on the file, capture all output.
--- Mirrors examples/test_qwen_coding_react.lua. M.run requires opts.runner to be a
+-- Mirrors examples/test_qwen_compile_loop.lua. M.run requires opts.runner to be a
 -- function (the runner_kind dispatch only happens inside M.register_tool).
 local function lua_runner(file_path)
     local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")

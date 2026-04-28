@@ -1,4 +1,4 @@
--- test_qwen_coding_react_lust.lua — CodingReact loop using mlua-probe (lua-debugger MCP)
+-- test_qwen_compile_loop_lust.lua — compile_loop using mlua-probe (lua-debugger MCP)
 -- as the runner. Structured per-test feedback instead of raw stdout grep.
 local coding = require("coding_agent")
 
@@ -77,7 +77,7 @@ local SPEC = [[Write a single Lua 5.3+ file (no external libs) that:
 
 Output ONLY the file contents in a single ```lua ... ``` block.]]
 
-log.info("CodingReact + mlua-probe lust runner. Target: " .. TARGET)
+log.info("compile_loop + mlua-probe lust runner. Target: " .. TARGET)
 
 local res = coding.run({
     provider     = "openai",

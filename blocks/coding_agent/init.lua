@@ -1,4 +1,4 @@
--- blocks/coding_agent/init.lua — Structured coding-react loop (full-file edit mode)
+-- blocks/coding_agent/init.lua — Structured compile_loop (full-file edit mode)
 --
 -- Different from blocks/agent (free ReAct). Here the loop is STRUCTURAL:
 --   LLM emits code → host auto-edits target_file → host auto-runs runner →
