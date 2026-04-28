@@ -9,58 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `coding_agent` — `provider = "anthropic"` path is now fully implemented in `llm_call()`.
-  Calls the Anthropic Messages API (`https://api.anthropic.com/v1/messages`) with the
-  `anthropic-version: 2023-06-01` header and normalizes the response to the OpenAI-compatible
-  `choices[1].message.content` shape so `M.run` requires zero changes.
-  - **API key resolution**: `opts.api_key` is checked first, then `ANTHROPIC_API_KEY` env
-    (or `opts.api_key_env` if set); an explicit error is raised when neither is present.
-    This mirrors the existing `openai` path and lets callers inject keys without polluting
-    the environment.
-  - **System prompt extraction**: the `{role="system"}` entry that `M.run` prepends to
-    the messages array is automatically lifted to the top-level `body.system` field required
-    by the Anthropic API; the messages array sent to the server contains only user/assistant
-    roles.
-  - **Response normalization**: `decoded.content[*].text` blocks are concatenated and
-    wrapped in `{choices={{message={content=...}}}}` so the downstream `extract_code()`
-    call site is unchanged.
-  - `disable_thinking` / `chat_template_kwargs` opts are silently ignored for the Anthropic
-    path (Qwen-specific, no-op as declared in the module docstring).
-- `examples/test_anthropic_compile_loop.lua` — new smoke test for the `coding_agent`
-  Anthropic provider path. Mirrors `test_qwen_compile_loop.lua` with
-  `provider="anthropic"` and `model="claude-haiku-4-5-20251001"`. Exits with code 2 when
-  `ANTHROPIC_API_KEY` is absent.
-
-- `blocks/coding_agent` — structured compile-and-fix loop block (`blocks/coding_agent/init.lua`).
-  The child LLM action space is confined to emitting the complete target file in a single fenced
-  code block on every iteration; tool selection, target file switching, and spec modification are
-  structurally unreachable by the child.
-- `coding_agent.run(opts)` — infallible loop entry point.
-  Returns `{ ok, code, artifact_path, iters, summary, history, failure_reason?, last_error? }`.
-  All failure paths return a structured payload; `ok=false` without diagnostic fields is never
-  returned.
-  - **Verdict Gate**: loop exits with `ok=true` on first runner PASS; exits with `ok=false` and
+- `blocks/compile_loop` — new Tool factory block (`blocks/compile_loop/init.lua`).
+  Primary surface: `compile_loop.make(conf)` returns a `tool_def = {name, schema, handler}`
+  that can be passed directly to `agent.run({extra_tools = {tool_def}})`. The compile-and-fix
+  loop logic (previously inside `coding_agent`) now lives here.
+  - **`compile_loop.make(conf)`** — factory function. `conf.runner` (function) is required;
+    `conf.llm` is optional and inherits the parent agent's provider/model/api_key at call
+    time when omitted (Crux #2: `_AGENT_LLM_CTX` stack resolution).
+  - **Tool input** (`spec`, `target_file`, `lang?`) is supplied by the calling LLM at tool-call
+    time; factory `conf` fixes the runner and LLM policy at registration time.
+  - **Counter WF-A defence**: handler output JSON never contains `code` or `history` fields
+    to prevent caller context contamination.
+  - **Stagnation detection**: when `STAGNATION_WINDOW = 3` consecutive iterations produce
+    identical runner `stderr`, the loop gives up immediately (`failure_reason = "stagnation"`).
+  - **Verdict Gate**: loop exits with `ok=true` on first runner PASS; gives up with
     `failure_reason = "max_iters"` when the iteration ceiling is reached.
-  - **Stagnation detection** (give-up gate): when `STAGNATION_WINDOW = 3` consecutive iterations
-    produce identical runner `stderr`, the loop gives up immediately, independent of the remaining
-    iteration budget. `failure_reason = "stagnation"`.
-  - **Structured failure payload**: `failure_reason` (`"llm_call"` | `"open_target_file"` |
-    `"stagnation"` | `"max_iters"`), `last_error` (last runner stderr, trimmed to 800 chars),
-    `iters`, `summary` (human-readable exit line), `artifact_path`.
-- `coding_agent.register_tool(opts)` — register the `compile_loop` tool with the host tool registry
-  (`tool.register`). The tool handler merges registration-time opts with per-call tool input;
-  `spec` and `target_file` are supplied by the calling LLM. The JSON-encoded response excludes
-  `code` and `history` to prevent Caller context contamination.
-- `runner_kind` string dispatch in `M.register_tool`: pass `runner_kind = "lua"` or
-  `runner_kind = "cargo"` for built-in runners. `"lua"` invokes the system `lua` interpreter and
-  passes on exit 0 + `ALL_PASS` in stdout. `"cargo"` runs `cargo test --offline` in the target
-  file's directory and passes on `"test result: ok"` in output. A Lua function may also be passed
-  directly as `runner_kind` (existing API).
-- `examples/test_compile_loop_parent.lua` — parent-agent smoke test: Anthropic Haiku parent calls
-  the `compile_loop` tool with a Qwen child LLM, exercising the full tool-registry → child-loop
-  → structured-result round-trip.
-- Updated `examples/test_qwen_compile_loop.lua`, `_hard.lua`, `_lust.lua`, `_rust.lua` to use
-  `res.failure_reason` (replaces `res.error`) and log `res.artifact_path` alongside `res.code`.
+  - **Structured result**: `{ ok, iters, summary, failure_reason?, last_error?, artifact_path }`.
+  - **Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
+    etc.) are both fully implemented with the same K-96 field set
+    (`provider`, `base_url`, `api_key`, `api_key_env`, `model`, `max_tokens`, `temperature`,
+    `disable_thinking`, `timeout`).
+  - **Side-effect**: `tool.register(name, schema, handler)` is called by `make()` so the
+    returned `tool_def.handler` and the registry entry are identity-equal.
+- `agent._llm_ctx_top()` — internal function (module-level, not public API). `agent.run()`
+  now pushes `{provider, base_url, api_key, api_key_env, model}` onto a module-level
+  `_AGENT_LLM_CTX` stack at call entry and pops it on return (both normal and error paths via
+  `pcall`). `compile_loop` handlers call `agent._llm_ctx_top()` at tool-dispatch time to
+  inherit the parent's LLM credentials when `conf.llm` is omitted.
+- 5 examples rewritten to the new `compile_loop.make()` + `agent.run({extra_tools={...}})`
+  API. All references to `coding_agent.run()` and `coding_agent.register_tool()` have been
+  removed from their call paths:
+  - `examples/test_compile_loop_parent.lua` — Anthropic Haiku parent calls the
+    `compile_loop` tool with a Qwen child LLM; exercises the full tool-registry →
+    child-loop → structured-result round-trip.
+  - `examples/test_anthropic_compile_loop.lua` — Anthropic Haiku parent + child; verifies
+    Crux #2 (LLM inheritance when `conf.llm` is omitted from `compile_loop.make()`).
+  - `examples/test_qwen_compile_loop.lua` — OpenAI-compatible (Qwen) child LLM via
+    `agent.run({extra_tools={compile_loop.make(...)}})`.
+  - `examples/test_qwen_compile_loop_lust.lua` — Qwen child; lust spec target.
+  - `examples/test_qwen_compile_loop_rust.lua` — Qwen child; cargo test runner.
+
+### Changed
+
+- `blocks/coding_agent` reduced to a thin backward-compatible facade (~155 lines) over
+  `blocks/compile_loop`. `coding_agent.run(opts)` and `coding_agent.register_tool(opts)`
+  remain available but delegate internally to `compile_loop.make()`.
+  - **Breaking**: `coding_agent.run()` return shape is now
+    `{ ok, iters, summary, failure_reason?, last_error?, artifact_path }`.
+    Fields `code` and `history` are no longer returned (accepted breaking change; existing
+    5 examples have all been updated to the new API).
+  - `runner_kind` string dispatch (`"lua"` / `"cargo"`) remains in the `coding_agent` facade
+    only; `compile_loop` itself accepts only a runner function (`conf.runner`).
+  - `coding_agent.register_tool()` now returns the registered tool name instead of the
+    `tool_def` table.
 
 ## [0.10.0] - 2026-04-28
 

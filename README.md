@@ -277,22 +277,98 @@ Key behaviours:
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
 
-### coding_agent (Filesystem block — `require("coding_agent")`)
+### compile_loop (Filesystem block — `require("compile_loop")`)
 
-Structured compile-and-fix loop. The child LLM action space is confined to emitting the
-complete target file in a single fenced code block; tool selection, target file switching,
-and spec modification are structurally unreachable.
+Tool factory for the autonomous compile-and-fix loop. The primary surface is
+`compile_loop.make(conf)`, which returns a `tool_def` consumable directly by `agent.run`.
 
-Place `blocks/coding_agent/init.lua` in the project root (the runtime resolves it via
-the filesystem `blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
+Place `blocks/compile_loop/init.lua` in the project root (resolved via the filesystem
+`blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
 
-**`coding_agent.run(opts)`** — run the loop directly from Lua.
+```lua
+local compile_loop = require("compile_loop")
+local agent        = require("agent")
+
+-- Define a caller-supplied runner function
+local function lua_runner(file_path)
+    local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
+    if not p then return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 } end
+    local out = p:read("*a") or ""
+    p:close()
+    local exit_code = tonumber(out:match("__EXIT__=(%d+)%s*$") or "1")
+    out = out:gsub("__EXIT__=%d+%s*$", "")
+    local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
+    return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+end
+
+-- Build a tool_def and pass it to the parent agent
+local td = compile_loop.make({
+    runner    = lua_runner,       -- required: function(path) → {ok, stdout, stderr, exit_code}
+    max_iters = 5,                -- optional, default 5
+    lang      = "lua",            -- optional, default "lua"
+    -- conf.llm is optional: when omitted the parent agent's provider/model/api_key
+    -- are inherited at call time via _AGENT_LLM_CTX (Crux #2).
+    llm = {
+        provider = "anthropic",
+        model    = "claude-haiku-4-5-20251001",
+        -- api_key / api_key_env / base_url / max_tokens / temperature / timeout
+    },
+})
+
+local result = agent.run({
+    prompt      = "Write a Lua function that returns the nth Fibonacci number.",
+    model       = "claude-haiku-4-5-20251001",
+    extra_tools = { td },         -- tool_def passed directly; no caller-side adaptation
+})
+```
+
+**`compile_loop.make(conf)`** returns `{ name, schema, handler }`. As a side-effect
+`tool.register(name, schema, handler)` is called, so the registry and `tool_def.handler`
+share the same function identity. The tool name defaults to `"compile_loop"`; pass
+`conf.name` to override (useful when registering multiple instances).
+
+**Tool input** (supplied by the LLM at call time): `spec` (string, required),
+`target_file` (absolute path, required), `lang` (string, optional).
+
+**Tool output JSON** (never contains `code` or `history` — Counter WF-A defence):
+
+```
+{ ok, iters, summary, failure_reason?, last_error?, artifact_path }
+```
+
+`failure_reason` values: `"llm_call"` | `"open_target_file"` | `"stagnation"` | `"max_iters"`.
+
+**LLM inheritance (Crux #2)**: when `conf.llm` is omitted (or individual fields are absent),
+`compile_loop` resolves `provider`, `base_url`, `api_key`, `api_key_env`, and `model` from
+the parent `agent.run` call context at tool-dispatch time. No hardcoded provider default;
+no error for missing credentials at `make()` time.
+
+**Stagnation detection**: when 3 consecutive iterations produce identical runner `stderr`
+the loop gives up immediately, independent of the remaining iteration budget.
+`failure_reason = "stagnation"`.
+
+**Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
+OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
+
+| `conf.llm.provider` | Default key env     | Override via                        |
+|---------------------|---------------------|-------------------------------------|
+| `"anthropic"`       | `ANTHROPIC_API_KEY` | `conf.llm.api_key` / `api_key_env`  |
+| `"openai"`          | `OPENAI_API_KEY`    | `conf.llm.api_key` / `api_key_env`  |
+
+### coding_agent (Filesystem block — `require("coding_agent")`, thin facade)
+
+Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
+new code. `coding_agent` is retained for existing callers.
+
+Place `blocks/coding_agent/init.lua` in the project root.
+
+**`coding_agent.run(opts)`** — run the loop directly from Lua (facade over `compile_loop`).
 
 ```lua
 local coding = require("coding_agent")
 
 local res = coding.run({
-    provider    = "anthropic",                    -- "openai" | "anthropic" (both fully supported)
+    provider    = "anthropic",                    -- "openai" | "anthropic"
     api_key     = "...",                          -- or api_key_env = "ANTHROPIC_API_KEY"
     model       = "claude-haiku-4-5-20251001",
     target_file = "/tmp/work/solution.lua",
@@ -310,22 +386,18 @@ local res = coding.run({
 })
 
 -- res fields:
---   ok            boolean
---   code          string      last emitted code (available when requiring directly)
---   artifact_path string      absolute path of the target file
---   iters         int
---   summary       string      "PASS in N iters" or "give-up: <reason>"
---   history       table       per-iter { iter, code, result, raw }
---   failure_reason string?    "llm_call"|"open_target_file"|"stagnation"|"max_iters"
---   last_error     string?    last runner stderr (trimmed to 800 chars) on failure
+--   ok             boolean
+--   artifact_path  string      absolute path of the target file
+--   iters          int
+--   summary        string      "PASS in N iters" or "give-up: <reason>"
+--   failure_reason string?     "llm_call"|"open_target_file"|"stagnation"|"max_iters"
+--   last_error     string?     last runner stderr (trimmed to 800 chars) on failure
+--
+-- NOTE: "code" and "history" fields are no longer returned (removed in this release).
 ```
 
-**Give-up gate (stagnation detection)**: when 3 consecutive iterations produce identical
-runner `stderr`, the loop gives up immediately (independent of the remaining iteration
-budget). `failure_reason = "stagnation"`.
-
 **`coding_agent.register_tool(opts)`** — register the `compile_loop` tool with the host
-tool registry so a parent LLM can invoke it via `tool.call`.
+tool registry so a parent LLM can invoke it via `tool.call`. Returns the registered tool name.
 
 ```lua
 local coding = require("coding_agent")
@@ -344,38 +416,17 @@ coding.register_tool({
 -- The parent LLM can now call the "compile_loop" tool with:
 --   { spec = "...", target_file = "/abs/path/to/file.lua", lang = "lua" }
 -- The tool response JSON contains: ok, artifact_path, iters, summary,
---   failure_reason?, last_error?   (code and history are excluded to prevent
---   Caller context contamination).
+--   failure_reason?, last_error?   (code and history are excluded).
 ```
 
-Built-in `runner_kind` values:
+Built-in `runner_kind` values (resolved in the `coding_agent` facade; `compile_loop` itself
+accepts only a runner function):
 
 | `runner_kind` | Behaviour |
 |---------------|-----------|
 | `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout |
 | `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on `"test result: ok"` |
 | function      | Called as `runner(file_path)` — must return `{ ok, stdout, stderr, exit_code }` |
-
-**Provider support**: both `"anthropic"` and `"openai"` are fully implemented. The Anthropic
-path normalizes `content[*].text` blocks to the OpenAI-compatible
-`choices[1].message.content` shape internally, so `M.run` is provider-agnostic.
-
-```lua
--- Anthropic child LLM (requires ANTHROPIC_API_KEY)
-coding.run({ provider = "anthropic", model = "claude-haiku-4-5-20251001", ... })
-
--- OpenAI-compatible child LLM (vLLM, llama.cpp, etc.)
-coding.run({ provider = "openai", base_url = "http://localhost:8080/v1",
-             model = "Qwen/Qwen2.5-Coder-7B", api_key = "token-abc123", ... })
-```
-
-API key resolution (same for both providers): `opts.api_key` → `opts.api_key_env` env →
-default env variable; explicit error when none is present.
-
-| `provider`    | Default key env       | Override via                        |
-|---------------|-----------------------|-------------------------------------|
-| `"anthropic"` | `ANTHROPIC_API_KEY`   | `opts.api_key` / `opts.api_key_env` |
-| `"openai"`    | `OPENAI_API_KEY`      | `opts.api_key` / `opts.api_key_env` |
 
 ### lshape (Vendored package — `require("lshape")`)
 
