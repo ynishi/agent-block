@@ -355,6 +355,17 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 | `"anthropic"`       | `ANTHROPIC_API_KEY` | `conf.llm.api_key` / `api_key_env`  |
 | `"openai"`          | `OPENAI_API_KEY`    | `conf.llm.api_key` / `api_key_env`  |
 
+#### External runner examples
+
+| Example | Runner | Provider |
+|---|---|---|
+| `examples/test_anthropic_compile_loop.lua` | inline lua | Anthropic |
+| `examples/test_qwen_compile_loop.lua` | inline lua | Qwen (OpenAI-compat) |
+| `examples/test_qwen_compile_loop_rust.lua` | inline cargo | Qwen (OpenAI-compat) |
+| `examples/test_qwen_compile_loop_lust.lua` | mlua-probe MCP | Qwen (OpenAI-compat) |
+| `examples/test_compile_loop_parent.lua` | inline lua | Anthropic parent + Qwen child |
+| `examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
+
 ### coding_agent (Filesystem block — `require("coding_agent")`, thin facade)
 
 Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
