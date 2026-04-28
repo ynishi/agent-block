@@ -105,5 +105,5 @@ mcp.disconnect("luadbg")
 
 log.info("=== RESULT ===")
 log.info(string.format("ok=%s iters=%d", tostring(res.ok), res.iters))
-if res.error then log.info("error: " .. tostring(res.error)) end
+if res.failure_reason then log.info("failure_reason: " .. tostring(res.failure_reason)) end
 os.exit(res.ok and 0 or 2)
