@@ -48,6 +48,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `agent.run({extra_tools={compile_loop.make(...)}})`.
   - `examples/test_qwen_compile_loop_lust.lua` — Qwen child; lust spec target.
   - `examples/test_qwen_compile_loop_rust.lua` — Qwen child; cargo test runner.
+- `examples/test_anthropic_compile_loop_pytest.lua` — new example: Anthropic parent +
+  inline `pytest_runner` that wraps `python3 -m pytest <file> --tb=short` via `io.popen`.
+  Pass judgement requires exit code 0 **and** at least one `"N passed"` count in stdout
+  (`%d+ passed` pattern; exit-code-only is insufficient to reject "no tests collected").
+  pytest absence is detected at startup via `python3 -m pytest --version` and exits with
+  code 2 (skip signal) rather than propagating an io.popen error.
+- README: added **External runner examples** mini-table under the `compile_loop` Provider
+  support section, listing all 6 example files with their runner kind and provider.
 
 ### Changed
 
