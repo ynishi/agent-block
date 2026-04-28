@@ -1,6 +1,8 @@
 -- test_qwen_compile_loop_rust.lua — compile_loop with cargo test runner
 -- Tricky Rust task: parse a small custom format with edge cases.
-local coding = require("coding_agent")
+
+local compile_loop = require("compile_loop")
+local agent        = require("agent")
 
 local QWEN_BASE_URL = std.env.get("QWEN_BASE_URL")
 if not QWEN_BASE_URL or QWEN_BASE_URL == "" then
@@ -48,29 +50,83 @@ Output ONLY the file contents in a single ```rust ... ``` block.]]
 
 log.info("Running compile_loop Rust task: " .. PROJ)
 
-local res = coding.run({
-    provider     = "openai",
-    base_url     = QWEN_BASE_URL,
-    api_key      = "dummy",
-    model        = "qwen",
-    target_file  = TARGET,
-    lang         = "rust",
-    spec         = SPEC,
-    runner       = cargo_runner,
-    max_iters    = 5,
-    max_tokens   = 3000,
-    temperature  = 0.2,
-    disable_thinking = true,
-    timeout      = 240,
-    on_iter = function(info)
-        local r = info.result
-        local tail = (r.stdout or ""):sub(-500):gsub("\n", " | ")
-        log.info(string.format("iter %d: ok=%s exit=%s", info.iter, tostring(r.ok), tostring(r.exit_code)))
-        log.info("  tail: " .. tail)
-    end,
+-- K-96: all LLM tuning fields are explicitly listed in the llm table.
+-- timeout is placed inside the llm table per K-96 (subtask-2.md §Constraints).
+local td = compile_loop.make({
+    runner   = cargo_runner,
+    llm      = {
+        provider         = "openai",
+        base_url         = QWEN_BASE_URL,
+        api_key          = "dummy",
+        model            = "qwen",
+        disable_thinking = true,
+        temperature      = 0.2,
+        max_tokens       = 3000,
+        timeout          = 240,
+    },
+    max_iters = 5,
+    lang      = "rust",
+})
+
+-- Parent also uses Qwen (minimum env: only QWEN_BASE_URL required).
+local result = agent.run({
+    provider       = "openai",
+    base_url       = QWEN_BASE_URL,
+    api_key        = "dummy",
+    model          = "qwen",
+    max_iterations = 3,
+    extra_tools    = { td },
+    prompt         = string.format(
+        "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
+        TARGET, SPEC
+    ),
 })
 
 log.info("=== RESULT ===")
-log.info(string.format("ok=%s iters=%d", tostring(res.ok), res.iters))
-if res.failure_reason then log.info("failure_reason: " .. tostring(res.failure_reason)) end
-os.exit(res.ok and 0 or 2)
+log.info("ok:        " .. tostring(result.ok))
+log.info("num_turns: " .. tostring(result.num_turns))
+if not result.ok then
+    log.error("parent agent failed: " .. tostring(result.error or "unknown"))
+    os.exit(2)
+end
+
+-- ── Extract tool_result from messages ─────────────────────────────────────────
+local captured = nil
+for _, msg in ipairs(result.messages or {}) do
+    if msg.role == "user" and type(msg.content) == "table" then
+        for _, block in ipairs(msg.content) do
+            if type(block) == "table" and block.type == "tool_result" then
+                captured = block.content
+                break
+            end
+        end
+    end
+    if captured then break end
+end
+
+if not captured then
+    log.error("FAIL: no tool_result found — compile_loop was never called")
+    os.exit(2)
+end
+
+log.info("tool_result JSON: " .. tostring(captured):sub(1, 400))
+
+-- ── Decode and assert shape ────────────────────────────────────────────────────
+local dec_ok, tool_output = pcall(std.json.decode, captured)
+if not dec_ok or type(tool_output) ~= "table" then
+    log.error("FAIL: tool_result is not valid JSON: " .. tostring(captured))
+    os.exit(2)
+end
+
+-- Required keys
+assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
+
+-- Counter WF-A: code / history must NOT appear in tool output
+assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
+
+log.info(string.format("ok=%s iters=%s", tostring(tool_output.ok), tostring(tool_output.iters)))
+if tool_output.failure_reason then log.info("failure_reason: " .. tostring(tool_output.failure_reason)) end
+os.exit(result.ok and 0 or 2)
