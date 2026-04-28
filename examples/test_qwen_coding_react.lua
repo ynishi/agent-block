@@ -84,7 +84,7 @@ local res = coding.run({
 log.info("=== RESULT ===")
 log.info("ok:    " .. tostring(res.ok))
 log.info("iters: " .. tostring(res.iters))
-if res.error then log.info("error: " .. tostring(res.error)) end
+if res.failure_reason then log.info("failure_reason: " .. tostring(res.failure_reason)) end
 if res.code then
     log.info("final code (first 200 chars): " .. (res.code:sub(1,200) or ""))
 end
