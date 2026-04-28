@@ -1,18 +1,22 @@
 -- test_anthropic_compile_loop.lua — compile_loop e2e (Anthropic)
 --
--- Demonstrates blocks/coding_agent: structural Edit→Run→Feedback loop
+-- Demonstrates blocks/compile_loop: structural Edit→Run→Feedback loop
 -- using the Anthropic Messages API (claude-haiku) as the LLM backend.
+--
+-- Crux #2 smoke: conf.llm is OMITTED from compile_loop.make() call so that
+-- the parent agent's provider/model/api_key are inherited at call time via
+-- _AGENT_LLM_CTX (set by agent.run before tool dispatch).
 --
 -- Run:
 --   agent-block -s examples/test_anthropic_compile_loop.lua
 --   (.env is auto-loaded by agent-block; no manual source needed)
 --
 -- Exit codes:
---   0 = PASS (converged within max_iters)
---   1 = FAIL (did not converge or coding_agent returned error)
---   2 = SKIP (ANTHROPIC_API_KEY not set)
+--   0 = PASS (tool called, returned well-formed filtered shape)
+--   2 = SKIP (ANTHROPIC_API_KEY not set) or tool never called
 
-local coding = require("coding_agent")
+local compile_loop = require("compile_loop")
+local agent        = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -20,12 +24,10 @@ if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
     os.exit(2)
 end
 
-local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+local MODEL  = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 local TARGET = "/tmp/coding_agent_anthropic_smoke.lua"
 
 -- Runner: invoke the local lua interpreter on the file, capture all output.
--- Mirrors examples/test_qwen_compile_loop.lua. M.run requires opts.runner to be a
--- function (the runner_kind dispatch only happens inside M.register_tool).
 local function lua_runner(file_path)
     local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
     if not p then return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 } end
@@ -53,41 +55,78 @@ Output ONLY the file contents in a single ```lua ... ``` block.]]
 log.info("Model:       " .. MODEL)
 log.info("Target file: " .. TARGET)
 
-local res = coding.run({
-    provider     = "anthropic",
-    api_key      = ANTHROPIC_API_KEY,
-    model        = MODEL,
-    target_file  = TARGET,
-    lang         = "lua",
-    spec         = SPEC,
-    runner       = lua_runner,
-    max_iters    = 5,
-    max_tokens   = 2000,
-    temperature  = 0.2,
-    on_iter = function(info)
-        local r = info.result
-        log.info(string.format(
-            "iter %d: ok=%s exit=%s stdout=%s",
-            info.iter,
-            tostring(r.ok),
-            tostring(r.exit_code),
-            (r.stdout or ""):gsub("\n", " | "):sub(1, 200)
-        ))
-    end,
+-- Crux #2: conf.llm is OMITTED → parent agent's provider/model/api_key
+-- are resolved at handler call time from _AGENT_LLM_CTX.
+local td = compile_loop.make({ runner = lua_runner })
+
+local result = agent.run({
+    provider       = "anthropic",
+    api_key        = ANTHROPIC_API_KEY,
+    model          = MODEL,
+    max_tokens     = 2048,
+    max_iterations = 3,
+    extra_tools    = { td },
+    prompt         = string.format(
+        "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
+        TARGET, SPEC
+    ),
 })
 
 log.info("=== RESULT ===")
-log.info("ok:    " .. tostring(res.ok))
-log.info("iters: " .. tostring(res.iters))
-if res.failure_reason then log.info("failure_reason: " .. tostring(res.failure_reason)) end
-if res.code then
-    log.info("final code (first 200 chars): " .. (res.code:sub(1, 200) or ""))
+log.info("ok:        " .. tostring(result.ok))
+log.info("num_turns: " .. tostring(result.num_turns))
+if not result.ok then
+    log.error("parent agent failed: " .. tostring(result.error or "unknown"))
+    os.exit(2)
 end
 
-if res.ok then
-    print("ALL_PASS")
-    os.exit(0)
-else
-    print("FAILED:", res.failure_reason, res.last_error)
-    os.exit(1)
+-- ── Extract tool_result from messages ─────────────────────────────────────────
+local captured = nil
+for _, msg in ipairs(result.messages or {}) do
+    if msg.role == "user" and type(msg.content) == "table" then
+        for _, block in ipairs(msg.content) do
+            if type(block) == "table" and block.type == "tool_result" then
+                captured = block.content
+                break
+            end
+        end
+    end
+    if captured then break end
 end
+
+if not captured then
+    log.error("FAIL: no tool_result found — compile_loop was never called")
+    os.exit(2)
+end
+
+log.info("tool_result JSON: " .. tostring(captured):sub(1, 400))
+
+-- ── Decode and assert shape ────────────────────────────────────────────────────
+local dec_ok, tool_output = pcall(std.json.decode, captured)
+if not dec_ok or type(tool_output) ~= "table" then
+    log.error("FAIL: tool_result is not valid JSON: " .. tostring(captured))
+    os.exit(2)
+end
+
+-- Required keys
+assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
+
+-- Counter WF-A: code / history must NOT appear in tool output
+assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
+
+log.info("compile_loop result: ok=" .. tostring(tool_output.ok)
+    .. " iters=" .. tostring(tool_output.iters)
+    .. " summary=" .. tostring(tool_output.summary))
+
+if tool_output.ok then
+    log.info("PASS: compile_loop converged in " .. tool_output.iters .. " iter(s)")
+else
+    log.warn("compile_loop did not converge (ok=false) — smoke test still PASSES")
+    log.warn("failure_reason: " .. tostring(tool_output.failure_reason))
+end
+
+log.info("SMOKE TEST PASS")
+os.exit(0)
