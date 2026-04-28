@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `blocks/coding_agent` — structured compile-and-fix loop block (`blocks/coding_agent/init.lua`).
+  The child LLM action space is confined to emitting the complete target file in a single fenced
+  code block on every iteration; tool selection, target file switching, and spec modification are
+  structurally unreachable by the child.
+- `coding_agent.run(opts)` — infallible loop entry point.
+  Returns `{ ok, code, artifact_path, iters, summary, history, failure_reason?, last_error? }`.
+  All failure paths return a structured payload; `ok=false` without diagnostic fields is never
+  returned.
+  - **Verdict Gate**: loop exits with `ok=true` on first runner PASS; exits with `ok=false` and
+    `failure_reason = "max_iters"` when the iteration ceiling is reached.
+  - **Stagnation detection** (give-up gate): when `STAGNATION_WINDOW = 3` consecutive iterations
+    produce identical runner `stderr`, the loop gives up immediately, independent of the remaining
+    iteration budget. `failure_reason = "stagnation"`.
+  - **Structured failure payload**: `failure_reason` (`"llm_call"` | `"open_target_file"` |
+    `"stagnation"` | `"max_iters"`), `last_error` (last runner stderr, trimmed to 800 chars),
+    `iters`, `summary` (human-readable exit line), `artifact_path`.
+- `coding_agent.register_tool(opts)` — register the `compile_loop` tool with the host tool registry
+  (`tool.register`). The tool handler merges registration-time opts with per-call tool input;
+  `spec` and `target_file` are supplied by the calling LLM. The JSON-encoded response excludes
+  `code` and `history` to prevent Caller context contamination.
+- `runner_kind` string dispatch in `M.register_tool`: pass `runner_kind = "lua"` or
+  `runner_kind = "cargo"` for built-in runners. `"lua"` invokes the system `lua` interpreter and
+  passes on exit 0 + `ALL_PASS` in stdout. `"cargo"` runs `cargo test --offline` in the target
+  file's directory and passes on `"test result: ok"` in output. A Lua function may also be passed
+  directly as `runner_kind` (existing API).
+- `examples/test_compile_loop_parent.lua` — parent-agent smoke test: Anthropic Haiku parent calls
+  the `compile_loop` tool with a Qwen child LLM, exercising the full tool-registry → child-loop
+  → structured-result round-trip.
+- Updated `examples/test_qwen_coding_react.lua`, `_hard.lua`, `_lust.lua`, `_rust.lua` to use
+  `res.failure_reason` (replaces `res.error`) and log `res.artifact_path` alongside `res.code`.
+
 ## [0.10.0] - 2026-04-28
 
 ### Added

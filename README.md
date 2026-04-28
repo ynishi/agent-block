@@ -277,6 +277,86 @@ Key behaviours:
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
 
+### coding_agent (Filesystem block — `require("coding_agent")`)
+
+Structured compile-and-fix loop. The child LLM action space is confined to emitting the
+complete target file in a single fenced code block; tool selection, target file switching,
+and spec modification are structurally unreachable.
+
+Place `blocks/coding_agent/init.lua` in the project root (the runtime resolves it via
+the filesystem `blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
+
+**`coding_agent.run(opts)`** — run the loop directly from Lua.
+
+```lua
+local coding = require("coding_agent")
+
+local res = coding.run({
+    provider    = "openai",                       -- "openai" | "anthropic"
+    base_url    = "http://localhost:8080/v1",     -- optional, default https://api.openai.com/v1
+    api_key     = "...",                          -- or api_key_env = "OPENAI_API_KEY"
+    model       = "Qwen/Qwen2.5-Coder-7B",
+    target_file = "/tmp/work/solution.lua",
+    spec        = "Write a Lua function that returns the nth Fibonacci number.",
+    lang        = "lua",                          -- code fence label (default "lua")
+    max_iters   = 5,
+    runner      = function(file_path)
+        -- return { ok=bool, stdout, stderr, exit_code }
+        local p = io.popen("lua " .. file_path .. " 2>&1; echo __EXIT__=$?", "r")
+        local out = p:read("*a"); p:close()
+        local ec = tonumber(out:match("__EXIT__=(%d+)") or "1")
+        return { ok = ec == 0, stdout = out, stderr = "", exit_code = ec }
+    end,
+    on_iter = function(info) print("iter", info.iter, info.result.ok) end,
+})
+
+-- res fields:
+--   ok            boolean
+--   code          string      last emitted code (available when requiring directly)
+--   artifact_path string      absolute path of the target file
+--   iters         int
+--   summary       string      "PASS in N iters" or "give-up: <reason>"
+--   history       table       per-iter { iter, code, result, raw }
+--   failure_reason string?    "llm_call"|"open_target_file"|"stagnation"|"max_iters"
+--   last_error     string?    last runner stderr (trimmed to 800 chars) on failure
+```
+
+**Give-up gate (stagnation detection)**: when 3 consecutive iterations produce identical
+runner `stderr`, the loop gives up immediately (independent of the remaining iteration
+budget). `failure_reason = "stagnation"`.
+
+**`coding_agent.register_tool(opts)`** — register the `compile_loop` tool with the host
+tool registry so a parent LLM can invoke it via `tool.call`.
+
+```lua
+local coding = require("coding_agent")
+
+-- Register once (typically at agent startup)
+coding.register_tool({
+    provider    = "openai",
+    base_url    = "http://localhost:8080/v1",
+    api_key     = "...",
+    model       = "Qwen/Qwen2.5-Coder-7B",
+    runner_kind = "lua",    -- "lua" | "cargo" | runner function
+    max_iters   = 5,
+    lang        = "lua",
+})
+
+-- The parent LLM can now call the "compile_loop" tool with:
+--   { spec = "...", target_file = "/abs/path/to/file.lua", lang = "lua" }
+-- The tool response JSON contains: ok, artifact_path, iters, summary,
+--   failure_reason?, last_error?   (code and history are excluded to prevent
+--   Caller context contamination).
+```
+
+Built-in `runner_kind` values:
+
+| `runner_kind` | Behaviour |
+|---------------|-----------|
+| `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout |
+| `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on `"test result: ok"` |
+| function      | Called as `runner(file_path)` — must return `{ ok, stdout, stderr, exit_code }` |
+
 ### lshape (Vendored package — `require("lshape")`)
 
 `lshape` is vendored under `blocks/lshape/` so scripts can use schema validation
