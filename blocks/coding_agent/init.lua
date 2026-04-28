@@ -278,4 +278,155 @@ function M.run(opts)
     }
 end
 
+-- Built-in runner factories for runner_kind string dispatch.
+-- These are resolved in M.register_tool before calling M.run,
+-- so M.run's runner assertion remains satisfied.
+local BUILTIN_RUNNERS = {
+    -- "lua" runner: invoke lua interpreter, pass/fail by exit 0 + "ALL_PASS" in stdout
+    lua = function(file_path)
+        local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
+        if not p then
+            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+        end
+        local out = p:read("*a") or ""
+        p:close()
+        local exit_str  = out:match("__EXIT__=(%d+)%s*$") or "1"
+        local exit_code = tonumber(exit_str) or 1
+        out = out:gsub("__EXIT__=%d+%s*$", "")
+        local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
+        return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+    end,
+    -- "cargo" runner: cd to target dir, run cargo test --offline, pass on "test result: ok"
+    cargo = function(file_path)
+        local dir = file_path:match("^(.*)/[^/]+$") or "."
+        local cmd = "cd " .. dir .. " && cargo test --offline 2>&1"
+        local p   = io.popen(cmd, "r")
+        if not p then
+            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+        end
+        local out = p:read("*a") or ""
+        p:close()
+        local pass = out:find("test result: ok", 1, true) ~= nil
+        return { ok = pass, stdout = out, stderr = "", exit_code = pass and 0 or 1 }
+    end,
+}
+
+-- Resolve runner_kind (string or function) → runner function.
+-- Returns (fn, nil) on success, (nil, err_string) on failure.
+local function resolve_runner(kind)
+    if type(kind) == "function" then
+        return kind, nil
+    end
+    if type(kind) == "string" then
+        local fn = BUILTIN_RUNNERS[kind]
+        if fn then
+            return fn, nil
+        end
+        return nil, "unknown runner_kind: " .. kind
+    end
+    return nil, "runner_kind must be a string or function, got: " .. type(kind)
+end
+
+-- Filter M.run result for tool output: remove code and history to prevent
+-- Caller context contamination (Counter WF-A defence).
+local function filter_for_tool_output(res)
+    return {
+        ok             = res.ok,
+        artifact_path  = res.artifact_path,
+        iters          = res.iters,
+        summary        = res.summary,
+        failure_reason = res.failure_reason,
+        last_error     = res.last_error,
+        -- code:    excluded (Counter WF-A defence)
+        -- history: excluded (circular-ref risk + context contamination)
+    }
+end
+
+-- M.register_tool(opts) — register the "compile_loop" tool with the host tool registry.
+--
+-- opts fields (all fixed at registration time; tool input may override spec/target_file/lang):
+--   provider     string   "openai" | "anthropic"
+--   base_url     string
+--   api_key      string
+--   model        string
+--   runner_kind  string|function  "lua" | "cargo" | runner function
+--   max_iters    int?    (default 5)
+--   lang         string? (default "lua")
+--
+-- The handler merges opts with tool input; input fields override opts fields.
+-- Returns the registered tool name ("compile_loop").
+function M.register_tool(opts)
+    assert(type(opts) == "table", "opts table required")
+    assert(opts.runner_kind ~= nil, "opts.runner_kind required")
+
+    local schema = {
+        description = [[Run an autonomous compile-and-fix loop: a child LLM emits the
+complete target file on every iteration, the runner executes it, and on
+failure the stderr is fed back until the run passes or the give-up gate
+triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]],
+        input_schema = {
+            type     = "object",
+            required = { "spec", "target_file" },
+            properties = {
+                spec = {
+                    type        = "string",
+                    description = "Full specification the child LLM must satisfy.",
+                },
+                target_file = {
+                    type        = "string",
+                    description = "Absolute path of the file the child LLM writes on each iteration.",
+                },
+                lang = {
+                    type        = "string",
+                    description = "Code fence language label (default: lua).",
+                },
+            },
+        },
+    }
+
+    local function handler(input)
+        -- Merge opts and tool input; input overrides opts for spec/target_file/lang.
+        local merged = {
+            provider    = opts.provider,
+            base_url    = opts.base_url,
+            api_key     = opts.api_key,
+            model       = opts.model,
+            max_iters   = opts.max_iters,
+            lang        = input.lang or opts.lang or "lua",
+            target_file = input.target_file,
+            spec        = input.spec,
+        }
+
+        -- Resolve runner_kind → runner function.
+        local runner, rerr = resolve_runner(opts.runner_kind)
+        if not runner then
+            local payload = {
+                ok             = false,
+                failure_reason = "runner_dispatch_failed",
+                last_error     = tostring(rerr),
+                iters          = 0,
+                summary        = "runner_kind resolution failed: " .. tostring(rerr),
+            }
+            local enc_ok, enc_str = pcall(std.json.encode, payload)
+            if enc_ok then return enc_str end
+            return '{"ok":false,"failure_reason":"encode_failed","summary":"json encode failed","iters":0}'
+        end
+        merged.runner = runner
+
+        -- Run the loop.
+        local res = M.run(merged)
+
+        -- Filter and encode; handler MUST return a string.
+        local filtered = filter_for_tool_output(res)
+        local enc_ok, enc_str = pcall(std.json.encode, filtered)
+        if enc_ok then
+            return enc_str
+        end
+        return '{"ok":false,"failure_reason":"encode_failed","summary":"json encode failed","iters":0}'
+    end
+
+    tool.register("compile_loop", schema, handler)
+    return "compile_loop"
+end
+
 return M
