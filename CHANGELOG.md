@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `coding_agent` — `provider = "anthropic"` path is now fully implemented in `llm_call()`.
+  Calls the Anthropic Messages API (`https://api.anthropic.com/v1/messages`) with the
+  `anthropic-version: 2023-06-01` header and normalizes the response to the OpenAI-compatible
+  `choices[1].message.content` shape so `M.run` requires zero changes.
+  - **API key resolution**: `opts.api_key` is checked first, then `ANTHROPIC_API_KEY` env
+    (or `opts.api_key_env` if set); an explicit error is raised when neither is present.
+    This mirrors the existing `openai` path and lets callers inject keys without polluting
+    the environment.
+  - **System prompt extraction**: the `{role="system"}` entry that `M.run` prepends to
+    the messages array is automatically lifted to the top-level `body.system` field required
+    by the Anthropic API; the messages array sent to the server contains only user/assistant
+    roles.
+  - **Response normalization**: `decoded.content[*].text` blocks are concatenated and
+    wrapped in `{choices={{message={content=...}}}}` so the downstream `extract_code()`
+    call site is unchanged.
+  - `disable_thinking` / `chat_template_kwargs` opts are silently ignored for the Anthropic
+    path (Qwen-specific, no-op as declared in the module docstring).
+- `examples/test_anthropic_compile_loop.lua` — new smoke test for the `coding_agent`
+  Anthropic provider path. Mirrors `test_qwen_compile_loop.lua` with
+  `provider="anthropic"` and `model="claude-haiku-4-5-20251001"`. Exits with code 2 when
+  `ANTHROPIC_API_KEY` is absent.
+
 - `blocks/coding_agent` — structured compile-and-fix loop block (`blocks/coding_agent/init.lua`).
   The child LLM action space is confined to emitting the complete target file in a single fenced
   code block on every iteration; tool selection, target file switching, and spec modification are
@@ -37,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/test_compile_loop_parent.lua` — parent-agent smoke test: Anthropic Haiku parent calls
   the `compile_loop` tool with a Qwen child LLM, exercising the full tool-registry → child-loop
   → structured-result round-trip.
-- Updated `examples/test_qwen_coding_react.lua`, `_hard.lua`, `_lust.lua`, `_rust.lua` to use
+- Updated `examples/test_qwen_compile_loop.lua`, `_hard.lua`, `_lust.lua`, `_rust.lua` to use
   `res.failure_reason` (replaces `res.error`) and log `res.artifact_path` alongside `res.code`.
 
 ## [0.10.0] - 2026-04-28

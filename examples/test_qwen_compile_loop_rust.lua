@@ -1,4 +1,4 @@
--- test_qwen_coding_react_rust.lua — CodingReact loop with cargo test runner
+-- test_qwen_compile_loop_rust.lua — compile_loop with cargo test runner
 -- Tricky Rust task: parse a small custom format with edge cases.
 local coding = require("coding_agent")
 
@@ -46,7 +46,7 @@ local SPEC = [[Write a single Rust file (`src/main.rs`) that:
 
 Output ONLY the file contents in a single ```rust ... ``` block.]]
 
-log.info("Running CodingReact Rust task: " .. PROJ)
+log.info("Running compile_loop Rust task: " .. PROJ)
 
 local res = coding.run({
     provider     = "openai",

@@ -1,4 +1,4 @@
--- test_qwen_coding_react.lua — CodingReact loop e2e (Qwen vLLM)
+-- test_qwen_compile_loop.lua — compile_loop e2e (Qwen vLLM)
 --
 -- Demonstrates blocks/coding_agent: structural Edit→Run→Feedback loop.
 -- Uses the SAME deep_merge spec that broke Qwen in 3 manual iters,
@@ -7,7 +7,7 @@
 -- Run:
 --   QWEN_BASE_URL=https://<pod>-8188.proxy.runpod.net/v1 \
 --   OPENAI_API_KEY=dummy \
---   agent-block -s examples/test_qwen_coding_react.lua
+--   agent-block -s examples/test_qwen_compile_loop.lua
 
 local coding = require("coding_agent")
 

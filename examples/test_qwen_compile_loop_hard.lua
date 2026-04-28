@@ -1,4 +1,4 @@
--- test_qwen_coding_react_hard.lua — harder Lua spec to exercise loop iterations
+-- test_qwen_compile_loop_hard.lua — harder Lua spec to exercise loop iterations
 -- Target: deepcopy that survives cycles + metatables + tables-as-keys.
 local coding = require("coding_agent")
 
@@ -42,7 +42,7 @@ Print `ALL_PASS` on success. End with `return M`.
 
 Output ONLY the file in a single ```lua ... ``` block.]]
 
-log.info("Running CodingReact hard task: " .. TARGET)
+log.info("Running compile_loop hard task: " .. TARGET)
 
 local res = coding.run({
     provider     = "openai",

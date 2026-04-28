@@ -54,7 +54,7 @@ local tool_name = coding_agent.register_tool({
 })
 log.info("registered tool: " .. tool_name)
 
--- ── Task spec (same deep_merge spec used by test_qwen_coding_react.lua) ────────
+-- ── Task spec (same deep_merge spec used by test_qwen_compile_loop.lua) ────────
 local SPEC = [[Write a single Lua 5.3+ file (no external libs) that:
 
 1. Defines `local M = {}` and `M.deep_merge(base, override)` returning a NEW table where:

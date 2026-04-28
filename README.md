@@ -292,10 +292,9 @@ the filesystem `blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
 local coding = require("coding_agent")
 
 local res = coding.run({
-    provider    = "openai",                       -- "openai" | "anthropic"
-    base_url    = "http://localhost:8080/v1",     -- optional, default https://api.openai.com/v1
-    api_key     = "...",                          -- or api_key_env = "OPENAI_API_KEY"
-    model       = "Qwen/Qwen2.5-Coder-7B",
+    provider    = "anthropic",                    -- "openai" | "anthropic" (both fully supported)
+    api_key     = "...",                          -- or api_key_env = "ANTHROPIC_API_KEY"
+    model       = "claude-haiku-4-5-20251001",
     target_file = "/tmp/work/solution.lua",
     spec        = "Write a Lua function that returns the nth Fibonacci number.",
     lang        = "lua",                          -- code fence label (default "lua")
@@ -356,6 +355,27 @@ Built-in `runner_kind` values:
 | `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout |
 | `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on `"test result: ok"` |
 | function      | Called as `runner(file_path)` — must return `{ ok, stdout, stderr, exit_code }` |
+
+**Provider support**: both `"anthropic"` and `"openai"` are fully implemented. The Anthropic
+path normalizes `content[*].text` blocks to the OpenAI-compatible
+`choices[1].message.content` shape internally, so `M.run` is provider-agnostic.
+
+```lua
+-- Anthropic child LLM (requires ANTHROPIC_API_KEY)
+coding.run({ provider = "anthropic", model = "claude-haiku-4-5-20251001", ... })
+
+-- OpenAI-compatible child LLM (vLLM, llama.cpp, etc.)
+coding.run({ provider = "openai", base_url = "http://localhost:8080/v1",
+             model = "Qwen/Qwen2.5-Coder-7B", api_key = "token-abc123", ... })
+```
+
+API key resolution (same for both providers): `opts.api_key` → `opts.api_key_env` env →
+default env variable; explicit error when none is present.
+
+| `provider`    | Default key env       | Override via                        |
+|---------------|-----------------------|-------------------------------------|
+| `"anthropic"` | `ANTHROPIC_API_KEY`   | `opts.api_key` / `opts.api_key_env` |
+| `"openai"`    | `OPENAI_API_KEY`      | `opts.api_key` / `opts.api_key_env` |
 
 ### lshape (Vendored package — `require("lshape")`)
 

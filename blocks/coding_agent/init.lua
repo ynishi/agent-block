@@ -1,4 +1,4 @@
--- blocks/coding_agent/init.lua — Structured coding-react loop (full-file edit mode)
+-- blocks/coding_agent/init.lua — Structured compile_loop (full-file edit mode)
 --
 -- Different from blocks/agent (free ReAct). Here the loop is STRUCTURAL:
 --   LLM emits code → host auto-edits target_file → host auto-runs runner →
@@ -99,9 +99,87 @@ end
 -- coding loop never uses tools.
 local function llm_call(opts, messages)
     local provider = opts.provider or "openai"
-    if provider ~= "openai" then
-        -- TODO: anthropic path. For now structural loop targets openai-compat
-        -- (vLLM / OpenAI / llama-cpp-python with proper parser).
+    if provider == "anthropic" then
+        -- 1. Resolve api_key: opts.api_key → ANTHROPIC_API_KEY env → error
+        local api_key = opts.api_key
+        if not api_key or api_key == "" then
+            api_key = std.env.get(opts.api_key_env or "ANTHROPIC_API_KEY")
+        end
+        if not api_key or api_key == "" then
+            return nil, "no api_key (opts.api_key or ANTHROPIC_API_KEY env)"
+        end
+
+        -- 2. Model
+        local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+        -- 3. Extract system role from messages → body.system
+        --    M.run inserts {role="system"} as messages[1]; Anthropic requires top-level system field.
+        local sys_text = nil
+        local body_messages = {}
+        for _, msg in ipairs(messages) do
+            if msg.role == "system" and sys_text == nil then
+                sys_text = msg.content
+            else
+                table.insert(body_messages, msg)
+            end
+        end
+
+        -- 4. Build body
+        local body = {
+            model      = model,
+            max_tokens = opts.max_tokens or 4096,
+            messages   = body_messages,
+        }
+        if sys_text then
+            body.system = sys_text
+        end
+        -- disable_thinking is Qwen-specific; silent no-op for anthropic
+
+        -- 5. Headers
+        local headers = {
+            ["x-api-key"]         = api_key,
+            ["anthropic-version"] = "2023-06-01",
+            ["content-type"]      = "application/json",
+        }
+
+        -- 6. HTTP call
+        local resp = http.request("https://api.anthropic.com/v1/messages", {
+            method  = "POST",
+            headers = headers,
+            body    = std.json.encode(body),
+            timeout = opts.timeout or 120,
+        })
+
+        -- 7. Status check
+        if resp.status ~= 200 then
+            return nil, "API error " .. tostring(resp.status) .. " body=" .. tostring(resp.body or "")
+        end
+
+        -- 8. pcall decode
+        local ok, decoded = pcall(std.json.decode, resp.body)
+        if not ok or type(decoded) ~= "table" then
+            return nil, "decode failed: " .. tostring(decoded)
+        end
+
+        -- 9. Extract text content blocks
+        if type(decoded.content) ~= "table" or #decoded.content == 0 then
+            return nil, "anthropic response missing content blocks"
+        end
+        local text_parts = {}
+        for _, block in ipairs(decoded.content) do
+            if block.type == "text" then
+                table.insert(text_parts, block.text or "")
+            end
+        end
+        local joined = table.concat(text_parts, "\n")
+        if joined == "" then
+            return nil, "anthropic response missing content blocks"
+        end
+
+        -- 10. Normalize to OpenAI-compatible shape so M.run (L199-200) requires zero changes
+        return { choices = { { message = { content = joined } } } }
+
+    elseif provider ~= "openai" then
         return nil, "provider " .. provider .. " not yet supported in coding_agent"
     end
 
