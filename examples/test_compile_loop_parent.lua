@@ -1,6 +1,6 @@
 -- test_compile_loop_parent.lua — smoke test: Anthropic Haiku parent → Qwen child
 --
--- Demonstrates the compile_loop tool registered via coding_agent.M.register_tool.
+-- Demonstrates the compile_loop tool created via compile_loop.make().
 -- The parent (Anthropic Haiku) calls the tool via tool_use; the tool drives a
 -- structural compile-and-fix loop on a Qwen child LLM.
 --
@@ -19,7 +19,7 @@
 --   0  PASS
 --   2  SKIP (env not configured)
 
-local coding_agent = require("coding_agent")
+local compile_loop = require("compile_loop")
 local agent        = require("agent")
 
 -- ── ENV guard ──────────────────────────────────────────────────────────────────
@@ -37,22 +37,38 @@ end
 
 local QWEN_API_KEY = std.env.get("OPENAI_API_KEY") or "dummy"
 
--- ── Register compile_loop tool ─────────────────────────────────────────────────
--- opts are fixed at registration time (provider / model / runner_kind / max_iters).
+-- ── Runner (caller-defined; BUILTIN_RUNNERS removed) ──────────────────────────
+local function lua_runner(file_path)
+    local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
+    if not p then return { ok=false, stdout="", stderr="popen failed", exit_code=-1 } end
+    local out = p:read("*a") or ""
+    p:close()
+    local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
+    local exit_code = tonumber(exit_str) or 1
+    out = out:gsub("__EXIT__=%d+%s*$", "")
+    local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
+    return { ok=pass, stdout=out, stderr="", exit_code=exit_code }
+end
+
+-- ── Create compile_loop tool_def ──────────────────────────────────────────────
+-- opts are fixed at make time (provider / model / runner / max_iters).
 -- tool input (spec / target_file / lang) is merged at handler call time.
-local tool_name = coding_agent.register_tool({
-    provider     = "openai",
-    base_url     = QWEN_BASE_URL,
-    api_key      = QWEN_API_KEY,
-    model        = "qwen",
-    runner_kind  = "lua",
-    max_iters    = 5,
-    lang         = "lua",
-    disable_thinking = true,
-    temperature  = 0.2,
-    max_tokens   = 2000,
+-- K-96: all LLM tuning fields are explicitly listed in the llm table.
+local td = compile_loop.make({
+    runner   = lua_runner,
+    llm      = {
+        provider         = "openai",
+        base_url         = QWEN_BASE_URL,
+        api_key          = QWEN_API_KEY,
+        model            = "qwen",
+        disable_thinking = true,
+        temperature      = 0.2,
+        max_tokens       = 2000,
+    },
+    max_iters = 5,
+    lang      = "lua",
 })
-log.info("registered tool: " .. tool_name)
+log.info("created tool_def: " .. td.name)
 
 -- ── Task spec (same deep_merge spec used by test_qwen_compile_loop.lua) ────────
 local SPEC = [[Write a single Lua 5.3+ file (no external libs) that:
@@ -76,9 +92,7 @@ Output ONLY the file contents in a single ```lua ... ``` block.]]
 
 local TARGET = "/tmp/compile_loop_parent_work.lua"
 
--- ── Capture tool result for assertion ─────────────────────────────────────────
-local captured_tool_result_str = nil
-
+-- ── Turn callback ──────────────────────────────────────────────────────────────
 local function on_turn(info)
     log.info(string.format(
         "parent turn %d: %d tool_call(s)",
@@ -96,13 +110,14 @@ log.info("Child endpoint: " .. QWEN_BASE_URL)
 log.info("Target file:    " .. TARGET)
 
 local result = agent.run({
-    provider    = "anthropic",
-    api_key     = ANTHROPIC_API_KEY,
-    model       = "claude-haiku-4-5",
-    max_tokens  = 2048,
+    provider       = "anthropic",
+    api_key        = ANTHROPIC_API_KEY,
+    model          = "claude-haiku-4-5",
+    max_tokens     = 2048,
     max_iterations = 3,
-    on_turn     = on_turn,
-    prompt      = string.format(
+    on_turn        = on_turn,
+    extra_tools    = { td },
+    prompt         = string.format(
         [[Use the compile_loop tool to solve the following coding task.
 Target file: %s
 Spec:
@@ -122,6 +137,7 @@ end
 -- ── Extract tool_result from messages ─────────────────────────────────────────
 -- After agent.run, messages contains the full conversation.
 -- Find the user message that holds a tool_result array.
+local captured_tool_result_str = nil
 for _, msg in ipairs(result.messages or {}) do
     if msg.role == "user" and type(msg.content) == "table" then
         for _, block in ipairs(msg.content) do
@@ -174,5 +190,5 @@ else
     log.warn("last_error:     " .. tostring(tool_output.last_error))
 end
 
-log.info("SMOKE TEST PASS: compile_loop tool registered, called, and returned valid filtered shape")
+log.info("SMOKE TEST PASS: compile_loop tool created via make(), called, and returned valid filtered shape")
 os.exit(0)
