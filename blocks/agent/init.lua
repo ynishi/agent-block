@@ -45,6 +45,28 @@
 local M = {}
 
 -- ============================================================
+-- Internal: parent LLM context stack (_AGENT_LLM_CTX)
+-- ============================================================
+--
+-- Allows child tools (e.g. compile_loop) to inherit the calling agent's
+-- provider/model/api_key at handler call time without hard-coding provider
+-- defaults or env vars in the factory (Crux #2).
+--
+-- Stack entries: { provider, base_url, api_key, api_key_env, model }
+-- push: M.run() entry (after opts validation)
+-- pop:  M.run() exit — both success and pcall-error branches
+--
+-- Never exposed as a Lua global. Accessed via M._llm_ctx_top().
+local _AGENT_LLM_CTX = {}
+
+--- M._llm_ctx_top() → table|nil
+--- Return the topmost LLM context pushed by the innermost active agent.run(),
+--- or nil when called outside any agent.run() (no parent context).
+function M._llm_ctx_top()
+    return _AGENT_LLM_CTX[#_AGENT_LLM_CTX]
+end
+
+-- ============================================================
 -- Internal: LLM dump controls (safe-by-default)
 -- ============================================================
 --
@@ -1269,6 +1291,16 @@ function M.run(opts)
         return { ok = false, error = "prompt is required", usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 }, num_turns = 0, messages = {} }
     end
 
+    -- Push parent LLM context so child tools (e.g. compile_loop) can inherit
+    -- provider/model/api_key at call time without hard-coding defaults (Crux #2).
+    table.insert(_AGENT_LLM_CTX, {
+        provider    = opts.provider,
+        base_url    = opts.base_url,
+        api_key     = opts.api_key,
+        api_key_env = opts.api_key_env,
+        model       = opts.model,
+    })
+
     -- Budget tracker
     local budget = new_budget_tracker(opts.max_tokens_budget)
     local max_iter = opts.max_iterations or 20
@@ -1282,6 +1314,8 @@ function M.run(opts)
         if err then
             -- Disconnect any servers that did connect before the failure
             disconnect_mcp_servers(partial_connected)
+            -- Pop LLM context before early return (stack must stay balanced).
+            table.remove(_AGENT_LLM_CTX)
             return {
                 ok = false,
                 error = err,
@@ -1443,6 +1477,9 @@ function M.run(opts)
             })
         end
     end)
+
+    -- Pop parent LLM context (both success and error paths — stack must stay balanced).
+    table.remove(_AGENT_LLM_CTX)
 
     -- Always disconnect MCP servers, regardless of loop outcome
     disconnect_mcp_servers(connected_servers)
