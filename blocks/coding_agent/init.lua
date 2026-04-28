@@ -4,6 +4,10 @@
 --   LLM emits code → host auto-edits target_file → host auto-runs runner →
 --   on FAIL feed result back, on PASS exit. No tool_use indirection.
 --
+-- Child LLM action space is confined to next_full_file ONLY.
+-- The child never receives tool arrays, tool schemas, or JSON dispatch.
+-- Target file switching and spec modification are structurally unreachable.
+--
 -- Usage:
 --   local coding = require("coding_agent")
 --   local res = coding.run({
@@ -19,15 +23,63 @@
 --       on_iter      = function(info) end,  -- info = { iter, code, result }
 --       disable_thinking = true,        -- Qwen-specific, no-op for others
 --   })
---   -- res = { ok, code, iters, history, error? }
+--   -- res = { ok, code, artifact_path, iters, summary, history, failure_reason?, last_error? }
 
 local M = {}
+
+-- Stagnation detection window: give-up when the last N consecutive runner stderr
+-- outputs are identical. This is a hard structural check, not a prompt heuristic.
+local STAGNATION_WINDOW = 3
 
 local DEFAULT_SYSTEM = [[You are an expert programmer.
 You will be given a spec and asked to write code that runs and passes its self-checks.
 Output ONLY the complete file contents in a single fenced code block (e.g. ```lua\n...\n```).
 No prose before or after the block.
 On retry, output the WHOLE corrected file (not a diff). Keep changes minimal.]]
+
+-- Resolve path to absolute. If already absolute, return as-is.
+local function to_abs(path)
+    if path:sub(1, 1) == "/" then
+        return path
+    end
+    return (os.getenv("PWD") or ".") .. "/" .. path
+end
+
+-- Build a human-readable summary string for all exit paths.
+local function make_summary(ok, iters, max_iters, reason)
+    if ok then
+        return string.format("PASS in %d iters", iters)
+    end
+    if reason == "stagnation" then
+        return string.format(
+            "give-up: stagnation at iter %d/%d (stderr identical %dx)",
+            iters, max_iters, STAGNATION_WINDOW
+        )
+    elseif reason == "max_iters" then
+        return string.format("give-up: max_iters reached (%d)", max_iters)
+    elseif reason == "llm_call" then
+        return string.format("give-up: llm_call failed at iter %d/%d", iters, max_iters)
+    elseif reason == "open_target_file" then
+        return string.format("give-up: open_target_file failed at iter %d/%d", iters, max_iters)
+    else
+        return string.format("give-up: %s", tostring(reason))
+    end
+end
+
+-- Stagnation detection: check if the last STAGNATION_WINDOW entries in history
+-- all have identical runner stderr. Independent of iter count.
+local function is_stagnant(history)
+    if #history < STAGNATION_WINDOW then
+        return false
+    end
+    local ref = ((history[#history].result) or {}).stderr or ""
+    for i = #history - STAGNATION_WINDOW + 1, #history do
+        if (((history[i].result) or {}).stderr or "") ~= ref then
+            return false
+        end
+    end
+    return true
+end
 
 -- Extract the FIRST fenced code block matching the lang label, falling back to any fence.
 local function extract_code(text, lang)
@@ -95,6 +147,9 @@ local function llm_call(opts, messages)
 end
 
 -- Build the failure-feedback user message.
+-- NOTE: This message contains ONLY spec and build feedback — no tool names,
+-- no JSON schema, no tool_use vocabulary. Child LLM action space is confined
+-- to emitting a corrected file in a single fenced code block.
 local function build_failure_msg(lang, rr)
     return string.format(
         "Run FAILED. Fix the code and re-output the WHOLE corrected file in a single ```%s ... ``` block.\n\n=== stdout ===\n%s\n\n=== stderr ===\n%s\n\n=== exit_code ===\n%s",
@@ -111,10 +166,14 @@ function M.run(opts)
     assert(opts.spec,        "opts.spec required")
     assert(type(opts.runner) == "function", "opts.runner (function) required")
 
-    local lang      = opts.lang or "lua"
-    local max_iters = opts.max_iters or 5
-    local system    = opts.system or DEFAULT_SYSTEM
+    local lang         = opts.lang or "lua"
+    local max_iters    = opts.max_iters or 5
+    local system       = opts.system or DEFAULT_SYSTEM
+    local artifact_path = to_abs(opts.target_file)
 
+    -- Child LLM messages list: system + user(spec) only.
+    -- No tool arrays, no extra_tools, no JSON schema.
+    -- Target file and spec are fixed by the parent; the child cannot modify them.
     local messages = {
         { role = "system", content = system },
         { role = "user",   content = opts.spec },
@@ -125,11 +184,15 @@ function M.run(opts)
     for iter = 1, max_iters do
         local resp, err = llm_call(opts, messages)
         if not resp then
+            local err_str = tostring(err)
             return {
-                ok = false,
-                error = "llm_call: " .. tostring(err),
-                iters = iter - 1,
-                history = history,
+                ok             = false,
+                failure_reason = "llm_call",
+                last_error     = err_str:sub(-800),
+                iters          = iter - 1,
+                summary        = make_summary(false, iter - 1, max_iters, "llm_call"),
+                artifact_path  = artifact_path,
+                history        = history,
             }
         end
 
@@ -137,14 +200,18 @@ function M.run(opts)
         local content = (choice.message or {}).content or ""
         local code    = extract_code(content, lang)
 
-        -- Write target file (full-file replace)
+        -- Write target file (full-file replace — next_full_file action)
         local f, werr = io.open(opts.target_file, "w")
         if not f then
+            local werr_str = tostring(werr)
             return {
-                ok = false,
-                error = "open target_file: " .. tostring(werr),
-                iters = iter,
-                history = history,
+                ok             = false,
+                failure_reason = "open_target_file",
+                last_error     = werr_str,
+                iters          = iter,
+                summary        = make_summary(false, iter, max_iters, "open_target_file"),
+                artifact_path  = artifact_path,
+                history        = history,
             }
         end
         f:write(code)
@@ -164,26 +231,202 @@ function M.run(opts)
 
         if rr.ok then
             return {
-                ok      = true,
-                code    = code,
-                iters   = iter,
-                history = history,
+                ok            = true,
+                code          = code,
+                artifact_path = artifact_path,
+                iters         = iter,
+                summary       = make_summary(true, iter, max_iters, nil),
+                history       = history,
             }
         end
 
-        -- Append assistant + failure user message for the next turn
+        -- Stagnation detection: if the last STAGNATION_WINDOW iterations all
+        -- produced identical runner stderr, give up — this is independent of
+        -- max_iters and detects infinite retry without progress.
+        if is_stagnant(history) then
+            local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+            return {
+                ok             = false,
+                failure_reason = "stagnation",
+                last_error     = last_stderr,
+                code           = code,
+                iters          = iter,
+                summary        = make_summary(false, iter, max_iters, "stagnation"),
+                artifact_path  = artifact_path,
+                history        = history,
+            }
+        end
+
+        -- Append assistant + failure user message for the next turn.
+        -- Only spec feedback is provided — no tool routing, no JSON schema injection.
         table.insert(messages, { role = "assistant", content = content })
         table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
     end
 
+    -- max_iters reached without PASS
     local last = history[#history] or {}
+    local last_stderr = tostring(((last.result) or {}).stderr or ""):sub(-800)
     return {
-        ok      = false,
-        error   = "max_iters reached without PASS",
-        iters   = max_iters,
-        code    = last.code,
-        history = history,
+        ok             = false,
+        failure_reason = "max_iters",
+        last_error     = last_stderr,
+        code           = last.code,
+        iters          = max_iters,
+        summary        = make_summary(false, max_iters, max_iters, "max_iters"),
+        artifact_path  = artifact_path,
+        history        = history,
     }
+end
+
+-- Built-in runner factories for runner_kind string dispatch.
+-- These are resolved in M.register_tool before calling M.run,
+-- so M.run's runner assertion remains satisfied.
+local BUILTIN_RUNNERS = {
+    -- "lua" runner: invoke lua interpreter, pass/fail by exit 0 + "ALL_PASS" in stdout
+    lua = function(file_path)
+        local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
+        if not p then
+            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+        end
+        local out = p:read("*a") or ""
+        p:close()
+        local exit_str  = out:match("__EXIT__=(%d+)%s*$") or "1"
+        local exit_code = tonumber(exit_str) or 1
+        out = out:gsub("__EXIT__=%d+%s*$", "")
+        local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
+        return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+    end,
+    -- "cargo" runner: cd to target dir, run cargo test --offline, pass on "test result: ok"
+    cargo = function(file_path)
+        local dir = file_path:match("^(.*)/[^/]+$") or "."
+        local cmd = "cd " .. dir .. " && cargo test --offline 2>&1"
+        local p   = io.popen(cmd, "r")
+        if not p then
+            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+        end
+        local out = p:read("*a") or ""
+        p:close()
+        local pass = out:find("test result: ok", 1, true) ~= nil
+        return { ok = pass, stdout = out, stderr = "", exit_code = pass and 0 or 1 }
+    end,
+}
+
+-- Resolve runner_kind (string or function) → runner function.
+-- Returns (fn, nil) on success, (nil, err_string) on failure.
+local function resolve_runner(kind)
+    if type(kind) == "function" then
+        return kind, nil
+    end
+    if type(kind) == "string" then
+        local fn = BUILTIN_RUNNERS[kind]
+        if fn then
+            return fn, nil
+        end
+        return nil, "unknown runner_kind: " .. kind
+    end
+    return nil, "runner_kind must be a string or function, got: " .. type(kind)
+end
+
+-- Filter M.run result for tool output: remove code and history to prevent
+-- Caller context contamination (Counter WF-A defence).
+local function filter_for_tool_output(res)
+    return {
+        ok             = res.ok,
+        artifact_path  = res.artifact_path,
+        iters          = res.iters,
+        summary        = res.summary,
+        failure_reason = res.failure_reason,
+        last_error     = res.last_error,
+        -- code:    excluded (Counter WF-A defence)
+        -- history: excluded (circular-ref risk + context contamination)
+    }
+end
+
+-- M.register_tool(opts) — register the "compile_loop" tool with the host tool registry.
+--
+-- opts fields (all fixed at registration time; tool input may override spec/target_file/lang):
+--   provider     string   "openai" | "anthropic"
+--   base_url     string
+--   api_key      string
+--   model        string
+--   runner_kind  string|function  "lua" | "cargo" | runner function
+--   max_iters    int?    (default 5)
+--   lang         string? (default "lua")
+--
+-- The handler merges opts with tool input; input fields override opts fields.
+-- Returns the registered tool name ("compile_loop").
+function M.register_tool(opts)
+    assert(type(opts) == "table", "opts table required")
+    assert(opts.runner_kind ~= nil, "opts.runner_kind required")
+
+    local schema = {
+        description = [[Run an autonomous compile-and-fix loop: a child LLM emits the
+complete target file on every iteration, the runner executes it, and on
+failure the stderr is fed back until the run passes or the give-up gate
+triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]],
+        input_schema = {
+            type     = "object",
+            required = { "spec", "target_file" },
+            properties = {
+                spec = {
+                    type        = "string",
+                    description = "Full specification the child LLM must satisfy.",
+                },
+                target_file = {
+                    type        = "string",
+                    description = "Absolute path of the file the child LLM writes on each iteration.",
+                },
+                lang = {
+                    type        = "string",
+                    description = "Code fence language label (default: lua).",
+                },
+            },
+        },
+    }
+
+    local function handler(input)
+        -- Merge opts and tool input; input overrides opts for spec/target_file/lang.
+        local merged = {
+            provider    = opts.provider,
+            base_url    = opts.base_url,
+            api_key     = opts.api_key,
+            model       = opts.model,
+            max_iters   = opts.max_iters,
+            lang        = input.lang or opts.lang or "lua",
+            target_file = input.target_file,
+            spec        = input.spec,
+        }
+
+        -- Resolve runner_kind → runner function.
+        local runner, rerr = resolve_runner(opts.runner_kind)
+        if not runner then
+            local payload = {
+                ok             = false,
+                failure_reason = "runner_dispatch_failed",
+                last_error     = tostring(rerr),
+                iters          = 0,
+                summary        = "runner_kind resolution failed: " .. tostring(rerr),
+            }
+            local enc_ok, enc_str = pcall(std.json.encode, payload)
+            if enc_ok then return enc_str end
+            return '{"ok":false,"failure_reason":"encode_failed","summary":"json encode failed","iters":0}'
+        end
+        merged.runner = runner
+
+        -- Run the loop.
+        local res = M.run(merged)
+
+        -- Filter and encode; handler MUST return a string.
+        local filtered = filter_for_tool_output(res)
+        local enc_ok, enc_str = pcall(std.json.encode, filtered)
+        if enc_ok then
+            return enc_str
+        end
+        return '{"ok":false,"failure_reason":"encode_failed","summary":"json encode failed","iters":0}'
+    end
+
+    tool.register("compile_loop", schema, handler)
+    return "compile_loop"
 end
 
 return M
