@@ -94,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `coding_agent.register_tool()` now returns the registered tool name instead of the
     `tool_def` table.
 
+### Fixed
+
+- `blocks/agent` — `build_tools` now flattens `extra_tools` entries that use the
+  `compile_loop.make()` return shape (`{name, schema={description, input_schema}, handler}`)
+  into the Anthropic flat form (`{name, description, input_schema}`), preventing
+  `unsupported type for JSON conversion` errors when passing `compile_loop` tools
+  via `agent.run({extra_tools = {...}})`. Already-flat entries pass through unchanged.
+
 ## [0.10.0] - 2026-04-28
 
 ### Added
