@@ -306,6 +306,8 @@ local td = compile_loop.make({
     runner    = lua_runner,       -- required: function(path) → {ok, stdout, stderr, exit_code}
     max_iters = 5,                -- optional, default 5
     lang      = "lua",            -- optional, default "lua"
+    register  = false,            -- optional, default true; pass false when using extra_tools
+                                  -- to avoid duplicate tool registration (Anthropic API 400)
     -- conf.llm is optional: when omitted the parent agent's provider/model/api_key
     -- are inherited at call time via _AGENT_LLM_CTX (Crux #2).
     llm = {
@@ -326,6 +328,11 @@ local result = agent.run({
 `tool.register(name, schema, handler)` is called, so the registry and `tool_def.handler`
 share the same function identity. The tool name defaults to `"compile_loop"`; pass
 `conf.name` to override (useful when registering multiple instances).
+
+Pass `conf.register = false` to skip `tool.register()`. This is required when passing
+the returned `tool_def` via `agent.run({ extra_tools = { td } })`: without it the tool
+name appears in both `tool.schema()` (via the registry) and `extra_tools`, causing an
+Anthropic API 400 duplicate-tool error.
 
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
 `target_file` (absolute path, required), `lang` (string, optional).

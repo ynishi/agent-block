@@ -66,6 +66,7 @@ local td = compile_loop.make({
     },
     max_iters = 5,
     lang      = "rust",
+    register  = false,
 })
 
 -- Parent also uses Qwen (minimum env: only QWEN_BASE_URL required).

@@ -57,7 +57,7 @@ log.info("Target file: " .. TARGET)
 
 -- Crux #2: conf.llm is OMITTED → parent agent's provider/model/api_key
 -- are resolved at handler call time from _AGENT_LLM_CTX.
-local td = compile_loop.make({ runner = lua_runner })
+local td = compile_loop.make({ runner = lua_runner, register = false })
 
 local result = agent.run({
     provider       = "anthropic",
