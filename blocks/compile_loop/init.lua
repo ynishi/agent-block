@@ -152,7 +152,8 @@ local function llm_call(opts, messages)
         }
 
         -- 6. HTTP call
-        local resp = http.request("https://api.anthropic.com/v1/messages", {
+        local base_url = opts.base_url or "https://api.anthropic.com"
+        local resp = http.request(base_url .. "/v1/messages", {
             method  = "POST",
             headers = headers,
             body    = std.json.encode(body),
