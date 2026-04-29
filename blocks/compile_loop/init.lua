@@ -566,7 +566,9 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
         return '{"ok":false,"failure_reason":"encode_failed","iters":0,"summary":"json encode failed"}'
     end
 
-    tool.register(name, schema, handler)
+    if conf.register ~= false then
+        tool.register(name, schema, handler)
+    end
     return { name = name, schema = schema, handler = handler }
 end
 
