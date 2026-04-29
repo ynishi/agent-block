@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/common/compile_loop_anthropic_mock.rs`,
   `tests/fixtures/compile_loop_openai_mock.lua`,
   `tests/fixtures/compile_loop_anthropic_mock.lua`.
+- `blocks/compile_loop` now emits `ab.obs` structured log events (`iter_start`, `iter_result`,
+  `converged`, `stagnation`, `max_iters_reached`) gated by `AGENT_BLOCK_LLM_DUMP=meta|full`.
+  Event lines use the fixed-order `prefix=ab.obs event=<name> component=compile_loop key=value`
+  format identical to the agent block's obs schema. Existing tests are unaffected (default `off`).
+  New e2e test `compile_loop_anthropic_mock_emits_obs_events` in `tests/e2e_compile_loop.rs`
+  validates the PASS-path events (`iter_start`, `iter_result`, `converged`) with
+  `predicate::str::contains`.
 
 ### Changed
 
