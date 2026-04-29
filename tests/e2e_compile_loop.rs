@@ -105,3 +105,56 @@ async fn compile_loop_anthropic_mock_iterates_until_pass() {
     );
     ct.cancel();
 }
+
+/// Verifies that compile_loop emits ab.obs events when AGENT_BLOCK_LLM_DUMP=meta.
+///
+/// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls).
+/// With AGENT_BLOCK_LLM_DUMP=meta the obs helpers are activated and the three
+/// events that appear on the PASS path — iter_start, iter_result, converged —
+/// must appear in stdout.
+///
+/// stagnation and max_iters_reached are not asserted: they do not occur in the
+/// 2-iteration PASS shape produced by this mock.
+#[tokio::test]
+async fn compile_loop_anthropic_mock_emits_obs_events() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_anthropic_mock::spawn_compile_loop_anthropic_mock_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .env("AGENT_BLOCK_LLM_DUMP", "meta")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=iter_start component=compile_loop",
+            ))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=iter_result component=compile_loop",
+            ))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=converged component=compile_loop",
+            ));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls to the anthropic mock"
+    );
+    ct.cancel();
+}
