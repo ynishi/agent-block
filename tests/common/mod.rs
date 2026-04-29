@@ -1,3 +1,4 @@
+pub mod compile_loop_openai_mock;
 pub mod openai_mock;
 
 use assert_cmd::Command;
