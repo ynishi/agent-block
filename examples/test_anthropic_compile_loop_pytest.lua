@@ -85,7 +85,6 @@ local td = compile_loop.make({
     runner    = pytest_runner,
     lang      = "python",
     max_iters = 5,
-    register  = false,
 })
 
 local result = agent.run({
