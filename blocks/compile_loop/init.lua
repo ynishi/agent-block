@@ -33,6 +33,84 @@ local agent = require("agent") -- for _llm_ctx_top()
 -- outputs are identical. Hard structural check, not a prompt heuristic.
 local STAGNATION_WINDOW = 3
 
+-- ============================================================
+-- Observability helpers (inline mirror from blocks/agent/init.lua:90-181)
+-- Gated by AGENT_BLOCK_LLM_DUMP env (off/meta/full).
+-- ============================================================
+
+local function env_true(name)
+    local v = std.env.get(name)
+    if not v then return false end
+    v = string.lower(tostring(v))
+    return v == "1" or v == "true" or v == "yes" or v == "on"
+end
+
+local function normalize_dump_mode(v)
+    if not v or v == "" then return nil end
+    v = string.lower(tostring(v))
+    if v == "off" or v == "none" then return "off" end
+    if v == "meta" then return "meta" end
+    if v == "full" then return "full" end
+    return "off"
+end
+
+local function resolve_dump_mode()
+    local mode = normalize_dump_mode(std.env.get("AGENT_BLOCK_LLM_DUMP"))
+    if not mode then
+        local rust_log = string.lower(std.env.get_or("RUST_LOG", ""))
+        if rust_log:find("trace", 1, true) or rust_log:find("debug", 1, true) then
+            mode = "meta"
+        else
+            mode = "off"
+        end
+    end
+    if mode == "full" then
+        local env_name = string.lower(std.env.get_or("AGENT_BLOCK_ENV", ""))
+        local is_prod = env_name == "prod" or env_name == "production"
+        if is_prod and not env_true("AGENT_BLOCK_LLM_DUMP_ALLOW_PROD") then
+            log.warn("compile_loop: AGENT_BLOCK_LLM_DUMP=full blocked in production env; downgraded to meta")
+            mode = "meta"
+        end
+    end
+    return mode
+end
+
+local LLM_DUMP_PREFIX = "ab.obs"
+
+local function kv_escape(v)
+    if v == nil then return "nil" end
+    if type(v) == "boolean" or type(v) == "number" then
+        return tostring(v)
+    end
+    local s = tostring(v)
+    if s == "" then return '""' end
+    if s:find("[%s=]") then
+        return std.json.encode(s)
+    end
+    return s
+end
+
+local function format_kv(parts)
+    local out = {}
+    for i, pair in ipairs(parts) do
+        out[i] = tostring(pair[1]) .. "=" .. kv_escape(pair[2])
+    end
+    return table.concat(out, " ")
+end
+
+local function obs_event(mode, event_name, fields)
+    if mode == "off" then return end
+    local entries = {
+        { "prefix",    LLM_DUMP_PREFIX },
+        { "event",     event_name },
+        { "component", "compile_loop" },
+    }
+    for _, f in ipairs(fields or {}) do
+        table.insert(entries, f)
+    end
+    log.info(format_kv(entries))
+end
+
 local DEFAULT_SYSTEM = [[You are an expert programmer.
 You will be given a spec and asked to write code that runs and passes its self-checks.
 Output ONLY the complete file contents in a single fenced code block (e.g. ```lua\n...\n```).
@@ -284,6 +362,7 @@ local function run_loop(conf)
     local max_iters     = conf.max_iters or 5
     local system        = conf.system or DEFAULT_SYSTEM
     local artifact_path = to_abs(conf.target_file)
+    local mode          = resolve_dump_mode()
 
     -- Child LLM messages list: system + user(spec) only.
     -- No tool arrays, no extra_tools, no JSON schema.
@@ -295,6 +374,7 @@ local function run_loop(conf)
     local history = {}
 
     for iter = 1, max_iters do
+        obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", artifact_path } })
         local resp, err = llm_call(conf, messages)
         if not resp then
             local err_str = tostring(err)
@@ -334,6 +414,12 @@ local function run_loop(conf)
         local rr = conf.runner(conf.target_file) or {}
         local entry = { iter = iter, code = code, result = rr, raw = content }
         table.insert(history, entry)
+        obs_event(mode, "iter_result", {
+            { "iter",       iter },
+            { "ok",         rr.ok and true or false },
+            { "exit_code",  rr.exit_code },
+            { "stderr_len", #(tostring(rr.stderr or "")) },
+        })
 
         if conf.on_iter then
             local cb_ok, cb_err = pcall(conf.on_iter, entry)
@@ -343,6 +429,7 @@ local function run_loop(conf)
         end
 
         if rr.ok then
+            obs_event(mode, "converged", { { "iters", iter } })
             return {
                 ok            = true,
                 code          = code,
@@ -356,6 +443,7 @@ local function run_loop(conf)
         -- Stagnation detection
         if is_stagnant(history) then
             local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+            obs_event(mode, "stagnation", { { "iters", iter } })
             return {
                 ok             = false,
                 failure_reason = "stagnation",
@@ -376,6 +464,7 @@ local function run_loop(conf)
     -- max_iters reached without PASS
     local last = history[#history] or {}
     local last_stderr = tostring(((last.result) or {}).stderr or ""):sub(-800)
+    obs_event(mode, "max_iters_reached", { { "iters", max_iters } })
     return {
         ok             = false,
         failure_reason = "max_iters",

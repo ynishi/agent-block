@@ -347,6 +347,19 @@ no error for missing credentials at `make()` time.
 the loop gives up immediately, independent of the remaining iteration budget.
 `failure_reason = "stagnation"`.
 
+**Observability (ab.obs events)**: `compile_loop` emits structured `ab.obs` log events on
+each iteration, gated by `AGENT_BLOCK_LLM_DUMP` (same env var as the agent block). Set
+`AGENT_BLOCK_LLM_DUMP=meta` to activate. Each line uses the `key=value` format with
+`prefix=ab.obs component=compile_loop`.
+
+| event | when emitted | fields |
+|---|---|---|
+| `iter_start` | start of each iteration | `iter`, `target_file` |
+| `iter_result` | after runner executes | `iter`, `ok`, `exit_code`, `stderr_len` |
+| `converged` | before PASS return | `iters` |
+| `stagnation` | before stagnation give-up | `iters` |
+| `max_iters_reached` | before max_iters give-up | `iters` |
+
 **Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
 OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 
