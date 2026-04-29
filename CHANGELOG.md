@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `compile_loop.make()` now accepts `register = false` opt to prevent duplicate tool
+  registration when used with `extra_tools` (Anthropic API 400 fix).
+
 ### Added
 
 - `blocks/compile_loop` — new Tool factory block (`blocks/compile_loop/init.lua`).

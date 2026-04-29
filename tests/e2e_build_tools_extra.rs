@@ -20,3 +20,14 @@ fn build_tools_extra_flatten() {
                 .and(predicate::str::contains("flat.description=flat desc")),
         );
 }
+
+#[test]
+fn compile_loop_make_register_false_no_dedup() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("build_tools_dedup.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dedup=ok"));
+}
