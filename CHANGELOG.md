@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Removed
 
-- `compile_loop.make()` now accepts `register = false` opt to prevent duplicate tool
-  registration when used with `extra_tools` (Anthropic API 400 fix).
+- `compile_loop.make()` の `conf.register` opt を削除。姉件 fix (1777461322-92442) で
+  `register = false` を渡すと `extra_tools` 経由 tool が `dispatch_tool` の registry
+  経路から見えなくなり 'tool not found' を引き起こすため、`tool.register` を常時呼び出す
+  元の挙動に戻す (1777469900-71779)。代わりに `build_tools` に first-wins dedup を追加
+  して duplicate tool エラーを防止し、`dispatch_tool` に `extra_tools` handler への直接
+  fallback 経路を追加して registry 非依存の dispatch wiring を確立する。
 
 ### Added
 
