@@ -1135,35 +1135,42 @@ end
 --- @return table              Unified tools array in Anthropic format
 local function build_tools(mcp_tool_map, extra_tools)
     local tools = {}
-
-    -- Add registered Lua tools from tool.schema()
-    local lua_tools = tool.schema()
-    for _, t in ipairs(lua_tools) do
+    local seen = {}
+    local function add_unique(t)
+        if seen[t.name] then
+            return
+        end
+        seen[t.name] = true
         table.insert(tools, t)
     end
 
-    -- Add MCP tools (already in Anthropic format from connect_mcp_servers)
-    for _, entry in pairs(mcp_tool_map) do
-        table.insert(tools, entry.def)
+    -- 1. Registered Lua tools (highest priority)
+    for _, t in ipairs(tool.schema()) do
+        add_unique(t)
     end
 
-	-- Add extra_tools if provided, normalising compile_loop.make() shape.
-	-- compile_loop.make() returns {name, schema={description, input_schema}, handler=<fn>}.
-	-- The handler function is not JSON-serialisable; flatten to Anthropic flat form.
-	if extra_tools then
-		for _, t in ipairs(extra_tools) do
-			if t.schema and t.handler then
-				-- nested-schema+handler form → Anthropic flat form (strip handler)
-				table.insert(tools, {
-					name = t.name,
-					description = t.schema.description,
-					input_schema = t.schema.input_schema,
-				})
-			else
-				table.insert(tools, t)
-			end
-		end
-	end
+    -- 2. MCP tools (already in Anthropic format from connect_mcp_servers)
+    for _, entry in pairs(mcp_tool_map) do
+        add_unique(entry.def)
+    end
+
+    -- 3. extra_tools (lowest priority, first-wins dedup).
+    -- compile_loop.make() returns {name, schema={description, input_schema}, handler=<fn>}.
+    -- The handler function is not JSON-serialisable; flatten to Anthropic flat form.
+    if extra_tools then
+        for _, t in ipairs(extra_tools) do
+            if t.schema and t.handler then
+                -- nested-schema+handler form → Anthropic flat form (strip handler)
+                add_unique({
+                    name = t.name,
+                    description = t.schema.description,
+                    input_schema = t.schema.input_schema,
+                })
+            else
+                add_unique(t)
+            end
+        end
+    end
 
     return tools
 end
@@ -1172,15 +1179,16 @@ end
 -- Internal: Tool dispatch (unified)
 -- ============================================================
 
---- Dispatch a tool call to either MCP or the local Lua registry.
+--- Dispatch a tool call to MCP, extra_tools direct handler, or the local Lua registry.
 --- Errors are returned as (content, is_error=true) instead of throwing.
---- @param name string         Tool name (possibly namespaced as "server__tool")
---- @param input table         Tool input from LLM
---- @param mcp_tool_map table  MCP namespace map
---- @return string             Result content string
---- @return boolean            is_error flag
-local function dispatch_tool(name, input, mcp_tool_map)
-    -- Check if this is an MCP-namespaced tool
+--- @param name string              Tool name (possibly namespaced as "server__tool")
+--- @param input table              Tool input from LLM
+--- @param mcp_tool_map table       MCP namespace map
+--- @param extra_tools_map table    extra_tools keyed by name (handler-bearing entries)
+--- @return string                  Result content string
+--- @return boolean                 is_error flag
+local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
+    -- 1. MCP path (namespaced tools)
     if mcp_tool_map[name] then
         local entry = mcp_tool_map[name]
         local call_result = mcp.call(entry.server, entry.tool, input)
@@ -1208,7 +1216,20 @@ local function dispatch_tool(name, input, mcp_tool_map)
         end
     end
 
-    -- Fall back to registered Lua tool
+    -- 2. extra_tools direct fallback (registry-independent; honours crux dispatch_tool wiring gap constraint)
+    if extra_tools_map and extra_tools_map[name] then
+        local entry = extra_tools_map[name]
+        local ok, res = pcall(entry.handler, input)
+        if not ok then
+            return "tool error: " .. tostring(res), true
+        end
+        if type(res) == "table" then
+            return std.json.encode(res), false
+        end
+        return tostring(res), false
+    end
+
+    -- 3. Fall back to registered Lua tool (tool.call registry)
     local ok, res = pcall(tool.call, name, input)
     if not ok then
         return "tool error: " .. tostring(res), true
@@ -1337,6 +1358,17 @@ function M.run(opts)
         end
         mcp_tool_map = tool_map
         connected_servers = partial_connected
+    end
+
+    -- Build extra_tools_map for registry-independent dispatch (crux dispatch_tool wiring gap).
+    -- Keyed by name; contains only entries that carry a handler function.
+    local extra_tools_map = {}
+    if opts.extra_tools then
+        for _, t in ipairs(opts.extra_tools) do
+            if t.name and t.handler then
+                extra_tools_map[t.name] = t
+            end
+        end
     end
 
     -- Build unified tools array
@@ -1472,7 +1504,7 @@ function M.run(opts)
             -- Dispatch tool calls and collect results
             local tool_results = {}
             for _, tc in ipairs(tool_calls) do
-                local content_str, is_error = dispatch_tool(tc.name, tc.input, mcp_tool_map)
+                local content_str, is_error = dispatch_tool(tc.name, tc.input, mcp_tool_map, extra_tools_map)
                 table.insert(tool_results, {
                     type = "tool_result",
                     tool_use_id = tc.id,
