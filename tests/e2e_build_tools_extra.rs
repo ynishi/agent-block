@@ -22,7 +22,7 @@ fn build_tools_extra_flatten() {
 }
 
 #[test]
-fn compile_loop_make_register_false_no_dedup() {
+fn compile_loop_make_default_dedup() {
     let tmp = tempdir().expect("tempdir");
     common::agent_block_cmd()
         .env("AGENT_BLOCK_HOME", tmp.path())
@@ -30,4 +30,15 @@ fn compile_loop_make_register_false_no_dedup() {
         .assert()
         .success()
         .stdout(predicate::str::contains("dedup=ok"));
+}
+
+#[test]
+fn dispatch_extra_tools_via_registry() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("dispatch_extra_tools.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dispatch=ok"));
 }
