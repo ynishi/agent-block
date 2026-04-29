@@ -1,3 +1,4 @@
+pub mod compile_loop_anthropic_mock;
 pub mod compile_loop_openai_mock;
 pub mod openai_mock;
 
