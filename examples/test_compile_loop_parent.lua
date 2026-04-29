@@ -67,7 +67,6 @@ local td = compile_loop.make({
     },
     max_iters = 5,
     lang      = "lua",
-    register  = false,
 })
 log.info("created tool_def: " .. td.name)
 
