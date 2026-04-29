@@ -330,6 +330,18 @@ share the same function identity. The tool name defaults to `"compile_loop"`; pa
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
 `target_file` (absolute path, required), `lang` (string, optional).
 
+**`target_file` dual role**: when `target_file` already exists at loop entry, its content is
+embedded in the initial user message as `=== Current file content ===` so the child LLM can
+build on it rather than generating from scratch. The file is then overwritten in full on every
+iteration (full-file output mode). When the file is absent or empty, the message contains
+`spec` only — preserving the original synthesis behaviour (backward-compatible).
+
+**Target model class**: the full-file output strategy is designed for Qwen3 / Haiku-grade
+mid-weight models. Emitting the whole file on each iteration avoids the apply-failure cost of
+diff/Edit-tool workflows and keeps the feedback loop simple and fast. For the latest
+Sonnet/Opus with native edit-tool support, a diff-based block is a future consideration
+(separate issue; out of scope here).
+
 **Tool output JSON** (never contains `code` or `history` — Counter WF-A defence):
 
 ```

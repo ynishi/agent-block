@@ -12,6 +12,10 @@
 --     system    = string?,
 -- }
 --
+-- target_file dual role: read on entry if already present (content embedded in
+-- the initial user message), then written in full on each iteration.
+-- Absent or empty → spec-only message (synthesis use case, backward-compatible).
+--
 -- Returns tool_def = { name = string, schema = table, handler = function }
 -- Side-effect: tool.register(name, schema, handler) is called so the registry
 --   and the returned tool_def share the same handler identity.
@@ -313,6 +317,19 @@ local function llm_call(opts, messages)
     return decoded
 end
 
+-- Read target file if it already exists and is non-empty.
+-- Returns file content as a string, or nil when the file is absent, empty, or unreadable.
+-- Uses to_abs so that relative paths are resolved before io.open.
+local function read_target_if_exists(path)
+    local abs_path = to_abs(path)
+    local f, _ = io.open(abs_path, "r")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    if not content or content == "" then return nil end
+    return content
+end
+
 -- Build the failure-feedback user message.
 -- NOTE: This message contains ONLY spec and build feedback — no tool names,
 -- no JSON schema, no tool_use vocabulary. Child LLM action space is confined
@@ -364,11 +381,23 @@ local function run_loop(conf)
     local artifact_path = to_abs(conf.target_file)
     local mode          = resolve_dump_mode()
 
-    -- Child LLM messages list: system + user(spec) only.
+    -- Build the initial user message.
+    -- When target_file already exists (build-resolver / minimal-edit use case),
+    -- embed its content so the child LLM has the current file as context.
+    -- Falls back to spec-only when the file is absent or empty (synthesis use case).
     -- No tool arrays, no extra_tools, no JSON schema.
+    local existing = read_target_if_exists(conf.target_file)
+    local user_content = conf.spec
+    if existing then
+        user_content = conf.spec
+            .. "\n\n=== Current file content ===\n```" .. lang .. "\n"
+            .. existing
+            .. "\n```"
+    end
+
     local messages = {
         { role = "system", content = system },
-        { role = "user",   content = conf.spec },
+        { role = "user",   content = user_content },
     }
 
     local history = {}
@@ -515,7 +544,7 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
                 },
                 target_file = {
                     type        = "string",
-                    description = "Absolute path of the file the child LLM writes on each iteration.",
+                    description = "Absolute path of the file. Read on entry if it already exists, then written on each iteration.",
                 },
                 lang = {
                     type        = "string",
