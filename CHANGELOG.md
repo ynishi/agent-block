@@ -56,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code 2 (skip signal) rather than propagating an io.popen error.
 - README: added **External runner examples** mini-table under the `compile_loop` Provider
   support section, listing all 6 example files with their runner kind and provider.
+- `blocks/compile_loop` Anthropic path now reads `opts.base_url` instead of using a
+  hardcoded endpoint. When `opts.base_url` is supplied the Anthropic client forwards it
+  as the base URL (`(opts.base_url or "https://api.anthropic.com") .. "/v1/messages"`),
+  matching the existing OpenAI path behaviour. Existing callers that omit `base_url` are
+  unaffected (falls back to `"https://api.anthropic.com"`).
+- E2E tests `compile_loop_openai_mock_iterates_until_pass` and
+  `compile_loop_anthropic_mock_iterates_until_pass` in `tests/e2e_compile_loop.rs`:
+  in-process axum mock servers (OpenAI `/chat/completions` and Anthropic `/v1/messages`)
+  return broken code on the first call and fixed code on the second, verifying that the
+  compile-and-fix loop iterates exactly twice before passing. Both tests carry no
+  `#[ignore]` and pass without `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` present
+  (`api_key="dummy"` is injected inline). Supporting infra:
+  `tests/common/compile_loop_openai_mock.rs`,
+  `tests/common/compile_loop_anthropic_mock.rs`,
+  `tests/fixtures/compile_loop_openai_mock.lua`,
+  `tests/fixtures/compile_loop_anthropic_mock.lua`.
 
 ### Changed
 
