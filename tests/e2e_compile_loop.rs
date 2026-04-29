@@ -133,7 +133,7 @@ async fn compile_loop_anthropic_mock_emits_obs_events() {
                 target_file.to_str().expect("utf8 path"),
             )
             .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "off")
+            .env("RUST_LOG", "info")
             .env("AGENT_BLOCK_LLM_DUMP", "meta")
             .assert()
             .success()
