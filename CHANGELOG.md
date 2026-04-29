@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Removed
 
-- `compile_loop.make()` now accepts `register = false` opt to prevent duplicate tool
-  registration when used with `extra_tools` (Anthropic API 400 fix).
+- `compile_loop.make()` の `conf.register` opt を削除。姉件 fix (1777461322-92442) で
+  `register = false` を渡すと `extra_tools` 経由 tool が `dispatch_tool` の registry
+  経路から見えなくなり 'tool not found' を引き起こすため、`tool.register` を常時呼び出す
+  元の挙動に戻す (1777469900-71779)。代わりに `build_tools` に first-wins dedup を追加
+  して duplicate tool エラーを防止し、`dispatch_tool` に `extra_tools` handler への直接
+  fallback 経路を追加して registry 非依存の dispatch wiring を確立する。
 
 ### Added
 
@@ -101,6 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `blocks/agent` — `build_tools` now applies first-wins dedup across `lua_tools → mcp_tools →
+  extra_tools` in that order, preventing duplicate tool entries when the same tool name appears
+  in multiple sources (e.g. registered via `tool.register` and also passed via `extra_tools`).
+- `blocks/agent` — `dispatch_tool` now holds a direct `extra_tools_map` fallback path
+  (`extra_tools_map[name].handler(input)`) between the MCP path and the registry (`tool.call`)
+  path. This means `extra_tools` handlers are dispatched correctly even when the tool is not
+  registered in the global registry, making dispatch wiring registry-independent (1777469900-71779).
 - `blocks/agent` — `build_tools` now flattens `extra_tools` entries that use the
   `compile_loop.make()` return shape (`{name, schema={description, input_schema}, handler}`)
   into the Anthropic flat form (`{name, description, input_schema}`), preventing
