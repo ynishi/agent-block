@@ -1147,12 +1147,23 @@ local function build_tools(mcp_tool_map, extra_tools)
         table.insert(tools, entry.def)
     end
 
-    -- Add extra_tools if provided
-    if extra_tools then
-        for _, t in ipairs(extra_tools) do
-            table.insert(tools, t)
-        end
-    end
+	-- Add extra_tools if provided, normalising compile_loop.make() shape.
+	-- compile_loop.make() returns {name, schema={description, input_schema}, handler=<fn>}.
+	-- The handler function is not JSON-serialisable; flatten to Anthropic flat form.
+	if extra_tools then
+		for _, t in ipairs(extra_tools) do
+			if t.schema and t.handler then
+				-- nested-schema+handler form → Anthropic flat form (strip handler)
+				table.insert(tools, {
+					name = t.name,
+					description = t.schema.description,
+					input_schema = t.schema.input_schema,
+				})
+			else
+				table.insert(tools, t)
+			end
+		end
+	end
 
     return tools
 end
@@ -1514,5 +1525,7 @@ function M.run(opts)
         messages = messages,
     }
 end
+
+M._build_tools = build_tools -- internal: for tests only
 
 return M
