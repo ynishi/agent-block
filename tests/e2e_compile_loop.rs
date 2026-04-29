@@ -4,6 +4,59 @@ use predicates::prelude::*;
 use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
+/// Verifies compile_loop in diff mode (edit_mode="diff") with the Anthropic provider.
+///
+/// Scenario: 2 iterations.
+///   - Iter 1: mock returns a SEARCH/REPLACE block with a wrong SEARCH text.
+///     apply_blocks detects the mismatch → failure feedback sent back → 2nd LLM call.
+///   - Iter 2: mock returns a correct SEARCH/REPLACE block (exact match of initial file).
+///     apply_blocks succeeds → file patched → mock_runner detects "world" in output → ok=true.
+///
+/// Validates that:
+///   - The diff mode parse/apply pipeline is wired correctly.
+///   - A SEARCH mismatch triggers a retry (not a silent skip).
+///   - The runner is invoked after a successful apply.
+///   - The loop converges on the second LLM call.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_diff_anthropic_mock_iterates_until_pass() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_diff_anthropic_mock::spawn_compile_loop_diff_anthropic_mock_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_diff_anthropic_mock.lua"),
+            ])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_DIFF_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls to the diff anthropic mock (iter1: apply-fail, iter2: pass)"
+    );
+    ct.cancel();
+}
+
 /// Verifies that compile_loop iterates exactly twice: once returning broken code
 /// (mock_runner fails) and once returning fixed code (mock_runner passes).
 ///

@@ -330,11 +330,42 @@ share the same function identity. The tool name defaults to `"compile_loop"`; pa
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
 `target_file` (absolute path, required), `lang` (string, optional).
 
+**`edit_mode` (opt-in diff mode)**: pass `edit_mode = "diff"` to `compile_loop.make` to
+switch the child LLM to Aider-style SEARCH/REPLACE patch output instead of emitting the
+whole file on every iteration. This is the preferred mode for large existing files where
+minimal-edit is critical (e.g. fixing a single function in a 500-line file).
+
+```lua
+local td = compile_loop.make({
+    runner    = lua_runner,
+    edit_mode = "diff",        -- opt-in; default is "full"
+    llm       = { provider = "anthropic", model = "claude-haiku-4-5-20251001" },
+})
+```
+
+The child LLM must output one or more SEARCH/REPLACE blocks in this exact format:
+
+```
+<<<<<<< SEARCH
+<existing text to replace, character-exact>
+=======
+<replacement text>
+>>>>>>> REPLACE
+```
+
+`compile_loop` applies each block in order using a two-stage match (exact → whitespace-
+normalized). Blocks whose SEARCH text does not match the current file content are reported
+back to the child LLM with the full file content attached, triggering a retry.
+
+When `target_file` is absent or empty at loop entry, `edit_mode = "diff"` automatically
+falls back to `"full"` with a warn-level log line (diff requires a base file to patch).
+
 **`target_file` dual role**: when `target_file` already exists at loop entry, its content is
 embedded in the initial user message as `=== Current file content ===` so the child LLM can
-build on it rather than generating from scratch. The file is then overwritten in full on every
-iteration (full-file output mode). When the file is absent or empty, the message contains
-`spec` only — preserving the original synthesis behaviour (backward-compatible).
+build on it rather than generating from scratch. In `full` mode the file is overwritten on
+every iteration; in `diff` mode only the matched regions are replaced. When the file is absent
+or empty, the message contains `spec` only — preserving the original synthesis behaviour
+(backward-compatible).
 
 **Target model class**: the full-file output strategy is designed for Qwen3 / Haiku-grade
 mid-weight models. Emitting the whole file on each iteration avoids the apply-failure cost of

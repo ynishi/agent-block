@@ -10,6 +10,7 @@
 --     lang      = string?, -- default "lua"
 --     name      = string?, -- default "compile_loop"
 --     system    = string?,
+--     edit_mode = "full"|"diff"?, -- default "full"; "diff" uses SEARCH/REPLACE patches
 -- }
 --
 -- target_file dual role: read on entry if already present (content embedded in
@@ -120,6 +121,20 @@ You will be given a spec and asked to write code that runs and passes its self-c
 Output ONLY the complete file contents in a single fenced code block (e.g. ```lua\n...\n```).
 No prose before or after the block.
 On retry, output the WHOLE corrected file (not a diff). Keep changes minimal.]]
+
+local DIFF_SYSTEM = [[You are an expert programmer editing an existing file.
+Output only SEARCH/REPLACE blocks in this exact format:
+
+<<<<<<< SEARCH
+<existing text to replace, character-exact>
+=======
+<replacement text>
+>>>>>>> REPLACE
+
+- Multiple blocks allowed.
+- SEARCH text must match the file character-exactly (whitespace included).
+- Do NOT output the full file. Do NOT use code fences.
+- Make the SMALLEST changes that satisfy the spec.]]
 
 -- ============================================================
 -- Internal helpers (moved from coding_agent/init.lua)
@@ -317,6 +332,129 @@ local function llm_call(opts, messages)
     return decoded
 end
 
+-- Parse Aider-style SEARCH/REPLACE blocks from LLM output.
+-- Returns (blocks, nil) on success or (nil, error_string) on failure.
+-- Each block = { search = string, replace = string }.
+-- Marker lines are excluded; inner text is preserved verbatim (no strip).
+local function parse_search_replace(text)
+    local blocks = {}
+    local pos = 1
+    local len = #text
+
+    while pos <= len do
+        -- Find next SEARCH marker
+        local s_start, s_end = text:find("<<<<<<< SEARCH\n", pos, true)
+        if not s_start then break end
+
+        -- Find ======= separator after SEARCH marker
+        local sep_start, sep_end = text:find("\n=======\n", s_end + 1, true)
+        if not sep_start then
+            return nil, "malformed SEARCH/REPLACE block: missing ======= separator"
+        end
+
+        -- Find >>>>>>> REPLACE marker after separator
+        local rep_start, rep_end = text:find("\n>>>>>>> REPLACE", sep_end + 1, true)
+        if not rep_start then
+            return nil, "malformed SEARCH/REPLACE block: missing >>>>>>> REPLACE marker"
+        end
+
+        local search_text  = text:sub(s_end + 1, sep_start - 1)
+        local replace_text = text:sub(sep_end + 1, rep_start - 1)
+
+        table.insert(blocks, { search = search_text, replace = replace_text })
+        pos = rep_end + 1
+    end
+
+    if #blocks == 0 then
+        return nil, "no SEARCH/REPLACE blocks found"
+    end
+    return blocks, nil
+end
+
+-- Whitespace-normalize a string: collapse runs of whitespace to a single space
+-- and strip leading/trailing whitespace. Used for the fallback ws-normalized match.
+local function ws_normalize(s)
+    return (s:gsub("%s+", " "):match("^%s*(.-)%s*$"))
+end
+
+-- Apply parsed SEARCH/REPLACE blocks to content.
+-- Returns (new_content, failed_indices).
+-- Two-stage match:
+--   1. exact: content:find(search, 1, true)
+--   2. ws-normalized: collapse whitespace in both search and content scan window
+-- Blocks that fail both stages are appended to failed_indices and skipped.
+-- Successful blocks are applied in order; applied content is updated after each success.
+local function apply_blocks(content, blocks)
+    local failed_indices = {}
+    local current = content
+
+    for i, block in ipairs(blocks) do
+        local search  = block.search
+        local replace = block.replace
+
+        -- Stage 1: exact match
+        local found_s, found_e = current:find(search, 1, true)
+        if found_s then
+            current = current:sub(1, found_s - 1) .. replace .. current:sub(found_e + 1)
+        else
+            -- Stage 2: whitespace-normalized match
+            -- Scan current content line by line to find a region that ws-normalizes to the same
+            -- normalized form as the search text.
+            local norm_search = ws_normalize(search)
+            local matched = false
+            -- We slide a window over content to find a matching substring.
+            -- For simplicity, we scan each possible start position in current.
+            local cur_len = #current
+            local search_len = #search
+            -- Heuristic: limit scan to a window that's at most 3× the search length
+            -- to avoid O(n²) for large files. We still check all positions.
+            local cpos = 1
+            while cpos <= cur_len do
+                -- Try windows of varying sizes (search_len ± 50% for ws variance)
+                local min_win = math.max(1, search_len - math.floor(search_len / 2))
+                local max_win = search_len + math.floor(search_len / 2) + 10
+                if max_win > cur_len - cpos + 1 then
+                    max_win = cur_len - cpos + 1
+                end
+                local found_window = false
+                for wlen = min_win, max_win do
+                    local window = current:sub(cpos, cpos + wlen - 1)
+                    if ws_normalize(window) == norm_search then
+                        current = current:sub(1, cpos - 1) .. replace .. current:sub(cpos + wlen)
+                        matched = true
+                        found_window = true
+                        break
+                    end
+                end
+                if found_window then break end
+                cpos = cpos + 1
+            end
+
+            if not matched then
+                table.insert(failed_indices, i)
+            end
+        end
+    end
+
+    return current, failed_indices
+end
+
+-- Build the failure-feedback user message for SEARCH/REPLACE apply failures.
+-- Called when one or more blocks could not be applied (SEARCH text not found).
+local function build_edit_failure_msg(failed_indices, blocks, current_content)
+    local parts = {}
+    for _, idx in ipairs(failed_indices) do
+        local blk = blocks[idx]
+        table.insert(parts, string.format(
+            "Edit FAILED: block %d could not be applied. The SEARCH text did not match.\n=== SEARCH (block %d) ===\n%s",
+            idx, idx, blk and blk.search or "(nil)"
+        ))
+    end
+    table.insert(parts, "=== Current file content ===\n" .. (current_content or ""))
+    table.insert(parts, "Re-emit ALL blocks from scratch with corrected SEARCH text.")
+    return table.concat(parts, "\n\n")
+end
+
 -- Read target file if it already exists and is non-empty.
 -- Returns file content as a string, or nil when the file is absent, empty, or unreadable.
 -- Uses to_abs so that relative paths are resolved before io.open.
@@ -365,7 +503,7 @@ end
 
 -- run_loop(conf, messages_override?) executes the structural compile-and-fix loop.
 -- conf fields (K-96 full set, all resolved before entry):
---   runner, lang, target_file, spec, max_iters, system,
+--   runner, lang, target_file, spec, max_iters, system, edit_mode,
 --   provider, base_url, api_key, api_key_env, model,
 --   max_tokens, temperature, disable_thinking, timeout,
 --   on_iter (optional callback)
@@ -377,22 +515,43 @@ local function run_loop(conf)
 
     local lang          = conf.lang or "lua"
     local max_iters     = conf.max_iters or 5
-    local system        = conf.system or DEFAULT_SYSTEM
     local artifact_path = to_abs(conf.target_file)
     local mode          = resolve_dump_mode()
 
+    -- Resolve edit_mode: "diff" requires a non-empty target_file; fallback to "full".
+    local edit_mode = conf.edit_mode or "full"
+    local existing  = read_target_if_exists(conf.target_file)
+    if edit_mode == "diff" and not existing then
+        log.warn("compile_loop: edit_mode=diff requires an existing non-empty target_file; falling back to full")
+        edit_mode = "full"
+    end
+
+    -- Select system prompt based on edit_mode.
+    local system
+    if edit_mode == "diff" then
+        system = conf.system or DIFF_SYSTEM
+    else
+        system = conf.system or DEFAULT_SYSTEM
+    end
+
     -- Build the initial user message.
-    -- When target_file already exists (build-resolver / minimal-edit use case),
-    -- embed its content so the child LLM has the current file as context.
-    -- Falls back to spec-only when the file is absent or empty (synthesis use case).
-    -- No tool arrays, no extra_tools, no JSON schema.
-    local existing = read_target_if_exists(conf.target_file)
-    local user_content = conf.spec
-    if existing then
+    -- full mode: embed existing file content (if any) in a code fence.
+    -- diff mode: embed existing file as plain text (child LLM will emit SEARCH/REPLACE blocks).
+    local user_content
+    if edit_mode == "diff" then
+        -- existing is guaranteed non-nil here (fallback already applied above).
         user_content = conf.spec
-            .. "\n\n=== Current file content ===\n```" .. lang .. "\n"
+            .. "\n\n=== Current file content ===\n"
             .. existing
-            .. "\n```"
+    else
+        -- full mode: original behaviour.
+        user_content = conf.spec
+        if existing then
+            user_content = conf.spec
+                .. "\n\n=== Current file content ===\n```" .. lang .. "\n"
+                .. existing
+                .. "\n```"
+        end
     end
 
     local messages = {
@@ -420,74 +579,220 @@ local function run_loop(conf)
 
         local choice  = (resp.choices or {})[1] or {}
         local content = (choice.message or {}).content or ""
-        local code    = extract_code(content, lang)
 
-        -- Write target file (full-file replace — next_full_file action)
-        local f, werr = io.open(conf.target_file, "w")
-        if not f then
-            local werr_str = tostring(werr)
-            return {
-                ok             = false,
-                failure_reason = "open_target_file",
-                last_error     = werr_str,
-                iters          = iter,
-                summary        = make_summary(false, iter, max_iters, "open_target_file"),
-                artifact_path  = artifact_path,
-                history        = history,
-            }
-        end
-        f:write(code)
-        f:close()
+        -- ── diff mode ──────────────────────────────────────────────────────────
+        if edit_mode == "diff" then
+            -- Parse SEARCH/REPLACE blocks from the LLM response.
+            local blocks, parse_err = parse_search_replace(content)
+            if not blocks then
+                -- Parse failure: tell the child LLM to re-emit valid blocks.
+                local fmt_msg = "Output format invalid: " .. tostring(parse_err)
+                    .. "\nRe-emit blocks correctly."
+                local entry = { iter = iter, code = nil, result = { ok = false, stderr = fmt_msg, stdout = "", exit_code = -1 }, raw = content }
+                table.insert(history, entry)
+                obs_event(mode, "iter_result", {
+                    { "iter",       iter },
+                    { "ok",         false },
+                    { "exit_code",  -1 },
+                    { "stderr_len", #fmt_msg },
+                })
+                if conf.on_iter then
+                    local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                    if not cb_ok then
+                        log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                    end
+                end
+                -- Stagnation check uses history entry result.stderr.
+                if is_stagnant(history) then
+                    obs_event(mode, "stagnation", { { "iters", iter } })
+                    return {
+                        ok             = false,
+                        failure_reason = "stagnation",
+                        last_error     = fmt_msg:sub(-800),
+                        iters          = iter,
+                        summary        = make_summary(false, iter, max_iters, "stagnation"),
+                        artifact_path  = artifact_path,
+                        history        = history,
+                    }
+                end
+                table.insert(messages, { role = "assistant", content = content })
+                table.insert(messages, { role = "user",      content = fmt_msg })
+            else
+                -- Apply blocks to the current file content.
+                local current_content = read_target_if_exists(conf.target_file) or existing
+                local new_content, failed_indices = apply_blocks(current_content, blocks)
 
-        -- Run
-        local rr = conf.runner(conf.target_file) or {}
-        local entry = { iter = iter, code = code, result = rr, raw = content }
-        table.insert(history, entry)
-        obs_event(mode, "iter_result", {
-            { "iter",       iter },
-            { "ok",         rr.ok and true or false },
-            { "exit_code",  rr.exit_code },
-            { "stderr_len", #(tostring(rr.stderr or "")) },
-        })
+                if #failed_indices > 0 then
+                    -- Partial or total apply failure: report and ask for re-emit.
+                    local fail_msg = build_edit_failure_msg(failed_indices, blocks, current_content)
+                    local entry = { iter = iter, code = nil, result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 }, raw = content }
+                    table.insert(history, entry)
+                    obs_event(mode, "iter_result", {
+                        { "iter",       iter },
+                        { "ok",         false },
+                        { "exit_code",  -1 },
+                        { "stderr_len", #fail_msg },
+                    })
+                    if conf.on_iter then
+                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                        if not cb_ok then
+                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                        end
+                    end
+                    if is_stagnant(history) then
+                        obs_event(mode, "stagnation", { { "iters", iter } })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = fail_msg:sub(-800),
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = artifact_path,
+                            history        = history,
+                        }
+                    end
+                    table.insert(messages, { role = "assistant", content = content })
+                    table.insert(messages, { role = "user",      content = fail_msg })
+                else
+                    -- All blocks applied successfully — write new content and run.
+                    local f, werr = io.open(conf.target_file, "w")
+                    if not f then
+                        local werr_str = tostring(werr)
+                        return {
+                            ok             = false,
+                            failure_reason = "open_target_file",
+                            last_error     = werr_str,
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "open_target_file"),
+                            artifact_path  = artifact_path,
+                            history        = history,
+                        }
+                    end
+                    f:write(new_content)
+                    f:close()
 
-        if conf.on_iter then
-            local cb_ok, cb_err = pcall(conf.on_iter, entry)
-            if not cb_ok then
-                log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                    local rr = conf.runner(conf.target_file) or {}
+                    local entry = { iter = iter, code = new_content, result = rr, raw = content }
+                    table.insert(history, entry)
+                    obs_event(mode, "iter_result", {
+                        { "iter",       iter },
+                        { "ok",         rr.ok and true or false },
+                        { "exit_code",  rr.exit_code },
+                        { "stderr_len", #(tostring(rr.stderr or "")) },
+                    })
+
+                    if conf.on_iter then
+                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                        if not cb_ok then
+                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                        end
+                    end
+
+                    if rr.ok then
+                        obs_event(mode, "converged", { { "iters", iter } })
+                        return {
+                            ok            = true,
+                            code          = new_content,
+                            artifact_path = artifact_path,
+                            iters         = iter,
+                            summary       = make_summary(true, iter, max_iters, nil),
+                            history       = history,
+                        }
+                    end
+
+                    if is_stagnant(history) then
+                        local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+                        obs_event(mode, "stagnation", { { "iters", iter } })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = last_stderr,
+                            code           = new_content,
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = artifact_path,
+                            history        = history,
+                        }
+                    end
+
+                    -- Runner failed — provide runner feedback for next iteration.
+                    table.insert(messages, { role = "assistant", content = content })
+                    table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
+                end
             end
-        end
 
-        if rr.ok then
-            obs_event(mode, "converged", { { "iters", iter } })
-            return {
-                ok            = true,
-                code          = code,
-                artifact_path = artifact_path,
-                iters         = iter,
-                summary       = make_summary(true, iter, max_iters, nil),
-                history       = history,
-            }
-        end
+        -- ── full mode (default) ────────────────────────────────────────────────
+        else
+            local code = extract_code(content, lang)
 
-        -- Stagnation detection
-        if is_stagnant(history) then
-            local last_stderr = tostring((rr.stderr) or ""):sub(-800)
-            obs_event(mode, "stagnation", { { "iters", iter } })
-            return {
-                ok             = false,
-                failure_reason = "stagnation",
-                last_error     = last_stderr,
-                code           = code,
-                iters          = iter,
-                summary        = make_summary(false, iter, max_iters, "stagnation"),
-                artifact_path  = artifact_path,
-                history        = history,
-            }
-        end
+            -- Write target file (full-file replace — next_full_file action)
+            local f, werr = io.open(conf.target_file, "w")
+            if not f then
+                local werr_str = tostring(werr)
+                return {
+                    ok             = false,
+                    failure_reason = "open_target_file",
+                    last_error     = werr_str,
+                    iters          = iter,
+                    summary        = make_summary(false, iter, max_iters, "open_target_file"),
+                    artifact_path  = artifact_path,
+                    history        = history,
+                }
+            end
+            f:write(code)
+            f:close()
 
-        -- Append assistant + failure user message for the next turn.
-        table.insert(messages, { role = "assistant", content = content })
-        table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
+            -- Run
+            local rr = conf.runner(conf.target_file) or {}
+            local entry = { iter = iter, code = code, result = rr, raw = content }
+            table.insert(history, entry)
+            obs_event(mode, "iter_result", {
+                { "iter",       iter },
+                { "ok",         rr.ok and true or false },
+                { "exit_code",  rr.exit_code },
+                { "stderr_len", #(tostring(rr.stderr or "")) },
+            })
+
+            if conf.on_iter then
+                local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                if not cb_ok then
+                    log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                end
+            end
+
+            if rr.ok then
+                obs_event(mode, "converged", { { "iters", iter } })
+                return {
+                    ok            = true,
+                    code          = code,
+                    artifact_path = artifact_path,
+                    iters         = iter,
+                    summary       = make_summary(true, iter, max_iters, nil),
+                    history       = history,
+                }
+            end
+
+            -- Stagnation detection
+            if is_stagnant(history) then
+                local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+                obs_event(mode, "stagnation", { { "iters", iter } })
+                return {
+                    ok             = false,
+                    failure_reason = "stagnation",
+                    last_error     = last_stderr,
+                    code           = code,
+                    iters          = iter,
+                    summary        = make_summary(false, iter, max_iters, "stagnation"),
+                    artifact_path  = artifact_path,
+                    history        = history,
+                }
+            end
+
+            -- Append assistant + failure user message for the next turn.
+            table.insert(messages, { role = "assistant", content = content })
+            table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
+        end
+        -- ── end of edit_mode branch ────────────────────────────────────────────
     end
 
     -- max_iters reached without PASS
@@ -572,6 +877,7 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
             -- factory conf fields
             max_iters = conf.max_iters,
             system    = conf.system,
+            edit_mode = conf.edit_mode,
             on_iter   = conf.on_iter,
 
             -- LLM fields (K-96 full set, all explicit):
