@@ -105,6 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `blocks/agent` — `build_tools` now applies first-wins dedup across `lua_tools → mcp_tools →
+  extra_tools` in that order, preventing duplicate tool entries when the same tool name appears
+  in multiple sources (e.g. registered via `tool.register` and also passed via `extra_tools`).
+- `blocks/agent` — `dispatch_tool` now holds a direct `extra_tools_map` fallback path
+  (`extra_tools_map[name].handler(input)`) between the MCP path and the registry (`tool.call`)
+  path. This means `extra_tools` handlers are dispatched correctly even when the tool is not
+  registered in the global registry, making dispatch wiring registry-independent (1777469900-71779).
 - `blocks/agent` — `build_tools` now flattens `extra_tools` entries that use the
   `compile_loop.make()` return shape (`{name, schema={description, input_schema}, handler}`)
   into the Anthropic flat form (`{name, description, input_schema}`), preventing
