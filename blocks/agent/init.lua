@@ -723,6 +723,12 @@ local function llm_call_openai(messages, opts, trace)
     if oai_tools and #oai_tools > 0 then
         body.tools = oai_tools
     end
+    -- extra_body pass-through (vLLM Qwen3 enable_thinking 等のための openai 互換拡張)
+    if opts.extra_body and type(opts.extra_body) == "table" then
+        for k, v in pairs(opts.extra_body) do
+            body[k] = v
+        end
+    end
 
     local headers = {
         ["Authorization"] = "Bearer " .. api_key,
