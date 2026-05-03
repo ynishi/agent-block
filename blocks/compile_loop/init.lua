@@ -319,6 +319,176 @@ end
 --                          } } } }
 --   failure: nil, error_string
 
+-- ============================================================
+-- Internal: OpenAI tool-use helpers (写経 from blocks/agent/init.lua, do NOT shared-extract)
+-- ============================================================
+
+--- Map OpenAI finish_reason to internal stop_reason string.
+--- @param finish_reason string|nil
+--- @return string
+local function cl_oai_map_finish_reason(finish_reason)
+    if finish_reason == "stop" then
+        return "end_turn"
+    elseif finish_reason == "tool_calls" then
+        return "tool_use"
+    elseif finish_reason == "length" then
+        return "max_tokens"
+    else
+        return tostring(finish_reason or "end_turn")
+    end
+end
+
+--- Normalize a raw OpenAI chat completion response into compile_loop internal shape.
+--- Internal shape (tools path):
+---   { choices = { { message = { content = joined_text,
+---                               tool_use_blocks = [{id, name, input}],
+---                               stop_reason = string } } } }
+--- @param raw table  Parsed OpenAI JSON response
+--- @return table|nil  compile_loop-shape table on success
+--- @return string|nil Error string on failure
+local function cl_oai_normalize(raw)
+    if not raw or not raw.choices or #raw.choices == 0 then
+        return nil, "invalid OpenAI response: missing choices"
+    end
+    local choice  = raw.choices[1]
+    local message = choice and choice.message
+    if not message then
+        return nil, "invalid OpenAI response: missing choices[0].message"
+    end
+
+    local text_parts      = {}
+    local tool_use_blocks = {}
+
+    -- Text portion (may be nil/empty on pure tool_calls turns).
+    local text = message.content
+    if text and text ~= "" then
+        table.insert(text_parts, text)
+    end
+
+    -- tool_calls → tool_use_blocks.
+    for _, tc in ipairs(message.tool_calls or {}) do
+        local fn    = tc["function"] or {}
+        local input = {}
+        local ok, parsed = pcall(std.json.decode, fn.arguments or "{}")
+        if ok and type(parsed) == "table" then
+            input = parsed
+        else
+            log.warn("compile_loop: OpenAI tool_call arguments JSON parse failed for tool '"
+                .. tostring(fn.name) .. "'; using empty input")
+            -- Acceptance Criteria #7 equivalent: input={}, is_error_hint, loop continues.
+            table.insert(tool_use_blocks, {
+                id            = tc.id,
+                name          = fn.name or "",
+                input         = {},
+                is_error_hint = "arguments_parse_failed",
+            })
+            goto continue_tc
+        end
+        table.insert(tool_use_blocks, {
+            id    = tc.id,
+            name  = fn.name or "",
+            input = input,
+        })
+        ::continue_tc::
+    end
+
+    local joined = table.concat(text_parts, "\n")
+    return {
+        choices = {
+            {
+                message = {
+                    content         = joined,
+                    tool_use_blocks = tool_use_blocks,
+                    stop_reason     = cl_oai_map_finish_reason(choice.finish_reason),
+                },
+            },
+        },
+    }, nil
+end
+
+--- Convert compile_loop Anthropic-shaped messages to OpenAI-shaped messages.
+--- Handles:
+---   assistant messages with tool_use blocks → assistant + tool_calls array
+---   user messages with tool_result blocks  → role="tool" + tool_call_id messages
+---   string content messages                → pass-through
+--- @param messages table    Anthropic-shaped messages array (role="system" already removed)
+--- @param system   string|nil  Optional system prompt text
+--- @return table              OpenAI-shaped messages array
+local function cl_oai_convert_messages(messages, system)
+    local out = {}
+
+    -- Insert system message first if provided.
+    if system and system ~= "" then
+        table.insert(out, { role = "system", content = system })
+    end
+
+    for _, msg in ipairs(messages) do
+        if type(msg.content) == "string" then
+            -- Simple string content (user prompt turns).
+            table.insert(out, { role = msg.role, content = msg.content })
+        elseif type(msg.content) == "table" then
+            if msg.role == "assistant" then
+                -- Assistant messages may have text + tool_use blocks.
+                local a_text_parts = {}
+                local tool_calls   = {}
+                for _, block in ipairs(msg.content) do
+                    if block.type == "text" then
+                        table.insert(a_text_parts, block.text or "")
+                    elseif block.type == "tool_use" then
+                        table.insert(tool_calls, {
+                            id   = block.id,
+                            type = "function",
+                            ["function"] = {
+                                name      = block.name,
+                                arguments = std.json.encode(block.input or {}),
+                            },
+                        })
+                    end
+                end
+                local text_content = #a_text_parts > 0 and table.concat(a_text_parts, "\n") or nil
+                local oai_msg = { role = "assistant" }
+                if text_content then oai_msg.content = text_content end
+                if #tool_calls > 0 then oai_msg.tool_calls = tool_calls end
+                table.insert(out, oai_msg)
+            elseif msg.role == "user" then
+                -- User messages with tool_result blocks → expand to role="tool" messages.
+                local has_tool_result = false
+                for _, block in ipairs(msg.content) do
+                    if block.type == "tool_result" then
+                        has_tool_result = true
+                        break
+                    end
+                end
+                if has_tool_result then
+                    for _, block in ipairs(msg.content) do
+                        if block.type == "tool_result" then
+                            table.insert(out, {
+                                role         = "tool",
+                                tool_call_id = block.tool_use_id,
+                                content      = tostring(block.content or ""),
+                            })
+                        end
+                    end
+                else
+                    -- Regular user message with content array (e.g. text blocks).
+                    local parts = {}
+                    for _, block in ipairs(msg.content) do
+                        if block.type == "text" then
+                            table.insert(parts, block.text or "")
+                        end
+                    end
+                    table.insert(out, { role = "user", content = table.concat(parts, "\n") })
+                end
+            else
+                -- Other roles: pass content as-is (fallback).
+                table.insert(out, { role = msg.role, content = msg.content })
+            end
+        end
+    end
+
+    return out
+end
+
 -- Module-level override for test monkey-patching (set via M._test_set_llm_call).
 local _llm_call_override = nil
 
@@ -441,10 +611,6 @@ local function llm_call(opts, messages)
     end
 
     -- OpenAI-compatible path.
-    -- Stub: if tools are requested (multi-file lazy-load) we cannot handle it yet.
-    if opts.tools ~= nil then
-        return nil, "openai provider does not yet support multi-file lazy-load"
-    end
 
     local api_key = opts.api_key
     if not api_key or api_key == "" then
@@ -454,15 +620,43 @@ local function llm_call(opts, messages)
         return nil, "no api_key (opts.api_key or OPENAI_API_KEY env)"
     end
 
+    -- Extract system role from messages (mirrors anthropic branch L:348-358).
+    local sys_text     = nil
+    local body_messages_raw = {}
+    for _, msg in ipairs(messages) do
+        if msg.role == "system" and sys_text == nil then
+            sys_text = msg.content
+        else
+            table.insert(body_messages_raw, msg)
+        end
+    end
+
+    -- Convert Anthropic-shaped messages to OpenAI shape.
+    local oai_messages = cl_oai_convert_messages(body_messages_raw, sys_text)
+
     local base_url = opts.base_url or "https://api.openai.com/v1"
     local body = {
         model       = opts.model or "gpt-4o-mini",
         max_tokens  = opts.max_tokens or 4096,
         temperature = opts.temperature or 0.2,
-        messages    = messages,
+        messages    = oai_messages,
     }
     if opts.disable_thinking then
         body.chat_template_kwargs = { enable_thinking = false }
+    end
+
+    -- tools conversion: input_schema → parameters (Crux #1, R2 guard).
+    if opts.tools and #opts.tools > 0 then
+        local oai_tools = {}
+        for _, t in ipairs(opts.tools) do
+            local fn_def = {
+                name        = t.name,
+                description = t.description or "",
+                parameters  = t.input_schema or { type = "object", properties = {} },
+            }
+            table.insert(oai_tools, { type = "function", ["function"] = fn_def })
+        end
+        body.tools = oai_tools
     end
 
     local headers = {
@@ -484,7 +678,13 @@ local function llm_call(opts, messages)
     if not ok or type(decoded) ~= "table" then
         return nil, "decode failed: " .. tostring(decoded)
     end
-    return decoded
+
+    -- tools=nil: return raw decoded (backward compat for single-file qwen tests, R4 guard).
+    -- tools~=nil: normalize to compile_loop internal shape so run_loop dispatch works (Crux #1).
+    if opts.tools == nil then
+        return decoded
+    end
+    return cl_oai_normalize(decoded)
 end
 
 -- Parse Aider-style SEARCH/REPLACE blocks from LLM output.
@@ -839,12 +1039,6 @@ local function run_loop(conf)
     local max_iters  = conf.max_iters or 5
     local multi_file = conf.multi_file or false
     local mode       = resolve_dump_mode()
-
-    -- Guard: openai provider does not support multi-file lazy-load.
-    local provider = conf.provider or "openai"
-    if multi_file and provider == "openai" then
-        error("openai provider does not yet support multi-file lazy-load")
-    end
 
     -- In single-file mode, artifact_path is the single absolute path (backward compat).
     -- In multi-file mode, artifact_path is nil; modified_files carries the list.
