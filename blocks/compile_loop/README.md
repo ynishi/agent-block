@@ -99,6 +99,19 @@ local result = agent.run({
 -- result.modified_files contains the list of absolute paths that were written
 ```
 
+### Multi-file examples (Anthropic)
+
+End-to-end smoke scripts under `examples/`, runnable as `agent-block -s examples/<file>.lua` (requires `ANTHROPIC_API_KEY` in `.env`):
+
+| Script | Scenario |
+|---|---|
+| `test_anthropic_compile_loop_multi.lua` | Add a function to **both** files (basic additive multi-file diff) |
+| `test_anthropic_compile_loop_multi_delete.lua` | Remove a function + assertions from both files (REPLACE-empty deletion) |
+| `test_anthropic_compile_loop_multi_selective.lua` | Edit one file only; verifies the untouched file is byte-identical |
+| `test_anthropic_compile_loop_multi_stagnation.lua` | Forced-fail runner; asserts `max_iters` bound and `ok=false` return |
+
+Single-file equivalents live alongside (`test_anthropic_compile_loop.lua` etc.).
+
 ## SEARCH/REPLACE format
 
 ### Single-file (`target_file`)
