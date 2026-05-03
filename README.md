@@ -327,6 +327,8 @@ local result = agent.run({
 share the same function identity. The tool name defaults to `"compile_loop"`; pass
 `conf.name` to override (useful when registering multiple instances).
 
+**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). See `blocks/compile_loop/README.md` §"Multi-file mode" and the four `examples/test_anthropic_compile_loop_multi*.lua` smoke scripts.
+
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
 `target_file` (absolute path, required), `lang` (string, optional).
 
