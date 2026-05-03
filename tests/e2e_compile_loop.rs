@@ -159,6 +159,125 @@ async fn compile_loop_anthropic_mock_iterates_until_pass() {
     ct.cancel();
 }
 
+/// Verifies compile_loop in multi-file diff mode (happy path, 1-turn, 2-file).
+///
+/// Scenario: 1 iteration.
+///   - Mock returns path-header SEARCH/REPLACE for both file_a and file_b in a single turn.
+///   - apply_blocks succeeds for both files → mock_runner receives paths list → ok=true.
+///
+/// Validates:
+///   - target_files list is accepted (Crux #2 backward-compatible conf API).
+///   - Parser extracts path headers and routes each block to the correct file (Crux #1).
+///   - Runner is called with a list of paths, not a single string (Crux #3 signature toggle).
+///   - result.modified_files contains 2 paths; result.artifact_path is nil.
+///   - Loop converges on the first LLM call (call_count == 1).
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_diff_multi_anthropic_mock::spawn_compile_loop_diff_multi_anthropic_mock_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let file_a = tmp.path().join("file_a.lua");
+        let file_b = tmp.path().join("file_b.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_diff_multi_anthropic_mock.lua"),
+            ])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET_FILES",
+                format!(
+                    "{}:{}",
+                    file_a.to_str().expect("utf8 path"),
+                    file_b.to_str().expect("utf8 path")
+                ),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "COMPILE_LOOP_DIFF_MULTI_MOCK_PASS",
+            ));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    // Happy path: exactly 1 HTTP call (both files patched in a single LLM turn).
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "expected exactly 1 HTTP call to the multi diff mock (happy path: 2 files in 1 turn)"
+    );
+    ct.cancel();
+}
+
+/// Verifies compile_loop in multi-file diff mode converges after a SEARCH mismatch (2-iter).
+///
+/// Scenario: 2 iterations.
+///   - Iter 1: mock returns file_a SEARCH with wrong text ("WRONG") — apply fails for file_a.
+///     compile_loop feeds back a failure message, triggering a second LLM call.
+///   - Iter 2: mock returns correct SEARCH for both file_a and file_b → apply succeeds → ok=true.
+///
+/// Validates:
+///   - A SEARCH mismatch in multi-file mode triggers a retry (not a silent skip).
+///   - Loop converges on the second LLM call (call_count == 2).
+///   - result.modified_files contains 2 paths; result.artifact_path is nil.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_diff_multi_anthropic_mock::spawn_compile_loop_diff_multi_anthropic_mock_two_iter_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let file_a = tmp.path().join("file_a.lua");
+        let file_b = tmp.path().join("file_b.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_diff_multi_anthropic_mock_two_iter.lua"),
+            ])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET_FILES",
+                format!(
+                    "{}:{}",
+                    file_a.to_str().expect("utf8 path"),
+                    file_b.to_str().expect("utf8 path")
+                ),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "COMPILE_LOOP_DIFF_MULTI_MOCK_TWO_ITER_PASS",
+            ));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    // 2-iter: exactly 2 HTTP calls (iter1: apply-fail, iter2: pass).
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls to the multi diff mock (iter1: apply-fail, iter2: pass)"
+    );
+    ct.cancel();
+}
+
 /// Verifies that compile_loop emits ab.obs events when AGENT_BLOCK_LLM_DUMP=meta.
 ///
 /// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls).
