@@ -3,7 +3,8 @@
 -- Primary surface: compile_loop.make(conf) → tool_def
 --
 -- conf = {
---     runner    = function(path) → {ok, stdout, stderr, exit_code},  -- required
+--     runner    = function(path) → {ok, stdout, stderr, exit_code},  -- required (single-file)
+--               | function(paths) → {ok, stdout, stderr, exit_code}, -- required (multi-file)
 --     llm       = { provider, base_url, api_key, api_key_env, model,
 --                   max_tokens, temperature, disable_thinking, timeout }, -- optional
 --     max_iters = int?,    -- default 5
@@ -13,9 +14,11 @@
 --     edit_mode = "full"|"diff"?, -- default "full"; "diff" uses SEARCH/REPLACE patches
 -- }
 --
+-- target_file (string) XOR target_files (list<string>): mutually exclusive.
 -- target_file dual role: read on entry if already present (content embedded in
 -- the initial user message), then written in full on each iteration.
 -- Absent or empty → spec-only message (synthesis use case, backward-compatible).
+-- target_files: multi-file mode, requires edit_mode="diff".
 --
 -- Returns tool_def = { name = string, schema = table, handler = function }
 -- Side-effect: tool.register(name, schema, handler) is called so the registry
@@ -134,6 +137,29 @@ Output only SEARCH/REPLACE blocks in this exact format:
 - Multiple blocks allowed.
 - SEARCH text must match the file character-exactly (whitespace included).
 - Do NOT output the full file. Do NOT use code fences.
+- Make the SMALLEST changes that satisfy the spec.]]
+
+-- System prompt for multi-file diff mode.
+-- Each group of SEARCH/REPLACE blocks must be preceded by a path header line:
+--   <<< path=<relative/or/absolute/path> >>>
+-- All SEARCH/REPLACE blocks that follow a path header apply to that file until the
+-- next path header appears. The path must exactly match one of the provided target files.
+local DIFF_SYSTEM_MULTI = [[You are an expert programmer editing multiple existing files simultaneously.
+Output SEARCH/REPLACE blocks grouped by file. Each group must start with a path header:
+
+<<< path=<file_path> >>>
+<<<<<<< SEARCH
+<existing text to replace, character-exact>
+=======
+<replacement text>
+>>>>>>> REPLACE
+
+Rules:
+- Every SEARCH/REPLACE block MUST be preceded by a <<< path=... >>> header.
+- The path must exactly match one of the target files provided.
+- Multiple SEARCH/REPLACE blocks for the same file: repeat the path header before each block, or place all blocks consecutively under one header.
+- SEARCH text must match the file character-exactly (whitespace included).
+- Do NOT output full file contents. Do NOT use code fences.
 - Make the SMALLEST changes that satisfy the spec.]]
 
 -- ============================================================
@@ -334,35 +360,79 @@ end
 
 -- Parse Aider-style SEARCH/REPLACE blocks from LLM output.
 -- Returns (blocks, nil) on success or (nil, error_string) on failure.
--- Each block = { search = string, replace = string }.
+-- Each block = { path = nil|string, search = string, replace = string }.
 -- Marker lines are excluded; inner text is preserved verbatim (no strip).
-local function parse_search_replace(text)
+--
+-- multi_file (bool): when true, <<< path=... >>> headers are required before each
+--   SEARCH/REPLACE block. target_files_set (table keyed by path string) is used
+--   to validate that every path header names an allowed file.
+--   When false (single-file mode), path headers are tolerated but ignored (path = nil).
+--
+-- Path header format: <<< path=<filepath> >>>  (on its own line, optionally preceded by whitespace)
+local function parse_search_replace(text, multi_file, target_files_set)
     local blocks = {}
     local pos = 1
     local len = #text
+    local current_path = nil  -- tracks the most recently seen path header
 
     while pos <= len do
-        -- Find next SEARCH marker
+        -- Before looking for SEARCH marker, check if the text at pos is a path header.
+        -- Path header pattern: <<< path=<anything> >>> followed by newline (or end).
+        -- We scan forward to find either a path header or a SEARCH marker.
+
+        -- Try to find a path header at or after pos (before the next SEARCH marker).
+        local ph_start, ph_end, ph_path = text:find("<<<%s*path=([^>]+)%s*>>>", pos)
         local s_start, s_end = text:find("<<<<<<< SEARCH\n", pos, true)
-        if not s_start then break end
 
-        -- Find ======= separator after SEARCH marker
-        local sep_start, sep_end = text:find("\n=======\n", s_end + 1, true)
-        if not sep_start then
-            return nil, "malformed SEARCH/REPLACE block: missing ======= separator"
+        -- If both exist, pick whichever comes first.
+        if ph_start and (not s_start or ph_start < s_start) then
+            -- Path header comes before next SEARCH (or there is no SEARCH yet).
+            local raw_path = ph_path:match("^%s*(.-)%s*$")  -- trim whitespace
+            if multi_file then
+                -- Validate against allowlist.
+                if not target_files_set[raw_path] then
+                    return nil, "path '" .. raw_path .. "' not in target_files allowlist"
+                end
+            end
+            -- In single-file mode, we accept but ignore path headers (current_path stays nil).
+            if multi_file then
+                current_path = raw_path
+            end
+            -- Advance past the path header line.
+            pos = ph_end + 1
+            -- Skip optional newline after path header.
+            if pos <= len and text:sub(pos, pos) == "\n" then
+                pos = pos + 1
+            end
+        elseif s_start then
+            -- Next thing is a SEARCH marker.
+            -- In multi-file mode, a SEARCH without a preceding path header is an error.
+            if multi_file and current_path == nil then
+                return nil, "missing path header for multi-file mode at offset " .. tostring(s_start)
+            end
+
+            -- Find ======= separator after SEARCH marker
+            local sep_start, sep_end = text:find("\n=======\n", s_end + 1, true)
+            if not sep_start then
+                return nil, "malformed SEARCH/REPLACE block: missing ======= separator"
+            end
+
+            -- Find >>>>>>> REPLACE marker after separator
+            local rep_start, rep_end = text:find("\n>>>>>>> REPLACE", sep_end + 1, true)
+            if not rep_start then
+                return nil, "malformed SEARCH/REPLACE block: missing >>>>>>> REPLACE marker"
+            end
+
+            local search_text  = text:sub(s_end + 1, sep_start - 1)
+            local replace_text = text:sub(sep_end + 1, rep_start - 1)
+
+            -- path is current_path (nil for single-file mode, string for multi-file mode).
+            table.insert(blocks, { path = current_path, search = search_text, replace = replace_text })
+            pos = rep_end + 1
+        else
+            -- No more path headers or SEARCH markers.
+            break
         end
-
-        -- Find >>>>>>> REPLACE marker after separator
-        local rep_start, rep_end = text:find("\n>>>>>>> REPLACE", sep_end + 1, true)
-        if not rep_start then
-            return nil, "malformed SEARCH/REPLACE block: missing >>>>>>> REPLACE marker"
-        end
-
-        local search_text  = text:sub(s_end + 1, sep_start - 1)
-        local replace_text = text:sub(sep_end + 1, rep_start - 1)
-
-        table.insert(blocks, { search = search_text, replace = replace_text })
-        pos = rep_end + 1
     end
 
     if #blocks == 0 then
@@ -484,10 +554,13 @@ end
 
 -- Filter run_loop result for tool output: remove code and history to prevent
 -- caller context contamination (Counter WF-A defence).
+-- For single-file mode: artifact_path is the absolute path, modified_files is nil.
+-- For multi-file mode: artifact_path is nil, modified_files is list<path>.
 local function filter_for_tool_output(res)
     return {
         ok             = res.ok,
-        artifact_path  = res.artifact_path,
+        artifact_path  = res.artifact_path,   -- single-file: abs path; multi-file: nil
+        modified_files = res.modified_files,  -- multi-file: list<path>; single-file: nil
         iters          = res.iters,
         summary        = res.summary,
         failure_reason = res.failure_reason,
@@ -498,53 +571,170 @@ local function filter_for_tool_output(res)
 end
 
 -- ============================================================
+-- Multi-file helper
+-- ============================================================
+
+-- Group parsed blocks by their path field.
+-- Returns a table: { [path_string] = {block, ...}, ... }
+-- Blocks with path == nil (single-file mode) all map to the key false.
+local function group_blocks_by_path(blocks)
+    local grouped = {}
+    for _, block in ipairs(blocks) do
+        local key = block.path or false
+        if not grouped[key] then
+            grouped[key] = {}
+        end
+        table.insert(grouped[key], block)
+    end
+    return grouped
+end
+
+-- Apply parsed blocks to each file in target_files and write results.
+-- target_files: list of absolute paths (strings).
+-- grouped: output of group_blocks_by_path (keyed by path string matching target_files entries).
+-- existing_map: { [abs_path] = content_string|nil } — pre-read content.
+--
+-- Returns:
+--   new_contents_map: { [abs_path] = new_content_string }   — only files that had blocks applied
+--   all_failed:       list of { path, indices }             — failed blocks per file
+--   write_err:        nil or "path: error_string"            — first write failure
+local function iterate_files(target_files, grouped, existing_map)
+    local new_contents_map = {}
+    local all_failed = {}
+    local write_err = nil
+
+    for _, abs_path in ipairs(target_files) do
+        local file_blocks = grouped[abs_path]
+        if file_blocks and #file_blocks > 0 then
+            local current = existing_map[abs_path] or ""
+            local new_content, failed_indices = apply_blocks(current, file_blocks)
+            if #failed_indices > 0 then
+                table.insert(all_failed, { path = abs_path, indices = failed_indices, blocks = file_blocks, current_content = current })
+            else
+                -- Write the new content.
+                local f, werr = io.open(abs_path, "w")
+                if not f then
+                    write_err = abs_path .. ": " .. tostring(werr)
+                    break
+                end
+                f:write(new_content)
+                f:close()
+                new_contents_map[abs_path] = new_content
+            end
+        end
+    end
+
+    return new_contents_map, all_failed, write_err
+end
+
+-- Build a failure-feedback message for multi-file apply failures.
+local function build_multifile_edit_failure_msg(all_failed, existing_map)
+    local parts = {}
+    for _, entry in ipairs(all_failed) do
+        for _, idx in ipairs(entry.indices) do
+            local blk = entry.blocks[idx]
+            table.insert(parts, string.format(
+                "Edit FAILED in %s: block %d could not be applied. The SEARCH text did not match.\n=== SEARCH (block %d) ===\n%s",
+                entry.path, idx, idx, blk and blk.search or "(nil)"
+            ))
+        end
+        table.insert(parts, "=== Current file content (" .. entry.path .. ") ===\n" .. (existing_map[entry.path] or ""))
+    end
+    table.insert(parts, "Re-emit ALL blocks from scratch with corrected SEARCH text.")
+    return table.concat(parts, "\n\n")
+end
+
+-- ============================================================
 -- Internal loop body (non-public; called only via make().handler)
 -- ============================================================
 
--- run_loop(conf, messages_override?) executes the structural compile-and-fix loop.
+-- run_loop(conf) executes the structural compile-and-fix loop.
 -- conf fields (K-96 full set, all resolved before entry):
---   runner, lang, target_file, spec, max_iters, system, edit_mode,
+--   runner, lang, target_files (list<abs_path>), multi_file (bool), spec,
+--   max_iters, system, edit_mode,
 --   provider, base_url, api_key, api_key_env, model,
 --   max_tokens, temperature, disable_thinking, timeout,
 --   on_iter (optional callback)
+--
+-- For backward compatibility, single-file callers pass conf.target_files = {abs_path}
+-- and conf.multi_file = false. The handler normalizes before calling run_loop.
 local function run_loop(conf)
     assert(type(conf) == "table", "conf table required")
-    assert(conf.target_file, "conf.target_file required")
+    assert(conf.target_files and #conf.target_files > 0, "conf.target_files (non-empty list) required")
     assert(conf.spec,        "conf.spec required")
     assert(type(conf.runner) == "function", "conf.runner (function) required")
 
-    local lang          = conf.lang or "lua"
-    local max_iters     = conf.max_iters or 5
-    local artifact_path = to_abs(conf.target_file)
-    local mode          = resolve_dump_mode()
+    local lang       = conf.lang or "lua"
+    local max_iters  = conf.max_iters or 5
+    local multi_file = conf.multi_file or false
+    local mode       = resolve_dump_mode()
 
-    -- Resolve edit_mode: "diff" requires a non-empty target_file; fallback to "full".
+    -- In single-file mode, artifact_path is the single absolute path (backward compat).
+    -- In multi-file mode, artifact_path is nil; modified_files carries the list.
+    local artifact_path = (not multi_file) and conf.target_files[1] or nil
+
+    -- Build a set for fast path-header validation in parse_search_replace.
+    local target_files_set = {}
+    for _, p in ipairs(conf.target_files) do
+        target_files_set[p] = true
+    end
+
+    -- Resolve edit_mode.
+    -- For single-file: "diff" requires a non-empty target file; fallback to "full".
+    -- For multi-file: edit_mode="diff" is required (enforced in handler, but guard here too).
     local edit_mode = conf.edit_mode or "full"
-    local existing  = read_target_if_exists(conf.target_file)
-    if edit_mode == "diff" and not existing then
+
+    -- Read all target files upfront (for diff mode initial message and apply base).
+    local existing_map = {}
+    for _, p in ipairs(conf.target_files) do
+        existing_map[p] = read_target_if_exists(p)
+    end
+
+    -- Single-file edit_mode fallback (multi-file must use diff — already asserted in handler).
+    if not multi_file and edit_mode == "diff" and not existing_map[conf.target_files[1]] then
         log.warn("compile_loop: edit_mode=diff requires an existing non-empty target_file; falling back to full")
         edit_mode = "full"
     end
 
-    -- Select system prompt based on edit_mode.
+    -- Select system prompt based on edit_mode and multi_file flag.
     local system
     if edit_mode == "diff" then
-        system = conf.system or DIFF_SYSTEM
+        if multi_file then
+            system = conf.system or DIFF_SYSTEM_MULTI
+        else
+            system = conf.system or DIFF_SYSTEM
+        end
     else
         system = conf.system or DEFAULT_SYSTEM
     end
 
     -- Build the initial user message.
-    -- full mode: embed existing file content (if any) in a code fence.
-    -- diff mode: embed existing file as plain text (child LLM will emit SEARCH/REPLACE blocks).
     local user_content
     if edit_mode == "diff" then
-        -- existing is guaranteed non-nil here (fallback already applied above).
-        user_content = conf.spec
-            .. "\n\n=== Current file content ===\n"
-            .. existing
+        if multi_file then
+            -- Multi-file diff mode: embed each file's content with path labels.
+            local content_parts = { conf.spec, "" }
+            for _, p in ipairs(conf.target_files) do
+                local fc = existing_map[p]
+                if fc then
+                    table.insert(content_parts, "=== Current file content (path=" .. p .. ") ===")
+                    table.insert(content_parts, fc)
+                    table.insert(content_parts, "=== end ===")
+                else
+                    table.insert(content_parts, "=== File (path=" .. p .. ") does not exist yet ===")
+                end
+            end
+            user_content = table.concat(content_parts, "\n")
+        else
+            -- Single-file diff mode: original behaviour.
+            -- existing is guaranteed non-nil here (fallback already applied above).
+            user_content = conf.spec
+                .. "\n\n=== Current file content ===\n"
+                .. (existing_map[conf.target_files[1]] or "")
+        end
     else
         -- full mode: original behaviour.
+        local existing = existing_map[conf.target_files[1]]
         user_content = conf.spec
         if existing then
             user_content = conf.spec
@@ -562,7 +752,8 @@ local function run_loop(conf)
     local history = {}
 
     for iter = 1, max_iters do
-        obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", artifact_path } })
+        local obs_target = artifact_path or table.concat(conf.target_files, ",")
+        obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
         local resp, err = llm_call(conf, messages)
         if not resp then
             local err_str = tostring(err)
@@ -583,7 +774,8 @@ local function run_loop(conf)
         -- ── diff mode ──────────────────────────────────────────────────────────
         if edit_mode == "diff" then
             -- Parse SEARCH/REPLACE blocks from the LLM response.
-            local blocks, parse_err = parse_search_replace(content)
+            -- Pass multi_file flag and allowlist set for path validation.
+            local blocks, parse_err = parse_search_replace(content, multi_file, target_files_set)
             if not blocks then
                 -- Parse failure: tell the child LLM to re-emit valid blocks.
                 local fmt_msg = "Output format invalid: " .. tostring(parse_err)
@@ -617,9 +809,114 @@ local function run_loop(conf)
                 end
                 table.insert(messages, { role = "assistant", content = content })
                 table.insert(messages, { role = "user",      content = fmt_msg })
+
+            elseif multi_file then
+                -- ── multi-file diff apply ────────────────────────────────────────
+                -- Re-read current file states (may have been written in prior iter).
+                local current_map = {}
+                for _, p in ipairs(conf.target_files) do
+                    current_map[p] = read_target_if_exists(p) or existing_map[p] or ""
+                end
+
+                local grouped = group_blocks_by_path(blocks)
+                local _new_contents, all_failed, write_err = iterate_files(conf.target_files, grouped, current_map)
+
+                if write_err then
+                    local werr_str = tostring(write_err)
+                    return {
+                        ok             = false,
+                        failure_reason = "open_target_file",
+                        last_error     = werr_str,
+                        iters          = iter,
+                        summary        = make_summary(false, iter, max_iters, "open_target_file"),
+                        artifact_path  = nil,
+                        history        = history,
+                    }
+                end
+
+                if #all_failed > 0 then
+                    local fail_msg = build_multifile_edit_failure_msg(all_failed, current_map)
+                    local entry = { iter = iter, code = nil, result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 }, raw = content }
+                    table.insert(history, entry)
+                    obs_event(mode, "iter_result", {
+                        { "iter",       iter },
+                        { "ok",         false },
+                        { "exit_code",  -1 },
+                        { "stderr_len", #fail_msg },
+                    })
+                    if conf.on_iter then
+                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                        if not cb_ok then
+                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                        end
+                    end
+                    if is_stagnant(history) then
+                        obs_event(mode, "stagnation", { { "iters", iter } })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = fail_msg:sub(-800),
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = nil,
+                            history        = history,
+                        }
+                    end
+                    table.insert(messages, { role = "assistant", content = content })
+                    table.insert(messages, { role = "user",      content = fail_msg })
+                else
+                    -- All blocks applied and written. Call runner with paths list (Crux #3).
+                    local rr = conf.runner(conf.target_files) or {}
+                    local entry = { iter = iter, code = nil, result = rr, raw = content }
+                    table.insert(history, entry)
+                    obs_event(mode, "iter_result", {
+                        { "iter",       iter },
+                        { "ok",         rr.ok and true or false },
+                        { "exit_code",  rr.exit_code },
+                        { "stderr_len", #(tostring(rr.stderr or "")) },
+                    })
+
+                    if conf.on_iter then
+                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                        if not cb_ok then
+                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+                        end
+                    end
+
+                    if rr.ok then
+                        obs_event(mode, "converged", { { "iters", iter } })
+                        return {
+                            ok             = true,
+                            artifact_path  = nil,
+                            modified_files = conf.target_files,
+                            iters          = iter,
+                            summary        = make_summary(true, iter, max_iters, nil),
+                            history        = history,
+                        }
+                    end
+
+                    if is_stagnant(history) then
+                        local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+                        obs_event(mode, "stagnation", { { "iters", iter } })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = last_stderr,
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = nil,
+                            history        = history,
+                        }
+                    end
+
+                    table.insert(messages, { role = "assistant", content = content })
+                    table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
+                end
+
             else
-                -- Apply blocks to the current file content.
-                local current_content = read_target_if_exists(conf.target_file) or existing
+                -- ── single-file diff apply (original path) ───────────────────────
+                local single_path = conf.target_files[1]
+                local current_content = read_target_if_exists(single_path) or existing_map[single_path]
                 local new_content, failed_indices = apply_blocks(current_content, blocks)
 
                 if #failed_indices > 0 then
@@ -655,7 +952,7 @@ local function run_loop(conf)
                     table.insert(messages, { role = "user",      content = fail_msg })
                 else
                     -- All blocks applied successfully — write new content and run.
-                    local f, werr = io.open(conf.target_file, "w")
+                    local f, werr = io.open(single_path, "w")
                     if not f then
                         local werr_str = tostring(werr)
                         return {
@@ -671,7 +968,8 @@ local function run_loop(conf)
                     f:write(new_content)
                     f:close()
 
-                    local rr = conf.runner(conf.target_file) or {}
+                    -- Single-file runner call with single string path (Crux #3).
+                    local rr = conf.runner(single_path) or {}
                     local entry = { iter = iter, code = new_content, result = rr, raw = content }
                     table.insert(history, entry)
                     obs_event(mode, "iter_result", {
@@ -723,10 +1021,11 @@ local function run_loop(conf)
 
         -- ── full mode (default) ────────────────────────────────────────────────
         else
+            local single_path = conf.target_files[1]
             local code = extract_code(content, lang)
 
             -- Write target file (full-file replace — next_full_file action)
-            local f, werr = io.open(conf.target_file, "w")
+            local f, werr = io.open(single_path, "w")
             if not f then
                 local werr_str = tostring(werr)
                 return {
@@ -742,8 +1041,8 @@ local function run_loop(conf)
             f:write(code)
             f:close()
 
-            -- Run
-            local rr = conf.runner(conf.target_file) or {}
+            -- Single-file runner call with single string path (Crux #3).
+            local rr = conf.runner(single_path) or {}
             local entry = { iter = iter, code = code, result = rr, raw = content }
             table.insert(history, entry)
             obs_event(mode, "iter_result", {
@@ -838,10 +1137,14 @@ function M.make(conf)
         description = [[Run an autonomous compile-and-fix loop: a child LLM emits the
 complete target file on every iteration, the runner executes it, and on
 failure the stderr is fed back until the run passes or the give-up gate
-triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]],
+triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.
+
+Single-file mode: provide target_file (string).
+Multi-file mode: provide target_files (array of absolute paths). Requires edit_mode=diff.
+target_file and target_files are mutually exclusive.]],
         input_schema = {
             type     = "object",
-            required = { "spec", "target_file" },
+            required = { "spec" },
             properties = {
                 spec = {
                     type        = "string",
@@ -849,7 +1152,12 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
                 },
                 target_file = {
                     type        = "string",
-                    description = "Absolute path of the file. Read on entry if it already exists, then written on each iteration.",
+                    description = "Absolute path of the file (single-file mode). Read on entry if it already exists, then written on each iteration. Mutually exclusive with target_files.",
+                },
+                target_files = {
+                    type        = "array",
+                    items       = { type = "string" },
+                    description = "Array of absolute paths (multi-file mode). Mutually exclusive with target_file. Multi-file mode requires edit_mode=diff.",
                 },
                 lang = {
                     type        = "string",
@@ -860,7 +1168,48 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
     }
 
     local function handler(input)
-        -- Resolve LLM fields at call time (Crux #2).
+        -- Crux #2: target_file and target_files are mutually exclusive.
+        assert(
+            not (input.target_file and input.target_files),
+            "target_file and target_files are mutually exclusive"
+        )
+        -- At least one must be provided.
+        assert(
+            input.target_file or input.target_files,
+            "target_file (string) or target_files (array) is required"
+        )
+
+        -- Determine multi_file mode and normalize to internal list.
+        local multi_file
+        local files_list
+
+        if input.target_files then
+            -- Multi-file mode entry.
+            multi_file = true
+            assert(type(input.target_files) == "table", "target_files must be an array")
+            assert(#input.target_files > 0, "target_files must not be empty")
+            for i, v in ipairs(input.target_files) do
+                assert(type(v) == "string", "target_files[" .. i .. "] must be a string")
+            end
+            -- Crux #2: normalize to internal list with abs paths applied element-wise.
+            files_list = {}
+            for _, p in ipairs(input.target_files) do
+                table.insert(files_list, to_abs(p))
+            end
+        else
+            -- Single-file mode entry (target_file string).
+            multi_file = false
+            files_list = { to_abs(input.target_file) }
+        end
+
+        -- Crux #2 / design-selection 5: multi-file mode requires edit_mode=diff.
+        local effective_edit_mode = conf.edit_mode
+        assert(
+            not (multi_file and effective_edit_mode == "full"),
+            "multi-file mode requires edit_mode=diff"
+        )
+
+        -- Resolve LLM fields at call time.
         -- Priority: conf.llm.<field> → _AGENT_LLM_CTX top → nil (env fallback in llm_call)
         local parent_ctx = agent._llm_ctx_top() or {}
         local llm_conf   = conf.llm or {}
@@ -869,15 +1218,16 @@ triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.]]
             -- runner (from factory conf, never from input)
             runner   = conf.runner,
 
-            -- tool input fields
-            lang        = input.lang or conf.lang or "lua",
-            target_file = input.target_file,
-            spec        = input.spec,
+            -- tool input fields (normalized)
+            lang         = input.lang or conf.lang or "lua",
+            target_files = files_list,   -- internal list (1-element for single-file)
+            multi_file   = multi_file,
+            spec         = input.spec,
 
             -- factory conf fields
             max_iters = conf.max_iters,
             system    = conf.system,
-            edit_mode = conf.edit_mode,
+            edit_mode = effective_edit_mode,
             on_iter   = conf.on_iter,
 
             -- LLM fields (K-96 full set, all explicit):
