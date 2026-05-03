@@ -210,6 +210,85 @@ local function is_stagnant(history)
     return true
 end
 
+-- FNV-1a 32-bit hash (inline fallback; no external dependency required).
+-- Returns a decimal string representation of the 32-bit hash value.
+local function fnv1a_hash(s)
+    s = s or ""
+    local hash = 2166136261  -- FNV offset basis (32-bit)
+    for i = 1, #s do
+        local byte = string.byte(s, i)
+        -- XOR with byte then multiply by FNV prime (16777619), truncated to 32-bit.
+        hash = (hash ~ byte) * 16777619
+        -- Keep only lower 32 bits to prevent integer overflow accumulation.
+        hash = hash & 0xFFFFFFFF
+    end
+    return tostring(hash)
+end
+
+-- Compute a stable hash for an SR block text (path header + SEARCH/REPLACE content).
+-- Normalises whitespace before hashing to avoid collisions due to trivial formatting differences.
+local function compute_sr_hash(sr_text)
+    local text = tostring(sr_text or "")
+    -- Normalise: collapse all whitespace runs to single space, strip leading/trailing.
+    text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return fnv1a_hash(text)
+end
+
+-- Stagnation detection for multi-file branch (independent of messages[] reset).
+-- Uses state.sr_history (list of sr_hash strings) rather than history[].result.stderr.
+--
+-- Conditions (all must hold):
+--   (1) #state.sr_history >= STAGNATION_WINDOW (= 3)
+--   (2) Among the last STAGNATION_WINDOW entries, >= 2 share the same sr_hash
+--   (3) The most recent verify outcome is failure (caller passes last_verify_failed = true)
+--
+-- Returns: boolean
+local function is_stagnant_v2(state, last_verify_failed)
+    assert(type(state) == "table", "state required")
+    assert(type(state.sr_history) == "table", "state.sr_history must be initialized as table")
+
+    if #state.sr_history < STAGNATION_WINDOW then return false end
+    if not last_verify_failed then return false end
+
+    -- Collect the last STAGNATION_WINDOW entries.
+    local recent = {}
+    for i = #state.sr_history - STAGNATION_WINDOW + 1, #state.sr_history do
+        recent[#recent + 1] = state.sr_history[i]
+    end
+
+    -- Count occurrences of each hash within the recent window.
+    local counts = {}
+    for _, h in ipairs(recent) do
+        counts[h] = (counts[h] or 0) + 1
+    end
+    for _, c in pairs(counts) do
+        if c >= 2 then return true end
+    end
+    return false
+end
+
+-- Update mf_state fields with optional trim policies (single write point — DRY).
+--   opts.last_err:         trim to <= 2000 chars (tail)
+--   opts.sr_digest_prev:   trim to <= 500 chars (head)
+--   opts.sr_hash_append:   append to sr_history
+--   opts.iter:             set state.iter
+local function update_state(state, opts)
+    if opts.last_err ~= nil then
+        local s = tostring(opts.last_err)
+        state.last_err = s:sub(-2000)
+    end
+    if opts.sr_digest_prev ~= nil then
+        local s = tostring(opts.sr_digest_prev)
+        state.sr_digest_prev = s:sub(1, 500)
+    end
+    if opts.sr_hash_append ~= nil then
+        table.insert(state.sr_history, opts.sr_hash_append)
+    end
+    if opts.iter ~= nil then
+        state.iter = opts.iter
+    end
+end
+
 -- Extract the FIRST fenced code block matching the lang label, falling back to any fence.
 local function extract_code(text, lang)
     lang = lang or "lua"
@@ -1101,7 +1180,30 @@ local function run_loop(conf)
                 end
                 -- For multi-file: update state; messages[] will be rebuilt next iter.
                 if multi_file then
-                    mf_state.last_err = fmt_msg:sub(-2000)
+                    -- Compute sr_hash for parse-error case: hash the raw content (LLM output).
+                    -- Using a tagged prefix to distinguish parse errors from valid SR blocks.
+                    local parse_sr_hash = compute_sr_hash("<parse_err:" .. compute_sr_hash(fmt_msg) .. ">")
+                    update_state(mf_state, {
+                        last_err       = fmt_msg,
+                        sr_hash_append = parse_sr_hash,
+                    })
+                    -- Stagnation check using sr_history (messages[] independent).
+                    if is_stagnant_v2(mf_state, true) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", parse_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = mf_state.last_err or "",
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = nil,
+                            history        = history,
+                        }
+                    end
                     -- messages[] for next iter is rebuilt from state; drop current iter messages.
                 else
                     -- Stagnation check uses history entry result.stderr.
@@ -1157,9 +1259,30 @@ local function run_loop(conf)
                             log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                         end
                     end
-                    -- Update state; stagnation_v2 check is subtask 2.
-                    mf_state.last_err = fail_msg:sub(-2000)
-                    mf_state.sr_digest_prev = content:sub(1, 500)
+                    -- Update state via update_state (DRY trim policy).
+                    local apply_sr_hash = compute_sr_hash(content)
+                    update_state(mf_state, {
+                        last_err       = fail_msg,
+                        sr_digest_prev = content,
+                        sr_hash_append = apply_sr_hash,
+                    })
+                    -- Stagnation check using sr_history (messages[] independent).
+                    if is_stagnant_v2(mf_state, true) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", apply_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = mf_state.last_err or "",
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = nil,
+                            history        = history,
+                        }
+                    end
                     -- messages[] for next iter is rebuilt from state (no accumulation).
                 else
                     -- All blocks applied and written. Call runner with paths list (Crux #3).
@@ -1192,19 +1315,26 @@ local function run_loop(conf)
                         }
                     end
 
-                    -- Runner failed: update state for next iter rebuild.
-                    -- stagnation_v2 (subtask 2) will use sr_history; for now fall through.
+                    -- Runner failed: update state via update_state (DRY trim policy).
                     local rr_stderr = tostring(rr.stderr or "")
-                    mf_state.last_err       = rr_stderr:sub(-2000)
-                    mf_state.sr_digest_prev = content:sub(1, 500)
-                    -- Stagnation check (multi-file, subtask 2): placeholder using history.
-                    if is_stagnant(history) then
-                        local last_stderr = rr_stderr:sub(-800)
-                        obs_event(mode, "stagnation", { { "iters", iter } })
+                    local runner_sr_hash = compute_sr_hash(content)
+                    update_state(mf_state, {
+                        last_err       = rr_stderr,
+                        sr_digest_prev = content,
+                        sr_hash_append = runner_sr_hash,
+                    })
+                    -- Stagnation check (multi-file): use sr_history, independent of messages[].
+                    local runner_failed = (rr.ok == false)
+                    if is_stagnant_v2(mf_state, runner_failed) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", runner_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
                         return {
                             ok             = false,
                             failure_reason = "stagnation",
-                            last_error     = last_stderr,
+                            last_error     = mf_state.last_err or "",
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
