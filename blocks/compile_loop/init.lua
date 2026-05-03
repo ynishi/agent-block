@@ -210,6 +210,85 @@ local function is_stagnant(history)
     return true
 end
 
+-- FNV-1a 32-bit hash (inline fallback; no external dependency required).
+-- Returns a decimal string representation of the 32-bit hash value.
+local function fnv1a_hash(s)
+    s = s or ""
+    local hash = 2166136261  -- FNV offset basis (32-bit)
+    for i = 1, #s do
+        local byte = string.byte(s, i)
+        -- XOR with byte then multiply by FNV prime (16777619), truncated to 32-bit.
+        hash = (hash ~ byte) * 16777619
+        -- Keep only lower 32 bits to prevent integer overflow accumulation.
+        hash = hash & 0xFFFFFFFF
+    end
+    return tostring(hash)
+end
+
+-- Compute a stable hash for an SR block text (path header + SEARCH/REPLACE content).
+-- Normalises whitespace before hashing to avoid collisions due to trivial formatting differences.
+local function compute_sr_hash(sr_text)
+    local text = tostring(sr_text or "")
+    -- Normalise: collapse all whitespace runs to single space, strip leading/trailing.
+    text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return fnv1a_hash(text)
+end
+
+-- Stagnation detection for multi-file branch (independent of messages[] reset).
+-- Uses state.sr_history (list of sr_hash strings) rather than history[].result.stderr.
+--
+-- Conditions (all must hold):
+--   (1) #state.sr_history >= STAGNATION_WINDOW (= 3)
+--   (2) Among the last STAGNATION_WINDOW entries, >= 2 share the same sr_hash
+--   (3) The most recent verify outcome is failure (caller passes last_verify_failed = true)
+--
+-- Returns: boolean
+local function is_stagnant_v2(state, last_verify_failed)
+    assert(type(state) == "table", "state required")
+    assert(type(state.sr_history) == "table", "state.sr_history must be initialized as table")
+
+    if #state.sr_history < STAGNATION_WINDOW then return false end
+    if not last_verify_failed then return false end
+
+    -- Collect the last STAGNATION_WINDOW entries.
+    local recent = {}
+    for i = #state.sr_history - STAGNATION_WINDOW + 1, #state.sr_history do
+        recent[#recent + 1] = state.sr_history[i]
+    end
+
+    -- Count occurrences of each hash within the recent window.
+    local counts = {}
+    for _, h in ipairs(recent) do
+        counts[h] = (counts[h] or 0) + 1
+    end
+    for _, c in pairs(counts) do
+        if c >= 2 then return true end
+    end
+    return false
+end
+
+-- Update mf_state fields with optional trim policies (single write point — DRY).
+--   opts.last_err:         trim to <= 2000 chars (tail)
+--   opts.sr_digest_prev:   trim to <= 500 chars (head)
+--   opts.sr_hash_append:   append to sr_history
+--   opts.iter:             set state.iter
+local function update_state(state, opts)
+    if opts.last_err ~= nil then
+        local s = tostring(opts.last_err)
+        state.last_err = s:sub(-2000)
+    end
+    if opts.sr_digest_prev ~= nil then
+        local s = tostring(opts.sr_digest_prev)
+        state.sr_digest_prev = s:sub(1, 500)
+    end
+    if opts.sr_hash_append ~= nil then
+        table.insert(state.sr_history, opts.sr_hash_append)
+    end
+    if opts.iter ~= nil then
+        state.iter = opts.iter
+    end
+end
+
 -- Extract the FIRST fenced code block matching the lang label, falling back to any fence.
 local function extract_code(text, lang)
     lang = lang or "lua"
@@ -224,13 +303,31 @@ local function extract_code(text, lang)
 end
 
 -- Minimal OpenAI-compatible chat call. Mirrors agent/init.lua llm_call_openai
--- but stripped of tool dispatch / cache_control / context_management since the
--- coding loop never uses tools.
+-- but extended for tool_use (multi-file lazy-load path).
 --
 -- opts fields (K-96 full set):
 --   provider, base_url, api_key, api_key_env, model,
---   max_tokens, temperature, disable_thinking, timeout
+--   max_tokens, temperature, disable_thinking, timeout,
+--   tools (optional: list of tool spec tables for anthropic tool_use)
+--
+-- Return shape:
+--   success (text-only): { choices = { { message = { content = joined_text } } } }
+--   success (tool_use):  { choices = { { message = {
+--                            content        = joined_text,   -- may be ""
+--                            tool_use_blocks = { {id, name, input}, ... },
+--                            stop_reason    = "tool_use"|"end_turn"|"max_tokens",
+--                          } } } }
+--   failure: nil, error_string
+
+-- Module-level override for test monkey-patching (set via M._test_set_llm_call).
+local _llm_call_override = nil
+
 local function llm_call(opts, messages)
+    -- Allow test monkey-patch to intercept all calls.
+    if _llm_call_override then
+        return _llm_call_override(opts, messages)
+    end
+
     local provider = opts.provider or "openai"
     if provider == "anthropic" then
         -- 1. Resolve api_key: opts.api_key → ANTHROPIC_API_KEY env → error
@@ -245,13 +342,17 @@ local function llm_call(opts, messages)
         -- 2. Model
         local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-        -- 3. Extract system role from messages → body.system
+        -- 3. Extract system role from messages → body.system.
+        --    User messages whose content is already a table (tool_result blocks) are
+        --    passed through as-is; only string content needs no transformation.
         local sys_text = nil
         local body_messages = {}
         for _, msg in ipairs(messages) do
             if msg.role == "system" and sys_text == nil then
                 sys_text = msg.content
             else
+                -- Transparent pass-through: content may be a string or a table
+                -- (e.g. [{type="tool_result", tool_use_id=..., content=...}]).
                 table.insert(body_messages, msg)
             end
         end
@@ -264,6 +365,11 @@ local function llm_call(opts, messages)
         }
         if sys_text then
             body.system = sys_text
+        end
+        -- Attach tools list when provided (multi-file lazy-load path).
+        -- Omit entirely when nil to maintain backward compatibility.
+        if opts.tools ~= nil then
+            body.tools = opts.tools
         end
         -- disable_thinking is Qwen-specific; silent no-op for anthropic
 
@@ -294,29 +400,52 @@ local function llm_call(opts, messages)
             return nil, "decode failed: " .. tostring(decoded)
         end
 
-        -- 9. Extract text content blocks
+        -- 9. Walk content blocks: separate text blocks and tool_use blocks.
         if type(decoded.content) ~= "table" or #decoded.content == 0 then
             return nil, "anthropic response missing content blocks"
         end
-        local text_parts = {}
+        local text_parts      = {}
+        local tool_use_blocks = {}
         for _, block in ipairs(decoded.content) do
             if block.type == "text" then
                 table.insert(text_parts, block.text or "")
+            elseif block.type == "tool_use" then
+                -- Collect tool_use blocks for run_loop dispatch.
+                table.insert(tool_use_blocks, {
+                    id    = block.id,
+                    name  = block.name,
+                    input = block.input or {},
+                })
             end
         end
-        local joined = table.concat(text_parts, "\n")
-        if joined == "" then
+        local joined      = table.concat(text_parts, "\n")
+        local stop_reason = decoded.stop_reason  -- "end_turn" | "tool_use" | "max_tokens"
+
+        -- If there are no text blocks AND no tool_use blocks, the response is empty.
+        if joined == "" and #tool_use_blocks == 0 then
             return nil, "anthropic response missing content blocks"
         end
 
-        -- 10. Normalize to OpenAI-compatible shape so run_loop requires zero changes
-        return { choices = { { message = { content = joined } } } }
+        -- 10. Build return shape.
+        --     tool_use_blocks field is always present when tools were requested, to
+        --     allow run_loop to branch on #tool_use_blocks > 0 without checking stop_reason.
+        local msg_shape = { content = joined }
+        if opts.tools ~= nil then
+            msg_shape.tool_use_blocks = tool_use_blocks
+            msg_shape.stop_reason     = stop_reason
+        end
+        return { choices = { { message = msg_shape } } }
 
     elseif provider ~= "openai" then
         return nil, "provider " .. provider .. " not yet supported in compile_loop"
     end
 
-    -- OpenAI-compatible path
+    -- OpenAI-compatible path.
+    -- Stub: if tools are requested (multi-file lazy-load) we cannot handle it yet.
+    if opts.tools ~= nil then
+        return nil, "openai provider does not yet support multi-file lazy-load"
+    end
+
     local api_key = opts.api_key
     if not api_key or api_key == "" then
         api_key = std.env.get(opts.api_key_env or "OPENAI_API_KEY")
@@ -571,6 +700,48 @@ local function filter_for_tool_output(res)
 end
 
 -- ============================================================
+-- Multi-file lazy-load: tool spec + handler
+-- ============================================================
+
+-- Maximum number of read_file tool calls allowed within a single iteration.
+-- Prevents infinite tool-use loops when the child LLM re-requests the same file.
+local MAX_TOOL_CALLS_PER_ITER = 8
+
+-- Tool spec for the child LLM (multi-file branch only).
+-- Passed as opts.tools in llm_call; never exposed to the parent agent layer.
+local READ_FILE_TOOL = {
+    name        = "read_file",
+    description = "Read the current content of a target file. Returns the file content as a string. Use this to fetch file content lazily before emitting SEARCH/REPLACE blocks.",
+    input_schema = {
+        type     = "object",
+        required = { "path" },
+        properties = {
+            path = {
+                type        = "string",
+                description = "Absolute path. Must be one of the target_files paths provided in the spec.",
+            },
+        },
+    },
+}
+
+-- Handle a read_file tool call from the child LLM.
+-- Returns {ok=true, content=string} or {ok=false, error=string}.
+-- Never raises; errors are propagated as tool_result content so the child LLM
+-- can recover (per-iter reset keeps the loop safe).
+local function read_file_tool_handler(path, target_files_set)
+    if not target_files_set[path] then
+        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
+    end
+    local f, err = io.open(path, "r")
+    if not f then
+        return { ok = false, error = "cannot open: " .. tostring(err) }
+    end
+    local content = f:read("*a")
+    f:close()
+    return { ok = true, content = content or "" }
+end
+
+-- ============================================================
 -- Multi-file helper
 -- ============================================================
 
@@ -669,6 +840,12 @@ local function run_loop(conf)
     local multi_file = conf.multi_file or false
     local mode       = resolve_dump_mode()
 
+    -- Guard: openai provider does not support multi-file lazy-load.
+    local provider = conf.provider or "openai"
+    if multi_file and provider == "openai" then
+        error("openai provider does not yet support multi-file lazy-load")
+    end
+
     -- In single-file mode, artifact_path is the single absolute path (backward compat).
     -- In multi-file mode, artifact_path is nil; modified_files carries the list.
     local artifact_path = (not multi_file) and conf.target_files[1] or nil
@@ -684,10 +861,14 @@ local function run_loop(conf)
     -- For multi-file: edit_mode="diff" is required (enforced in handler, but guard here too).
     local edit_mode = conf.edit_mode or "full"
 
-    -- Read all target files upfront (for diff mode initial message and apply base).
+    -- For multi-file lazy-load, do NOT pre-read file contents into initial message.
+    -- existing_map starts empty; it is populated on-demand per-iter before apply.
+    -- For single-file mode, pre-read as before (existing_map used for initial message + apply base).
     local existing_map = {}
-    for _, p in ipairs(conf.target_files) do
-        existing_map[p] = read_target_if_exists(p)
+    if not multi_file then
+        for _, p in ipairs(conf.target_files) do
+            existing_map[p] = read_target_if_exists(p)
+        end
     end
 
     -- Single-file edit_mode fallback (multi-file must use diff — already asserted in handler).
@@ -708,53 +889,105 @@ local function run_loop(conf)
         system = conf.system or DEFAULT_SYSTEM
     end
 
-    -- Build the initial user message.
-    local user_content
-    if edit_mode == "diff" then
-        if multi_file then
-            -- Multi-file diff mode: embed each file's content with path labels.
-            local content_parts = { conf.spec, "" }
-            for _, p in ipairs(conf.target_files) do
-                local fc = existing_map[p]
-                if fc then
-                    table.insert(content_parts, "=== Current file content (path=" .. p .. ") ===")
-                    table.insert(content_parts, fc)
-                    table.insert(content_parts, "=== end ===")
-                else
-                    table.insert(content_parts, "=== File (path=" .. p .. ") does not exist yet ===")
-                end
-            end
-            user_content = table.concat(content_parts, "\n")
-        else
-            -- Single-file diff mode: original behaviour.
+    -- ── Multi-file: build lazy-load initial user_content (path list only) ──────
+    -- File content is NOT embedded. The child LLM fetches files via read_file tool.
+    local multi_initial_user_content
+    if multi_file then
+        local path_lines = {}
+        for _, p in ipairs(conf.target_files) do
+            table.insert(path_lines, "  " .. p)
+        end
+        multi_initial_user_content = conf.spec
+            .. "\n\nFiles:\n"
+            .. table.concat(path_lines, "\n")
+            .. "\n\nUse the read_file tool to fetch file content when needed."
+    end
+
+    -- ── Single-file: build initial user_content (original behaviour) ───────────
+    local single_initial_user_content
+    if not multi_file then
+        if edit_mode == "diff" then
+            -- Single-file diff mode: embed current content.
             -- existing is guaranteed non-nil here (fallback already applied above).
-            user_content = conf.spec
+            single_initial_user_content = conf.spec
                 .. "\n\n=== Current file content ===\n"
                 .. (existing_map[conf.target_files[1]] or "")
-        end
-    else
-        -- full mode: original behaviour.
-        local existing = existing_map[conf.target_files[1]]
-        user_content = conf.spec
-        if existing then
-            user_content = conf.spec
-                .. "\n\n=== Current file content ===\n```" .. lang .. "\n"
-                .. existing
-                .. "\n```"
+        else
+            -- full mode: embed content if present.
+            local existing = existing_map[conf.target_files[1]]
+            if existing then
+                single_initial_user_content = conf.spec
+                    .. "\n\n=== Current file content ===\n```" .. lang .. "\n"
+                    .. existing
+                    .. "\n```"
+            else
+                single_initial_user_content = conf.spec
+            end
         end
     end
 
-    local messages = {
-        { role = "system", content = system },
-        { role = "user",   content = user_content },
+    -- ── Per-iter state for multi-file lazy-load ─────────────────────────────────
+    -- messages[] is rebuilt each iter from state; not accumulated across iters.
+    -- sr_history is reserved for subtask 2 (stagnation_v2); initialized empty here.
+    local mf_state = {
+        iter           = 0,
+        last_err       = nil,   -- most recent verify failure stderr (≤2,000 chars)
+        sr_digest_prev = nil,   -- digest of last SR block (≤500 chars)
+        sr_history     = {},    -- populated in subtask 2
     }
+    assert(type(mf_state.sr_history) == "table", "mf_state.sr_history must be initialized")
+
+    -- For single-file mode, messages accumulate across iters (original behaviour).
+    local messages
+    if not multi_file then
+        messages = {
+            { role = "system", content = system },
+            { role = "user",   content = single_initial_user_content },
+        }
+    end
 
     local history = {}
 
     for iter = 1, max_iters do
         local obs_target = artifact_path or table.concat(conf.target_files, ",")
         obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
-        local resp, err = llm_call(conf, messages)
+
+        -- ── Multi-file: per-iter messages rebuild ───────────────────────────────
+        -- messages[] is constructed fresh each iter from system + per-iter user content.
+        -- tool_use/tool_result pairs are appended within the iter and dropped at iter end.
+        if multi_file then
+            mf_state.iter = iter
+            -- Build per-iter user content: base + optional last_err + optional sr_digest_prev.
+            local user_parts = { multi_initial_user_content }
+            if mf_state.last_err and mf_state.last_err ~= "" then
+                table.insert(user_parts, "\n=== Last verify error (trimmed) ===\n" .. mf_state.last_err)
+            end
+            if mf_state.sr_digest_prev and mf_state.sr_digest_prev ~= "" then
+                table.insert(user_parts, "\n=== Previous SR digest ===\n" .. mf_state.sr_digest_prev)
+            end
+            local iter_user_content = table.concat(user_parts, "")
+            messages = {
+                { role = "system", content = system },
+                { role = "user",   content = iter_user_content },
+            }
+            obs_event(mode, "iter_messages_size", {
+                { "iter",         iter },
+                { "messages_len", #messages },
+                { "user_len",     #iter_user_content },
+            })
+        end
+
+        -- ── LLM call 1 (multi-file: may return tool_use; single-file: returns SR/code) ──
+        local call_opts = conf
+        if multi_file then
+            -- Attach tool spec so the child LLM can call read_file.
+            -- We build a shallow copy of conf with tools added to avoid mutating conf.
+            call_opts = {}
+            for k, v in pairs(conf) do call_opts[k] = v end
+            call_opts.tools = { READ_FILE_TOOL }
+        end
+
+        local resp, err = llm_call(call_opts, messages)
         if not resp then
             local err_str = tostring(err)
             return {
@@ -768,12 +1001,163 @@ local function run_loop(conf)
             }
         end
 
+        -- ── Multi-file: tool_use dispatch loop ──────────────────────────────────
+        -- The child LLM may issue read_file calls before emitting SR blocks.
+        -- We resolve up to MAX_TOOL_CALLS_PER_ITER calls within this iter,
+        -- then do a final LLM call to obtain SR blocks (or accept the SR directly
+        -- if no tool_use was requested).
+        --
+        -- existing_map also serves as a cache (R2 fallback): if the LLM requests the
+        -- same path twice, return the cached content instead of re-reading.
+        -- The cache is scoped to this iter (existing_map reset per-iter below).
+        if multi_file then
+            -- Reset per-iter read cache before tool dispatch.
+            existing_map = {}
+
+            local tool_call_count = 0
+            local cur_resp        = resp
+
+            while true do
+                local cur_choice        = (cur_resp.choices or {})[1] or {}
+                local cur_msg           = cur_choice.message or {}
+                local cur_tool_blocks   = cur_msg.tool_use_blocks or {}
+
+                if #cur_tool_blocks == 0 then
+                    -- No tool_use requested; fall through to SR parse below.
+                    resp = cur_resp
+                    break
+                end
+
+                -- Hard cap: give up if too many tool calls in one iter.
+                if tool_call_count + #cur_tool_blocks > MAX_TOOL_CALLS_PER_ITER then
+                    obs_event(mode, "tool_loop_giveup", { { "iter", iter }, { "count", tool_call_count } })
+                    local giveup_err = "exceeded MAX_TOOL_CALLS_PER_ITER=" .. MAX_TOOL_CALLS_PER_ITER .. " within a single iter"
+                    return {
+                        ok             = false,
+                        failure_reason = "tool_loop",
+                        last_error     = giveup_err,
+                        iters          = iter,
+                        summary        = make_summary(false, iter, max_iters, "tool_loop"),
+                        artifact_path  = nil,
+                        history        = history,
+                    }
+                end
+
+                -- Build assistant message carrying the tool_use blocks.
+                -- content field: text portion (may be empty string).
+                local assistant_content = {}
+                -- Include text blocks if present.
+                if cur_msg.content and cur_msg.content ~= "" then
+                    table.insert(assistant_content, { type = "text", text = cur_msg.content })
+                end
+                -- Include tool_use blocks (raw form: id, name, input).
+                for _, tb in ipairs(cur_tool_blocks) do
+                    table.insert(assistant_content, {
+                        type  = "tool_use",
+                        id    = tb.id,
+                        name  = tb.name,
+                        input = tb.input,
+                    })
+                end
+                table.insert(messages, { role = "assistant", content = assistant_content })
+
+                -- Dispatch each tool_use block and collect tool_result blocks.
+                local tool_result_content = {}
+                for _, tb in ipairs(cur_tool_blocks) do
+                    tool_call_count = tool_call_count + 1
+                    if tb.name == "read_file" then
+                        local path = (tb.input or {}).path or ""
+                        -- Use cached result if available (R2 fallback: dedup repeated reads).
+                        local cached = existing_map[path]
+                        local dispatch_result
+                        if cached ~= nil then
+                            dispatch_result = { ok = true, content = cached }
+                            obs_event(mode, "tool_use", {
+                                { "iter",   iter },
+                                { "path",   path },
+                                { "ok",     true },
+                                { "cached", true },
+                            })
+                        else
+                            dispatch_result = read_file_tool_handler(path, target_files_set)
+                            if dispatch_result.ok then
+                                -- Cache the result for this iter.
+                                existing_map[path] = dispatch_result.content
+                                obs_event(mode, "tool_use", {
+                                    { "iter", iter },
+                                    { "path", path },
+                                    { "ok",   true },
+                                })
+                            else
+                                obs_event(mode, "tool_use_fail", {
+                                    { "iter", iter },
+                                    { "path", path },
+                                    { "err",  dispatch_result.error },
+                                })
+                            end
+                        end
+
+                        -- Build tool_result block (error string propagated to child LLM).
+                        local result_text
+                        if dispatch_result.ok then
+                            result_text = dispatch_result.content
+                        else
+                            result_text = "ERROR: " .. tostring(dispatch_result.error)
+                        end
+                        table.insert(tool_result_content, {
+                            type        = "tool_result",
+                            tool_use_id = tb.id,
+                            content     = result_text,
+                        })
+                    else
+                        -- Unknown tool name; return error to child LLM.
+                        obs_event(mode, "tool_use_fail", {
+                            { "iter", iter },
+                            { "path", tostring((tb.input or {}).path or "") },
+                            { "err",  "unknown tool: " .. tostring(tb.name) },
+                        })
+                        table.insert(tool_result_content, {
+                            type        = "tool_result",
+                            tool_use_id = tb.id,
+                            content     = "ERROR: unknown tool '" .. tostring(tb.name) .. "'",
+                        })
+                    end
+                end
+
+                -- Append user message containing all tool_result blocks.
+                table.insert(messages, { role = "user", content = tool_result_content })
+
+                -- Second LLM call: provide tool results so the child LLM can emit SR blocks.
+                local resp2, err2 = llm_call(call_opts, messages)
+                if not resp2 then
+                    local err_str = tostring(err2)
+                    return {
+                        ok             = false,
+                        failure_reason = "llm_call",
+                        last_error     = err_str:sub(-800),
+                        iters          = iter,
+                        summary        = make_summary(false, iter, max_iters, "llm_call"),
+                        artifact_path  = nil,
+                        history        = history,
+                    }
+                end
+                cur_resp = resp2
+                -- Loop: if the child LLM issues more tool_use calls, repeat.
+            end
+            -- resp now holds the final response (no more tool_use blocks).
+        end
+        -- ── end of multi-file tool dispatch loop ────────────────────────────────
+
         local choice  = (resp.choices or {})[1] or {}
-        local content = (choice.message or {}).content or ""
+        local msg_obj = choice.message or {}
+
+        -- Extract text-only content for SR parse (tool_use blocks must NOT be passed
+        -- to parse_search_replace — only text content is valid SR source).
+        local content = msg_obj.content or ""
 
         -- ── diff mode ──────────────────────────────────────────────────────────
         if edit_mode == "diff" then
-            -- Parse SEARCH/REPLACE blocks from the LLM response.
+            -- Parse SEARCH/REPLACE blocks from the LLM text response.
             -- Pass multi_file flag and allowlist set for path validation.
             local blocks, parse_err = parse_search_replace(content, multi_file, target_files_set)
             if not blocks then
@@ -794,32 +1178,57 @@ local function run_loop(conf)
                         log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                     end
                 end
-                -- Stagnation check uses history entry result.stderr.
-                if is_stagnant(history) then
-                    obs_event(mode, "stagnation", { { "iters", iter } })
-                    return {
-                        ok             = false,
-                        failure_reason = "stagnation",
-                        last_error     = fmt_msg:sub(-800),
-                        iters          = iter,
-                        summary        = make_summary(false, iter, max_iters, "stagnation"),
-                        artifact_path  = artifact_path,
-                        history        = history,
-                    }
+                -- For multi-file: update state; messages[] will be rebuilt next iter.
+                if multi_file then
+                    -- Compute sr_hash for parse-error case: hash the raw content (LLM output).
+                    -- Using a tagged prefix to distinguish parse errors from valid SR blocks.
+                    local parse_sr_hash = compute_sr_hash("<parse_err:" .. compute_sr_hash(fmt_msg) .. ">")
+                    update_state(mf_state, {
+                        last_err       = fmt_msg,
+                        sr_hash_append = parse_sr_hash,
+                    })
+                    -- Stagnation check using sr_history (messages[] independent).
+                    if is_stagnant_v2(mf_state, true) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", parse_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = mf_state.last_err or "",
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = nil,
+                            history        = history,
+                        }
+                    end
+                    -- messages[] for next iter is rebuilt from state; drop current iter messages.
+                else
+                    -- Stagnation check uses history entry result.stderr.
+                    if is_stagnant(history) then
+                        obs_event(mode, "stagnation", { { "iters", iter } })
+                        return {
+                            ok             = false,
+                            failure_reason = "stagnation",
+                            last_error     = fmt_msg:sub(-800),
+                            iters          = iter,
+                            summary        = make_summary(false, iter, max_iters, "stagnation"),
+                            artifact_path  = artifact_path,
+                            history        = history,
+                        }
+                    end
+                    table.insert(messages, { role = "assistant", content = content })
+                    table.insert(messages, { role = "user",      content = fmt_msg })
                 end
-                table.insert(messages, { role = "assistant", content = content })
-                table.insert(messages, { role = "user",      content = fmt_msg })
 
             elseif multi_file then
-                -- ── multi-file diff apply ────────────────────────────────────────
-                -- Re-read current file states (may have been written in prior iter).
-                local current_map = {}
-                for _, p in ipairs(conf.target_files) do
-                    current_map[p] = read_target_if_exists(p) or existing_map[p] or ""
-                end
-
+                -- ── multi-file diff apply (per-iter rebuild path) ────────────────
+                -- existing_map was populated by the tool dispatch loop above.
+                -- Apply blocks using the on-demand-populated existing_map.
                 local grouped = group_blocks_by_path(blocks)
-                local _new_contents, all_failed, write_err = iterate_files(conf.target_files, grouped, current_map)
+                local _new_contents, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
 
                 if write_err then
                     local werr_str = tostring(write_err)
@@ -835,7 +1244,7 @@ local function run_loop(conf)
                 end
 
                 if #all_failed > 0 then
-                    local fail_msg = build_multifile_edit_failure_msg(all_failed, current_map)
+                    local fail_msg = build_multifile_edit_failure_msg(all_failed, existing_map)
                     local entry = { iter = iter, code = nil, result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 }, raw = content }
                     table.insert(history, entry)
                     obs_event(mode, "iter_result", {
@@ -850,20 +1259,31 @@ local function run_loop(conf)
                             log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                         end
                     end
-                    if is_stagnant(history) then
-                        obs_event(mode, "stagnation", { { "iters", iter } })
+                    -- Update state via update_state (DRY trim policy).
+                    local apply_sr_hash = compute_sr_hash(content)
+                    update_state(mf_state, {
+                        last_err       = fail_msg,
+                        sr_digest_prev = content,
+                        sr_hash_append = apply_sr_hash,
+                    })
+                    -- Stagnation check using sr_history (messages[] independent).
+                    if is_stagnant_v2(mf_state, true) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", apply_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
                         return {
                             ok             = false,
                             failure_reason = "stagnation",
-                            last_error     = fail_msg:sub(-800),
+                            last_error     = mf_state.last_err or "",
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
                             history        = history,
                         }
                     end
-                    table.insert(messages, { role = "assistant", content = content })
-                    table.insert(messages, { role = "user",      content = fail_msg })
+                    -- messages[] for next iter is rebuilt from state (no accumulation).
                 else
                     -- All blocks applied and written. Call runner with paths list (Crux #3).
                     local rr = conf.runner(conf.target_files) or {}
@@ -895,22 +1315,33 @@ local function run_loop(conf)
                         }
                     end
 
-                    if is_stagnant(history) then
-                        local last_stderr = tostring((rr.stderr) or ""):sub(-800)
-                        obs_event(mode, "stagnation", { { "iters", iter } })
+                    -- Runner failed: update state via update_state (DRY trim policy).
+                    local rr_stderr = tostring(rr.stderr or "")
+                    local runner_sr_hash = compute_sr_hash(content)
+                    update_state(mf_state, {
+                        last_err       = rr_stderr,
+                        sr_digest_prev = content,
+                        sr_hash_append = runner_sr_hash,
+                    })
+                    -- Stagnation check (multi-file): use sr_history, independent of messages[].
+                    local runner_failed = (rr.ok == false)
+                    if is_stagnant_v2(mf_state, runner_failed) then
+                        obs_event(mode, "stagnation_v2", {
+                            { "iter",           iter },
+                            { "sr_hash_recent", runner_sr_hash:sub(1, 8) },
+                            { "reason",         "sr_history_repeat" },
+                        })
                         return {
                             ok             = false,
                             failure_reason = "stagnation",
-                            last_error     = last_stderr,
+                            last_error     = mf_state.last_err or "",
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
                             history        = history,
                         }
                     end
-
-                    table.insert(messages, { role = "assistant", content = content })
-                    table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
+                    -- messages[] for next iter is rebuilt from mf_state (no accumulation).
                 end
 
             else
@@ -1253,6 +1684,23 @@ target_file and target_files are mutually exclusive.]],
 
     tool.register(name, schema, handler)
     return { name = name, schema = schema, handler = handler }
+end
+
+-- ============================================================
+-- Test helpers (internal; _ prefix signals non-public)
+-- ============================================================
+
+--- Override the internal llm_call function for test monkey-patching.
+--- Call M._test_reset_llm_call() after the test to restore production behaviour.
+--- Production callers must never call this.
+function M._test_set_llm_call(fn)
+    assert(type(fn) == "function", "_test_set_llm_call requires a function")
+    _llm_call_override = fn
+end
+
+--- Reset the llm_call override installed by M._test_set_llm_call().
+function M._test_reset_llm_call()
+    _llm_call_override = nil
 end
 
 return M
