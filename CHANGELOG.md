@@ -97,6 +97,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nil` in multi-file mode. New e2e test
   `compile_loop_diff_multi_anthropic_mock_iterates_until_pass` in
   `tests/e2e_compile_loop.rs` validates a 2-file simultaneous edit scenario.
+- `blocks/compile_loop` — OpenAI path now fully supports multi-file lazy-load
+  (`read_file` tool dispatch loop, sliding window K=3, stderr trim). Previously the
+  `llm_call` OpenAI branch returned early before processing `tool_calls`, making multi-file
+  lazy-load a no-op on that path. Now the branch: (a) converts messages to OpenAI wire
+  format (`tool_calls` / `role:"tool"` + `tool_call_id`), (b) normalises the response into
+  the internal `tool_use_blocks` shape so the existing provider-agnostic `run_loop` dispatch
+  loop and K=3 sliding window run unchanged, (c) strips `stderr` from `read_file` responses.
+  The `run_loop` guard that skipped tool dispatch on the OpenAI path is removed.
+  Helper functions (`compile_loop_convert_messages_to_openai`,
+  `compile_loop_normalize_openai_response`, `compile_loop_map_finish_reason`) are file-local
+  duplicates of the corresponding helpers in `blocks/agent/init.lua`; no shared module is
+  extracted (design decision: isolation over abstraction).
+- `examples/test_openai_compile_loop_multi_lazy_load.lua` — new e2e mock that exercises the
+  OpenAI path for multi-file lazy-load: mock LLM requests `read_file` for two files across
+  two turns, then produces a SEARCH/REPLACE patch that causes the runner to pass. Mirrors
+  the structure of `examples/test_anthropic_compile_loop_multi_lazy_load.lua`.
 
 ### Changed
 
