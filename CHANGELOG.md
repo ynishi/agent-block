@@ -88,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New e2e test `compile_loop_anthropic_mock_emits_obs_events` in `tests/e2e_compile_loop.rs`
   validates the PASS-path events (`iter_start`, `iter_result`, `converged`) with
   `predicate::str::contains`.
+- `blocks/compile_loop` — Add multi-file mode to compile_loop block (`target_files` list,
+  path-aware SEARCH/REPLACE parser with `<<< path=... >>>` headers, mode-toggle runner
+  signature: single-file `runner(path: string)` / multi-file `runner(paths: list<string>)`).
+  `target_file` (string) and `target_files` (list) are mutually exclusive; both forms
+  normalise to an internal list. Multi-file mode requires `edit_mode = "diff"`. Return
+  shape gains `modified_files: list<string>` for multi-file callers; `artifact_path` is
+  `nil` in multi-file mode. New e2e test
+  `compile_loop_diff_multi_anthropic_mock_iterates_until_pass` in
+  `tests/e2e_compile_loop.rs` validates a 2-file simultaneous edit scenario.
 
 ### Changed
 
