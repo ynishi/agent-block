@@ -1,6 +1,7 @@
 pub mod compile_loop_anthropic_mock;
 pub mod compile_loop_diff_anthropic_mock;
 pub mod compile_loop_diff_multi_anthropic_mock;
+pub mod compile_loop_distill_mock;
 pub mod compile_loop_openai_mock;
 pub mod openai_mock;
 

@@ -1133,12 +1133,14 @@ end
 -- Never passes tools → raw text response (no tool_use schema in distill path).
 -- Returns digest_string on success, nil on any failure (caller handles fallback).
 local function call_distill_llm(path, chunk, mf_state, conf)
-    -- Build distill conf — inherit provider/model/base_url from outer conf.
+    -- Build distill conf — inherit provider/model/base_url/api_key from outer conf.
     -- No 'tools' key → llm_call treats tools as nil → raw text response.
     local distill_conf = {
-        provider = conf.provider,
-        model    = conf.model,
-        base_url = conf.base_url,
+        provider    = conf.provider,
+        model       = conf.model,
+        base_url    = conf.base_url,
+        api_key     = conf.api_key,
+        api_key_env = conf.api_key_env,
     }
 
     -- Resolve target_func with type guard (subtask-3.md Constraint / Risk).
@@ -1521,12 +1523,13 @@ local function iterate_files(target_files, grouped, existing_map)
     for _, abs_path in ipairs(target_files) do
         local file_blocks = grouped[abs_path]
         if file_blocks and #file_blocks > 0 then
-            -- Use cached content from tool dispatch loop; fall back to reading the file
-            -- directly when the LLM emitted SR blocks without calling read_file first.
-            local current = existing_map[abs_path]
-            if current == nil then
-                current = read_target_if_exists(abs_path) or ""
-            end
+            -- Always read raw file content from disk for SR application.
+            -- existing_map may contain a distilled digest (not raw content) when the
+            -- file exceeded READ_FILE_FULL_THRESHOLD; applying SR against a digest
+            -- would cause block matching to fail. Raw content is the correct base.
+            -- When the file has not been written yet (LLM emitting SR before read_file),
+            -- read_target_if_exists returns nil and we default to "".
+            local current = read_target_if_exists(abs_path) or ""
             local new_content, failed_indices = apply_blocks(current, file_blocks)
             if #failed_indices > 0 then
                 table.insert(all_failed, { path = abs_path, indices = failed_indices, blocks = file_blocks, current_content = current })
