@@ -1038,25 +1038,333 @@ local function truncate_with_warning(content, err)
     return head .. warn
 end
 
--- Distill subloop — ST2 STUB.
--- In ST3 this will chunk the content, call the distill LLM, and build a real digest.
--- For ST2 the stub returns a fixed digest so cache lifecycle tests can run without
--- a real LLM provider. Prefix "STUB DIGEST: " allows ST3 to detect residual stubs
--- via `rg "STUB DIGEST"`.
+-- ── ST3: distill subloop helpers ────────────────────────────────────────────
+
+-- Prompt template for the distill LLM call.
+-- Placeholder order (8 args, AC#8): path, chunk_start, chunk_end, total_lines,
+--   last_err, target_func, chunk_text, DISTILL_CHUNK_DIGEST_MAX_CHARS
+local DISTILL_CHUNK_PROMPT =
+    "You are summarizing a chunk of a source code file for a coding assistant.\n" ..
+    "Your summary will be used as a digest that lets the assistant understand the code\n" ..
+    "without seeing the full file.\n\n" ..
+    "File: %s\n" ..
+    "Chunk: lines %d-%d (of %d total)\n" ..
+    "Recent build error (if any): %s\n" ..
+    "Target function (if any): %s\n\n" ..
+    "Code chunk:\n" ..
+    "```\n%s\n```\n\n" ..
+    "Instructions:\n" ..
+    "- Write a concise technical summary of what this chunk defines and does.\n" ..
+    "- Emphasize any definitions, exports, or logic relevant to the build error or target function.\n" ..
+    "- Include key function/class/variable names so the assistant can ask for specific lines.\n" ..
+    "- Keep the summary under %d characters.\n" ..
+    "- Output ONLY the summary text, no preamble."
+
+-- Split a string into a list of lines (no trailing newline in each entry).
+-- Returns a table of strings, 1-indexed.
+local function split_lines(content)
+    local lines = {}
+    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(lines, line)
+    end
+    return lines
+end
+
+-- Split lines into chunks of at most chunk_size lines.
+-- Applies boundary adjustment: after computing the natural chunk end, scans up to
+-- +20 lines ahead for a line matching a function-definition prefix
+-- (^function / ^local function / ^def / ^fn ).  If found at index i, the chunk
+-- is extended to i-1 (just before the definition) to avoid mid-function splits.
 --
--- Signature mirrors the ST3 real implementation:
---   path, content, mf_state, conf → digest, line_index, err_string
--- Returns: (digest_string, line_index_string, err_string|nil)
+-- Returns: { {start=N, end_=M, total_lines=T, text="..."}, ... }
+--   - start / end_ are 1-indexed, inclusive
+--   - total_lines is #lines (same for every chunk; used as prompt context)
+local function chunk_by_lines(lines, chunk_size)
+    local chunks = {}
+    local total  = #lines
+    local i      = 1
+    while i <= total do
+        local natural_end = math.min(i + chunk_size - 1, total)
+        local adjusted_end = natural_end
+        -- Boundary adjustment: scan up to +20 lines ahead for a function start.
+        if natural_end < total then
+            local scan_limit = math.min(natural_end + 20, total)
+            for j = natural_end + 1, scan_limit do
+                local line = lines[j]
+                if line:match("^function ") or line:match("^local function ")
+                    or line:match("^def ") or line:match("^fn ") then
+                    -- Extend chunk to end just before this definition line.
+                    adjusted_end = j - 1
+                    break
+                end
+            end
+        end
+        -- Build chunk text.
+        local chunk_lines = {}
+        for k = i, adjusted_end do
+            table.insert(chunk_lines, lines[k])
+        end
+        table.insert(chunks, {
+            start       = i,
+            end_        = adjusted_end,
+            total_lines = total,
+            text        = table.concat(chunk_lines, "\n"),
+        })
+        i = adjusted_end + 1
+    end
+    return chunks
+end
+
+-- Extract the text content from an llm_call response.
+-- Handles both Anthropic and OpenAI-compatible paths (both return
+-- resp.choices[1].message.content for tools=nil calls).
+-- Returns the content string or nil on any access failure.
+local function extract_text(resp)
+    if not resp then return nil end
+    local choices = resp.choices
+    if not choices or not choices[1] then return nil end
+    local msg = choices[1].message
+    if not msg then return nil end
+    return msg.content  -- string for both providers when tools=nil
+end
+
+-- Call the distill LLM for a single chunk.
+-- Uses conf.provider (provider-agnostic — crux-card §2 must_not_simplify).
+-- Never passes tools → raw text response (no tool_use schema in distill path).
+-- Returns digest_string on success, nil on any failure (caller handles fallback).
+local function call_distill_llm(path, chunk, mf_state, conf)
+    -- Build distill conf — inherit provider/model/base_url from outer conf.
+    -- No 'tools' key → llm_call treats tools as nil → raw text response.
+    local distill_conf = {
+        provider = conf.provider,
+        model    = conf.model,
+        base_url = conf.base_url,
+    }
+
+    -- Resolve target_func with type guard (subtask-3.md Constraint / Risk).
+    local target_func_str = "(none)"
+    if conf.target_func and type(conf.target_func) == "string" then
+        target_func_str = conf.target_func
+    end
+
+    local prompt = string.format(
+        DISTILL_CHUNK_PROMPT,
+        path,
+        chunk.start,
+        chunk.end_,
+        chunk.total_lines,
+        mf_state.last_err or "(none)",
+        target_func_str,
+        chunk.text,
+        DISTILL_CHUNK_DIGEST_MAX_CHARS
+    )
+
+    local messages = {
+        { role = "user", content = prompt },
+    }
+
+    local resp, call_err = llm_call(distill_conf, messages)  -- luacheck: ignore call_err
+    if not resp then
+        return nil
+    end
+
+    local text = extract_text(resp)
+    return text  -- may be nil if response shape is unexpected
+end
+
+-- Pack chunk digests into a single string that fits within max_chars.
+-- chunk_digests: list of { start=N, end_=M, digest=string }  (already priority-sorted)
+-- max_chars:     upper bound (DISTILL_DIGEST_MAX_CHARS)
+-- tolerance:     allowed undershoot fraction (Aider repomap.py:568-591, default 0.15)
+--
+-- Algorithm:
+--   1. If total length ≤ max_chars → include all (no binary search needed).
+--   2. Otherwise binary-search for the largest K such that
+--      sum(digests[1..K]) ≤ max_chars.
+--      (tolerance is used to check whether we are in the acceptable window
+--       max_chars*(1-tolerance) ≤ sum ≤ max_chars; if the best K already
+--       satisfies this we stop early.)
+--   3. Restore original order (sort by .start) before concatenating.
+-- Returns: concatenated digest string (may be "" if every individual chunk
+--          exceeds max_chars — caller's truncate_with_warning handles this).
+local function binary_search_pack(chunk_digests, max_chars, tolerance)
+    tolerance = tolerance or 0.15
+    if #chunk_digests == 0 then return "" end
+
+    -- Compute cumulative lengths.
+    local total_len = 0
+    for _, cd in ipairs(chunk_digests) do
+        total_len = total_len + #(cd.digest or "")
+    end
+
+    local selected
+    if total_len <= max_chars then
+        -- All fit — take everything.
+        selected = {}
+        for _, cd in ipairs(chunk_digests) do
+            table.insert(selected, cd)
+        end
+    else
+        -- Binary search for largest K that fits.
+        local lo, hi = 0, #chunk_digests
+        local best_k = 0
+        local lower_bound = max_chars * (1 - tolerance)
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local sum = 0
+            for k = 1, mid do
+                sum = sum + #(chunk_digests[k].digest or "")
+            end
+            if sum <= max_chars then
+                best_k = mid
+                if sum >= lower_bound then
+                    -- Within acceptable window — stop early (Aider tolerance logic).
+                    break
+                end
+                lo = mid + 1
+            else
+                hi = mid - 1
+            end
+        end
+        -- Collect top-K.
+        selected = {}
+        for k = 1, best_k do
+            table.insert(selected, chunk_digests[k])
+        end
+    end
+
+    -- Restore original order (sort by .start ascending).
+    table.sort(selected, function(a, b) return a.start < b.start end)
+
+    -- Concatenate digests.
+    local parts = {}
+    for _, cd in ipairs(selected) do
+        table.insert(parts, cd.digest or "")
+    end
+    return table.concat(parts, "\n")
+end
+
+-- Build a line-index string from a list of chunk digest entries.
+-- Each entry: { start=N, end_=M, digest=string }
+-- Format: "L1-50: <first non-empty line of digest, max 80 chars>\n..."
+local function build_line_index(chunk_digests)
+    local lines = {}
+    for _, cd in ipairs(chunk_digests) do
+        -- First non-empty line of the digest.
+        local first_line = ""
+        for line in (tostring(cd.digest or "") .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then
+                first_line = line
+                break
+            end
+        end
+        if #first_line > 80 then
+            first_line = first_line:sub(1, 80)
+        end
+        table.insert(lines, "L" .. cd.start .. "-" .. cd.end_ .. ": " .. first_line)
+    end
+    return table.concat(lines, "\n")
+end
+
+-- Distill subloop — real implementation (ST3).
+-- Replaces the ST2 stub.
+--
+-- Signature: path, content, mf_state, conf → digest, line_index, err_string
 --   err_string non-nil means failure; caller should invoke truncate_with_warning.
+--
+-- Steps:
+--   1. Split content into chunks (chunk_by_lines).
+--   2. For each chunk, call call_distill_llm → collect {start, end_, digest}.
+--      Chunk with no digest (LLM failure) is skipped; if ALL fail → err_string.
+--   3. Priority-sort chunk_digests for binary_search_pack:
+--      (1) chunks whose range overlaps last_err line (if any)
+--      (2) chunks containing conf.target_func string (if non-nil string)
+--      (3) original order
+--   4. binary_search_pack → digest string.
+--   5. build_line_index → line_index string.
 --
 -- Module-level override for test injection (M._test_set_distill_subloop).
 local _distill_subloop_override = nil
 
-local function distill_subloop(path, content, mf_state, conf)  -- luacheck: ignore mf_state conf
+local function distill_subloop(path, content, mf_state, conf)
     if _distill_subloop_override then
         return _distill_subloop_override(path, content, mf_state, conf)
     end
-    return "STUB DIGEST: " .. content:sub(1, 200), "L1-?: stub", nil
+
+    -- 1. Split and chunk.
+    local lines  = split_lines(content)
+    local chunks = chunk_by_lines(lines, DISTILL_CHUNK_LINES)
+
+    -- 2. Distill each chunk via LLM.
+    local chunk_digests = {}
+    for _, chunk in ipairs(chunks) do
+        local digest = call_distill_llm(path, chunk, mf_state, conf)
+        if digest then
+            table.insert(chunk_digests, {
+                start  = chunk.start,
+                end_   = chunk.end_,
+                digest = digest,
+            })
+        end
+        -- Chunks with nil digest are silently skipped; if all fail we handle below.
+    end
+
+    if #chunk_digests == 0 then
+        return nil, nil, "distill_subloop: all chunks failed (no LLM response)"
+    end
+
+    -- 3. Priority-sort for binary_search_pack.
+    -- Extract the error line number from mf_state.last_err (path:line or path:line:col).
+    local err_line = nil
+    if mf_state.last_err then
+        local m = mf_state.last_err:match(":(%d+)")
+        if m then
+            err_line = tonumber(m)
+        end
+    end
+
+    local target_func = nil
+    if conf and conf.target_func and type(conf.target_func) == "string" then
+        target_func = conf.target_func
+    end
+
+    -- Assign priority to each chunk digest.
+    local function chunk_priority(cd)
+        -- Priority 1: overlaps err_line.
+        if err_line and cd.start <= err_line and err_line <= cd.end_ then
+            return 1
+        end
+        -- Priority 2: contains target_func string.
+        if target_func and cd.digest:find(target_func, 1, true) then
+            return 2
+        end
+        -- Priority 3: original order (handled by stable secondary sort below).
+        return 3
+    end
+
+    -- Stable sort: primary = priority, secondary = original index (position in table).
+    local indexed = {}
+    for idx, cd in ipairs(chunk_digests) do
+        table.insert(indexed, { cd = cd, prio = chunk_priority(cd), orig = idx })
+    end
+    table.sort(indexed, function(a, b)
+        if a.prio ~= b.prio then return a.prio < b.prio end
+        return a.orig < b.orig
+    end)
+
+    -- Rebuild sorted list for binary_search_pack.
+    local sorted_digests = {}
+    for _, entry in ipairs(indexed) do
+        table.insert(sorted_digests, entry.cd)
+    end
+
+    -- 4. Pack into budget.
+    local digest    = binary_search_pack(sorted_digests, DISTILL_DIGEST_MAX_CHARS, 0.15)
+
+    -- 5. Build line index (using original order for readability).
+    local line_index = build_line_index(chunk_digests)
+
+    return digest, line_index, nil
 end
 
 -- Handle a read_file_range tool call from the child LLM.
@@ -2220,6 +2528,13 @@ function M._test_helpers()
         read_file_range_tool_handler = read_file_range_tool_handler,
         read_file_tool_handler       = read_file_tool_handler,
         file_mtime                  = file_mtime,
+        -- ST3 additions
+        split_lines                 = split_lines,
+        chunk_by_lines              = chunk_by_lines,
+        extract_text                = extract_text,
+        call_distill_llm            = call_distill_llm,
+        binary_search_pack          = binary_search_pack,
+        build_line_index            = build_line_index,
     }
 end
 
