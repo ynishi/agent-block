@@ -329,6 +329,29 @@ share the same function identity. The tool name defaults to `"compile_loop"`; pa
 
 **Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. See `blocks/compile_loop/README.md` §"Multi-file mode" and the `examples/test_anthropic_compile_loop_multi*.lua` / `examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
 
+**Read-and-distill for large files**: in multi-file lazy-load mode, `read_file` now inspects
+file size before returning content. Files at or below `READ_FILE_FULL_THRESHOLD` (default
+10 000 chars) are returned verbatim as before. Files that exceed the threshold are split into
+line-based chunks and summarised by the child LLM (provider-agnostic, same call path as the
+outer loop), and the tool returns a digest string plus a line-index (`"L1-50: ...\nL51-180: ..."`).
+The digest cache (`mf_state.file_digest[path]`) survives per-iteration resets; only file-mtime
+changes or `file_digest_refresh = "always"` trigger re-distillation.
+
+**`read_file_range` tool**: after receiving a digest the LLM can call `read_file_range(path,
+line_start, line_end)` to retrieve the verbatim lines from that range. The handler reads
+directly from disk without passing through distillation, regardless of file size. Guards:
+`target_files` allowlist, 1-indexed inclusive range, max `READ_FILE_RANGE_MAX_LINES`
+lines (default 500) per call.
+
+**New optional `conf` fields for large-file distillation**:
+
+| field | type | default | description |
+|---|---|---|---|
+| `conf.target_func` | string \| nil | `nil` | Function name to prioritise in chunk ordering. Chunks containing this name are ranked second (after `last_err`-overlap chunks). Existing callers that omit this field are unaffected. |
+| `conf.distill_threshold` | number \| nil | 10 000 | Override `READ_FILE_FULL_THRESHOLD` per-instance. |
+| `conf.distill_chunk_lines` | number \| nil | 200 | Lines per distill chunk. |
+| `conf.distill_max_tokens` | number \| nil | 4 000 | Max chars for the packed digest returned to the LLM. |
+
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
 `target_file` (absolute path, required), `lang` (string, optional).
 
@@ -425,6 +448,8 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 | `examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
 | `examples/test_anthropic_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Anthropic |
 | `examples/test_openai_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Qwen (OpenAI-compat) |
+| `tests/fixtures/compile_loop_distill_mock.lua` | shared e2e fixture (distill, multi-file) | Anthropic / OpenAI-compat |
+| `tests/fixtures/compile_loop_distill_range_mock.lua` | e2e fixture (read_file_range verbatim) | Anthropic |
 
 ### coding_agent (Filesystem block — `require("coding_agent")`, thin facade)
 
