@@ -907,11 +907,35 @@ end
 -- Prevents infinite tool-use loops when the child LLM re-requests the same file.
 local MAX_TOOL_CALLS_PER_ITER = 8
 
+-- ── Distill / cache constants (added ST1) ───────────────────────────────────
+-- Files with content length >= this threshold trigger the distill subloop (ST2-3).
+-- Below threshold: full content returned verbatim (unchanged behaviour).
+local READ_FILE_FULL_THRESHOLD        = 10000 -- chars
+
+-- Lines per chunk fed to the distill LLM in one call.
+local DISTILL_CHUNK_LINES             = 200
+
+-- Maximum chars for the aggregate digest returned by read_file after distillation.
+local DISTILL_DIGEST_MAX_CHARS        = 4000
+
+-- Maximum chars for a single chunk's contribution to the aggregate digest.
+local DISTILL_CHUNK_DIGEST_MAX_CHARS  = 400
+
+-- TTL seconds for file_digest cache entries in "auto" refresh mode.
+local CACHE_AUTO_TTL_SEC              = 10
+
+-- Maximum line span allowed in a single read_file_range call.
+local READ_FILE_RANGE_MAX_LINES       = 500
+-- ── end distill / cache constants ───────────────────────────────────────────
+
 -- Tool spec for the child LLM (multi-file branch only).
 -- Passed as opts.tools in llm_call; never exposed to the parent agent layer.
 local READ_FILE_TOOL = {
     name        = "read_file",
-    description = "Read the current content of a target file. Returns the file content as a string. Use this to fetch file content lazily before emitting SEARCH/REPLACE blocks.",
+    description = "Read the current content of a target file. " ..
+                  "For files <= READ_FILE_FULL_THRESHOLD bytes, returns full content. " ..
+                  "For larger files, returns a distilled digest with line index hints; " ..
+                  "use read_file_range to fetch verbatim ranges as needed.",
     input_schema = {
         type     = "object",
         required = { "path" },
@@ -919,6 +943,33 @@ local READ_FILE_TOOL = {
             path = {
                 type        = "string",
                 description = "Absolute path. Must be one of the target_files paths provided in the spec.",
+            },
+        },
+    },
+}
+
+-- Tool spec for verbatim line-range retrieval (multi-file branch only).
+-- Allows the child LLM to fetch exact source lines after read_file returns a digest.
+local READ_FILE_RANGE_TOOL = {
+    name        = "read_file_range",
+    description = "Read a verbatim line range of a target file. " ..
+                  "Use this after read_file returned a distilled digest, to fetch a specific section. " ..
+                  "1-indexed, inclusive; line_end - line_start + 1 must be <= READ_FILE_RANGE_MAX_LINES.",
+    input_schema = {
+        type     = "object",
+        required = { "path", "line_start", "line_end" },
+        properties = {
+            path = {
+                type        = "string",
+                description = "Absolute path. Must be in target_files.",
+            },
+            line_start = {
+                type        = "integer",
+                description = "1-indexed start line, inclusive.",
+            },
+            line_end = {
+                type        = "integer",
+                description = "1-indexed end line, inclusive.",
             },
         },
     },
@@ -1124,12 +1175,20 @@ local function run_loop(conf)
     -- messages[] is rebuilt each iter from state; not accumulated across iters.
     -- sr_history is reserved for subtask 2 (stagnation_v2); initialized empty here.
     local mf_state = {
-        iter           = 0,
-        last_err       = nil,   -- most recent verify failure stderr (≤2,000 chars)
-        sr_digest_prev = nil,   -- digest of last SR block (≤500 chars)
-        sr_history     = {},    -- populated in subtask 2
+        iter                = 0,
+        last_err            = nil,   -- most recent verify failure stderr (≤2,000 chars)
+        sr_digest_prev      = nil,   -- digest of last SR block (≤500 chars)
+        sr_history          = {},    -- populated in subtask 2
+        -- ST1: per-iter-reset-surviving file digest cache (crux-card §1).
+        -- Keyed by absolute path; each entry: { digest, line_index, mtime, cached_at }.
+        -- Must NOT be cleared or overwritten in the per-iter rebuild path (L1149-1170).
+        file_digest         = {},
+        -- Refresh policy for file_digest cache ("auto" uses CACHE_AUTO_TTL_SEC).
+        file_digest_refresh = "auto",
     }
     assert(type(mf_state.sr_history) == "table", "mf_state.sr_history must be initialized")
+    assert(type(mf_state.file_digest) == "table", "mf_state.file_digest must be initialized")
+    assert(mf_state.file_digest_refresh == "auto", "mf_state.file_digest_refresh must default to 'auto'")
 
     -- For single-file mode, messages accumulate across iters (original behaviour).
     local messages
@@ -1178,7 +1237,7 @@ local function run_loop(conf)
             -- We build a shallow copy of conf with tools added to avoid mutating conf.
             call_opts = {}
             for k, v in pairs(conf) do call_opts[k] = v end
-            call_opts.tools = { READ_FILE_TOOL }
+            call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
         end
 
         local resp, err = llm_call(call_opts, messages)
@@ -1895,6 +1954,20 @@ end
 --- Reset the llm_call override installed by M._test_set_llm_call().
 function M._test_reset_llm_call()
     _llm_call_override = nil
+end
+
+--- Return a fresh mf_state table with ST1 initial field defaults.
+--- Used by unit tests to assert invariants without running the full make() pipeline.
+--- Production callers must never call this.
+function M._test_make_mf_state()
+    return {
+        iter                = 0,
+        last_err            = nil,
+        sr_digest_prev      = nil,
+        sr_history          = {},
+        file_digest         = {},
+        file_digest_refresh = "auto",
+    }
 end
 
 return M
