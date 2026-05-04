@@ -975,11 +975,159 @@ local READ_FILE_RANGE_TOOL = {
     },
 }
 
+-- ── ST2: cache lifecycle helpers ────────────────────────────────────────────
+
+-- Return the mtime of a file as a number.
+-- Tries std.fs.metadata(path).modified first (mlua-batteries fs feature).
+-- Falls back to os.time() if the metadata call is unavailable or returns nil.
+-- Fallback behaviour: within the same iter every call returns os.time() which is
+-- nearly identical (same-second), so cache will hit for repeated reads within an
+-- iter; across iter boundaries the TTL-based "auto" mode governs expiry.
+local function file_mtime(path)
+    local ok, meta = pcall(function() return std.fs.metadata(path) end)
+    if ok and meta and meta.modified then
+        return meta.modified
+    end
+    -- Fallback: os.time() — same-iter reads get near-identical timestamps,
+    -- so auto-mode cache will hit within a single iter. Across iters the TTL
+    -- (CACHE_AUTO_TTL_SEC) governs whether the cache is considered fresh.
+    return os.time()
+end
+
+-- Determine whether the cached digest for a path is still valid.
+-- cached:        mf_state.file_digest[path] entry (or nil if not yet cached)
+-- cur_mtime:     current file mtime (number from file_mtime)
+-- refresh_mode:  "auto" | "always" | "files" | "manual"
+--
+-- Returns true  → use cache (no distill call needed)
+--         false → cache miss or forced refresh (call distill_subloop)
+local function should_use_cache(cached, cur_mtime, refresh_mode)
+    if cached == nil then return false end
+    if refresh_mode == "always" then return false end
+    if refresh_mode == "manual" then return true end  -- mtime ignored
+    local mtime_match = (cached.mtime == cur_mtime)
+    if refresh_mode == "files" then return mtime_match end
+    -- "auto": mtime match AND within TTL window
+    return mtime_match and (os.time() - cached.cached_at) < CACHE_AUTO_TTL_SEC
+end
+
+-- Format a cached digest entry into an LLM-readable text block.
+-- cached: { digest=string, line_index=string, mtime=number, cached_at=number }
+-- Returns a formatted string combining the digest and the line index.
+local function format_digest_response(cached)
+    local parts = {}
+    table.insert(parts, "[Distilled digest]\n" .. tostring(cached.digest or ""))
+    if cached.line_index and cached.line_index ~= "" then
+        table.insert(parts, "\n[Line index]\n" .. tostring(cached.line_index))
+    end
+    table.insert(parts, "\n[Use read_file_range to fetch verbatim line ranges.]")
+    return table.concat(parts, "")
+end
+
+-- Return the first READ_FILE_FULL_THRESHOLD chars of content with a warning suffix.
+-- Used as a fallback when distill_subloop fails — compile_loop continues rather than
+-- aborting (Phase 3b error design: handler returns content, never {ok=false}).
+-- err: optional error string from distill_subloop (may be nil)
+local function truncate_with_warning(content, err)
+    local head = content:sub(1, READ_FILE_FULL_THRESHOLD)
+    local warn = "\n\n[WARNING: file exceeded size threshold; content truncated"
+    if err and err ~= "" then
+        warn = warn .. " (distill error: " .. tostring(err) .. ")"
+    end
+    warn = warn .. "]"
+    return head .. warn
+end
+
+-- Distill subloop — ST2 STUB.
+-- In ST3 this will chunk the content, call the distill LLM, and build a real digest.
+-- For ST2 the stub returns a fixed digest so cache lifecycle tests can run without
+-- a real LLM provider. Prefix "STUB DIGEST: " allows ST3 to detect residual stubs
+-- via `rg "STUB DIGEST"`.
+--
+-- Signature mirrors the ST3 real implementation:
+--   path, content, mf_state, conf → digest, line_index, err_string
+-- Returns: (digest_string, line_index_string, err_string|nil)
+--   err_string non-nil means failure; caller should invoke truncate_with_warning.
+--
+-- Module-level override for test injection (M._test_set_distill_subloop).
+local _distill_subloop_override = nil
+
+local function distill_subloop(path, content, mf_state, conf)  -- luacheck: ignore mf_state conf
+    if _distill_subloop_override then
+        return _distill_subloop_override(path, content, mf_state, conf)
+    end
+    return "STUB DIGEST: " .. content:sub(1, 200), "L1-?: stub", nil
+end
+
+-- Handle a read_file_range tool call from the child LLM.
+-- Returns verbatim lines [line_start, line_end] (1-indexed, inclusive) from path.
+-- NEVER passes through distillation — verbatim access is guaranteed regardless of
+-- file size (crux-card §3 must_not_simplify: verbatim range access after distill).
+-- Returns {ok=true, content=string} or {ok=false, error=string}.
+local function read_file_range_tool_handler(path, line_start, line_end, target_files_set)
+    -- Allowlist check
+    if not target_files_set[path] then
+        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
+    end
+    -- Type and range validation
+    if type(line_start) ~= "number" or type(line_end) ~= "number"
+        or math.floor(line_start) ~= line_start
+        or math.floor(line_end) ~= line_end then
+        return { ok = false, error = "line_start and line_end must be integers" }
+    end
+    line_start = math.floor(line_start)
+    line_end   = math.floor(line_end)
+    if line_start < 1 or line_end < line_start then
+        return { ok = false, error = "invalid range: require 1 <= line_start <= line_end" }
+    end
+    if (line_end - line_start + 1) > READ_FILE_RANGE_MAX_LINES then
+        return { ok = false, error = string.format(
+            "range %d-%d exceeds READ_FILE_RANGE_MAX_LINES=%d",
+            line_start, line_end, READ_FILE_RANGE_MAX_LINES
+        )}
+    end
+    -- Verbatim line read (no distillation)
+    local f, open_err = io.open(path, "r")
+    if not f then
+        return { ok = false, error = "cannot open: " .. tostring(open_err) }
+    end
+    local lines = {}
+    local cur = 0
+    for line in f:lines() do
+        cur = cur + 1
+        if cur >= line_start then
+            table.insert(lines, line)
+        end
+        if cur >= line_end then
+            break
+        end
+    end
+    f:close()
+    if cur < line_start then
+        return { ok = false, error = string.format(
+            "file has %d lines; line_start=%d out of range", cur, line_start
+        )}
+    end
+    return { ok = true, content = table.concat(lines, "\n") }
+end
+-- ── end ST2: cache lifecycle helpers ────────────────────────────────────────
+
 -- Handle a read_file tool call from the child LLM.
 -- Returns {ok=true, content=string} or {ok=false, error=string}.
 -- Never raises; errors are propagated as tool_result content so the child LLM
 -- can recover (per-iter reset keeps the loop safe).
-local function read_file_tool_handler(path, target_files_set)
+--
+-- ST2: signature extended to (path, target_files_set, mf_state, conf).
+-- mf_state and conf may be nil when called from paths that do not yet pass them
+-- (guards below ensure backward-safe behaviour).
+-- Size branch:
+--   content <= READ_FILE_FULL_THRESHOLD → return full content (unchanged behaviour)
+--   content >  READ_FILE_FULL_THRESHOLD → run distill_subloop (stub in ST2)
+--     cache hit  → return format_digest_response(cached)  [no LLM call]
+--     cache miss → call distill_subloop → cache result → format_digest_response
+--     distill failure → truncate_with_warning (loop continues)
+local function read_file_tool_handler(path, target_files_set, mf_state, conf)
+    -- Error messages below are kept verbatim from the original (BC2 regression guard).
     if not target_files_set[path] then
         return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
     end
@@ -989,7 +1137,44 @@ local function read_file_tool_handler(path, target_files_set)
     end
     local content = f:read("*a")
     f:close()
-    return { ok = true, content = content or "" }
+    content = content or ""
+
+    -- Below-threshold: return full content unchanged (AC #2, backward-compat).
+    if #content <= READ_FILE_FULL_THRESHOLD then
+        return { ok = true, content = content }
+    end
+
+    -- Above-threshold: use distill / cache path.
+    -- mf_state guard: if caller did not supply mf_state (legacy path), fall back to truncate.
+    if not mf_state or type(mf_state.file_digest) ~= "table" then
+        return { ok = true, content = truncate_with_warning(content, nil) }
+    end
+
+    local refresh_mode = mf_state.file_digest_refresh or "auto"
+    local cur_mtime    = file_mtime(path)
+    local cached       = mf_state.file_digest[path]
+
+    if should_use_cache(cached, cur_mtime, refresh_mode) then
+        -- Cache hit: return digest without calling distill_subloop (AC #3).
+        return { ok = true, content = format_digest_response(cached) }
+    end
+
+    -- Cache miss or forced refresh: call distill_subloop (stub in ST2).
+    local digest, line_index, distill_err = distill_subloop(path, content, mf_state, conf)
+    if distill_err then
+        -- Distill failure: return truncated content with warning; do not abort loop (AC #5).
+        return { ok = true, content = truncate_with_warning(content, distill_err) }
+    end
+
+    -- Store result in cache (AC #4).
+    mf_state.file_digest[path] = {
+        digest    = digest,
+        line_index = line_index,
+        mtime     = cur_mtime,
+        cached_at = os.time(),
+    }
+
+    return { ok = true, content = format_digest_response(mf_state.file_digest[path]) }
 end
 
 -- ============================================================
@@ -1028,7 +1213,12 @@ local function iterate_files(target_files, grouped, existing_map)
     for _, abs_path in ipairs(target_files) do
         local file_blocks = grouped[abs_path]
         if file_blocks and #file_blocks > 0 then
-            local current = existing_map[abs_path] or ""
+            -- Use cached content from tool dispatch loop; fall back to reading the file
+            -- directly when the LLM emitted SR blocks without calling read_file first.
+            local current = existing_map[abs_path]
+            if current == nil then
+                current = read_target_if_exists(abs_path) or ""
+            end
             local new_content, failed_indices = apply_blocks(current, file_blocks)
             if #failed_indices > 0 then
                 table.insert(all_failed, { path = abs_path, indices = failed_indices, blocks = file_blocks, current_content = current })
@@ -1332,7 +1522,8 @@ local function run_loop(conf)
                                 { "cached", true },
                             })
                         else
-                            dispatch_result = read_file_tool_handler(path, target_files_set)
+                            -- ST2: pass mf_state and conf so size-branch + cache works.
+                            dispatch_result = read_file_tool_handler(path, target_files_set, mf_state, conf)
                             if dispatch_result.ok then
                                 -- Cache the result for this iter.
                                 existing_map[path] = dispatch_result.content
@@ -1361,6 +1552,41 @@ local function run_loop(conf)
                             type        = "tool_result",
                             tool_use_id = tb.id,
                             content     = result_text,
+                        })
+                    elseif tb.name == "read_file_range" then
+                        -- ST2: verbatim line-range retrieval; never passes through distill
+                        -- (crux-card §3: verbatim range access after distill).
+                        local inp        = tb.input or {}
+                        local path       = inp.path or ""
+                        local line_start = inp.line_start
+                        local line_end   = inp.line_end
+                        local rr_result  = read_file_range_tool_handler(
+                            path, line_start, line_end, target_files_set
+                        )
+                        local rr_text
+                        if rr_result.ok then
+                            rr_text = rr_result.content
+                            obs_event(mode, "tool_use", {
+                                { "iter",       iter },
+                                { "path",       path },
+                                { "tool",       "read_file_range" },
+                                { "line_start", tostring(line_start) },
+                                { "line_end",   tostring(line_end) },
+                                { "ok",         true },
+                            })
+                        else
+                            rr_text = "ERROR: " .. tostring(rr_result.error)
+                            obs_event(mode, "tool_use_fail", {
+                                { "iter", iter },
+                                { "path", path },
+                                { "tool", "read_file_range" },
+                                { "err",  rr_result.error },
+                            })
+                        end
+                        table.insert(tool_result_content, {
+                            type        = "tool_result",
+                            tool_use_id = tb.id,
+                            content     = rr_text,
                         })
                     else
                         -- Unknown tool name; return error to child LLM.
@@ -1967,6 +2193,33 @@ function M._test_make_mf_state()
         sr_history          = {},
         file_digest         = {},
         file_digest_refresh = "auto",
+    }
+end
+
+--- Override the internal distill_subloop function for test monkey-patching.
+--- fn signature: (path, content, mf_state, conf) → digest, line_index, err_string|nil
+--- Call M._test_reset_distill_subloop() after the test to restore production behaviour.
+--- Production callers must never call this.
+function M._test_set_distill_subloop(fn)
+    assert(type(fn) == "function", "_test_set_distill_subloop requires a function")
+    _distill_subloop_override = fn
+end
+
+--- Reset the distill_subloop override installed by M._test_set_distill_subloop().
+function M._test_reset_distill_subloop()
+    _distill_subloop_override = nil
+end
+
+--- Expose internal helpers for unit testing (read-only access).
+--- Returns a table of helper functions so tests can call them directly.
+function M._test_helpers()
+    return {
+        should_use_cache            = should_use_cache,
+        format_digest_response      = format_digest_response,
+        truncate_with_warning       = truncate_with_warning,
+        read_file_range_tool_handler = read_file_range_tool_handler,
+        read_file_tool_handler       = read_file_tool_handler,
+        file_mtime                  = file_mtime,
     }
 end
 
