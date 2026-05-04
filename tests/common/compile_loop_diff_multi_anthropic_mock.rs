@@ -60,10 +60,10 @@ pub struct MultiDiffMockState {
 
 /// Extract absolute file paths from a compile_loop messages request body.
 ///
-/// The Lua init.lua embeds target file paths in the user message using the format:
-///   `=== Current file content (path=<abs_path>) ===`
-/// or
-///   `=== File (path=<abs_path>) does not exist yet ===`
+/// The Lua init.lua embeds target file paths in the user message using one of:
+///   1. Multi-file lazy-load format: `Files:\n  <abs_path>\n  <abs_path>`
+///   2. Single-file diff format: `=== Current file content (path=<abs_path>) ===`
+///   3. Non-existent file format: `=== File (path=<abs_path>) does not exist yet ===`
 ///
 /// Returns at most 2 paths in order of appearance.
 fn extract_paths_from_request(body: &serde_json::Value) -> Vec<String> {
@@ -77,6 +77,36 @@ fn extract_paths_from_request(body: &serde_json::Value) -> Vec<String> {
             Some(c) => c,
             None => continue,
         };
+        // Match multi-file lazy-load format:
+        //   `Files:\n  <abs_path>\n  <abs_path>`
+        // Lines after "Files:" that start with whitespace + "/" are absolute paths.
+        let mut in_files_section = false;
+        for line in content.lines() {
+            if line.trim() == "Files:" {
+                in_files_section = true;
+                continue;
+            }
+            if in_files_section {
+                let trimmed = line.trim();
+                if trimmed.starts_with('/') {
+                    let p = trimmed.to_string();
+                    if !p.is_empty() && !paths.contains(&p) {
+                        paths.push(p);
+                    }
+                    if paths.len() >= 2 {
+                        break;
+                    }
+                } else if !trimmed.is_empty() {
+                    // Non-empty, non-path line ends the Files: section.
+                    in_files_section = false;
+                }
+            }
+        }
+
+        if paths.len() >= 2 {
+            break;
+        }
+
         // Match `=== Current file content (path=<abs_path>) ===`
         // or `=== File (path=<abs_path>) does not exist yet ===`
         for line in content.lines() {
