@@ -113,6 +113,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI path for multi-file lazy-load: mock LLM requests `read_file` for two files across
   two turns, then produces a SEARCH/REPLACE patch that causes the runner to pass. Mirrors
   the structure of `examples/test_anthropic_compile_loop_multi_lazy_load.lua`.
+- `blocks/compile_loop` — read-and-distill subloop for large files in multi-file lazy-load
+  mode. When `read_file` is called on a file whose byte length exceeds `READ_FILE_FULL_THRESHOLD`
+  (default 10 000 chars), the block splits the file into line-based chunks (`DISTILL_CHUNK_LINES`
+  default 200 lines, boundary-adjusted to avoid splitting mid-function) and calls the child
+  LLM once per chunk (`tools = nil`, provider-agnostic path identical to the outer loop) to
+  produce a compact digest. Digests are gathered into a digest string and a line-index table
+  (`"L1-50: ...\nL51-180: ..."` format) and returned as the `read_file` tool result. Files
+  below the threshold are returned verbatim as before (zero behaviour change on the existing
+  path). Key design points:
+  - **`mf_state.file_digest[path]` cache** — digest and mtime are stored in the per-run
+    `mf_state` table at the same scope as `sr_digest_prev`. The cache survives the per-iteration
+    state rebuild that resets `last_err` and `sr_digest_prev`; it is never cleared at iteration
+    boundaries (Crux §1: per-iter file cache survives reset).
+  - **`file_digest_refresh` 4-value mode** — `"auto"` (mtime match + TTL), `"always"` (never
+    cache), `"files"` (mtime match only), `"manual"` (use cache regardless of mtime). Default
+    `"auto"`. Borrowed from Aider `--map-refresh` catalogue.
+  - **`call_distill_llm`** resolves `provider`, `model`, `base_url` from `conf` directly so
+    it uses the same provider-agnostic call path as the outer compile loop; no model or
+    provider name is hardcoded (Crux §2: distill subloop is provider-agnostic).
+  - **Chunk importance ordering** for the binary-search packing step: (1) chunks whose line
+    range overlaps `mf_state.last_err` file:line reference, (2) chunks containing
+    `conf.target_func` (new optional field, default nil), (3) document order. The binary
+    search packs the top-K chunks within `DISTILL_DIGEST_MAX_CHARS` at 15% tolerance
+    (borrowed from Aider `repomap.py`).
+- `blocks/compile_loop` — new `read_file_range` LLM-callable tool. The LLM calls
+  `read_file_range(path, line_start, line_end)` to retrieve verbatim source lines from any
+  file in the `target_files` allowlist. The handler reads directly via `io.open` without
+  passing through the distillation path regardless of file size (Crux §3: verbatim range
+  access after distill). Guards: `target_files` allowlist, `1 <= line_start <= line_end`,
+  `line_end - line_start + 1 <= READ_FILE_RANGE_MAX_LINES` (default 500). The tool schema
+  description explicitly says "Use this after read_file returned a distilled digest, to fetch
+  a specific section. 1-indexed, inclusive." so the LLM understands the intended workflow.
+- E2E mock tests for the distill subloop in `tests/e2e_compile_loop.rs`:
+  `compile_loop_distill_openai_mock_iterates_until_pass` and
+  `compile_loop_distill_anthropic_mock_iterates_until_pass` use a shared mock server
+  (`tests/common/compile_loop_distill_mock.rs`) that stubs both Anthropic `/v1/messages` and
+  OpenAI `/chat/completions` endpoints. The mock distinguishes distill calls (request body
+  has no `tools` field and prompt contains the distill signature phrase) from outer compile
+  loop calls. A third test `compile_loop_read_file_range_verbatim` exercises the
+  `read_file_range` verbatim path via `tests/fixtures/compile_loop_distill_range_mock.lua`.
+  All three tests run without external API keys (`api_key="dummy"`).
+- New module-level constants in `blocks/compile_loop/init.lua`:
+  `READ_FILE_FULL_THRESHOLD` (10 000), `DISTILL_CHUNK_LINES` (200),
+  `DISTILL_DIGEST_MAX_CHARS` (4 000), `DISTILL_CHUNK_DIGEST_MAX_CHARS` (400),
+  `CACHE_AUTO_TTL_SEC` (10), `READ_FILE_RANGE_MAX_LINES` (500).
+- New optional `conf` field **`conf.target_func`** (string, default nil) for `compile_loop.make`.
+  When provided, chunks containing this function name are promoted to priority 2 in the distill
+  importance ordering. Existing callers that omit the field are unaffected (Lua nil-field access
+  returns nil without error).
 
 ### Changed
 

@@ -907,11 +907,35 @@ end
 -- Prevents infinite tool-use loops when the child LLM re-requests the same file.
 local MAX_TOOL_CALLS_PER_ITER = 8
 
+-- ── Distill / cache constants (added ST1) ───────────────────────────────────
+-- Files with content length >= this threshold trigger the distill subloop (ST2-3).
+-- Below threshold: full content returned verbatim (unchanged behaviour).
+local READ_FILE_FULL_THRESHOLD        = 10000 -- chars
+
+-- Lines per chunk fed to the distill LLM in one call.
+local DISTILL_CHUNK_LINES             = 200
+
+-- Maximum chars for the aggregate digest returned by read_file after distillation.
+local DISTILL_DIGEST_MAX_CHARS        = 4000
+
+-- Maximum chars for a single chunk's contribution to the aggregate digest.
+local DISTILL_CHUNK_DIGEST_MAX_CHARS  = 400
+
+-- TTL seconds for file_digest cache entries in "auto" refresh mode.
+local CACHE_AUTO_TTL_SEC              = 10
+
+-- Maximum line span allowed in a single read_file_range call.
+local READ_FILE_RANGE_MAX_LINES       = 500
+-- ── end distill / cache constants ───────────────────────────────────────────
+
 -- Tool spec for the child LLM (multi-file branch only).
 -- Passed as opts.tools in llm_call; never exposed to the parent agent layer.
 local READ_FILE_TOOL = {
     name        = "read_file",
-    description = "Read the current content of a target file. Returns the file content as a string. Use this to fetch file content lazily before emitting SEARCH/REPLACE blocks.",
+    description = "Read the current content of a target file. " ..
+                  "For files <= READ_FILE_FULL_THRESHOLD bytes, returns full content. " ..
+                  "For larger files, returns a distilled digest with line index hints; " ..
+                  "use read_file_range to fetch verbatim ranges as needed.",
     input_schema = {
         type     = "object",
         required = { "path" },
@@ -924,11 +948,496 @@ local READ_FILE_TOOL = {
     },
 }
 
+-- Tool spec for verbatim line-range retrieval (multi-file branch only).
+-- Allows the child LLM to fetch exact source lines after read_file returns a digest.
+local READ_FILE_RANGE_TOOL = {
+    name        = "read_file_range",
+    description = "Read a verbatim line range of a target file. " ..
+                  "Use this after read_file returned a distilled digest, to fetch a specific section. " ..
+                  "1-indexed, inclusive; line_end - line_start + 1 must be <= READ_FILE_RANGE_MAX_LINES.",
+    input_schema = {
+        type     = "object",
+        required = { "path", "line_start", "line_end" },
+        properties = {
+            path = {
+                type        = "string",
+                description = "Absolute path. Must be in target_files.",
+            },
+            line_start = {
+                type        = "integer",
+                description = "1-indexed start line, inclusive.",
+            },
+            line_end = {
+                type        = "integer",
+                description = "1-indexed end line, inclusive.",
+            },
+        },
+    },
+}
+
+-- ── ST2: cache lifecycle helpers ────────────────────────────────────────────
+
+-- Return the mtime of a file as a number.
+-- Tries std.fs.metadata(path).modified first (mlua-batteries fs feature).
+-- Falls back to os.time() if the metadata call is unavailable or returns nil.
+-- Fallback behaviour: within the same iter every call returns os.time() which is
+-- nearly identical (same-second), so cache will hit for repeated reads within an
+-- iter; across iter boundaries the TTL-based "auto" mode governs expiry.
+local function file_mtime(path)
+    local ok, meta = pcall(function() return std.fs.metadata(path) end)
+    if ok and meta and meta.modified then
+        return meta.modified
+    end
+    -- Fallback: os.time() — same-iter reads get near-identical timestamps,
+    -- so auto-mode cache will hit within a single iter. Across iters the TTL
+    -- (CACHE_AUTO_TTL_SEC) governs whether the cache is considered fresh.
+    return os.time()
+end
+
+-- Determine whether the cached digest for a path is still valid.
+-- cached:        mf_state.file_digest[path] entry (or nil if not yet cached)
+-- cur_mtime:     current file mtime (number from file_mtime)
+-- refresh_mode:  "auto" | "always" | "files" | "manual"
+--
+-- Returns true  → use cache (no distill call needed)
+--         false → cache miss or forced refresh (call distill_subloop)
+local function should_use_cache(cached, cur_mtime, refresh_mode)
+    if cached == nil then return false end
+    if refresh_mode == "always" then return false end
+    if refresh_mode == "manual" then return true end  -- mtime ignored
+    local mtime_match = (cached.mtime == cur_mtime)
+    if refresh_mode == "files" then return mtime_match end
+    -- "auto": mtime match AND within TTL window
+    return mtime_match and (os.time() - cached.cached_at) < CACHE_AUTO_TTL_SEC
+end
+
+-- Format a cached digest entry into an LLM-readable text block.
+-- cached: { digest=string, line_index=string, mtime=number, cached_at=number }
+-- Returns a formatted string combining the digest and the line index.
+local function format_digest_response(cached)
+    local parts = {}
+    table.insert(parts, "[Distilled digest]\n" .. tostring(cached.digest or ""))
+    if cached.line_index and cached.line_index ~= "" then
+        table.insert(parts, "\n[Line index]\n" .. tostring(cached.line_index))
+    end
+    table.insert(parts, "\n[Use read_file_range to fetch verbatim line ranges.]")
+    return table.concat(parts, "")
+end
+
+-- Return the first READ_FILE_FULL_THRESHOLD chars of content with a warning suffix.
+-- Used as a fallback when distill_subloop fails — compile_loop continues rather than
+-- aborting (Phase 3b error design: handler returns content, never {ok=false}).
+-- err: optional error string from distill_subloop (may be nil)
+local function truncate_with_warning(content, err)
+    local head = content:sub(1, READ_FILE_FULL_THRESHOLD)
+    local warn = "\n\n[WARNING: file exceeded size threshold; content truncated"
+    if err and err ~= "" then
+        warn = warn .. " (distill error: " .. tostring(err) .. ")"
+    end
+    warn = warn .. "]"
+    return head .. warn
+end
+
+-- ── ST3: distill subloop helpers ────────────────────────────────────────────
+
+-- Prompt template for the distill LLM call.
+-- Placeholder order (8 args, AC#8): path, chunk_start, chunk_end, total_lines,
+--   last_err, target_func, chunk_text, DISTILL_CHUNK_DIGEST_MAX_CHARS
+local DISTILL_CHUNK_PROMPT =
+    "You are summarizing a chunk of a source code file for a coding assistant.\n" ..
+    "Your summary will be used as a digest that lets the assistant understand the code\n" ..
+    "without seeing the full file.\n\n" ..
+    "File: %s\n" ..
+    "Chunk: lines %d-%d (of %d total)\n" ..
+    "Recent build error (if any): %s\n" ..
+    "Target function (if any): %s\n\n" ..
+    "Code chunk:\n" ..
+    "```\n%s\n```\n\n" ..
+    "Instructions:\n" ..
+    "- Write a concise technical summary of what this chunk defines and does.\n" ..
+    "- Emphasize any definitions, exports, or logic relevant to the build error or target function.\n" ..
+    "- Include key function/class/variable names so the assistant can ask for specific lines.\n" ..
+    "- Keep the summary under %d characters.\n" ..
+    "- Output ONLY the summary text, no preamble."
+
+-- Split a string into a list of lines (no trailing newline in each entry).
+-- Returns a table of strings, 1-indexed.
+local function split_lines(content)
+    local lines = {}
+    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(lines, line)
+    end
+    return lines
+end
+
+-- Split lines into chunks of at most chunk_size lines.
+-- Applies boundary adjustment: after computing the natural chunk end, scans up to
+-- +20 lines ahead for a line matching a function-definition prefix
+-- (^function / ^local function / ^def / ^fn ).  If found at index i, the chunk
+-- is extended to i-1 (just before the definition) to avoid mid-function splits.
+--
+-- Returns: { {start=N, end_=M, total_lines=T, text="..."}, ... }
+--   - start / end_ are 1-indexed, inclusive
+--   - total_lines is #lines (same for every chunk; used as prompt context)
+local function chunk_by_lines(lines, chunk_size)
+    local chunks = {}
+    local total  = #lines
+    local i      = 1
+    while i <= total do
+        local natural_end = math.min(i + chunk_size - 1, total)
+        local adjusted_end = natural_end
+        -- Boundary adjustment: scan up to +20 lines ahead for a function start.
+        if natural_end < total then
+            local scan_limit = math.min(natural_end + 20, total)
+            for j = natural_end + 1, scan_limit do
+                local line = lines[j]
+                if line:match("^function ") or line:match("^local function ")
+                    or line:match("^def ") or line:match("^fn ") then
+                    -- Extend chunk to end just before this definition line.
+                    adjusted_end = j - 1
+                    break
+                end
+            end
+        end
+        -- Build chunk text.
+        local chunk_lines = {}
+        for k = i, adjusted_end do
+            table.insert(chunk_lines, lines[k])
+        end
+        table.insert(chunks, {
+            start       = i,
+            end_        = adjusted_end,
+            total_lines = total,
+            text        = table.concat(chunk_lines, "\n"),
+        })
+        i = adjusted_end + 1
+    end
+    return chunks
+end
+
+-- Extract the text content from an llm_call response.
+-- Handles both Anthropic and OpenAI-compatible paths (both return
+-- resp.choices[1].message.content for tools=nil calls).
+-- Returns the content string or nil on any access failure.
+local function extract_text(resp)
+    if not resp then return nil end
+    local choices = resp.choices
+    if not choices or not choices[1] then return nil end
+    local msg = choices[1].message
+    if not msg then return nil end
+    return msg.content  -- string for both providers when tools=nil
+end
+
+-- Call the distill LLM for a single chunk.
+-- Uses conf.provider (provider-agnostic — crux-card §2 must_not_simplify).
+-- Never passes tools → raw text response (no tool_use schema in distill path).
+-- Returns digest_string on success, nil on any failure (caller handles fallback).
+local function call_distill_llm(path, chunk, mf_state, conf)
+    -- Build distill conf — inherit provider/model/base_url/api_key from outer conf.
+    -- No 'tools' key → llm_call treats tools as nil → raw text response.
+    local distill_conf = {
+        provider    = conf.provider,
+        model       = conf.model,
+        base_url    = conf.base_url,
+        api_key     = conf.api_key,
+        api_key_env = conf.api_key_env,
+    }
+
+    -- Resolve target_func with type guard (subtask-3.md Constraint / Risk).
+    local target_func_str = "(none)"
+    if conf.target_func and type(conf.target_func) == "string" then
+        target_func_str = conf.target_func
+    end
+
+    local prompt = string.format(
+        DISTILL_CHUNK_PROMPT,
+        path,
+        chunk.start,
+        chunk.end_,
+        chunk.total_lines,
+        mf_state.last_err or "(none)",
+        target_func_str,
+        chunk.text,
+        DISTILL_CHUNK_DIGEST_MAX_CHARS
+    )
+
+    local messages = {
+        { role = "user", content = prompt },
+    }
+
+    local resp, call_err = llm_call(distill_conf, messages)  -- luacheck: ignore call_err
+    if not resp then
+        return nil
+    end
+
+    local text = extract_text(resp)
+    return text  -- may be nil if response shape is unexpected
+end
+
+-- Pack chunk digests into a single string that fits within max_chars.
+-- chunk_digests: list of { start=N, end_=M, digest=string }  (already priority-sorted)
+-- max_chars:     upper bound (DISTILL_DIGEST_MAX_CHARS)
+-- tolerance:     allowed undershoot fraction (Aider repomap.py:568-591, default 0.15)
+--
+-- Algorithm:
+--   1. If total length ≤ max_chars → include all (no binary search needed).
+--   2. Otherwise binary-search for the largest K such that
+--      sum(digests[1..K]) ≤ max_chars.
+--      (tolerance is used to check whether we are in the acceptable window
+--       max_chars*(1-tolerance) ≤ sum ≤ max_chars; if the best K already
+--       satisfies this we stop early.)
+--   3. Restore original order (sort by .start) before concatenating.
+-- Returns: concatenated digest string (may be "" if every individual chunk
+--          exceeds max_chars — caller's truncate_with_warning handles this).
+local function binary_search_pack(chunk_digests, max_chars, tolerance)
+    tolerance = tolerance or 0.15
+    if #chunk_digests == 0 then return "" end
+
+    -- Compute cumulative lengths.
+    local total_len = 0
+    for _, cd in ipairs(chunk_digests) do
+        total_len = total_len + #(cd.digest or "")
+    end
+
+    local selected
+    if total_len <= max_chars then
+        -- All fit — take everything.
+        selected = {}
+        for _, cd in ipairs(chunk_digests) do
+            table.insert(selected, cd)
+        end
+    else
+        -- Binary search for largest K that fits.
+        local lo, hi = 0, #chunk_digests
+        local best_k = 0
+        local lower_bound = max_chars * (1 - tolerance)
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local sum = 0
+            for k = 1, mid do
+                sum = sum + #(chunk_digests[k].digest or "")
+            end
+            if sum <= max_chars then
+                best_k = mid
+                if sum >= lower_bound then
+                    -- Within acceptable window — stop early (Aider tolerance logic).
+                    break
+                end
+                lo = mid + 1
+            else
+                hi = mid - 1
+            end
+        end
+        -- Collect top-K.
+        selected = {}
+        for k = 1, best_k do
+            table.insert(selected, chunk_digests[k])
+        end
+    end
+
+    -- Restore original order (sort by .start ascending).
+    table.sort(selected, function(a, b) return a.start < b.start end)
+
+    -- Concatenate digests.
+    local parts = {}
+    for _, cd in ipairs(selected) do
+        table.insert(parts, cd.digest or "")
+    end
+    return table.concat(parts, "\n")
+end
+
+-- Build a line-index string from a list of chunk digest entries.
+-- Each entry: { start=N, end_=M, digest=string }
+-- Format: "L1-50: <first non-empty line of digest, max 80 chars>\n..."
+local function build_line_index(chunk_digests)
+    local lines = {}
+    for _, cd in ipairs(chunk_digests) do
+        -- First non-empty line of the digest.
+        local first_line = ""
+        for line in (tostring(cd.digest or "") .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then
+                first_line = line
+                break
+            end
+        end
+        if #first_line > 80 then
+            first_line = first_line:sub(1, 80)
+        end
+        table.insert(lines, "L" .. cd.start .. "-" .. cd.end_ .. ": " .. first_line)
+    end
+    return table.concat(lines, "\n")
+end
+
+-- Distill subloop — real implementation (ST3).
+-- Replaces the ST2 stub.
+--
+-- Signature: path, content, mf_state, conf → digest, line_index, err_string
+--   err_string non-nil means failure; caller should invoke truncate_with_warning.
+--
+-- Steps:
+--   1. Split content into chunks (chunk_by_lines).
+--   2. For each chunk, call call_distill_llm → collect {start, end_, digest}.
+--      Chunk with no digest (LLM failure) is skipped; if ALL fail → err_string.
+--   3. Priority-sort chunk_digests for binary_search_pack:
+--      (1) chunks whose range overlaps last_err line (if any)
+--      (2) chunks containing conf.target_func string (if non-nil string)
+--      (3) original order
+--   4. binary_search_pack → digest string.
+--   5. build_line_index → line_index string.
+--
+-- Module-level override for test injection (M._test_set_distill_subloop).
+local _distill_subloop_override = nil
+
+local function distill_subloop(path, content, mf_state, conf)
+    if _distill_subloop_override then
+        return _distill_subloop_override(path, content, mf_state, conf)
+    end
+
+    -- 1. Split and chunk.
+    local lines  = split_lines(content)
+    local chunks = chunk_by_lines(lines, DISTILL_CHUNK_LINES)
+
+    -- 2. Distill each chunk via LLM.
+    local chunk_digests = {}
+    for _, chunk in ipairs(chunks) do
+        local digest = call_distill_llm(path, chunk, mf_state, conf)
+        if digest then
+            table.insert(chunk_digests, {
+                start  = chunk.start,
+                end_   = chunk.end_,
+                digest = digest,
+            })
+        end
+        -- Chunks with nil digest are silently skipped; if all fail we handle below.
+    end
+
+    if #chunk_digests == 0 then
+        return nil, nil, "distill_subloop: all chunks failed (no LLM response)"
+    end
+
+    -- 3. Priority-sort for binary_search_pack.
+    -- Extract the error line number from mf_state.last_err (path:line or path:line:col).
+    local err_line = nil
+    if mf_state.last_err then
+        local m = mf_state.last_err:match(":(%d+)")
+        if m then
+            err_line = tonumber(m)
+        end
+    end
+
+    local target_func = nil
+    if conf and conf.target_func and type(conf.target_func) == "string" then
+        target_func = conf.target_func
+    end
+
+    -- Assign priority to each chunk digest.
+    local function chunk_priority(cd)
+        -- Priority 1: overlaps err_line.
+        if err_line and cd.start <= err_line and err_line <= cd.end_ then
+            return 1
+        end
+        -- Priority 2: contains target_func string.
+        if target_func and cd.digest:find(target_func, 1, true) then
+            return 2
+        end
+        -- Priority 3: original order (handled by stable secondary sort below).
+        return 3
+    end
+
+    -- Stable sort: primary = priority, secondary = original index (position in table).
+    local indexed = {}
+    for idx, cd in ipairs(chunk_digests) do
+        table.insert(indexed, { cd = cd, prio = chunk_priority(cd), orig = idx })
+    end
+    table.sort(indexed, function(a, b)
+        if a.prio ~= b.prio then return a.prio < b.prio end
+        return a.orig < b.orig
+    end)
+
+    -- Rebuild sorted list for binary_search_pack.
+    local sorted_digests = {}
+    for _, entry in ipairs(indexed) do
+        table.insert(sorted_digests, entry.cd)
+    end
+
+    -- 4. Pack into budget.
+    local digest    = binary_search_pack(sorted_digests, DISTILL_DIGEST_MAX_CHARS, 0.15)
+
+    -- 5. Build line index (using original order for readability).
+    local line_index = build_line_index(chunk_digests)
+
+    return digest, line_index, nil
+end
+
+-- Handle a read_file_range tool call from the child LLM.
+-- Returns verbatim lines [line_start, line_end] (1-indexed, inclusive) from path.
+-- NEVER passes through distillation — verbatim access is guaranteed regardless of
+-- file size (crux-card §3 must_not_simplify: verbatim range access after distill).
+-- Returns {ok=true, content=string} or {ok=false, error=string}.
+local function read_file_range_tool_handler(path, line_start, line_end, target_files_set)
+    -- Allowlist check
+    if not target_files_set[path] then
+        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
+    end
+    -- Type and range validation
+    if type(line_start) ~= "number" or type(line_end) ~= "number"
+        or math.floor(line_start) ~= line_start
+        or math.floor(line_end) ~= line_end then
+        return { ok = false, error = "line_start and line_end must be integers" }
+    end
+    line_start = math.floor(line_start)
+    line_end   = math.floor(line_end)
+    if line_start < 1 or line_end < line_start then
+        return { ok = false, error = "invalid range: require 1 <= line_start <= line_end" }
+    end
+    if (line_end - line_start + 1) > READ_FILE_RANGE_MAX_LINES then
+        return { ok = false, error = string.format(
+            "range %d-%d exceeds READ_FILE_RANGE_MAX_LINES=%d",
+            line_start, line_end, READ_FILE_RANGE_MAX_LINES
+        )}
+    end
+    -- Verbatim line read (no distillation)
+    local f, open_err = io.open(path, "r")
+    if not f then
+        return { ok = false, error = "cannot open: " .. tostring(open_err) }
+    end
+    local lines = {}
+    local cur = 0
+    for line in f:lines() do
+        cur = cur + 1
+        if cur >= line_start then
+            table.insert(lines, line)
+        end
+        if cur >= line_end then
+            break
+        end
+    end
+    f:close()
+    if cur < line_start then
+        return { ok = false, error = string.format(
+            "file has %d lines; line_start=%d out of range", cur, line_start
+        )}
+    end
+    return { ok = true, content = table.concat(lines, "\n") }
+end
+-- ── end ST2: cache lifecycle helpers ────────────────────────────────────────
+
 -- Handle a read_file tool call from the child LLM.
 -- Returns {ok=true, content=string} or {ok=false, error=string}.
 -- Never raises; errors are propagated as tool_result content so the child LLM
 -- can recover (per-iter reset keeps the loop safe).
-local function read_file_tool_handler(path, target_files_set)
+--
+-- ST2: signature extended to (path, target_files_set, mf_state, conf).
+-- mf_state and conf may be nil when called from paths that do not yet pass them
+-- (guards below ensure backward-safe behaviour).
+-- Size branch:
+--   content <= READ_FILE_FULL_THRESHOLD → return full content (unchanged behaviour)
+--   content >  READ_FILE_FULL_THRESHOLD → run distill_subloop (stub in ST2)
+--     cache hit  → return format_digest_response(cached)  [no LLM call]
+--     cache miss → call distill_subloop → cache result → format_digest_response
+--     distill failure → truncate_with_warning (loop continues)
+local function read_file_tool_handler(path, target_files_set, mf_state, conf)
+    -- Error messages below are kept verbatim from the original (BC2 regression guard).
     if not target_files_set[path] then
         return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
     end
@@ -938,7 +1447,44 @@ local function read_file_tool_handler(path, target_files_set)
     end
     local content = f:read("*a")
     f:close()
-    return { ok = true, content = content or "" }
+    content = content or ""
+
+    -- Below-threshold: return full content unchanged (AC #2, backward-compat).
+    if #content <= READ_FILE_FULL_THRESHOLD then
+        return { ok = true, content = content }
+    end
+
+    -- Above-threshold: use distill / cache path.
+    -- mf_state guard: if caller did not supply mf_state (legacy path), fall back to truncate.
+    if not mf_state or type(mf_state.file_digest) ~= "table" then
+        return { ok = true, content = truncate_with_warning(content, nil) }
+    end
+
+    local refresh_mode = mf_state.file_digest_refresh or "auto"
+    local cur_mtime    = file_mtime(path)
+    local cached       = mf_state.file_digest[path]
+
+    if should_use_cache(cached, cur_mtime, refresh_mode) then
+        -- Cache hit: return digest without calling distill_subloop (AC #3).
+        return { ok = true, content = format_digest_response(cached) }
+    end
+
+    -- Cache miss or forced refresh: call distill_subloop (stub in ST2).
+    local digest, line_index, distill_err = distill_subloop(path, content, mf_state, conf)
+    if distill_err then
+        -- Distill failure: return truncated content with warning; do not abort loop (AC #5).
+        return { ok = true, content = truncate_with_warning(content, distill_err) }
+    end
+
+    -- Store result in cache (AC #4).
+    mf_state.file_digest[path] = {
+        digest    = digest,
+        line_index = line_index,
+        mtime     = cur_mtime,
+        cached_at = os.time(),
+    }
+
+    return { ok = true, content = format_digest_response(mf_state.file_digest[path]) }
 end
 
 -- ============================================================
@@ -977,7 +1523,13 @@ local function iterate_files(target_files, grouped, existing_map)
     for _, abs_path in ipairs(target_files) do
         local file_blocks = grouped[abs_path]
         if file_blocks and #file_blocks > 0 then
-            local current = existing_map[abs_path] or ""
+            -- Always read raw file content from disk for SR application.
+            -- existing_map may contain a distilled digest (not raw content) when the
+            -- file exceeded READ_FILE_FULL_THRESHOLD; applying SR against a digest
+            -- would cause block matching to fail. Raw content is the correct base.
+            -- When the file has not been written yet (LLM emitting SR before read_file),
+            -- read_target_if_exists returns nil and we default to "".
+            local current = read_target_if_exists(abs_path) or ""
             local new_content, failed_indices = apply_blocks(current, file_blocks)
             if #failed_indices > 0 then
                 table.insert(all_failed, { path = abs_path, indices = failed_indices, blocks = file_blocks, current_content = current })
@@ -1124,12 +1676,20 @@ local function run_loop(conf)
     -- messages[] is rebuilt each iter from state; not accumulated across iters.
     -- sr_history is reserved for subtask 2 (stagnation_v2); initialized empty here.
     local mf_state = {
-        iter           = 0,
-        last_err       = nil,   -- most recent verify failure stderr (≤2,000 chars)
-        sr_digest_prev = nil,   -- digest of last SR block (≤500 chars)
-        sr_history     = {},    -- populated in subtask 2
+        iter                = 0,
+        last_err            = nil,   -- most recent verify failure stderr (≤2,000 chars)
+        sr_digest_prev      = nil,   -- digest of last SR block (≤500 chars)
+        sr_history          = {},    -- populated in subtask 2
+        -- ST1: per-iter-reset-surviving file digest cache (crux-card §1).
+        -- Keyed by absolute path; each entry: { digest, line_index, mtime, cached_at }.
+        -- Must NOT be cleared or overwritten in the per-iter rebuild path (L1149-1170).
+        file_digest         = {},
+        -- Refresh policy for file_digest cache ("auto" uses CACHE_AUTO_TTL_SEC).
+        file_digest_refresh = "auto",
     }
     assert(type(mf_state.sr_history) == "table", "mf_state.sr_history must be initialized")
+    assert(type(mf_state.file_digest) == "table", "mf_state.file_digest must be initialized")
+    assert(mf_state.file_digest_refresh == "auto", "mf_state.file_digest_refresh must default to 'auto'")
 
     -- For single-file mode, messages accumulate across iters (original behaviour).
     local messages
@@ -1178,7 +1738,7 @@ local function run_loop(conf)
             -- We build a shallow copy of conf with tools added to avoid mutating conf.
             call_opts = {}
             for k, v in pairs(conf) do call_opts[k] = v end
-            call_opts.tools = { READ_FILE_TOOL }
+            call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
         end
 
         local resp, err = llm_call(call_opts, messages)
@@ -1273,7 +1833,8 @@ local function run_loop(conf)
                                 { "cached", true },
                             })
                         else
-                            dispatch_result = read_file_tool_handler(path, target_files_set)
+                            -- ST2: pass mf_state and conf so size-branch + cache works.
+                            dispatch_result = read_file_tool_handler(path, target_files_set, mf_state, conf)
                             if dispatch_result.ok then
                                 -- Cache the result for this iter.
                                 existing_map[path] = dispatch_result.content
@@ -1302,6 +1863,41 @@ local function run_loop(conf)
                             type        = "tool_result",
                             tool_use_id = tb.id,
                             content     = result_text,
+                        })
+                    elseif tb.name == "read_file_range" then
+                        -- ST2: verbatim line-range retrieval; never passes through distill
+                        -- (crux-card §3: verbatim range access after distill).
+                        local inp        = tb.input or {}
+                        local path       = inp.path or ""
+                        local line_start = inp.line_start
+                        local line_end   = inp.line_end
+                        local rr_result  = read_file_range_tool_handler(
+                            path, line_start, line_end, target_files_set
+                        )
+                        local rr_text
+                        if rr_result.ok then
+                            rr_text = rr_result.content
+                            obs_event(mode, "tool_use", {
+                                { "iter",       iter },
+                                { "path",       path },
+                                { "tool",       "read_file_range" },
+                                { "line_start", tostring(line_start) },
+                                { "line_end",   tostring(line_end) },
+                                { "ok",         true },
+                            })
+                        else
+                            rr_text = "ERROR: " .. tostring(rr_result.error)
+                            obs_event(mode, "tool_use_fail", {
+                                { "iter", iter },
+                                { "path", path },
+                                { "tool", "read_file_range" },
+                                { "err",  rr_result.error },
+                            })
+                        end
+                        table.insert(tool_result_content, {
+                            type        = "tool_result",
+                            tool_use_id = tb.id,
+                            content     = rr_text,
                         })
                     else
                         -- Unknown tool name; return error to child LLM.
@@ -1895,6 +2491,54 @@ end
 --- Reset the llm_call override installed by M._test_set_llm_call().
 function M._test_reset_llm_call()
     _llm_call_override = nil
+end
+
+--- Return a fresh mf_state table with ST1 initial field defaults.
+--- Used by unit tests to assert invariants without running the full make() pipeline.
+--- Production callers must never call this.
+function M._test_make_mf_state()
+    return {
+        iter                = 0,
+        last_err            = nil,
+        sr_digest_prev      = nil,
+        sr_history          = {},
+        file_digest         = {},
+        file_digest_refresh = "auto",
+    }
+end
+
+--- Override the internal distill_subloop function for test monkey-patching.
+--- fn signature: (path, content, mf_state, conf) → digest, line_index, err_string|nil
+--- Call M._test_reset_distill_subloop() after the test to restore production behaviour.
+--- Production callers must never call this.
+function M._test_set_distill_subloop(fn)
+    assert(type(fn) == "function", "_test_set_distill_subloop requires a function")
+    _distill_subloop_override = fn
+end
+
+--- Reset the distill_subloop override installed by M._test_set_distill_subloop().
+function M._test_reset_distill_subloop()
+    _distill_subloop_override = nil
+end
+
+--- Expose internal helpers for unit testing (read-only access).
+--- Returns a table of helper functions so tests can call them directly.
+function M._test_helpers()
+    return {
+        should_use_cache            = should_use_cache,
+        format_digest_response      = format_digest_response,
+        truncate_with_warning       = truncate_with_warning,
+        read_file_range_tool_handler = read_file_range_tool_handler,
+        read_file_tool_handler       = read_file_tool_handler,
+        file_mtime                  = file_mtime,
+        -- ST3 additions
+        split_lines                 = split_lines,
+        chunk_by_lines              = chunk_by_lines,
+        extract_text                = extract_text,
+        call_distill_llm            = call_distill_llm,
+        binary_search_pack          = binary_search_pack,
+        build_line_index            = build_line_index,
+    }
 end
 
 return M
