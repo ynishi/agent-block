@@ -278,6 +278,170 @@ async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
     ct.cancel();
 }
 
+/// Verifies the compile_loop distill subloop with an OpenAI provider mock.
+///
+/// Scenario (3-turn per iter, with distill LLM calls interleaved):
+///   Turn 0 (main, with tools):   mock returns tool_use=read_file for the target file.
+///                                 compile_loop dispatches read_file → size > threshold →
+///                                 calls distill_subloop → N HTTP calls to mock (no tools).
+///   Turn 1 (distill, no tools):  mock returns short text summaries.
+///                                 distill_call_count incremented per chunk.
+///   Turn 2 (main, with tools + tool results): mock returns SR pass block.
+///                                 compile_loop applies SR → mock_runner returns ok=true.
+///
+/// Asserts:
+///   - COMPILE_LOOP_DISTILL_MOCK_PASS received (loop converged).
+///   - distill_call_count > 0 (distill subloop was triggered).
+///   - received_distill_body has no `tools` key (BC5: provider-agnostic distill).
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
+#[tokio::test]
+async fn compile_loop_distill_openai_mock_iterates_until_pass() {
+    let (addr, state) = common::compile_loop_distill_mock::spawn_distill_mock("openai").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let base_url = format!("http://{addr}");
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("distill_target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_distill_mock.lua")])
+            .env("OPENAI_BASE_URL_TEST", &base_url)
+            .env("DISTILL_MOCK_PROVIDER", "openai")
+            .env(
+                "COMPILE_LOOP_DISTILL_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_DISTILL_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert!(
+        state.distill_call_count.load(Ordering::SeqCst) > 0,
+        "distill_call_count must be > 0: distill subloop was not triggered"
+    );
+
+    let body_guard = state.received_distill_body.lock().unwrap();
+    let distill_body = body_guard
+        .as_ref()
+        .expect("received_distill_body must be set after distill call");
+    assert!(
+        distill_body.get("tools").is_none(),
+        "BC5: distill LLM call must not include `tools` field in request body"
+    );
+}
+
+/// Verifies the compile_loop distill subloop with an Anthropic provider mock.
+///
+/// Same scenario as `compile_loop_distill_openai_mock_iterates_until_pass` but
+/// using the Anthropic Messages API schema. Confirms provider-agnostic distill
+/// (crux-card §2: distill uses the same call path regardless of provider).
+///
+/// Asserts:
+///   - COMPILE_LOOP_DISTILL_MOCK_PASS received.
+///   - distill_call_count > 0.
+///   - received_distill_body has no `tools` key (BC5).
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
+#[tokio::test]
+async fn compile_loop_distill_anthropic_mock_iterates_until_pass() {
+    let (addr, state) = common::compile_loop_distill_mock::spawn_distill_mock("anthropic").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let base_url = format!("http://{addr}");
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("distill_target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_distill_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &base_url)
+            .env("DISTILL_MOCK_PROVIDER", "anthropic")
+            .env(
+                "COMPILE_LOOP_DISTILL_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_DISTILL_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert!(
+        state.distill_call_count.load(Ordering::SeqCst) > 0,
+        "distill_call_count must be > 0: distill subloop was not triggered"
+    );
+
+    let body_guard = state.received_distill_body.lock().unwrap();
+    let distill_body = body_guard
+        .as_ref()
+        .expect("received_distill_body must be set after distill call");
+    assert!(
+        distill_body.get("tools").is_none(),
+        "BC5: distill LLM call must not include `tools` field in request body"
+    );
+}
+
+/// Verifies that read_file_range returns verbatim source lines without distillation
+/// even when the target file exceeds READ_FILE_FULL_THRESHOLD (crux-card §3).
+///
+/// Scenario (Anthropic mock, 2 turns):
+///   Turn 0: mock returns tool_use=read_file_range(path, 10, 20).
+///           compile_loop dispatches to read_file_range_tool_handler.
+///           Handler reads lines 10-20 verbatim (no distill path).
+///   Turn 1: mock returns SR block (REPLACE_ME → DONE) after tool result.
+///           compile_loop applies SR → mock_runner returns ok=true.
+///
+/// Asserts:
+///   - READ_FILE_RANGE_VERBATIM_PASS received (loop converged using range access).
+///   - call_count == 2 (exactly 2 main LLM calls, no distill interleaved).
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
+#[tokio::test]
+async fn compile_loop_read_file_range_verbatim() {
+    let (addr, state) = common::compile_loop_distill_mock::spawn_range_mock().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let base_url = format!("http://{addr}");
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("range_target.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_distill_range_mock.lua"),
+            ])
+            .env("ANTHROPIC_BASE_URL_TEST", &base_url)
+            .env(
+                "COMPILE_LOOP_RANGE_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("READ_FILE_RANGE_VERBATIM_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    // Range mock: exactly 2 main calls (turn 0 + turn 1), no distill calls.
+    assert_eq!(
+        state.call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls to the range mock (turn 0: read_file_range, turn 1: SR pass)"
+    );
+    assert_eq!(
+        state.distill_call_count.load(Ordering::SeqCst),
+        0,
+        "range mock must not trigger distill subloop (read_file_range bypasses distill)"
+    );
+}
+
 /// Verifies that compile_loop emits ab.obs events when AGENT_BLOCK_LLM_DUMP=meta.
 ///
 /// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls).
