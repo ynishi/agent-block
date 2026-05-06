@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-06
+
 ### Removed
 
 - `compile_loop.make()` の `conf.register` opt を削除。姉件 fix (1777461322-92442) で
