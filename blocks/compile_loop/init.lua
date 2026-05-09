@@ -239,7 +239,8 @@ end
 --
 -- Conditions (all must hold):
 --   (1) #state.sr_history >= STAGNATION_WINDOW (= 3)
---   (2) Among the last STAGNATION_WINDOW entries, >= 2 share the same sr_hash
+--   (2) Among the last STAGNATION_WINDOW entries, all STAGNATION_WINDOW share the same sr_hash
+--       (full-window identical-hash requirement; partial matches do not trigger stagnation)
 --   (3) The most recent verify outcome is failure (caller passes last_verify_failed = true)
 --
 -- Returns: boolean
@@ -257,14 +258,28 @@ local function is_stagnant_v2(state, last_verify_failed)
     end
 
     -- Count occurrences of each hash within the recent window.
+    -- Stagnation requires ALL window entries to share the same hash (c >= STAGNATION_WINDOW).
+    -- A 2-of-3 partial match is not sufficient; LLM must have fully converged to one output.
     local counts = {}
     for _, h in ipairs(recent) do
         counts[h] = (counts[h] or 0) + 1
     end
     for _, c in pairs(counts) do
-        if c >= 2 then return true end
+        if c >= STAGNATION_WINDOW then return true end
     end
     return false
+end
+
+-- Convert a modified_set (path → true map) to a sorted list of path strings.
+-- Used to populate the modified_files field on every return path in the SR block.
+-- pure function, no errors.
+local function collect_modified_paths(set)
+    local paths = {}
+    for path in pairs(set) do
+        paths[#paths + 1] = path
+    end
+    table.sort(paths)
+    return paths
 end
 
 -- Update mf_state fields with optional trim policies (single write point — DRY).
@@ -1701,10 +1716,14 @@ local function run_loop(conf)
         file_digest         = {},
         -- Refresh policy for file_digest cache ("auto" uses CACHE_AUTO_TTL_SEC).
         file_digest_refresh = "auto",
+        -- Accumulates paths that were successfully written by iterate_files across iters.
+        -- Used to populate modified_files on every return path (crux §3).
+        modified_set        = {},
     }
     assert(type(mf_state.sr_history) == "table", "mf_state.sr_history must be initialized")
     assert(type(mf_state.file_digest) == "table", "mf_state.file_digest must be initialized")
     assert(mf_state.file_digest_refresh == "auto", "mf_state.file_digest_refresh must default to 'auto'")
+    assert(type(mf_state.modified_set) == "table", "mf_state.modified_set must be initialized")
 
     -- For single-file mode, messages accumulate across iters (original behaviour).
     local messages
@@ -2006,6 +2025,7 @@ local function run_loop(conf)
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
+                            modified_files = collect_modified_paths(mf_state.modified_set),
                             history        = history,
                         }
                     end
@@ -2033,7 +2053,14 @@ local function run_loop(conf)
                 -- existing_map was populated by the tool dispatch loop above.
                 -- Apply blocks using the on-demand-populated existing_map.
                 local grouped = group_blocks_by_path(blocks)
-                local _new_contents, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
+                local new_contents_map, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
+                -- Accumulate successfully-written paths into mf_state.modified_set for
+                -- modified_files preservation on every return path (crux §3).
+                if new_contents_map then
+                    for path in pairs(new_contents_map) do
+                        mf_state.modified_set[path] = true
+                    end
+                end
 
                 if write_err then
                     local werr_str = tostring(write_err)
@@ -2044,6 +2071,7 @@ local function run_loop(conf)
                         iters          = iter,
                         summary        = make_summary(false, iter, max_iters, "open_target_file"),
                         artifact_path  = nil,
+                        modified_files = collect_modified_paths(mf_state.modified_set),
                         history        = history,
                     }
                 end
@@ -2085,6 +2113,7 @@ local function run_loop(conf)
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
+                            modified_files = collect_modified_paths(mf_state.modified_set),
                             history        = history,
                         }
                     end
@@ -2109,11 +2138,14 @@ local function run_loop(conf)
                     end
 
                     if rr.ok then
+                        -- Append sr_hash to sr_history on success (crux §2: every SR attempt,
+                        -- regardless of ok value, must append to sr_history).
+                        update_state(mf_state, { sr_hash_append = compute_sr_hash(content) })
                         obs_event(mode, "converged", { { "iters", iter } })
                         return {
                             ok             = true,
                             artifact_path  = nil,
-                            modified_files = conf.target_files,
+                            modified_files = collect_modified_paths(mf_state.modified_set),
                             iters          = iter,
                             summary        = make_summary(true, iter, max_iters, nil),
                             history        = history,
@@ -2143,6 +2175,7 @@ local function run_loop(conf)
                             iters          = iter,
                             summary        = make_summary(false, iter, max_iters, "stagnation"),
                             artifact_path  = nil,
+                            modified_files = collect_modified_paths(mf_state.modified_set),
                             history        = history,
                         }
                     end
@@ -2334,7 +2367,7 @@ local function run_loop(conf)
     local last = history[#history] or {}
     local last_stderr = tostring(((last.result) or {}).stderr or ""):sub(-800)
     obs_event(mode, "max_iters_reached", { { "iters", max_iters } })
-    return {
+    local max_iters_result = {
         ok             = false,
         failure_reason = "max_iters",
         last_error     = last_stderr,
@@ -2344,6 +2377,11 @@ local function run_loop(conf)
         artifact_path  = artifact_path,
         history        = history,
     }
+    -- Preserve modified_files for multi-file branch (single-file uses or {} on consumer side).
+    if multi_file then
+        max_iters_result.modified_files = collect_modified_paths(mf_state.modified_set)
+    end
+    return max_iters_result
 end
 
 -- ============================================================
@@ -2519,6 +2557,7 @@ function M._test_make_mf_state()
         sr_history          = {},
         file_digest         = {},
         file_digest_refresh = "auto",
+        modified_set        = {},
     }
 end
 
@@ -2552,6 +2591,11 @@ function M._test_helpers()
         extract_text                = extract_text,
         call_distill_llm            = call_distill_llm,
         binary_search_pack          = binary_search_pack,
+        -- Stagnation / bookkeeping helpers (for unit testing 3-fix)
+        is_stagnant_v2              = is_stagnant_v2,
+        compute_sr_hash             = compute_sr_hash,
+        collect_modified_paths      = collect_modified_paths,
+        update_state                = update_state,
         build_line_index            = build_line_index,
     }
 end
