@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `compile_loop` — stagnation detection threshold corrected: `is_stagnant_v2` now requires
+  all `STAGNATION_WINDOW` (= 3) consecutive hashes to be identical before declaring
+  stagnation, up from the previous "2-of-3" condition that fired after only a single
+  repeated pair (`blocks/compile_loop/init.lua`).
+- `compile_loop` — `sr_history` is now appended on every SR attempt regardless of outcome.
+  Previously, successful SR returns (`rr.ok=true`) never updated `sr_history`, so stagnation
+  detection operated on a biased sample that excluded all successful iterations.
+- `compile_loop` — `modified_files` is now populated on every return path in the multi-file
+  SR processing block. Previously, all failure-path returns omitted the field and silently
+  discarded the `new_contents_map` produced by `iterate_files`, causing the wrapper to
+  report `edits_applied=0` even when file edits had been written to disk.
+
 ## [0.11.0] - 2026-05-06
 
 ### Removed
