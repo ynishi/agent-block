@@ -365,6 +365,21 @@ local function cl_oai_normalize(raw)
         table.insert(text_parts, text)
     end
 
+    -- DEBUG (2026-05-09): raw assistant content dump for Gemma debugging.
+    -- Gated by AGENT_BLOCK_DEBUG_RAW=1 env. Issue 1778284470-98687.
+    if std.env.get("AGENT_BLOCK_DEBUG_RAW") == "1" then
+        local tc_count = #(message.tool_calls or {})
+        local preview = (text or ""):sub(1, 1500)
+        log.info("[DEBUG_RAW] content_len=" .. tostring(text and #text or 0)
+            .. " tool_calls=" .. tostring(tc_count)
+            .. " content_preview<<<" .. preview .. ">>>")
+        for i, tc in ipairs(message.tool_calls or {}) do
+            local fn = tc["function"] or {}
+            log.info("[DEBUG_RAW] tool_call[" .. i .. "] name=" .. tostring(fn.name)
+                .. " args=" .. tostring(fn.arguments or ""):sub(1, 500))
+        end
+    end
+
     -- tool_calls → tool_use_blocks.
     for _, tc in ipairs(message.tool_calls or {}) do
         local fn    = tc["function"] or {}
