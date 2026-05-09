@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-10
+
+### Added
+
+- `AGENT_BLOCK_DEBUG_RAW=1` env hook — when set, `compile_loop` dumps raw assistant
+  responses for debugging visibility (no API change; opt-in via env var).
+
 ### Fixed
 
 - `compile_loop` — stagnation detection threshold corrected: `is_stagnant_v2` now requires
