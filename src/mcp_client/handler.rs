@@ -12,8 +12,8 @@ use rmcp::{
     handler::client::ClientHandler,
     model::{
         CreateMessageRequestParams, CreateMessageResult, LoggingLevel,
-        LoggingMessageNotificationParam, ProgressNotificationParam, Role, SamplingMessage,
-        SamplingMessageContent,
+        LoggingMessageNotificationParam, ProgressNotificationParam,
+        ResourceUpdatedNotificationParam, Role, SamplingMessage, SamplingMessageContent,
     },
     service::{NotificationContext, RequestContext, RoleClient},
     ErrorData as McpError,
@@ -40,6 +40,31 @@ pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
 pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
+
+/// Global table that holds user-provided resource-update callbacks stored by
+/// server name on the **main Isle**.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_RESOURCE_UPDATE_CBS: &str = "__mcp_user_resource_update_cbs";
+
+/// Global table that holds user-provided resources-list-changed callbacks stored
+/// by server name on the **main Isle**.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_RESOURCES_LIST_CHANGED_CBS: &str =
+    "__mcp_user_resources_list_changed_cbs";
+
+/// Global table that holds user-provided tools-list-changed callbacks stored by
+/// server name on the **main Isle**.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_TOOLS_LIST_CHANGED_CBS: &str = "__mcp_user_tools_list_changed_cbs";
+
+/// Global table that holds user-provided prompts-list-changed callbacks stored
+/// by server name on the **main Isle**.
+///
+/// Same rationale as `MCP_USER_PROGRESS_CBS`.
+pub(crate) const MCP_USER_PROMPTS_LIST_CHANGED_CBS: &str = "__mcp_user_prompts_list_changed_cbs";
 
 /// Capacity of the bounded notification dispatch channel.
 ///
@@ -74,9 +99,14 @@ pub(crate) struct ServerHandlerRegistry {
     pub(crate) on_progress: bool,
     /// Whether a Lua on_log handler is installed on the handler Isle.
     pub(crate) on_log: bool,
-    /// Whether a Lua on_resource_updated handler is installed (placeholder).
-    #[allow(dead_code)]
+    /// Whether a Lua on_resource_updated handler is installed.
     pub(crate) on_resource_updated: bool,
+    /// Whether a Lua on_resource_list_changed handler is installed.
+    pub(crate) on_resource_list_changed: bool,
+    /// Whether a Lua on_tool_list_changed handler is installed.
+    pub(crate) on_tool_list_changed: bool,
+    /// Whether a Lua on_prompt_list_changed handler is installed.
+    pub(crate) on_prompt_list_changed: bool,
     /// Whether a Lua sampling callback is installed on the handler Isle.
     pub(crate) sampling: bool,
     /// Whether to inject `__ab_obs` trace context into `call_tool` arguments
@@ -91,6 +121,9 @@ impl ServerHandlerRegistry {
             on_progress: false,
             on_log: false,
             on_resource_updated: false,
+            on_resource_list_changed: false,
+            on_tool_list_changed: false,
+            on_prompt_list_changed: false,
             sampling: false,
             trace_context: false,
         }
@@ -246,6 +279,42 @@ impl AgentBlockClientHandler {
             .entry(server_name.to_string())
             .or_insert_with(ServerHandlerRegistry::new);
         entry.on_log = true;
+    }
+
+    /// Mark that a Lua on_resource_updated handler has been installed.
+    pub(crate) fn mark_on_resource_updated(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.on_resource_updated = true;
+    }
+
+    /// Mark that a Lua on_resource_list_changed handler has been installed.
+    pub(crate) fn mark_on_resource_list_changed(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.on_resource_list_changed = true;
+    }
+
+    /// Mark that a Lua on_tool_list_changed handler has been installed.
+    pub(crate) fn mark_on_tool_list_changed(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.on_tool_list_changed = true;
+    }
+
+    /// Mark that a Lua on_prompt_list_changed handler has been installed.
+    pub(crate) fn mark_on_prompt_list_changed(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.on_prompt_list_changed = true;
     }
 
     /// Set whether trace context (`__ab_obs`) should be injected into `call_tool`
@@ -643,6 +712,276 @@ impl ClientHandler for AgentBlockClientHandler {
         }
     }
 
+    fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let main_isle = self.main_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name_opt = self.server_name.clone();
+        let notify_tx = self.notify_tx.clone();
+
+        async move {
+            let main_isle = match main_isle {
+                Some(i) => i,
+                None => return,
+            };
+            let server_name = match server_name_opt {
+                Some(s) => s,
+                None => return,
+            };
+            let has_cb = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&server_name)
+                    .is_some_and(|r| r.on_resource_updated)
+                // guard dropped here — no await held (K-4)
+            };
+            if !has_cb {
+                return;
+            }
+
+            let uri = params.uri.clone();
+
+            if let Some(tx) = notify_tx {
+                let item = NotificationItem {
+                    isle: main_isle,
+                    server_name,
+                    cbs_table: MCP_USER_RESOURCE_UPDATE_CBS,
+                    build_ev: Box::new(move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "resource_update")?;
+                        ev.set("server", server_for_task)?;
+                        ev.set("uri", uri.as_str())?;
+                        Ok(ev)
+                    }),
+                    caller: "on_resource_updated",
+                };
+                if let Err(e) = tx.try_send(item) {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        error = %e,
+                        "on_resource_updated: notification channel full, dropping notification \
+                         (server is emitting faster than Lua can consume)"
+                    );
+                }
+            } else {
+                isle_dispatch(
+                    main_isle,
+                    server_name,
+                    MCP_USER_RESOURCE_UPDATE_CBS,
+                    move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "resource_update")?;
+                        ev.set("server", server_for_task)?;
+                        ev.set("uri", uri.as_str())?;
+                        Ok(ev)
+                    },
+                    "on_resource_updated",
+                );
+            }
+        }
+    }
+
+    fn on_resource_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let main_isle = self.main_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name_opt = self.server_name.clone();
+        let notify_tx = self.notify_tx.clone();
+
+        async move {
+            let main_isle = match main_isle {
+                Some(i) => i,
+                None => return,
+            };
+            let server_name = match server_name_opt {
+                Some(s) => s,
+                None => return,
+            };
+            let has_cb = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&server_name)
+                    .is_some_and(|r| r.on_resource_list_changed)
+                // guard dropped here — no await held (K-4)
+            };
+            if !has_cb {
+                return;
+            }
+
+            if let Some(tx) = notify_tx {
+                let item = NotificationItem {
+                    isle: main_isle,
+                    server_name,
+                    cbs_table: MCP_USER_RESOURCES_LIST_CHANGED_CBS,
+                    build_ev: Box::new(move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "resources_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    }),
+                    caller: "on_resource_list_changed",
+                };
+                if let Err(e) = tx.try_send(item) {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        error = %e,
+                        "on_resource_list_changed: notification channel full, dropping notification"
+                    );
+                }
+            } else {
+                isle_dispatch(
+                    main_isle,
+                    server_name,
+                    MCP_USER_RESOURCES_LIST_CHANGED_CBS,
+                    move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "resources_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    },
+                    "on_resource_list_changed",
+                );
+            }
+        }
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let main_isle = self.main_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name_opt = self.server_name.clone();
+        let notify_tx = self.notify_tx.clone();
+
+        async move {
+            let main_isle = match main_isle {
+                Some(i) => i,
+                None => return,
+            };
+            let server_name = match server_name_opt {
+                Some(s) => s,
+                None => return,
+            };
+            let has_cb = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&server_name)
+                    .is_some_and(|r| r.on_tool_list_changed)
+                // guard dropped here — no await held (K-4)
+            };
+            if !has_cb {
+                return;
+            }
+
+            if let Some(tx) = notify_tx {
+                let item = NotificationItem {
+                    isle: main_isle,
+                    server_name,
+                    cbs_table: MCP_USER_TOOLS_LIST_CHANGED_CBS,
+                    build_ev: Box::new(move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "tools_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    }),
+                    caller: "on_tool_list_changed",
+                };
+                if let Err(e) = tx.try_send(item) {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        error = %e,
+                        "on_tool_list_changed: notification channel full, dropping notification"
+                    );
+                }
+            } else {
+                isle_dispatch(
+                    main_isle,
+                    server_name,
+                    MCP_USER_TOOLS_LIST_CHANGED_CBS,
+                    move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "tools_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    },
+                    "on_tool_list_changed",
+                );
+            }
+        }
+    }
+
+    fn on_prompt_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let main_isle = self.main_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name_opt = self.server_name.clone();
+        let notify_tx = self.notify_tx.clone();
+
+        async move {
+            let main_isle = match main_isle {
+                Some(i) => i,
+                None => return,
+            };
+            let server_name = match server_name_opt {
+                Some(s) => s,
+                None => return,
+            };
+            let has_cb = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&server_name)
+                    .is_some_and(|r| r.on_prompt_list_changed)
+                // guard dropped here — no await held (K-4)
+            };
+            if !has_cb {
+                return;
+            }
+
+            if let Some(tx) = notify_tx {
+                let item = NotificationItem {
+                    isle: main_isle,
+                    server_name,
+                    cbs_table: MCP_USER_PROMPTS_LIST_CHANGED_CBS,
+                    build_ev: Box::new(move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "prompts_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    }),
+                    caller: "on_prompt_list_changed",
+                };
+                if let Err(e) = tx.try_send(item) {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        error = %e,
+                        "on_prompt_list_changed: notification channel full, dropping notification"
+                    );
+                }
+            } else {
+                isle_dispatch(
+                    main_isle,
+                    server_name,
+                    MCP_USER_PROMPTS_LIST_CHANGED_CBS,
+                    move |lua, server_for_task| {
+                        let ev = lua.create_table()?;
+                        ev.set("type", "prompts_list_changed")?;
+                        ev.set("server", server_for_task)?;
+                        Ok(ev)
+                    },
+                    "on_prompt_list_changed",
+                );
+            }
+        }
+    }
+
     fn create_message(
         &self,
         params: CreateMessageRequestParams,
@@ -882,6 +1221,42 @@ mod tests {
         h.mark_sampling("srv");
         let guard = h.registry.lock().unwrap();
         assert!(guard.get("srv").unwrap().sampling);
+    }
+
+    #[test]
+    fn mark_on_resource_updated_sets_flag() {
+        let h = AgentBlockClientHandler::new();
+        h.ensure_server("srv");
+        h.mark_on_resource_updated("srv");
+        let guard = h.registry.lock().unwrap();
+        assert!(guard.get("srv").unwrap().on_resource_updated);
+    }
+
+    #[test]
+    fn mark_on_resource_list_changed_sets_flag() {
+        let h = AgentBlockClientHandler::new();
+        h.ensure_server("srv");
+        h.mark_on_resource_list_changed("srv");
+        let guard = h.registry.lock().unwrap();
+        assert!(guard.get("srv").unwrap().on_resource_list_changed);
+    }
+
+    #[test]
+    fn mark_on_tool_list_changed_sets_flag() {
+        let h = AgentBlockClientHandler::new();
+        h.ensure_server("srv");
+        h.mark_on_tool_list_changed("srv");
+        let guard = h.registry.lock().unwrap();
+        assert!(guard.get("srv").unwrap().on_tool_list_changed);
+    }
+
+    #[test]
+    fn mark_on_prompt_list_changed_sets_flag() {
+        let h = AgentBlockClientHandler::new();
+        h.ensure_server("srv");
+        h.mark_on_prompt_list_changed("srv");
+        let guard = h.registry.lock().unwrap();
+        assert!(guard.get("srv").unwrap().on_prompt_list_changed);
     }
 
     /// Verify that `install_mcp_dispatcher_on_handler_isle` now only installs the

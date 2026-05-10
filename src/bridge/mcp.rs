@@ -19,7 +19,11 @@ use std::sync::Arc;
 
 use crate::bridge::obs;
 use crate::host::HostContext;
-use crate::mcp_client::handler::{MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS};
+use crate::mcp_client::handler::{
+    MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS, MCP_USER_PROMPTS_LIST_CHANGED_CBS,
+    MCP_USER_RESOURCES_LIST_CHANGED_CBS, MCP_USER_RESOURCE_UPDATE_CBS,
+    MCP_USER_TOOLS_LIST_CHANGED_CBS,
+};
 
 use super::{json_to_lua, lua_to_json};
 
@@ -41,6 +45,38 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     }
     if lua.globals().get::<mlua::Value>(MCP_USER_LOG_CBS)?.is_nil() {
         lua.globals().set(MCP_USER_LOG_CBS, lua.create_table()?)?;
+    }
+    if lua
+        .globals()
+        .get::<mlua::Value>(MCP_USER_RESOURCE_UPDATE_CBS)?
+        .is_nil()
+    {
+        lua.globals()
+            .set(MCP_USER_RESOURCE_UPDATE_CBS, lua.create_table()?)?;
+    }
+    if lua
+        .globals()
+        .get::<mlua::Value>(MCP_USER_RESOURCES_LIST_CHANGED_CBS)?
+        .is_nil()
+    {
+        lua.globals()
+            .set(MCP_USER_RESOURCES_LIST_CHANGED_CBS, lua.create_table()?)?;
+    }
+    if lua
+        .globals()
+        .get::<mlua::Value>(MCP_USER_TOOLS_LIST_CHANGED_CBS)?
+        .is_nil()
+    {
+        lua.globals()
+            .set(MCP_USER_TOOLS_LIST_CHANGED_CBS, lua.create_table()?)?;
+    }
+    if lua
+        .globals()
+        .get::<mlua::Value>(MCP_USER_PROMPTS_LIST_CHANGED_CBS)?
+        .is_nil()
+    {
+        lua.globals()
+            .set(MCP_USER_PROMPTS_LIST_CHANGED_CBS, lua.create_table()?)?;
     }
     let script_name: String = lua
         .globals()
@@ -462,6 +498,150 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
                     mgr.read().await.handler.mark_on_log(&server_name);
 
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.subscribe_resource(server_name, uri) → { ok=bool, error=str }
+    // Subscribe to resource updates for the given URI on the named server.
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "subscribe_resource",
+            lua.create_async_function(move |lua, (name, uri): (String, String)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let result = mgr.read().await.subscribe_resource(&name, &uri).await;
+                    let tbl = lua.create_table()?;
+                    match result {
+                        Ok(_) => {
+                            tbl.set("ok", true)?;
+                        }
+                        Err(e) => {
+                            tbl.set("ok", false)?;
+                            tbl.set("error", e.to_string())?;
+                        }
+                    }
+                    Ok(tbl)
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.unsubscribe_resource(server_name, uri) → { ok=bool, error=str }
+    // Unsubscribe from resource updates for the given URI on the named server.
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "unsubscribe_resource",
+            lua.create_async_function(move |lua, (name, uri): (String, String)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let result = mgr.read().await.unsubscribe_resource(&name, &uri).await;
+                    let tbl = lua.create_table()?;
+                    match result {
+                        Ok(_) => {
+                            tbl.set("ok", true)?;
+                        }
+                        Err(e) => {
+                            tbl.set("ok", false)?;
+                            tbl.set("error", e.to_string())?;
+                        }
+                    }
+                    Ok(tbl)
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.on_resource_update(server_name, fn)
+    // Registers a Lua callback for resource-update notifications from `server_name`.
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server, uri
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "on_resource_update",
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_RESOURCE_UPDATE_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+                    mgr.read()
+                        .await
+                        .handler
+                        .mark_on_resource_updated(&server_name);
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.on_resources_list_changed(server_name, fn)
+    // Registers a Lua callback for resources-list-changed notifications from `server_name`.
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "on_resources_list_changed",
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_RESOURCES_LIST_CHANGED_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+                    mgr.read()
+                        .await
+                        .handler
+                        .mark_on_resource_list_changed(&server_name);
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.on_tools_list_changed(server_name, fn)
+    // Registers a Lua callback for tools-list-changed notifications from `server_name`.
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "on_tools_list_changed",
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_TOOLS_LIST_CHANGED_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+                    mgr.read()
+                        .await
+                        .handler
+                        .mark_on_tool_list_changed(&server_name);
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
+    // mcp.on_prompts_list_changed(server_name, fn)
+    // Registers a Lua callback for prompts-list-changed notifications from `server_name`.
+    // The callback signature: function(ev) where ev is a table with fields:
+    //   type, server
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "on_prompts_list_changed",
+            lua.create_async_function(move |lua, (server_name, func): (String, LuaFunction)| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let tbl: LuaTable = lua.globals().get(MCP_USER_PROMPTS_LIST_CHANGED_CBS)?;
+                    tbl.set(server_name.as_str(), func)?;
+                    mgr.read()
+                        .await
+                        .handler
+                        .mark_on_prompt_list_changed(&server_name);
                     Ok(())
                 }
             })?,
