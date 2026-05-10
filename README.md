@@ -133,6 +133,23 @@ See `examples/verify_echo_harness.lua` for the full verification script.
   Returns `{ ok=true, server_info={serverInfo, capabilities, ...} }` on success.
   Useful for inspecting which MCP capability groups (resources, prompts, tools, etc.)
   a server declares. Returns `{ ok=false, error="..." }` if the server is not connected.
+- `mcp.subscribe_resource(server, uri)` — Send a `resources/subscribe` RPC for the given
+  resource URI. Returns `{ ok=true }` on success or `{ ok=false, error="..." }` on failure.
+  Requires the server to declare the `resources.subscribe` capability.
+- `mcp.unsubscribe_resource(server, uri)` — Send a `resources/unsubscribe` RPC to stop
+  receiving change notifications for the given URI. Same return shape as `subscribe_resource`.
+- `mcp.on_resource_update(server, callback)` — Register a per-server callback for
+  `notifications/resources/updated` events. `callback(ev)` where
+  `ev = { type="resource_update", server, uri }`. Handler must be a pure Lua function.
+- `mcp.on_resources_list_changed(server, callback)` — Register a per-server callback for
+  `notifications/resources/list_changed` events. `callback(ev)` where
+  `ev = { type="resources_list_changed", server }`.
+- `mcp.on_tools_list_changed(server, callback)` — Register a per-server callback for
+  `notifications/tools/list_changed` events. `callback(ev)` where
+  `ev = { type="tools_list_changed", server }`.
+- `mcp.on_prompts_list_changed(server, callback)` — Register a per-server callback for
+  `notifications/prompts/list_changed` events. `callback(ev)` where
+  `ev = { type="prompts_list_changed", server }`.
 - `mcp.disconnect(name)` — Disconnect server
 
 ### mesh.*
