@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-10
+
 ### Added
 
+- `docs/architecture/agent-state-primitives.md` — design draft cataloging current
+  KV / SQLite primitive contract and proposed Data Primitive Futures along 4 axes
+  (Storage / Knowledge / Coordination / External). Includes Notification / Watch
+  Convention (§2.6) and the existing-primitive gap entry for MCP Resource Subscribe
+  (§3.7) that this release implements.
+- `docs/runbooks/e2e-mcp-resource-subscribe.md` — runbook covering positive
+  (`cargo test --test e2e_mcp_resource_subscribe`) and negative (shell smoke
+  against an MCP server without `resources.subscribe` capability, e.g.
+  `outline-mcp`) verification of the 6 new APIs.
 - `mcp.subscribe_resource(server, uri)` — send a `resources/subscribe` RPC to the named
   MCP server for the given resource URI. Returns `{ ok=true }` on success or
   `{ ok=false, error="..." }` on timeout / protocol failure. Requires the server to declare
