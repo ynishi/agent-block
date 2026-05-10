@@ -42,7 +42,8 @@ use mlua_isle::AsyncIsle;
 use rmcp::{
     model::{
         CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
+        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams, SubscribeRequestParams,
+        UnsubscribeRequestParams,
     },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
@@ -418,6 +419,54 @@ impl McpManager {
             })?;
         serde_json::to_value(&result)
             .map_err(|e| BlockError::Mcp(format!("serialize read_resource result: {e}")))
+    }
+
+    /// Call `resources/subscribe` to subscribe to updates for the given URI.
+    ///
+    /// Immutable receiver — usable under `RwLock::read`.
+    pub async fn subscribe_resource(&self, name: &str, uri: &str) -> BlockResult<()> {
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, uri = %uri, "mcp subscribe_resource on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        let params = SubscribeRequestParams::new(uri);
+        timeout(rpc_timeout, srv.subscribe(params))
+            .await
+            .map_err(|_| {
+                warn!(server = %name, uri = %uri, timeout = ?rpc_timeout, "mcp subscribe_resource timed out");
+                BlockError::Timeout(format!(
+                    "subscribe_resource '{uri}' on '{name}' timed out after {rpc_timeout:?}"
+                ))
+            })?
+            .map_err(|e| {
+                warn!(server = %name, uri = %uri, error = %e, "mcp subscribe_resource failed");
+                BlockError::Mcp(format!("subscribe_resource '{uri}' on '{name}': {e}"))
+            })
+    }
+
+    /// Call `resources/unsubscribe` to stop receiving updates for the given URI.
+    ///
+    /// Immutable receiver — usable under `RwLock::read`.
+    pub async fn unsubscribe_resource(&self, name: &str, uri: &str) -> BlockResult<()> {
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, uri = %uri, "mcp unsubscribe_resource on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        let params = UnsubscribeRequestParams::new(uri);
+        timeout(rpc_timeout, srv.unsubscribe(params))
+            .await
+            .map_err(|_| {
+                warn!(server = %name, uri = %uri, timeout = ?rpc_timeout, "mcp unsubscribe_resource timed out");
+                BlockError::Timeout(format!(
+                    "unsubscribe_resource '{uri}' on '{name}' timed out after {rpc_timeout:?}"
+                ))
+            })?
+            .map_err(|e| {
+                warn!(server = %name, uri = %uri, error = %e, "mcp unsubscribe_resource failed");
+                BlockError::Mcp(format!("unsubscribe_resource '{uri}' on '{name}': {e}"))
+            })
     }
 
     /// Call `prompts/list` and return prompts as a JSON array.
