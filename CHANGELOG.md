@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mcp.subscribe_resource(server, uri)` — send a `resources/subscribe` RPC to the named
+  MCP server for the given resource URI. Returns `{ ok=true }` on success or
+  `{ ok=false, error="..." }` on timeout / protocol failure. Requires the server to declare
+  the `resources.subscribe` capability.
+- `mcp.unsubscribe_resource(server, uri)` — send a `resources/unsubscribe` RPC to
+  stop receiving change notifications for the given URI. Same return shape as
+  `subscribe_resource`.
+- `mcp.on_resource_update(server, callback)` — register a per-server Lua callback for
+  `notifications/resources/updated` events. `callback(ev)` is called with
+  `ev = { type="resource_update", server, uri }`. Handler must be a pure Lua function;
+  execution errors are logged at `warn` and the notification is dropped.
+- `mcp.on_resources_list_changed(server, callback)` — register a per-server Lua callback
+  for `notifications/resources/list_changed` events. `callback(ev)` is called with
+  `ev = { type="resources_list_changed", server }`. Same handler contract as
+  `on_resource_update`.
+- `mcp.on_tools_list_changed(server, callback)` — register a per-server Lua callback for
+  `notifications/tools/list_changed` events. `callback(ev)` is called with
+  `ev = { type="tools_list_changed", server }`.
+- `mcp.on_prompts_list_changed(server, callback)` — register a per-server Lua callback
+  for `notifications/prompts/list_changed` events. `callback(ev)` is called with
+  `ev = { type="prompts_list_changed", server }`.
+- `examples/mcp_resource_subscribe.lua` — runnable smoke-test demonstrating the full
+  subscribe → callback-fire round-trip against a live MCP server with resource-subscribe
+  capability.
+- E2E test `mcp_resource_subscribe_round_trip` in `tests/e2e_mcp_resource_subscribe.rs`:
+  in-process MCP server with `enable_resources_subscribe()` capability, verifies that
+  `subscribe_resource` succeeds, a server-side `notify_resource_updated` push fires the
+  registered Lua `on_resource_update` callback with the correct `uri` payload, and
+  `unsubscribe_resource` succeeds. All four `ClientHandler` notification overrides
+  (`on_resource_updated`, `on_resource_list_changed`, `on_tool_list_changed`,
+  `on_prompt_list_changed`) use the existing mpsc channel (cap=128) + per-server global
+  callback table dispatch pattern, identical to the `on_progress` / `on_log` implementation.
+
 ## [0.11.1] - 2026-05-10
 
 ### Added
