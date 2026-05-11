@@ -53,6 +53,29 @@ local function env_true(name)
     return v == "1" or v == "true" or v == "yes" or v == "on"
 end
 
+-- Module-level override for test monkey-patching of std.env.get (set via M._test_set_env_get).
+-- Declared here so resolve_temperature() can close over it as an upvalue.
+local _env_get_override = nil
+
+--- resolve_temperature() — infallible, returns a number.
+--- Priority: caller (opts.temperature) > COMPILE_LOOP_LLM_TEMPERATURE env > 0.0 default.
+--- This function returns only the env/default tier; caller tier is applied at the call site.
+local function resolve_temperature()
+    local s
+    if _env_get_override then
+        s = _env_get_override("COMPILE_LOOP_LLM_TEMPERATURE")
+    else
+        s = std.env.get("COMPILE_LOOP_LLM_TEMPERATURE")
+    end
+    if s == nil then return 0.0 end
+    local n = tonumber(s)
+    if n == nil then
+        log.warn("compile_loop: COMPILE_LOOP_LLM_TEMPERATURE=" .. tostring(s) .. " is not a valid number; falling back to 0.0")
+        return 0.0
+    end
+    return n
+end
+
 local function normalize_dump_mode(v)
     if not v or v == "" then return nil end
     v = string.lower(tostring(v))
@@ -668,7 +691,7 @@ local function llm_call(opts, messages)
     local body = {
         model       = opts.model or "gpt-4o-mini",
         max_tokens  = opts.max_tokens or 4096,
-        temperature = opts.temperature or 0.2,
+        temperature = opts.temperature or resolve_temperature(),
         messages    = oai_messages,
     }
     if opts.disable_thinking then
@@ -1735,8 +1758,13 @@ local function run_loop(conf)
     end
 
     local history = {}
+    -- bad_stagnation_count: counts consecutive iters where the LLM produced zero successful edits.
+    -- Reset to 0 whenever at least one edit applies (good iter). When it reaches STAGNATION_WINDOW,
+    -- the loop terminates with failure_reason = "no_edits_applied".
+    local bad_stagnation_count = 0
 
     for iter = 1, max_iters do
+        local iter_edits_applied = 0  -- reset each iter; incremented when >= 1 edit succeeds
         local obs_target = artifact_path or table.concat(conf.target_files, ",")
         obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
 
@@ -2012,7 +2040,35 @@ local function run_loop(conf)
                         sr_hash_append = parse_sr_hash,
                     })
                     -- Stagnation check using sr_history (messages[] independent).
-                    if is_stagnant_v2(mf_state, true) then
+                    -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
+                    if iter_edits_applied == 0 then
+                        bad_stagnation_count = bad_stagnation_count + 1
+                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                            obs_event(mode, "bad_stagnation_blocked", {
+                                { "iter",   iter },
+                                { "reason", "no_edits_applied" },
+                            })
+                            return {
+                                ok             = false,
+                                failure_reason = "no_edits_applied",
+                                last_error     = mf_state.last_err or "",
+                                iters          = iter,
+                                summary        = make_summary(false, iter, max_iters, "no_edits_applied"),
+                                artifact_path  = nil,
+                                modified_files = collect_modified_paths(mf_state.modified_set),
+                                history        = history,
+                            }
+                        end
+                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                        local retry_msg = "Your previous attempt produced zero successful edits."
+                            .. " You must emit a SEARCH/REPLACE block that actually applies"
+                            .. " — make sure the SEARCH section matches the current file content exactly."
+                        update_state(mf_state, { last_err = mf_state.last_err })
+                        messages = {
+                            { role = "system", content = system },
+                            { role = "user",   content = table.concat({ multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg }, "") },
+                        }
+                    elseif is_stagnant_v2(mf_state, true) then
                         obs_event(mode, "stagnation_v2", {
                             { "iter",           iter },
                             { "sr_hash_recent", parse_sr_hash:sub(1, 8) },
@@ -2031,8 +2087,32 @@ local function run_loop(conf)
                     end
                     -- messages[] for next iter is rebuilt from state; drop current iter messages.
                 else
-                    -- Stagnation check uses history entry result.stderr.
-                    if is_stagnant(history) then
+                    -- Single-file parse failure: LLM emitted zero edits — bad stagnation check.
+                    -- Bad stagnation takes priority over good stagnation (stderr-based).
+                    if iter_edits_applied == 0 then
+                        bad_stagnation_count = bad_stagnation_count + 1
+                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                            obs_event(mode, "bad_stagnation_blocked", {
+                                { "iter",   iter },
+                                { "reason", "no_edits_applied" },
+                            })
+                            return {
+                                ok             = false,
+                                failure_reason = "no_edits_applied",
+                                last_error     = fmt_msg:sub(-800),
+                                iters          = iter,
+                                summary        = make_summary(false, iter, max_iters, "no_edits_applied"),
+                                artifact_path  = artifact_path,
+                                history        = history,
+                            }
+                        end
+                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                        local retry_msg = "Your previous attempt produced zero successful edits."
+                            .. " You must emit a SEARCH/REPLACE block that actually applies"
+                            .. " — make sure the SEARCH section matches the current file content exactly."
+                        table.insert(messages, { role = "assistant", content = content })
+                        table.insert(messages, { role = "user",      content = retry_msg })
+                    elseif is_stagnant(history) then
                         obs_event(mode, "stagnation", { { "iters", iter } })
                         return {
                             ok             = false,
@@ -2043,9 +2123,10 @@ local function run_loop(conf)
                             artifact_path  = artifact_path,
                             history        = history,
                         }
+                    else
+                        table.insert(messages, { role = "assistant", content = content })
+                        table.insert(messages, { role = "user",      content = fmt_msg })
                     end
-                    table.insert(messages, { role = "assistant", content = content })
-                    table.insert(messages, { role = "user",      content = fmt_msg })
                 end
 
             elseif multi_file then
@@ -2056,7 +2137,13 @@ local function run_loop(conf)
                 local new_contents_map, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
                 -- Accumulate successfully-written paths into mf_state.modified_set for
                 -- modified_files preservation on every return path (crux §3).
-                if new_contents_map then
+                if new_contents_map and next(new_contents_map) ~= nil then
+                    iter_edits_applied = iter_edits_applied + 1
+                    bad_stagnation_count = 0
+                    for path in pairs(new_contents_map) do
+                        mf_state.modified_set[path] = true
+                    end
+                elseif new_contents_map then
                     for path in pairs(new_contents_map) do
                         mf_state.modified_set[path] = true
                     end
@@ -2100,7 +2187,35 @@ local function run_loop(conf)
                         sr_hash_append = apply_sr_hash,
                     })
                     -- Stagnation check using sr_history (messages[] independent).
-                    if is_stagnant_v2(mf_state, true) then
+                    -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
+                    if iter_edits_applied == 0 then
+                        bad_stagnation_count = bad_stagnation_count + 1
+                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                            obs_event(mode, "bad_stagnation_blocked", {
+                                { "iter",   iter },
+                                { "reason", "no_edits_applied" },
+                            })
+                            return {
+                                ok             = false,
+                                failure_reason = "no_edits_applied",
+                                last_error     = mf_state.last_err or "",
+                                iters          = iter,
+                                summary        = make_summary(false, iter, max_iters, "no_edits_applied"),
+                                artifact_path  = nil,
+                                modified_files = collect_modified_paths(mf_state.modified_set),
+                                history        = history,
+                            }
+                        end
+                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                        local retry_msg = "Your previous attempt produced zero successful edits."
+                            .. " You must emit a SEARCH/REPLACE block that actually applies"
+                            .. " — make sure the SEARCH section matches the current file content exactly."
+                        update_state(mf_state, { last_err = mf_state.last_err })
+                        messages = {
+                            { role = "system", content = system },
+                            { role = "user",   content = table.concat({ multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg }, "") },
+                        }
+                    elseif is_stagnant_v2(mf_state, true) then
                         obs_event(mode, "stagnation_v2", {
                             { "iter",           iter },
                             { "sr_hash_recent", apply_sr_hash:sub(1, 8) },
@@ -2190,6 +2305,11 @@ local function run_loop(conf)
 
                 if #failed_indices > 0 then
                     -- Partial or total apply failure: report and ask for re-emit.
+                    -- Partial success (some blocks applied) counts as edits_applied.
+                    if #failed_indices < #blocks then
+                        iter_edits_applied = iter_edits_applied + 1
+                        bad_stagnation_count = 0
+                    end
                     local fail_msg = build_edit_failure_msg(failed_indices, blocks, current_content)
                     local entry = { iter = iter, code = nil, result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 }, raw = content }
                     table.insert(history, entry)
@@ -2205,7 +2325,31 @@ local function run_loop(conf)
                             log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                         end
                     end
-                    if is_stagnant(history) then
+                    -- Bad stagnation (zero edits) takes priority over good stagnation.
+                    if iter_edits_applied == 0 then
+                        bad_stagnation_count = bad_stagnation_count + 1
+                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                            obs_event(mode, "bad_stagnation_blocked", {
+                                { "iter",   iter },
+                                { "reason", "no_edits_applied" },
+                            })
+                            return {
+                                ok             = false,
+                                failure_reason = "no_edits_applied",
+                                last_error     = fail_msg:sub(-800),
+                                iters          = iter,
+                                summary        = make_summary(false, iter, max_iters, "no_edits_applied"),
+                                artifact_path  = artifact_path,
+                                history        = history,
+                            }
+                        end
+                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                        local retry_msg = "Your previous attempt produced zero successful edits."
+                            .. " You must emit a SEARCH/REPLACE block that actually applies"
+                            .. " — make sure the SEARCH section matches the current file content exactly."
+                        table.insert(messages, { role = "assistant", content = content })
+                        table.insert(messages, { role = "user",      content = retry_msg })
+                    elseif is_stagnant(history) then
                         obs_event(mode, "stagnation", { { "iters", iter } })
                         return {
                             ok             = false,
@@ -2216,11 +2360,14 @@ local function run_loop(conf)
                             artifact_path  = artifact_path,
                             history        = history,
                         }
+                    else
+                        table.insert(messages, { role = "assistant", content = content })
+                        table.insert(messages, { role = "user",      content = fail_msg })
                     end
-                    table.insert(messages, { role = "assistant", content = content })
-                    table.insert(messages, { role = "user",      content = fail_msg })
                 else
                     -- All blocks applied successfully — write new content and run.
+                    iter_edits_applied = iter_edits_applied + 1
+                    bad_stagnation_count = 0
                     local f, werr = io.open(single_path, "w")
                     if not f then
                         local werr_str = tostring(werr)
@@ -2293,6 +2440,13 @@ local function run_loop(conf)
             local single_path = conf.target_files[1]
             local code = extract_code(content, lang)
 
+            -- Full mode: empty code means the LLM produced zero usable edits (bad stagnation).
+            -- Non-empty code is always an edit (full-file replace).
+            if #code > 0 then
+                iter_edits_applied = iter_edits_applied + 1
+                bad_stagnation_count = 0
+            end
+
             -- Write target file (full-file replace — next_full_file action)
             local f, werr = io.open(single_path, "w")
             if not f then
@@ -2340,8 +2494,33 @@ local function run_loop(conf)
                 }
             end
 
-            -- Stagnation detection
-            if is_stagnant(history) then
+            -- Stagnation detection: bad stagnation (empty code = zero edits) takes priority.
+            if iter_edits_applied == 0 then
+                bad_stagnation_count = bad_stagnation_count + 1
+                if bad_stagnation_count >= STAGNATION_WINDOW then
+                    local last_stderr = tostring((rr.stderr) or ""):sub(-800)
+                    obs_event(mode, "bad_stagnation_blocked", {
+                        { "iter",   iter },
+                        { "reason", "no_edits_applied" },
+                    })
+                    return {
+                        ok             = false,
+                        failure_reason = "no_edits_applied",
+                        last_error     = last_stderr,
+                        code           = code,
+                        iters          = iter,
+                        summary        = make_summary(false, iter, max_iters, "no_edits_applied"),
+                        artifact_path  = artifact_path,
+                        history        = history,
+                    }
+                end
+                -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                local retry_msg = "Your previous attempt produced zero successful edits."
+                    .. " You must emit a SEARCH/REPLACE block that actually applies"
+                    .. " — make sure the SEARCH section matches the current file content exactly."
+                table.insert(messages, { role = "assistant", content = content })
+                table.insert(messages, { role = "user",      content = retry_msg })
+            elseif is_stagnant(history) then
                 local last_stderr = tostring((rr.stderr) or ""):sub(-800)
                 obs_event(mode, "stagnation", { { "iters", iter } })
                 return {
@@ -2354,11 +2533,11 @@ local function run_loop(conf)
                     artifact_path  = artifact_path,
                     history        = history,
                 }
+            else
+                -- Append assistant + failure user message for the next turn.
+                table.insert(messages, { role = "assistant", content = content })
+                table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
             end
-
-            -- Append assistant + failure user message for the next turn.
-            table.insert(messages, { role = "assistant", content = content })
-            table.insert(messages, { role = "user",      content = build_failure_msg(lang, rr) })
         end
         -- ── end of edit_mode branch ────────────────────────────────────────────
     end
@@ -2546,6 +2725,20 @@ function M._test_reset_llm_call()
     _llm_call_override = nil
 end
 
+--- Override std.env.get for test monkey-patching of resolve_temperature().
+--- fn signature: (name: string) → string|nil
+--- Call M._test_reset_env_get() after the test to restore production behaviour.
+--- Production callers must never call this.
+function M._test_set_env_get(fn)
+    assert(type(fn) == "function", "_test_set_env_get requires a function")
+    _env_get_override = fn
+end
+
+--- Reset the env_get override installed by M._test_set_env_get().
+function M._test_reset_env_get()
+    _env_get_override = nil
+end
+
 --- Return a fresh mf_state table with ST1 initial field defaults.
 --- Used by unit tests to assert invariants without running the full make() pipeline.
 --- Production callers must never call this.
@@ -2597,6 +2790,10 @@ function M._test_helpers()
         collect_modified_paths      = collect_modified_paths,
         update_state                = update_state,
         build_line_index            = build_line_index,
+        -- Temperature resolution (for unit testing env override)
+        resolve_temperature         = resolve_temperature,
+        -- run_loop (for unit testing bad stagnation / full-loop scenarios without handler)
+        run_loop                    = run_loop,
     }
 end
 
