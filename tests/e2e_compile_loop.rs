@@ -442,6 +442,96 @@ async fn compile_loop_read_file_range_verbatim() {
     );
 }
 
+/// Verifies that compile_loop with the OpenAI provider converges after exactly 3 turns
+/// (broken1 → broken2 → fixed) and that the same input sequence produces the same
+/// output sequence across two independent subprocess runs (Crux: deterministic across runs).
+///
+/// ## Scenario
+/// - Turn 1: mock returns broken Lua code A; mock_runner returns {ok=false, stderr="iter 1"}.
+/// - Turn 2: mock returns broken Lua code B (different from A to avoid early stagnation);
+///           mock_runner returns {ok=false, stderr="iter 2"}.
+/// - Turn 3: mock returns fixed Lua code; mock_runner returns {ok=true}.
+///
+/// ## Determinism check (Crux constraint — 1 spawn縮退不可)
+/// The test spawns two subprocesses against the same mock server:
+///   Run 1: assert call_count == 3 and stdout contains "COMPILE_LOOP_MOCK_PASS".
+///   call_count.store(0, SeqCst) — reset between runs.
+///   Run 2: assert call_count == 3 and stdout contains "COMPILE_LOOP_MOCK_PASS".
+/// Both runs passing with identical call counts demonstrates that identical input
+/// sequences produce identical tool-call sequences across runs.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+/// api_key is always "dummy" (OPENAI_API_KEY is never read).
+#[tokio::test]
+async fn compile_loop_openai_mock_three_turn_converges() {
+    let (base_url, call_count, ct) = common::compile_loop_openai_mock_three_turn::spawn_compile_loop_openai_mock_three_turn_server().await;
+    // Give the server a moment to start accepting connections before the subprocess runs.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // --- Run 1 ---
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_openai_mock_three_turn.lua"),
+            ])
+            .env("OPENAI_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task (run 1) should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        3,
+        "run 1: expected exactly 3 HTTP calls to the 3-turn mock (broken1, broken2, fixed)"
+    );
+
+    // Reset between runs — AtomicUsize store is safe here: run 1 subprocess has exited.
+    call_count.store(0, Ordering::SeqCst);
+
+    // --- Run 2 (deterministic check: same input → same output sequence) ---
+    let url_clone2 = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args([
+                "-s",
+                &common::fixture("compile_loop_openai_mock_three_turn.lua"),
+            ])
+            .env("OPENAI_BASE_URL_TEST", &url_clone2)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task (run 2) should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        3,
+        "run 2: expected exactly 3 HTTP calls to the 3-turn mock (broken1, broken2, fixed)"
+    );
+
+    ct.cancel();
+}
+
 /// Verifies that compile_loop emits ab.obs events when AGENT_BLOCK_LLM_DUMP=meta.
 ///
 /// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls).
