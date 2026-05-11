@@ -87,6 +87,37 @@ print(mcp.call("echo", "slow_echo", { msg = "hi", steps = 3 }))
 
 See `examples/verify_echo_harness.lua` for the full verification script.
 
+## MCP Resource Subscribe Smoke Server
+
+A standalone binary example for shell-level smoke-testing the Resource Subscribe API
+(`mcp.subscribe_resource` / `mcp.on_resource_update`). Starts an HTTP MCP server with
+`resources.subscribe` capability enabled and fires at least one `notify_resource_updated`
+event after each subscribe call.
+
+```sh
+# Ephemeral port — prints SUBSCRIBE_TEST_SERVER_URL=http://127.0.0.1:<port>/mcp
+cargo run --example subscribe_test_server
+
+# Fixed port
+cargo run --example subscribe_test_server -- --port 7878
+
+# Periodic notify every 500 ms (instead of single fire on subscribe)
+cargo run --example subscribe_test_server -- --port 0 --interval 500
+```
+
+Shell smoke (requires the server URL printed above):
+
+```sh
+export MCP_HTTP_URL="$(cargo run --example subscribe_test_server 2>/dev/null \
+    | grep SUBSCRIBE_TEST_SERVER_URL | cut -d= -f2-)"
+agent-block -s tests/fixtures/mcp_on_resource_update_callback.lua
+# Expect: SUBSCRIBE_OK, RESOURCE_UPDATE_EV_OK, UPDATE_HITS=1, FIXTURE_DONE
+```
+
+See `docs/runbooks/e2e-mcp-resource-subscribe.md` for the full positive/negative verification
+procedure (Step 2 = shell positive, Step 3 = negative against a server without subscribe
+capability).
+
 ## Lua API
 
 ### llm.*

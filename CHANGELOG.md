@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `examples/bin/subscribe_test_server.rs` — standalone binary example (`cargo run --example
+  subscribe_test_server`) that exposes an HTTP MCP server with `resources.subscribe` capability.
+  Enables shell-level positive smoke of the Resource Subscribe API without requiring an
+  in-process test harness. Handler logic is lifted verbatim from
+  `tests/e2e_mcp_resource_subscribe.rs`. Accepts `--port <N>` (default `0` = ephemeral) and
+  `--interval <ms>` (default `0` = fire once on subscribe; `>0` = periodic notify loop).
+  Prints `SUBSCRIBE_TEST_SERVER_URL=http://127.0.0.1:<port>/mcp` to stdout for shell consumers.
+- `[[example]]` entry for `subscribe_test_server` in `Cargo.toml` (explicit path under
+  `examples/bin/`; dev-dependencies used as-is, no `required-features` needed).
+- `docs/runbooks/e2e-mcp-resource-subscribe.md` — split into three separate numbered steps:
+  Step 1 (in-process `cargo test`), Step 2 (shell positive smoke against new binary), and
+  Step 3 (shell negative smoke against a server without subscribe capability, e.g. `outline-mcp`).
+
 ## [0.12.0] - 2026-05-10
 
 ### Added

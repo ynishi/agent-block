@@ -79,7 +79,56 @@ The test asserts the following stdout markers appear in the Lua fixture
 If any marker is absent or `UPDATE_HITS != 1`, the dispatch chain has
 regressed (most likely `handler.rs` notification overrides).
 
-### Step 2: negative path (shell smoke against outline-mcp)
+### Step 2: positive path (shell smoke against `subscribe_test_server`)
+
+Runs the standalone `subscribe_test_server` binary (HTTP transport) and
+drives it with the Lua fixture to confirm the full
+`subscribe_resource` → `notify_resource_updated` → `on_resource_update`
+callback chain works at the shell level, outside `cargo test`.
+
+**2a. Start the server (background)**
+
+```sh
+cargo run --example subscribe_test_server -- --port 0 &
+# Capture the URL from the first line of stdout:
+# SUBSCRIBE_TEST_SERVER_URL=http://127.0.0.1:<port>/mcp
+```
+
+Wait for the `SUBSCRIBE_TEST_SERVER_URL=…` line to appear in stdout before
+proceeding (it is printed synchronously before the server enters its accept
+loop).
+
+**2b. Run the fixture**
+
+```sh
+MCP_HTTP_URL=<value of SUBSCRIBE_TEST_SERVER_URL> \
+  agent-block -s tests/fixtures/mcp_on_resource_update_callback.lua
+```
+
+**Expected stdout markers** (all four must appear):
+
+```
+SUBSCRIBE_OK
+RESOURCE_UPDATE_EV_OK
+UPDATE_HITS=1
+FIXTURE_DONE
+```
+
+**2c. Stop the server**
+
+```sh
+kill %1   # or send SIGINT to the background job
+```
+
+Failure modes:
+
+- `SUBSCRIBE_OK` absent → `subscribe_resource` RPC failed; check that the
+  binary is running and `MCP_HTTP_URL` is set correctly.
+- `RESOURCE_UPDATE_EV_OK` / `UPDATE_HITS=1` absent → `notify_resource_updated`
+  was not dispatched or the Lua `on_resource_update` callback did not fire.
+- `FIXTURE_DONE` absent → the fixture crashed before completion.
+
+### Step 3: negative path (shell smoke against outline-mcp)
 
 Validates that a server returning `-32601` (Method not found) for
 `resources/subscribe` is surfaced as `{ok=false, error=...}` in Lua and
@@ -122,9 +171,11 @@ Failure modes:
 
 ## Pass criteria
 
-Both Step 1 and Step 2 must pass cleanly. Step 1 (positive) covers the
-dispatch chain end-to-end; Step 2 (negative) covers the error path that
-the in-process test server cannot reach.
+Step 1, Step 2, and Step 3 must all pass cleanly. Step 1 (positive,
+in-process) covers the dispatch chain end-to-end via `cargo test`. Step 2
+(positive, shell) confirms the same chain works against the standalone
+binary over a live HTTP transport. Step 3 (negative) covers the error path
+that the in-process test server cannot reach.
 
 ## See also
 
