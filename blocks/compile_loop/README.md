@@ -196,7 +196,7 @@ end
 | `summary` | `string` | always |
 | `artifact_path` | `string\|nil` | single-file only (absolute path of the edited file) |
 | `modified_files` | `list<string>\|nil` | multi-file only (absolute paths of all written files) |
-| `failure_reason` | `string\|nil` | on failure (`"max_iters"` or `"stagnation"`) |
+| `failure_reason` | `string\|nil` | on failure (`"max_iters"`, `"stagnation"`, or `"no_edits_applied"`) |
 | `last_error` | `string\|nil` | on failure |
 
 In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
@@ -210,6 +210,9 @@ In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
 - `target_files` must be a non-empty list of strings.
 - Stagnation detection: when `STAGNATION_WINDOW = 3` consecutive iterations produce identical
   runner `stderr`, the loop exits immediately with `failure_reason = "stagnation"`.
+- Bad stagnation: when `STAGNATION_WINDOW = 3` consecutive iterations apply zero edits (LLM
+  emitted no valid SEARCH/REPLACE blocks, or all blocks failed SEARCH matching), the loop exits
+  with `failure_reason = "no_edits_applied"`. See §Qwen path operational notes for details.
 
 ## Background
 
@@ -218,3 +221,69 @@ Tool factory. Multi-file mode was added to address LLM context overflow (`max_mo
 exceeded) when embedding entire large files in the prompt — diffing only the changed sections
 across multiple files keeps context size bounded. For motivation see
 [agent-profiles issue 1777766817-70585](https://github.com/ynishi/agent-profiles/issues/1777766817-70585).
+
+## Qwen path operational notes
+
+These notes apply to the OpenAI provider path when targeting a Qwen vLLM endpoint
+(e.g. RunPod proxy serving `qwen36-vllm-a40` or similar). The compile_loop block
+itself is provider-agnostic — these are operational guidance for callers.
+
+### Deterministic temperature
+
+The OpenAI body defaults `temperature = 0.0` for deterministic greedy decoding,
+which is the desired behaviour for code-editing loops. Callers can override via
+either:
+
+- `compile_loop.make({ llm = { temperature = <number> } })` — explicit caller value
+- `COMPILE_LOOP_LLM_TEMPERATURE=<number>` — env override applied when caller does
+  not pass `llm.temperature`
+
+Precedence: caller > env > `0.0` default. Setting `COMPILE_LOOP_LLM_TEMPERATURE`
+to a non-numeric value falls back to `0.0` with a warning log entry.
+
+### Disable thinking mode
+
+For Qwen-style models that expose a chain-of-thought thinking budget, set
+`disable_thinking = true` on the LLM config to suppress reasoning output and
+reduce latency. Example:
+
+```lua
+local tool = compile_loop.make({
+    llm = {
+        provider          = "openai",
+        base_url          = "https://<runpod-proxy>/v1",
+        api_key_env       = "QWEN_API_KEY",
+        model             = "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
+        disable_thinking  = true,  -- recommended for code-editing loops
+        -- temperature defaults to 0.0; set COMPILE_LOOP_LLM_TEMPERATURE
+        -- or pass explicit temperature here to override.
+    },
+    runner = function(path) ... end,
+})
+```
+
+### Bad vs good stagnation
+
+The loop distinguishes two failure modes when iterations do not converge:
+
+- `failure_reason = "stagnation"` — runner produced identical `stderr` for
+  `STAGNATION_WINDOW = 3` consecutive iterations after at least one successful
+  edit. This is the "good" stagnation case: the LLM is editing, but the runner
+  is stuck on the same error.
+- `failure_reason = "no_edits_applied"` — `STAGNATION_WINDOW = 3` consecutive
+  iterations produced zero successful SEARCH/REPLACE applies (parse failure or
+  all blocks failed to match). The "bad" stagnation case: the LLM is not making
+  progress in edits at all. Before terminating, the loop injects an explicit
+  retry message asking the LLM to emit a SEARCH/REPLACE block that actually
+  applies; only after the third consecutive zero-edit iteration does the loop
+  exit with `failure_reason = "no_edits_applied"`.
+
+Callers should treat `no_edits_applied` as a stronger failure signal than
+`stagnation` — it suggests the prompt or model is incompatible with the target
+file shape, not just that the fix is hard.
+
+### Cross-reference
+
+For RunPod proxy operational gotchas (e.g. ~30s cold-start timeout on first
+request after pod idle), see
+[agent-profiles `blocks/coding_resolver/README.md` §既知の罠](https://github.com/ynishi/agent-profiles/blob/main/blocks/coding_resolver/README.md).
