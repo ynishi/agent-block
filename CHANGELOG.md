@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `COMPILE_LOOP_LLM_TEMPERATURE` env var — overrides default `0.0` temperature for OpenAI
+  provider in `compile_loop`. Resolution precedence: caller-supplied `opts.temperature` >
+  env > default `0.0`. Anthropic provider unaffected (no temperature field). Improves
+  Qwen reasoning determinism for compile_loop multi-turn tasks (escape hatch preserved).
+- `failure_reason = "no_edits_applied"` — new BLOCKED state for bad stagnation
+  distinguished from existing `"stagnation"`. Fires after `STAGNATION_WINDOW = 3`
+  consecutive iterations with `edits_applied = 0` (LLM calls `read_file` / `run_verify`
+  but never `edit_file` / SEARCH-REPLACE). Before BLOCKED, an explicit retry hint
+  is injected to the LLM. `bad_stagnation_count` is `run_loop`-scoped (cumulative);
+  `iter_edits_applied` is per-iter (reset). Crux: 3 candidates HONORED, no Anthropic regression.
+- `tests/common/compile_loop_openai_mock_three_turn.rs` + matching fixture
+  `tests/fixtures/compile_loop_openai_mock_three_turn.lua` — 3-turn OpenAI mock for
+  multi-turn deterministic check. New e2e test `compile_loop_openai_mock_three_turn_converges`
+  spawns 2 subprocesses (with `call_count` reset) and asserts both runs produce identical
+  tool-call sequence + `COMPILE_LOOP_MOCK_PASS` + `call_count == 3` (deterministic across
+  runs). 1-spawn fallback forbidden per Crux constraint.
+- `blocks/compile_loop/README.md` — new `## Qwen path operational notes` section
+  documenting deterministic temperature, disable_thinking recommendation, bad vs good
+  stagnation distinction, and cross-ref to agent-profiles
+  `blocks/coding_resolver/README.md` for RunPod proxy ~30s cold-start timeout.
+
 ## [0.13.0] - 2026-05-11
 
 ### Added
