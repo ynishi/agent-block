@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mcp.ping(server_name)` Lua API (Phase 5) — client→server keepalive with `Instant`-based
+  latency_ms measurement. Returns `{ ok=true, latency_ms=N }` on success or
+  `{ ok=false, error="..." }` on failure. Uses `send_request(ClientRequest::PingRequest(...))`
+  via rmcp `Peer` (no dedicated `ping()` method in rmcp 1.4.0). Part of Umbrella `1778981063-7028`.
 - `mcp.set_elicitation_handler(server_name, fn)` Lua API (Phase 4) — Register a Lua handler responding
   to server-originated `elicitation/create` requests (Form variant only). The callback receives
   `(server_name, message, schema_json)` and must return `{action="accept"|"decline"|"cancel",

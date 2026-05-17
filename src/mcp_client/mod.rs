@@ -36,14 +36,15 @@ pub(crate) mod http;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mlua_isle::AsyncIsle;
 use rmcp::{
     model::{
         ArgumentInfo, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-        CompleteRequestParams, GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
-        Reference, RootsListChangedNotification, SubscribeRequestParams, UnsubscribeRequestParams,
+        ClientRequest, CompleteRequestParams, GetPromptRequestParams, NumberOrString, PingRequest,
+        ReadResourceRequestParams, Reference, RootsListChangedNotification, ServerResult,
+        SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
@@ -418,6 +419,52 @@ impl McpManager {
             })?;
         serde_json::to_value(&templates)
             .map_err(|e| BlockError::Mcp(format!("serialize list_resource_templates result: {e}")))
+    }
+
+    /// Send a `ping` keepalive to the named server and return the round-trip
+    /// latency in milliseconds.
+    ///
+    /// Uses `send_request(ClientRequest::PingRequest(...))` — rmcp 1.4.0 has
+    /// no dedicated `Peer::ping()` method.  Latency is measured with
+    /// `Instant::now()` immediately before the send and `elapsed()` immediately
+    /// after the `EmptyResult` is received (crux must_not_simplify).
+    ///
+    /// Immutable receiver — usable under `RwLock::read` alongside concurrent RPCs.
+    pub async fn ping(&self, name: &str) -> BlockResult<u64> {
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, "mcp ping on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        // Clone Peer out of RunningService before awaiting to avoid holding
+        // the lock across the await point (K-4 / await-holding-lock).
+        let peer = srv.peer().clone();
+        let ping_req = ClientRequest::PingRequest(PingRequest::default());
+        // Measure latency from immediately before send to immediately after
+        // EmptyResult receipt (crux: must_not_simplify).
+        let started = Instant::now();
+        let response = timeout(rpc_timeout, peer.send_request(ping_req))
+            .await
+            .map_err(|_| {
+                warn!(server = %name, timeout = ?rpc_timeout, "mcp ping timed out");
+                BlockError::Timeout(format!("ping '{name}' timed out after {rpc_timeout:?}"))
+            })?
+            .map_err(|e| {
+                warn!(server = %name, error = %e, "mcp ping failed");
+                BlockError::Mcp(format!("ping '{name}': {e}"))
+            })?;
+        match response {
+            ServerResult::EmptyResult(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                Ok(latency_ms)
+            }
+            other => {
+                warn!(server = %name, "mcp ping: unexpected response");
+                Err(BlockError::Mcp(format!(
+                    "ping '{name}': unexpected response: {other:?}"
+                )))
+            }
+        }
     }
 
     /// Call `resources/read` and return the resource contents as JSON.
@@ -2456,6 +2503,87 @@ mod rich_tests {
         assert!(
             result_json.contains("elicitation:decline:"),
             "expected elicitation:decline: when no handler registered: {result_json}"
+        );
+    }
+
+    // ── Test Servers: ping ─────────────────────────────────────────────
+
+    /// A server that sleeps `delay` before responding to every `ping`.
+    /// Used to drive the timeout path in `McpManager::ping`.
+    /// K-181: ServerHandler impl uses `async fn` directly.
+    #[derive(Clone)]
+    struct SlowPingServer {
+        delay: Duration,
+    }
+
+    impl ServerHandler for SlowPingServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().build())
+        }
+
+        async fn ping(&self, _ctx: RequestContext<RoleServer>) -> Result<(), McpError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
+    }
+
+    /// Attach an in-process `SlowPingServer` to `mgr` under `name`.
+    async fn attach_slow_ping_server(mgr: &mut McpManager, name: &str, delay: Duration) {
+        let (server_side, client_side) = tokio::io::duplex(8192);
+        let server = SlowPingServer { delay };
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let handler = AgentBlockClientHandler::new();
+        let running = handler
+            .serve(client_side)
+            .await
+            .expect("client handshake should succeed over duplex");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    // ── Tests: ping ────────────────────────────────────────────────────
+
+    /// (P1) ping against a responsive server returns Ok(latency_ms).
+    /// latency_ms is a non-negative integer (monotonic Instant measurement).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_success_returns_latency_ms() {
+        let mut mgr = McpManager::new();
+        // Use zero delay so the test completes quickly.
+        attach_slow_ping_server(&mut mgr, "pingsrv", Duration::from_millis(0)).await;
+
+        let result = mgr.ping("pingsrv").await;
+        let latency_ms = result.expect("ping should succeed against a live server");
+        // latency_ms must be a non-negative integer; the type is u64.
+        // We cannot assert an exact value, but it should be <= 5000ms on
+        // any reasonable CI box.
+        assert!(
+            latency_ms <= 5000,
+            "latency_ms={latency_ms} looks unreasonable (> 5 s)"
+        );
+    }
+
+    /// (P2) ping against a server that delays beyond rpc_timeout returns
+    /// `BlockError::Timeout`, not `BlockError::Mcp`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_timeout_returns_block_error_timeout() {
+        let mut mgr = McpManager::with_rpc_timeout(Duration::from_millis(1))
+            .expect("with_rpc_timeout(1ms) should succeed");
+        // Server sleeps 200ms, rpc_timeout is 1ms → guaranteed timeout.
+        attach_slow_ping_server(&mut mgr, "slowping", Duration::from_millis(200)).await;
+
+        let result = mgr.ping("slowping").await;
+        let err = result.expect_err("ping should time out");
+        assert!(
+            matches!(err, BlockError::Timeout(_)),
+            "expected BlockError::Timeout, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out"),
+            "timeout message should contain 'timed out': {msg}"
         );
     }
 }
