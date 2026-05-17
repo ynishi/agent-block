@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mcp.set_elicitation_handler(server_name, fn)` Lua API (Phase 4) — Register a Lua handler responding
+  to server-originated `elicitation/create` requests (Form variant only). The callback receives
+  `(server_name, message, schema_json)` and must return `{action="accept"|"decline"|"cancel",
+  content=...}` (content required on accept, absent otherwise). Url variant is always declined
+  without reaching the callback. Implemented via `impl ClientHandler::create_elicitation` override.
+  Part of Umbrella `1778981063-7028`.
 - `mcp.complete(server, ref, arg_name, arg_value)` Lua API (Phase 3) — MCP Completion typeahead outbound request. `ref` is `{type="ref/prompt", name=...}` or `{type="ref/resource", uri=...}`; dispatches at runtime to `Reference::for_prompt`/`for_resource`. Part of Umbrella `1778981063-7028`.
 - `mcp.set_roots_handler(server_name, fn)` Lua API (Phase 2) — Register a Lua handler responding
   to server-originated `roots/list` requests. The server calls this when it wants to discover the
