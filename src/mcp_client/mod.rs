@@ -2114,4 +2114,348 @@ mod rich_tests {
             "call_tool must fail when no roots handler is registered: {result:?}"
         );
     }
+
+    // ── Test Server: ElicitationTestServer ─────────────────────────────
+
+    /// A test server that, when `call_tool` is invoked, issues an
+    /// `elicitation/create` request back to the client (server→client direction)
+    /// using a Form variant and embeds the result in the tool response. This
+    /// exercises the `ClientHandler::create_elicitation` override.
+    #[derive(Clone)]
+    struct ElicitationTestServer;
+
+    impl ServerHandler for ElicitationTestServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _params: rmcp::model::CallToolRequestParams,
+            ctx: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, McpError> {
+            use rmcp::model::{
+                CreateElicitationRequestParams, ElicitationSchema, PrimitiveSchema, StringSchema,
+            };
+            use std::collections::BTreeMap;
+
+            // Build a minimal Form variant with one string property.
+            let mut props = BTreeMap::new();
+            props.insert(
+                "name".to_string(),
+                PrimitiveSchema::String(StringSchema::new()),
+            );
+            let schema = ElicitationSchema::new(props);
+            let req = CreateElicitationRequestParams::FormElicitationParams {
+                meta: None,
+                message: "What is your name?".to_string(),
+                requested_schema: schema,
+            };
+
+            let result =
+                ctx.peer.create_elicitation(req).await.map_err(|e| {
+                    McpError::internal_error(format!("create_elicitation: {e}"), None)
+                })?;
+
+            // Encode action + content as text so tests can assert.
+            let action_str = match result.action {
+                rmcp::model::ElicitationAction::Accept => "accept",
+                rmcp::model::ElicitationAction::Decline => "decline",
+                rmcp::model::ElicitationAction::Cancel => "cancel",
+            };
+            let content_str = result
+                .content
+                .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                .unwrap_or_default();
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(format!("elicitation:{action_str}:{content_str}")),
+            ]))
+        }
+    }
+
+    /// A test server that issues a Url-variant `elicitation/create` request.
+    /// Used to verify that the client always returns Decline for Url variants
+    /// without dispatching to the Lua callback.
+    #[derive(Clone)]
+    struct ElicitationUrlTestServer;
+
+    impl ServerHandler for ElicitationUrlTestServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _params: rmcp::model::CallToolRequestParams,
+            ctx: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, McpError> {
+            use rmcp::model::CreateElicitationRequestParams;
+
+            // Issue a Url variant — client must always Decline without Lua dispatch.
+            let req = CreateElicitationRequestParams::UrlElicitationParams {
+                meta: None,
+                message: "Please complete this form online".to_string(),
+                url: "https://example.com/form".to_string(),
+                elicitation_id: "test-elicitation-id-001".to_string(),
+            };
+
+            let result =
+                ctx.peer.create_elicitation(req).await.map_err(|e| {
+                    McpError::internal_error(format!("create_elicitation: {e}"), None)
+                })?;
+
+            let action_str = match result.action {
+                rmcp::model::ElicitationAction::Accept => "accept",
+                rmcp::model::ElicitationAction::Decline => "decline",
+                rmcp::model::ElicitationAction::Cancel => "cancel",
+            };
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(format!("url_elicitation:{action_str}")),
+            ]))
+        }
+    }
+
+    /// Attach an `ElicitationTestServer` (Form variant) with a pre-configured
+    /// handler Isle that has a Lua elicitation handler returning the given
+    /// `action` and (for accept) a content object `{name: "Alice"}`.
+    ///
+    /// Returns the `IsleDriver` so the caller can keep the driver alive.
+    async fn attach_elicitation_server_with_isle(
+        mgr: &mut McpManager,
+        name: &str,
+        action: &str,
+    ) -> mlua_isle::AsyncIsleDriver {
+        use mlua_isle::AsyncIsle;
+
+        let (isle, driver) = AsyncIsle::spawn(|_lua: &mlua::Lua| Ok(()))
+            .await
+            .expect("AsyncIsle::spawn should succeed");
+
+        let name_owned = name.to_string();
+        let action_owned = action.to_string();
+        isle.exec(move |lua| {
+            handler::install_mcp_dispatcher_on_handler_isle(lua)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("setup dispatcher: {e}")))?;
+            // Pre-install the Lua elicitation handler for `name_owned`.
+            use mlua::prelude::*;
+            let handlers: LuaTable = lua
+                .globals()
+                .get("__mcp_elicitation_handlers")
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("get handlers: {e}")))?;
+
+            // Build a handler that returns the requested action.
+            let handler_src = match action_owned.as_str() {
+                "accept" => {
+                    r#"
+                    return function(server_name, message, schema_json)
+                        return { action = "accept", content = { name = "Alice" } }
+                    end
+                "#
+                }
+                "decline" => {
+                    r#"
+                    return function(server_name, message, schema_json)
+                        return { action = "decline" }
+                    end
+                "#
+                }
+                "cancel" => {
+                    r#"
+                    return function(server_name, message, schema_json)
+                        return { action = "cancel" }
+                    end
+                "#
+                }
+                _ => {
+                    r#"
+                    return function(server_name, message, schema_json)
+                        return { action = "decline" }
+                    end
+                "#
+                }
+            };
+
+            let cb: LuaFunction = lua
+                .load(handler_src)
+                .set_name("@test_elicitation_handler")
+                .eval()
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("eval: {e}")))?;
+            handlers
+                .set(name_owned.as_str(), cb)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .expect("isle setup must succeed");
+
+        let isle_arc = std::sync::Arc::new(isle);
+
+        let mut handler = AgentBlockClientHandler::new();
+        handler.handler_isle = Some(std::sync::Arc::clone(&isle_arc));
+        handler.server_name = Some(name.to_string());
+        handler.mark_elicitation(name);
+
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = ElicitationTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+
+        driver
+    }
+
+    /// Attach a plain `ElicitationTestServer` (Form variant) without any Lua
+    /// handler wired. Used for testing the no-handler Decline path.
+    /// Server name is wired so `create_elicitation` can check the registry and
+    /// return `Decline` (not `method_not_found`) when no handler is registered.
+    async fn attach_elicitation_server_bare(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = ElicitationTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let mut handler = AgentBlockClientHandler::new();
+        handler.ensure_server(name);
+        handler.server_name = Some(name.to_string());
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    /// Attach a `ElicitationUrlTestServer` (Url variant) without any Lua handler.
+    /// Used to verify Url-variant always returns Decline.
+    async fn attach_elicitation_url_server(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = ElicitationUrlTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let handler = AgentBlockClientHandler::new();
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    // ── Tests: mark_elicitation flag ───────────────────────────────────
+
+    /// (T1) mark_elicitation sets the registry flag that create_elicitation checks.
+    #[test]
+    fn mark_elicitation_sets_flag_accessible_by_handler() {
+        let handler = AgentBlockClientHandler::new();
+        handler.ensure_server("elicit-srv");
+        assert!(
+            !handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("elicit-srv")
+                .unwrap()
+                .elicitation
+        );
+        handler.mark_elicitation("elicit-srv");
+        assert!(
+            handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("elicit-srv")
+                .unwrap()
+                .elicitation
+        );
+    }
+
+    // ── Tests: live duplex elicitation round-trips ─────────────────────
+
+    /// (T1 / elicitation_accept) Form variant + handler accept → Accept result with content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn elicitation_accept_returns_accept_with_content() {
+        let mut mgr = McpManager::new();
+        let _driver = attach_elicitation_server_with_isle(&mut mgr, "elicit", "accept").await;
+
+        let result = mgr
+            .call_tool("elicit", "any_tool", serde_json::json!({}))
+            .await
+            .expect("call_tool must succeed");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("elicitation:accept:"),
+            "expected elicitation:accept: in result: {result_json}"
+        );
+        assert!(
+            result_json.contains("Alice"),
+            "expected Alice in content: {result_json}"
+        );
+    }
+
+    /// (T2 / elicitation_decline) Form variant + handler decline → Decline result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn elicitation_decline_returns_decline() {
+        let mut mgr = McpManager::new();
+        let _driver = attach_elicitation_server_with_isle(&mut mgr, "elicit", "decline").await;
+
+        let result = mgr
+            .call_tool("elicit", "any_tool", serde_json::json!({}))
+            .await
+            .expect("call_tool must succeed");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("elicitation:decline:"),
+            "expected elicitation:decline: in result: {result_json}"
+        );
+    }
+
+    /// (T3 / elicitation_cancel) Form variant + handler cancel → Cancel result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn elicitation_cancel_returns_cancel() {
+        let mut mgr = McpManager::new();
+        let _driver = attach_elicitation_server_with_isle(&mut mgr, "elicit", "cancel").await;
+
+        let result = mgr
+            .call_tool("elicit", "any_tool", serde_json::json!({}))
+            .await
+            .expect("call_tool must succeed");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("elicitation:cancel:"),
+            "expected elicitation:cancel: in result: {result_json}"
+        );
+    }
+
+    /// (T4 / elicitation_url_decline) Url variant → always Decline, no Lua dispatch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn elicitation_url_variant_always_declines() {
+        let mut mgr = McpManager::new();
+        attach_elicitation_url_server(&mut mgr, "elicit-url").await;
+
+        let result = mgr
+            .call_tool("elicit-url", "any_tool", serde_json::json!({}))
+            .await
+            .expect("call_tool must succeed");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("url_elicitation:decline"),
+            "expected url_elicitation:decline in result: {result_json}"
+        );
+    }
+
+    /// (T5 / elicitation_no_handler) Form variant + no handler → Decline (spec neutral).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn elicitation_no_handler_returns_decline() {
+        let mut mgr = McpManager::new();
+        // Attach without wiring an isle or elicitation handler.
+        attach_elicitation_server_bare(&mut mgr, "elicit-bare").await;
+
+        let result = mgr
+            .call_tool("elicit-bare", "any_tool", serde_json::json!({}))
+            .await
+            .expect("call_tool must succeed — no handler → Decline, not error");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("elicitation:decline:"),
+            "expected elicitation:decline: when no handler registered: {result_json}"
+        );
+    }
 }

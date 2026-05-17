@@ -53,7 +53,7 @@ tempfile = "3"
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
 # `transport-streamable-http-server` enables the axum-backed in-process HTTP
 # server used by `tests/e2e_mcp_rich.rs` to round-trip `connect_http` + `list_tools`.
-rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server", "elicitation"] }
 # `test-util` enables `tokio::time::pause`/`advance`/`resume` and the
 # `start_paused` flavor used by concurrency tests in `src/bus/dispatcher.rs`.
 tokio = { version = "1", features = ["full", "test-util"] }
