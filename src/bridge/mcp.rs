@@ -350,6 +350,32 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.list_resource_templates(name) → { ok=bool, resource_templates=[...], error=str }
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "list_resource_templates",
+            lua.create_async_function(move |lua, name: String| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let result = mgr.read().await.list_resource_templates(&name).await;
+                    let tbl = lua.create_table()?;
+                    match result {
+                        Ok(val) => {
+                            tbl.set("ok", true)?;
+                            tbl.set("resource_templates", json_to_lua(&lua, val)?)?;
+                        }
+                        Err(e) => {
+                            tbl.set("ok", false)?;
+                            tbl.set("error", e.to_string())?;
+                        }
+                    }
+                    Ok(tbl)
+                }
+            })?,
+        )?;
+    }
+
     // mcp.read_resource(name, uri) → { ok=bool, contents=[...], error=str }
     {
         let mgr = Arc::clone(manager);
