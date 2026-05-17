@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mcp.list_resource_templates(name)` — new Lua API that lists resource URI templates exposed by
+  an MCP server. Returns `{ ok=true, resource_templates=[{uriTemplate, name, ...}] }` on success
+  or `{ ok=false, error="..." }` on failure. Return shape is structurally identical to
+  `mcp.list_resources` (`ok` / array key / `error`). Crux: McpManager → rmcp
+  `list_all_resource_templates` RPC path enforced; no stub or bypass permitted.
+- `McpManager::list_resource_templates` (`src/mcp_client/mod.rs`) — Rust method backing the Lua
+  API. Mirrors `list_resources` with `tracing::warn!` on unknown server, timeout, and RPC failure.
+- Two in-process rich_tests added to `src/mcp_client/mod.rs`: `list_resource_templates_returns_all_templates`
+  and `list_resource_templates_unknown_server_returns_error`. Use rmcp duplex `ServerHandler`
+  pattern, consistent with existing `list_resources` and `list_prompts` test coverage.
+- `examples/test_mcp_resource_templates.lua` — manual smoke example: `mcp.connect` →
+  `mcp.list_resource_templates` → result log → `mcp.disconnect`.
+
 ## [0.14.0] - 2026-05-12
 
 ### Added
