@@ -42,8 +42,8 @@ use mlua_isle::AsyncIsle;
 use rmcp::{
     model::{
         CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams, SubscribeRequestParams,
-        UnsubscribeRequestParams,
+        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
+        RootsListChangedNotification, SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
@@ -629,6 +629,43 @@ impl McpManager {
                     request_id = %id,
                     error = %e,
                     "send_cancelled: peer send_notification failed"
+                );
+            }
+        });
+    }
+
+    /// Notify the named server that the client's roots list has changed.
+    ///
+    /// Sends a `notifications/roots/list_changed` notification to the server as a
+    /// fire-and-forget operation. The server may respond by issuing a new
+    /// `roots/list` request.
+    ///
+    /// # Arguments
+    /// - `name` — the name of the server connection to notify.
+    ///
+    /// # Errors
+    /// None propagated. Unknown server is logged at warn level and silently
+    /// ignored. Send failures inside the spawned task are also logged at warn
+    /// level and discarded.
+    pub fn notify_roots_list_changed(&self, name: &str) {
+        let Some(srv) = self.servers.get(name) else {
+            warn!(server = %name, "notify_roots_list_changed: unknown server, ignoring");
+            return;
+        };
+        // Clone the Peer out of the RunningService before spawning so we do
+        // not hold any lock across the await (await-holding-lock prevention).
+        let peer = srv.peer().clone();
+        let name_owned = name.to_string();
+        tokio::spawn(async move {
+            // RootsListChangedNotification has no params; Default::default() is
+            // sufficient (method = RootsListChangedNotificationMethod::default(),
+            // extensions = Default).
+            let notification = RootsListChangedNotification::default();
+            if let Err(e) = peer.send_notification(notification.into()).await {
+                warn!(
+                    server = %name_owned,
+                    error = %e,
+                    "notify_roots_list_changed: peer send_notification failed"
                 );
             }
         });
@@ -1638,5 +1675,247 @@ mod rich_tests {
         mgr.list_resources("srv")
             .await
             .expect("list_resources with handler should succeed");
+    }
+
+    // ── Test Server: RootsTestServer ────────────────────────────────────
+
+    /// A test server that, when `call_tool` is invoked, issues a `roots/list`
+    /// request back to the client (server→client direction) and embeds the
+    /// result in the tool response. This exercises the Crux C2 duplex path:
+    /// the client's `ClientHandler::list_roots` override is triggered by the
+    /// server's outbound `peer.list_roots()` call.
+    #[derive(Clone)]
+    struct RootsTestServer;
+
+    impl ServerHandler for RootsTestServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            _params: rmcp::model::CallToolRequestParams,
+            ctx: RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::CallToolResult, McpError> {
+            // Issue a server→client `roots/list` request.
+            // This triggers `AgentBlockClientHandler::list_roots` on the
+            // client side, which calls the registered Lua roots handler.
+            let roots_result = ctx.peer.list_roots().await.map_err(|e| {
+                McpError::internal_error(format!("server list_roots failed: {e}"), None)
+            })?;
+            // Return the count and first URI as text so the test can assert.
+            let count = roots_result.roots.len();
+            let first_uri = roots_result
+                .roots
+                .first()
+                .map(|r| r.uri.as_str())
+                .unwrap_or("(none)");
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(format!("roots:{count}:{first_uri}")),
+            ]))
+        }
+    }
+
+    /// Attach a `RootsTestServer` to `mgr` under `name`, with a pre-configured
+    /// handler Isle that has a Lua roots handler installed for the server name.
+    ///
+    /// Returns the `IsleDriver` so the caller can keep the driver alive.
+    async fn attach_roots_server_with_isle(
+        mgr: &mut McpManager,
+        name: &str,
+    ) -> mlua_isle::AsyncIsleDriver {
+        use mlua_isle::AsyncIsle;
+
+        // Spawn the isle with a trivial init, then configure it via exec().
+        let (isle, driver) = AsyncIsle::spawn(|_lua: &mlua::Lua| Ok(()))
+            .await
+            .expect("AsyncIsle::spawn should succeed");
+
+        let name_owned = name.to_string();
+        isle.exec(move |lua| {
+            handler::install_mcp_dispatcher_on_handler_isle(lua)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("setup dispatcher: {e}")))?;
+            // Pre-install the Lua roots handler for `name_owned`.
+            use mlua::prelude::*;
+            let handlers: LuaTable = lua
+                .globals()
+                .get("__mcp_roots_handlers")
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("get handlers: {e}")))?;
+            let cb: LuaFunction = lua
+                .load(
+                    r#"
+                    return function(server_name)
+                        return {
+                            { uri = "file:///test", name = "TestRoot" },
+                        }
+                    end
+                "#,
+                )
+                .set_name("@test_roots_handler")
+                .eval()
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("eval: {e}")))?;
+            handlers
+                .set(name_owned.as_str(), cb)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .expect("isle setup must succeed");
+
+        let isle_arc = std::sync::Arc::new(isle);
+
+        // Build a fresh handler, wire the isle and server_name BEFORE calling
+        // serve() so the RunningService clone has them set.
+        let mut handler = AgentBlockClientHandler::new();
+        handler.handler_isle = Some(std::sync::Arc::clone(&isle_arc));
+        handler.server_name = Some(name.to_string());
+        handler.mark_roots(name);
+
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = RootsTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+
+        driver
+    }
+
+    /// Attach a plain `RootsTestServer` without any Lua handler wired.
+    /// Used for testing the no-handler error path.
+    async fn attach_roots_server_bare(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = RootsTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let handler = AgentBlockClientHandler::new();
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    // ── Tests: mark_roots flag ──────────────────────────────────────────
+
+    /// (T1) mark_roots sets the registry flag that list_roots checks.
+    #[test]
+    fn mark_roots_sets_flag_accessible_by_handler() {
+        let handler = AgentBlockClientHandler::new();
+        handler.ensure_server("roots-srv");
+        assert!(
+            !handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("roots-srv")
+                .unwrap()
+                .roots
+        );
+        handler.mark_roots("roots-srv");
+        assert!(
+            handler
+                .registry
+                .lock()
+                .unwrap()
+                .get("roots-srv")
+                .unwrap()
+                .roots
+        );
+    }
+
+    // ── Tests: notify_roots_list_changed ───────────────────────────────
+
+    /// (T2) notify_roots_list_changed on an unknown server must not panic.
+    #[tokio::test]
+    async fn notify_roots_list_changed_unknown_server_is_no_op() {
+        let mgr = McpManager::new();
+        // Should not panic — logs a warn and returns.
+        mgr.notify_roots_list_changed("ghost");
+    }
+
+    /// (T1) notify_roots_list_changed on a live in-process server completes
+    /// without error. Mirrors `send_cancelled_live_server_does_not_panic`.
+    #[tokio::test]
+    async fn notify_roots_list_changed_live_server_does_not_panic() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "res").await;
+        mgr.notify_roots_list_changed("res");
+        // Give the spawned task a moment to complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ── Tests: live duplex roots round-trip (Crux C2) ───────────────────
+
+    /// (T1 / Crux C2) Live duplex test: the server issues `roots/list` to the
+    /// client while the client concurrently sends `notify_roots_list_changed`
+    /// back to the server. Both must complete successfully.
+    ///
+    /// Flow:
+    ///  (a) server→client: `call_tool` triggers `peer.list_roots()` which
+    ///      dispatches to `AgentBlockClientHandler::list_roots` on the client.
+    ///  (b) client→server: `notify_roots_list_changed` fires a
+    ///      `notifications/roots/list_changed` notification concurrently.
+    ///
+    /// This test verifies thread-safety of the ROOTS_HANDLERS registry under
+    /// real async dispatch (Crux C2: concurrent flight, not sequential stubs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_duplex_roots_round_trip() {
+        let mut mgr = McpManager::new();
+        let _driver = attach_roots_server_with_isle(&mut mgr, "roots").await;
+
+        // Wrap in Arc<RwLock<...>> for concurrent access.
+        let mgr_arc = std::sync::Arc::new(tokio::sync::RwLock::new(mgr));
+
+        // (a) Spawn call_tool — server will issue list_roots back to client.
+        let mgr_a = std::sync::Arc::clone(&mgr_arc);
+        let call_handle = tokio::spawn(async move {
+            mgr_a
+                .read()
+                .await
+                .call_tool("roots", "any_tool", serde_json::json!({}))
+                .await
+        });
+
+        // (b) Concurrently send notify_roots_list_changed client→server.
+        let mgr_b = std::sync::Arc::clone(&mgr_arc);
+        let notify_handle = tokio::spawn(async move {
+            // Small yield to let call_tool start, ensuring concurrent flight.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            mgr_b.read().await.notify_roots_list_changed("roots");
+        });
+
+        // Both must complete without panic.
+        let tool_result = call_handle.await.expect("call_handle must not panic");
+        notify_handle.await.expect("notify_handle must not panic");
+
+        // The tool result contains the roots count embedded in the text.
+        let result = tool_result.expect("call_tool must succeed");
+        let result_json = serde_json::to_string(&result).expect("serialize result");
+        assert!(
+            result_json.contains("roots:1:file:///test"),
+            "expected roots:1:file:///test in tool result: {result_json}"
+        );
+    }
+
+    /// (T3) list_roots without a registered handler returns method_not_found error.
+    /// The server propagates the error back to the client as a McpError.
+    #[tokio::test]
+    async fn live_duplex_roots_no_handler_returns_error() {
+        let mut mgr = McpManager::new();
+        // Attach without wiring an isle or handler — call_tool triggers list_roots
+        // which should return method_not_found on the client side.
+        attach_roots_server_bare(&mut mgr, "roots-no-handler").await;
+
+        let result = mgr
+            .call_tool("roots-no-handler", "any_tool", serde_json::json!({}))
+            .await;
+        // The server propagates the list_roots method_not_found error as a
+        // BlockError on the client side.
+        assert!(
+            result.is_err(),
+            "call_tool must fail when no roots handler is registered: {result:?}"
+        );
     }
 }

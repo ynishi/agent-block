@@ -761,6 +761,91 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.set_roots_handler(server_name, fn)
+    // Register a Lua callback responding to server-originated roots/list requests.
+    // The callback signature: function(server_name) -> table
+    //   where the returned table is an array of { uri, name } entries.
+    // `fn` must be a pure Lua function.
+    {
+        let mgr = Arc::clone(manager);
+        let isle = Arc::clone(&handler_isle);
+        mcp_tbl.set(
+            "set_roots_handler",
+            lua.create_async_function(
+                move |_, (server_name, func): (String, LuaFunction)| {
+                    let mgr = Arc::clone(&mgr);
+                    let isle = Arc::clone(&isle);
+                    async move {
+                        if func.info().what != "Lua" {
+                            return Err(LuaError::external(
+                                "mcp.set_roots_handler: handler must be a pure Lua function \
+                                 (C functions and Rust-bound callbacks are not supported)",
+                            ));
+                        }
+                        let bytecode = func.dump(true);
+                        if bytecode.is_empty() {
+                            return Err(LuaError::external(
+                                "mcp.set_roots_handler: Function::dump returned empty bytecode",
+                            ));
+                        }
+
+                        let server_for_exec = server_name.clone();
+                        let bytecode_name = format!("@mcp_roots[{server_name}]");
+                        isle.exec(move |lua| {
+                            use mlua::prelude::*;
+                            let loaded: LuaFunction = lua
+                                .load(bytecode.as_slice())
+                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_name(&bytecode_name)
+                                .into_function()
+                                .map_err(|e| {
+                                    IsleError::Lua(format!("set_roots_handler load: {e}"))
+                                })?;
+                            let tbl: LuaTable = lua
+                                .globals()
+                                .get("__mcp_roots_handlers")
+                                .map_err(|e| {
+                                    IsleError::Lua(format!("set_roots_handler get table: {e}"))
+                                })?;
+                            tbl.set(server_for_exec.as_str(), loaded).map_err(|e| {
+                                IsleError::Lua(format!("set_roots_handler set: {e}"))
+                            })?;
+                            Ok(String::new())
+                        })
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(server = %server_name, error = %e, "mcp.set_roots_handler: handler isle load failed");
+                            LuaError::external(format!(
+                                "mcp.set_roots_handler: handler isle load failed: {e}"
+                            ))
+                        })?;
+
+                        mgr.read().await.handler.mark_roots(&server_name);
+
+                        Ok(())
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // mcp.notify_roots_list_changed(server_name)
+    // Send a notifications/roots/list_changed notification to the named server.
+    // Fire-and-forget: returns immediately; errors are logged at warn level.
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "notify_roots_list_changed",
+            lua.create_async_function(move |_, server_name: String| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    mgr.read().await.notify_roots_list_changed(&server_name);
+                    Ok(())
+                }
+            })?,
+        )?;
+    }
+
     // mcp.server_info(name)
     // Return the server's InitializeResult as a Lua table.
     // Shape: { ok=true, server_info={...} } | { ok=false, error=... }
