@@ -162,6 +162,8 @@ capability).
   `handler(params)` receives the `CreateMessageRequest` table and must return a table
   matching `CreateMessageResult` (`{ model, stop_reason, role, content }`).
   When no handler is registered the server receives `method_not_found`.
+- `mcp.set_roots_handler(server_name, fn)` — Register a Lua handler responding to server-originated list_roots requests.
+- `mcp.notify_roots_list_changed(name)` — Notify the named server that the client roots list has changed.
 - `mcp.server_info(name)` — Return the server's `InitializeResult` as a Lua table.
   Returns `{ ok=true, server_info={serverInfo, capabilities, ...} }` on success.
   Useful for inspecting which MCP capability groups (resources, prompts, tools, etc.)
