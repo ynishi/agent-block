@@ -395,6 +395,31 @@ impl McpManager {
             .map_err(|e| BlockError::Mcp(format!("serialize list_resources result: {e}")))
     }
 
+    /// Call `resources/templates/list` and return resource templates as a JSON array.
+    ///
+    /// Immutable receiver — usable under `RwLock::read` alongside concurrent RPCs.
+    pub async fn list_resource_templates(&self, name: &str) -> BlockResult<serde_json::Value> {
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, "mcp list_resource_templates on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        let templates = timeout(rpc_timeout, srv.list_all_resource_templates())
+            .await
+            .map_err(|_| {
+                warn!(server = %name, timeout = ?rpc_timeout, "mcp list_resource_templates timed out");
+                BlockError::Timeout(format!(
+                    "list_resource_templates '{name}' timed out after {rpc_timeout:?}"
+                ))
+            })?
+            .map_err(|e| {
+                warn!(server = %name, error = %e, "mcp list_resource_templates failed");
+                BlockError::Mcp(format!("list_resource_templates '{name}': {e}"))
+            })?;
+        serde_json::to_value(&templates)
+            .map_err(|e| BlockError::Mcp(format!("serialize list_resource_templates result: {e}")))
+    }
+
     /// Call `resources/read` and return the resource contents as JSON.
     ///
     /// Immutable receiver — usable under `RwLock::read`.
@@ -929,10 +954,12 @@ mod rich_tests {
     use super::*;
     use rmcp::{
         model::{
-            GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
-            NumberOrString, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
-            Prompt, PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
-            ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+            GetPromptRequestParams, GetPromptResult, ListPromptsResult,
+            ListResourceTemplatesResult, ListResourcesResult, NumberOrString,
+            PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt,
+            PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
+            ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+            ServerInfo,
         },
         service::{MaybeSendFuture, RequestContext},
         ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -981,6 +1008,26 @@ mod rich_tests {
             std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 text, uri,
             )])))
+        }
+
+        fn list_resource_templates(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _ctx: RequestContext<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, McpError>>
+               + MaybeSendFuture
+               + '_ {
+            let templates = vec![
+                rmcp::model::ResourceTemplate::new(
+                    RawResourceTemplate::new("file:///{name}.txt", "file-template"),
+                    None,
+                ),
+                rmcp::model::ResourceTemplate::new(
+                    RawResourceTemplate::new("db:///{table}/{id}", "db-template"),
+                    None,
+                ),
+            ];
+            std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
         }
     }
 
@@ -1067,6 +1114,44 @@ mod rich_tests {
         let mgr = McpManager::new();
         let err = mgr
             .list_resources("ghost")
+            .await
+            .expect_err("unknown server must error");
+        assert!(
+            err.to_string().contains("no server named"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── Tests: list_resource_templates ─────────────────────────────────
+
+    #[tokio::test]
+    async fn list_resource_templates_returns_all_templates() {
+        let mut mgr = McpManager::new();
+        attach_resource_server(&mut mgr, "res").await;
+
+        let result = mgr
+            .list_resource_templates("res")
+            .await
+            .expect("list_resource_templates should succeed");
+
+        let arr = result.as_array().expect("should be JSON array");
+        assert_eq!(arr.len(), 2, "expected 2 templates: {result}");
+
+        let uri_template = arr[0]
+            .get("uriTemplate")
+            .and_then(|v| v.as_str())
+            .expect("first template should have uriTemplate");
+        assert!(
+            uri_template.contains("{name}"),
+            "uriTemplate should contain placeholder: {uri_template}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_resource_templates_unknown_server_returns_error() {
+        let mgr = McpManager::new();
+        let err = mgr
+            .list_resource_templates("ghost")
             .await
             .expect_err("unknown server must error");
         assert!(
