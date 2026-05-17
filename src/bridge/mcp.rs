@@ -1017,6 +1017,36 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.ping(name)
+    // Send a ping keepalive to the named server and return round-trip latency.
+    // Shape: { ok=true, latency_ms=<integer> } | { ok=false, error=<string> }
+    // latency_ms is set as i64 (Lua Integer; u64 values within realistic range
+    // are safe after as i64 cast).
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "ping",
+            lua.create_async_function(move |lua, name: String| {
+                let mgr = Arc::clone(&mgr);
+                async move {
+                    let result = mgr.read().await.ping(&name).await;
+                    let tbl = lua.create_table()?;
+                    match result {
+                        Ok(latency_ms) => {
+                            tbl.set("ok", true)?;
+                            tbl.set("latency_ms", latency_ms as i64)?;
+                        }
+                        Err(e) => {
+                            tbl.set("ok", false)?;
+                            tbl.set("error", e.to_string())?;
+                        }
+                    }
+                    Ok(tbl)
+                }
+            })?,
+        )?;
+    }
+
     lua.globals().set("mcp", mcp_tbl)?;
     Ok(())
 }
