@@ -27,6 +27,13 @@ pub(crate) const MCP_SAMPLING_HANDLERS: &str = "__mcp_sampling_handlers";
 /// Constant name of the Lua dispatcher function called for sampling/createMessage.
 const MCP_DISPATCH_SAMPLING: &str = "__mcp_dispatch_sampling";
 
+/// Constant name of the Lua global table used to store per-server roots handlers
+/// on the handler Isle.
+pub(crate) const MCP_ROOTS_HANDLERS: &str = "__mcp_roots_handlers";
+
+/// Constant name of the Lua dispatcher function called for roots/list requests.
+const MCP_DISPATCH_ROOTS: &str = "__mcp_dispatch_roots";
+
 /// Global table that holds user-provided progress callbacks stored by server name
 /// on the **main Isle**.
 ///
@@ -109,6 +116,8 @@ pub(crate) struct ServerHandlerRegistry {
     pub(crate) on_prompt_list_changed: bool,
     /// Whether a Lua sampling callback is installed on the handler Isle.
     pub(crate) sampling: bool,
+    /// Whether a Lua roots handler callback is installed on the handler Isle.
+    pub(crate) roots: bool,
     /// Whether to inject `__ab_obs` trace context into `call_tool` arguments
     /// for this server. Opt-in (default: `false`) to avoid leaking agent
     /// identity to untrusted or third-party MCP servers.
@@ -125,6 +134,7 @@ impl ServerHandlerRegistry {
             on_tool_list_changed: false,
             on_prompt_list_changed: false,
             sampling: false,
+            roots: false,
             trace_context: false,
         }
     }
@@ -341,6 +351,23 @@ impl AgentBlockClientHandler {
             .or_insert_with(ServerHandlerRegistry::new);
         entry.sampling = true;
     }
+
+    /// Mark that a Lua roots handler has been installed on the handler Isle.
+    ///
+    /// # Arguments
+    /// - `server_name` — the server for which the roots handler was registered.
+    ///
+    /// # Side effects
+    /// Creates a registry entry for the server if one does not yet exist, then
+    /// sets `roots = true` so that `list_roots` requests are dispatched to the
+    /// Lua callback rather than returning `method_not_found`.
+    pub(crate) fn mark_roots(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.roots = true;
+    }
 }
 
 impl Default for AgentBlockClientHandler {
@@ -385,6 +412,26 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
         .eval()?;
     lua.globals()
         .set(MCP_DISPATCH_SAMPLING, dispatch_sampling)?;
+
+    // ── roots ──────────────────────────────────────────────────────────────────
+    lua.globals().set(MCP_ROOTS_HANDLERS, lua.create_table()?)?;
+
+    let roots_src = r#"
+        local HANDLERS = "__mcp_roots_handlers"
+        return function(server_name)
+            local handlers = _G[HANDLERS]
+            local h = handlers and handlers[server_name]
+            if type(h) ~= "function" then
+                return nil  -- signal: no handler registered
+            end
+            return h(server_name)
+        end
+    "#;
+    let dispatch_roots: LuaFunction = lua
+        .load(roots_src)
+        .set_name("@agent_block:__mcp_dispatch_roots")
+        .eval()?;
+    lua.globals().set(MCP_DISPATCH_ROOTS, dispatch_roots)?;
 
     Ok(())
 }
@@ -1139,6 +1186,153 @@ impl ClientHandler for AgentBlockClientHandler {
                         result = result.with_stop_reason(sr);
                     }
                     Ok(result)
+                }
+            }
+        }
+    }
+
+    /// Handle an inbound `roots/list` request that arrives from the MCP server.
+    ///
+    /// The server sends `roots/list` to ask the client which filesystem roots are
+    /// available. This is a **server→client** request; the implementation looks up
+    /// the Lua callback registered via `mcp.set_roots_handler` and returns its
+    /// result.
+    ///
+    /// # Returns
+    /// - `Ok(ListRootsResult)` containing the roots the Lua handler returned.
+    /// - `Err(McpError::method_not_found)` when no server name is wired, no roots
+    ///   handler is registered, or no handler Isle is available.
+    /// - `Err(McpError::internal_error)` when the handler Isle exec fails or the
+    ///   Lua result cannot be parsed.
+    fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListRootsResult, McpError>> + Send + '_
+    {
+        let isle = self.handler_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name = self.server_name.clone();
+
+        async move {
+            // If no server_name wired, fall through to method_not_found.
+            let sn = match server_name.as_deref() {
+                Some(s) => s.to_string(),
+                None => {
+                    return Err(McpError::method_not_found::<
+                        rmcp::model::ListRootsRequestMethod,
+                    >());
+                }
+            };
+
+            // Check if roots handler is registered for this server.
+            let has_roots = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get(&sn).is_some_and(|r| r.roots)
+            };
+
+            if !has_roots {
+                return Err(McpError::method_not_found::<
+                    rmcp::model::ListRootsRequestMethod,
+                >());
+            }
+
+            let isle = match isle {
+                Some(i) => i,
+                None => {
+                    return Err(McpError::method_not_found::<
+                        rmcp::model::ListRootsRequestMethod,
+                    >());
+                }
+            };
+
+            // Dispatch to Lua roots handler and await result.
+            let sn_task = sn.clone();
+            let result_val = isle
+                .exec(move |lua| {
+                    use mlua::prelude::*;
+                    let dispatch: LuaFunction =
+                        lua.globals().get(MCP_DISPATCH_ROOTS).map_err(|e| {
+                            mlua_isle::IsleError::Lua(format!("list_roots: get dispatcher: {e}"))
+                        })?;
+                    let result: LuaValue = dispatch.call(sn_task.as_str()).map_err(|e| {
+                        mlua_isle::IsleError::Lua(format!("list_roots: dispatch: {e}"))
+                    })?;
+
+                    // Lua handler must return a table or nil.
+                    match result {
+                        LuaValue::Nil => Ok(String::new()),
+                        LuaValue::Table(tbl) => {
+                            // Serialize the table to JSON string.
+                            let json_val = crate::bridge::lua_to_json(lua, LuaValue::Table(tbl))
+                                .map_err(|e| {
+                                    mlua_isle::IsleError::Lua(format!(
+                                        "list_roots: lua_to_json: {e}"
+                                    ))
+                                })?;
+                            serde_json::to_string(&json_val).map_err(|e| {
+                                mlua_isle::IsleError::Lua(format!("list_roots: to_string: {e}"))
+                            })
+                        }
+                        other => Err(mlua_isle::IsleError::Lua(format!(
+                            "list_roots: handler must return table or nil, got: {:?}",
+                            other.type_name()
+                        ))),
+                    }
+                })
+                .await;
+
+            match result_val {
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        server = %sn,
+                        error = %e,
+                        "list_roots: handler isle error"
+                    );
+                    Err(McpError::internal_error(
+                        format!("roots handler: {e}"),
+                        None,
+                    ))
+                }
+                Ok(json_str) if json_str.is_empty() => {
+                    // Lua returned nil — no handler registered in dispatcher
+                    Err(McpError::method_not_found::<
+                        rmcp::model::ListRootsRequestMethod,
+                    >())
+                }
+                Ok(json_str) => {
+                    // Parse Lua response into Vec<Root>.
+                    let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+                        McpError::internal_error(format!("roots handler result parse: {e}"), None)
+                    })?;
+
+                    // The Lua handler returns an array of {uri, name} tables.
+                    let entries = v.as_array().ok_or_else(|| {
+                        McpError::internal_error(
+                            "roots handler result parse: expected array".to_string(),
+                            None,
+                        )
+                    })?;
+
+                    let mut roots = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        let uri = entry
+                            .get("uri")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = entry
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        let root = if let Some(n) = name {
+                            rmcp::model::Root::new(uri).with_name(n)
+                        } else {
+                            rmcp::model::Root::new(uri)
+                        };
+                        roots.push(root);
+                    }
+                    Ok(rmcp::model::ListRootsResult::new(roots))
                 }
             }
         }

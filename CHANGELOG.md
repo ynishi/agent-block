@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mcp.set_roots_handler(server_name, fn)` Lua API (Phase 2) — Register a Lua handler responding
+  to server-originated `roots/list` requests. The server calls this when it wants to discover the
+  client's filesystem roots. Implemented via `impl ClientHandler::list_roots` override.
+- `mcp.notify_roots_list_changed(name)` Lua API (Phase 2) — Send a
+  `notifications/roots/list_changed` notification to the named server (fire-and-forget).
 - `mcp.list_resource_templates(name)` — new Lua API that lists resource URI templates exposed by
   an MCP server. Returns `{ ok=true, resource_templates=[{uriTemplate, name, ...}] }` on success
   or `{ ok=false, error="..." }` on failure. Return shape is structurally identical to
