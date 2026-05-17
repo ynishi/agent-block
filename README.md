@@ -146,6 +146,9 @@ capability).
   Returns `{ ok=true, prompts=[{name, description, arguments}] }`.
 - `mcp.get_prompt(name, prompt_name, args)` — Retrieve a rendered prompt template.
   Returns `{ ok=true, description, messages=[{role, content}] }`.
+- `mcp.complete(name, ref, arg_name, arg_value)` — Request completion suggestions (MCP Completion typeahead, Phase 3).
+  `ref` is `{type="ref/prompt", name=...}` or `{type="ref/resource", uri=...}`.
+  Returns `{ ok=true, values=[...], total=number?, has_more=bool? }` or `{ ok=false, error=str }`.
 - `mcp.on_progress(name, handler)` — Register a per-server progress notification callback.
   `handler(token, progress, total, message)` is called for each `notifications/progress`
   event from the named server. Handler must be a pure Lua function.
