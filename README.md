@@ -165,6 +165,12 @@ capability).
   `handler(params)` receives the `CreateMessageRequest` table and must return a table
   matching `CreateMessageResult` (`{ model, stop_reason, role, content }`).
   When no handler is registered the server receives `method_not_found`.
+- `mcp.set_elicitation_handler(server_name, fn)` — Register a per-server Lua function to respond
+  to `elicitation/create` requests originating from the MCP server (server→client, Form variant
+  only). `fn(server_name, message, schema_json)` must return a table with `action =
+  "accept"|"decline"|"cancel"` and (for accept) a `content` table conforming to the schema.
+  Url-variant elicitation requests are always declined without reaching the callback. Handler must
+  be a pure Lua function.
 - `mcp.set_roots_handler(server_name, fn)` — Register a per-server Lua function to respond to
   `roots/list` requests originating from the MCP server (server→client direction).
   `fn(server_name)` must return a Lua array of root tables, each with at least a `uri` field

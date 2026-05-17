@@ -11,7 +11,8 @@ use mlua_isle::AsyncIsle;
 use rmcp::{
     handler::client::ClientHandler,
     model::{
-        CreateMessageRequestParams, CreateMessageResult, LoggingLevel,
+        CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+        CreateMessageResult, ElicitationAction, ElicitationCreateRequestMethod, LoggingLevel,
         LoggingMessageNotificationParam, ProgressNotificationParam,
         ResourceUpdatedNotificationParam, Role, SamplingMessage, SamplingMessageContent,
     },
@@ -33,6 +34,13 @@ pub(crate) const MCP_ROOTS_HANDLERS: &str = "__mcp_roots_handlers";
 
 /// Constant name of the Lua dispatcher function called for roots/list requests.
 const MCP_DISPATCH_ROOTS: &str = "__mcp_dispatch_roots";
+
+/// Constant name of the Lua global table used to store per-server elicitation handlers
+/// on the handler Isle.
+pub(crate) const MCP_ELICITATION_HANDLERS: &str = "__mcp_elicitation_handlers";
+
+/// Constant name of the Lua dispatcher function called for elicitation/create requests.
+const MCP_DISPATCH_ELICITATION: &str = "__mcp_dispatch_elicitation";
 
 /// Global table that holds user-provided progress callbacks stored by server name
 /// on the **main Isle**.
@@ -118,6 +126,8 @@ pub(crate) struct ServerHandlerRegistry {
     pub(crate) sampling: bool,
     /// Whether a Lua roots handler callback is installed on the handler Isle.
     pub(crate) roots: bool,
+    /// Whether a Lua elicitation handler callback is installed on the handler Isle.
+    pub(crate) elicitation: bool,
     /// Whether to inject `__ab_obs` trace context into `call_tool` arguments
     /// for this server. Opt-in (default: `false`) to avoid leaking agent
     /// identity to untrusted or third-party MCP servers.
@@ -135,6 +145,7 @@ impl ServerHandlerRegistry {
             on_prompt_list_changed: false,
             sampling: false,
             roots: false,
+            elicitation: false,
             trace_context: false,
         }
     }
@@ -368,6 +379,23 @@ impl AgentBlockClientHandler {
             .or_insert_with(ServerHandlerRegistry::new);
         entry.roots = true;
     }
+
+    /// Mark that a Lua elicitation handler has been installed on the handler Isle.
+    ///
+    /// # Arguments
+    /// - `server_name` — the server for which the elicitation handler was registered.
+    ///
+    /// # Side effects
+    /// Creates a registry entry for the server if one does not yet exist, then
+    /// sets `elicitation = true` so that `create_elicitation` requests are dispatched
+    /// to the Lua callback rather than returning `Decline` (no-handler path).
+    pub(crate) fn mark_elicitation(&self, server_name: &str) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(server_name.to_string())
+            .or_insert_with(ServerHandlerRegistry::new);
+        entry.elicitation = true;
+    }
 }
 
 impl Default for AgentBlockClientHandler {
@@ -432,6 +460,28 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
         .set_name("@agent_block:__mcp_dispatch_roots")
         .eval()?;
     lua.globals().set(MCP_DISPATCH_ROOTS, dispatch_roots)?;
+
+    // ── elicitation ───────────────────────────────────────────────────────────
+    lua.globals()
+        .set(MCP_ELICITATION_HANDLERS, lua.create_table()?)?;
+
+    let elicitation_src = r#"
+        local HANDLERS = "__mcp_elicitation_handlers"
+        return function(server_name, message, schema_json)
+            local handlers = _G[HANDLERS]
+            local h = handlers and handlers[server_name]
+            if type(h) ~= "function" then
+                return nil  -- signal: no handler registered → Decline
+            end
+            return h(server_name, message, schema_json)
+        end
+    "#;
+    let dispatch_elicitation: LuaFunction = lua
+        .load(elicitation_src)
+        .set_name("@agent_block:__mcp_dispatch_elicitation")
+        .eval()?;
+    lua.globals()
+        .set(MCP_DISPATCH_ELICITATION, dispatch_elicitation)?;
 
     Ok(())
 }
@@ -1333,6 +1383,250 @@ impl ClientHandler for AgentBlockClientHandler {
                         roots.push(root);
                     }
                     Ok(rmcp::model::ListRootsResult::new(roots))
+                }
+            }
+        }
+    }
+
+    /// Handle an inbound `elicitation/create` request that arrives from the MCP server.
+    ///
+    /// The server sends `elicitation/create` to ask the client to gather user input.
+    /// This is a **server→client** request. Form variant is dispatched to the Lua
+    /// callback registered via `mcp.set_elicitation_handler`; Url variant is always
+    /// declined without reaching the Lua layer (crux Form-only dispatch constraint).
+    ///
+    /// # Returns
+    /// - `Ok(CreateElicitationResult { action: Accept, content: Some(json), .. })` on accept.
+    /// - `Ok(CreateElicitationResult { action: Decline, .. })` on decline, cancel-as-decline,
+    ///   Url variant, or no handler registered (spec neutral — not an error).
+    /// - `Ok(CreateElicitationResult { action: Cancel, .. })` on cancel.
+    /// - `Err(McpError::method_not_found)` when no server name is wired or no handler Isle
+    ///   is available (mirrors list_roots).
+    /// - `Err(McpError::internal_error)` when the handler Isle exec fails or the Lua
+    ///   result fails 3-action contract validation.
+    fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_
+    {
+        let isle = self.handler_isle.clone();
+        let registry = Arc::clone(&self.registry);
+        let server_name = self.server_name.clone();
+
+        async move {
+            // ── Crux: Form-only dispatch — Url variant never reaches Lua ──────────
+            let (message, requested_schema) = match request {
+                CreateElicitationRequestParams::UrlElicitationParams { .. } => {
+                    return Ok(CreateElicitationResult {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                }
+                CreateElicitationRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } => (message, requested_schema),
+            };
+
+            // If no server_name wired, fall through to method_not_found.
+            let sn = match server_name.as_deref() {
+                Some(s) => s.to_string(),
+                None => {
+                    return Err(McpError::method_not_found::<ElicitationCreateRequestMethod>());
+                }
+            };
+
+            // Check if elicitation handler is registered for this server.
+            let has_elicitation = {
+                let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get(&sn).is_some_and(|r| r.elicitation)
+            };
+
+            if !has_elicitation {
+                // No handler registered — spec neutral Decline (not an error).
+                return Ok(CreateElicitationResult {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                    meta: None,
+                });
+            }
+
+            let isle = match isle {
+                Some(i) => i,
+                None => {
+                    return Err(McpError::method_not_found::<ElicitationCreateRequestMethod>());
+                }
+            };
+
+            // Serialize schema for Lua (crux schema-to-Lua conversion).
+            let schema_json = serde_json::to_string(&requested_schema).map_err(|e| {
+                McpError::internal_error(format!("create_elicitation: schema serialize: {e}"), None)
+            })?;
+
+            // Dispatch to Lua elicitation handler and await result.
+            let sn_task = sn.clone();
+            let message_task = message.clone();
+            let result_val = isle
+                .exec(move |lua| {
+                    use mlua::prelude::*;
+                    let dispatch: LuaFunction =
+                        lua.globals().get(MCP_DISPATCH_ELICITATION).map_err(|e| {
+                            mlua_isle::IsleError::Lua(format!(
+                                "create_elicitation: get dispatcher: {e}"
+                            ))
+                        })?;
+                    let result: LuaValue = dispatch
+                        .call((
+                            sn_task.as_str(),
+                            message_task.as_str(),
+                            schema_json.as_str(),
+                        ))
+                        .map_err(|e| {
+                            mlua_isle::IsleError::Lua(format!("create_elicitation: dispatch: {e}"))
+                        })?;
+
+                    // Lua handler must return a table or nil.
+                    match result {
+                        LuaValue::Nil => Ok(String::new()),
+                        LuaValue::Table(tbl) => {
+                            // Serialize the table to JSON string.
+                            let json_val = crate::bridge::lua_to_json(lua, LuaValue::Table(tbl))
+                                .map_err(|e| {
+                                    mlua_isle::IsleError::Lua(format!(
+                                        "create_elicitation: lua_to_json: {e}"
+                                    ))
+                                })?;
+                            serde_json::to_string(&json_val).map_err(|e| {
+                                mlua_isle::IsleError::Lua(format!(
+                                    "create_elicitation: to_string: {e}"
+                                ))
+                            })
+                        }
+                        other => Err(mlua_isle::IsleError::Lua(format!(
+                            "create_elicitation: handler must return table or nil, got: {:?}",
+                            other.type_name()
+                        ))),
+                    }
+                })
+                .await;
+
+            match result_val {
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mcp_client",
+                        server = %sn,
+                        error = %e,
+                        "create_elicitation: handler isle error"
+                    );
+                    Err(McpError::internal_error(
+                        format!("elicitation handler: {e}"),
+                        None,
+                    ))
+                }
+                Ok(json_str) if json_str.is_empty() => {
+                    // Lua returned nil — no handler registered in dispatcher → Decline.
+                    Ok(CreateElicitationResult {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    })
+                }
+                Ok(json_str) => {
+                    // ── Crux: 3-action response contract validation ────────────────
+                    let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+                        McpError::internal_error(
+                            format!("elicitation handler result parse: {e}"),
+                            None,
+                        )
+                    })?;
+
+                    let action_str = v
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            McpError::internal_error(
+                                "elicitation handler result: missing or non-string 'action' field"
+                                    .to_string(),
+                                None,
+                            )
+                        })?;
+
+                    let content = v.get("content").cloned();
+
+                    match action_str {
+                        "accept" => {
+                            if content.is_none() {
+                                tracing::warn!(
+                                    target: "mcp_client",
+                                    server = %sn,
+                                    "create_elicitation: action=accept but content is nil"
+                                );
+                                return Err(McpError::internal_error(
+                                    "elicitation handler: action=accept but content is nil"
+                                        .to_string(),
+                                    None,
+                                ));
+                            }
+                            Ok(CreateElicitationResult {
+                                action: ElicitationAction::Accept,
+                                content,
+                                meta: None,
+                            })
+                        }
+                        "decline" => {
+                            if content.is_some() {
+                                tracing::warn!(
+                                    target: "mcp_client",
+                                    server = %sn,
+                                    "create_elicitation: action=decline but content is non-nil"
+                                );
+                                return Err(McpError::internal_error(
+                                    "elicitation handler: action=decline but content is non-nil"
+                                        .to_string(),
+                                    None,
+                                ));
+                            }
+                            Ok(CreateElicitationResult {
+                                action: ElicitationAction::Decline,
+                                content: None,
+                                meta: None,
+                            })
+                        }
+                        "cancel" => {
+                            if content.is_some() {
+                                tracing::warn!(
+                                    target: "mcp_client",
+                                    server = %sn,
+                                    "create_elicitation: action=cancel but content is non-nil"
+                                );
+                                return Err(McpError::internal_error(
+                                    "elicitation handler: action=cancel but content is non-nil"
+                                        .to_string(),
+                                    None,
+                                ));
+                            }
+                            Ok(CreateElicitationResult {
+                                action: ElicitationAction::Cancel,
+                                content: None,
+                                meta: None,
+                            })
+                        }
+                        other => {
+                            tracing::warn!(
+                                target: "mcp_client",
+                                server = %sn,
+                                action = %other,
+                                "create_elicitation: unknown action"
+                            );
+                            Err(McpError::internal_error(
+                                format!("elicitation handler: unknown action: {other}"),
+                                None,
+                            ))
+                        }
+                    }
                 }
             }
         }
