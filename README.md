@@ -138,6 +138,8 @@ capability).
 - `mcp.list_tools(name)` — List available tools
 - `mcp.list_resources(name)` — List resources exposed by the server.
   Returns `{ ok=true, resources=[{uri, name, description, mimeType, ...}] }`.
+- `mcp.list_resource_templates(name)` — List resource URI templates exposed by the server.
+  Returns `{ ok=true, resource_templates=[{uriTemplate, name, ...}] }`.
 - `mcp.read_resource(name, uri)` — Read a resource by URI.
   Returns `{ ok=true, contents=[{uri, mimeType, text|blob}] }`.
 - `mcp.list_prompts(name)` — List prompt templates exposed by the server.
