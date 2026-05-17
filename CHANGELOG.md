@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mcp.complete(server, ref, arg_name, arg_value)` Lua API (Phase 3) — MCP Completion typeahead outbound request. `ref` is `{type="ref/prompt", name=...}` or `{type="ref/resource", uri=...}`; dispatches at runtime to `Reference::for_prompt`/`for_resource`. Part of Umbrella `1778981063-7028`.
 - `mcp.set_roots_handler(server_name, fn)` Lua API (Phase 2) — Register a Lua handler responding
   to server-originated `roots/list` requests. The server calls this when it wants to discover the
   client's filesystem roots. Implemented via `impl ClientHandler::list_roots` override.

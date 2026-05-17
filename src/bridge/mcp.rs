@@ -477,6 +477,78 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         )?;
     }
 
+    // mcp.complete(name, ref, arg_name, arg_value)
+    // → { ok=bool, values=[...], total=number?, has_more=bool?, error=str }
+    //
+    // `ref` must be a Lua table with a `type` field of "ref/prompt" (+ `name`)
+    // or "ref/resource" (+ `uri`).  `CompletionContext` is not exposed (scope-out
+    // per issue.md:51).
+    {
+        let mgr = Arc::clone(manager);
+        mcp_tbl.set(
+            "complete",
+            lua.create_async_function(
+                move |lua,
+                      (name, ref_val, arg_name, arg_value): (
+                    String,
+                    LuaValue,
+                    String,
+                    String,
+                )| {
+                    let mgr = Arc::clone(&mgr);
+                    async move {
+                        let ref_json = lua_to_json(&lua, ref_val)?;
+                        let result = mgr
+                            .read()
+                            .await
+                            .complete(&name, ref_json, &arg_name, &arg_value)
+                            .await;
+                        let tbl = lua.create_table()?;
+                        match result {
+                            Ok(val) => {
+                                tbl.set("ok", true)?;
+                                // Extract fields from CompleteResult.completion
+                                let completion = val
+                                    .get("completion")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Object(
+                                        serde_json::Map::new(),
+                                    ));
+                                let values = completion
+                                    .get("values")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Array(vec![]));
+                                tbl.set("values", json_to_lua(&lua, values)?)?;
+                                // total: optional u32
+                                if let Some(total) = completion.get("total") {
+                                    if !total.is_null() {
+                                        tbl.set("total", json_to_lua(&lua, total.clone())?)?;
+                                    }
+                                }
+                                // has_more: optional bool — rmcp may serialize as hasMore (camelCase)
+                                // or has_more (snake_case) depending on serde rename; check both.
+                                let has_more = completion
+                                    .get("hasMore")
+                                    .or_else(|| completion.get("has_more"))
+                                    .cloned();
+                                if let Some(hm) = has_more {
+                                    if !hm.is_null() {
+                                        tbl.set("has_more", json_to_lua(&lua, hm)?)?;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tbl.set("ok", false)?;
+                                tbl.set("error", e.to_string())?;
+                            }
+                        }
+                        Ok(tbl)
+                    }
+                },
+            )?,
+        )?;
+    }
+
     // mcp.on_progress(server_name, fn)
     // Registers a Lua callback for progress notifications from `server_name`.
     // The callback signature: function(ev) where ev is a table with fields:
