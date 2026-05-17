@@ -41,9 +41,9 @@ use std::time::Duration;
 use mlua_isle::AsyncIsle;
 use rmcp::{
     model::{
-        CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-        GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
-        RootsListChangedNotification, SubscribeRequestParams, UnsubscribeRequestParams,
+        ArgumentInfo, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+        CompleteRequestParams, GetPromptRequestParams, NumberOrString, ReadResourceRequestParams,
+        Reference, RootsListChangedNotification, SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
@@ -569,6 +569,75 @@ impl McpManager {
             .map_err(|e| BlockError::Mcp(format!("serialize get_prompt result: {e}")))
     }
 
+    /// Call `completion/complete` with the given reference and argument.
+    ///
+    /// `ref_json` must be a JSON Object with a `type` field of either
+    /// `"ref/prompt"` (with a `name` field) or `"ref/resource"` (with a `uri`
+    /// field).  Any other `type` value is rejected with `BlockError::Mcp`.
+    ///
+    /// `CompletionContext` is not exposed (scope-out per issue.md:51); it is
+    /// always sent as `None`.  Immutable receiver — usable under `RwLock::read`.
+    pub async fn complete(
+        &self,
+        name: &str,
+        ref_json: serde_json::Value,
+        arg_name: &str,
+        arg_value: &str,
+    ) -> BlockResult<serde_json::Value> {
+        // Build the Reference by dispatching on the `type` field at runtime.
+        // This is the crux: both prompt-ref and resource-ref paths must be
+        // preserved; collapsing or hardcoding one variant is forbidden.
+        let reference = match ref_json.get("type").and_then(|v| v.as_str()) {
+            Some("ref/prompt") => {
+                let prompt_name = ref_json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                Reference::for_prompt(prompt_name)
+            }
+            Some("ref/resource") => {
+                let uri = ref_json.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                Reference::for_resource(uri)
+            }
+            Some(kind) => {
+                warn!(server = %name, kind = ?kind, "mcp complete: invalid ref kind");
+                return Err(BlockError::Mcp(format!(
+                    "complete on '{name}': invalid ref kind '{kind}', \
+                     expected 'ref/prompt' or 'ref/resource'"
+                )));
+            }
+            None => {
+                warn!(server = %name, "mcp complete: ref missing 'type' field");
+                return Err(BlockError::Mcp(format!(
+                    "complete on '{name}': ref object has no 'type' field"
+                )));
+            }
+        };
+        let params = CompleteRequestParams::new(
+            reference,
+            ArgumentInfo {
+                name: arg_name.to_string(),
+                value: arg_value.to_string(),
+            },
+        );
+        let srv = self.servers.get(name).ok_or_else(|| {
+            warn!(server = %name, "mcp complete on unknown server");
+            BlockError::Mcp(format!("no server named '{name}'"))
+        })?;
+        let rpc_timeout = self.rpc_timeout;
+        let result = timeout(rpc_timeout, srv.complete(params))
+            .await
+            .map_err(|_| {
+                warn!(server = %name, timeout = ?rpc_timeout, "mcp complete timed out");
+                BlockError::Timeout(format!(
+                    "complete on '{name}' timed out after {rpc_timeout:?}"
+                ))
+            })?
+            .map_err(|e| {
+                warn!(server = %name, error = %e, "mcp complete failed");
+                BlockError::Mcp(format!("complete on '{name}': {e}"))
+            })?;
+        serde_json::to_value(&result)
+            .map_err(|e| BlockError::Mcp(format!("serialize complete result: {e}")))
+    }
+
     /// Return the server's `InitializeResult` serialized as JSON.
     ///
     /// `peer_info()` is sync (no I/O). It returns `Some` after a successful
@@ -991,12 +1060,12 @@ mod rich_tests {
     use super::*;
     use rmcp::{
         model::{
-            GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-            ListResourceTemplatesResult, ListResourcesResult, NumberOrString,
-            PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt,
-            PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
-            ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-            ServerInfo,
+            CompleteRequestParams, CompleteResult, CompletionInfo, GetPromptRequestParams,
+            GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+            NumberOrString, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+            Prompt, PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
+            ReadResourceRequestParams, ReadResourceResult, Reference, ResourceContents,
+            ServerCapabilities, ServerInfo,
         },
         service::{MaybeSendFuture, RequestContext},
         ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -1122,6 +1191,55 @@ mod rich_tests {
         let (server_side, client_side) = tokio::io::duplex(65536);
         tokio::spawn(async move {
             if let Ok(running) = PromptTestServer.serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let handler = AgentBlockClientHandler::new();
+        let running = handler.serve(client_side).await.expect("handshake");
+        mgr.servers.insert(name.to_string(), running);
+    }
+
+    #[derive(Clone)]
+    struct CompleteTestServer;
+
+    impl ServerHandler for CompleteTestServer {
+        fn get_info(&self) -> ServerInfo {
+            // Enable both prompts and resources so this server handles both ref kinds.
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_prompts()
+                    .enable_resources()
+                    .build(),
+            )
+        }
+
+        async fn complete(
+            &self,
+            request: CompleteRequestParams,
+            _ctx: RequestContext<RoleServer>,
+        ) -> Result<CompleteResult, McpError> {
+            let info = match &request.r#ref {
+                Reference::Prompt(_) => CompletionInfo::with_pagination(
+                    vec!["alice".to_string(), "alpha".to_string()],
+                    Some(2),
+                    false,
+                )
+                .expect("valid completion info"),
+                Reference::Resource(_) => CompletionInfo::with_pagination(
+                    vec!["file:///a.txt".to_string()],
+                    Some(1),
+                    false,
+                )
+                .expect("valid completion info"),
+            };
+            Ok(CompleteResult::new(info))
+        }
+    }
+
+    async fn attach_complete_server(mgr: &mut McpManager, name: &str) {
+        let (server_side, client_side) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            if let Ok(running) = CompleteTestServer.serve(server_side).await {
                 let _ = running.waiting().await;
             }
         });
@@ -1308,6 +1426,84 @@ mod rich_tests {
             .expect_err("unknown server must error");
         assert!(
             err.to_string().contains("no server named"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── Tests: complete ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn complete_prompt_ref_returns_values() {
+        let mut mgr = McpManager::new();
+        attach_complete_server(&mut mgr, "cmp").await;
+
+        let ref_json = serde_json::json!({ "type": "ref/prompt", "name": "greet" });
+        let result = mgr
+            .complete("cmp", ref_json, "name", "al")
+            .await
+            .expect("complete with prompt ref should succeed");
+
+        let completion = result
+            .get("completion")
+            .expect("result should have 'completion' key");
+        let values = completion
+            .get("values")
+            .and_then(|v| v.as_array())
+            .expect("completion should have 'values' array");
+        assert!(
+            !values.is_empty(),
+            "values must not be empty for prompt ref: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_resource_ref_returns_values() {
+        let mut mgr = McpManager::new();
+        attach_complete_server(&mut mgr, "cmp").await;
+
+        let ref_json = serde_json::json!({ "type": "ref/resource", "uri": "file:///a.txt" });
+        let result = mgr
+            .complete("cmp", ref_json, "uri", "file:///")
+            .await
+            .expect("complete with resource ref should succeed");
+
+        let completion = result
+            .get("completion")
+            .expect("result should have 'completion' key");
+        let values = completion
+            .get("values")
+            .and_then(|v| v.as_array())
+            .expect("completion should have 'values' array");
+        assert!(
+            !values.is_empty(),
+            "values must not be empty for resource ref: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_unknown_server_returns_error() {
+        let mgr = McpManager::new();
+        let ref_json = serde_json::json!({ "type": "ref/prompt", "name": "greet" });
+        let err = mgr
+            .complete("ghost", ref_json, "name", "al")
+            .await
+            .expect_err("unknown server must error");
+        assert!(
+            err.to_string().contains("no server named"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_invalid_ref_kind_returns_error() {
+        let mgr = McpManager::new();
+        let ref_json = serde_json::json!({ "type": "ref/unknown", "name": "x" });
+        let err = mgr
+            .complete("any", ref_json, "name", "x")
+            .await
+            .expect_err("invalid ref kind must error");
+        assert!(
+            err.to_string().contains("invalid ref kind"),
             "unexpected error: {err}"
         );
     }
