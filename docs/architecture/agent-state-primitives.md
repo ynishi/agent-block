@@ -28,12 +28,12 @@ Agent state needs split along four axes. The current primitives cover the
 Storage axis and part of the External axis; the future catalog (§3) covers
 the remaining gaps.
 
-| Axis          | Question being answered                          | Current        | Future candidates       |
-|---------------|--------------------------------------------------|----------------|-------------------------|
-| Storage tier  | "Where does this byte live and for how long?"    | KV, SQL        | TSDB (#3.8), object store (#3.4) |
-| Knowledge     | "Find me things related to X"                    | (none)         | vector (#3.1), rule (#3.2) |
-| Coordination  | "Reconcile state / events across agents"         | (none)         | CRDT (#3.3), messaging (#3.5) |
-| External      | "Read / subscribe to data the runtime does not own" | mcp (partial) | resource subscribe (#3.7) |
+| Axis          | Question being answered                          | Current              | Future candidates       |
+|---------------|--------------------------------------------------|----------------------|-------------------------|
+| Storage tier  | "Where does this byte live and for how long?"    | KV, SQL, TSDB (#3.8) | object store (#3.4)     |
+| Knowledge     | "Find me things related to X"                    | (none)               | vector (#3.1), rule (#3.2) |
+| Coordination  | "Reconcile state / events across agents"         | (none)               | CRDT (#3.3), messaging (#3.5) |
+| External      | "Read / subscribe to data the runtime does not own" | mcp (partial)     | resource subscribe (#3.7) |
 
 The axes are **chosen to minimize overlap**. A new primitive proposal that
 does not clearly land on one axis (or that duplicates an existing one)
@@ -321,6 +321,8 @@ details.
   MCP spec — implement only when a consumer needs them.
 
 ### 3.8 TSDB — `std.ts.*`
+
+**Status: implemented (v1)**
 
 - **Need**: append-only time-series log with range + tag-filtered
   retrieval at KV-level ergonomics. Motivating uses: `journal.md`

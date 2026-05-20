@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.ts.append(series, value, tags?, at?)` — append a data point to a named
+  time-series. `value` accepts both Lua numbers and tables; both are JSON-encoded in
+  SQLite and decoded losslessly on query return (Crux C1 dual-type contract).
+- `std.ts.query(series, opts)` — range query with optional tag AND-filter
+  (`opts.tags` evaluated via SQLite `json_extract`, never serialised-string equality,
+  Crux C2), aggregation (`opts.agg` ∈ {count, sum, avg, last}), time-bucketing
+  (`opts.bucket_ms`; agg + no bucket = single aggregate, agg + bucket = bucketed,
+  Crux C3), and pagination (`opts.limit`, `opts.offset`).
+- `std.ts.last(series, tags?)` — retrieve the most-recent data point for a series,
+  optionally filtered by tags using the same AND-conjunction as `std.ts.query`.
+- `std.ts.register_tools()` — register `ts_append`, `ts_query`, and `ts_last` as
+  LLM-callable tools (JSON Schema definitions; mirrors `std.kv.register_tools`).
+- `bridge::config::ts_path()` — maps `AGENT_BLOCK_TS_PATH` / `AGENT_BLOCK_HOME` to
+  the SQLite file path for the ts primitive (`:memory:` supported).
+- `bridge::ts::register(lua, ctx)` — Rust registration function that runs DDL init
+  (idempotent `CREATE TABLE IF NOT EXISTS ts …` + index) and installs all Lua surface
+  functions into `std.ts`.
+- `HostContext::ts_conn` / `HostContext::ts_interrupt` — `Arc<Mutex<rusqlite::Connection>>`
+  and `Arc<rusqlite::InterruptHandle>` fields; follow the same pattern as the existing
+  `sql_conn` / `sql_interrupt` / `kv_conn` / `kv_interrupt` fields.
+
 ## [0.15.0] - 2026-05-18
 
 ### Added

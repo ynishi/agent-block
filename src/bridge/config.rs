@@ -1,24 +1,26 @@
-//! Config resolution for `std.kv` / `std.sql` storage backends.
+//! Config resolution for `std.kv` / `std.sql` / `std.ts` storage backends.
 //!
 //! All knobs are ENV-driven (no CLI flags) so `.env` can drive them uniformly.
 //!
 //! | ENV var                            | Default                  | Used by  |
 //! |------------------------------------|--------------------------|----------|
-//! | `AGENT_BLOCK_HOME`                 | `$HOME/.agent-block`     | both     |
+//! | `AGENT_BLOCK_HOME`                 | `$HOME/.agent-block`     | all      |
 //! | `AGENT_BLOCK_KV_PATH`              | `{HOME}/kv.sqlite`       | std.kv   |
 //! | `AGENT_BLOCK_SQL_PATH`             | `{HOME}/db.sqlite`       | std.sql  |
-//! | `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`  | `5000`                   | both     |
-//! | `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` | `5000`                   | both     |
-//! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | both     |
+//! | `AGENT_BLOCK_TS_PATH`              | `{HOME}/ts.sqlite`       | std.ts   |
+//! | `AGENT_BLOCK_SQL_BUSY_TIMEOUT_MS`  | `5000`                   | all      |
+//! | `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS` | `5000`                   | all      |
+//! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | all      |
 //! | `AGENT_BLOCK_BUS_CAPACITY`         | `64`                     | EventBus |
 //! | `AGENT_BLOCK_TASK_GRACE_MS`        | `1000`                   | task/bus |
 //!
-//! `std.kv` and `std.sql` are backed by separate SQLite database files so
-//! that agent-internal KV state and explicit user SQL data don't share WAL,
-//! page cache, or backup lifecycle. Pragma/timeout knobs apply to both.
+//! `std.kv`, `std.sql`, and `std.ts` are backed by separate SQLite database
+//! files so that agent-internal KV state, explicit user SQL data, and
+//! time-series rows don't share WAL, page cache, or backup lifecycle.
+//! Pragma/timeout knobs apply to all three.
 //!
-//! Special: `=:memory:` selects an in-memory database (works for both
-//! `AGENT_BLOCK_KV_PATH` and `AGENT_BLOCK_SQL_PATH`).
+//! Special: `=:memory:` selects an in-memory database (works for
+//! `AGENT_BLOCK_KV_PATH`, `AGENT_BLOCK_SQL_PATH`, and `AGENT_BLOCK_TS_PATH`).
 //! Journal mode is ignored for `:memory:` (SQLite forces MEMORY).
 //! `AGENT_BLOCK_SQL_QUERY_TIMEOUT_MS=0` disables the query timeout.
 
@@ -57,6 +59,18 @@ pub fn sql_path() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(v));
     }
     Ok(base_dir()?.join("db.sqlite"))
+}
+
+/// Path to the std.ts SQLite database file (or `:memory:`).
+///
+/// `AGENT_BLOCK_TS_PATH` → `{base_dir}/ts.sqlite`.
+/// Separate from kv and sql so the TSDB WAL does not share page cache or
+/// backup lifecycle with agent-internal KV or user SQL data.
+pub fn ts_path() -> Result<PathBuf, String> {
+    if let Some(v) = std::env::var_os("AGENT_BLOCK_TS_PATH") {
+        return Ok(PathBuf::from(v));
+    }
+    Ok(base_dir()?.join("ts.sqlite"))
 }
 
 /// True when the resolved path is SQLite's in-memory sentinel.

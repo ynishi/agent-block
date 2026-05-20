@@ -232,6 +232,37 @@ capability).
 - `std.path.join(...)`, `std.path.basename(path)`, `std.path.dirname(path)`
 - `std.time.now()`, `std.time.sleep(secs)`, `std.time.measure(fn)`
 
+### std.kv.* (mlua-batteries, SQLite-backed)
+- `std.kv.get(ns, key)` — retrieve a value by namespace + key; returns `nil` if absent
+- `std.kv.set(ns, key, value)` — store a value (any Lua value, JSON-encoded internally)
+- `std.kv.delete(ns, key)` — delete a key; returns `true` if it existed, `false` otherwise
+- `std.kv.list(ns, prefix?)` — list keys in a namespace, optionally filtered by prefix
+- `std.kv.register_tools()` — register `kv_get`, `kv_set`, `kv_delete`, `kv_list` as LLM-callable tools
+
+Storage: `AGENT_BLOCK_HOME/kv.sqlite` (override via `AGENT_BLOCK_KV_PATH`; `:memory:` supported).
+
+### std.sql.* (mlua-batteries, SQLite-backed)
+- `std.sql.execute(sql, params?)` — execute a DML statement; returns `{ affected = N }`
+- `std.sql.query(sql, params?)` — execute a query; returns an array of row tables
+- `std.sql.register_tools()` — register `sql_execute`, `sql_query` as LLM-callable tools
+
+Storage: `AGENT_BLOCK_HOME/sql.sqlite` (override via `AGENT_BLOCK_SQL_PATH`; `:memory:` supported).
+
+### std.ts.* (agent-block, SQLite-backed TSDB)
+- `std.ts.append(series, value, tags?, at?)` — append a data point; `value` is a Lua
+  number or table (JSON-encoded, losslessly decoded on read); `tags` is an optional
+  `{key=value}` table; `at` is an optional Unix timestamp in milliseconds (default: now)
+- `std.ts.query(series, opts)` — range query; `opts` fields:
+  - `from`, `to` (integer ms) — time range (default: full range)
+  - `tags` (table) — AND-filter; each key-value pair uses SQLite `json_extract`
+  - `agg` (string) — `"count"` | `"sum"` | `"avg"` | `"last"` (optional)
+  - `bucket_ms` (integer) — bucket width; requires `agg`; produces time-bucketed rows
+  - `limit`, `offset` (integer) — pagination
+- `std.ts.last(series, tags?)` — most-recent data point; same tag AND-filter as `query`
+- `std.ts.register_tools()` — register `ts_append`, `ts_query`, `ts_last` as LLM-callable tools
+
+Storage: `AGENT_BLOCK_HOME/ts.sqlite` (override via `AGENT_BLOCK_TS_PATH`; `:memory:` supported).
+
 ### agent (StdPkg — `require("agent")`)
 
 Built-in ReAct loop module. Available without any path configuration after `cargo install`.
