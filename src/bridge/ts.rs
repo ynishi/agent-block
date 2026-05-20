@@ -156,12 +156,15 @@ fn build_query_sql(
                 }
 
                 // ── path 3: time-bucketed aggregate ───────────────────────
-                Some(_bms) => {
+                Some(bms) => {
                     // bucket_ts = (ts / bucket_ms) * bucket_ms  (integer division)
-                    // The bucket_ms value is bound twice as a parameter: once
-                    // for the divisor and once for the multiplier, so that
-                    // the bucket_ms binding is safe and does not embed the
-                    // literal into the SQL string.
+                    // The bucket_ms literal is embedded directly into the SQL
+                    // string (safe: validated positive i64, no user-supplied
+                    // string content).  Embedding avoids the parameter-ordering
+                    // issue that arises when SELECT-clause `?` placeholders
+                    // appear before WHERE-clause `?` placeholders — SQLite
+                    // positional binding fills them left-to-right, so any `?`
+                    // in the SELECT would consume series/from_ts/to_ts params.
                     let bucketed_agg_expr = if agg_name == "last" {
                         // For bucketed "last" we return the maximum ts in
                         // each bucket as a proxy for the last value.
@@ -173,7 +176,7 @@ fn build_query_sql(
                     };
 
                     let sql = format!(
-                        "SELECT (ts / ?) * ? AS bucket_ts, {bucketed_agg_expr} AS agg_value \
+                        "SELECT (ts / {bms}) * {bms} AS bucket_ts, {bucketed_agg_expr} AS agg_value \
                          FROM ts {where_clause} \
                          GROUP BY bucket_ts ORDER BY bucket_ts{limit_clause}"
                     );
@@ -445,7 +448,6 @@ fn make_query(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction>
             let is_single_agg = agg.is_some() && bucket_ms.is_none();
             let is_last_single = agg.as_deref() == Some("last") && bucket_ms.is_none();
             let is_bucketed = agg.is_some() && bucket_ms.is_some();
-            let bucket_ms_val = bucket_ms;
 
             let rows_raw: Result<Vec<Vec<Option<String>>>, String> =
                 tokio::task::spawn_blocking(move || {
@@ -464,13 +466,9 @@ fn make_query(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction>
                     for v in tag_values {
                         params.push(Box::new(v));
                     }
-                    if is_bucketed {
-                        // bucket_ms appears twice: divisor and multiplier
-                        if let Some(bms) = bucket_ms_val {
-                            params.push(Box::new(bms));
-                            params.push(Box::new(bms));
-                        }
-                    }
+                    // Note: bucket_ms is embedded as a literal in the SQL
+                    // (see build_query_sql path 3), so no additional params
+                    // are needed for the bucketed-aggregate case.
 
                     let param_refs: Vec<&dyn rusqlite::ToSql> =
                         params.iter().map(|p| p.as_ref()).collect();
