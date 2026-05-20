@@ -30,7 +30,7 @@ the remaining gaps.
 
 | Axis          | Question being answered                          | Current        | Future candidates       |
 |---------------|--------------------------------------------------|----------------|-------------------------|
-| Storage tier  | "Where does this byte live and for how long?"    | KV, SQL        | object store (#3.4)     |
+| Storage tier  | "Where does this byte live and for how long?"    | KV, SQL        | TSDB (#3.8), object store (#3.4) |
 | Knowledge     | "Find me things related to X"                    | (none)         | vector (#3.1), rule (#3.2) |
 | Coordination  | "Reconcile state / events across agents"         | (none)         | CRDT (#3.3), messaging (#3.5) |
 | External      | "Read / subscribe to data the runtime does not own" | mcp (partial) | resource subscribe (#3.7) |
@@ -320,7 +320,35 @@ details.
   the spec is well-defined. The `*_list_changed` group is optional per
   MCP spec — implement only when a consumer needs them.
 
-### 3.8 Rejected / Deferred
+### 3.8 TSDB — `std.ts.*`
+
+- **Need**: append-only time-series log with range + tag-filtered
+  retrieval at KV-level ergonomics. Motivating uses: `journal.md`
+  parallel machine-readable trace, agent run metrics
+  (token / duration / cost), MCP notification log.
+- **Why not other primitives**: `std.sql.*` can encode time-series but
+  re-discovering the right schema / index / tag layout / agg query each
+  time is the "SQLite As TSDB" trap. `std.kv.*` has no range or
+  aggregation. A narrow, append-focused primitive carries its own
+  contract so callers do not bikeshed.
+- **Surface** (instance of §2 contract; SQLite-backed):
+  ```lua
+  std.ts.append(series, value, tags?, at?)
+  std.ts.query(series, { from, to, tags?, agg?, bucket_ms? })
+  std.ts.last(series, tags?)
+  ```
+- **Backend**: single SQLite file under `AGENT_BLOCK_HOME/ts.sqlite`
+  (override via `AGENT_BLOCK_TS_PATH`, `:memory:` supported). One
+  table `(series, ts, tags JSON, value JSON)` + index
+  `(series, ts)`; tag filter via SQLite JSON1.
+- **Non-goals**: high-frequency (>100 w/s) workloads, distributed /
+  replication, PromQL-like DSL, automatic retention / downsampling
+  (deferred to v2). Real TSDB engines (InfluxDB, Timescale) are out
+  of scope; agent-host write rate is low enough that SQLite suffices.
+- **Scope risk**: low. Same shape as `std.kv.*` / `std.sql.*` (§2),
+  no new dependency, no MCP coupling.
+
+### 3.9 Rejected / Deferred
 
 - **CXL memory pool**: hardware-tier memory disaggregation is not
   addressable from userland Lua and depends on cloud-vendor capability.
