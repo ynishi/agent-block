@@ -10,6 +10,7 @@
 //! | `tool` | `tool.*`     | Tool registry (define and call tools from Lua) |
 //! | `http` | `http.*`     | Async HTTP client |
 //! | `log`  | `log.*`, `env.*` | Logging and environment access |
+//! | `ts`   | `std.ts.*`   | SQLite-backed time-series primitive (in-tree) |
 
 pub mod bus;
 pub mod config;
@@ -24,6 +25,7 @@ pub mod sh;
 pub mod sql;
 pub mod task;
 pub mod tool;
+pub mod ts;
 
 use mlua::prelude::*;
 
@@ -169,6 +171,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     llm::register(lua)?;
     kv::register(lua, ctx)?;
     sql::register(lua, ctx)?;
+    ts::register(lua, ctx)?;
     task::register(lua)?;
     Ok(())
 }
