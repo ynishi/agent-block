@@ -96,6 +96,13 @@ pub struct HostContext {
     pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the kv connection.
     pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
+    /// Shared SQLite connection for `ts.*` bridge (TSDB — time-series table).
+    /// Separate DB file so TSDB WAL does not share page cache with kv/sql.
+    pub ts_conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Interrupt handle for the ts connection.
+    /// Used by `bridge::ts` to cancel in-flight queries on timeout (Subtask 2).
+    #[allow(dead_code)]
+    pub ts_interrupt: Arc<rusqlite::InterruptHandle>,
     /// Async handle to the main Isle Lua VM that runs the user script via
     /// `coroutine_eval`. After Subtask 2, `bridge::bus` no longer dispatches
     /// handlers against this Isle; handlers live on `handler_isle` instead.
@@ -342,6 +349,9 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let kv_path = crate::bridge::config::kv_path().map_err(BlockError::Runtime)?;
     let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
 
+    let ts_path = crate::bridge::config::ts_path().map_err(BlockError::Runtime)?;
+    let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
+
     let script_path = config.script_path.clone();
     let script_dir = script_path
         .parent()
@@ -397,6 +407,8 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         sql_interrupt,
         kv_conn,
         kv_interrupt,
+        ts_conn,
+        ts_interrupt,
         isle: Arc::clone(&isle),
         handler_isle: Arc::clone(&handler_isle),
         bus_tx: bus_tx.clone(),
