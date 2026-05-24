@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-05-25
+
+### Added
+
+- `blocks/session` — cross-invocation conversation persistence StdPkg.
+  Round-trips an `agent.run` messages array via `std.kv` (SQLite-backed)
+  under namespace `_agent_block_session`. API: `session.load(id)` →
+  messages array (empty `{}` when absent), `session.save(id, messages)`,
+  `session.clear(id)` → boolean. Trim / compaction / summarisation are
+  caller's responsibility — the block deliberately exposes raw
+  load / save / clear only so persona / long-term memory concerns stay
+  out of agent-block scope.
+- `agent.run(opts.history)` — optional prior messages array (typically
+  from `session.load`) prepended before the new user prompt so the LLM
+  sees the full conversational thread. Non-table values are rejected
+  with `ok=false / error="history must be a table (messages array)"`
+  before any API call (guard before network).
+- `examples/session_chat.lua` — driver illustrating the
+  `AGENT_ID` + `AGENT_PROMPT` env-driven pattern (single-shot CLI
+  invocation that participates in a persistent thread, restartable
+  across process boundaries).
+- `tests/e2e_session.rs` + `tests/fixtures/session_roundtrip.lua` —
+  end-to-end round-trip test covering empty load, save / reload order
+  preservation, clear (existing → true / missing → false), and id
+  validation (empty / nil → reject).
+
+### Notes
+
+- Session backend is `std.kv` (SQLite under `~/.agent-block/kv.sqlite`);
+  no new persistence primitive introduced — the block is a thin
+  convention layer on existing infrastructure (Lua for logic, Rust
+  for plumbing).
+- CLI surface (`src/main.rs`) is unchanged. Identity is supplied by
+  `os.getenv("AGENT_ID")` on the Lua side, consistent with the existing
+  `AGENT_BLOCK_AGENT_ID` / `log_meta` convention. No `--state` / `--id`
+  flags were added to `agent-block` itself.
+
 ## [0.16.0] - 2026-05-20
 
 ### Added
