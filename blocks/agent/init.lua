@@ -1288,6 +1288,10 @@ end
 ---                   Fallback env vars: AGENT_BLOCK_TRACE_ID / AGENT_BLOCK_AGENT_ID
 ---                   / AGENT_BLOCK_AGENT_NAME / AGENT_BLOCK_RUN_ID.
 ---                   Deprecated fallback: `task_id` / AGENT_BLOCK_TASK_ID maps to `trace_id`.
+---   history         (optional) Prior messages array (e.g. from session.load).
+---                   When present, prepended before the new user prompt so the
+---                   LLM sees the full conversation thread. Treated as opaque —
+---                   trimming / compaction is the caller's responsibility.
 ---   extra_tools     (optional) Extra Anthropic tool definitions to include
 ---   provider        (optional) LLM provider: "anthropic" (default) | "openai".
 ---                   When "openai", routes to the OpenAI Chat Completions API shape
@@ -1411,10 +1415,21 @@ function M.run(opts)
     }
     local log_meta = build_log_meta(opts)
 
-    -- Initialize message history
-    local messages = {
-        { role = "user", content = opts.prompt },
-    }
+    -- Initialize message history. When opts.history is provided (typically
+    -- loaded via blocks/session), prepend it before the new user prompt so
+    -- the LLM sees the full thread. The block treats history as opaque —
+    -- trimming / compaction is the caller's responsibility.
+    local messages = {}
+    if opts.history then
+        if type(opts.history) ~= "table" then
+            table.remove(_AGENT_LLM_CTX)
+            return { ok = false, error = "history must be a table (messages array)", usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 }, num_turns = 0, messages = {} }
+        end
+        for _, m in ipairs(opts.history) do
+            table.insert(messages, m)
+        end
+    end
+    table.insert(messages, { role = "user", content = opts.prompt })
 
     -- ReAct loop state
     local num_turns = 0

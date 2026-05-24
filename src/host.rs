@@ -26,7 +26,10 @@ use crate::mcp_client::McpManager;
 /// Embedded Lua sources for blocks/ StdPkg modules.
 /// These are baked into the binary at compile time so `cargo install` works
 /// without any extra file distribution.
-const EMBEDDED_BLOCKS: &[(&str, &str)] = &[("agent", include_str!("../blocks/agent/init.lua"))];
+const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
+    ("agent", include_str!("../blocks/agent/init.lua")),
+    ("session", include_str!("../blocks/session/init.lua")),
+];
 
 /// Build the `blocks/` portion of `package.path` from filesystem locations.
 ///
