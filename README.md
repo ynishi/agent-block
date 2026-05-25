@@ -261,6 +261,11 @@ Storage: `AGENT_BLOCK_HOME/sql.sqlite` (override via `AGENT_BLOCK_SQL_PATH`; `:m
 - `std.ts.last(series, tags?)` — most-recent data point; same tag AND-filter as `query`
 - `std.ts.register_tools()` — register `ts_append`, `ts_query`, `ts_last` as LLM-callable tools
 
+Ordering guarantee: raw-path results (`query` without `agg`) are ordered by `(ts ASC, rowid ASC)`;
+`last` and `query` with `agg="last"` resolve same-millisecond ties by `(ts DESC, rowid DESC)` so
+the last-appended row always wins. This is a deterministic SQLite rowid tie-breaker — no DDL or
+index change is required.
+
 Storage: `AGENT_BLOCK_HOME/ts.sqlite` (override via `AGENT_BLOCK_TS_PATH`; `:memory:` supported).
 
 ### agent (StdPkg — `require("agent")`)
