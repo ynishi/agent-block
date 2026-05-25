@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `std.ts.query` (raw path) — result rows are now returned in deterministic INSERT order
+  when multiple data points share the same millisecond timestamp. `ORDER BY ts` is now
+  `ORDER BY ts, rowid` so same-ms ties are broken by SQLite rowid (insertion sequence).
+- `std.ts.last` and `std.ts.query` with `agg="last"` (no bucket) — the most-recent data
+  point is now the last-inserted row among same-ms ties. `ORDER BY ts DESC LIMIT 1` is now
+  `ORDER BY ts DESC, rowid DESC LIMIT 1` in both the `build_query_sql` path and the
+  `make_last` closure. DDL, index, and Lua API surface are unchanged.
+
 ## [0.17.0] - 2026-05-25
 
 ### Added
