@@ -130,11 +130,9 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
         lua.create_function(|lua, ()| {
             let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
             let names = lua.create_table()?;
-            let mut idx = 1;
-            for pair in registry.pairs::<String, LuaTable>() {
+            for (idx, pair) in (1..).zip(registry.pairs::<String, LuaTable>()) {
                 let (name, _) = pair?;
                 names.set(idx, name)?;
-                idx += 1;
             }
             Ok(names)
         })?,
@@ -147,8 +145,7 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
         lua.create_function(|lua, ()| {
             let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
             let arr = lua.create_table()?;
-            let mut idx = 1;
-            for pair in registry.pairs::<String, LuaTable>() {
+            for (idx, pair) in (1..).zip(registry.pairs::<String, LuaTable>()) {
                 let (_, entry) = pair?;
                 let name: String = entry.get("name")?;
                 let schema: LuaTable = entry.get("schema")?;
@@ -160,7 +157,6 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
                 tool_def.set("description", description)?;
                 tool_def.set("input_schema", input_schema)?;
                 arr.set(idx, tool_def)?;
-                idx += 1;
             }
             Ok(arr)
         })?,
