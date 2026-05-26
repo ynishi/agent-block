@@ -43,6 +43,18 @@ struct Cli {
     /// Applied uniformly to connect / list_tools / call_tool.
     #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
     mcp_timeout_secs: Option<u64>,
+
+    /// Prompt string injected as `_PROMPT` Lua global.
+    /// Scripts can use it as `agent.run({prompt = _PROMPT, ...})`.
+    /// Env: `AGENT_BLOCK_PROMPT`.
+    #[arg(long, env = "AGENT_BLOCK_PROMPT")]
+    prompt: Option<String>,
+
+    /// Context string injected as `_CONTEXT` Lua global.
+    /// Typically used as a system prompt: `agent.run({system = _CONTEXT, ...})`.
+    /// Env: `AGENT_BLOCK_CONTEXT`.
+    #[arg(short = 'c', long, env = "AGENT_BLOCK_CONTEXT")]
+    context: Option<String>,
 }
 
 #[tokio::main]
@@ -72,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
         relay_url: cli.relay,
         secret_key: cli.secret_key,
         mcp_rpc_timeout,
+        prompt: cli.prompt,
+        context: cli.context,
     };
 
     Ok(run(config).await?)

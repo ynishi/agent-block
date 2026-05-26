@@ -4,6 +4,12 @@
 -- Run with:
 --   agent-block -s examples/test_agent.lua
 --
+-- Run with custom prompt and context (injected as Lua globals _PROMPT / _CONTEXT):
+--   agent-block --prompt "What time is it?" -c "You are a helpful assistant." -s examples/test_agent.lua
+--
+-- The _PROMPT and _CONTEXT globals are set by the host when
+-- --prompt / -c flags (or AGENT_BLOCK_PROMPT / AGENT_BLOCK_CONTEXT env vars) are provided.
+--
 -- This is a sample script; it is NOT part of `cargo test`.
 
 local agent = require("agent")
@@ -21,8 +27,8 @@ end)
 
 -- Run the agent
 local result = agent.run({
-    prompt = "What time is it? Use the get_time tool to find out, then tell me.",
-    system = "You are a helpful assistant. Use available tools to answer questions. Be concise.",
+    prompt = _PROMPT or "What time is it? Use the get_time tool to find out, then tell me.",
+    system = _CONTEXT or "You are a helpful assistant. Use available tools to answer questions. Be concise.",
     max_tokens = 512,
     max_iterations = 5,
     on_turn = function(info)
