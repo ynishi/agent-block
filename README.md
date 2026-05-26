@@ -52,7 +52,32 @@ agent-block --script scripts/test_fcloop.lua --project .
 
 # With mesh
 ANTHROPIC_API_KEY=... agent-block --script my_agent.lua --relay ws://localhost:9090/ws
+
+# Pass a prompt and system context from the CLI
+agent-block --script my_agent.lua \
+    --prompt "Summarise the README" \
+    -c "You are a concise technical writer."
 ```
+
+CLI flags `--prompt` and `-c / --context` inject the `_PROMPT` and `_CONTEXT` Lua globals
+into the script. Use them with `agent.run`:
+
+```lua
+-- my_agent.lua
+local agent = require("agent")
+local result = agent.run({
+    prompt = _PROMPT,    -- nil when --prompt is omitted (agent.run will error — expected)
+    system = _CONTEXT,   -- nil when -c is omitted (system prompt is optional)
+})
+print(result.content)
+```
+
+Both flags also accept environment variables as fallback:
+
+| Flag | Env var |
+|---|---|
+| `--prompt` | `AGENT_BLOCK_PROMPT` |
+| `-c / --context` | `AGENT_BLOCK_CONTEXT` |
 
 ## MCP Echo Harness
 

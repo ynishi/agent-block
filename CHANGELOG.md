@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--prompt TEXT` CLI flag (long only; env `AGENT_BLOCK_PROMPT`) — injects the value as
+  the `_PROMPT` Lua global. Scripts can pass it directly to `agent.run({ prompt = _PROMPT, ... })`.
+  When the flag is omitted `_PROMPT` is `nil` (the existing "prompt is required" guard in
+  `agent.run` fires as expected).
+- `-c / --context TEXT` CLI flag (env `AGENT_BLOCK_CONTEXT`) — injects the value as the
+  `_CONTEXT` Lua global. Canonical usage maps it to the system prompt field:
+  `agent.run({ system = _CONTEXT, ... })`. When omitted `_CONTEXT` is `nil`.
+- `tests/e2e_prompt.rs` + `tests/fixtures/prompt_flag.lua` — four E2E test cases covering
+  `--prompt` long form, `-c` short form, both flags together, and neither flag (nil globals).
+
 ## [0.17.1] - 2026-05-25
 
 ### Fixed
