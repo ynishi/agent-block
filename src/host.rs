@@ -78,6 +78,10 @@ pub struct BlockConfig {
     /// Per-RPC timeout for every MCP round-trip (connect / list / call).
     /// Defaults to [`crate::mcp_client::DEFAULT_RPC_TIMEOUT`].
     pub mcp_rpc_timeout: Duration,
+    /// Prompt string injected as `_PROMPT` Lua global. `None` = global not set.
+    pub prompt: Option<String>,
+    /// Context string injected as `_CONTEXT` Lua global. `None` = global not set.
+    pub context: Option<String>,
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -185,10 +189,18 @@ fn build_isle_init(
     script_name: String,
     script_dir: String,
     blocks_paths: String,
+    prompt: Option<String>,
+    context: Option<String>,
 ) -> impl FnOnce(&mlua::Lua) -> mlua::Result<()> + Send + 'static {
     move |lua| {
         // Set script name before registering bridges (used by log.* for attribution)
         lua.globals().set("_SCRIPT_NAME", script_name.as_str())?;
+        if let Some(ref p) = prompt {
+            lua.globals().set("_PROMPT", p.as_str())?;
+        }
+        if let Some(ref c) = context {
+            lua.globals().set("_CONTEXT", c.as_str())?;
+        }
 
         mlua_batteries::register_all(lua, "std")?;
 
@@ -243,8 +255,10 @@ async fn spawn_handler_isle(
     script_name: String,
     script_dir: String,
     blocks_paths: String,
+    prompt: Option<String>,
+    context: Option<String>,
 ) -> BlockResult<(Arc<AsyncIsle>, AsyncIsleDriver)> {
-    let init = build_isle_init(script_name, script_dir, blocks_paths);
+    let init = build_isle_init(script_name, script_dir, blocks_paths, prompt, context);
     let (isle, driver) = AsyncIsle::builder()
         .thread_name("agent-block-handler-isle")
         .spawn(init)
@@ -367,12 +381,16 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
     let blocks_paths = build_blocks_path(&project_root);
+    let prompt = config.prompt.clone();
+    let context = config.context.clone();
 
     // ── main Isle ─────────────────────────────────────────────────
     let (isle, driver) = AsyncIsle::spawn(build_isle_init(
         script_name.clone(),
         script_dir.clone(),
         blocks_paths.clone(),
+        prompt.clone(),
+        context.clone(),
     ))
     .await
     .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
@@ -383,6 +401,8 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         script_name.clone(),
         script_dir.clone(),
         blocks_paths.clone(),
+        prompt,
+        context,
     )
     .await?;
 
