@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-05-27
+
 ### Added
 
 - `--prompt TEXT` CLI flag (long only; env `AGENT_BLOCK_PROMPT`) — injects the value as
