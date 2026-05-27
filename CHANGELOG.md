@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-28
+
+### Added
+
+- `tool_choice` option for `agent.run()` — passes through to the Anthropic API body.
+  Accepts `"auto"`, `"any"`, `"none"` (string → `{ type = str }` wrap) or a table
+  like `{ type = "tool", name = "search" }` (direct pass-through). Omitting defaults
+  to API auto behavior.
+- Tool group support: `tool.register(name, schema, handler, { group = "..." })` accepts
+  an optional 4th argument to assign tools to named groups. `tool.schema()` includes the
+  `group` field in its output. `agent.run({ tool_groups = { "retrieval" } })` filters
+  the tools array to only include tools from the specified groups. Tools without a group
+  are assigned to `"default"`. Omitting `tool_groups` or passing an empty table includes
+  all tools (backwards compatible).
+
 ## [0.18.0] - 2026-05-27
 
 ### Added
