@@ -374,6 +374,16 @@ local function llm_call_anthropic(messages, opts, trace)
     -- Anthropic context-management (beta): add header + body only when enabled.
     -- call_opts normalization in M.run() makes opts.context_management either
     -- nil (opt-out) or a table (enabled: default or user-provided override).
+    -- tool_choice: "auto" | "any" | "none" | { type = "tool", name = "..." }
+    if opts.tool_choice then
+        local tc = opts.tool_choice
+        if type(tc) == "string" then
+            body.tool_choice = { type = tc }
+        elseif type(tc) == "table" then
+            body.tool_choice = tc
+        end
+    end
+
     if opts.context_management ~= nil then
         headers["anthropic-beta"] = "context-management-2025-06-27"
         body.context_management = opts.context_management
@@ -1136,14 +1146,37 @@ end
 
 --- Build the unified tools array for the Anthropic API.
 --- Merges tool.schema() (registered Lua tools) + MCP tools + extra_tools.
---- @param mcp_tool_map table  MCP namespace map (may be empty)
---- @param extra_tools table   Additional Anthropic tool definitions (may be nil/empty)
---- @return table              Unified tools array in Anthropic format
-local function build_tools(mcp_tool_map, extra_tools)
+--- When active_groups is non-nil and non-empty, only tools whose group
+--- matches one of the active groups are included. Tools without a group
+--- are assigned to the "default" group. nil/empty = all tools (backwards compat).
+--- @param mcp_tool_map table        MCP namespace map (may be empty)
+--- @param extra_tools table         Additional Anthropic tool definitions (may be nil/empty)
+--- @param active_groups table|nil   Array of group names to include (nil = all)
+--- @return table                    Unified tools array in Anthropic format
+local function build_tools(mcp_tool_map, extra_tools, active_groups)
     local tools = {}
     local seen = {}
+
+    -- Build group lookup set (nil = no filtering)
+    local group_set = nil
+    if active_groups and #active_groups > 0 then
+        group_set = {}
+        for _, g in ipairs(active_groups) do
+            group_set[g] = true
+        end
+    end
+
+    local function passes_group(t)
+        if not group_set then return true end
+        local g = t.group or "default"
+        return group_set[g] == true
+    end
+
     local function add_unique(t)
         if seen[t.name] then
+            return
+        end
+        if not passes_group(t) then
             return
         end
         seen[t.name] = true
@@ -1171,6 +1204,7 @@ local function build_tools(mcp_tool_map, extra_tools)
                     name = t.name,
                     description = t.schema.description,
                     input_schema = t.schema.input_schema,
+                    group = t.group,
                 })
             else
                 add_unique(t)
@@ -1381,8 +1415,8 @@ function M.run(opts)
         end
     end
 
-    -- Build unified tools array
-    local tools = build_tools(mcp_tool_map, opts.extra_tools)
+    -- Build unified tools array (tool_groups filter applied here)
+    local tools = build_tools(mcp_tool_map, opts.extra_tools, opts.tool_groups)
 
     -- Normalize context_management opts once:
     --   opts.context_management == false                   → cm_final = nil (opt-out)
@@ -1402,6 +1436,7 @@ function M.run(opts)
         timeout = opts.timeout or 120,
         system = opts.system,
         tools = tools,
+        tool_choice = opts.tool_choice,  -- nil = API default (auto)
         context_management = cm_final,  -- nil = opt-out, table = enabled
         -- Provider routing (new — additive, default nil = anthropic path)
         provider = opts.provider,

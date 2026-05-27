@@ -19,17 +19,29 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
 
     let tool_tbl = lua.create_table()?;
 
-    // tool.register(name, schema, handler_fn)
+    // tool.register(name, schema, handler_fn [, meta])
+    // meta is an optional table: { group = "..." }
     let script_name_register = script_name.clone();
     tool_tbl.set(
         "register",
         lua.create_function(
-            move |lua, (name, schema, handler): (String, LuaValue, LuaFunction)| {
+            move |lua,
+                  (name, schema, handler, meta): (
+                String,
+                LuaValue,
+                LuaFunction,
+                Option<LuaTable>,
+            )| {
                 let registry: LuaTable = lua.globals().get("_TOOL_REGISTRY")?;
                 let entry = lua.create_table()?;
                 entry.set("name", name.clone())?;
                 entry.set("schema", schema)?;
                 entry.set("handler", handler)?;
+                if let Some(ref m) = meta {
+                    if let Ok(group) = m.get::<String>("group") {
+                        entry.set("group", group)?;
+                    }
+                }
                 registry.set(name.clone(), entry)?;
                 tracing::info!(
                     target: "lua",
@@ -156,6 +168,9 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
                 tool_def.set("name", name)?;
                 tool_def.set("description", description)?;
                 tool_def.set("input_schema", input_schema)?;
+                if let Ok(group) = entry.get::<String>("group") {
+                    tool_def.set("group", group)?;
+                }
                 arr.set(idx, tool_def)?;
             }
             Ok(arr)
