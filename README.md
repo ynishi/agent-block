@@ -155,6 +155,10 @@ capability).
 - `tool.schema()` — Anthropic tools-format schema array (includes `group` field when set)
 
 ### mcp.*
+
+Support status, capability matrix, and the tool-grouping design rationale
+live in `docs/architecture/mcp-support.md`.
+
 - `mcp.connect(name, command, args)` — Spawn MCP server over stdio + initialize handshake
 - `mcp.connect_http(name, url, opts)` — Connect to an MCP server over HTTP transport.
   `opts.transport = "sse" | "http"` (default `"http"` = Streamable HTTP; `"sse"` = SSE).
