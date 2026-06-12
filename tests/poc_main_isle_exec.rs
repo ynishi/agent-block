@@ -7,8 +7,6 @@
 //! is preserved across multiple calls — i.e. bytecode-dump is not involved and
 //! upvalue identity is intact.
 //!
-//! This is Phase 1 of the mcp-callback-main-vm design
-//! (`workspace/tasks/mcp-callback-main-vm/issue.md`).
 //! rmcp / handler_isle are not touched.
 
 use mlua_isle::AsyncIsle;

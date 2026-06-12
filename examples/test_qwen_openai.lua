@@ -13,7 +13,7 @@
 -- Run:
 --   agent-block -s examples/test_qwen_openai.lua
 --
--- What this exercises (issue 1777297062-44306 受け入れ基準):
+-- What this exercises (受け入れ基準):
 --   - opts.provider = "openai" 経路全体
 --   - opts.base_url override (RunPod proxy)
 --   - tool.register された Lua tool が ReAct loop で 1 回以上 dispatch される

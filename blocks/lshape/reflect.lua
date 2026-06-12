@@ -1,7 +1,7 @@
 --- lshape.reflect — reflection over shape schemas.
 ---
---- Provenance: extracted from algocline-bundled-packages/alc_shapes at
---- Phase 3 of Issue 1776678075-14184. Pure Lua, zero dependencies.
+--- Provenance: extracted from algocline-bundled-packages/alc_shapes.
+--- Pure Lua, zero dependencies.
 ---
 --- fields(schema) -> { { name, type, optional, doc? }, ... } sorted by name.
 --- walk(schema, visitor) -> DFS visit of all nested schemas.

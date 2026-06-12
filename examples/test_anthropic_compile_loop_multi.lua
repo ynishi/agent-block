@@ -4,9 +4,6 @@
 -- multi-file mode では LLM が `<<< path=... >>>` ヘッダ + SEARCH/REPLACE を両 file 分出す。
 -- 結果として multiply / add / square は SEARCH/REPLACE 対象にならず保持され、
 -- subtract 関数 + assert が両 file に追加されるのを確認。
---
--- 過去類例: workspace/tasks/1777495443-55475/verify_diff.lua (single-file diff mode)
--- 関連: issue 1777768688-97555 / merge commit f7a2789
 
 local compile_loop = require("compile_loop")
 local agent        = require("agent")

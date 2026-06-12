@@ -219,8 +219,7 @@ In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
 The compile_loop block was extracted from `coding_agent` to allow reuse as a standalone
 Tool factory. Multi-file mode was added to address LLM context overflow (`max_model_len`
 exceeded) when embedding entire large files in the prompt — diffing only the changed sections
-across multiple files keeps context size bounded. For motivation see
-[agent-profiles issue 1777766817-70585](https://github.com/ynishi/agent-profiles/issues/1777766817-70585).
+across multiple files keeps context size bounded.
 
 ## Qwen path operational notes
 
@@ -285,5 +284,4 @@ file shape, not just that the fix is hard.
 ### Cross-reference
 
 For RunPod proxy operational gotchas (e.g. ~30s cold-start timeout on first
-request after pod idle), see
-[agent-profiles `blocks/coding_resolver/README.md` §既知の罠](https://github.com/ynishi/agent-profiles/blob/main/blocks/coding_resolver/README.md).
+request after pod idle), consult your proxy-side documentation.

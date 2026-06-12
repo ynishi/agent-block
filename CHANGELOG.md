@@ -146,14 +146,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mcp.ping(server_name)` Lua API (Phase 5) — client→server keepalive with `Instant`-based
   latency_ms measurement. Returns `{ ok=true, latency_ms=N }` on success or
   `{ ok=false, error="..." }` on failure. Uses `send_request(ClientRequest::PingRequest(...))`
-  via rmcp `Peer` (no dedicated `ping()` method in rmcp 1.4.0). Part of Umbrella `1778981063-7028`.
+  via rmcp `Peer` (no dedicated `ping()` method in rmcp 1.4.0).
 - `mcp.set_elicitation_handler(server_name, fn)` Lua API (Phase 4) — Register a Lua handler responding
   to server-originated `elicitation/create` requests (Form variant only). The callback receives
   `(server_name, message, schema_json)` and must return `{action="accept"|"decline"|"cancel",
   content=...}` (content required on accept, absent otherwise). Url variant is always declined
   without reaching the callback. Implemented via `impl ClientHandler::create_elicitation` override.
-  Part of Umbrella `1778981063-7028`.
-- `mcp.complete(server, ref, arg_name, arg_value)` Lua API (Phase 3) — MCP Completion typeahead outbound request. `ref` is `{type="ref/prompt", name=...}` or `{type="ref/resource", uri=...}`; dispatches at runtime to `Reference::for_prompt`/`for_resource`. Part of Umbrella `1778981063-7028`.
+- `mcp.complete(server, ref, arg_name, arg_value)` Lua API (Phase 3) — MCP Completion typeahead outbound request. `ref` is `{type="ref/prompt", name=...}` or `{type="ref/resource", uri=...}`; dispatches at runtime to `Reference::for_prompt`/`for_resource`.
 - `mcp.set_roots_handler(server_name, fn)` Lua API (Phase 2) — Register a Lua handler responding
   to server-originated `roots/list` requests. The server calls this when it wants to discover the
   client's filesystem roots. Implemented via `impl ClientHandler::list_roots` override.
@@ -194,8 +193,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs). 1-spawn fallback forbidden per Crux constraint.
 - `blocks/compile_loop/README.md` — new `## Qwen path operational notes` section
   documenting deterministic temperature, disable_thinking recommendation, bad vs good
-  stagnation distinction, and cross-ref to agent-profiles
-  `blocks/coding_resolver/README.md` for RunPod proxy ~30s cold-start timeout.
+  stagnation distinction, and cross-ref to proxy-side documentation for RunPod proxy
+  ~30s cold-start timeout.
 
 ## [0.13.0] - 2026-05-11
 
@@ -285,12 +284,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- `compile_loop.make()` の `conf.register` opt を削除。姉件 fix (1777461322-92442) で
-  `register = false` を渡すと `extra_tools` 経由 tool が `dispatch_tool` の registry
-  経路から見えなくなり 'tool not found' を引き起こすため、`tool.register` を常時呼び出す
-  元の挙動に戻す (1777469900-71779)。代わりに `build_tools` に first-wins dedup を追加
-  して duplicate tool エラーを防止し、`dispatch_tool` に `extra_tools` handler への直接
-  fallback 経路を追加して registry 非依存の dispatch wiring を確立する。
+- `compile_loop.make()` の `conf.register` opt を削除。`register = false` を渡すと
+  `extra_tools` 経由 tool が `dispatch_tool` の registry 経路から見えなくなり
+  'tool not found' を引き起こすため、`tool.register` を常時呼び出す元の挙動に戻す。
+  代わりに `build_tools` に first-wins dedup を追加して duplicate tool エラーを防止し、
+  `dispatch_tool` に `extra_tools` handler への直接 fallback 経路を追加して
+  registry 非依存の dispatch wiring を確立する。
 
 ### Added
 
@@ -461,7 +460,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `blocks/agent` — `dispatch_tool` now holds a direct `extra_tools_map` fallback path
   (`extra_tools_map[name].handler(input)`) between the MCP path and the registry (`tool.call`)
   path. This means `extra_tools` handlers are dispatched correctly even when the tool is not
-  registered in the global registry, making dispatch wiring registry-independent (1777469900-71779).
+  registered in the global registry, making dispatch wiring registry-independent.
 - `blocks/agent` — `build_tools` now flattens `extra_tools` entries that use the
   `compile_loop.make()` return shape (`{name, schema={description, input_schema}, handler}`)
   into the Anthropic flat form (`{name, description, input_schema}`), preventing

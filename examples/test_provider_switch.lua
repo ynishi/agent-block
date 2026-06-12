@@ -1,8 +1,7 @@
 -- test_provider_switch.lua — Anthropic (Haiku) ↔ OpenAI-compat (Qwen vLLM, etc.) switch demo
 --
 -- Same tool.register + agent.run() block runs against either provider; only the
--- per-call opts (provider / base_url / api_key / model) differ. This is the
--- intended consumer pattern from issue 1777297062-44306.
+-- per-call opts (provider / base_url / api_key / model) differ.
 --
 -- Pre-req:
 --   AGENT_PROVIDER=anthropic (default)

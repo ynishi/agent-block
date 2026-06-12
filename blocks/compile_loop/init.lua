@@ -404,7 +404,7 @@ local function cl_oai_normalize(raw)
     end
 
     -- DEBUG (2026-05-09): raw assistant content dump for Gemma debugging.
-    -- Gated by AGENT_BLOCK_DEBUG_RAW=1 env. Issue 1778284470-98687.
+    -- Gated by AGENT_BLOCK_DEBUG_RAW=1 env.
     if std.env.get("AGENT_BLOCK_DEBUG_RAW") == "1" then
         local tc_count = #(message.tool_calls or {})
         local preview = (text or ""):sub(1, 1500)

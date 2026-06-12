@@ -1,7 +1,7 @@
 --- lshape.t — DSL combinators and schema internal structure.
 ---
---- Provenance: extracted from algocline-bundled-packages/alc_shapes at
---- Phase 3 of Issue 1776678075-14184. Pure Lua, zero dependencies.
+--- Provenance: extracted from algocline-bundled-packages/alc_shapes.
+--- Pure Lua, zero dependencies.
 ---
 --- Schema-as-Data contract (after Malli's data-driven schemas):
 ---   * Every schema is a plain Lua table whose state is held in

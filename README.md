@@ -217,7 +217,6 @@ live in `docs/architecture/mcp-support.md`.
 - `mcp.ping(name)` — Send a `ping` keepalive request to the named server and measure
   round-trip latency. Returns `{ ok=true, latency_ms=N }` on success or
   `{ ok=false, error="..." }` on failure (unknown server, timeout, or RPC error).
-  Part of Umbrella `1778981063-7028`.
 - `mcp.subscribe_resource(server, uri)` — Send a `resources/subscribe` RPC for the given
   resource URI. Returns `{ ok=true }` on success or `{ ok=false, error="..." }` on failure.
   Requires the server to declare the `resources.subscribe` capability.

@@ -4,10 +4,9 @@
 --- type_of is "" (neutral). Hosts that want a brand prefix pass it
 --- explicitly (e.g. "AlcResult" from algocline).
 ---
---- Provenance: extracted from algocline-bundled-packages/alc_shapes
---- at Phase 3 of Issue 1776678075-14184; the ALC-coupling hooks were
---- parameterized in Phase 2 so this file migrates verbatim except for
---- the require path below.
+--- Provenance: extracted from algocline-bundled-packages/alc_shapes;
+--- the ALC-coupling hooks were parameterized so this file migrates
+--- verbatim except for the require path below.
 ---
 --- class_for(class_name, shape_schema)       -> LuaCATS class text
 --- gen(shapes_table, class_prefix?)          -> full d.lua contents

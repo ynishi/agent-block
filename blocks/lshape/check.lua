@@ -9,9 +9,9 @@
 ---   H2: `M.dev_env_var` (field, default "LSHAPE_CHECK").
 ---       Host overrides to change the env var name.
 ---
---- Provenance: extracted from algocline-bundled-packages/alc_shapes at
---- Phase 3 of Issue 1776678075-14184; ALC hosts bind H1 to their shape
---- registry and H2 to "ALC_SHAPE_CHECK" at their init site.
+--- Provenance: extracted from algocline-bundled-packages/alc_shapes;
+--- ALC hosts bind H1 to their shape registry and H2 to "ALC_SHAPE_CHECK"
+--- at their init site.
 ---
 --- API:
 ---   check(value, schema, opts?)                -> ok:boolean, reason:string?

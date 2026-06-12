@@ -1,6 +1,6 @@
 -- dispatch_extra_tools.lua — verify that compile_loop.make() registers a tool
 -- in the registry and tool.call() can invoke its handler (regression test for
--- "tool not found" bug 1777469900-71779).
+-- a past "tool not found" bug).
 
 local compile_loop = require("compile_loop")
 

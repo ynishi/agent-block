@@ -54,8 +54,7 @@
 //! # wf-sim verdict doc comments
 //!
 //! The doc comments on `bus.on` and `bus.on_any` (below) encode the wf-sim
-//! verdicts recorded in `workspace/tasks/event-bus/wf-sim-bus-on-*.md` and
-//! `workspace/tasks/event-bus/wf-sim-bus-on-any-*.md`. Do not remove.
+//! verdicts. Do not remove.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -119,8 +118,7 @@ impl Handler for LuaHandler {
         // out and is dropping the dispatcher chain), the Drop guard fires
         // the cancel token, which the Isle's debug hook picks up at the
         // next HOOK_INTERVAL. Without this guard the Isle thread would
-        // run the Lua handler to completion — defeating the grace window
-        // (see Bug A in workspace/tasks/bus-isle-handler/scratch/).
+        // run the Lua handler to completion — defeating the grace window.
         let task = self.isle.spawn_coroutine_call(BUS_DISPATCH_FN, &args);
         struct CancelOnDrop(CancelToken);
         impl Drop for CancelOnDrop {
