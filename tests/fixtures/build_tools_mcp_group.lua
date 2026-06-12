@@ -65,3 +65,15 @@ for _, t in ipairs(tools_default) do
     end
 end
 print("case4.mcp_not_in_default=" .. tostring(not mcp_leaked))
+
+-- Case 5: emitted tool defs must NOT contain the `group` field.
+-- group is an internal filtering field; forwarding it to the Anthropic API
+-- causes 400 "Extra inputs are not permitted".
+local tools_all2 = agent._build_tools(mcp_tool_map, nil, nil)
+local group_leaked = false
+for _, t in ipairs(tools_all2) do
+    if t.group ~= nil then
+        group_leaked = true
+    end
+end
+print("case5.group_not_in_emitted_def=" .. tostring(not group_leaked))

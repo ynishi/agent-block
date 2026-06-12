@@ -10,6 +10,7 @@ local nested_tool = {
 	handler = function()
 		return ""
 	end,
+	group = "mygroup",
 }
 
 -- already-flat form: plain Anthropic tool definition
@@ -30,3 +31,7 @@ print("nested.schema=" .. tostring(tools[1].schema))
 -- flat_y: must pass through unchanged
 print("flat.name=" .. tostring(tools[2].name))
 print("flat.description=" .. tostring(tools[2].description))
+
+-- group must be stripped from all emitted defs (Anthropic API rejects extra fields)
+print("nested.group=" .. tostring(tools[1].group))
+print("flat.group=" .. tostring(tools[2].group))

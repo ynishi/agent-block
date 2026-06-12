@@ -1181,7 +1181,16 @@ local function build_tools(mcp_tool_map, extra_tools, active_groups)
             return
         end
         seen[t.name] = true
-        table.insert(tools, t)
+        -- Strip internal `group` field before inserting into the API payload.
+        -- `group` is used only for filtering (passes_group) and must not be
+        -- forwarded to the Anthropic API (causes 400 "Extra inputs are not permitted").
+        local def = {}
+        for k, v in pairs(t) do
+            if k ~= "group" then
+                def[k] = v
+            end
+        end
+        table.insert(tools, def)
     end
 
     -- 1. Registered Lua tools (highest priority)

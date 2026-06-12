@@ -17,7 +17,8 @@ fn build_tools_mcp_group_filter() {
                 .and(predicate::str::contains("case2.search_included=true"))
                 .and(predicate::str::contains("case2.outline_excluded=true"))
                 .and(predicate::str::contains("case3.all_tools_count=2_expected=2"))
-                .and(predicate::str::contains("case4.mcp_not_in_default=true")),
+                .and(predicate::str::contains("case4.mcp_not_in_default=true"))
+                .and(predicate::str::contains("case5.group_not_in_emitted_def=true")),
         );
 }
 
@@ -35,7 +36,9 @@ fn build_tools_extra_flatten() {
                 .and(predicate::str::contains("nested.handler=nil"))
                 .and(predicate::str::contains("nested.schema=nil"))
                 .and(predicate::str::contains("flat.name=flat_y"))
-                .and(predicate::str::contains("flat.description=flat desc")),
+                .and(predicate::str::contains("flat.description=flat desc"))
+                .and(predicate::str::contains("nested.group=nil"))
+                .and(predicate::str::contains("flat.group=nil")),
         );
 }
 
