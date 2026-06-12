@@ -987,6 +987,7 @@ local function connect_mcp_servers(servers, opts)
                     name = ns_name,
                     description = t.description or "",
                     input_schema = input_schema,
+                    group = name,
                 },
             }
         end
@@ -1035,7 +1036,7 @@ local function connect_mcp_servers(servers, opts)
                             local r = mcp.list_resources(sn)
                             if not r.ok then return std.json.encode({ error = r.error }) end
                             return std.json.encode(r.resources)
-                        end)
+                        end, { group = sn })
                         tool.register(sn .. "__mcp_read_resource", {
                             description = "Read a resource by URI from MCP server '" .. sn .. "'",
                             input_schema = {
@@ -1047,7 +1048,7 @@ local function connect_mcp_servers(servers, opts)
                             local r = mcp.read_resource(sn, input.uri)
                             if not r.ok then return std.json.encode({ error = r.error }) end
                             return std.json.encode(r.contents)
-                        end)
+                        end, { group = sn })
                     else
                         log.info("agent: server '" .. name .. "' has no resources capability; skipping register")
                     end
@@ -1063,7 +1064,7 @@ local function connect_mcp_servers(servers, opts)
                             local r = mcp.list_prompts(sn)
                             if not r.ok then return std.json.encode({ error = r.error }) end
                             return std.json.encode(r.prompts)
-                        end)
+                        end, { group = sn })
                         tool.register(sn .. "__mcp_get_prompt", {
                             description = "Get a prompt by name from MCP server '" .. sn .. "'",
                             input_schema = {
@@ -1078,7 +1079,7 @@ local function connect_mcp_servers(servers, opts)
                             local r = mcp.get_prompt(sn, input.name, input.args or {})
                             if not r.ok then return std.json.encode({ error = r.error }) end
                             return std.json.encode(r.messages)
-                        end)
+                        end, { group = sn })
                     else
                         log.info("agent: server '" .. name .. "' has no prompts capability; skipping register")
                     end

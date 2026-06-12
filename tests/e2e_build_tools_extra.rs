@@ -4,6 +4,24 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 #[test]
+fn build_tools_mcp_group_filter() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("build_tools_mcp_group.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("case1.outline_included=true")
+                .and(predicate::str::contains("case1.search_excluded=true"))
+                .and(predicate::str::contains("case2.search_included=true"))
+                .and(predicate::str::contains("case2.outline_excluded=true"))
+                .and(predicate::str::contains("case3.all_tools_count=2_expected=2"))
+                .and(predicate::str::contains("case4.mcp_not_in_default=true")),
+        );
+}
+
+#[test]
 fn build_tools_extra_flatten() {
     let tmp = tempdir().expect("tempdir");
     common::agent_block_cmd()

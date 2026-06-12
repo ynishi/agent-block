@@ -13,6 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_PROMPT` Lua global. Mutually exclusive with `--prompt`.
 - `--context-file FILE` CLI flag (long only) — reads the file and injects its contents as the
   `_CONTEXT` Lua global. Mutually exclusive with `--context`.
+- MCP tools connected via `agent.run({ mcp_servers = {...} })` are now automatically assigned to
+  a tool group named after their server. Pass `tool_groups = { "outline" }` to filter the active
+  tool set to a single MCP server, consistent with the MCP SEP-986 tool-name prefix grouping
+  guidance and the `mcp__<server>__*` convention used by Claude Code.
+- The four meta-tools registered by `enable_resources` / `enable_prompts`
+  (`{server}__mcp_list_resources`, `{server}__mcp_read_resource`,
+  `{server}__mcp_list_prompts`, `{server}__mcp_get_prompt`) now also carry the
+  server name as their `group`, so they can be included or excluded via `tool_groups`
+  along with that server's regular tools.
+
+### Changed
+
+- **Behaviour change**: MCP tools previously fell into the `"default"` group (i.e., no `group`
+  field). They are now assigned `group = <server_name>`. Scripts that pass
+  `tool_groups = { "default" }` will no longer receive MCP tools in their tool array; add the
+  relevant server name(s) explicitly to restore them.
 
 ## [0.19.0] - 2026-05-28
 
