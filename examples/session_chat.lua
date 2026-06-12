@@ -4,7 +4,9 @@
 -- Run multiple times with the same AGENT_ID and the agent will remember the
 -- prior turns:
 --
---   AGENT_ID=alice AGENT_PROMPT="my name is alice" agent-block -s examples/session_chat.lua
+--   agent-block --prompt "my name is alice" -s examples/session_chat.lua
+--   agent-block --prompt-file ./prompt.txt  -s examples/session_chat.lua
+--   AGENT_ID=alice AGENT_PROMPT="my name is alice" agent-block -s examples/session_chat.lua  # deprecated: use --prompt / --prompt-file
 --   AGENT_ID=alice AGENT_PROMPT="what is my name?" agent-block -s examples/session_chat.lua
 --   AGENT_ID=alice agent-block -s examples/session_chat.lua -- clear   # wipe thread
 --
@@ -15,8 +17,10 @@
 local agent   = require("agent")
 local session = require("session")
 
-local id     = std.env.get_or("AGENT_ID",     "default")
-local prompt = std.env.get_or("AGENT_PROMPT", "Say hello in one short sentence.")
+local id = std.env.get_or("AGENT_ID", "default")
+-- _PROMPT is injected by --prompt / --prompt-file CLI flags (preferred).
+-- AGENT_PROMPT env var is deprecated; migrate to --prompt or --prompt-file.
+local prompt = _PROMPT or std.env.get_or("AGENT_PROMPT", "Say hello in one short sentence.")
 
 -- Optional: trim history to last N messages to bound token cost.
 local function trim_last_n(msgs, n)

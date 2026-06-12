@@ -6,6 +6,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
+use anyhow::Context as _;
 
 use crate::host::{run, BlockConfig};
 use crate::mcp_client::DEFAULT_RPC_TIMEOUT;
@@ -55,6 +56,16 @@ struct Cli {
     /// Env: `AGENT_BLOCK_CONTEXT`.
     #[arg(short = 'c', long, env = "AGENT_BLOCK_CONTEXT")]
     context: Option<String>,
+
+    /// Path to a file whose contents are injected as `_PROMPT` Lua global.
+    /// Mutually exclusive with `--prompt`.
+    #[arg(long, value_name = "FILE", conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
+
+    /// Path to a file whose contents are injected as `_CONTEXT` Lua global.
+    /// Mutually exclusive with `--context`.
+    #[arg(long, value_name = "FILE", conflicts_with = "context")]
+    context_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -78,14 +89,32 @@ async fn main() -> anyhow::Result<()> {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RPC_TIMEOUT);
 
+    let prompt = match cli.prompt_file {
+        Some(ref path) => {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --prompt-file '{}'", path.display()))?;
+            Some(content)
+        }
+        None => cli.prompt,
+    };
+
+    let context = match cli.context_file {
+        Some(ref path) => {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --context-file '{}'", path.display()))?;
+            Some(content)
+        }
+        None => cli.context,
+    };
+
     let config = BlockConfig {
         script_path: cli.script,
         project_root: cli.project,
         relay_url: cli.relay,
         secret_key: cli.secret_key,
         mcp_rpc_timeout,
-        prompt: cli.prompt,
-        context: cli.context,
+        prompt,
+        context,
     };
 
     Ok(run(config).await?)
