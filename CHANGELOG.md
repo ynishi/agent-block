@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.20.0] - 2026-06-12
+
+### Added
+
 - `--prompt-file FILE` CLI flag (long only) — reads the file and injects its contents as the
   `_PROMPT` Lua global. Mutually exclusive with `--prompt`.
 - `--context-file FILE` CLI flag (long only) — reads the file and injects its contents as the
