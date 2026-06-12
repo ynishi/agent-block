@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field). They are now assigned `group = <server_name>`. Scripts that pass
   `tool_groups = { "default" }` will no longer receive MCP tools in their tool array; add the
   relevant server name(s) explicitly to restore them.
+- MCP tool group resolution now honours a server-declared `_meta.group` field. When an
+  MCP tool carries `_meta.group` (a non-empty string), that value is used as the group
+  label instead of the server name. This allows a single MCP server to spread its tools
+  across multiple named groups without renaming the server. Falls back to the server name
+  when `_meta.group` is absent, empty, or a non-string type. Exposed as
+  `agent._resolve_mcp_group(tool_json, server_name)` for testing.
 
 ## [0.19.0] - 2026-05-28
 

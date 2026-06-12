@@ -63,3 +63,22 @@ fn dispatch_extra_tools_via_registry() {
         .success()
         .stdout(predicate::str::contains("dispatch=ok"));
 }
+
+#[test]
+fn resolve_mcp_group_priority() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("resolve_mcp_group.lua")])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("case1._meta.group_wins=true")
+                .and(predicate::str::contains("case2.no_meta_fallback=true"))
+                .and(predicate::str::contains("case3.empty_group_fallback=true"))
+                .and(predicate::str::contains("case4.number_group_fallback=true"))
+                .and(predicate::str::contains("case5.table_group_fallback=true"))
+                .and(predicate::str::contains("case6.no_group_key_fallback=true"))
+                .and(predicate::str::contains("case7.meta_group_used_for_filtering=true")),
+        );
+}

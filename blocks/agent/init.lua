@@ -987,7 +987,7 @@ local function connect_mcp_servers(servers, opts)
                     name = ns_name,
                     description = t.description or "",
                     input_schema = input_schema,
-                    group = name,
+                    group = M._resolve_mcp_group(t, name),
                 },
             }
         end
@@ -1625,5 +1625,29 @@ function M.run(opts)
 end
 
 M._build_tools = build_tools -- internal: for tests only
+
+--- Resolve the group label for an MCP tool definition.
+-- Priority:
+--   1. tool JSON `_meta.group` (string, non-empty) — server-declared group
+--   2. fallback: server_name (current behaviour)
+--
+-- rmcp 1.4.0 serialises Tool.meta as `_meta` (via #[serde(rename = "_meta")]),
+-- so the Lua-side JSON key is always `_meta`.
+--
+-- @param tool_json   table   Raw tool object from mcp.list_tools
+-- @param server_name string  MCP server name (fallback)
+-- @return string             Resolved group label
+local function resolve_mcp_group(tool_json, server_name)
+    local meta = tool_json._meta
+    if type(meta) == "table" then
+        local g = meta.group
+        if type(g) == "string" and g ~= "" then
+            return g
+        end
+    end
+    return server_name
+end
+
+M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 
 return M
