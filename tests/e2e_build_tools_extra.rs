@@ -16,9 +16,13 @@ fn build_tools_mcp_group_filter() {
                 .and(predicate::str::contains("case1.search_excluded=true"))
                 .and(predicate::str::contains("case2.search_included=true"))
                 .and(predicate::str::contains("case2.outline_excluded=true"))
-                .and(predicate::str::contains("case3.all_tools_count=2_expected=2"))
+                .and(predicate::str::contains(
+                    "case3.all_tools_count=2_expected=2",
+                ))
                 .and(predicate::str::contains("case4.mcp_not_in_default=true"))
-                .and(predicate::str::contains("case5.group_not_in_emitted_def=true")),
+                .and(predicate::str::contains(
+                    "case5.group_not_in_emitted_def=true",
+                )),
         );
 }
 
@@ -79,6 +83,8 @@ fn resolve_mcp_group_priority() {
                 .and(predicate::str::contains("case4.number_group_fallback=true"))
                 .and(predicate::str::contains("case5.table_group_fallback=true"))
                 .and(predicate::str::contains("case6.no_group_key_fallback=true"))
-                .and(predicate::str::contains("case7.meta_group_used_for_filtering=true")),
+                .and(predicate::str::contains(
+                    "case7.meta_group_used_for_filtering=true",
+                )),
         );
 }

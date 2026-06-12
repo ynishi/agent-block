@@ -3,10 +3,10 @@
 //! Parses command-line arguments and launches the Host.
 //! The binary is intentionally thin — all logic lives in Lua scripts.
 
+use anyhow::Context as _;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
-use anyhow::Context as _;
 
 use crate::host::{run, BlockConfig};
 use crate::mcp_client::DEFAULT_RPC_TIMEOUT;

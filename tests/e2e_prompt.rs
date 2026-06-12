@@ -67,7 +67,12 @@ fn prompt_file_injects_global() {
     let path = tmp.path().to_str().expect("path str");
 
     common::agent_block_cmd()
-        .args(["--prompt-file", path, "-s", &common::fixture("prompt_flag.lua")])
+        .args([
+            "--prompt-file",
+            path,
+            "-s",
+            &common::fixture("prompt_flag.lua"),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("PROMPT:from file content"))
@@ -81,7 +86,12 @@ fn context_file_injects_global() {
     let path = tmp.path().to_str().expect("path str");
 
     common::agent_block_cmd()
-        .args(["--context-file", path, "-s", &common::fixture("prompt_flag.lua")])
+        .args([
+            "--context-file",
+            path,
+            "-s",
+            &common::fixture("prompt_flag.lua"),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("PROMPT:nil"))
