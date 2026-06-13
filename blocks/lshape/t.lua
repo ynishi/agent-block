@@ -36,11 +36,11 @@ function combinators:describe(doc)
     return setmetatable({ kind = "described", inner = self, doc = doc }, schema_mt)
 end
 
-M.string  = setmetatable({ kind = "prim", prim = "string" },  schema_mt)
-M.number  = setmetatable({ kind = "prim", prim = "number" },  schema_mt)
+M.string = setmetatable({ kind = "prim", prim = "string" }, schema_mt)
+M.number = setmetatable({ kind = "prim", prim = "number" }, schema_mt)
 M.boolean = setmetatable({ kind = "prim", prim = "boolean" }, schema_mt)
-M.table   = setmetatable({ kind = "prim", prim = "table" },   schema_mt)
-M.any     = setmetatable({ kind = "any" },                    schema_mt)
+M.table = setmetatable({ kind = "prim", prim = "table" }, schema_mt)
+M.any = setmetatable({ kind = "any" }, schema_mt)
 
 --- T.shape(fields, opts) — named key set.
 ---
@@ -74,8 +74,7 @@ function M.shape(fields, opts)
             error("lshape.t: shape field name must be string, got " .. type(name), 2)
         end
         if not is_schema(sub) then
-            error(string.format(
-                "lshape.t: shape field '%s' must be a schema (table with kind)", name), 2)
+            error(string.format("lshape.t: shape field '%s' must be a schema (table with kind)", name), 2)
         end
         copy[name] = sub
     end
@@ -114,8 +113,7 @@ function M.partial(fields, opts)
             error("lshape.t: partial field name must be string, got " .. type(name), 2)
         end
         if not is_schema(sub) then
-            error(string.format(
-                "lshape.t: partial field '%s' must be a schema (table with kind)", name), 2)
+            error(string.format("lshape.t: partial field '%s' must be a schema (table with kind)", name), 2)
         end
         if rawget(sub, "kind") == "optional" then
             wrapped[name] = sub
@@ -144,11 +142,12 @@ function M.array_of(elem)
     end
     if rawget(probe, "kind") == "optional" then
         error(
-            "lshape.t: array_of(optional(T)) is not allowed — " ..
-            "Lua's `#` cannot reliably validate arrays with nil holes. " ..
-            "Use array_of(T) (require dense) or model the nil-admission " ..
-            "at the enclosing field (e.g. T.array_of(T):is_optional()).",
-            2)
+            "lshape.t: array_of(optional(T)) is not allowed — "
+                .. "Lua's `#` cannot reliably validate arrays with nil holes. "
+                .. "Use array_of(T) (require dense) or model the nil-admission "
+                .. "at the enclosing field (e.g. T.array_of(T):is_optional()).",
+            2
+        )
     end
     return setmetatable({ kind = "array_of", elem = elem }, schema_mt)
 end
@@ -158,7 +157,9 @@ function M.one_of(values)
         error("lshape.t: one_of expects a values table as argument", 2)
     end
     local n = 0
-    for _ in pairs(values) do n = n + 1 end
+    for _ in pairs(values) do
+        n = n + 1
+    end
     if n == 0 then
         error("lshape.t: one_of expects at least one value", 2)
     end
@@ -169,9 +170,7 @@ function M.one_of(values)
         end
         local t = type(v)
         if t ~= "string" and t ~= "number" and t ~= "boolean" then
-            error(string.format(
-                "lshape.t: one_of values must be string/number/boolean, got %s at index %d",
-                t, i), 2)
+            error(string.format("lshape.t: one_of values must be string/number/boolean, got %s at index %d", t, i), 2)
         end
     end
     -- C5: reject duplicate literals. `T.one_of({"a", "a"})` is almost
@@ -185,10 +184,14 @@ function M.one_of(values)
         local v = values[i]
         local key = type(v) .. ":" .. tostring(v)
         if seen[key] then
-            error(string.format(
-                "lshape.t: one_of has duplicate value %s at index %d",
-                (type(v) == "string") and string.format("%q", v) or tostring(v),
-                i), 2)
+            error(
+                string.format(
+                    "lshape.t: one_of has duplicate value %s at index %d",
+                    (type(v) == "string") and string.format("%q", v) or tostring(v),
+                    i
+                ),
+                2
+            )
         end
         seen[key] = true
         copy[i] = v
@@ -202,8 +205,7 @@ end
 function M.literal(value)
     local t = type(value)
     if t ~= "string" and t ~= "number" and t ~= "boolean" then
-        error(string.format(
-            "lshape.t: literal expects string/number/boolean, got %s", t), 2)
+        error(string.format("lshape.t: literal expects string/number/boolean, got %s", t), 2)
     end
     return M.one_of({ value })
 end
@@ -232,13 +234,10 @@ function M.discriminated(tag, variants)
             error("lshape.t: discriminated variant key must be string, got " .. type(k), 2)
         end
         if not is_schema(v) or rawget(v, "kind") ~= "shape" then
-            error(string.format(
-                "lshape.t: discriminated variant '%s' must be a shape schema", k), 2)
+            error(string.format("lshape.t: discriminated variant '%s' must be a shape schema", k), 2)
         end
         if rawget(rawget(v, "fields"), tag) == nil then
-            error(string.format(
-                "lshape.t: discriminated variant '%s' must declare the tag field '%s'",
-                k, tag), 2)
+            error(string.format("lshape.t: discriminated variant '%s' must declare the tag field '%s'", k, tag), 2)
         end
         copy[k] = v
         count = count + 1
@@ -277,7 +276,9 @@ function M.any_of(variants)
         error("lshape.t: any_of expects a variants table as argument", 2)
     end
     local n = 0
-    for _ in pairs(variants) do n = n + 1 end
+    for _ in pairs(variants) do
+        n = n + 1
+    end
     if n < 2 then
         error("lshape.t: any_of expects at least two variants", 2)
     end
@@ -288,8 +289,7 @@ function M.any_of(variants)
             error("lshape.t: any_of expects a 1-based dense array of variants", 2)
         end
         if not is_schema(v) then
-            error(string.format(
-                "lshape.t: any_of variant at index %d must be a schema", i), 2)
+            error(string.format("lshape.t: any_of variant at index %d must be a schema", i), 2)
         end
         copy[i] = v
     end
@@ -307,9 +307,9 @@ function M.map_of(key, val)
 end
 
 M._internal = {
-    schema_mt   = schema_mt,
+    schema_mt = schema_mt,
     combinators = combinators,
-    is_schema   = is_schema,
+    is_schema = is_schema,
 }
 
 return M

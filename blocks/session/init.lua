@@ -46,7 +46,9 @@ end
 function M.load(id)
     assert_id(id)
     local v = std.kv.get(M.NS, id)
-    if v == nil then return {} end
+    if v == nil then
+        return {}
+    end
     if type(v) ~= "table" then
         -- Defensive: a non-table value would mean the slot was clobbered by
         -- something other than session.save. Surface as empty so a corrupted

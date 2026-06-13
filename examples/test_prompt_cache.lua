@@ -177,15 +177,17 @@ local result = agent.run({
     -- cm edits that could invalidate the byte-exact cache key.
     context_management = false,
     on_turn = function(info)
-        log.info(string.format(
-            "on_turn turn=%d tool_calls=%d in=%d out=%d cache_create=%d cache_read=%d",
-            info.turn_number,
-            #info.tool_calls,
-            info.usage and info.usage.input_tokens or 0,
-            info.usage and info.usage.output_tokens or 0,
-            info.usage and info.usage.cache_creation_input_tokens or 0,
-            info.usage and info.usage.cache_read_input_tokens or 0
-        ))
+        log.info(
+            string.format(
+                "on_turn turn=%d tool_calls=%d in=%d out=%d cache_create=%d cache_read=%d",
+                info.turn_number,
+                #info.tool_calls,
+                info.usage and info.usage.input_tokens or 0,
+                info.usage and info.usage.output_tokens or 0,
+                info.usage and info.usage.cache_creation_input_tokens or 0,
+                info.usage and info.usage.cache_read_input_tokens or 0
+            )
+        )
     end,
 })
 

@@ -16,7 +16,7 @@
 --   2 = SKIP (ANTHROPIC_API_KEY not set) or tool never called
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -24,13 +24,15 @@ if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
     os.exit(2)
 end
 
-local MODEL  = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 local TARGET = "/tmp/coding_agent_anthropic_smoke.lua"
 
 -- Runner: invoke the local lua interpreter on the file, capture all output.
 local function lua_runner(file_path)
     local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
-    if not p then return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 } end
+    if not p then
+        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    end
     local out = p:read("*a") or ""
     p:close()
     local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
@@ -60,15 +62,16 @@ log.info("Target file: " .. TARGET)
 local td = compile_loop.make({ runner = lua_runner })
 
 local result = agent.run({
-    provider       = "anthropic",
-    api_key        = ANTHROPIC_API_KEY,
-    model          = MODEL,
-    max_tokens     = 2048,
+    provider = "anthropic",
+    api_key = ANTHROPIC_API_KEY,
+    model = MODEL,
+    max_tokens = 2048,
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
-        TARGET, SPEC
+        TARGET,
+        SPEC
     ),
 })
 
@@ -91,7 +94,9 @@ for _, msg in ipairs(result.messages or {}) do
             end
         end
     end
-    if captured then break end
+    if captured then
+        break
+    end
 end
 
 if not captured then
@@ -109,17 +114,22 @@ if not dec_ok or type(tool_output) ~= "table" then
 end
 
 -- Required keys
-assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
-assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
 -- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
 assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
 
-log.info("compile_loop result: ok=" .. tostring(tool_output.ok)
-    .. " iters=" .. tostring(tool_output.iters)
-    .. " summary=" .. tostring(tool_output.summary))
+log.info(
+    "compile_loop result: ok="
+        .. tostring(tool_output.ok)
+        .. " iters="
+        .. tostring(tool_output.iters)
+        .. " summary="
+        .. tostring(tool_output.summary)
+)
 
 if tool_output.ok then
     log.info("PASS: compile_loop converged in " .. tool_output.iters .. " iter(s)")

@@ -4,7 +4,7 @@
 -- 期待: path header が calc 側にしか出ない (main 側は byte 単位で不変)。
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -12,7 +12,7 @@ if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
     os.exit(2)
 end
 
-local MODEL    = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 local TARGET_A = "/tmp/verify_sel_calc.lua"
 local TARGET_B = "/tmp/verify_sel_main.lua"
 
@@ -50,7 +50,9 @@ end
 
 local function read_file(path)
     local rf = io.open(path, "r")
-    if not rf then return "" end
+    if not rf then
+        return ""
+    end
     local c = rf:read("*a")
     rf:close()
     return c
@@ -99,22 +101,24 @@ Requirements:
 ]])
 
 local td = compile_loop.make({
-    runner       = lua_runner_multi,
+    runner = lua_runner_multi,
     target_files = { TARGET_A, TARGET_B },
-    edit_mode    = "diff",
-    max_iters    = 3,
+    edit_mode = "diff",
+    max_iters = 3,
 })
 
 local result = agent.run({
-    provider       = "anthropic",
-    api_key        = ANTHROPIC_API_KEY,
-    model          = MODEL,
-    max_tokens     = 4096,
+    provider = "anthropic",
+    api_key = ANTHROPIC_API_KEY,
+    model = MODEL,
+    max_tokens = 4096,
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool. Edit ONLY %s. DO NOT touch %s.\nSpec:\n%s",
-        TARGET_A, TARGET_B, SPEC
+        TARGET_A,
+        TARGET_B,
+        SPEC
     ),
 })
 
@@ -129,27 +133,39 @@ log.info("=== FINAL " .. TARGET_B .. " ===")
 log.info(final_b)
 
 -- A: subtract 追加 / 既存保持
-local has_subtract_a  = final_a:find("subtract", 1, true) ~= nil
-local has_add_a       = final_a:find("function M.add", 1, true) ~= nil
-local has_multiply_a  = final_a:find("function M.multiply", 1, true) ~= nil
+local has_subtract_a = final_a:find("subtract", 1, true) ~= nil
+local has_add_a = final_a:find("function M.add", 1, true) ~= nil
+local has_multiply_a = final_a:find("function M.multiply", 1, true) ~= nil
 
 -- B: byte-identical
-local b_unchanged     = (final_b == B_BEFORE)
+local b_unchanged = (final_b == B_BEFORE)
 
-log.info("a: subtract=" .. tostring(has_subtract_a)
-    .. " add=" .. tostring(has_add_a)
-    .. " mul=" .. tostring(has_multiply_a))
-log.info("b: byte_unchanged=" .. tostring(b_unchanged)
-    .. " (before=" .. #B_BEFORE .. " bytes, after=" .. #final_b .. " bytes)")
+log.info(
+    "a: subtract=" .. tostring(has_subtract_a) .. " add=" .. tostring(has_add_a) .. " mul=" .. tostring(has_multiply_a)
+)
+log.info(
+    "b: byte_unchanged="
+        .. tostring(b_unchanged)
+        .. " (before="
+        .. #B_BEFORE
+        .. " bytes, after="
+        .. #final_b
+        .. " bytes)"
+)
 
-local addition_ok    = has_subtract_a and has_add_a and has_multiply_a
+local addition_ok = has_subtract_a and has_add_a and has_multiply_a
 
 if result.ok and addition_ok and b_unchanged then
     log.info("VERIFY PASS: only calc edited, main byte-identical")
     os.exit(0)
 else
-    log.error("VERIFY FAIL: result.ok=" .. tostring(result.ok)
-        .. " addition_ok=" .. tostring(addition_ok)
-        .. " b_unchanged=" .. tostring(b_unchanged))
+    log.error(
+        "VERIFY FAIL: result.ok="
+            .. tostring(result.ok)
+            .. " addition_ok="
+            .. tostring(addition_ok)
+            .. " b_unchanged="
+            .. tostring(b_unchanged)
+    )
     os.exit(1)
 end

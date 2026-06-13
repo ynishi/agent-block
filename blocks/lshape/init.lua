@@ -22,8 +22,8 @@ local M = {}
 
 M._VERSION = "0.1.0"
 
-M.t       = require("lshape.t")
-M.check   = require("lshape.check")
+M.t = require("lshape.t")
+M.check = require("lshape.check")
 M.reflect = require("lshape.reflect")
 M.luacats = require("lshape.luacats")
 

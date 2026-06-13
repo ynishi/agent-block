@@ -27,7 +27,7 @@ local BUILTIN_RUNNERS = {
         end
         local out = p:read("*a") or ""
         p:close()
-        local exit_str  = out:match("__EXIT__=(%d+)%s*$") or "1"
+        local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
         local exit_code = tonumber(exit_str) or 1
         out = out:gsub("__EXIT__=%d+%s*$", "")
         local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
@@ -37,7 +37,7 @@ local BUILTIN_RUNNERS = {
     cargo = function(file_path)
         local dir = file_path:match("^(.*)/[^/]+$") or "."
         local cmd = "cd " .. dir .. " && cargo test --offline 2>&1"
-        local p   = io.popen(cmd, "r")
+        local p = io.popen(cmd, "r")
         if not p then
             return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
         end
@@ -56,7 +56,9 @@ local function resolve_runner(kind)
     end
     if type(kind) == "string" then
         local fn = BUILTIN_RUNNERS[kind]
-        if fn then return fn, nil end
+        if fn then
+            return fn, nil
+        end
         return nil, "unknown runner_kind: " .. kind
     end
     return nil, "runner_kind must be a string or function, got: " .. type(kind)
@@ -70,27 +72,27 @@ end
 function M.run(opts)
     assert(type(opts) == "table", "opts table required")
     assert(opts.target_file, "opts.target_file required")
-    assert(opts.spec,        "opts.spec required")
+    assert(opts.spec, "opts.spec required")
     assert(type(opts.runner) == "function", "opts.runner (function) required")
 
     -- Build conf with all K-96 fields explicitly listed.
     local conf = {
-        runner           = opts.runner,
-        lang             = opts.lang,
-        max_iters        = opts.max_iters,
-        system           = opts.system,
-        on_iter          = opts.on_iter,
-        name             = "compile_loop",
+        runner = opts.runner,
+        lang = opts.lang,
+        max_iters = opts.max_iters,
+        system = opts.system,
+        on_iter = opts.on_iter,
+        name = "compile_loop",
         llm = {
-            provider         = opts.provider,
-            base_url         = opts.base_url,
-            api_key          = opts.api_key,
-            api_key_env      = opts.api_key_env,
-            model            = opts.model,
-            max_tokens       = opts.max_tokens,
-            temperature      = opts.temperature,
+            provider = opts.provider,
+            base_url = opts.base_url,
+            api_key = opts.api_key,
+            api_key_env = opts.api_key_env,
+            model = opts.model,
+            max_tokens = opts.max_tokens,
+            temperature = opts.temperature,
             disable_thinking = opts.disable_thinking,
-            timeout          = opts.timeout,
+            timeout = opts.timeout,
         },
     }
 
@@ -98,19 +100,19 @@ function M.run(opts)
 
     -- handler expects the tool input shape: {spec, target_file, lang?}
     local raw_json = td.handler({
-        spec        = opts.spec,
+        spec = opts.spec,
         target_file = opts.target_file,
-        lang        = opts.lang,
+        lang = opts.lang,
     })
 
     local ok, result = pcall(std.json.decode, raw_json)
     if not ok or type(result) ~= "table" then
         return {
-            ok             = false,
+            ok = false,
             failure_reason = "decode_failed",
-            last_error     = tostring(result),
-            iters          = 0,
-            summary        = "coding_agent.run: failed to decode compile_loop result",
+            last_error = tostring(result),
+            iters = 0,
+            summary = "coding_agent.run: failed to decode compile_loop result",
         }
     end
     return result
@@ -132,21 +134,21 @@ function M.register_tool(opts)
 
     -- Build conf with all K-96 fields explicitly listed.
     local conf = {
-        runner           = runner,
-        lang             = opts.lang,
-        max_iters        = opts.max_iters,
-        system           = opts.system,
-        name             = opts.name,
+        runner = runner,
+        lang = opts.lang,
+        max_iters = opts.max_iters,
+        system = opts.system,
+        name = opts.name,
         llm = {
-            provider         = opts.provider,
-            base_url         = opts.base_url,
-            api_key          = opts.api_key,
-            api_key_env      = opts.api_key_env,
-            model            = opts.model,
-            max_tokens       = opts.max_tokens,
-            temperature      = opts.temperature,
+            provider = opts.provider,
+            base_url = opts.base_url,
+            api_key = opts.api_key,
+            api_key_env = opts.api_key_env,
+            model = opts.model,
+            max_tokens = opts.max_tokens,
+            temperature = opts.temperature,
             disable_thinking = opts.disable_thinking,
-            timeout          = opts.timeout,
+            timeout = opts.timeout,
         },
     }
 

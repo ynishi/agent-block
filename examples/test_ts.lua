@@ -15,14 +15,14 @@ local series = "smoke"
 std.ts.append(series, 1)
 
 -- Append a structured payload (table value).
-std.ts.append(series, {ok = true, msg = "hello"})
+std.ts.append(series, { ok = true, msg = "hello" })
 
 -- last() returns the most-recent data point.
 local last_row = std.ts.last(series)
 print("smoke_last_type=" .. type(last_row.value))
 
 -- query() with agg="count" aggregates all rows.
-local count_result = std.ts.query(series, {agg = "count"})
+local count_result = std.ts.query(series, { agg = "count" })
 print("smoke_count=" .. tostring(count_result[1].value))
 
 -- query() in raw mode returns all rows ordered by ts.

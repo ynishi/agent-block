@@ -32,26 +32,30 @@ local result = agent.run({
     max_tokens = 512,
     max_iterations = 5,
     on_turn = function(info)
-        log.info(string.format(
-            "Turn %d: %d tool calls, tokens: %d in / %d out",
-            info.turn_number,
-            #info.tool_calls,
-            info.usage and info.usage.input_tokens or 0,
-            info.usage and info.usage.output_tokens or 0
-        ))
+        log.info(
+            string.format(
+                "Turn %d: %d tool calls, tokens: %d in / %d out",
+                info.turn_number,
+                #info.tool_calls,
+                info.usage and info.usage.input_tokens or 0,
+                info.usage and info.usage.output_tokens or 0
+            )
+        )
     end,
 })
 
 if result.ok then
     log.info("Agent completed successfully")
     log.info("Response: " .. result.content)
-    log.info(string.format(
-        "Total usage: %d input + %d output = %d tokens in %d turns",
-        result.usage.input_tokens,
-        result.usage.output_tokens,
-        result.usage.total_tokens,
-        result.num_turns
-    ))
+    log.info(
+        string.format(
+            "Total usage: %d input + %d output = %d tokens in %d turns",
+            result.usage.input_tokens,
+            result.usage.output_tokens,
+            result.usage.total_tokens,
+            result.num_turns
+        )
+    )
 else
     log.error("Agent failed: " .. (result.error or "unknown error"))
 end

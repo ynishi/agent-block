@@ -28,8 +28,10 @@ local tools = mcp.list_tools("echo")
 assert(tools and tools.ok, "list_tools failed")
 assert(#tools.tools == 2, "expected 2 tools, got " .. #tools.tools)
 local tool_names = {}
-for _, t in ipairs(tools.tools) do tool_names[t.name] = true end
-assert(tool_names["echo"],      "tool 'echo' missing")
+for _, t in ipairs(tools.tools) do
+    tool_names[t.name] = true
+end
+assert(tool_names["echo"], "tool 'echo' missing")
 assert(tool_names["slow_echo"], "tool 'slow_echo' missing")
 print("LIST_TOOLS_OK (count=" .. #tools.tools .. ")")
 
@@ -79,7 +81,15 @@ print("ECHO_OK")
 local progress_count = 0
 mcp.on_progress("echo", function(tok, prog, total, msg)
     progress_count = progress_count + 1
-    print(string.format("  PROGRESS token=%s prog=%s/%s msg=%s", tostring(tok), tostring(prog), tostring(total), tostring(msg)))
+    print(
+        string.format(
+            "  PROGRESS token=%s prog=%s/%s msg=%s",
+            tostring(tok),
+            tostring(prog),
+            tostring(total),
+            tostring(msg)
+        )
+    )
 end)
 
 -- Send a progressToken in the _meta field via raw call arguments.

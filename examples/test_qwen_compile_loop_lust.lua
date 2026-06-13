@@ -2,7 +2,7 @@
 -- as the runner. Structured per-test feedback instead of raw stdout grep.
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local QWEN_BASE_URL = std.env.get("QWEN_BASE_URL")
 if not QWEN_BASE_URL or QWEN_BASE_URL == "" then
@@ -30,21 +30,30 @@ local function lust_runner(file_path)
     end
     -- Build a human-readable diagnostic that the LLM can act on.
     local lines = {}
-    table.insert(lines, string.format("total=%d passed=%d failed=%d",
-        parsed.total or 0, parsed.passed or 0, parsed.failed or 0))
+    table.insert(
+        lines,
+        string.format("total=%d passed=%d failed=%d", parsed.total or 0, parsed.passed or 0, parsed.failed or 0)
+    )
     for _, t in ipairs(parsed.tests or {}) do
         if t.passed then
             table.insert(lines, string.format("  PASS  %s :: %s", tostring(t.suite), tostring(t.name)))
         else
-            table.insert(lines, string.format("  FAIL  %s :: %s\n        error: %s",
-                tostring(t.suite), tostring(t.name), tostring(t.error or "(no message)")))
+            table.insert(
+                lines,
+                string.format(
+                    "  FAIL  %s :: %s\n        error: %s",
+                    tostring(t.suite),
+                    tostring(t.name),
+                    tostring(t.error or "(no message)")
+                )
+            )
         end
     end
     local pass = (parsed.failed or 0) == 0 and (parsed.total or 0) > 0
     return {
-        ok        = pass,
-        stdout    = table.concat(lines, "\n"),
-        stderr    = "",
+        ok = pass,
+        stdout = table.concat(lines, "\n"),
+        stderr = "",
         exit_code = pass and 0 or 1,
     }
 end
@@ -83,31 +92,32 @@ log.info("compile_loop + mlua-probe lust runner. Target: " .. TARGET)
 
 -- K-96: all LLM tuning fields are explicitly listed in the llm table.
 local td = compile_loop.make({
-    runner   = lust_runner,
-    llm      = {
-        provider         = "openai",
-        base_url         = QWEN_BASE_URL,
-        api_key          = "dummy",
-        model            = "qwen",
+    runner = lust_runner,
+    llm = {
+        provider = "openai",
+        base_url = QWEN_BASE_URL,
+        api_key = "dummy",
+        model = "qwen",
         disable_thinking = true,
-        temperature      = 0.2,
-        max_tokens       = 2500,
+        temperature = 0.2,
+        max_tokens = 2500,
     },
     max_iters = 5,
-    lang      = "lua",
+    lang = "lua",
 })
 
 -- Parent also uses Qwen (minimum env: only QWEN_BASE_URL required).
 local result = agent.run({
-    provider       = "openai",
-    base_url       = QWEN_BASE_URL,
-    api_key        = "dummy",
-    model          = "qwen",
+    provider = "openai",
+    base_url = QWEN_BASE_URL,
+    api_key = "dummy",
+    model = "qwen",
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
-        TARGET, SPEC
+        TARGET,
+        SPEC
     ),
 })
 
@@ -132,7 +142,9 @@ for _, msg in ipairs(result.messages or {}) do
             end
         end
     end
-    if captured then break end
+    if captured then
+        break
+    end
 end
 
 if not captured then
@@ -150,14 +162,16 @@ if not dec_ok or type(tool_output) ~= "table" then
 end
 
 -- Required keys
-assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
-assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
 -- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
 assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
 
 log.info(string.format("ok=%s iters=%s", tostring(tool_output.ok), tostring(tool_output.iters)))
-if tool_output.failure_reason then log.info("failure_reason: " .. tostring(tool_output.failure_reason)) end
+if tool_output.failure_reason then
+    log.info("failure_reason: " .. tostring(tool_output.failure_reason))
+end
 os.exit(result.ok and 0 or 2)

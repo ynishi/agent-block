@@ -2,7 +2,7 @@
 -- Tricky Rust task: parse a small custom format with edge cases.
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local QWEN_BASE_URL = std.env.get("QWEN_BASE_URL")
 if not QWEN_BASE_URL or QWEN_BASE_URL == "" then
@@ -10,14 +10,16 @@ if not QWEN_BASE_URL or QWEN_BASE_URL == "" then
     os.exit(2)
 end
 
-local PROJ   = "/tmp/qwen-rust-react"
+local PROJ = "/tmp/qwen-rust-react"
 local TARGET = PROJ .. "/src/main.rs"
 
 local function cargo_runner(file_path)
     -- Run cargo test in offline mode (faster, deterministic). Capture stdout+stderr.
     local cmd = string.format("cd %s && cargo test --offline 2>&1; echo __EXIT__=$?", PROJ)
     local p = io.popen(cmd, "r")
-    if not p then return { ok=false, stdout="", stderr="popen failed", exit_code=-1 } end
+    if not p then
+        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    end
     local out = p:read("*a") or ""
     p:close()
     local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
@@ -53,32 +55,33 @@ log.info("Running compile_loop Rust task: " .. PROJ)
 -- K-96: all LLM tuning fields are explicitly listed in the llm table.
 -- timeout is placed inside the llm table per K-96 (subtask-2.md §Constraints).
 local td = compile_loop.make({
-    runner   = cargo_runner,
-    llm      = {
-        provider         = "openai",
-        base_url         = QWEN_BASE_URL,
-        api_key          = "dummy",
-        model            = "qwen",
+    runner = cargo_runner,
+    llm = {
+        provider = "openai",
+        base_url = QWEN_BASE_URL,
+        api_key = "dummy",
+        model = "qwen",
         disable_thinking = true,
-        temperature      = 0.2,
-        max_tokens       = 3000,
-        timeout          = 240,
+        temperature = 0.2,
+        max_tokens = 3000,
+        timeout = 240,
     },
     max_iters = 5,
-    lang      = "rust",
+    lang = "rust",
 })
 
 -- Parent also uses Qwen (minimum env: only QWEN_BASE_URL required).
 local result = agent.run({
-    provider       = "openai",
-    base_url       = QWEN_BASE_URL,
-    api_key        = "dummy",
-    model          = "qwen",
+    provider = "openai",
+    base_url = QWEN_BASE_URL,
+    api_key = "dummy",
+    model = "qwen",
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
-        TARGET, SPEC
+        TARGET,
+        SPEC
     ),
 })
 
@@ -101,7 +104,9 @@ for _, msg in ipairs(result.messages or {}) do
             end
         end
     end
-    if captured then break end
+    if captured then
+        break
+    end
 end
 
 if not captured then
@@ -119,14 +124,16 @@ if not dec_ok or type(tool_output) ~= "table" then
 end
 
 -- Required keys
-assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
-assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
 -- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
 assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
 
 log.info(string.format("ok=%s iters=%s", tostring(tool_output.ok), tostring(tool_output.iters)))
-if tool_output.failure_reason then log.info("failure_reason: " .. tostring(tool_output.failure_reason)) end
+if tool_output.failure_reason then
+    log.info("failure_reason: " .. tostring(tool_output.failure_reason))
+end
 os.exit(result.ok and 0 or 2)

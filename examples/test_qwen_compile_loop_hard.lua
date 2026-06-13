@@ -11,8 +11,10 @@ end
 local TARGET = "/tmp/qwen_react_deepcopy.lua"
 
 local function lua_runner(file_path)
-    local p = io.popen("lua " .. file_path .. " 2>&1; echo \"__EXIT__=$?\"", "r")
-    if not p then return { ok=false, stdout="", stderr="popen failed", exit_code=-1 } end
+    local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
+    if not p then
+        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    end
     local out = p:read("*a") or ""
     p:close()
     local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
@@ -22,7 +24,8 @@ local function lua_runner(file_path)
     return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
 end
 
-local SPEC = [[Write a single Lua 5.3+ file (no external libs) defining `local M = {}` and `M.deepcopy(t)` that returns a deep copy of `t` such that:
+local SPEC =
+    [[Write a single Lua 5.3+ file (no external libs) defining `local M = {}` and `M.deepcopy(t)` that returns a deep copy of `t` such that:
 
 (1) Nested tables are recursively cloned (no shared references with input).
 (2) **Cycles are handled** — `t.self = t` does NOT cause infinite recursion. The output preserves the same cycle topology.
@@ -45,31 +48,30 @@ Output ONLY the file in a single ```lua ... ``` block.]]
 log.info("Running compile_loop hard task: " .. TARGET)
 
 local res = coding.run({
-    provider     = "openai",
-    base_url     = QWEN_BASE_URL,
-    api_key      = "dummy",
-    model        = "qwen",
-    target_file  = TARGET,
-    lang         = "lua",
-    spec         = SPEC,
-    runner       = lua_runner,
-    max_iters    = 5,
-    max_tokens   = 2500,
-    temperature  = 0.2,
+    provider = "openai",
+    base_url = QWEN_BASE_URL,
+    api_key = "dummy",
+    model = "qwen",
+    target_file = TARGET,
+    lang = "lua",
+    spec = SPEC,
+    runner = lua_runner,
+    max_iters = 5,
+    max_tokens = 2500,
+    temperature = 0.2,
     disable_thinking = true,
     on_iter = function(info)
         local r = info.result
-        log.info(string.format(
-            "iter %d: ok=%s exit=%s",
-            info.iter, tostring(r.ok), tostring(r.exit_code)
-        ))
+        log.info(string.format("iter %d: ok=%s exit=%s", info.iter, tostring(r.ok), tostring(r.exit_code)))
         if not r.ok then
-            log.info("  stdout: " .. (r.stdout or ""):gsub("\n", " | "):sub(1,300))
+            log.info("  stdout: " .. (r.stdout or ""):gsub("\n", " | "):sub(1, 300))
         end
     end,
 })
 
 log.info("=== RESULT ===")
 log.info(string.format("ok=%s iters=%d", tostring(res.ok), res.iters))
-if res.failure_reason then log.info("failure_reason: " .. tostring(res.failure_reason)) end
+if res.failure_reason then
+    log.info("failure_reason: " .. tostring(res.failure_reason))
+end
 os.exit(res.ok and 0 or 2)

@@ -5,7 +5,7 @@ local agent = require("agent")
 
 -- 1 line: register get / set / list tools, scoped to the "todos" namespace.
 local names = std.kv.register_tools({
-    prefix  = "todo_",
+    prefix = "todo_",
     allowed = { "get", "set", "list" },
     ns_lock = "todos",
 })
@@ -28,28 +28,35 @@ The namespace is implicit (already bound); you only need to pass key / value / p
 
 Use the tools; do not guess values.
 ]],
-    system  = "You are a concise assistant that uses the provided todo_* tools to manage state.",
-    model   = "claude-haiku-4-5-20251001",
-    max_tokens     = 512,
+    system = "You are a concise assistant that uses the provided todo_* tools to manage state.",
+    model = "claude-haiku-4-5-20251001",
+    max_tokens = 512,
     max_iterations = 8,
     on_turn = function(info)
         local ns = {}
-        for _, tc in ipairs(info.tool_calls) do table.insert(ns, tc.name) end
-        table.insert(turn_log, string.format(
-            "turn %d: [%s]",
-            info.turn_number, table.concat(ns, ",")
-        ))
+        for _, tc in ipairs(info.tool_calls) do
+            table.insert(ns, tc.name)
+        end
+        table.insert(turn_log, string.format("turn %d: [%s]", info.turn_number, table.concat(ns, ",")))
     end,
 })
 
 print("=== turn log ===")
-for _, line in ipairs(turn_log) do print(line) end
+for _, line in ipairs(turn_log) do
+    print(line)
+end
 
 print("\n=== result ===")
 print("ok=" .. tostring(result.ok) .. " turns=" .. tostring(result.num_turns))
 if result.usage then
-    print(string.format("tokens: in=%d out=%d total=%d",
-        result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens))
+    print(
+        string.format(
+            "tokens: in=%d out=%d total=%d",
+            result.usage.input_tokens,
+            result.usage.output_tokens,
+            result.usage.total_tokens
+        )
+    )
 end
 if result.ok then
     print("--- final content ---")

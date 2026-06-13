@@ -32,31 +32,30 @@ print("cursor_before=" .. cursor_before)
 
 -- 3. Fake scan: 3 new sessions
 local new_sessions = {
-  { id = "sess-101", kind = "agent-candidate", reason = "repeated web+read+grep sequence" },
-  { id = "sess-102", kind = "skill-candidate", reason = "complex argument-parsing stanza" },
-  { id = "sess-103", kind = "agent-candidate", reason = "three-stage planning pattern" },
+    { id = "sess-101", kind = "agent-candidate", reason = "repeated web+read+grep sequence" },
+    { id = "sess-102", kind = "skill-candidate", reason = "complex argument-parsing stanza" },
+    { id = "sess-103", kind = "agent-candidate", reason = "three-stage planning pattern" },
 }
 
 -- 4. Insert + advance cursor
 local base_ts = os.time()
 for i, s in ipairs(new_sessions) do
-  local r = std.sql.exec(
-    "INSERT INTO candidates (session_id, kind, reason, created_at) VALUES (?, ?, ?, ?)",
-    { s.id, s.kind, s.reason, base_ts + i }
-  )
-  print(string.format("inserted id=%d session=%s", r.last_id, s.id))
+    local r = std.sql.exec(
+        "INSERT INTO candidates (session_id, kind, reason, created_at) VALUES (?, ?, ?, ?)",
+        { s.id, s.kind, s.reason, base_ts + i }
+    )
+    print(string.format("inserted id=%d session=%s", r.last_id, s.id))
 end
 std.kv.set("cursor", scanner, new_sessions[#new_sessions].id)
 
 -- 5. Top-N agent-candidate query
 local top = std.sql.query(
-  "SELECT session_id, kind, reason FROM candidates "
-    .. "WHERE kind = ? ORDER BY created_at DESC LIMIT ?",
-  { "agent-candidate", 5 }
+    "SELECT session_id, kind, reason FROM candidates " .. "WHERE kind = ? ORDER BY created_at DESC LIMIT ?",
+    { "agent-candidate", 5 }
 )
 print("top_count=" .. tostring(#top))
 for i, r in ipairs(top) do
-  print(string.format("top[%d]=%s :: %s", i, r.session_id, r.reason))
+    print(string.format("top[%d]=%s :: %s", i, r.session_id, r.reason))
 end
 
 -- 6. Cursor after

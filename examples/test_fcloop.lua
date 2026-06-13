@@ -31,7 +31,10 @@ end)
 
 -- Run FCLoop
 local messages = {
-    { role = "user", content = "List the lua scripts in the scripts/ directory, then read hello.lua and summarize what it does in one sentence." },
+    {
+        role = "user",
+        content = "List the lua scripts in the scripts/ directory, then read hello.lua and summarize what it does in one sentence.",
+    },
 }
 
 fcloop.run(messages, {

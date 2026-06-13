@@ -6,7 +6,7 @@
 -- add / multiply は両 file で保持されること。
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -14,7 +14,7 @@ if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
     os.exit(2)
 end
 
-local MODEL    = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 local TARGET_A = "/tmp/verify_del_calc.lua"
 local TARGET_B = "/tmp/verify_del_main.lua"
 
@@ -97,22 +97,24 @@ Requirements:
 ]]
 
 local td = compile_loop.make({
-    runner       = lua_runner_multi,
+    runner = lua_runner_multi,
     target_files = { TARGET_A, TARGET_B },
-    edit_mode    = "diff",
-    max_iters    = 3,
+    edit_mode = "diff",
+    max_iters = 3,
 })
 
 local result = agent.run({
-    provider       = "anthropic",
-    api_key        = ANTHROPIC_API_KEY,
-    model          = MODEL,
-    max_tokens     = 4096,
+    provider = "anthropic",
+    api_key = ANTHROPIC_API_KEY,
+    model = MODEL,
+    max_tokens = 4096,
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to modify the existing files.\nTarget files:\n  - %s\n  - %s\nSpec:\n%s",
-        TARGET_A, TARGET_B, SPEC
+        TARGET_A,
+        TARGET_B,
+        SPEC
     ),
 })
 
@@ -120,7 +122,9 @@ log.info("=== RESULT === ok=" .. tostring(result.ok))
 
 local function read_file(path)
     local rf = io.open(path, "r")
-    if not rf then return "" end
+    if not rf then
+        return ""
+    end
     local c = rf:read("*a")
     rf:close()
     return c
@@ -135,31 +139,41 @@ log.info("=== FINAL " .. TARGET_B .. " ===")
 log.info(final_b)
 
 -- Preservation: add / multiply 残存
-local has_add_a       = final_a:find("function M.add", 1, true) ~= nil
-local has_multiply_a  = final_a:find("function M.multiply", 1, true) ~= nil
-local has_add_b       = final_b:find("calc.add", 1, true) ~= nil
-local has_multiply_b  = final_b:find("calc.multiply", 1, true) ~= nil
+local has_add_a = final_a:find("function M.add", 1, true) ~= nil
+local has_multiply_a = final_a:find("function M.multiply", 1, true) ~= nil
+local has_add_b = final_b:find("calc.add", 1, true) ~= nil
+local has_multiply_b = final_b:find("calc.multiply", 1, true) ~= nil
 
 -- Deletion: divide 消滅
-local divide_gone_a   = final_a:find("divide", 1, true) == nil
-local divide_gone_b   = final_b:find("divide", 1, true) == nil
+local divide_gone_a = final_a:find("divide", 1, true) == nil
+local divide_gone_b = final_b:find("divide", 1, true) == nil
 
-log.info("preservation: add_a=" .. tostring(has_add_a)
-    .. " mul_a=" .. tostring(has_multiply_a)
-    .. " add_b=" .. tostring(has_add_b)
-    .. " mul_b=" .. tostring(has_multiply_b))
-log.info("deletion: divide_gone_a=" .. tostring(divide_gone_a)
-    .. " divide_gone_b=" .. tostring(divide_gone_b))
+log.info(
+    "preservation: add_a="
+        .. tostring(has_add_a)
+        .. " mul_a="
+        .. tostring(has_multiply_a)
+        .. " add_b="
+        .. tostring(has_add_b)
+        .. " mul_b="
+        .. tostring(has_multiply_b)
+)
+log.info("deletion: divide_gone_a=" .. tostring(divide_gone_a) .. " divide_gone_b=" .. tostring(divide_gone_b))
 
 local preservation_ok = has_add_a and has_multiply_a and has_add_b and has_multiply_b
-local deletion_ok     = divide_gone_a and divide_gone_b
+local deletion_ok = divide_gone_a and divide_gone_b
 
 if result.ok and preservation_ok and deletion_ok then
     log.info("VERIFY PASS: divide removed from BOTH files, add/multiply preserved")
     os.exit(0)
 else
-    log.error("VERIFY FAIL: result.ok=" .. tostring(result.ok)
-        .. " preservation=" .. tostring(preservation_ok)
-        .. " deletion=" .. tostring(deletion_ok))
+    log.error(
+        "VERIFY FAIL: result.ok="
+            .. tostring(result.ok)
+            .. " preservation="
+            .. tostring(preservation_ok)
+            .. " deletion="
+            .. tostring(deletion_ok)
+    )
     os.exit(1)
 end

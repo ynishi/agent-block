@@ -42,19 +42,21 @@ end)
 local provider = std.env.get("AGENT_PROVIDER") or "anthropic"
 
 local opts = {
-    max_tokens     = 512,
-    timeout        = 120,
+    max_tokens = 512,
+    timeout = 120,
     max_iterations = 5,
-    system         = "You are a helpful assistant. Use available tools to answer questions. Be concise.",
-    prompt         = "What is 17 + 25, and what time is it now? Use the tools, do not guess.",
+    system = "You are a helpful assistant. Use available tools to answer questions. Be concise.",
+    prompt = "What is 17 + 25, and what time is it now? Use the tools, do not guess.",
     on_turn = function(info)
-        log.info(string.format(
-            "Turn %d: %d tool calls, tokens %d in / %d out",
-            info.turn_number,
-            #info.tool_calls,
-            info.usage and info.usage.input_tokens or 0,
-            info.usage and info.usage.output_tokens or 0
-        ))
+        log.info(
+            string.format(
+                "Turn %d: %d tool calls, tokens %d in / %d out",
+                info.turn_number,
+                #info.tool_calls,
+                info.usage and info.usage.input_tokens or 0,
+                info.usage and info.usage.output_tokens or 0
+            )
+        )
     end,
 }
 
@@ -66,8 +68,8 @@ if provider == "openai" then
     end
     opts.provider = "openai"
     opts.base_url = base_url
-    opts.api_key  = "dummy"
-    opts.model    = "qwen"
+    opts.api_key = "dummy"
+    opts.model = "qwen"
 elseif provider == "anthropic" then
     opts.model = "claude-haiku-4-5-20251001"
 else
@@ -86,13 +88,15 @@ end
 
 log.info("=== RESULT ===")
 log.info("content: " .. tostring(result.content))
-log.info(string.format(
-    "usage: %d in + %d out = %d total (turns=%d)",
-    result.usage.input_tokens or 0,
-    result.usage.output_tokens or 0,
-    result.usage.total_tokens or 0,
-    result.num_turns or 0
-))
+log.info(
+    string.format(
+        "usage: %d in + %d out = %d total (turns=%d)",
+        result.usage.input_tokens or 0,
+        result.usage.output_tokens or 0,
+        result.usage.total_tokens or 0,
+        result.num_turns or 0
+    )
+)
 
 local pass = true
 if not result.content or result.content == "" then

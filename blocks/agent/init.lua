@@ -89,17 +89,27 @@ end
 
 local function env_true(name)
     local v = std.env.get(name)
-    if not v then return false end
+    if not v then
+        return false
+    end
     v = string.lower(tostring(v))
     return v == "1" or v == "true" or v == "yes" or v == "on"
 end
 
 local function normalize_dump_mode(v)
-    if not v or v == "" then return nil end
+    if not v or v == "" then
+        return nil
+    end
     v = string.lower(tostring(v))
-    if v == "off" or v == "none" then return "off" end
-    if v == "meta" then return "meta" end
-    if v == "full" then return "full" end
+    if v == "off" or v == "none" then
+        return "off"
+    end
+    if v == "meta" then
+        return "meta"
+    end
+    if v == "full" then
+        return "full"
+    end
     return "off"
 end
 
@@ -147,12 +157,16 @@ end
 local LLM_DUMP_PREFIX = "ab.obs"
 
 local function kv_escape(v)
-    if v == nil then return "nil" end
+    if v == nil then
+        return "nil"
+    end
     if type(v) == "boolean" or type(v) == "number" then
         return tostring(v)
     end
     local s = tostring(v)
-    if s == "" then return '""' end
+    if s == "" then
+        return '""'
+    end
     if s:find("[%s=]") then
         return std.json.encode(s)
     end
@@ -168,7 +182,9 @@ local function format_kv(parts)
 end
 
 local function llm_dump_event(mode, event_name, fields)
-    if mode == "off" then return end
+    if mode == "off" then
+        return
+    end
     local pairs = {
         { "prefix", LLM_DUMP_PREFIX },
         { "event", event_name },
@@ -233,7 +249,7 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
         {
             type = "clear_tool_uses_20250919",
             trigger = { type = "input_tokens", value = 80000 },
-            keep   = { type = "tool_uses",    value = 3 },
+            keep = { type = "tool_uses", value = 3 },
             clear_at_least = { type = "input_tokens", value = 10000 },
         },
     },
@@ -555,7 +571,11 @@ local function normalize_openai_response(raw)
         if ok and type(parsed) == "table" then
             input = parsed
         else
-            log.warn("agent: OpenAI tool_call arguments JSON parse failed for tool '" .. tostring(fn.name) .. "'; using empty input")
+            log.warn(
+                "agent: OpenAI tool_call arguments JSON parse failed for tool '"
+                    .. tostring(fn.name)
+                    .. "'; using empty input"
+            )
             -- Acceptance Criteria #7: input={}, is_error_hint mark, loop continues
             table.insert(content, {
                 type = "tool_use",
@@ -629,8 +649,12 @@ local function convert_messages_to_openai(messages, system)
                 end
                 local text_content = #text_parts > 0 and table.concat(text_parts, "\n") or nil
                 local oai_msg = { role = "assistant" }
-                if text_content then oai_msg.content = text_content end
-                if #tool_calls > 0 then oai_msg.tool_calls = tool_calls end
+                if text_content then
+                    oai_msg.content = text_content
+                end
+                if #tool_calls > 0 then
+                    oai_msg.tool_calls = tool_calls
+                end
                 table.insert(out, oai_msg)
             elseif msg.role == "user" then
                 -- User messages with tool_result blocks → expand to role="tool" messages
@@ -904,7 +928,9 @@ local function new_budget_tracker(max_tokens_budget)
     end
 
     function tracker:exceeded()
-        if not self.limit then return false end
+        if not self.limit then
+            return false
+        end
         return self.total_tokens >= self.limit
     end
 
@@ -945,7 +971,9 @@ local function connect_mcp_servers(servers, opts)
         if srv.url then
             -- Merge server-level trace_context into transport_opts when not already set.
             local transport_opts = {}
-            for k, v in pairs(srv.transport_opts or {}) do transport_opts[k] = v end
+            for k, v in pairs(srv.transport_opts or {}) do
+                transport_opts[k] = v
+            end
             if transport_opts.trace_context == nil then
                 transport_opts.trace_context = not not srv.trace_context
             end
@@ -1009,9 +1037,14 @@ local function connect_mcp_servers(servers, opts)
         elseif opts.progress_to_log then
             local sn = name
             mcp.on_progress(sn, function(ev)
-                local msg = "mcp progress: server=" .. tostring(ev.server)
-                    .. " token=" .. tostring(ev.token)
-                    .. " p=" .. tostring(ev.progress) .. "/" .. tostring(ev.total or "")
+                local msg = "mcp progress: server="
+                    .. tostring(ev.server)
+                    .. " token="
+                    .. tostring(ev.token)
+                    .. " p="
+                    .. tostring(ev.progress)
+                    .. "/"
+                    .. tostring(ev.total or "")
                 if ev.message and ev.message ~= "" then
                     msg = msg .. " msg=" .. ev.message
                 end
@@ -1034,7 +1067,9 @@ local function connect_mcp_servers(servers, opts)
                             input_schema = { type = "object", properties = {} },
                         }, function(_input)
                             local r = mcp.list_resources(sn)
-                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            if not r.ok then
+                                return std.json.encode({ error = r.error })
+                            end
                             return std.json.encode(r.resources)
                         end, { group = sn })
                         tool.register(sn .. "__mcp_read_resource", {
@@ -1046,7 +1081,9 @@ local function connect_mcp_servers(servers, opts)
                             },
                         }, function(input)
                             local r = mcp.read_resource(sn, input.uri)
-                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            if not r.ok then
+                                return std.json.encode({ error = r.error })
+                            end
                             return std.json.encode(r.contents)
                         end, { group = sn })
                     else
@@ -1062,7 +1099,9 @@ local function connect_mcp_servers(servers, opts)
                             input_schema = { type = "object", properties = {} },
                         }, function(_input)
                             local r = mcp.list_prompts(sn)
-                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            if not r.ok then
+                                return std.json.encode({ error = r.error })
+                            end
                             return std.json.encode(r.prompts)
                         end, { group = sn })
                         tool.register(sn .. "__mcp_get_prompt", {
@@ -1077,7 +1116,9 @@ local function connect_mcp_servers(servers, opts)
                             },
                         }, function(input)
                             local r = mcp.get_prompt(sn, input.name, input.args or {})
-                            if not r.ok then return std.json.encode({ error = r.error }) end
+                            if not r.ok then
+                                return std.json.encode({ error = r.error })
+                            end
                             return std.json.encode(r.messages)
                         end, { group = sn })
                     else
@@ -1102,9 +1143,12 @@ local function connect_mcp_servers(servers, opts)
                         else
                             -- log_to_stderr=true: bridge to log.* by level
                             mcp.on_log(sn, function(ev)
-                                local msg = "mcp log: server=" .. tostring(ev.server)
-                                    .. " logger=" .. tostring(ev.logger)
-                                    .. " data=" .. tostring(ev.data)
+                                local msg = "mcp log: server="
+                                    .. tostring(ev.server)
+                                    .. " logger="
+                                    .. tostring(ev.logger)
+                                    .. " data="
+                                    .. tostring(ev.data)
                                 if ev.level == "debug" then
                                     log.debug(msg)
                                 elseif ev.level == "warning" then
@@ -1117,7 +1161,9 @@ local function connect_mcp_servers(servers, opts)
                             end)
                         end
                     else
-                        log.info("agent: server '" .. name .. "' has no logging capability; on_log/log_to_stderr skipped")
+                        log.info(
+                            "agent: server '" .. name .. "' has no logging capability; on_log/log_to_stderr skipped"
+                        )
                     end
                 end
             else
@@ -1168,7 +1214,9 @@ local function build_tools(mcp_tool_map, extra_tools, active_groups)
     end
 
     local function passes_group(t)
-        if not group_set then return true end
+        if not group_set then
+            return true
+        end
         local g = t.group or "default"
         return group_set[g] == true
     end
@@ -1374,17 +1422,23 @@ function M.run(opts)
 
     -- Validate required fields
     if not opts.prompt or opts.prompt == "" then
-        return { ok = false, error = "prompt is required", usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 }, num_turns = 0, messages = {} }
+        return {
+            ok = false,
+            error = "prompt is required",
+            usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 },
+            num_turns = 0,
+            messages = {},
+        }
     end
 
     -- Push parent LLM context so child tools (e.g. compile_loop) can inherit
     -- provider/model/api_key at call time without hard-coding defaults (Crux #2).
     table.insert(_AGENT_LLM_CTX, {
-        provider    = opts.provider,
-        base_url    = opts.base_url,
-        api_key     = opts.api_key,
+        provider = opts.provider,
+        base_url = opts.base_url,
+        api_key = opts.api_key,
         api_key_env = opts.api_key_env,
-        model       = opts.model,
+        model = opts.model,
     })
 
     -- Budget tracker
@@ -1446,8 +1500,8 @@ function M.run(opts)
         timeout = opts.timeout or 120,
         system = opts.system,
         tools = tools,
-        tool_choice = opts.tool_choice,  -- nil = API default (auto)
-        context_management = cm_final,  -- nil = opt-out, table = enabled
+        tool_choice = opts.tool_choice, -- nil = API default (auto)
+        context_management = cm_final, -- nil = opt-out, table = enabled
         -- Provider routing (new — additive, default nil = anthropic path)
         provider = opts.provider,
         base_url = opts.base_url,
@@ -1468,7 +1522,13 @@ function M.run(opts)
     if opts.history then
         if type(opts.history) ~= "table" then
             table.remove(_AGENT_LLM_CTX)
-            return { ok = false, error = "history must be a table (messages array)", usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 }, num_turns = 0, messages = {} }
+            return {
+                ok = false,
+                error = "history must be a table (messages array)",
+                usage = { input_tokens = 0, output_tokens = 0, total_tokens = 0 },
+                num_turns = 0,
+                messages = {},
+            }
         end
         for _, m in ipairs(opts.history) do
             table.insert(messages, m)

@@ -60,7 +60,7 @@ local llm_response = http.request("https://api.anthropic.com/v1/messages", {
         model = "claude-haiku-4-5-20251001",
         max_tokens = data.max_tokens or 128,
         messages = {
-            { role = "user", content = data.prompt }
+            { role = "user", content = data.prompt },
         },
     }),
 })
@@ -76,8 +76,7 @@ local llm_data = std.json.decode(llm_response.body)
 local llm_text = llm_data.content[1].text
 local usage = llm_data.usage or {}
 log.info("LLM responded: " .. llm_text)
-log.info(string.format("  tokens: %d in / %d out",
-    usage.input_tokens or 0, usage.output_tokens or 0))
+log.info(string.format("  tokens: %d in / %d out", usage.input_tokens or 0, usage.output_tokens or 0))
 
 -- alc_continue で再開（session_id 必須）
 log.info("Calling alc_continue...")
@@ -94,7 +93,9 @@ local continue_result = mcp.call("algocline", "alc_continue", {
 if continue_result.ok then
     log.info("alc_continue result:")
     for _, c in ipairs(continue_result.content or {}) do
-        if c.text then log.info(c.text) end
+        if c.text then
+            log.info(c.text)
+        end
     end
 else
     log.error("alc_continue failed: " .. (continue_result.error or "unknown"))

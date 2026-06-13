@@ -23,71 +23,97 @@ if in_test_framework then
     -- Inject globals that agent-block normally provides.
     tool = tool or { register = function() end }
 
-    std = std or {
-        env = {
-            get    = function(_k) return nil end,
-            get_or = function(_k, d) return d end,
-        },
-        json = {
-            -- Minimal JSON encoder sufficient for this test.
-            encode = function(t)
-                if type(t) ~= "table" then return tostring(t) end
-                local parts = {}
-                for k, v in pairs(t) do
-                    local vstr
-                    if type(v) == "boolean" then
-                        vstr = tostring(v)
-                    elseif type(v) == "number" then
-                        vstr = tostring(v)
-                    elseif type(v) == "string" then
-                        vstr = '"' .. v:gsub('"', '\\"') .. '"'
-                    elseif type(v) == "nil" then
-                        vstr = "null"
-                    else
-                        vstr = '"' .. tostring(v) .. '"'
+    std = std
+        or {
+            env = {
+                get = function(_k)
+                    return nil
+                end,
+                get_or = function(_k, d)
+                    return d
+                end,
+            },
+            json = {
+                -- Minimal JSON encoder sufficient for this test.
+                encode = function(t)
+                    if type(t) ~= "table" then
+                        return tostring(t)
                     end
-                    parts[#parts + 1] = '"' .. tostring(k) .. '":' .. vstr
-                end
-                return "{" .. table.concat(parts, ",") .. "}"
-            end,
-            -- Minimal decoder: extracts top-level string/bool/number fields.
-            -- Sufficient for reading ok, iters, failure_reason, summary from result JSON.
-            decode = function(s)
-                if type(s) ~= "string" then return {} end
-                local t = {}
-                -- ok field
-                local ok_val = s:match('"ok"%s*:%s*(true)') or s:match('"ok"%s*:%s*(false)')
-                if ok_val == "true" then t.ok = true
-                elseif ok_val == "false" then t.ok = false end
-                -- iters field
-                local iters_val = s:match('"iters"%s*:%s*(%d+)')
-                if iters_val then t.iters = tonumber(iters_val) end
-                -- failure_reason field
-                local fr = s:match('"failure_reason"%s*:%s*"([^"]+)"')
-                if fr then t.failure_reason = fr end
-                -- summary field
-                local summ = s:match('"summary"%s*:%s*"([^"]*)"')
-                if summ then t.summary = summ end
-                return t
-            end,
-        },
-    }
+                    local parts = {}
+                    for k, v in pairs(t) do
+                        local vstr
+                        if type(v) == "boolean" then
+                            vstr = tostring(v)
+                        elseif type(v) == "number" then
+                            vstr = tostring(v)
+                        elseif type(v) == "string" then
+                            vstr = '"' .. v:gsub('"', '\\"') .. '"'
+                        elseif type(v) == "nil" then
+                            vstr = "null"
+                        else
+                            vstr = '"' .. tostring(v) .. '"'
+                        end
+                        parts[#parts + 1] = '"' .. tostring(k) .. '":' .. vstr
+                    end
+                    return "{" .. table.concat(parts, ",") .. "}"
+                end,
+                -- Minimal decoder: extracts top-level string/bool/number fields.
+                -- Sufficient for reading ok, iters, failure_reason, summary from result JSON.
+                decode = function(s)
+                    if type(s) ~= "string" then
+                        return {}
+                    end
+                    local t = {}
+                    -- ok field
+                    local ok_val = s:match('"ok"%s*:%s*(true)') or s:match('"ok"%s*:%s*(false)')
+                    if ok_val == "true" then
+                        t.ok = true
+                    elseif ok_val == "false" then
+                        t.ok = false
+                    end
+                    -- iters field
+                    local iters_val = s:match('"iters"%s*:%s*(%d+)')
+                    if iters_val then
+                        t.iters = tonumber(iters_val)
+                    end
+                    -- failure_reason field
+                    local fr = s:match('"failure_reason"%s*:%s*"([^"]+)"')
+                    if fr then
+                        t.failure_reason = fr
+                    end
+                    -- summary field
+                    local summ = s:match('"summary"%s*:%s*"([^"]*)"')
+                    if summ then
+                        t.summary = summ
+                    end
+                    return t
+                end,
+            },
+        }
 
-    log = log or {
-        info  = function(msg) io.write("[INFO]  " .. tostring(msg) .. "\n") end,
-        warn  = function(msg) io.write("[WARN]  " .. tostring(msg) .. "\n") end,
-        error = function(msg) io.write("[ERROR] " .. tostring(msg) .. "\n") end,
-    }
+    log = log
+        or {
+            info = function(msg)
+                io.write("[INFO]  " .. tostring(msg) .. "\n")
+            end,
+            warn = function(msg)
+                io.write("[WARN]  " .. tostring(msg) .. "\n")
+            end,
+            error = function(msg)
+                io.write("[ERROR] " .. tostring(msg) .. "\n")
+            end,
+        }
 
     -- agent module mock: returns an LLM context pointing at "openai" so that
     -- run_loop uses the openai provider path.
-    package.preload["agent"] = package.preload["agent"] or function()
-        return {
-            _llm_ctx_top = function()
-                return { provider = "openai", api_key = "mock-key" }
-            end,
-        }
-    end
+    package.preload["agent"] = package.preload["agent"]
+        or function()
+            return {
+                _llm_ctx_top = function()
+                    return { provider = "openai", api_key = "mock-key" }
+                end,
+            }
+        end
 
     -- search_paths is provided via test_launch's search_paths argument,
     -- which prepends the blocks/ directory to package.path automatically.
@@ -119,12 +145,18 @@ local function measure_messages(messages)
             for _, blk in ipairs(m.content) do
                 if type(blk) == "table" then
                     -- text block or tool_result content
-                    if type(blk.content) == "string" then total = total + #blk.content end
-                    if type(blk.text)    == "string" then total = total + #blk.text    end
+                    if type(blk.content) == "string" then
+                        total = total + #blk.content
+                    end
+                    if type(blk.text) == "string" then
+                        total = total + #blk.text
+                    end
                     -- tool_use input: approximate via json encode
                     if type(blk.input) == "table" then
                         local enc_ok, enc = pcall(std.json.encode, blk.input)
-                        if enc_ok then total = total + #enc end
+                        if enc_ok then
+                            total = total + #enc
+                        end
                     end
                 end
             end
@@ -136,11 +168,10 @@ end
 -- ── Test suite ───────────────────────────────────────────────────────────────
 
 local describe = lust.describe
-local it       = lust.it
-local expect   = lust.expect
+local it = lust.it
+local expect = lust.expect
 
 describe("compile_loop multi-file lazy load e2e (openai)", function()
-
     -- ── R4: _test_set_llm_call must be exported ───────────────────────────────
     it("exports _test_set_llm_call (subtask-1 dependency)", function()
         expect(type(compile_loop._test_set_llm_call)).to.equal("function")
@@ -166,9 +197,9 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
 
         -- Mock state.
         local mock_state = {
-            call_count         = 0,
-            messages_size_log  = {},
-            max_seen_size      = 0,
+            call_count = 0,
+            messages_size_log = {},
+            max_seen_size = 0,
         }
 
         -- Per-file version tracker: SR SEARCH text must match current file content exactly.
@@ -177,24 +208,22 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
         -- Build an SR block that exactly matches the current file content.
         -- Returns the SR text and bumps the version counter.
         local function make_sr_block(file_idx, call_tag)
-            local path    = TARGET_FILES[file_idx]
+            local path = TARGET_FILES[file_idx]
             local cur_ver = file_versions[file_idx]
             local search_line
             if cur_ver == 1 then
                 search_line = "-- oai_lazy_file_" .. file_idx .. "_v0\n"
             else
-                search_line = "-- oai_lazy_file_" .. file_idx
-                           .. "_v" .. (cur_ver - 1)
-                           .. "_c" .. (cur_ver - 1) .. "\n"
+                search_line = "-- oai_lazy_file_" .. file_idx .. "_v" .. (cur_ver - 1) .. "_c" .. (cur_ver - 1) .. "\n"
             end
-            local replace_line = "-- oai_lazy_file_" .. file_idx
-                               .. "_v" .. cur_ver
-                               .. "_c" .. call_tag .. "\n"
+            local replace_line = "-- oai_lazy_file_" .. file_idx .. "_v" .. cur_ver .. "_c" .. call_tag .. "\n"
             file_versions[file_idx] = cur_ver + 1
 
             return string.format(
                 "<<< path=%s >>>\n<<<<<<< SEARCH\n%s=======\n%s>>>>>>> REPLACE\n",
-                path, search_line, replace_line
+                path,
+                search_line,
+                replace_line
             )
         end
 
@@ -214,29 +243,32 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
             if sz > mock_state.max_seen_size then
                 mock_state.max_seen_size = sz
             end
-            assert(sz <= 24000,
-                string.format("(gamma) messages size %d > 24000 at llm_call #%d", sz, cn))
+            assert(sz <= 24000, string.format("(gamma) messages size %d > 24000 at llm_call #%d", sz, cn))
 
             if (cn % 2) == 1 then
                 -- tool_use response: read_file for file indexed by cn.
                 local file_idx = 1 + ((cn // 2) % #TARGET_FILES)
                 return {
-                    choices = { {
-                        message = {
-                            content         = "",
-                            tool_use_blocks = { {
-                                id    = "tid_" .. cn,
-                                name  = "read_file",
-                                input = { path = TARGET_FILES[file_idx] },
-                            } },
-                            stop_reason     = "tool_use",
+                    choices = {
+                        {
+                            message = {
+                                content = "",
+                                tool_use_blocks = {
+                                    {
+                                        id = "tid_" .. cn,
+                                        name = "read_file",
+                                        input = { path = TARGET_FILES[file_idx] },
+                                    },
+                                },
+                                stop_reason = "tool_use",
+                            },
                         },
-                    } },
+                    },
                 }
             else
                 -- SR text response for the file matching this even call.
                 local file_idx = 1 + (((cn // 2) - 1) % #TARGET_FILES)
-                local sr_text  = make_sr_block(file_idx, cn)
+                local sr_text = make_sr_block(file_idx, cn)
                 return {
                     choices = { {
                         message = { content = sr_text },
@@ -256,9 +288,9 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
                 return { ok = true, stdout = "ALL_PASS", stderr = "", exit_code = 0 }
             end
             return {
-                ok        = false,
-                stdout    = "",
-                stderr    = "FAIL_iter_" .. runner_call_count .. "_unique",
+                ok = false,
+                stdout = "",
+                stderr = "FAIL_iter_" .. runner_call_count .. "_unique",
                 exit_code = 1,
             }
         end
@@ -267,16 +299,16 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
         compile_loop._test_set_llm_call(mock_llm)
 
         local td = compile_loop.make({
-            runner       = lazy_runner,
-            llm          = { provider = "openai", api_key = "mock-key" },
+            runner = lazy_runner,
+            llm = { provider = "openai", api_key = "mock-key" },
             target_files = TARGET_FILES,
-            edit_mode    = "diff",
-            max_iters    = 10,
+            edit_mode = "diff",
+            max_iters = 10,
         })
 
         -- Invoke the handler directly (no real agent.run, no API key needed).
         local handle_ok, result_json = pcall(td.handler, {
-            spec         = "Add version comments to each oai lazy file.",
+            spec = "Add version comments to each oai lazy file.",
             target_files = TARGET_FILES,
         })
 
@@ -285,9 +317,14 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
 
         -- handler must not raise.
         if not handle_ok then
-            error("td.handler raised: " .. tostring(result_json)
-                .. "\n  mock.call_count=" .. mock_state.call_count
-                .. " runner_call_count=" .. runner_call_count)
+            error(
+                "td.handler raised: "
+                    .. tostring(result_json)
+                    .. "\n  mock.call_count="
+                    .. mock_state.call_count
+                    .. " runner_call_count="
+                    .. runner_call_count
+            )
         end
 
         -- Decode result JSON.
@@ -318,19 +355,18 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
         -- Each odd llm_call returns 1 tool_use block → 1 dispatch in run_loop.
         -- Odd calls = ceil(call_count / 2).
         local dispatches = math.ceil(mock_state.call_count / 2)
-        expect(dispatches >= 3).to.be.truthy(
-            "(alpha) need >= 3 read_file dispatches, got " .. dispatches)
+        expect(dispatches >= 3).to.be.truthy("(alpha) need >= 3 read_file dispatches, got " .. dispatches)
 
         -- (beta) Completed successfully or via stagnation/max_iters give-up.
         local beta_ok = (tool_output.ok == true)
             or (tool_output.failure_reason == "stagnation")
             or (tool_output.failure_reason == "max_iters")
-        expect(beta_ok).to.be.truthy(
-            "(beta) unexpected failure_reason=" .. tostring(tool_output.failure_reason))
+        expect(beta_ok).to.be.truthy("(beta) unexpected failure_reason=" .. tostring(tool_output.failure_reason))
 
         -- (gamma) All messages[] sizes within 24K chars.
         expect(mock_state.max_seen_size <= 24000).to.be.truthy(
-            "(gamma) max messages size " .. mock_state.max_seen_size .. " > 24000")
+            "(gamma) max messages size " .. mock_state.max_seen_size .. " > 24000"
+        )
     end)
 
     -- ── Regression: forced-fail stagnation path (mirrors multi_stagnation e2e) ──
@@ -345,7 +381,9 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
         write_file(TF_B, "-- oai_stag_b_v0\n")
 
         -- Constant SR block: same content every call → same sr_hash → triggers stagnation.
-        local CONST_SR = "<<< path=" .. TF_A .. " >>>\n<<<<<<< SEARCH\n-- oai_stag_a_v0\n=======\n-- oai_stag_a_patched\n>>>>>>> REPLACE\n"
+        local CONST_SR = "<<< path="
+            .. TF_A
+            .. " >>>\n<<<<<<< SEARCH\n-- oai_stag_a_v0\n=======\n-- oai_stag_a_patched\n>>>>>>> REPLACE\n"
 
         local stag_call_n = 0
         local function stag_mock(_opts, _messages)
@@ -364,15 +402,15 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
         compile_loop._test_set_llm_call(stag_mock)
 
         local stag_td = compile_loop.make({
-            runner       = stag_runner,
-            llm          = { provider = "openai", api_key = "mock-key" },
+            runner = stag_runner,
+            llm = { provider = "openai", api_key = "mock-key" },
             target_files = { TF_A, TF_B },
-            edit_mode    = "diff",
-            max_iters    = 10,
+            edit_mode = "diff",
+            max_iters = 10,
         })
 
         local stag_ok, stag_json = pcall(stag_td.handler, {
-            spec         = "Patch oai_stag_a.",
+            spec = "Patch oai_stag_a.",
             target_files = { TF_A, TF_B },
         })
 
@@ -387,26 +425,28 @@ describe("compile_loop multi-file lazy load e2e (openai)", function()
             error("stagnation result decode failed: " .. tostring(stag_json))
         end
 
-        io.write(string.format("[DIAG stagnation] ok=%s failure_reason=%s iters=%s runner_n=%d\n",
-            tostring(stag_out.ok), tostring(stag_out.failure_reason),
-            tostring(stag_out.iters), stag_runner_n))
+        io.write(
+            string.format(
+                "[DIAG stagnation] ok=%s failure_reason=%s iters=%s runner_n=%d\n",
+                tostring(stag_out.ok),
+                tostring(stag_out.failure_reason),
+                tostring(stag_out.iters),
+                stag_runner_n
+            )
+        )
 
         -- ok must be false.
         expect(stag_out.ok).to_not.equal(true)
 
         -- failure_reason must be stagnation or max_iters (stagnation is expected here,
         -- but max_iters is also acceptable per subtask-3 spec).
-        local stag_reason_ok = (stag_out.failure_reason == "stagnation")
-            or (stag_out.failure_reason == "max_iters")
-        expect(stag_reason_ok).to.be.truthy(
-            "expected stagnation|max_iters, got " .. tostring(stag_out.failure_reason))
+        local stag_reason_ok = (stag_out.failure_reason == "stagnation") or (stag_out.failure_reason == "max_iters")
+        expect(stag_reason_ok).to.be.truthy("expected stagnation|max_iters, got " .. tostring(stag_out.failure_reason))
 
         -- Note: runner may not be called at all when apply_blocks fails every iter
         -- (SEARCH text mismatch after first patch → all_failed path).
         -- is_stagnant_v2 fires on repeated sr_hash regardless of runner invocation.
         -- We only assert iters > 0 (the loop ran at least one iteration).
-        expect((stag_out.iters or 0) > 0).to.be.truthy(
-            "expected iters > 0, got " .. tostring(stag_out.iters))
+        expect((stag_out.iters or 0) > 0).to.be.truthy("expected iters > 0, got " .. tostring(stag_out.iters))
     end)
-
 end)

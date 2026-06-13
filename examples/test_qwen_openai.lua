@@ -59,25 +59,27 @@ end
 log.info("Connecting to Qwen vLLM endpoint: " .. QWEN_BASE_URL)
 
 local result = agent.run({
-    provider   = "openai",
-    base_url   = QWEN_BASE_URL,
-    api_key    = "dummy", -- vLLM ignores; placeholder satisfies header builder
-    model      = "qwen",  -- --served-model-name qwen
+    provider = "openai",
+    base_url = QWEN_BASE_URL,
+    api_key = "dummy", -- vLLM ignores; placeholder satisfies header builder
+    model = "qwen", -- --served-model-name qwen
     max_tokens = 512,
-    timeout    = 120,
+    timeout = 120,
     max_iterations = 5,
 
     system = "You are a helpful assistant. Use available tools to answer questions. Be concise.",
     prompt = "What is 17 + 25, and what time is it now? Use the tools, do not guess.",
 
     on_turn = function(info)
-        log.info(string.format(
-            "Turn %d: %d tool calls, tokens %d in / %d out",
-            info.turn_number,
-            #info.tool_calls,
-            info.usage and info.usage.input_tokens or 0,
-            info.usage and info.usage.output_tokens or 0
-        ))
+        log.info(
+            string.format(
+                "Turn %d: %d tool calls, tokens %d in / %d out",
+                info.turn_number,
+                #info.tool_calls,
+                info.usage and info.usage.input_tokens or 0,
+                info.usage and info.usage.output_tokens or 0
+            )
+        )
         for _, tc in ipairs(info.tool_calls) do
             log.info("  -> tool=" .. tostring(tc.name) .. " input=" .. std.json.encode(tc.input or {}))
         end
@@ -91,13 +93,15 @@ end
 
 log.info("=== RESULT ===")
 log.info("content: " .. tostring(result.content))
-log.info(string.format(
-    "usage: %d in + %d out = %d total (turns=%d)",
-    result.usage.input_tokens or 0,
-    result.usage.output_tokens or 0,
-    result.usage.total_tokens or 0,
-    result.num_turns or 0
-))
+log.info(
+    string.format(
+        "usage: %d in + %d out = %d total (turns=%d)",
+        result.usage.input_tokens or 0,
+        result.usage.output_tokens or 0,
+        result.usage.total_tokens or 0,
+        result.num_turns or 0
+    )
+)
 
 -- Acceptance gates
 local pass = true

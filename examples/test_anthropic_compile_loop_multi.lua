@@ -6,7 +6,7 @@
 -- subtract 関数 + assert が両 file に追加されるのを確認。
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -14,7 +14,7 @@ if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
     os.exit(2)
 end
 
-local MODEL    = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 local TARGET_A = "/tmp/verify_multi_calc.lua"
 local TARGET_B = "/tmp/verify_multi_main.lua"
 
@@ -99,22 +99,24 @@ Requirements:
 
 -- multi-file diff mode opt-in
 local td = compile_loop.make({
-    runner       = lua_runner_multi,
+    runner = lua_runner_multi,
     target_files = { TARGET_A, TARGET_B },
-    edit_mode    = "diff",
-    max_iters    = 3,
+    edit_mode = "diff",
+    max_iters = 3,
 })
 
 local result = agent.run({
-    provider       = "anthropic",
-    api_key        = ANTHROPIC_API_KEY,
-    model          = MODEL,
-    max_tokens     = 4096,
+    provider = "anthropic",
+    api_key = ANTHROPIC_API_KEY,
+    model = MODEL,
+    max_tokens = 4096,
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to modify the existing files.\nTarget files:\n  - %s\n  - %s\nSpec:\n%s",
-        TARGET_A, TARGET_B, SPEC
+        TARGET_A,
+        TARGET_B,
+        SPEC
     ),
 })
 
@@ -122,7 +124,9 @@ log.info("=== RESULT === ok=" .. tostring(result.ok))
 
 local function read_file(path)
     local rf = io.open(path, "r")
-    if not rf then return "" end
+    if not rf then
+        return ""
+    end
     local c = rf:read("*a")
     rf:close()
     return c
@@ -138,32 +142,43 @@ log.info(final_b)
 
 -- Preservation checks (full-rewrite ではなく minimal patch である証拠)
 local has_multiply = final_a:find("multiply", 1, true) ~= nil
-local has_add      = final_a:find("function M.add", 1, true) ~= nil or final_a:find("M.add =", 1, true) ~= nil
-local has_square   = final_b:find("square", 1, true) ~= nil
-local sentinel_a   = final_a:find("Pre%-existing helper file: calc operations", 1) ~= nil
-local sentinel_b   = final_b:find("Pre%-existing helper file: main entry", 1) ~= nil
+local has_add = final_a:find("function M.add", 1, true) ~= nil or final_a:find("M.add =", 1, true) ~= nil
+local has_square = final_b:find("square", 1, true) ~= nil
+local sentinel_a = final_a:find("Pre%-existing helper file: calc operations", 1) ~= nil
+local sentinel_b = final_b:find("Pre%-existing helper file: main entry", 1) ~= nil
 
 -- Addition checks
-local subtract_a   = final_a:find("subtract", 1, true) ~= nil
-local subtract_b   = final_b:find("subtract", 1, true) ~= nil
+local subtract_a = final_a:find("subtract", 1, true) ~= nil
+local subtract_b = final_b:find("subtract", 1, true) ~= nil
 
-log.info("preservation: multiply=" .. tostring(has_multiply)
-    .. " add=" .. tostring(has_add)
-    .. " square=" .. tostring(has_square)
-    .. " sentinel_a=" .. tostring(sentinel_a)
-    .. " sentinel_b=" .. tostring(sentinel_b))
-log.info("addition: subtract_a=" .. tostring(subtract_a)
-    .. " subtract_b=" .. tostring(subtract_b))
+log.info(
+    "preservation: multiply="
+        .. tostring(has_multiply)
+        .. " add="
+        .. tostring(has_add)
+        .. " square="
+        .. tostring(has_square)
+        .. " sentinel_a="
+        .. tostring(sentinel_a)
+        .. " sentinel_b="
+        .. tostring(sentinel_b)
+)
+log.info("addition: subtract_a=" .. tostring(subtract_a) .. " subtract_b=" .. tostring(subtract_b))
 
 local preservation_ok = has_multiply and has_add and has_square and sentinel_a and sentinel_b
-local addition_ok     = subtract_a and subtract_b
+local addition_ok = subtract_a and subtract_b
 
 if result.ok and preservation_ok and addition_ok then
     log.info("VERIFY PASS: minimal patch applied to BOTH files via path-aware SEARCH/REPLACE")
     os.exit(0)
 else
-    log.error("VERIFY FAIL: result.ok=" .. tostring(result.ok)
-        .. " preservation=" .. tostring(preservation_ok)
-        .. " addition=" .. tostring(addition_ok))
+    log.error(
+        "VERIFY FAIL: result.ok="
+            .. tostring(result.ok)
+            .. " preservation="
+            .. tostring(preservation_ok)
+            .. " addition="
+            .. tostring(addition_ok)
+    )
     os.exit(1)
 end

@@ -34,13 +34,15 @@ local result = agent.run({
         run_id = std.env.get_or("AGENT_BLOCK_RUN_ID", "demo-run-id"),
     },
     on_turn = function(info)
-        log.info(string.format(
-            "on_turn turn=%d tool_calls=%d in=%d out=%d",
-            info.turn_number,
-            #info.tool_calls,
-            info.usage and info.usage.input_tokens or 0,
-            info.usage and info.usage.output_tokens or 0
-        ))
+        log.info(
+            string.format(
+                "on_turn turn=%d tool_calls=%d in=%d out=%d",
+                info.turn_number,
+                #info.tool_calls,
+                info.usage and info.usage.input_tokens or 0,
+                info.usage and info.usage.output_tokens or 0
+            )
+        )
     end,
 })
 

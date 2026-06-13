@@ -10,7 +10,7 @@
 --   agent-block -s examples/test_qwen_compile_loop.lua
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local QWEN_BASE_URL = std.env.get("QWEN_BASE_URL")
 if not QWEN_BASE_URL or QWEN_BASE_URL == "" then
@@ -23,7 +23,9 @@ local TARGET = "/tmp/qwen_react_work.lua"
 -- Runner: invoke the local lua interpreter on the file, capture all output.
 local function lua_runner(file_path)
     local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
-    if not p then return { ok=false, stdout="", stderr="popen failed", exit_code=-1 } end
+    if not p then
+        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    end
     local out = p:read("*a") or ""
     p:close()
     -- Extract __EXIT__ marker
@@ -59,31 +61,32 @@ log.info("Target file:   " .. TARGET)
 
 -- K-96: all LLM tuning fields are explicitly listed in the llm table.
 local td = compile_loop.make({
-    runner   = lua_runner,
-    llm      = {
-        provider         = "openai",
-        base_url         = QWEN_BASE_URL,
-        api_key          = "dummy",
-        model            = "qwen",
+    runner = lua_runner,
+    llm = {
+        provider = "openai",
+        base_url = QWEN_BASE_URL,
+        api_key = "dummy",
+        model = "qwen",
         disable_thinking = true,
-        temperature      = 0.2,
-        max_tokens       = 2000,
+        temperature = 0.2,
+        max_tokens = 2000,
     },
     max_iters = 5,
-    lang      = "lua",
+    lang = "lua",
 })
 
 -- Parent also uses Qwen (minimum env: only QWEN_BASE_URL required).
 local result = agent.run({
-    provider       = "openai",
-    base_url       = QWEN_BASE_URL,
-    api_key        = "dummy",
-    model          = "qwen",
+    provider = "openai",
+    base_url = QWEN_BASE_URL,
+    api_key = "dummy",
+    model = "qwen",
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
-        TARGET, SPEC
+        TARGET,
+        SPEC
     ),
 })
 
@@ -106,7 +109,9 @@ for _, msg in ipairs(result.messages or {}) do
             end
         end
     end
-    if captured then break end
+    if captured then
+        break
+    end
 end
 
 if not captured then
@@ -124,17 +129,22 @@ if not dec_ok or type(tool_output) ~= "table" then
 end
 
 -- Required keys
-assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
-assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
 -- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
 assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
 
-log.info("compile_loop result: ok=" .. tostring(tool_output.ok)
-    .. " iters=" .. tostring(tool_output.iters)
-    .. " summary=" .. tostring(tool_output.summary))
+log.info(
+    "compile_loop result: ok="
+        .. tostring(tool_output.ok)
+        .. " iters="
+        .. tostring(tool_output.iters)
+        .. " summary="
+        .. tostring(tool_output.summary)
+)
 
 if tool_output.ok then
     log.info("PASS: compile_loop converged in " .. tool_output.iters .. " iter(s)")

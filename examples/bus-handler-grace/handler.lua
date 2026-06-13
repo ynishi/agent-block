@@ -29,7 +29,8 @@ bus.on("mesh", function(ev)
     -- _ENV), so it survives bytecode transfer. No user-defined upvalues.
     local deadline = os.time() + 10
     while os.time() < deadline do
-        for _ = 1, 1000000 do end
+        for _ = 1, 1000000 do
+        end
     end
     log.info("handler END id=" .. tostring(ev.id))
     return { ok = true }

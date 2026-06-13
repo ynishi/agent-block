@@ -15,7 +15,7 @@
 --   2 = SKIP (ANTHROPIC_API_KEY not set, or pytest not available) or tool never called
 
 local compile_loop = require("compile_loop")
-local agent        = require("agent")
+local agent = require("agent")
 
 local ANTHROPIC_API_KEY = std.env.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "" then
@@ -28,7 +28,9 @@ end
 -- that python3 exists or that pytest is importable but broken).
 local function check_pytest()
     local p = io.popen("python3 -m pytest --version 2>&1; echo __EXIT__=$?", "r")
-    if not p then return false end
+    if not p then
+        return false
+    end
     local out = p:read("*a") or ""
     p:close()
     local exit_code = tonumber(out:match("__EXIT__=(%d+)%s*$") or "1")
@@ -40,22 +42,21 @@ if not check_pytest() then
     os.exit(2)
 end
 
-local MODEL  = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+local MODEL = std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 local TARGET = "/tmp/pytest_compile_loop_work.py"
 
 -- Runner: invoke pytest on the target file, capture all output.
 -- Crux #1: pass judgment requires BOTH exit_code == 0 AND at least one
 -- "N passed" count in stdout. Hardcoding ok=true is never permitted.
 local function pytest_runner(file_path)
-    local cmd = string.format(
-        "python3 -m pytest %s -v --tb=short 2>&1; echo __EXIT__=$?",
-        file_path
-    )
+    local cmd = string.format("python3 -m pytest %s -v --tb=short 2>&1; echo __EXIT__=$?", file_path)
     local p = io.popen(cmd, "r")
-    if not p then return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 } end
+    if not p then
+        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    end
     local out = p:read("*a") or ""
     p:close()
-    local exit_str  = out:match("__EXIT__=(%d+)%s*$") or "1"
+    local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
     local exit_code = tonumber(exit_str) or 1
     out = out:gsub("__EXIT__=%d+%s*$", "")
     -- Crux #1: extract "N passed" count; require count > 0 to guard against
@@ -82,21 +83,22 @@ log.info("Target file: " .. TARGET)
 -- llm is omitted → parent agent's provider/model/api_key are inherited at
 -- handler call time from _AGENT_LLM_CTX (same pattern as test_anthropic_compile_loop.lua).
 local td = compile_loop.make({
-    runner    = pytest_runner,
-    lang      = "python",
+    runner = pytest_runner,
+    lang = "python",
     max_iters = 5,
 })
 
 local result = agent.run({
-    provider       = "anthropic",
-    api_key        = ANTHROPIC_API_KEY,
-    model          = MODEL,
-    max_tokens     = 2048,
+    provider = "anthropic",
+    api_key = ANTHROPIC_API_KEY,
+    model = MODEL,
+    max_tokens = 2048,
     max_iterations = 3,
-    extra_tools    = { td },
-    prompt         = string.format(
+    extra_tools = { td },
+    prompt = string.format(
         "Use the compile_loop tool to solve the following coding task.\nTarget file: %s\nSpec:\n%s",
-        TARGET, SPEC
+        TARGET,
+        SPEC
     ),
 })
 
@@ -119,7 +121,9 @@ for _, msg in ipairs(result.messages or {}) do
             end
         end
     end
-    if captured then break end
+    if captured then
+        break
+    end
 end
 
 if not captured then
@@ -137,20 +141,22 @@ if not dec_ok or type(tool_output) ~= "table" then
 end
 
 -- Required keys
-assert(tool_output.ok ~= nil,      "FAIL: tool_output.ok is absent")
-assert(tool_output.iters ~= nil,   "FAIL: tool_output.iters is absent")
+assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
+assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
 -- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil,    "Counter WF-A: code leaked to caller")
+assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
 assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
 
-log.info(string.format(
-    "compile_loop result: ok=%s iters=%s summary=%s",
-    tostring(tool_output.ok),
-    tostring(tool_output.iters),
-    tostring(tool_output.summary)
-))
+log.info(
+    string.format(
+        "compile_loop result: ok=%s iters=%s summary=%s",
+        tostring(tool_output.ok),
+        tostring(tool_output.iters),
+        tostring(tool_output.summary)
+    )
+)
 if tool_output.failure_reason then
     log.info("failure_reason: " .. tostring(tool_output.failure_reason))
 end

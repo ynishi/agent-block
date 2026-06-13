@@ -31,7 +31,9 @@ local function pascal_case(name)
         if #token > 0 then
             out[#out + 1] = token:sub(1, 1):upper() .. token:sub(2)
         end
-        if not us then break end
+        if not us then
+            break
+        end
     end
     return table.concat(out)
 end
@@ -72,7 +74,9 @@ end
 --- shapes reached via `array_of` / shape-field / map_of value etc.
 local function inline_shape_type(node, class_prefix)
     local entries = reflect.fields(node)
-    if #entries == 0 then return "table" end
+    if #entries == 0 then
+        return "table"
+    end
     local parts = {}
     for i = 1, #entries do
         local e = entries[i]
@@ -146,7 +150,9 @@ type_of = function(node, class_prefix)
         -- field autocomplete based on the current value of `name`.
         local variants = rawget(node, "variants")
         local keys = {}
-        for k in pairs(variants) do keys[#keys + 1] = k end
+        for k in pairs(variants) do
+            keys[#keys + 1] = k
+        end
         table.sort(keys)
         local parts = {}
         for i = 1, #keys do
@@ -250,8 +256,8 @@ function M.gen(shapes_table, class_prefix)
 end
 
 M._internal = {
-    pascal_case       = pascal_case,
-    type_of           = type_of,
+    pascal_case = pascal_case,
+    type_of = type_of,
     inline_shape_type = inline_shape_type,
 }
 

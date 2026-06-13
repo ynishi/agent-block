@@ -14,7 +14,7 @@
 -- persists across runs). Trimming / compaction is a caller concern — see
 -- the optional trim_last_n example below.
 
-local agent   = require("agent")
+local agent = require("agent")
 local session = require("session")
 
 local id = std.env.get_or("AGENT_ID", "default")
@@ -24,7 +24,9 @@ local prompt = _PROMPT or std.env.get_or("AGENT_PROMPT", "Say hello in one short
 
 -- Optional: trim history to last N messages to bound token cost.
 local function trim_last_n(msgs, n)
-    if #msgs <= n then return msgs end
+    if #msgs <= n then
+        return msgs
+    end
     local out = {}
     for i = #msgs - n + 1, #msgs do
         table.insert(out, msgs[i])
@@ -36,9 +38,9 @@ local prior = session.load(id)
 print(string.format("session[%s] prior_turns=%d", id, #prior))
 
 local r = agent.run({
-    prompt  = prompt,
+    prompt = prompt,
     history = prior,
-    system  = "You are a concise assistant. Remember context from prior turns.",
+    system = "You are a concise assistant. Remember context from prior turns.",
     max_iterations = 5,
 })
 
@@ -50,8 +52,7 @@ end
 print("--- response ---")
 print(r.content)
 print("----------------")
-print(string.format("usage: in=%d out=%d total=%d",
-    r.usage.input_tokens, r.usage.output_tokens, r.usage.total_tokens))
+print(string.format("usage: in=%d out=%d total=%d", r.usage.input_tokens, r.usage.output_tokens, r.usage.total_tokens))
 
 -- Save the full thread back. Swap to `trim_last_n(r.messages, 40)` if the
 -- conversation grows and per-call cost becomes a concern.
