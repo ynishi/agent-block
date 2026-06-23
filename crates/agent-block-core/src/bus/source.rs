@@ -19,7 +19,7 @@
 use async_trait::async_trait;
 
 use crate::bus::event::Event;
-use crate::error::BlockError;
+use agent_block_types::error::BlockError;
 
 /// A producer of [`Event`]s.
 ///

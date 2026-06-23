@@ -19,6 +19,19 @@ Think of it like Envoy for agents: the process itself is simple, but the communi
 
 ## Architecture
 
+The repository is a Cargo workspace with 4 crates (strict one-way
+dependency `bin → core → mcp → types`):
+
+| Crate | Role | Deps |
+|---|---|---|
+| `agent-block-types`  | shared `error` + `obs` (sanitize_url 等) | leaf |
+| `agent-block-mcp`    | rmcp wrapper + Lua↔JSON converters | types |
+| `agent-block-core`   | host runtime + Lua stdlib bridge + EventBus | mcp, types |
+| `agent-block` (bin)  | thin CLI on top of `core` | core, mcp |
+
+Downstream Rust applications can depend on `agent-block-core` (or just
+`agent-block-types` for error/obs) without pulling in clap / the CLI.
+
 ```text
 ┌─────────────────────────────────────────────┐
 │              agent-block (binary)            │

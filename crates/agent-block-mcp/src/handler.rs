@@ -48,38 +48,37 @@ const MCP_DISPATCH_ELICITATION: &str = "__mcp_dispatch_elicitation";
 /// Written by `mcp.on_progress` (main Isle bridge) so that `on_progress`
 /// notifications dispatched via `main_isle.exec` can call the closure with its
 /// upvalues intact (no bytecode dump/reload across Lua VMs).
-pub(crate) const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
+pub const MCP_USER_PROGRESS_CBS: &str = "__mcp_user_progress_cbs";
 
 /// Global table that holds user-provided log callbacks stored by server name
 /// on the **main Isle**.
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
+pub const MCP_USER_LOG_CBS: &str = "__mcp_user_log_cbs";
 
 /// Global table that holds user-provided resource-update callbacks stored by
 /// server name on the **main Isle**.
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_RESOURCE_UPDATE_CBS: &str = "__mcp_user_resource_update_cbs";
+pub const MCP_USER_RESOURCE_UPDATE_CBS: &str = "__mcp_user_resource_update_cbs";
 
 /// Global table that holds user-provided resources-list-changed callbacks stored
 /// by server name on the **main Isle**.
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_RESOURCES_LIST_CHANGED_CBS: &str =
-    "__mcp_user_resources_list_changed_cbs";
+pub const MCP_USER_RESOURCES_LIST_CHANGED_CBS: &str = "__mcp_user_resources_list_changed_cbs";
 
 /// Global table that holds user-provided tools-list-changed callbacks stored by
 /// server name on the **main Isle**.
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_TOOLS_LIST_CHANGED_CBS: &str = "__mcp_user_tools_list_changed_cbs";
+pub const MCP_USER_TOOLS_LIST_CHANGED_CBS: &str = "__mcp_user_tools_list_changed_cbs";
 
 /// Global table that holds user-provided prompts-list-changed callbacks stored
 /// by server name on the **main Isle**.
 ///
 /// Same rationale as `MCP_USER_PROGRESS_CBS`.
-pub(crate) const MCP_USER_PROMPTS_LIST_CHANGED_CBS: &str = "__mcp_user_prompts_list_changed_cbs";
+pub const MCP_USER_PROMPTS_LIST_CHANGED_CBS: &str = "__mcp_user_prompts_list_changed_cbs";
 
 /// Capacity of the bounded notification dispatch channel.
 ///
@@ -285,7 +284,7 @@ impl AgentBlockClientHandler {
 
     /// Mark that a Lua on_progress handler has been installed on the handler Isle
     /// for the given server.
-    pub(crate) fn mark_on_progress(&self, server_name: &str) {
+    pub fn mark_on_progress(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -294,7 +293,7 @@ impl AgentBlockClientHandler {
     }
 
     /// Mark that a Lua on_log handler has been installed on the handler Isle.
-    pub(crate) fn mark_on_log(&self, server_name: &str) {
+    pub fn mark_on_log(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -303,7 +302,7 @@ impl AgentBlockClientHandler {
     }
 
     /// Mark that a Lua on_resource_updated handler has been installed.
-    pub(crate) fn mark_on_resource_updated(&self, server_name: &str) {
+    pub fn mark_on_resource_updated(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -312,7 +311,7 @@ impl AgentBlockClientHandler {
     }
 
     /// Mark that a Lua on_resource_list_changed handler has been installed.
-    pub(crate) fn mark_on_resource_list_changed(&self, server_name: &str) {
+    pub fn mark_on_resource_list_changed(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -321,7 +320,7 @@ impl AgentBlockClientHandler {
     }
 
     /// Mark that a Lua on_tool_list_changed handler has been installed.
-    pub(crate) fn mark_on_tool_list_changed(&self, server_name: &str) {
+    pub fn mark_on_tool_list_changed(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -330,7 +329,7 @@ impl AgentBlockClientHandler {
     }
 
     /// Mark that a Lua on_prompt_list_changed handler has been installed.
-    pub(crate) fn mark_on_prompt_list_changed(&self, server_name: &str) {
+    pub fn mark_on_prompt_list_changed(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -349,13 +348,13 @@ impl AgentBlockClientHandler {
     }
 
     /// Return whether trace context injection is enabled for the named server.
-    pub(crate) fn trace_context_enabled(&self, server_name: &str) -> bool {
+    pub fn trace_context_enabled(&self, server_name: &str) -> bool {
         let guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         guard.get(server_name).is_some_and(|r| r.trace_context)
     }
 
     /// Mark that a Lua sampling handler has been installed on the handler Isle.
-    pub(crate) fn mark_sampling(&self, server_name: &str) {
+    pub fn mark_sampling(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -372,7 +371,7 @@ impl AgentBlockClientHandler {
     /// Creates a registry entry for the server if one does not yet exist, then
     /// sets `roots = true` so that `list_roots` requests are dispatched to the
     /// Lua callback rather than returning `method_not_found`.
-    pub(crate) fn mark_roots(&self, server_name: &str) {
+    pub fn mark_roots(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -389,7 +388,7 @@ impl AgentBlockClientHandler {
     /// Creates a registry entry for the server if one does not yet exist, then
     /// sets `elicitation = true` so that `create_elicitation` requests are dispatched
     /// to the Lua callback rather than returning `Decline` (no-handler path).
-    pub(crate) fn mark_elicitation(&self, server_name: &str) {
+    pub fn mark_elicitation(&self, server_name: &str) {
         let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
             .entry(server_name.to_string())
@@ -1160,7 +1159,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         LuaValue::Nil => Ok(String::new()),
                         LuaValue::Table(tbl) => {
                             // Serialize the table to JSON string.
-                            let json_val = crate::bridge::lua_to_json(lua, LuaValue::Table(tbl))
+                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
                                 .map_err(|e| {
                                     mlua_isle::IsleError::Lua(format!(
                                         "create_message: lua_to_json: {e}"
@@ -1313,7 +1312,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         LuaValue::Nil => Ok(String::new()),
                         LuaValue::Table(tbl) => {
                             // Serialize the table to JSON string.
-                            let json_val = crate::bridge::lua_to_json(lua, LuaValue::Table(tbl))
+                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
                                 .map_err(|e| {
                                     mlua_isle::IsleError::Lua(format!(
                                         "list_roots: lua_to_json: {e}"
@@ -1493,7 +1492,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         LuaValue::Nil => Ok(String::new()),
                         LuaValue::Table(tbl) => {
                             // Serialize the table to JSON string.
-                            let json_val = crate::bridge::lua_to_json(lua, LuaValue::Table(tbl))
+                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
                                 .map_err(|e| {
                                     mlua_isle::IsleError::Lua(format!(
                                         "create_elicitation: lua_to_json: {e}"

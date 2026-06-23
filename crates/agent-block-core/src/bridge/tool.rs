@@ -1,6 +1,6 @@
 //! tool.* — Lua-side tool registry for LLM function calling.
 
-use crate::bridge::obs;
+use agent_block_types::obs;
 use mlua::prelude::*;
 
 /// Register tool.* Lua API.

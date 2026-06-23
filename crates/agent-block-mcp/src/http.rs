@@ -11,9 +11,10 @@ use rmcp::{
     ServiceExt,
 };
 
-use crate::bridge::obs::sanitize_url;
-use crate::error::{BlockError, BlockResult};
-use crate::mcp_client::handler::AgentBlockClientHandler;
+use agent_block_types::error::{BlockError, BlockResult};
+use agent_block_types::obs::sanitize_url;
+
+use crate::handler::AgentBlockClientHandler;
 
 /// Perform the MCP initialize handshake over Streamable HTTP transport.
 ///

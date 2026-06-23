@@ -8,14 +8,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::host::{run, BlockConfig};
-use crate::mcp_client::DEFAULT_RPC_TIMEOUT;
-
-mod bridge;
-mod bus;
-mod error;
-mod host;
-mod mcp_client;
+use agent_block_core::{run, BlockConfig};
+use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -45,7 +45,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::event::{AckResult, Event};
-use crate::error::BlockError;
+use agent_block_types::error::BlockError;
 
 /// Callable target for a registered handler.
 ///

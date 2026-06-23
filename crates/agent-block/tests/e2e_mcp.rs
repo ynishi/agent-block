@@ -43,7 +43,7 @@ fn mcp_errors_propagate_to_lua_and_tracing() {
             "--mcp-timeout-secs",
             "2",
         ])
-        .env("RUST_LOG", "agent_block::mcp_client=warn")
+        .env("RUST_LOG", "agent_block_mcp=warn")
         .assert()
         .success();
 

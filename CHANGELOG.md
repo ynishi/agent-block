@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Split the single `agent-block` crate into a 4-crate workspace** to make the
+  SDK reusable from downstream Rust applications without dragging in the CLI:
+  - `agent-block-types` — `error` + `obs` (leaf, no agent-block-* deps)
+  - `agent-block-mcp`   — rmcp wrapper + Lua↔JSON converters
+  - `agent-block-core`  — host runtime + Lua stdlib bridge + EventBus
+  - `agent-block`       — thin CLI bin on top of `core`
+  Dependency direction is strictly `bin → core → mcp → types` with no cycles.
+  Existing CLI surface (`agent-block -s <script.lua>` + flags) is unchanged.
+
 ### Deprecated
 
 ### Removed

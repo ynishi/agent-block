@@ -1,0 +1,39 @@
+[package]
+name = "agent-block-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host runtime + Lua stdlib bridge + EventBus for agent-block"
+
+[dependencies]
+agent-block-types.workspace = true
+agent-block-mcp.workspace = true
+
+mlua.workspace = true
+mlua-isle.workspace = true
+mlua-batteries.workspace = true
+agent-mesh-core.workspace = true
+agent-mesh-sdk.workspace = true
+llm-extract.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+dotenvy.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7" }
+tempfile = "3"
+
+# SIGTERM / SIGINT delivery for EventBus dispatcher unit tests.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }

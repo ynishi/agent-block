@@ -12,7 +12,7 @@
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::error::BlockError;
+use agent_block_types::error::BlockError;
 
 /// Result carried back to the originating source via [`Event::ack_tx`].
 pub type AckResult = Result<Value, BlockError>;

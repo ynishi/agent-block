@@ -17,13 +17,13 @@ use mlua_isle::IsleError;
 use serde_json::Map;
 use std::sync::Arc;
 
-use crate::bridge::obs;
 use crate::host::HostContext;
-use crate::mcp_client::handler::{
+use agent_block_mcp::handler::{
     MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS, MCP_USER_PROMPTS_LIST_CHANGED_CBS,
     MCP_USER_RESOURCES_LIST_CHANGED_CBS, MCP_USER_RESOURCE_UPDATE_CBS,
     MCP_USER_TOOLS_LIST_CHANGED_CBS,
 };
+use agent_block_types::obs;
 
 use super::{json_to_lua, lua_to_json};
 

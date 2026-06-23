@@ -67,8 +67,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{AckResult, EventBus, Handler};
-use crate::error::BlockError;
 use crate::host::HostContext;
+use agent_block_types::error::BlockError;
 
 /// Name of the Lua-side dispatcher function injected by [`register`].
 ///

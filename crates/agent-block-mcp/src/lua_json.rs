@@ -1,35 +1,11 @@
-//! Lua Stdlib Bridge — injects all `*.*` global APIs into the Lua VM.
+//! Lua ↔ JSON value bridge.
 //!
-//! Each submodule registers one namespace:
-//!
-//! | Module | Lua namespace | Purpose |
-//! |--------|--------------|---------|
-//! | `mesh` | `mesh.*`     | Agent-to-agent mesh communication |
-//! | `mcp`  | `mcp.*`      | MCP server management |
-//! | `sh`   | `sh.*`       | Shell command execution |
-//! | `tool` | `tool.*`     | Tool registry (define and call tools from Lua) |
-//! | `http` | `http.*`     | Async HTTP client |
-//! | `log`  | `log.*`, `env.*` | Logging and environment access |
-//! | `ts`   | `std.ts.*`   | SQLite-backed time-series primitive (in-tree) |
-
-pub mod bus;
-pub mod config;
-pub mod http;
-pub mod kv;
-pub mod llm;
-pub mod log;
-pub mod mcp;
-pub mod mesh;
-pub mod obs;
-pub mod sh;
-pub mod sql;
-pub mod task;
-pub mod tool;
-pub mod ts;
+//! Moved from `src/bridge/mod.rs` during the 4-crate split so that the MCP
+//! handler can reach these conversions without depending on `agent-block-core`.
+//! `agent-block-core::bridge` re-exports them for the other bridge modules
+//! (llm / mesh / mcp.lua), preserving the historical `crate::bridge::*` API.
 
 use mlua::prelude::*;
-
-use crate::host::HostContext;
 
 /// Convert a Lua value to a serde_json::Value.
 ///
@@ -150,55 +126,4 @@ fn json_to_lua_inner(lua: &Lua, val: &serde_json::Value, depth: usize) -> LuaRes
             Ok(LuaValue::Table(table))
         }
     }
-}
-
-/// Register bridge APIs shared between main VM and handler VM.
-///
-/// Registers everything except `bus::*`.  Split out from `register_all` so
-/// the handler-side Isle can re-use the same set of bridges without
-/// installing the main-VM-only `bus` global.
-///
-/// `is_handler_side` is forwarded to `mesh::register` so the handler Isle
-/// can skip the `mesh.on` alias (which depends on `bus.on` and would fail
-/// because the handler Isle does not expose a `bus` global).
-fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResult<()> {
-    mesh::register(lua, ctx, is_handler_side)?;
-    sh::register(lua, ctx)?;
-    tool::register(lua)?;
-    log::register(lua, ctx)?;
-    mcp::register(lua, ctx)?;
-    http::register(lua, ctx)?;
-    llm::register(lua)?;
-    kv::register(lua, ctx)?;
-    sql::register(lua, ctx)?;
-    ts::register(lua, ctx)?;
-    task::register(lua)?;
-    Ok(())
-}
-
-/// Register all bridge APIs into the Lua state (main Isle).
-///
-/// Note: `fs`, `env`, `json`, `path`, `time` are provided by mlua-batteries
-/// (registered as `std.*` in host.rs). This function registers only
-/// agent-block-specific APIs.
-pub fn register_all(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    // bus must register before mesh — the mesh.on alias (see
-    // bridge/mesh.rs) reads the `bus` global produced here.
-    bus::register(lua, ctx)?;
-    register_non_bus_bridges(lua, ctx, false)
-}
-
-/// Register bridge APIs for the handler Isle.
-///
-/// The handler Isle runs Lua handlers forwarded from the main Isle's
-/// `bus.on` / `bus.on_any` via bytecode transfer. It therefore needs the
-/// dispatcher-side globals (`__bus_handlers`, `__bus_on_any`,
-/// `__bus_dispatch`) installed by
-/// [`bus::install_bus_dispatcher_on_handler_isle`], but does **not** expose
-/// the `bus.*` Lua table — nested `bus.on(...)` from inside a handler is
-/// intentionally unsupported.
-pub fn register_all_handler_side(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    bus::install_bus_dispatcher_on_handler_isle(lua)?;
-    crate::mcp_client::handler::install_mcp_dispatcher_on_handler_isle(lua)?;
-    register_non_bus_bridges(lua, ctx, true)
 }

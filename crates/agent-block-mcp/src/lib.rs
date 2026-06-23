@@ -32,6 +32,7 @@
 
 pub mod handler;
 pub(crate) mod http;
+pub mod lua_json;
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -54,7 +55,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
-use crate::error::{BlockError, BlockResult};
+use agent_block_types::error::{BlockError, BlockResult};
 
 pub use handler::AgentBlockClientHandler;
 
@@ -65,10 +66,10 @@ pub struct McpManager {
     /// Server connections keyed by name. `pub(crate)` so integration tests
     /// can insert in-process test servers directly (same as `concurrency_tests`
     /// in this module).
-    pub(crate) servers: HashMap<String, RunningService<RoleClient, AgentBlockClientHandler>>,
+    pub servers: HashMap<String, RunningService<RoleClient, AgentBlockClientHandler>>,
     rpc_timeout: Duration,
     /// Shared handler instance — all connections share the same registry Arc.
-    pub(crate) handler: AgentBlockClientHandler,
+    pub handler: AgentBlockClientHandler,
 }
 
 impl McpManager {

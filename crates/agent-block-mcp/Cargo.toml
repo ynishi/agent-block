@@ -1,0 +1,28 @@
+[package]
+name = "agent-block-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rmcp client wrapper for agent-block (MCP server lifecycle + custom handler)"
+
+[dependencies]
+agent-block-types.workspace = true
+
+rmcp.workspace = true
+mlua.workspace = true
+mlua-isle.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# rmcp `server` (+ `transport-async-rw`) for in-process concurrency tests that
+# run an MCP server over tokio::io::duplex pipes; `elicitation` for the elicit
+# round-trip tests in lib.rs.
+rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server", "elicitation"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7" }

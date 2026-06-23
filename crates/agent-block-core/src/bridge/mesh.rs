@@ -8,8 +8,8 @@ use serde_json::Map;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bridge::obs;
 use crate::host::HostContext;
+use agent_block_types::obs;
 
 /// Register the `mesh.*` Lua table.
 ///

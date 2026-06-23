@@ -20,8 +20,8 @@ use tracing::{info, info_span, warn};
 
 use crate::bridge;
 use crate::bus::{Event, EventBus};
-use crate::error::{BlockError, BlockResult};
-use crate::mcp_client::McpManager;
+use agent_block_mcp::McpManager;
+use agent_block_types::error::{BlockError, BlockResult};
 
 /// Embedded Lua sources for blocks/ StdPkg modules.
 /// These are baked into the binary at compile time so `cargo install` works
@@ -76,7 +76,7 @@ pub struct BlockConfig {
     /// generated. Required to talk to registry/ACL-gated hosted meshes.
     pub secret_key: Option<String>,
     /// Per-RPC timeout for every MCP round-trip (connect / list / call).
-    /// Defaults to [`crate::mcp_client::DEFAULT_RPC_TIMEOUT`].
+    /// Defaults to [`agent_block_mcp::DEFAULT_RPC_TIMEOUT`].
     pub mcp_rpc_timeout: Duration,
     /// Prompt string injected as `_PROMPT` Lua global. `None` = global not set.
     pub prompt: Option<String>,

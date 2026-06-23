@@ -1,68 +1,43 @@
-[package]
-name = "agent-block"
-version = "0.20.0"
+[workspace]
+members = [
+    "crates/agent-block-types",
+    "crates/agent-block-mcp",
+    "crates/agent-block-core",
+    "crates/agent-block",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.21.0"
 edition = "2021"
-description = "Lua-first Agent Runtime built on AgentMesh"
 authors = ["Yutaka Nishimura"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/agent-block"
-keywords = ["lua", "agent", "runtime", "mcp", "mesh"]
-categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.70"
 
-[[bin]]
-name = "agent-block"
-path = "src/main.rs"
+[workspace.dependencies]
+agent-block-types = { path = "crates/agent-block-types", version = "0.21.0" }
+agent-block-mcp   = { path = "crates/agent-block-mcp",   version = "0.21.0" }
+agent-block-core  = { path = "crates/agent-block-core",  version = "0.21.0" }
 
-[[example]]
-name = "subscribe_test_server"
-path = "examples/bin/subscribe_test_server.rs"
-
-[dependencies]
-mlua-isle = { version = "0.4.1", features = ["pool", "tokio"] }
-mlua = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
-
-agent-mesh-core = "0.3"
-agent-mesh-sdk = "0.3"
-
+thiserror    = "2"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+reqwest      = { version = "0.12", features = ["json"] }
+uuid         = { version = "1", features = ["v4"] }
+tracing      = "0.1"
+async-trait  = "0.1"
+rmcp         = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
+mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
 mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task", "sql", "kv"] }
-llm-extract = "0.1"
-
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive", "env"] }
-thiserror = "2"
-anyhow = "1"
-uuid = { version = "1", features = ["v4"] }
-dotenvy = "0.15"
-tracing = "0.1"
+rusqlite     = { version = "0.31", features = ["bundled"] }
+anyhow       = "1"
+dotenvy      = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1"
-rusqlite = { version = "0.31", features = ["bundled"] }
-rmcp = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-
-[dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-tempfile = "3"
-# Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
-# concurrency tests that run an MCP server over tokio::io::duplex pipes.
-# `transport-streamable-http-server` enables the axum-backed in-process HTTP
-# server used by `tests/e2e_mcp_rich.rs` to round-trip `connect_http` + `list_tools`.
-rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server", "elicitation"] }
-# `test-util` enables `tokio::time::pause`/`advance`/`resume` and the
-# `start_paused` flavor used by concurrency tests in `src/bus/dispatcher.rs`.
-tokio = { version = "1", features = ["full", "test-util"] }
-# axum is needed by `tests/e2e_mcp_rich.rs` to serve the in-process
-# StreamableHttpService on an ephemeral port.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-tokio-util = { version = "0.7" }
-
-# SIGTERM / SIGINT delivery for EventBus e2e tests (tests/e2e_bus.rs).
-# `signal` for `kill(2)` + Signal enum, `process` for `Pid::from_raw`.
-[target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.29", features = ["signal", "process"] }
+clap         = { version = "4", features = ["derive", "env"] }
+rustls       = { version = "0.23", default-features = false, features = ["ring"] }
+agent-mesh-core = "0.3"
+agent-mesh-sdk  = "0.3"
+llm-extract     = "0.1"

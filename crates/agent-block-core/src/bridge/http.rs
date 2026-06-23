@@ -20,8 +20,8 @@ use mlua::prelude::*;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::bridge::obs;
 use crate::host::HostContext;
+use agent_block_types::obs;
 
 /// Default request timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
