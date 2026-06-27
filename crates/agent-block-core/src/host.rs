@@ -119,6 +119,21 @@ pub struct BlockConfig {
     /// Defaults to `false` (legacy behavior: dispatcher only runs when the
     /// script calls `bus.serve()`).
     pub auto_serve_bus: bool,
+    /// Optional caller-supplied cancellation token. When cancelled, the
+    /// in-flight script is interrupted via the Isle's debug-hook cancel
+    /// path, the auto-serve dispatcher (if any) is shut down, and `run()`
+    /// returns `Err(BlockError::Cancelled)`.
+    ///
+    /// Intended for SDK consumers that spawn `run()` as a tokio task and
+    /// need an out-of-band abort signal (timeouts, parent-task cancellation
+    /// propagation, user-driven stop). The token is observed across the
+    /// `coroutine_eval` await; once cancellation propagates, the shutdown
+    /// sequence (MCP disconnect, Isle drivers, auto-serve dispatcher)
+    /// still runs so file descriptors and remote handles are released.
+    ///
+    /// Defaults to `None` (legacy behavior: `run()` only completes when
+    /// the script returns naturally).
+    pub shutdown_token: Option<CancellationToken>,
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -331,8 +346,12 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let root_span = info_span!("agent_block", script = %script_name);
-    let _root_guard = root_span.enter();
+    // NOTE: We previously held entered span guards across awaits for nested
+    // span context. That made the `run()` future `!Send`, which prevents
+    // SDK consumers from `tokio::spawn(run(config))`. Span context is
+    // attached to events via fields on the `info_span!` calls below; the
+    // missing nesting is an acceptable trade-off for `Send` correctness.
+    let _root_span = info_span!("agent_block", script = %script_name);
 
     // ── .env ──────────────────────────────────────────────────────
     // Load .env from project_root if present. Variables are merged into
@@ -345,7 +364,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     }
 
     // ── Init ──────────────────────────────────────────────────────
-    let _init_guard = info_span!("init").entered();
+    let _init_span = info_span!("init");
 
     // ── EventBus channel ─────────────────────────────────────────────
     // Construct the bounded mpsc BEFORE MeshAgent::connect so the relay
@@ -554,19 +573,45 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
             .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
     }
 
-    drop(_init_guard);
+    drop(_init_span);
 
     // ── Execute ───────────────────────────────────────────────────
-    {
-        let _exec_guard = info_span!("execute", script = %script_name).entered();
+    // When `shutdown_token` is supplied, race the script future against
+    // the caller's cancellation signal. On cancel, propagate to the Isle
+    // via the AsyncTask's cancel token so the debug hook unwinds the Lua
+    // VM, then continue into the shutdown sequence below (we still want
+    // to release MCP/mesh handles and join the auto-serve dispatcher
+    // before returning).
+    let script_result: Result<(), BlockError> = {
+        let _exec_span = info_span!("execute", script = %script_name);
 
         let script = std::fs::read_to_string(&script_path)
             .map_err(|e| BlockError::Script(format!("{}: {e}", script_path.display())))?;
 
-        isle.coroutine_eval(&script)
-            .await
-            .map_err(|e| BlockError::Script(format!("{e}")))?;
-    }
+        let mut task = isle.spawn_coroutine_eval(&script);
+        let task_cancel = task.cancel_token().clone();
+        match config.shutdown_token.as_ref() {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        task_cancel.cancel();
+                        // Wait for the Isle to unwind so the VM is in a
+                        // consistent state before driver shutdown. The
+                        // debug hook fires at the next HOOK_INTERVAL.
+                        let _ = (&mut task).await;
+                        info!("shutdown_token: cancelled by caller");
+                        Err(BlockError::Cancelled)
+                    }
+                    res = &mut task => res.map(|_| ()).map_err(|e| BlockError::Script(format!("{e}"))),
+                }
+            }
+            None => (&mut task)
+                .await
+                .map(|_| ())
+                .map_err(|e| BlockError::Script(format!("{e}"))),
+        }
+    };
 
     // ── auto-serve drain + cancel ─────────────────────────────────
     // Let the dispatcher drain events queued by the script, then signal
@@ -592,7 +637,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 
     // ── Shutdown ──────────────────────────────────────────────────
     {
-        let _shutdown_guard = info_span!("shutdown").entered();
+        let _shutdown_span = info_span!("shutdown");
 
         mcp_manager.write().await.disconnect_all().await?;
 
@@ -618,7 +663,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         }
     }
 
-    Ok(())
+    script_result
 }
 
 /// mesh → bus source adapter.

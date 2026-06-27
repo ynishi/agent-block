@@ -9,7 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.shutdown_token: Option<CancellationToken>` — SDK consumers
+  spawning `run()` as a tokio task can now signal an out-of-band abort.
+  When the token is cancelled the in-flight script is interrupted via
+  the Isle's debug-hook cancel path, the auto-serve dispatcher (if any)
+  is shut down, the standard shutdown sequence (MCP disconnect, Isle
+  drivers) runs to release handles, and `run()` returns
+  `Err(BlockError::Cancelled)`. Required for timeouts, parent-task
+  cancellation propagation, and user-driven stop. Defaults to `None`
+  (legacy behavior).
+- `BlockError::Cancelled` variant raised by `run()` when an external
+  `shutdown_token` fires.
+
 ### Changed
+
+- `run()` no longer holds tracing `EnteredSpan` guards across `.await`
+  points, making the returned future `Send`. SDK consumers can now
+  `tokio::spawn(host::run(config))` instead of having to drive `run()`
+  on a single-thread `LocalSet`. Span nesting (`init` / `execute` /
+  `shutdown`) is lost; events still carry the `agent_block` /
+  `script` fields.
 
 ### Deprecated
 

@@ -29,6 +29,12 @@ pub enum BlockError {
     // Used by `crate::bus` (dispatcher + event) and `bridge::bus`.
     #[error("bus error: {0}")]
     Bus(String),
+
+    /// External `BlockConfig.shutdown_token` was cancelled while `run()`
+    /// was driving the script. The script may have been interrupted
+    /// mid-execution; in-flight handlers may have observed partial state.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type BlockResult<T> = Result<T, BlockError>;

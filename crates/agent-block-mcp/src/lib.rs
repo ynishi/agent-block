@@ -1834,6 +1834,10 @@ mod rich_tests {
     struct LoggingCapableServer;
 
     impl ServerHandler for LoggingCapableServer {
+        // rmcp v1.4: `enable_logging()` is deprecated by SEP-2577. Kept on
+        // the test surface until the migration to the post-2577 logging
+        // API lands (tracked separately).
+        #[allow(deprecated)]
         fn get_info(&self) -> ServerInfo {
             ServerInfo::new(
                 ServerCapabilities::builder()
@@ -1936,6 +1940,10 @@ mod rich_tests {
             ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
         }
 
+        // rmcp v1.4: `peer.list_roots()` is deprecated by SEP-2577. Kept
+        // on the test surface until the migration to the post-2577 roots
+        // API lands (tracked separately).
+        #[allow(deprecated)]
         async fn call_tool(
             &self,
             _params: rmcp::model::CallToolRequestParams,
