@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.24.0] - 2026-06-27
+
+### Added
+
 - `BlockConfig.auto_serve_bus: bool` — when `true` and host handlers are
   installed, `run()` spawns the EventBus dispatcher in the background for
   the duration of the script, then grace-drains and cancels it after the
