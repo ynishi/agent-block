@@ -19,7 +19,7 @@ use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use tracing::{info, info_span, warn};
 
 use crate::bridge;
-use crate::bus::{Event, EventBus};
+use crate::bus::{Event, EventBus, Handler};
 use agent_block_mcp::McpManager;
 use agent_block_types::error::{BlockError, BlockResult};
 
@@ -82,6 +82,21 @@ pub struct BlockConfig {
     pub prompt: Option<String>,
     /// Context string injected as `_CONTEXT` Lua global. `None` = global not set.
     pub context: Option<String>,
+    /// Host-side Rust handlers pre-installed on the EventBus before the user
+    /// script starts. Each entry registers `handler` against `kind` via
+    /// [`EventBus::on`], so a script-side `bus.emit(kind, payload)` is
+    /// captured by the Rust handler rather than dispatched to a Lua function.
+    ///
+    /// Intended for SDK consumers that embed `agent-block-core` and need to
+    /// receive script output programmatically (e.g. a Spawner adapter that
+    /// turns LLM script output into a typed `WorkerResult`). Lua-side
+    /// `bus.on(kind, fn)` registrations layered on top of the handler Isle
+    /// are still possible, but the EventBus dispatches a single handler per
+    /// `kind` (last-write-wins), so host-side and Lua-side registrations on
+    /// the same `kind` collide; choose one side per routing key.
+    ///
+    /// Defaults to an empty map (no host handlers).
+    pub host_handlers: HashMap<String, Arc<dyn Handler>>,
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -317,6 +332,27 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let bus_capacity = crate::bridge::config::bus_capacity();
     let (bus_tx, bus_rx) = mpsc::channel::<Event>(bus_capacity);
     let event_bus = Arc::new(Mutex::new(Some(EventBus::new(bus_rx))));
+
+    // ── Pre-install host-side Rust handlers ───────────────────────────
+    // SDK consumers attach Rust handlers via `BlockConfig.host_handlers`
+    // so that script-side `bus.emit(kind, payload)` is captured by a Rust
+    // `Arc<dyn Handler>` instead of being dispatched to a Lua function.
+    // Registered here (before any Lua bridge registers handlers and before
+    // `bus.serve` takes ownership of the bus) so the EventBus already
+    // carries the host handlers when the script starts.
+    if !config.host_handlers.is_empty() {
+        let mut guard = event_bus
+            .lock()
+            .map_err(|_| BlockError::Bus("event_bus mutex poisoned".into()))?;
+        let bus = guard
+            .as_mut()
+            .ok_or_else(|| BlockError::Bus("event_bus already taken".into()))?;
+        for (kind, handler) in &config.host_handlers {
+            bus.on(kind.clone(), Arc::clone(handler))
+                .map_err(|e| BlockError::Bus(format!("host_handlers on({kind}): {e}")))?;
+        }
+        info!(count = config.host_handlers.len(), "host handlers pre-installed");
+    }
 
     let mesh_agent = if let Some(ref relay_url) = config.relay_url {
         let keypair = match &config.secret_key {

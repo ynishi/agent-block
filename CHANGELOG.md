@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.host_handlers: HashMap<String, Arc<dyn Handler>>` — SDK
+  consumers can pre-install Rust-side EventBus handlers before the user
+  script starts. Lua-side `bus.emit(kind, payload)` calls then dispatch
+  to the supplied `Arc<dyn Handler>` instead of a Lua function, enabling
+  programmatic capture of script output (e.g. Spawner adapters that
+  fold LLM script results into a typed `WorkerResult`). Empty by
+  default, so existing callers are unaffected at runtime; struct-literal
+  callers must add the new field.
+
 ### Changed
 
 ### Deprecated

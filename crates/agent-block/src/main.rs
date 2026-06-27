@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_rpc_timeout,
         prompt,
         context,
+        host_handlers: std::collections::HashMap::new(),
     };
 
     Ok(run(config).await?)
