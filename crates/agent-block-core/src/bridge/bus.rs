@@ -7,7 +7,7 @@
 //! - `bus.serve()`             — block until SIGTERM / Ctrl+C, driving the
 //!   serial dispatcher inside the Isle thread.
 //!
-//! # Concurrency model (see `concurrency-analysis.md` §1)
+//! # Concurrency model
 //!
 //! | Primitive                               | Where                          |
 //! |-----------------------------------------|--------------------------------|
@@ -66,7 +66,7 @@ use mlua_isle::{AsyncIsle, CancelToken, IsleError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::{AckResult, EventBus, Handler};
+use crate::bus::{AckResult, Event, EventBus, Handler};
 use crate::host::HostContext;
 use agent_block_types::error::BlockError;
 
@@ -211,6 +211,8 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let handler_isle_for_on = Arc::clone(&ctx.handler_isle);
     let handler_isle_for_on_any = Arc::clone(&ctx.handler_isle);
 
+    let bus_tx_for_emit = ctx.bus_tx.clone();
+
     // ── bus.on ────────────────────────────────────────────────────────
     // Register a handler for the given event `kind`.
     //
@@ -220,9 +222,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // should not rely on this silent behavior for intentional dynamic
     // rebinding; future revisions may emit a tracing::warn on overwrite.
     //
-    // (doc verbatim from subtask-1.md §wf-sim Counter-WF)
-    //
-    // **Upvalue caveat** (Subtask 2): the handler closure is serialized with
+    // **Upvalue caveat**: the handler closure is serialized with
     // `Function::dump(true)` on the main Isle and reloaded on the handler
     // Isle. Bytecode transfer does not preserve upvalue identity; upvalues
     // captured by the closure are re-initialized to `nil` on the handler
@@ -322,8 +322,6 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // handlers) is out of scope for this task and tracked as a follow-up
     // (`bus.tap` or equivalent).
     //
-    // (doc verbatim from subtask-1.md §wf-sim R3)
-    //
     // Same bytecode-transfer / upvalue / C-function caveats as `bus.on`.
     bus_tbl.set(
         "on_any",
@@ -383,6 +381,42 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 Ok(())
             }
         })?,
+    )?;
+
+    // ── bus.emit ──────────────────────────────────────────────────────
+    // Push a script-originated event into the host EventBus
+    // (fire-and-forget; no ack returned to the script).
+    //
+    // Signature: `bus.emit(kind: string, payload: any, id: string?)`
+    //
+    // - `kind` routes to host-side subscribers via `bus_tx`, just like a
+    //   mesh / webhook source. Subscribers attached via `BlockConfig`
+    //   (or future tee adapters) receive the `Event` programmatically.
+    // - `payload` is converted to JSON via `lua_to_json`.
+    // - `id` defaults to a fresh UUID v4 when omitted, so callers do
+    //   not need to thread their own correlation id when they only need
+    //   fire-and-forget delivery.
+    //
+    // Returns `nil` on success, propagates `LuaError::external` when the
+    // bus channel is closed (host has shut down).
+    bus_tbl.set(
+        "emit",
+        lua.create_async_function(
+            move |lua, (kind, payload, id_opt): (String, LuaValue, Option<String>)| {
+                let bus_tx = bus_tx_for_emit.clone();
+                async move {
+                    use crate::bridge::lua_to_json;
+                    let payload_json = lua_to_json(&lua, payload)?;
+                    let id = id_opt.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let evt = Event::fire_and_forget(kind.clone(), id, payload_json);
+                    bus_tx.send(evt).await.map_err(|e| {
+                        tracing::error!(%kind, error = %e, "bus.emit: bus channel closed");
+                        LuaError::external(format!("bus.emit: bus channel closed: {e}"))
+                    })?;
+                    Ok(())
+                }
+            },
+        )?,
     )?;
 
     // ── bus.serve ─────────────────────────────────────────────────────
