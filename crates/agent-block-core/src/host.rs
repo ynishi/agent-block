@@ -20,9 +20,9 @@ use tracing::{info, info_span, warn};
 
 use crate::bridge;
 use crate::bus::{Event, EventBus, Handler};
-use tokio_util::sync::CancellationToken;
 use agent_block_mcp::McpManager;
 use agent_block_types::error::{BlockError, BlockResult};
+use tokio_util::sync::CancellationToken;
 
 /// Embedded Lua sources for blocks/ StdPkg modules.
 /// These are baked into the binary at compile time so `cargo install` works
@@ -373,7 +373,10 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
             bus.on(kind.clone(), Arc::clone(handler))
                 .map_err(|e| BlockError::Bus(format!("host_handlers on({kind}): {e}")))?;
         }
-        info!(count = config.host_handlers.len(), "host handlers pre-installed");
+        info!(
+            count = config.host_handlers.len(),
+            "host handlers pre-installed"
+        );
     }
 
     // ── auto-serve: background dispatcher for SDK-embed callers ───────
@@ -384,8 +387,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // to call `bus.serve()` (which blocks on signals and never returns
     // under programmatic embedding).
     let auto_serve = config.auto_serve_bus && !config.host_handlers.is_empty();
-    let auto_serve_state: Option<(tokio::task::JoinHandle<()>, CancellationToken)> = if auto_serve
-    {
+    let auto_serve_state: Option<(tokio::task::JoinHandle<()>, CancellationToken)> = if auto_serve {
         let bus = {
             let mut guard = event_bus
                 .lock()
