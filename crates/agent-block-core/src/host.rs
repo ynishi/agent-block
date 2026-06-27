@@ -20,6 +20,7 @@ use tracing::{info, info_span, warn};
 
 use crate::bridge;
 use crate::bus::{Event, EventBus, Handler};
+use tokio_util::sync::CancellationToken;
 use agent_block_mcp::McpManager;
 use agent_block_types::error::{BlockError, BlockResult};
 
@@ -97,6 +98,27 @@ pub struct BlockConfig {
     ///
     /// Defaults to an empty map (no host handlers).
     pub host_handlers: HashMap<String, Arc<dyn Handler>>,
+    /// When `true`, the EventBus dispatcher loop is driven in the background
+    /// for the duration of the script and shut down gracefully after the
+    /// script completes. Required for SDK-embed callers that supply
+    /// [`Self::host_handlers`] and need `bus.emit(kind, payload)` events
+    /// emitted from the script to actually reach those handlers without
+    /// requiring the script to call `bus.serve()` (which blocks on
+    /// SIGTERM / Ctrl+C and never returns under programmatic embedding).
+    ///
+    /// After the script finishes, the dispatcher is given a grace window
+    /// (`AGENT_BLOCK_TASK_GRACE_MS`, default 1000ms) to drain queued events
+    /// and finish any in-flight handler, then is cancelled.
+    ///
+    /// Mutually exclusive with Lua-side `bus.serve()`: enabling this flag
+    /// takes ownership of the EventBus before the script runs, so a script
+    /// that calls `bus.on(...)` followed by `bus.serve()` will error
+    /// ("bus.serve() has already taken ownership"). Use this flag when the
+    /// script's sole purpose is to push events to host handlers.
+    ///
+    /// Defaults to `false` (legacy behavior: dispatcher only runs when the
+    /// script calls `bus.serve()`).
+    pub auto_serve_bus: bool,
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -354,6 +376,38 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         info!(count = config.host_handlers.len(), "host handlers pre-installed");
     }
 
+    // ── auto-serve: background dispatcher for SDK-embed callers ───────
+    // When `auto_serve_bus` is on and host handlers are installed, take the
+    // EventBus out of the Mutex *before* the script runs and spawn the
+    // dispatcher loop on the runtime. This lets `bus.emit(kind, payload)`
+    // from the script reach the host handler without requiring the script
+    // to call `bus.serve()` (which blocks on signals and never returns
+    // under programmatic embedding).
+    let auto_serve = config.auto_serve_bus && !config.host_handlers.is_empty();
+    let auto_serve_state: Option<(tokio::task::JoinHandle<()>, CancellationToken)> = if auto_serve
+    {
+        let bus = {
+            let mut guard = event_bus
+                .lock()
+                .map_err(|_| BlockError::Bus("event_bus mutex poisoned".into()))?;
+            guard
+                .take()
+                .ok_or_else(|| BlockError::Bus("event_bus already taken".into()))?
+        };
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let handle = tokio::spawn(async move {
+            let mut bus = bus;
+            if let Err(e) = bus.run(token_for_task).await {
+                tracing::error!(error = %e, "auto-serve: dispatcher loop returned error");
+            }
+        });
+        info!("auto-serve: dispatcher spawned");
+        Some((handle, token))
+    } else {
+        None
+    };
+
     let mesh_agent = if let Some(ref relay_url) = config.relay_url {
         let keypair = match &config.secret_key {
             Some(hex_str) => {
@@ -510,6 +564,28 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         isle.coroutine_eval(&script)
             .await
             .map_err(|e| BlockError::Script(format!("{e}")))?;
+    }
+
+    // ── auto-serve drain + cancel ─────────────────────────────────
+    // Let the dispatcher drain events queued by the script, then signal
+    // shutdown and bound the join. Mirrors `bus.serve`'s grace pattern.
+    if let Some((handle, token)) = auto_serve_state {
+        let grace_ms = crate::bridge::config::task_grace_ms();
+        let grace = Duration::from_millis(grace_ms);
+        tokio::time::sleep(grace).await;
+        token.cancel();
+        match tokio::time::timeout(grace, handle).await {
+            Ok(Ok(())) => info!("auto-serve: dispatcher shut down cleanly"),
+            Ok(Err(join_err)) => {
+                tracing::error!(error = %join_err, "auto-serve: dispatcher task join error");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    grace_ms,
+                    "auto-serve: dispatcher join timed out after cancel; forcing exit"
+                );
+            }
+        }
     }
 
     // ── Shutdown ──────────────────────────────────────────────────

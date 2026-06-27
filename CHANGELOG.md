@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.auto_serve_bus: bool` — when `true` and host handlers are
+  installed, `run()` spawns the EventBus dispatcher in the background for
+  the duration of the script, then grace-drains and cancels it after the
+  script returns. SDK-embed callers can now receive `bus.emit(kind,
+  payload)` events at their host handlers without requiring the script
+  to call `bus.serve()` (which blocks on SIGTERM/Ctrl+C and never
+  returns under programmatic embedding). Mutually exclusive with
+  Lua-side `bus.serve()` since the flag takes ownership of the
+  EventBus before the script runs. Defaults to `false` (legacy
+  behavior).
+
 ### Changed
 
 ### Deprecated

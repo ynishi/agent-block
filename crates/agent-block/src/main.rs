@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         prompt,
         context,
         host_handlers: std::collections::HashMap::new(),
+        auto_serve_bus: false,
     };
 
     Ok(run(config).await?)
