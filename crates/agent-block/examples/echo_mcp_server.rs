@@ -104,6 +104,10 @@ impl EchoServer {
 }
 
 impl ServerHandler for EchoServer {
+    // rmcp v1.4: `enable_logging()` is deprecated by SEP-2577. Kept on
+    // this example until the migration to the post-2577 logging API
+    // lands (tracked separately).
+    #[allow(deprecated)]
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -158,6 +162,10 @@ impl ServerHandler for EchoServer {
 
     // ── tools/call ───────────────────────────────────────────────────────────
 
+    // rmcp v1.4: `peer.create_message()` and `peer.notify_logging_message()`
+    // are deprecated by SEP-2577. Kept on this example until the migration
+    // to the post-2577 sampling/logging APIs lands (tracked separately).
+    #[allow(deprecated)]
     async fn call_tool(
         &self,
         params: CallToolRequestParams,

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.25.0] - 2026-06-28
+
+### Added
+
 - `BlockConfig.shutdown_token: Option<CancellationToken>` — SDK consumers
   spawning `run()` as a tokio task can now signal an out-of-band abort.
   When the token is cancelled the in-flight script is interrupted via

@@ -240,6 +240,10 @@ impl ServerHandler for ProgressTestServer {
 #[derive(Clone)]
 struct LoggingTestServer;
 
+// rmcp v1.4: `enable_logging()` / `notify_logging_message()` are deprecated
+// by SEP-2577. Kept on this test surface until the migration to the
+// post-2577 logging API lands (tracked separately).
+#[allow(deprecated)]
 impl ServerHandler for LoggingTestServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -401,6 +405,8 @@ impl ServerHandler for NilPatternProgressServer {
 #[derive(Clone)]
 struct NilPatternLoggingServer;
 
+// Same SEP-2577 deprecation rationale as LoggingTestServer above.
+#[allow(deprecated)]
 impl ServerHandler for NilPatternLoggingServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
