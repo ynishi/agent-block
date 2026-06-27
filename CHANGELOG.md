@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.22.0] - 2026-06-27
+
+### Added
+
+- `bus.emit(kind, payload, id?)` Lua bridge — scripts can push fire-and-forget
+  events into the host `EventBus`, enabling host-side subscribers (mesh /
+  webhook / SDK consumers) to capture script-originated results
+  programmatically without parsing stdout. `payload` is converted via
+  `lua_to_json`; `id` defaults to a fresh UUID v4 when omitted.
+
+### Changed
+
 - **Split the single `agent-block` crate into a 4-crate workspace** to make the
   SDK reusable from downstream Rust applications without dragging in the CLI:
   - `agent-block-types` — `error` + `obs` (leaf, no agent-block-* deps)
