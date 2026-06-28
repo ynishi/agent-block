@@ -3,11 +3,11 @@
 //! Parses command-line arguments and launches the Host.
 //! The binary is intentionally thin — all logic lives in Lua scripts.
 
-use anyhow::Context as _;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
 use agent_block_core::{run, BlockConfig};
 use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
 
@@ -83,29 +83,32 @@ async fn main() -> anyhow::Result<()> {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RPC_TIMEOUT);
 
-    let prompt = match cli.prompt_file {
-        Some(ref path) => {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read --prompt-file '{}'", path.display()))?;
-            Some(content)
+    // Map the CLI argument shapes to the SDK `Source` enums. The
+    // `Path`/`Inline`/`Env` variants do the actual disk/env read inside
+    // `run()`, so we just wrap here.
+    let prompt = match (cli.prompt, cli.prompt_file) {
+        (None, None) => None,
+        (Some(s), None) => Some(PromptSource::Inline(s)),
+        (None, Some(p)) => Some(PromptSource::File(p)),
+        (Some(_), Some(_)) => {
+            // clap's `conflicts_with` should make this unreachable.
+            anyhow::bail!("--prompt and --prompt-file are mutually exclusive");
         }
-        None => cli.prompt,
     };
-
-    let context = match cli.context_file {
-        Some(ref path) => {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read --context-file '{}'", path.display()))?;
-            Some(content)
+    let context = match (cli.context, cli.context_file) {
+        (None, None) => None,
+        (Some(s), None) => Some(PromptSource::Inline(s)),
+        (None, Some(p)) => Some(PromptSource::File(p)),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--context and --context-file are mutually exclusive");
         }
-        None => cli.context,
     };
 
     let config = BlockConfig {
-        script_path: cli.script,
+        script: ScriptSource::Path(cli.script),
         project_root: cli.project,
         relay_url: cli.relay,
-        secret_key: cli.secret_key,
+        secret_key: cli.secret_key.map(SecretKeySource::Inline),
         mcp_rpc_timeout,
         prompt,
         context,

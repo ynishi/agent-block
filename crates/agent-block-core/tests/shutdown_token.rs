@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use agent_block_core::host::{run, BlockConfig};
+use agent_block_core::host::{run, BlockConfig, ScriptSource};
 use agent_block_types::error::BlockError;
 
 #[tokio::test]
@@ -40,7 +40,7 @@ async fn shutdown_token_interrupts_long_running_script() {
     let shutdown = CancellationToken::new();
 
     let config = BlockConfig {
-        script_path: script_path.clone(),
+        script: ScriptSource::Path(script_path.clone()),
         project_root: dir.path().to_path_buf(),
         relay_url: None,
         secret_key: None,

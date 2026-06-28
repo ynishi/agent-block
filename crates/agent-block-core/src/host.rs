@@ -32,6 +32,77 @@ const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     ("session", include_str!("../blocks/session/init.lua")),
 ];
 
+/// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
+///
+/// Runs the StdPkg `agent` module with `_PROMPT` / `_CONTEXT` injected and
+/// emits the result on the EventBus under kind `"agent_result"` so SDK
+/// consumers can wire a host handler without bundling any Lua file.
+const DEFAULT_AGENT_INVOKER: &str = r#"
+local agent = require("agent")
+local r = agent.run({
+    prompt = _PROMPT,
+    system = _CONTEXT,
+})
+bus.emit("agent_result", r)
+"#;
+
+/// How the Lua script source for `run()` is supplied.
+///
+/// `Path` matches the CLI form (`agent-block -s <path>`), reading from
+/// the filesystem at start. `Inline` lets SDK consumers pass a script
+/// they hold in memory (compile-time `include_str!`, dynamically built
+/// string, etc.) without writing it to a tempfile. `DefaultAgent` uses
+/// an embedded invoker that runs the StdPkg `agent` module with the
+/// caller-supplied prompt/context and emits the result via
+/// `bus.emit("agent_result", ...)`.
+#[derive(Debug, Clone)]
+pub enum ScriptSource {
+    /// Read the script from a filesystem path at start.
+    Path(PathBuf),
+    /// Use the supplied source code directly.
+    Inline {
+        /// Lua source code.
+        source: String,
+        /// Display name used in tracing, error messages, and the Lua
+        /// `_SCRIPT_NAME` global (e.g. `"agent_invoker.lua"`).
+        name: String,
+    },
+    /// Use the embedded default agent invoker. `prompt` / `context`
+    /// are forwarded as `_PROMPT` / `_CONTEXT` Lua globals and the
+    /// result is emitted on the EventBus under kind `"agent_result"`.
+    /// SDK consumers typically pair this with `host_handlers` keyed on
+    /// `"agent_result"` and `auto_serve_bus = true`.
+    DefaultAgent,
+}
+
+/// How a string payload (prompt / system context) is supplied.
+///
+/// `Inline` is the literal string variant (CLI `--prompt` / `--context`).
+/// `File` reads the contents from disk at `run()` start (CLI
+/// `--prompt-file` / `--context-file`).
+#[derive(Debug, Clone)]
+pub enum PromptSource {
+    /// Literal string.
+    Inline(String),
+    /// Filesystem path; contents are read at `run()` start.
+    File(PathBuf),
+}
+
+/// How the Ed25519 mesh identity secret key is supplied.
+///
+/// `Inline` is a 64-hex literal. `Env` reads the named environment
+/// variable at `run()` start (CLI default uses
+/// `AGENT_BLOCK_MESH_SECRET_KEY`). Absence of any `SecretKeySource`
+/// (i.e. `BlockConfig.secret_key = None`) causes a random keypair to
+/// be generated, matching the prior behavior.
+#[derive(Debug, Clone)]
+pub enum SecretKeySource {
+    /// 64-character hex literal.
+    Inline(String),
+    /// Environment variable name to read at start.
+    Env(String),
+}
+
 /// Build the `blocks/` portion of `package.path` from filesystem locations.
 ///
 /// Priority (highest first):
@@ -70,19 +141,27 @@ fn build_blocks_path(project_root: &Path) -> String {
 }
 
 pub struct BlockConfig {
-    pub script_path: PathBuf,
+    /// Lua script to execute. See [`ScriptSource`] for the supported
+    /// shapes (filesystem path / inline source / embedded default
+    /// agent invoker).
+    pub script: ScriptSource,
     pub project_root: PathBuf,
     pub relay_url: Option<String>,
-    /// Ed25519 secret key (64 hex chars). If `None`, a random keypair is
-    /// generated. Required to talk to registry/ACL-gated hosted meshes.
-    pub secret_key: Option<String>,
+    /// Ed25519 secret key for mesh identity. See [`SecretKeySource`]
+    /// for the supported shapes (inline 64-hex / environment variable).
+    /// `None` generates a random keypair. Required to talk to
+    /// registry/ACL-gated hosted meshes.
+    pub secret_key: Option<SecretKeySource>,
     /// Per-RPC timeout for every MCP round-trip (connect / list / call).
     /// Defaults to [`agent_block_mcp::DEFAULT_RPC_TIMEOUT`].
     pub mcp_rpc_timeout: Duration,
-    /// Prompt string injected as `_PROMPT` Lua global. `None` = global not set.
-    pub prompt: Option<String>,
-    /// Context string injected as `_CONTEXT` Lua global. `None` = global not set.
-    pub context: Option<String>,
+    /// Prompt payload injected as `_PROMPT` Lua global. See
+    /// [`PromptSource`] for the supported shapes. `None` leaves the
+    /// global unset.
+    pub prompt: Option<PromptSource>,
+    /// Context payload injected as `_CONTEXT` Lua global (typically
+    /// the system prompt). Same shape rules as [`Self::prompt`].
+    pub context: Option<PromptSource>,
     /// Host-side Rust handlers pre-installed on the EventBus before the user
     /// script starts. Each entry registers `handler` against `kind` via
     /// [`EventBus::on`], so a script-side `bus.emit(kind, payload)` is
@@ -340,11 +419,55 @@ fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
 }
 
 pub async fn run(config: BlockConfig) -> BlockResult<()> {
-    let script_name = config
-        .script_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // ── Resolve sources ───────────────────────────────────────────
+    // Convert the `Source` enums on `BlockConfig` to their concrete
+    // payloads before any Isle setup. `File`/`Path`/`Env` variants
+    // read from disk / environment exactly once, here at the start.
+    let (script_source, script_name, script_dir_pathbuf) = match &config.script {
+        ScriptSource::Path(p) => {
+            let source = std::fs::read_to_string(p)
+                .map_err(|e| BlockError::Script(format!("{}: {e}", p.display())))?;
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let dir = p
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            (source, name, dir)
+        }
+        ScriptSource::Inline { source, name } => {
+            (source.clone(), name.clone(), config.project_root.clone())
+        }
+        ScriptSource::DefaultAgent => (
+            DEFAULT_AGENT_INVOKER.to_string(),
+            "default_agent_invoker.lua".to_string(),
+            config.project_root.clone(),
+        ),
+    };
+
+    let prompt_resolved: Option<String> = match &config.prompt {
+        Some(PromptSource::Inline(s)) => Some(s.clone()),
+        Some(PromptSource::File(p)) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| BlockError::Script(format!("prompt file {}: {e}", p.display())))?,
+        ),
+        None => None,
+    };
+    let context_resolved: Option<String> = match &config.context {
+        Some(PromptSource::Inline(s)) => Some(s.clone()),
+        Some(PromptSource::File(p)) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| BlockError::Script(format!("context file {}: {e}", p.display())))?,
+        ),
+        None => None,
+    };
+    let secret_key_resolved: Option<String> = match &config.secret_key {
+        Some(SecretKeySource::Inline(s)) => Some(s.clone()),
+        Some(SecretKeySource::Env(var)) => std::env::var(var).ok(),
+        None => None,
+    };
 
     // NOTE: We previously held entered span guards across awaits for nested
     // span context. That made the `run()` future `!Send`, which prevents
@@ -430,10 +553,10 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     };
 
     let mesh_agent = if let Some(ref relay_url) = config.relay_url {
-        let keypair = match &config.secret_key {
+        let keypair = match &secret_key_resolved {
             Some(hex_str) => {
                 let bytes = hex_decode_32(hex_str)
-                    .map_err(|e| BlockError::Runtime(format!("--secret-key: {e}")))?;
+                    .map_err(|e| BlockError::Runtime(format!("secret-key: {e}")))?;
                 agent_mesh_core::identity::AgentKeypair::from_bytes(&bytes)
             }
             None => agent_mesh_core::identity::AgentKeypair::generate(),
@@ -480,11 +603,10 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let ts_path = crate::bridge::config::ts_path().map_err(BlockError::Runtime)?;
     let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
 
-    let script_path = config.script_path.clone();
-    let script_dir = script_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
+    // Use the script dir derived from the resolved `ScriptSource` for
+    // `package.path` lookups. For inline / default-agent variants the dir
+    // falls back to `project_root` (set during source resolution above).
+    let script_dir = script_dir_pathbuf.to_string_lossy().to_string();
 
     // Precompute values captured by the init closure so we don't need to
     // move the full `HostContext` into it (HostContext now holds
@@ -492,8 +614,8 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
     let blocks_paths = build_blocks_path(&project_root);
-    let prompt = config.prompt.clone();
-    let context = config.context.clone();
+    let prompt = prompt_resolved.clone();
+    let context = context_resolved.clone();
 
     // ── main Isle ─────────────────────────────────────────────────
     let (isle, driver) = AsyncIsle::spawn(build_isle_init(
@@ -585,10 +707,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let script_result: Result<(), BlockError> = {
         let _exec_span = info_span!("execute", script = %script_name);
 
-        let script = std::fs::read_to_string(&script_path)
-            .map_err(|e| BlockError::Script(format!("{}: {e}", script_path.display())))?;
-
-        let mut task = isle.spawn_coroutine_eval(&script);
+        let mut task = isle.spawn_coroutine_eval(&script_source);
         let task_cancel = task.cancel_token().clone();
         match config.shutdown_token.as_ref() {
             Some(token) => {

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use agent_block_core::bus::{AckResult, Handler};
-use agent_block_core::host::{run, BlockConfig};
+use agent_block_core::host::{run, BlockConfig, ScriptSource};
 
 struct CaptureHandler {
     tx: tokio::sync::Mutex<Option<oneshot::Sender<Value>>>,
@@ -50,7 +50,7 @@ async fn auto_serve_bus_delivers_emit_to_host_handler() {
     host_handlers.insert("worker_result".to_string(), handler);
 
     let config = BlockConfig {
-        script_path: script_path.clone(),
+        script: ScriptSource::Path(script_path.clone()),
         project_root: dir.path().to_path_buf(),
         relay_url: None,
         secret_key: None,

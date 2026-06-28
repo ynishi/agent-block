@@ -9,7 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ScriptSource` / `PromptSource` / `SecretKeySource` source enums for
+  `BlockConfig`. SDK consumers can now pass the Lua script as an inline
+  string (`ScriptSource::Inline`), use the embedded default agent
+  invoker (`ScriptSource::DefaultAgent`) so that supplying `prompt` /
+  `context` alone runs `agent.run({prompt=_PROMPT, system=_CONTEXT})`
+  and emits the result on `bus.emit("agent_result", r)`, supply a
+  prompt/context payload as either a literal or a filesystem path
+  resolved at `run()` start, and supply the mesh secret key as either a
+  hex literal or an environment variable name read at `run()` start.
+  No bundled Lua file is required for the common agent-invocation use
+  case.
+
 ### Changed
+
+- **BREAKING**: `BlockConfig` field shapes updated to clean up the
+  CLI-derived payloads at the SDK boundary:
+  - `script_path: PathBuf` → `script: ScriptSource`
+  - `secret_key: Option<String>` → `secret_key: Option<SecretKeySource>`
+  - `prompt: Option<String>` → `prompt: Option<PromptSource>`
+  - `context: Option<String>` → `context: Option<PromptSource>`
+  All filesystem reads / environment lookups are deferred to `run()`
+  start. The CLI binary wraps the existing arguments into the new
+  enums and is unchanged at runtime.
 
 ### Deprecated
 
