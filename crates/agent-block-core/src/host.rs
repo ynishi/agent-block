@@ -30,6 +30,10 @@ use tokio_util::sync::CancellationToken;
 const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     ("agent", include_str!("../blocks/agent/init.lua")),
     ("session", include_str!("../blocks/session/init.lua")),
+    (
+        "compile_loop",
+        include_str!("../blocks/compile_loop/init.lua"),
+    ),
 ];
 
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].

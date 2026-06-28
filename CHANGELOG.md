@@ -9,7 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Embed the `compile_loop` StdPkg into `agent-block-core` so it is
+  bundled in the published crate tarball and reachable via
+  `require("compile_loop")` after `cargo install agent-block` (the
+  binary previously only carried `agent` / `session` as embedded
+  modules; coding loops required a workspace-root `blocks/` checkout).
+  SDK consumers depending on `agent-block-core = "0.27"` get the same
+  module without vendoring any Lua source.
+
 ### Changed
+
+- The canonical home of the `compile_loop` Lua module is now
+  `crates/agent-block-core/blocks/compile_loop/` (moved from the
+  workspace-root `blocks/`). Filesystem lookups via
+  `BlockConfig.project_root.join("blocks")` still take precedence over
+  the embedded copy when both are present, so repo-internal hot-reload
+  workflows are unaffected.
 
 ### Deprecated
 
