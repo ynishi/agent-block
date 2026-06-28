@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.26.0] - 2026-06-28
+
+### Added
+
 - `ScriptSource` / `PromptSource` / `SecretKeySource` source enums for
   `BlockConfig`. SDK consumers can now pass the Lua script as an inline
   string (`ScriptSource::Inline`), use the embedded default agent
