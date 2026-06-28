@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.27.0] - 2026-06-28
+
+### Added
+
 - Embed the `compile_loop` StdPkg into `agent-block-core` so it is
   bundled in the published crate tarball and reachable via
   `require("compile_loop")` after `cargo install agent-block` (the
