@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.29.0] - 2026-06-29
+
+### Added
+
 - `BlockConfig.host_tools: Vec<HostToolSpec>` — SDK consumers can now
   inject Rust-implemented tools into the Lua tool registry without
   writing any Lua. Each entry carries an Anthropic-shaped tool spec
