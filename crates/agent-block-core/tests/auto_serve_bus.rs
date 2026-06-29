@@ -58,6 +58,7 @@ async fn auto_serve_bus_delivers_emit_to_host_handler() {
         prompt: None,
         context: None,
         host_handlers,
+        host_handler: None,
         auto_serve_bus: true,
         shutdown_token: None,
     };

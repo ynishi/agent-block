@@ -39,15 +39,17 @@ const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
 ///
 /// Runs the StdPkg `agent` module with `_PROMPT` / `_CONTEXT` injected and
-/// emits the result on the EventBus under kind `"agent_result"` so SDK
-/// consumers can wire a host handler without bundling any Lua file.
+/// emits the result on the EventBus. The emit kind is `"_"` — a neutral
+/// label with no SDK-side meaning. The result is intended to be received
+/// via [`BlockConfig::host_handler`] (the kind-agnostic single sink); the
+/// literal label is irrelevant to SDK consumers.
 const DEFAULT_AGENT_INVOKER: &str = r#"
 local agent = require("agent")
 local r = agent.run({
     prompt = _PROMPT,
     system = _CONTEXT,
 })
-bus.emit("agent_result", r)
+bus.emit("_", r)
 "#;
 
 /// How the Lua script source for `run()` is supplied.
@@ -73,9 +75,12 @@ pub enum ScriptSource {
     },
     /// Use the embedded default agent invoker. `prompt` / `context`
     /// are forwarded as `_PROMPT` / `_CONTEXT` Lua globals and the
-    /// result is emitted on the EventBus under kind `"agent_result"`.
-    /// SDK consumers typically pair this with `host_handlers` keyed on
-    /// `"agent_result"` and `auto_serve_bus = true`.
+    /// agent result is emitted on the EventBus under a neutral label
+    /// (`"_"`). SDK consumers should pair this with
+    /// [`BlockConfig::host_handler`] (the kind-agnostic single sink)
+    /// and `auto_serve_bus = true`. The emit-kind is intentionally
+    /// meaningless; consumers that need string-keyed routing should
+    /// supply [`ScriptSource::Inline`] with their own invoker.
     DefaultAgent,
 }
 
@@ -181,6 +186,25 @@ pub struct BlockConfig {
     ///
     /// Defaults to an empty map (no host handlers).
     pub host_handlers: HashMap<String, Arc<dyn Handler>>,
+    /// Single host-side Rust handler that catches every event regardless
+    /// of `kind`. Internally registered via [`EventBus::on_any`], so it
+    /// acts as a fallback when no entry in [`Self::host_handlers`]
+    /// matches the incoming `kind`.
+    ///
+    /// This is the SDK-embed 1-shot sink: SDK consumers do not need to
+    /// invent or coordinate a string `kind` between the Lua script and
+    /// their Rust code. The agent invoker's emit-kind is irrelevant —
+    /// the handler receives every event.
+    ///
+    /// Use this when you want a single Rust handler to receive results
+    /// (typical embedded use). Use [`Self::host_handlers`] instead when
+    /// you actually need string-keyed routing (multi-source / multi-
+    /// handler dispatch). The two may coexist: kind-specific handlers
+    /// in `host_handlers` take precedence, and this single handler is
+    /// the fallback for unmatched kinds.
+    ///
+    /// Defaults to `None`.
+    pub host_handler: Option<Arc<dyn Handler>>,
     /// When `true`, the EventBus dispatcher loop is driven in the background
     /// for the duration of the script and shut down gracefully after the
     /// script completes. Required for SDK-embed callers that supply
@@ -508,7 +532,13 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // Registered here (before any Lua bridge registers handlers and before
     // `bus.serve` takes ownership of the bus) so the EventBus already
     // carries the host handlers when the script starts.
-    if !config.host_handlers.is_empty() {
+    // Install host-side Rust handlers: kind-specific entries from
+    // `host_handlers` and, when set, the kind-agnostic `host_handler`
+    // (registered via `on_any` as the fallback for unmatched kinds).
+    // SDK-embed 1-shot callers typically only set `host_handler`.
+    let has_kind_handlers = !config.host_handlers.is_empty();
+    let has_any_handler = config.host_handler.is_some();
+    if has_kind_handlers || has_any_handler {
         let mut guard = event_bus
             .lock()
             .map_err(|_| BlockError::Bus("event_bus mutex poisoned".into()))?;
@@ -519,20 +549,26 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
             bus.on(kind.clone(), Arc::clone(handler))
                 .map_err(|e| BlockError::Bus(format!("host_handlers on({kind}): {e}")))?;
         }
+        if let Some(any_handler) = &config.host_handler {
+            bus.on_any(Arc::clone(any_handler))
+                .map_err(|e| BlockError::Bus(format!("host_handler on_any: {e}")))?;
+        }
         info!(
-            count = config.host_handlers.len(),
+            kind_handlers = config.host_handlers.len(),
+            any_handler = has_any_handler,
             "host handlers pre-installed"
         );
     }
 
     // ── auto-serve: background dispatcher for SDK-embed callers ───────
-    // When `auto_serve_bus` is on and host handlers are installed, take the
-    // EventBus out of the Mutex *before* the script runs and spawn the
-    // dispatcher loop on the runtime. This lets `bus.emit(kind, payload)`
-    // from the script reach the host handler without requiring the script
-    // to call `bus.serve()` (which blocks on signals and never returns
-    // under programmatic embedding).
-    let auto_serve = config.auto_serve_bus && !config.host_handlers.is_empty();
+    // When `auto_serve_bus` is on and at least one host-side handler
+    // (kind-specific or kind-agnostic) is installed, take the EventBus
+    // out of the Mutex *before* the script runs and spawn the dispatcher
+    // loop on the runtime. This lets `bus.emit(kind, payload)` from the
+    // script reach the host handler without requiring the script to call
+    // `bus.serve()` (which blocks on signals and never returns under
+    // programmatic embedding).
+    let auto_serve = config.auto_serve_bus && (has_kind_handlers || has_any_handler);
     let auto_serve_state: Option<(tokio::task::JoinHandle<()>, CancellationToken)> = if auto_serve {
         let bus = {
             let mut guard = event_bus

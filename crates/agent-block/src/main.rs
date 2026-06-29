@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         prompt,
         context,
         host_handlers: std::collections::HashMap::new(),
+        host_handler: None,
         auto_serve_bus: false,
         shutdown_token: None,
     };

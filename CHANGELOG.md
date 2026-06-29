@@ -9,7 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.host_handler: Option<Arc<dyn Handler>>` — kind-agnostic
+  single-sink fallback registered internally via `EventBus::on_any`.
+  SDK-embed 1-shot callers can now receive script-emitted results
+  without inventing or coordinating any `kind` string between the Lua
+  source and their Rust code; the handler catches every event whose
+  `kind` is not claimed by an entry in `host_handlers`. `host_handlers`
+  remains for callers that actually need string-keyed routing
+  (multi-source / multi-handler dispatch).
+
 ### Changed
+
+- `ScriptSource::DefaultAgent` no longer leaks the private convention
+  `"agent_result"` as its emit-kind label. The embedded invoker now
+  emits under a deliberately neutral label (`"_"`) and SDK consumers
+  are expected to register a single `host_handler` rather than to key
+  a `host_handlers` entry on the previous literal. The `kind` chosen
+  by the default invoker has no SDK-side meaning; consumers who
+  actually need string-keyed routing should supply
+  `ScriptSource::Inline` with their own invoker.
+
+- `auto_serve_bus` no longer requires `host_handlers` to be non-empty:
+  the background dispatcher is now also spawned when only
+  `host_handler` is supplied, so the kind-agnostic sink works
+  end-to-end with the embedded default invoker.
 
 ### Deprecated
 
