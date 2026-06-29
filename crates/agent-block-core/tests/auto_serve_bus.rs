@@ -59,6 +59,7 @@ async fn auto_serve_bus_delivers_emit_to_host_handler() {
         context: None,
         host_handlers,
         host_handler: None,
+        host_tools: vec![],
         auto_serve_bus: true,
         shutdown_token: None,
     };

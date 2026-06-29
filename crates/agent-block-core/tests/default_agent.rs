@@ -70,6 +70,7 @@ async fn host_handler_catches_any_emit_kind() {
         context: Some(PromptSource::Inline("you are an agent".to_string())),
         host_handlers: HashMap::new(),
         host_handler: Some(handler),
+        host_tools: Vec::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };
@@ -119,6 +120,7 @@ async fn prompt_source_file_is_read_at_run_start() {
         context: None,
         host_handlers: HashMap::new(),
         host_handler: Some(handler),
+        host_tools: Vec::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };

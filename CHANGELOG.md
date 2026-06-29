@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.host_tools: Vec<HostToolSpec>` — SDK consumers can now
+  inject Rust-implemented tools into the Lua tool registry without
+  writing any Lua. Each entry carries an Anthropic-shaped tool spec
+  (`name` / `description` / `input_schema` / optional `group`) plus
+  an `Arc<dyn ToolHandler>` for the async Rust callback. After
+  injection the tool is indistinguishable from a Lua-defined one:
+  `tool.call("...", input)`, `tool.list()`, `tool.schema()`, and
+  `agent.run`'s LLM function-calling all see it uniformly.
+- `inspect_tools(&BlockConfig) -> Vec<ToolMeta>` — static
+  introspection of the tools a config will expose to the LLM, merging
+  `host_tools` and embedded StdPkg blocks (`agent`, `session`,
+  `compile_loop`). MCP server tools are deliberately omitted because
+  they are only known after the MCP `initialize` handshake; use
+  `tool.schema()` from inside the running script for that view.
+- `ToolHandler` trait + `HostToolSpec` / `ToolMeta` / `ToolSource`
+  types exposed from `agent_block_core::host`.
+
 ### Changed
 
 ### Deprecated

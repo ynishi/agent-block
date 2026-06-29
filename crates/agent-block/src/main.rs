@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         context,
         host_handlers: std::collections::HashMap::new(),
         host_handler: None,
+        host_tools: Vec::new(),
         auto_serve_bus: false,
         shutdown_token: None,
     };

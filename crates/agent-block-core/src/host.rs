@@ -112,6 +112,108 @@ pub enum SecretKeySource {
     Env(String),
 }
 
+/// Async handler invoked when the LLM (or a Lua call to
+/// `tool.call(name, ...)`) targets a Rust-implemented tool supplied via
+/// [`BlockConfig::host_tools`].
+///
+/// `input` arrives as a `serde_json::Value` (converted from Lua before
+/// the handler is invoked). The returned value is converted back to a
+/// Lua value and delivered to the caller. Errors are propagated as
+/// `LuaError::external` (visible inside the script) and as `BlockError`
+/// on the Rust side.
+#[async_trait::async_trait]
+pub trait ToolHandler: Send + Sync + 'static {
+    async fn call(&self, input: serde_json::Value) -> Result<serde_json::Value, BlockError>;
+}
+
+/// Declarative spec for a Rust-implemented tool injected into the Lua
+/// tool registry before the user script runs. The resulting entry is
+/// indistinguishable from a Lua-defined tool from the script's view:
+/// `tool.call("<name>", input)`, `agent.run({ ... })` tool dispatch,
+/// and `tool.schema()` enumeration all work uniformly.
+#[derive(Clone)]
+pub struct HostToolSpec {
+    /// Tool name. Becomes the routing key in `_TOOL_REGISTRY` and the
+    /// `name` field exposed by `tool.schema()` (Anthropic tool spec).
+    pub name: String,
+    /// Free-form description shown to the LLM. Becomes the
+    /// `description` field of the Anthropic tool spec.
+    pub description: String,
+    /// Input schema (Anthropic-compatible JSON Schema object).
+    pub input_schema: serde_json::Value,
+    /// Optional group label for [`agent.run`'s `tool_groups`] filter
+    /// and for [`BlockConfig::tool_policy`] (planned).
+    pub group: Option<String>,
+    /// Rust callback dispatched on every invocation.
+    pub handler: Arc<dyn ToolHandler>,
+}
+
+impl std::fmt::Debug for HostToolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostToolSpec")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("input_schema", &self.input_schema)
+            .field("group", &self.group)
+            .field("handler", &"<dyn ToolHandler>")
+            .finish()
+    }
+}
+
+/// Snapshot of a tool that a given [`BlockConfig`] will (statically)
+/// expose to the LLM. Produced by [`inspect_tools`] without running
+/// the script. MCP server tools are *not* included because they are
+/// only known after the MCP `initialize` handshake completes; callers
+/// that need that view should run the script and call `tool.schema()`
+/// from Lua.
+#[derive(Debug, Clone)]
+pub struct ToolMeta {
+    pub name: String,
+    pub description: String,
+    pub group: Option<String>,
+    pub source: ToolSource,
+}
+
+/// Origin of a tool listed by [`inspect_tools`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSource {
+    /// Supplied via [`BlockConfig::host_tools`] (Rust-implemented).
+    HostRust,
+    /// Embedded StdPkg block (`agent`, `compile_loop`, …) — discovered
+    /// statically from [`EMBEDDED_BLOCKS`]. Note: not every embedded
+    /// block exposes a registered tool; this entry simply records that
+    /// the module is available via `require(...)`.
+    EmbeddedBlock,
+}
+
+/// Inspect the tools a [`BlockConfig`] will expose to the LLM without
+/// actually running the script. Returns the merged list of
+/// `host_tools` (declared in the config) and embedded-block sources.
+///
+/// MCP server tools are deliberately omitted — they only become known
+/// after the MCP `initialize` handshake. Use `tool.schema()` from
+/// inside the running script for that view.
+pub fn inspect_tools(config: &BlockConfig) -> Vec<ToolMeta> {
+    let mut out = Vec::new();
+    for t in &config.host_tools {
+        out.push(ToolMeta {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            group: t.group.clone(),
+            source: ToolSource::HostRust,
+        });
+    }
+    for (name, _src) in EMBEDDED_BLOCKS {
+        out.push(ToolMeta {
+            name: (*name).to_string(),
+            description: format!("Embedded StdPkg block (require(\"{name}\"))"),
+            group: None,
+            source: ToolSource::EmbeddedBlock,
+        });
+    }
+    out
+}
+
 /// Build the `blocks/` portion of `package.path` from filesystem locations.
 ///
 /// Priority (highest first):
@@ -205,6 +307,19 @@ pub struct BlockConfig {
     ///
     /// Defaults to `None`.
     pub host_handler: Option<Arc<dyn Handler>>,
+    /// Rust-implemented tools injected into the Lua tool registry
+    /// before the user script runs. Each entry becomes
+    /// indistinguishable from a Lua-defined tool: it is discoverable
+    /// via `tool.list()` / `tool.schema()`, dispatchable via
+    /// `tool.call(name, input)`, and visible to `agent.run`'s LLM
+    /// function-calling.
+    ///
+    /// SDK consumers can use this to expose Rust capabilities
+    /// (database lookups, business logic, etc.) to the LLM without
+    /// writing any Lua. See [`HostToolSpec`] and [`ToolHandler`].
+    ///
+    /// Defaults to an empty list.
+    pub host_tools: Vec<HostToolSpec>,
     /// When `true`, the EventBus dispatcher loop is driven in the background
     /// for the duration of the script and shut down gracefully after the
     /// script completes. Required for SDK-embed callers that supply
@@ -733,6 +848,78 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
             })
             .await
             .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
+    }
+
+    // ── Inject host_tools into the Lua tool registry ───────────────
+    // Done after `bridge::register_all` so `_TOOL_REGISTRY` exists.
+    // Each entry becomes an Anthropic-shaped tool spec table
+    //   { name, schema = { description, input_schema }, handler, group? }
+    // where `handler` is a Lua async function that bridges back into
+    // the supplied `ToolHandler::call`. Lua-side `tool.list()` /
+    // `tool.schema()` / `agent.run` see these uniformly with native
+    // Lua-defined tools.
+    if !config.host_tools.is_empty() {
+        let host_tools = config.host_tools.clone();
+        let tool_count = host_tools.len();
+        isle.exec(move |lua| {
+            let registry: mlua::Table = lua
+                .globals()
+                .get("_TOOL_REGISTRY")
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("get _TOOL_REGISTRY: {e}")))?;
+            for tool in host_tools {
+                let entry = lua
+                    .create_table()
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create entry: {e}")))?;
+                entry
+                    .set("name", tool.name.as_str())
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set name: {e}")))?;
+                // schema = { description, input_schema } — Anthropic shape
+                let schema = lua
+                    .create_table()
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create schema: {e}")))?;
+                schema
+                    .set("description", tool.description.as_str())
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set description: {e}")))?;
+                let input_schema_lua =
+                    crate::bridge::json_to_lua(lua, tool.input_schema.clone())
+                        .map_err(|e| mlua_isle::IsleError::Lua(format!("input_schema: {e}")))?;
+                schema
+                    .set("input_schema", input_schema_lua)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set input_schema: {e}")))?;
+                entry
+                    .set("schema", schema)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set schema: {e}")))?;
+                if let Some(group) = &tool.group {
+                    entry
+                        .set("group", group.as_str())
+                        .map_err(|e| mlua_isle::IsleError::Lua(format!("set group: {e}")))?;
+                }
+                let handler_arc = Arc::clone(&tool.handler);
+                let handler_fn = lua
+                    .create_async_function(move |lua, input: mlua::Value| {
+                        let handler = Arc::clone(&handler_arc);
+                        async move {
+                            let input_json = crate::bridge::lua_to_json(&lua, input)?;
+                            let result = handler
+                                .call(input_json)
+                                .await
+                                .map_err(mlua::Error::external)?;
+                            crate::bridge::json_to_lua(&lua, result)
+                        }
+                    })
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create handler: {e}")))?;
+                entry
+                    .set("handler", handler_fn)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
+                registry
+                    .set(tool.name.as_str(), entry)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("registry set: {e}")))?;
+            }
+            Ok(String::new())
+        })
+        .await
+        .map_err(|e| BlockError::Runtime(format!("host_tools inject: {e}")))?;
+        info!(count = tool_count, "host tools injected into Lua registry");
     }
 
     drop(_init_span);

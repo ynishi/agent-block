@@ -49,6 +49,7 @@ async fn shutdown_token_interrupts_long_running_script() {
         context: None,
         host_handlers: HashMap::new(),
         host_handler: None,
+        host_tools: Vec::new(),
         auto_serve_bus: false,
         shutdown_token: Some(shutdown.clone()),
     };
