@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.30.0] - 2026-06-30
+
+### Added
+
 - `BlockConfig.http_client: Option<reqwest::Client>` — SDK consumers
   can now plug in a pre-built `reqwest::Client` for the `http.*` Lua
   bridge. Use to wire in custom TLS roots, proxy, default headers,
