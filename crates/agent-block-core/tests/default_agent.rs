@@ -71,6 +71,11 @@ async fn host_handler_catches_any_emit_kind() {
         host_handlers: HashMap::new(),
         host_handler: Some(handler),
         host_tools: Vec::new(),
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };
@@ -121,6 +126,11 @@ async fn prompt_source_file_is_read_at_run_start() {
         host_handlers: HashMap::new(),
         host_handler: Some(handler),
         host_tools: Vec::new(),
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };

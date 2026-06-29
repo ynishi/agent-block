@@ -96,6 +96,11 @@ async fn host_tool_dispatches_through_lua_registry() {
         host_handlers: HashMap::new(),
         host_handler: Some(captor),
         host_tools: vec![adder],
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };
@@ -133,6 +138,11 @@ async fn inspect_tools_lists_host_and_embedded_sources() {
         host_handlers: HashMap::new(),
         host_handler: None,
         host_tools: vec![adder],
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: false,
         shutdown_token: None,
     };

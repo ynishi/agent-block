@@ -320,6 +320,38 @@ pub struct BlockConfig {
     ///
     /// Defaults to an empty list.
     pub host_tools: Vec<HostToolSpec>,
+    /// Optional custom `reqwest::Client` for the `http.*` Lua bridge
+    /// and any other in-process HTTP traffic. SDK consumers can wire
+    /// in their own TLS roots, proxy, default headers, connection
+    /// pool tuning, etc.
+    ///
+    /// `None` falls back to `reqwest::Client::new()` with default
+    /// settings (legacy behavior).
+    pub http_client: Option<reqwest::Client>,
+    /// Override path for the `std.sql` SQLite database file. `None`
+    /// reads the `AGENT_BLOCK_SQL_PATH` env var (CLI default), or
+    /// falls back to `{base_dir}/db.sqlite`. Pass `Some(":memory:")`
+    /// for an in-memory DB (useful for tests / isolation).
+    pub sql_path: Option<PathBuf>,
+    /// Override path for the `std.kv` SQLite database file. Same
+    /// semantics as [`Self::sql_path`].
+    pub kv_path: Option<PathBuf>,
+    /// Override path for the `std.ts` SQLite database file. Same
+    /// semantics as [`Self::sql_path`].
+    pub ts_path: Option<PathBuf>,
+    /// Extra Lua globals injected into both the main Isle and the
+    /// handler Isle before the user script runs. Each entry
+    /// `(name, value)` results in `_G[name] = json_to_lua(value)`.
+    ///
+    /// Use this to parameterize an inline script from Rust without
+    /// baking the values into the Lua source (`_USER_ID`,
+    /// `_TENANT`, `_FEATURE_FLAGS`, etc.). Keys must be valid Lua
+    /// identifiers; values are any `serde_json::Value`.
+    ///
+    /// `_PROMPT`, `_CONTEXT`, and `_SCRIPT_NAME` are reserved
+    /// (managed by other `BlockConfig` fields); colliding with them
+    /// silently overrides those defaults — use with care.
+    pub extra_globals: HashMap<String, serde_json::Value>,
     /// When `true`, the EventBus dispatcher loop is driven in the background
     /// for the duration of the script and shut down gracefully after the
     /// script completes. Required for SDK-embed callers that supply
@@ -465,6 +497,7 @@ fn build_isle_init(
     blocks_paths: String,
     prompt: Option<String>,
     context: Option<String>,
+    extra_globals: HashMap<String, serde_json::Value>,
 ) -> impl FnOnce(&mlua::Lua) -> mlua::Result<()> + Send + 'static {
     move |lua| {
         // Set script name before registering bridges (used by log.* for attribution)
@@ -477,6 +510,18 @@ fn build_isle_init(
         }
 
         mlua_batteries::register_all(lua, "std")?;
+
+        // ── extra_globals from BlockConfig ──────────────────────────
+        // Inject SDK-supplied parameterisation values into the Lua
+        // global namespace. Registered after mlua_batteries so that
+        // any value that *intentionally* shadows a `std.*` symbol
+        // wins — callers are responsible for not stomping on bridges
+        // they need.
+        for (name, value) in &extra_globals {
+            let lua_value = crate::bridge::json_to_lua(lua, value.clone())
+                .map_err(|e| mlua::Error::external(format!("extra_globals[{name}]: {e}")))?;
+            lua.globals().set(name.as_str(), lua_value)?;
+        }
 
         // ── package.path ──────────────────────────────────────────────
         // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
@@ -531,8 +576,16 @@ async fn spawn_handler_isle(
     blocks_paths: String,
     prompt: Option<String>,
     context: Option<String>,
+    extra_globals: HashMap<String, serde_json::Value>,
 ) -> BlockResult<(Arc<AsyncIsle>, AsyncIsleDriver)> {
-    let init = build_isle_init(script_name, script_dir, blocks_paths, prompt, context);
+    let init = build_isle_init(
+        script_name,
+        script_dir,
+        blocks_paths,
+        prompt,
+        context,
+        extra_globals,
+    );
     let (isle, driver) = AsyncIsle::builder()
         .thread_name("agent-block-handler-isle")
         .spawn(init)
@@ -745,17 +798,29 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         .canonicalize()
         .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&config.project_root)))?;
 
-    let http_client = reqwest::Client::new();
+    // HTTP client: prefer the SDK-supplied client if any; otherwise
+    // construct a fresh default reqwest::Client (legacy behavior).
+    let http_client = config.http_client.clone().unwrap_or_default();
 
     // ── SQLite init (kv + sql get separate DB files) ──────────────────────
-    // All knobs are ENV-driven (see `bridge/config.rs`).
-    let sql_path = crate::bridge::config::sql_path().map_err(BlockError::Runtime)?;
+    // BlockConfig overrides take precedence; otherwise the env-driven
+    // resolution in `bridge::config::*` applies (see crate docs).
+    let sql_path = match &config.sql_path {
+        Some(p) => p.clone(),
+        None => crate::bridge::config::sql_path().map_err(BlockError::Runtime)?,
+    };
     let (sql_conn, sql_interrupt) = open_sqlite(&sql_path, "sql")?;
 
-    let kv_path = crate::bridge::config::kv_path().map_err(BlockError::Runtime)?;
+    let kv_path = match &config.kv_path {
+        Some(p) => p.clone(),
+        None => crate::bridge::config::kv_path().map_err(BlockError::Runtime)?,
+    };
     let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
 
-    let ts_path = crate::bridge::config::ts_path().map_err(BlockError::Runtime)?;
+    let ts_path = match &config.ts_path {
+        Some(p) => p.clone(),
+        None => crate::bridge::config::ts_path().map_err(BlockError::Runtime)?,
+    };
     let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
 
     // Use the script dir derived from the resolved `ScriptSource` for
@@ -779,6 +844,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         blocks_paths.clone(),
         prompt.clone(),
         context.clone(),
+        config.extra_globals.clone(),
     ))
     .await
     .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
@@ -791,6 +857,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         blocks_paths.clone(),
         prompt,
         context,
+        config.extra_globals.clone(),
     )
     .await?;
 

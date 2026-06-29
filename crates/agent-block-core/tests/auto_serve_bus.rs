@@ -60,6 +60,11 @@ async fn auto_serve_bus_delivers_emit_to_host_handler() {
         host_handlers,
         host_handler: None,
         host_tools: vec![],
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: true,
         shutdown_token: None,
     };

@@ -50,6 +50,11 @@ async fn shutdown_token_interrupts_long_running_script() {
         host_handlers: HashMap::new(),
         host_handler: None,
         host_tools: Vec::new(),
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: HashMap::new(),
         auto_serve_bus: false,
         shutdown_token: Some(shutdown.clone()),
     };

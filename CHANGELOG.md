@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig.http_client: Option<reqwest::Client>` — SDK consumers
+  can now plug in a pre-built `reqwest::Client` for the `http.*` Lua
+  bridge. Use to wire in custom TLS roots, proxy, default headers,
+  connection-pool tuning, etc. Defaults to a fresh
+  `reqwest::Client::default()` (legacy behavior).
+- `BlockConfig.sql_path` / `kv_path` / `ts_path: Option<PathBuf>` —
+  per-config overrides for the three SQLite database paths used by
+  `std.sql` / `std.kv` / `std.ts`. `None` falls back to the
+  existing env-driven resolution (`AGENT_BLOCK_SQL_PATH`,
+  `AGENT_BLOCK_KV_PATH`, `AGENT_BLOCK_TS_PATH`, then
+  `{base_dir}/{name}.sqlite`). Pass `Some(":memory:")` for
+  test-isolated in-memory databases.
+- `BlockConfig.extra_globals: HashMap<String, serde_json::Value>` —
+  inject arbitrary Lua globals (in addition to `_PROMPT` /
+  `_CONTEXT` / `_SCRIPT_NAME`) into both the main Isle and the
+  handler Isle before the user script runs. Use to parameterize an
+  inline script from Rust without baking values into the Lua source
+  (`_USER_ID`, `_TENANT`, `_FEATURE_FLAGS`, etc.). Keys collide with
+  the reserved names silently, so callers are responsible for not
+  stomping on the built-in globals.
+
 ### Changed
 
 ### Deprecated

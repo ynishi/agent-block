@@ -125,6 +125,11 @@ async fn main() -> anyhow::Result<()> {
         host_handlers: std::collections::HashMap::new(),
         host_handler: None,
         host_tools: Vec::new(),
+        http_client: None,
+        sql_path: None,
+        kv_path: None,
+        ts_path: None,
+        extra_globals: std::collections::HashMap::new(),
         auto_serve_bus: false,
         shutdown_token: None,
     };
