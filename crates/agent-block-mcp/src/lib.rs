@@ -35,6 +35,7 @@ pub(crate) mod http;
 pub mod lua_json;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,15 +112,26 @@ impl McpManager {
     /// injected into `call_tool` arguments for this server.  Defaults to `false`
     /// (opt-in) so that third-party / untrusted stdio servers do not receive agent
     /// identity metadata unless explicitly enabled.
+    ///
+    /// `cwd`: if `Some`, the spawned subprocess inherits this as its current
+    /// working directory; if `None`, the subprocess inherits the parent
+    /// process's CWD. Callers driven through `agent-block-core` typically
+    /// pass `BlockConfig.project_root` so the MCP server sees the same
+    /// project root as the Lua script (matters for servers that rely on
+    /// path-based discovery such as `git rev-parse --show-toplevel`).
     pub async fn connect(
         &mut self,
         name: &str,
         command: &str,
         args: &[String],
         trace_context: bool,
+        cwd: Option<&Path>,
     ) -> BlockResult<()> {
         let mut cmd = Command::new(command);
         cmd.args(args).stderr(Stdio::inherit());
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         let transport = TokioChildProcess::new(cmd).map_err(|e| {
             warn!(server = %name, command = %command, error = %e, "mcp spawn failed");
             BlockError::Mcp(format!("spawn '{command}': {e}"))

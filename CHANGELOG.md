@@ -9,7 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mcp.connect` (Lua) now accepts an optional `opts.cwd` string and the
+  underlying `McpManager::connect` (Rust) takes an optional `cwd:
+  Option<&Path>` argument. The spawned MCP server subprocess
+  inherits this directory as its current working directory.
+
 ### Changed
+
+- **BREAKING (agent-block-mcp)**: `McpManager::connect` signature now
+  includes a trailing `cwd: Option<&Path>` argument. Direct
+  consumers of the `agent-block-mcp` crate must thread this through;
+  pass `None` to preserve the previous behavior (subprocess inherits
+  the parent process's CWD). Callers driven through
+  `agent-block-core` are migrated transparently.
+
+### Fixed
+
+- MCP server subprocesses spawned via `mcp.connect` from a Lua script
+  now default their working directory to `BlockConfig.project_root`
+  instead of silently inheriting whichever CWD the host process
+  happened to have. This unbreaks servers that rely on path-based
+  discovery (`git rev-parse --show-toplevel`, `Cargo.toml` lookup,
+  etc.) when the host process is launched from a different directory
+  than the Lua script's project root. The Lua side can override via
+  `mcp.connect(name, cmd, args, { cwd = "/path" })`.
 
 ### Deprecated
 

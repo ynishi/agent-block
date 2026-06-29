@@ -87,8 +87,11 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     // mcp.connect(name, command, args, opts)
     // opts is an optional table. Supported keys:
     //   trace_context (bool): if true, inject __ab_obs into call_tool args (default: false)
+    //   cwd (string): working directory for the spawned MCP subprocess
+    //                 (default: `BlockConfig.project_root`)
     {
         let mgr = Arc::clone(manager);
+        let default_cwd: Arc<std::path::PathBuf> = Arc::new(ctx.project_root.clone());
         mcp_tbl.set(
             "connect",
             lua.create_async_function(
@@ -100,6 +103,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     Option<LuaValue>,
                 )| {
                     let mgr = Arc::clone(&mgr);
+                    let default_cwd = Arc::clone(&default_cwd);
                     async move {
                         // Iterate by integer index (1..=len) so argv order is
                         // preserved regardless of table layout. `pairs` gives
@@ -115,20 +119,26 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             }
                             _ => Vec::new(),
                         };
-                        // Parse opts for trace_context flag.
-                        let trace_context = match opts {
+                        // Parse opts: trace_context flag + cwd override.
+                        let (trace_context, cwd_override) = match opts {
                             Some(v) => {
                                 let opts_json = lua_to_json(&lua, v)?;
-                                opts_json
+                                let trace = opts_json
                                     .get("trace_context")
                                     .and_then(|v| v.as_bool())
-                                    .unwrap_or(false)
+                                    .unwrap_or(false);
+                                let cwd = opts_json
+                                    .get("cwd")
+                                    .and_then(|v| v.as_str())
+                                    .map(std::path::PathBuf::from);
+                                (trace, cwd)
                             }
-                            None => false,
+                            None => (false, None),
                         };
+                        let cwd_path = cwd_override.as_deref().unwrap_or(default_cwd.as_path());
                         mgr.write()
                             .await
-                            .connect(&name, &command, &args, trace_context)
+                            .connect(&name, &command, &args, trace_context, Some(cwd_path))
                             .await
                             .map_err(LuaError::external)
                     }
