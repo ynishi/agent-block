@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.28.1] - 2026-06-29
+
+### Added
+
 - `mcp.connect` (Lua) now accepts an optional `opts.cwd` string and the
   underlying `McpManager::connect` (Rust) takes an optional `cwd:
   Option<&Path>` argument. The spawned MCP server subprocess
@@ -21,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumers of the `agent-block-mcp` crate must thread this through;
   pass `None` to preserve the previous behavior (subprocess inherits
   the parent process's CWD). Callers driven through
-  `agent-block-core` are migrated transparently.
+  `agent-block-core` are migrated transparently — `BlockConfig` and
+  the rest of the `agent-block-core` SDK surface are unchanged,
+  hence this ships as a patch bump.
 
 ### Fixed
 
