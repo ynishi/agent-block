@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.28.0] - 2026-06-29
+
+### Added
+
 - `BlockConfig.host_handler: Option<Arc<dyn Handler>>` — kind-agnostic
   single-sink fallback registered internally via `EventBus::on_any`.
   SDK-embed 1-shot callers can now receive script-emitted results

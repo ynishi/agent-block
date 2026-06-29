@@ -3,6 +3,7 @@
 //! Parses command-line arguments and launches the Host.
 //! The binary is intentionally thin — all logic lives in Lua scripts.
 
+use anyhow::Context as _;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -83,13 +84,18 @@ async fn main() -> anyhow::Result<()> {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RPC_TIMEOUT);
 
-    // Map the CLI argument shapes to the SDK `Source` enums. The
-    // `Path`/`Inline`/`Env` variants do the actual disk/env read inside
-    // `run()`, so we just wrap here.
+    // Map the CLI argument shapes to the SDK `Source` enums. File-backed
+    // variants are read eagerly here so the error message carries the
+    // CLI flag name (`--prompt-file` / `--context-file`); the SDK side
+    // sees the contents directly via `PromptSource::Inline`.
     let prompt = match (cli.prompt, cli.prompt_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
-        (None, Some(p)) => Some(PromptSource::File(p)),
+        (None, Some(p)) => {
+            let content = std::fs::read_to_string(&p)
+                .with_context(|| format!("failed to read --prompt-file '{}'", p.display()))?;
+            Some(PromptSource::Inline(content))
+        }
         (Some(_), Some(_)) => {
             // clap's `conflicts_with` should make this unreachable.
             anyhow::bail!("--prompt and --prompt-file are mutually exclusive");
@@ -98,7 +104,11 @@ async fn main() -> anyhow::Result<()> {
     let context = match (cli.context, cli.context_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
-        (None, Some(p)) => Some(PromptSource::File(p)),
+        (None, Some(p)) => {
+            let content = std::fs::read_to_string(&p)
+                .with_context(|| format!("failed to read --context-file '{}'", p.display()))?;
+            Some(PromptSource::Inline(content))
+        }
         (Some(_), Some(_)) => {
             anyhow::bail!("--context and --context-file are mutually exclusive");
         }
