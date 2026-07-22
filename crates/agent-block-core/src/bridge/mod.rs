@@ -15,15 +15,19 @@
 pub mod bus;
 pub mod config;
 pub mod http;
+#[cfg(feature = "sqlite")]
 pub mod kv;
 pub mod llm;
 pub mod log;
 pub mod mcp;
+#[cfg(feature = "mesh")]
 pub mod mesh;
 pub mod sh;
+#[cfg(feature = "sqlite")]
 pub mod sql;
 pub mod task;
 pub mod tool;
+#[cfg(feature = "sqlite")]
 pub mod ts;
 
 use mlua::prelude::*;
@@ -51,15 +55,21 @@ pub use agent_block_mcp::lua_json::{json_to_lua, lua_to_json};
 /// can skip the `mesh.on` alias (which depends on `bus.on` and would fail
 /// because the handler Isle does not expose a `bus` global).
 fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool) -> LuaResult<()> {
+    #[cfg(feature = "mesh")]
     mesh::register(lua, ctx, is_handler_side)?;
+    #[cfg(not(feature = "mesh"))]
+    let _ = is_handler_side;
     sh::register(lua, ctx)?;
     tool::register(lua)?;
     log::register(lua, ctx)?;
     mcp::register(lua, ctx)?;
     http::register(lua, ctx)?;
     llm::register(lua)?;
+    #[cfg(feature = "sqlite")]
     kv::register(lua, ctx)?;
+    #[cfg(feature = "sqlite")]
     sql::register(lua, ctx)?;
+    #[cfg(feature = "sqlite")]
     ts::register(lua, ctx)?;
     task::register(lua)?;
     Ok(())

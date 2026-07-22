@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, RwLock};
 
 use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use tracing::{info, info_span, warn};
@@ -650,27 +650,36 @@ impl BlockConfigBuilder {
 #[derive(Clone)]
 pub struct HostContext {
     pub project_root: PathBuf,
+    /// Connected mesh agent (present only when the `mesh` feature is enabled
+    /// and a relay URL was supplied).
+    #[cfg(feature = "mesh")]
     pub mesh_agent: Option<Arc<agent_mesh_sdk::MeshAgent>>,
     pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
     /// Shared SQLite connection for `sql.*` bridge (user tables).
+    #[cfg(feature = "sqlite")]
     pub sql_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the sql connection.
     /// Used to cancel in-flight queries on timeout (see `bridge/sql.rs`).
+    #[cfg(feature = "sqlite")]
     pub sql_interrupt: Arc<rusqlite::InterruptHandle>,
     /// Shared SQLite connection for `kv.*` bridge (`__kv` table only).
     /// Separate from sql_conn so KV scratch state and user SQL data don't
     /// share WAL, page cache, or backup lifecycle.
+    #[cfg(feature = "sqlite")]
     pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the kv connection.
+    #[cfg(feature = "sqlite")]
     pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
     /// Shared SQLite connection for `ts.*` bridge (TSDB — time-series table).
     /// Separate DB file so TSDB WAL does not share page cache with kv/sql.
+    #[cfg(feature = "sqlite")]
     pub ts_conn: Arc<Mutex<rusqlite::Connection>>,
     /// Interrupt handle for the ts connection.
     /// Used by `bridge::ts` to cancel in-flight queries on timeout (Subtask 2).
     #[allow(dead_code)]
+    #[cfg(feature = "sqlite")]
     pub ts_interrupt: Arc<rusqlite::InterruptHandle>,
     /// Async handle to the main Isle Lua VM that runs the user script via
     /// `coroutine_eval`. After Subtask 2, `bridge::bus` no longer dispatches
@@ -703,12 +712,32 @@ pub struct HostContext {
     pub event_bus: Arc<Mutex<Option<EventBus>>>,
 }
 
+impl HostContext {
+    /// Agent id of the connected mesh agent, if any.
+    ///
+    /// Returns `Some(agent_id)` when the `mesh` feature is enabled and a mesh
+    /// agent is connected. Keeps the `#[cfg(feature = "mesh")]` gating out of
+    /// bridge call sites that only need a fallback agent-id string.
+    #[cfg(feature = "mesh")]
+    pub fn mesh_agent_id(&self) -> Option<String> {
+        self.mesh_agent.as_ref().map(|a| a.agent_id().to_string())
+    }
+
+    /// See the `mesh`-enabled variant. Without the `mesh` feature there is no
+    /// mesh agent, so this is always `None`.
+    #[cfg(not(feature = "mesh"))]
+    pub fn mesh_agent_id(&self) -> Option<String> {
+        None
+    }
+}
+
 /// Open a SQLite connection at `path` (or `:memory:`) and apply the shared
 /// pragmas driven by ENV (`journal_mode`, `busy_timeout`). Returns the
 /// connection wrapped in Arc<Mutex<_>> together with its interrupt handle.
 ///
 /// `label` is used only for the init log line (`sql` / `kv`) so that the two
 /// databases are distinguishable in tracing output.
+#[cfg(feature = "sqlite")]
 fn open_sqlite(
     path: &Path,
     label: &'static str,
@@ -854,6 +883,7 @@ async fn spawn_handler_isle(
     Ok((Arc::new(isle), driver))
 }
 
+#[cfg(feature = "mesh")]
 fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
     if s.len() != 64 {
@@ -1043,6 +1073,7 @@ fn setup_event_bus(config: &BlockConfig) -> BlockResult<BusSetup> {
 /// Connect to the mesh relay when `relay_url` is set, deriving the Ed25519
 /// identity from `secret_key` (or a fresh random keypair) and wiring the
 /// EventBus relay handler. Returns `None` when mesh is disabled.
+#[cfg(feature = "mesh")]
 async fn connect_mesh(
     relay_url: Option<&String>,
     secret_key: Option<&String>,
@@ -1076,6 +1107,7 @@ async fn connect_mesh(
 
 /// The three SQLite connections (with interrupt handles) backing the
 /// `sql.*`, `kv.*`, and `ts.*` Lua bridges.
+#[cfg(feature = "sqlite")]
 struct SqliteConns {
     sql_conn: Arc<Mutex<rusqlite::Connection>>,
     sql_interrupt: Arc<rusqlite::InterruptHandle>,
@@ -1087,6 +1119,7 @@ struct SqliteConns {
 
 /// Open the sql / kv / ts SQLite databases, honoring the [`BlockConfig`]
 /// path overrides and otherwise falling back to the env-driven resolution.
+#[cfg(feature = "sqlite")]
 fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
     let sql_path = match &config.sql_path {
         Some(p) => p.clone(),
@@ -1428,12 +1461,16 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         auto_serve_state,
     } = setup_event_bus(&config)?;
 
+    #[cfg(feature = "mesh")]
     let mesh_agent = connect_mesh(
         config.relay_url.as_ref(),
         secret_key_resolved.as_ref(),
         &bus_tx,
     )
     .await?;
+    // `secret_key` / `relay_url` are consumed only by the mesh connect path.
+    #[cfg(not(feature = "mesh"))]
+    let _ = (&secret_key_resolved, &config.relay_url);
 
     let mcp_manager = Arc::new(RwLock::new(McpManager::with_rpc_timeout(
         config.mcp_rpc_timeout,
@@ -1453,7 +1490,11 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 
     // ── SQLite init (sql + kv + ts get separate DB files) ─────────────
     // BlockConfig overrides take precedence; otherwise the env-driven
-    // resolution in `bridge::config::*` applies (see crate docs).
+    // resolution in `bridge::config::*` applies (see crate docs). Gated
+    // behind the `sqlite` feature; when off, the sql/kv/ts bridges are not
+    // registered and the `sql_path` / `kv_path` / `ts_path` config fields
+    // (which remain present for API stability) are ignored.
+    #[cfg(feature = "sqlite")]
     let SqliteConns {
         sql_conn,
         sql_interrupt,
@@ -1510,14 +1551,21 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // handlers from the EventBus dispatcher task).
     let ctx = HostContext {
         project_root,
+        #[cfg(feature = "mesh")]
         mesh_agent,
         mcp_manager: Arc::clone(&mcp_manager),
         http_client,
+        #[cfg(feature = "sqlite")]
         sql_conn,
+        #[cfg(feature = "sqlite")]
         sql_interrupt,
+        #[cfg(feature = "sqlite")]
         kv_conn,
+        #[cfg(feature = "sqlite")]
         kv_interrupt,
+        #[cfg(feature = "sqlite")]
         ts_conn,
+        #[cfg(feature = "sqlite")]
         ts_interrupt,
         isle: Arc::clone(&isle),
         handler_isle: Arc::clone(&handler_isle),
@@ -1577,10 +1625,12 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 ///
 /// The 30s ack timeout mirrors the client-side timeout on `mesh.request`
 /// (see `src/bridge/mesh.rs`).
+#[cfg(feature = "mesh")]
 struct BusRelayHandler {
     tx: mpsc::Sender<Event>,
 }
 
+#[cfg(feature = "mesh")]
 impl BusRelayHandler {
     fn new(tx: mpsc::Sender<Event>) -> Self {
         Self { tx }
@@ -1588,8 +1638,10 @@ impl BusRelayHandler {
 }
 
 /// Bound used for both the mesh-adapter ack wait and other source timeouts.
+#[cfg(feature = "mesh")]
 const BUS_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(feature = "mesh")]
 #[async_trait::async_trait]
 impl agent_mesh_sdk::RequestHandler for BusRelayHandler {
     async fn handle(
@@ -1600,7 +1652,7 @@ impl agent_mesh_sdk::RequestHandler for BusRelayHandler {
     ) -> serde_json::Value {
         let id = uuid::Uuid::new_v4().to_string();
         let meta = serde_json::json!({"from": from.to_string()});
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let event = Event {
             kind: "mesh".into(),
             id: id.clone(),

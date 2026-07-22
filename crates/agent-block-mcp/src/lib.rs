@@ -31,6 +31,7 @@
 //! ```
 
 pub mod handler;
+#[cfg(feature = "mcp-http")]
 pub(crate) mod http;
 pub mod lua_json;
 
@@ -361,6 +362,9 @@ impl McpManager {
     ///
     /// The handler Isle must be wired via `set_handler_isle` before calling
     /// this method if `on_progress` callbacks are needed.
+    ///
+    /// Only available when the `mcp-http` feature is enabled (on by default).
+    #[cfg(feature = "mcp-http")]
     pub async fn connect_http(
         &mut self,
         name: &str,
@@ -1624,6 +1628,7 @@ mod rich_tests {
     // ── Tests: connect_http ─────────────────────────────────────────────
 
     /// connect_http on an unreachable address fails with BlockError::Mcp or Timeout.
+    #[cfg(feature = "mcp-http")]
     #[tokio::test]
     async fn connect_http_unreachable_returns_error() {
         let mut mgr = McpManager::with_rpc_timeout(Duration::from_millis(100))

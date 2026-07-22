@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cargo features on `agent-block-core`: `mesh` / `sqlite` / `mcp-http`**
+  (all on by default). SDK embedders can now build a slimmer core with
+  `default-features = false` and opt back into only the axes they need.
+  `mesh` gates the `mesh.*` bridge and mesh relay/identity (drops the
+  `agent-mesh-core` / `agent-mesh-sdk` dependencies); `sqlite` gates the
+  `sql.*` / `kv.*` / `ts.*` bridges (drops the bundled `rusqlite` C build
+  and `mlua-batteries` sql/kv batteries); `mcp-http` gates
+  `mcp.connect_http` (drops rmcp's HTTP/SSE client transports, keeping the
+  always-on stdio transport). The default feature set reproduces the
+  previous behavior exactly, so existing embedders and the `agent-block`
+  CLI are unaffected. A matching `mcp-http` feature was added to
+  `agent-block-mcp` (default on) to gate the rmcp HTTP transport surface.
 - `BlockConfig::builder(script, project_root)` + `BlockConfigBuilder` —
   a chainable builder is now the recommended construction path for SDK
   embedders. The two semantically required inputs (`script` and

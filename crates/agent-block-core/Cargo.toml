@@ -7,19 +7,36 @@ license.workspace = true
 repository.workspace = true
 description = "Host runtime + Lua stdlib bridge + EventBus for agent-block"
 
+[features]
+# Default enables the full runtime surface, preserving existing behavior for
+# every embedder that depends on agent-block-core with default features.
+default = ["mesh", "sqlite", "mcp-http"]
+# `mesh` — agent-to-agent mesh (`mesh.*` Lua bridge, relay connect, Ed25519
+# identity). Pulls in agent-mesh-core / agent-mesh-sdk.
+mesh = ["dep:agent-mesh-core", "dep:agent-mesh-sdk"]
+# `sqlite` — SQLite-backed `sql.*` / `kv.*` / `ts.*` Lua bridges. Pulls in
+# rusqlite (bundled) and the mlua-batteries sql/kv batteries.
+sqlite = ["dep:rusqlite", "mlua-batteries/sql", "mlua-batteries/kv"]
+# `mcp-http` — Streamable HTTP / SSE MCP transport (`mcp.connect_http`).
+# Forwards to agent-block-mcp's `mcp-http` feature (stdio transport is always on).
+mcp-http = ["agent-block-mcp/mcp-http"]
+
 [dependencies]
 agent-block-types.workspace = true
+# agent-block-mcp is inherited with default-features = false (set at the
+# workspace level), so the core `mcp-http` feature is the sole switch for the
+# HTTP transport; without it agent-block-mcp compiles stdio-only.
 agent-block-mcp.workspace = true
 
 mlua.workspace = true
 mlua-isle.workspace = true
 mlua-batteries.workspace = true
-agent-mesh-core.workspace = true
-agent-mesh-sdk.workspace = true
+agent-mesh-core = { workspace = true, optional = true }
+agent-mesh-sdk = { workspace = true, optional = true }
 llm-extract.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

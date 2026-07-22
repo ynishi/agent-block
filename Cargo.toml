@@ -16,7 +16,10 @@ repository = "https://github.com/ynishi/agent-block"
 
 [workspace.dependencies]
 agent-block-types = { path = "crates/agent-block-types", version = "0.30.0" }
-agent-block-mcp   = { path = "crates/agent-block-mcp",   version = "0.30.0" }
+# default-features = false so in-workspace consumers (core) control the
+# `mcp-http` transport feature explicitly. External consumers still get the
+# crate's own default (["mcp-http"]) — this only affects this workspace.
+agent-block-mcp   = { path = "crates/agent-block-mcp",   version = "0.30.0", default-features = false }
 agent-block-core  = { path = "crates/agent-block-core",  version = "0.30.0" }
 
 thiserror    = "2"
@@ -28,10 +31,15 @@ reqwest      = { version = "0.12", features = ["json"] }
 uuid         = { version = "1", features = ["v4"] }
 tracing      = "0.1"
 async-trait  = "0.1"
-rmcp         = { version = "1.4.0", features = ["client", "transport-child-process", "client-side-sse", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+# HTTP-transport features (client-side-sse / transport-streamable-http-client*)
+# are NOT declared here so they can be gated behind the agent-block-mcp
+# `mcp-http` feature. The base set (stdio child-process transport) is always on.
+rmcp         = { version = "1.4.0", features = ["client", "transport-child-process"] }
 mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
 mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
-mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task", "sql", "kv"] }
+# `sql` / `kv` features are NOT declared here so they can be gated behind the
+# agent-block-core `sqlite` feature (they pull in rusqlite/bundled).
+mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task"] }
 rusqlite     = { version = "0.31", features = ["bundled"] }
 anyhow       = "1"
 dotenvy      = "0.15"

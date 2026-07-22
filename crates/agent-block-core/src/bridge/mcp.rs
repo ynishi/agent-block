@@ -82,7 +82,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         .globals()
         .get::<Option<String>>("_SCRIPT_NAME")?
         .unwrap_or_else(|| "unknown".to_string());
-    let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
+    let fallback_agent_id = ctx.mesh_agent_id();
 
     // mcp.connect(name, command, args, opts)
     // opts is an optional table. Supported keys:
@@ -302,6 +302,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
     // mcp.connect_http(name, url, opts)
     // opts: { auth_header = "..." } (optional)
+    // Gated behind the `mcp-http` feature (on by default). When disabled, a
+    // stub is registered that returns an explicit error rather than silently
+    // omitting the function.
+    #[cfg(feature = "mcp-http")]
     {
         let mgr = Arc::clone(manager);
         mcp_tbl.set(
@@ -333,6 +337,16 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
             )?,
         )?;
     }
+    #[cfg(not(feature = "mcp-http"))]
+    mcp_tbl.set(
+        "connect_http",
+        lua.create_function(|_, _: mlua::MultiValue| -> LuaResult<()> {
+            Err(LuaError::external(
+                "mcp.connect_http: agent-block was built without the `mcp-http` feature \
+                 (HTTP/SSE MCP transport disabled)",
+            ))
+        })?,
+    )?;
 
     // mcp.list_resources(name) → { ok=bool, resources=[...], error=str }
     {

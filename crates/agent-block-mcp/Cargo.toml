@@ -7,6 +7,20 @@ license.workspace = true
 repository.workspace = true
 description = "rmcp client wrapper for agent-block (MCP server lifecycle + custom handler)"
 
+[features]
+# Default keeps the HTTP transport surface on, preserving existing behavior for
+# any crate that depends on agent-block-mcp with default features.
+default = ["mcp-http"]
+# `mcp-http` enables the Streamable HTTP / SSE MCP transports (McpManager::connect_http).
+# When off, only the stdio child-process transport is compiled and connect_http
+# is absent. rmcp's HTTP-client transport features are pulled in here so they
+# are excluded from the binary when a downstream crate opts out.
+mcp-http = [
+    "rmcp/client-side-sse",
+    "rmcp/transport-streamable-http-client",
+    "rmcp/transport-streamable-http-client-reqwest",
+]
+
 [dependencies]
 agent-block-types.workspace = true
 

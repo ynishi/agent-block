@@ -67,11 +67,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let std_ns: LuaTable = lua.globals().get("std")?;
     let env_tbl: LuaTable = std_ns.get("env")?;
 
-    let agent_id_str = ctx
-        .mesh_agent
-        .as_ref()
-        .map(|a| a.agent_id().to_string())
-        .unwrap_or_default();
+    let agent_id_str = ctx.mesh_agent_id().unwrap_or_default();
     env_tbl.set(
         "agent_id",
         lua.create_function(move |_, ()| Ok(agent_id_str.clone()))?,

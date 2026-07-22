@@ -37,7 +37,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         .get::<Option<String>>("_SCRIPT_NAME")?
         .unwrap_or_else(|| "unknown".to_string());
     let client = ctx.http_client.clone();
-    let fallback_agent_id = ctx.mesh_agent.as_ref().map(|a| a.agent_id().to_string());
+    let fallback_agent_id = ctx.mesh_agent_id();
     http_tbl.set(
         "request",
         lua.create_async_function(move |lua, (url, opts): (String, Option<LuaTable>)| {
