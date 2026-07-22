@@ -38,6 +38,16 @@ pub fn obs_context(fallback_agent_id: Option<&str>) -> (String, String, String, 
     (trace_id, run_id, agent_id, agent_name)
 }
 
+/// Render a single structured observability log line in the fixed
+/// `key=value` format used by the `ab.obs` logging convention.
+///
+/// The line always begins with `prefix=ab.obs`, followed by `event`,
+/// `component`, and the four context fields carried in `ctx`
+/// (`trace_id`, `run_id`, `agent_id`, `agent_name`), then appends each
+/// caller-supplied `extra` pair in order. Every value is passed through
+/// `kv_escape`, which redacts sensitive keys, sanitizes `url` values, and
+/// JSON-quotes any value containing whitespace or `=` so the line stays
+/// parseable.
 pub fn obs_line(
     component: &str,
     event: &str,
@@ -99,6 +109,14 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
+/// Strip credentials and volatile components from a URL so it is safe to log.
+///
+/// Removes any `user:pass@` userinfo, the query string, and the fragment.
+/// Parseable URLs are rebuilt via the `url` crate (username / password cleared,
+/// query / fragment dropped). Unparseable inputs have their `user:pass@`
+/// userinfo and any `?query` / `#fragment` stripped heuristically, then are
+/// truncated to the first 16 characters (suffixed with `...`) so a human can
+/// still recognise the target from logs without leaking secrets.
 pub fn sanitize_url(raw: &str) -> String {
     match Url::parse(raw) {
         Ok(mut u) => {

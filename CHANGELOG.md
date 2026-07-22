@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockConfig::builder(script, project_root)` + `BlockConfigBuilder` —
+  a chainable builder is now the recommended construction path for SDK
+  embedders. The two semantically required inputs (`script` and
+  `project_root`) are passed up front; every other field starts at its
+  documented default and is set via fluent setters (`.prompt(..)`,
+  `.host_handler(..)`, `.auto_serve_bus(true)`, etc.), finishing with
+  `.build()`. New config fields can now be added without breaking
+  existing call sites.
+
 ### Changed
+
+- **Breaking:** `BlockConfig` is now `#[non_exhaustive]`. Crates outside
+  `agent-block-core` can no longer construct it with a
+  `BlockConfig { .. }` struct literal — use `BlockConfig::builder(..)`
+  instead. All fields remain `pub` for reading. This removes the churn
+  where every field addition (recently `host_tools`, `http_client`,
+  `sql_path` / `kv_path` / `ts_path`, `extra_globals`) forced every
+  embedder to update their literal.
 
 ### Deprecated
 

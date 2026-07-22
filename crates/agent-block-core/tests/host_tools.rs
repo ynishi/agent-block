@@ -6,7 +6,6 @@
 //! Also exercises `inspect_tools()` for the static introspection
 //! contract (host_tools + embedded blocks merged, no MCP).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,28 +81,18 @@ async fn host_tool_dispatches_through_lua_registry() {
         bus.emit("_", r)
     "#;
 
-    let config = BlockConfig {
-        script: ScriptSource::Inline {
+    let config = BlockConfig::builder(
+        ScriptSource::Inline {
             source: script.to_string(),
             name: "host_tool_smoke.lua".to_string(),
         },
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: Some(captor),
-        host_tools: vec![adder],
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .host_handler(captor)
+    .host_tools(vec![adder])
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 
@@ -127,25 +116,10 @@ async fn inspect_tools_lists_host_and_embedded_sources() {
         handler: Arc::new(AdderTool),
     };
 
-    let config = BlockConfig {
-        script: ScriptSource::DefaultAgent,
-        project_root: std::env::temp_dir(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: None,
-        host_tools: vec![adder],
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: false,
-        shutdown_token: None,
-    };
+    let config = BlockConfig::builder(ScriptSource::DefaultAgent, std::env::temp_dir())
+        .mcp_rpc_timeout(Duration::from_secs(30))
+        .host_tools(vec![adder])
+        .build();
 
     let tools = inspect_tools(&config);
 

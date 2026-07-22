@@ -59,28 +59,21 @@ async fn extra_globals_are_visible_to_lua_script() {
         })
     "#;
 
-    let config = BlockConfig {
-        script: ScriptSource::Inline {
+    let config = BlockConfig::builder(
+        ScriptSource::Inline {
             source: script.to_string(),
             name: "extra_globals_smoke.lua".to_string(),
         },
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: Some(captor),
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: Some(PathBuf::from(":memory:")),
-        kv_path: Some(PathBuf::from(":memory:")),
-        ts_path: Some(PathBuf::from(":memory:")),
-        extra_globals,
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .host_handler(captor)
+    .sql_path(PathBuf::from(":memory:"))
+    .kv_path(PathBuf::from(":memory:"))
+    .ts_path(PathBuf::from(":memory:"))
+    .extra_globals(extra_globals)
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 
@@ -111,28 +104,20 @@ async fn sqlite_path_overrides_accept_in_memory_sentinel() {
         tx: tokio::sync::Mutex::new(Some(tx)),
     });
 
-    let config = BlockConfig {
-        script: ScriptSource::Inline {
+    let config = BlockConfig::builder(
+        ScriptSource::Inline {
             source: r#"bus.emit("_", { ok = true })"#.to_string(),
             name: "noop.lua".to_string(),
         },
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: Some(captor),
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: Some(PathBuf::from(":memory:")),
-        kv_path: Some(PathBuf::from(":memory:")),
-        ts_path: Some(PathBuf::from(":memory:")),
-        extra_globals: HashMap::new(),
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .host_handler(captor)
+    .sql_path(PathBuf::from(":memory:"))
+    .kv_path(PathBuf::from(":memory:"))
+    .ts_path(PathBuf::from(":memory:"))
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 

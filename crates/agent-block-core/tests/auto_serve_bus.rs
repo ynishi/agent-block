@@ -49,25 +49,14 @@ async fn auto_serve_bus_delivers_emit_to_host_handler() {
     let mut host_handlers: HashMap<String, Arc<dyn Handler>> = HashMap::new();
     host_handlers.insert("worker_result".to_string(), handler);
 
-    let config = BlockConfig {
-        script: ScriptSource::Path(script_path.clone()),
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers,
-        host_handler: None,
-        host_tools: vec![],
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+    let config = BlockConfig::builder(
+        ScriptSource::Path(script_path.clone()),
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .host_handlers(host_handlers)
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 

@@ -7,4 +7,4 @@ pub mod bridge;
 pub mod bus;
 pub mod host;
 
-pub use host::{run, BlockConfig, HostContext};
+pub use host::{run, BlockConfig, BlockConfigBuilder, HostContext};

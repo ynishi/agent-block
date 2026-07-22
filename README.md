@@ -123,7 +123,7 @@ end)
 print(mcp.call("echo", "slow_echo", { msg = "hi", steps = 3 }))
 ```
 
-See `examples/verify_echo_harness.lua` for the full verification script.
+See `crates/agent-block/examples/verify_echo_harness.lua` for the full verification script.
 
 ## MCP Resource Subscribe Smoke Server
 
@@ -478,7 +478,7 @@ local result = agent.run({
 share the same function identity. The tool name defaults to `"compile_loop"`; pass
 `conf.name` to override (useful when registering multiple instances).
 
-**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. See `blocks/compile_loop/README.md` §"Multi-file mode" and the `examples/test_anthropic_compile_loop_multi*.lua` / `examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
+**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. See `blocks/compile_loop/README.md` §"Multi-file mode" and the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` / `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
 
 **Read-and-distill for large files**: in multi-file lazy-load mode, `read_file` now inspects
 file size before returning content. Files at or below `READ_FILE_FULL_THRESHOLD` (default
@@ -591,14 +591,14 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 
 | Example | Runner | Provider |
 |---|---|---|
-| `examples/test_anthropic_compile_loop.lua` | inline lua | Anthropic |
-| `examples/test_qwen_compile_loop.lua` | inline lua | Qwen (OpenAI-compat) |
-| `examples/test_qwen_compile_loop_rust.lua` | inline cargo | Qwen (OpenAI-compat) |
-| `examples/test_qwen_compile_loop_lust.lua` | mlua-probe MCP | Qwen (OpenAI-compat) |
-| `examples/test_compile_loop_parent.lua` | inline lua | Anthropic parent + Qwen child |
-| `examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
-| `examples/test_anthropic_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Anthropic |
-| `examples/test_openai_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Qwen (OpenAI-compat) |
+| `crates/agent-block/examples/test_anthropic_compile_loop.lua` | inline lua | Anthropic |
+| `crates/agent-block/examples/test_qwen_compile_loop.lua` | inline lua | Qwen (OpenAI-compat) |
+| `crates/agent-block/examples/test_qwen_compile_loop_rust.lua` | inline cargo | Qwen (OpenAI-compat) |
+| `crates/agent-block/examples/test_qwen_compile_loop_lust.lua` | mlua-probe MCP | Qwen (OpenAI-compat) |
+| `crates/agent-block/examples/test_compile_loop_parent.lua` | inline lua | Anthropic parent + Qwen child |
+| `crates/agent-block/examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
+| `crates/agent-block/examples/test_anthropic_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Anthropic |
+| `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Qwen (OpenAI-compat) |
 | `tests/fixtures/compile_loop_distill_mock.lua` | shared e2e fixture (distill, multi-file) | Anthropic / OpenAI-compat |
 | `tests/fixtures/compile_loop_distill_range_mock.lua` | e2e fixture (read_file_range verbatim) | Anthropic |
 

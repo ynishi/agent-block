@@ -114,25 +114,21 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let config = BlockConfig {
-        script: ScriptSource::Path(cli.script),
-        project_root: cli.project,
-        relay_url: cli.relay,
-        secret_key: cli.secret_key.map(SecretKeySource::Inline),
-        mcp_rpc_timeout,
-        prompt,
-        context,
-        host_handlers: std::collections::HashMap::new(),
-        host_handler: None,
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: std::collections::HashMap::new(),
-        auto_serve_bus: false,
-        shutdown_token: None,
-    };
+    let mut builder = BlockConfig::builder(ScriptSource::Path(cli.script), cli.project)
+        .mcp_rpc_timeout(mcp_rpc_timeout);
+    if let Some(relay) = cli.relay {
+        builder = builder.relay_url(relay);
+    }
+    if let Some(secret_key) = cli.secret_key {
+        builder = builder.secret_key(SecretKeySource::Inline(secret_key));
+    }
+    if let Some(prompt) = prompt {
+        builder = builder.prompt(prompt);
+    }
+    if let Some(context) = context {
+        builder = builder.context(context);
+    }
+    let config = builder.build();
 
     Ok(run(config).await?)
 }

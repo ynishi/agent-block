@@ -4,7 +4,6 @@
 //! interrupted, the shutdown sequence still runs, and `run()` returns
 //! `BlockError::Cancelled`.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::time::Duration;
 
@@ -39,25 +38,13 @@ async fn shutdown_token_interrupts_long_running_script() {
 
     let shutdown = CancellationToken::new();
 
-    let config = BlockConfig {
-        script: ScriptSource::Path(script_path.clone()),
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: None,
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: None,
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: false,
-        shutdown_token: Some(shutdown.clone()),
-    };
+    let config = BlockConfig::builder(
+        ScriptSource::Path(script_path.clone()),
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .shutdown_token(shutdown.clone())
+    .build();
 
     let handle = tokio::spawn(run(config));
 

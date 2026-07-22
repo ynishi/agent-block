@@ -251,6 +251,33 @@ fn build_blocks_path(project_root: &Path) -> String {
     out
 }
 
+/// Full configuration for a single [`run`] execution.
+///
+/// # Construction
+///
+/// Prefer [`BlockConfig::builder`] over struct-literal construction. The
+/// struct is `#[non_exhaustive]`, so crates outside `agent-block-core`
+/// cannot build it with a `BlockConfig { .. }` literal; the builder is the
+/// supported, forward-compatible path. New fields are added with sensible
+/// defaults, so existing builder call sites keep compiling when the config
+/// surface grows.
+///
+/// All fields remain `pub` for reading (`config.project_root`, etc.); only
+/// the literal-construction form is gated by `#[non_exhaustive]`.
+///
+/// ```no_run
+/// use agent_block_core::BlockConfig;
+/// use agent_block_core::host::ScriptSource;
+/// use std::path::PathBuf;
+///
+/// let config = BlockConfig::builder(
+///     ScriptSource::Path(PathBuf::from("agent.lua")),
+///     PathBuf::from("."),
+/// )
+/// .auto_serve_bus(true)
+/// .build();
+/// ```
+#[non_exhaustive]
 pub struct BlockConfig {
     /// Lua script to execute. See [`ScriptSource`] for the supported
     /// shapes (filesystem path / inline source / embedded default
@@ -388,6 +415,235 @@ pub struct BlockConfig {
     /// Defaults to `None` (legacy behavior: `run()` only completes when
     /// the script returns naturally).
     pub shutdown_token: Option<CancellationToken>,
+}
+
+impl BlockConfig {
+    /// Start building a [`BlockConfig`] with the two semantically required
+    /// inputs supplied up front.
+    ///
+    /// `script` selects what Lua source to execute — there is no meaningful
+    /// default, since a run has nothing to do without a script. `project_root`
+    /// anchors `.env` loading, inline-script directory resolution, and the
+    /// default working directory handed to spawned MCP servers.
+    ///
+    /// Every other field starts at the default documented on the matching
+    /// [`BlockConfig`] field and is overridden through the chainable
+    /// [`BlockConfigBuilder`] setters. This is the recommended construction
+    /// path for SDK embedders: `BlockConfig` is `#[non_exhaustive]`, so
+    /// struct-literal construction is unavailable to downstream crates and new
+    /// fields can be added without breaking existing builder call sites.
+    ///
+    /// ```no_run
+    /// use agent_block_core::BlockConfig;
+    /// use agent_block_core::host::ScriptSource;
+    /// use std::path::PathBuf;
+    ///
+    /// let config = BlockConfig::builder(
+    ///     ScriptSource::Path(PathBuf::from("agent.lua")),
+    ///     PathBuf::from("."),
+    /// )
+    /// .auto_serve_bus(true)
+    /// .build();
+    /// ```
+    pub fn builder(script: ScriptSource, project_root: PathBuf) -> BlockConfigBuilder {
+        BlockConfigBuilder::new(script, project_root)
+    }
+}
+
+/// Chainable builder for [`BlockConfig`], created via
+/// [`BlockConfig::builder`].
+///
+/// Each setter returns `self` for fluent chaining. Setters for `Option<_>`
+/// fields take the inner value and wrap it in `Some` internally, so callers
+/// pass e.g. `.prompt(PromptSource::Inline(..))` rather than an `Option`.
+/// Fields left untouched keep the defaults documented on the corresponding
+/// [`BlockConfig`] field.
+///
+/// Because [`BlockConfig`] is `#[non_exhaustive]`, this builder is the only
+/// supported way for crates outside `agent-block-core` to construct one, and
+/// it stays source-compatible as new config fields are introduced.
+pub struct BlockConfigBuilder {
+    script: ScriptSource,
+    project_root: PathBuf,
+    relay_url: Option<String>,
+    secret_key: Option<SecretKeySource>,
+    mcp_rpc_timeout: Duration,
+    prompt: Option<PromptSource>,
+    context: Option<PromptSource>,
+    host_handlers: HashMap<String, Arc<dyn Handler>>,
+    host_handler: Option<Arc<dyn Handler>>,
+    host_tools: Vec<HostToolSpec>,
+    http_client: Option<reqwest::Client>,
+    sql_path: Option<PathBuf>,
+    kv_path: Option<PathBuf>,
+    ts_path: Option<PathBuf>,
+    extra_globals: HashMap<String, serde_json::Value>,
+    auto_serve_bus: bool,
+    shutdown_token: Option<CancellationToken>,
+}
+
+impl BlockConfigBuilder {
+    fn new(script: ScriptSource, project_root: PathBuf) -> Self {
+        Self {
+            script,
+            project_root,
+            relay_url: None,
+            secret_key: None,
+            mcp_rpc_timeout: agent_block_mcp::DEFAULT_RPC_TIMEOUT,
+            prompt: None,
+            context: None,
+            host_handlers: HashMap::new(),
+            host_handler: None,
+            host_tools: Vec::new(),
+            http_client: None,
+            sql_path: None,
+            kv_path: None,
+            ts_path: None,
+            extra_globals: HashMap::new(),
+            auto_serve_bus: false,
+            shutdown_token: None,
+        }
+    }
+
+    /// Override the Lua script to execute (`BlockConfig::script`).
+    pub fn script(mut self, script: ScriptSource) -> Self {
+        self.script = script;
+        self
+    }
+
+    /// Override the project root (`BlockConfig::project_root`).
+    pub fn project_root(mut self, project_root: impl Into<PathBuf>) -> Self {
+        self.project_root = project_root.into();
+        self
+    }
+
+    /// Set the mesh relay URL (`BlockConfig::relay_url`). Defaults to `None`
+    /// (mesh disabled).
+    pub fn relay_url(mut self, relay_url: impl Into<String>) -> Self {
+        self.relay_url = Some(relay_url.into());
+        self
+    }
+
+    /// Set the mesh identity secret key source (`BlockConfig::secret_key`).
+    /// Defaults to `None` (random keypair).
+    pub fn secret_key(mut self, secret_key: SecretKeySource) -> Self {
+        self.secret_key = Some(secret_key);
+        self
+    }
+
+    /// Override the per-RPC MCP timeout (`BlockConfig::mcp_rpc_timeout`).
+    /// Defaults to [`agent_block_mcp::DEFAULT_RPC_TIMEOUT`].
+    pub fn mcp_rpc_timeout(mut self, mcp_rpc_timeout: Duration) -> Self {
+        self.mcp_rpc_timeout = mcp_rpc_timeout;
+        self
+    }
+
+    /// Set the prompt payload injected as `_PROMPT` (`BlockConfig::prompt`).
+    /// Defaults to `None`.
+    pub fn prompt(mut self, prompt: PromptSource) -> Self {
+        self.prompt = Some(prompt);
+        self
+    }
+
+    /// Set the context payload injected as `_CONTEXT`
+    /// (`BlockConfig::context`). Defaults to `None`.
+    pub fn context(mut self, context: PromptSource) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// Set the kind-keyed host-side handlers (`BlockConfig::host_handlers`).
+    /// Defaults to an empty map.
+    pub fn host_handlers(mut self, host_handlers: HashMap<String, Arc<dyn Handler>>) -> Self {
+        self.host_handlers = host_handlers;
+        self
+    }
+
+    /// Set the kind-agnostic fallback host handler
+    /// (`BlockConfig::host_handler`). Defaults to `None`.
+    pub fn host_handler(mut self, host_handler: Arc<dyn Handler>) -> Self {
+        self.host_handler = Some(host_handler);
+        self
+    }
+
+    /// Set the Rust-implemented tools injected into the Lua registry
+    /// (`BlockConfig::host_tools`). Defaults to an empty list.
+    pub fn host_tools(mut self, host_tools: Vec<HostToolSpec>) -> Self {
+        self.host_tools = host_tools;
+        self
+    }
+
+    /// Set a custom `reqwest::Client` for the `http.*` bridge
+    /// (`BlockConfig::http_client`). Defaults to `None`.
+    pub fn http_client(mut self, http_client: reqwest::Client) -> Self {
+        self.http_client = Some(http_client);
+        self
+    }
+
+    /// Override the `std.sql` database path (`BlockConfig::sql_path`).
+    /// Defaults to `None`.
+    pub fn sql_path(mut self, sql_path: impl Into<PathBuf>) -> Self {
+        self.sql_path = Some(sql_path.into());
+        self
+    }
+
+    /// Override the `std.kv` database path (`BlockConfig::kv_path`).
+    /// Defaults to `None`.
+    pub fn kv_path(mut self, kv_path: impl Into<PathBuf>) -> Self {
+        self.kv_path = Some(kv_path.into());
+        self
+    }
+
+    /// Override the `std.ts` database path (`BlockConfig::ts_path`).
+    /// Defaults to `None`.
+    pub fn ts_path(mut self, ts_path: impl Into<PathBuf>) -> Self {
+        self.ts_path = Some(ts_path.into());
+        self
+    }
+
+    /// Set the extra Lua globals injected before the script runs
+    /// (`BlockConfig::extra_globals`). Defaults to an empty map.
+    pub fn extra_globals(mut self, extra_globals: HashMap<String, serde_json::Value>) -> Self {
+        self.extra_globals = extra_globals;
+        self
+    }
+
+    /// Enable or disable the background EventBus dispatcher
+    /// (`BlockConfig::auto_serve_bus`). Defaults to `false`.
+    pub fn auto_serve_bus(mut self, auto_serve_bus: bool) -> Self {
+        self.auto_serve_bus = auto_serve_bus;
+        self
+    }
+
+    /// Set the caller-supplied cancellation token
+    /// (`BlockConfig::shutdown_token`). Defaults to `None`.
+    pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = Some(shutdown_token);
+        self
+    }
+
+    /// Finalize the builder into a [`BlockConfig`].
+    pub fn build(self) -> BlockConfig {
+        BlockConfig {
+            script: self.script,
+            project_root: self.project_root,
+            relay_url: self.relay_url,
+            secret_key: self.secret_key,
+            mcp_rpc_timeout: self.mcp_rpc_timeout,
+            prompt: self.prompt,
+            context: self.context,
+            host_handlers: self.host_handlers,
+            host_handler: self.host_handler,
+            host_tools: self.host_tools,
+            http_client: self.http_client,
+            sql_path: self.sql_path,
+            kv_path: self.kv_path,
+            ts_path: self.ts_path,
+            extra_globals: self.extra_globals,
+            auto_serve_bus: self.auto_serve_bus,
+            shutdown_token: self.shutdown_token,
+        }
+    }
 }
 
 /// Shared context passed into Lua bridge functions.
@@ -614,12 +870,21 @@ fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-pub async fn run(config: BlockConfig) -> BlockResult<()> {
-    // ── Resolve sources ───────────────────────────────────────────
-    // Convert the `Source` enums on `BlockConfig` to their concrete
-    // payloads before any Isle setup. `File`/`Path`/`Env` variants
-    // read from disk / environment exactly once, here at the start.
-    let (script_source, script_name, script_dir_pathbuf) = match &config.script {
+/// Concrete payloads resolved from the `*Source` enums on [`BlockConfig`]
+/// before any Isle setup begins.
+struct ResolvedSources {
+    script_source: String,
+    script_name: String,
+    script_dir: PathBuf,
+    prompt: Option<String>,
+    context: Option<String>,
+    secret_key: Option<String>,
+}
+
+/// Resolve the script / prompt / context / secret-key sources to their
+/// concrete values, reading from disk or environment exactly once.
+fn resolve_sources(config: &BlockConfig) -> BlockResult<ResolvedSources> {
+    let (script_source, script_name, script_dir) = match &config.script {
         ScriptSource::Path(p) => {
             let source = std::fs::read_to_string(p)
                 .map_err(|e| BlockError::Script(format!("{}: {e}", p.display())))?;
@@ -643,7 +908,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         ),
     };
 
-    let prompt_resolved: Option<String> = match &config.prompt {
+    let prompt: Option<String> = match &config.prompt {
         Some(PromptSource::Inline(s)) => Some(s.clone()),
         Some(PromptSource::File(p)) => Some(
             std::fs::read_to_string(p)
@@ -651,7 +916,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         ),
         None => None,
     };
-    let context_resolved: Option<String> = match &config.context {
+    let context: Option<String> = match &config.context {
         Some(PromptSource::Inline(s)) => Some(s.clone()),
         Some(PromptSource::File(p)) => Some(
             std::fs::read_to_string(p)
@@ -659,33 +924,48 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         ),
         None => None,
     };
-    let secret_key_resolved: Option<String> = match &config.secret_key {
+    let secret_key: Option<String> = match &config.secret_key {
         Some(SecretKeySource::Inline(s)) => Some(s.clone()),
         Some(SecretKeySource::Env(var)) => std::env::var(var).ok(),
         None => None,
     };
 
-    // NOTE: We previously held entered span guards across awaits for nested
-    // span context. That made the `run()` future `!Send`, which prevents
-    // SDK consumers from `tokio::spawn(run(config))`. Span context is
-    // attached to events via fields on the `info_span!` calls below; the
-    // missing nesting is an acceptable trade-off for `Send` correctness.
-    let _root_span = info_span!("agent_block", script = %script_name);
+    Ok(ResolvedSources {
+        script_source,
+        script_name,
+        script_dir,
+        prompt,
+        context,
+        secret_key,
+    })
+}
 
-    // ── .env ──────────────────────────────────────────────────────
-    // Load .env from project_root if present. Variables are merged into
-    // the process environment so Lua's `std.env.get()` picks them up.
-    let env_path = config.project_root.join(".env");
+/// Load `.env` from the project root into the process environment so Lua's
+/// `std.env.get()` observes it. A missing file is intentionally ignored.
+fn load_dotenv(project_root: &Path) {
+    let env_path = project_root.join(".env");
     match dotenvy::from_path(&env_path) {
         Ok(()) => info!(path = %env_path.display(), ".env loaded"),
         Err(dotenvy::Error::Io(_)) => {} // file not found — fine
         Err(e) => tracing::warn!(path = %env_path.display(), error = %e, ".env parse error"),
     }
+}
 
-    // ── Init ──────────────────────────────────────────────────────
-    let _init_span = info_span!("init");
+/// Background auto-serve dispatcher task handle plus its cancellation token,
+/// or `None` when auto-serve is disabled.
+type AutoServeState = Option<(tokio::task::JoinHandle<()>, CancellationToken)>;
 
-    // ── EventBus channel ─────────────────────────────────────────────
+/// EventBus wiring produced by [`setup_event_bus`].
+struct BusSetup {
+    event_bus: Arc<Mutex<Option<EventBus>>>,
+    bus_tx: mpsc::Sender<Event>,
+    auto_serve_state: AutoServeState,
+}
+
+/// Construct the bounded EventBus channel, pre-install host-side Rust
+/// handlers, and (when `auto_serve_bus` is set with at least one handler)
+/// spawn the background dispatcher loop before the script runs.
+fn setup_event_bus(config: &BlockConfig) -> BlockResult<BusSetup> {
     // Construct the bounded mpsc BEFORE MeshAgent::connect so the relay
     // handler can hold a `bus_tx` clone and forward incoming requests
     // into the dispatcher. Capacity is ENV-driven (see bridge::config).
@@ -693,17 +973,12 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let (bus_tx, bus_rx) = mpsc::channel::<Event>(bus_capacity);
     let event_bus = Arc::new(Mutex::new(Some(EventBus::new(bus_rx))));
 
-    // ── Pre-install host-side Rust handlers ───────────────────────────
-    // SDK consumers attach Rust handlers via `BlockConfig.host_handlers`
-    // so that script-side `bus.emit(kind, payload)` is captured by a Rust
-    // `Arc<dyn Handler>` instead of being dispatched to a Lua function.
-    // Registered here (before any Lua bridge registers handlers and before
-    // `bus.serve` takes ownership of the bus) so the EventBus already
-    // carries the host handlers when the script starts.
     // Install host-side Rust handlers: kind-specific entries from
     // `host_handlers` and, when set, the kind-agnostic `host_handler`
     // (registered via `on_any` as the fallback for unmatched kinds).
-    // SDK-embed 1-shot callers typically only set `host_handler`.
+    // Registered before any Lua bridge registers handlers and before
+    // `bus.serve` takes ownership, so the EventBus already carries the
+    // host handlers when the script starts.
     let has_kind_handlers = !config.host_handlers.is_empty();
     let has_any_handler = config.host_handler.is_some();
     if has_kind_handlers || has_any_handler {
@@ -728,16 +1003,14 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         );
     }
 
-    // ── auto-serve: background dispatcher for SDK-embed callers ───────
-    // When `auto_serve_bus` is on and at least one host-side handler
-    // (kind-specific or kind-agnostic) is installed, take the EventBus
-    // out of the Mutex *before* the script runs and spawn the dispatcher
-    // loop on the runtime. This lets `bus.emit(kind, payload)` from the
-    // script reach the host handler without requiring the script to call
-    // `bus.serve()` (which blocks on signals and never returns under
+    // auto-serve: when enabled with at least one host-side handler, take the
+    // EventBus out of the Mutex *before* the script runs and spawn the
+    // dispatcher loop on the runtime. This lets `bus.emit(kind, payload)`
+    // from the script reach the host handler without requiring the script to
+    // call `bus.serve()` (which blocks on signals and never returns under
     // programmatic embedding).
     let auto_serve = config.auto_serve_bus && (has_kind_handlers || has_any_handler);
-    let auto_serve_state: Option<(tokio::task::JoinHandle<()>, CancellationToken)> = if auto_serve {
+    let auto_serve_state: AutoServeState = if auto_serve {
         let bus = {
             let mut guard = event_bus
                 .lock()
@@ -760,51 +1033,61 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         None
     };
 
-    let mesh_agent = if let Some(ref relay_url) = config.relay_url {
-        let keypair = match &secret_key_resolved {
-            Some(hex_str) => {
-                let bytes = hex_decode_32(hex_str)
-                    .map_err(|e| BlockError::Runtime(format!("secret-key: {e}")))?;
-                agent_mesh_core::identity::AgentKeypair::from_bytes(&bytes)
-            }
-            None => agent_mesh_core::identity::AgentKeypair::generate(),
-        };
-        info!(agent_id = %keypair.agent_id(), "mesh identity");
-        let acl = agent_mesh_core::acl::AclPolicy {
-            default_deny: false,
-            rules: vec![],
-        };
-        let handler: Arc<dyn agent_mesh_sdk::RequestHandler> =
-            Arc::new(BusRelayHandler::new(bus_tx.clone()));
-        let url = relay_url.clone();
-        let agent = agent_mesh_sdk::MeshAgent::connect(keypair, &url, acl, handler)
-            .await
-            .map_err(|e| BlockError::Mesh(format!("connect to {relay_url} failed: {e}")))?;
-        info!(relay_url = %relay_url, "mesh connected");
-        Some(Arc::new(agent))
-    } else {
-        None
+    Ok(BusSetup {
+        event_bus,
+        bus_tx,
+        auto_serve_state,
+    })
+}
+
+/// Connect to the mesh relay when `relay_url` is set, deriving the Ed25519
+/// identity from `secret_key` (or a fresh random keypair) and wiring the
+/// EventBus relay handler. Returns `None` when mesh is disabled.
+async fn connect_mesh(
+    relay_url: Option<&String>,
+    secret_key: Option<&String>,
+    bus_tx: &mpsc::Sender<Event>,
+) -> BlockResult<Option<Arc<agent_mesh_sdk::MeshAgent>>> {
+    let Some(relay_url) = relay_url else {
+        return Ok(None);
     };
+    let keypair = match secret_key {
+        Some(hex_str) => {
+            let bytes = hex_decode_32(hex_str)
+                .map_err(|e| BlockError::Runtime(format!("secret-key: {e}")))?;
+            agent_mesh_core::identity::AgentKeypair::from_bytes(&bytes)
+        }
+        None => agent_mesh_core::identity::AgentKeypair::generate(),
+    };
+    info!(agent_id = %keypair.agent_id(), "mesh identity");
+    let acl = agent_mesh_core::acl::AclPolicy {
+        default_deny: false,
+        rules: vec![],
+    };
+    let handler: Arc<dyn agent_mesh_sdk::RequestHandler> =
+        Arc::new(BusRelayHandler::new(bus_tx.clone()));
+    let url = relay_url.clone();
+    let agent = agent_mesh_sdk::MeshAgent::connect(keypair, &url, acl, handler)
+        .await
+        .map_err(|e| BlockError::Mesh(format!("connect to {relay_url} failed: {e}")))?;
+    info!(relay_url = %relay_url, "mesh connected");
+    Ok(Some(Arc::new(agent)))
+}
 
-    let mcp_manager = Arc::new(RwLock::new(McpManager::with_rpc_timeout(
-        config.mcp_rpc_timeout,
-    )?));
+/// The three SQLite connections (with interrupt handles) backing the
+/// `sql.*`, `kv.*`, and `ts.*` Lua bridges.
+struct SqliteConns {
+    sql_conn: Arc<Mutex<rusqlite::Connection>>,
+    sql_interrupt: Arc<rusqlite::InterruptHandle>,
+    kv_conn: Arc<Mutex<rusqlite::Connection>>,
+    kv_interrupt: Arc<rusqlite::InterruptHandle>,
+    ts_conn: Arc<Mutex<rusqlite::Connection>>,
+    ts_interrupt: Arc<rusqlite::InterruptHandle>,
+}
 
-    // Resolve project_root to absolute path.
-    // canonicalize() can fail if the path doesn't exist; fall back to
-    // joining with current_dir to guarantee an absolute path.
-    let project_root = config
-        .project_root
-        .canonicalize()
-        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&config.project_root)))?;
-
-    // HTTP client: prefer the SDK-supplied client if any; otherwise
-    // construct a fresh default reqwest::Client (legacy behavior).
-    let http_client = config.http_client.clone().unwrap_or_default();
-
-    // ── SQLite init (kv + sql get separate DB files) ──────────────────────
-    // BlockConfig overrides take precedence; otherwise the env-driven
-    // resolution in `bridge::config::*` applies (see crate docs).
+/// Open the sql / kv / ts SQLite databases, honoring the [`BlockConfig`]
+/// path overrides and otherwise falling back to the env-driven resolution.
+fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
     let sql_path = match &config.sql_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::sql_path().map_err(BlockError::Runtime)?,
@@ -823,6 +1106,363 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     };
     let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
 
+    Ok(SqliteConns {
+        sql_conn,
+        sql_interrupt,
+        kv_conn,
+        kv_interrupt,
+        ts_conn,
+        ts_interrupt,
+    })
+}
+
+/// The main and handler Isles plus their drivers, produced by [`spawn_isles`].
+struct SpawnedIsles {
+    isle: Arc<AsyncIsle>,
+    driver: AsyncIsleDriver,
+    handler_isle: Arc<AsyncIsle>,
+    handler_driver: AsyncIsleDriver,
+}
+
+/// Spawn the main Lua Isle and the dedicated handler Isle from the same
+/// resolved script parameters. Their bridges are registered in a later pass
+/// (via [`register_bridges`]) once the `HostContext` exists.
+async fn spawn_isles(
+    script_name: &str,
+    script_dir: &str,
+    blocks_paths: &str,
+    prompt: Option<String>,
+    context: Option<String>,
+    extra_globals: &HashMap<String, serde_json::Value>,
+) -> BlockResult<SpawnedIsles> {
+    let (isle, driver) = AsyncIsle::spawn(build_isle_init(
+        script_name.to_string(),
+        script_dir.to_string(),
+        blocks_paths.to_string(),
+        prompt.clone(),
+        context.clone(),
+        extra_globals.clone(),
+    ))
+    .await
+    .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
+    let isle = Arc::new(isle);
+
+    // handler Isle (sequential, dependencies are trivial)
+    let (handler_isle, handler_driver) = spawn_handler_isle(
+        script_name.to_string(),
+        script_dir.to_string(),
+        blocks_paths.to_string(),
+        prompt,
+        context,
+        extra_globals.clone(),
+    )
+    .await?;
+
+    Ok(SpawnedIsles {
+        isle,
+        driver,
+        handler_isle,
+        handler_driver,
+    })
+}
+
+/// Register the Lua stdlib bridges on both the main Isle
+/// (`bridge::register_all`) and the handler Isle
+/// (`bridge::register_all_handler_side`).
+async fn register_bridges(
+    ctx: &HostContext,
+    isle: &Arc<AsyncIsle>,
+    handler_isle: &Arc<AsyncIsle>,
+) -> BlockResult<()> {
+    {
+        let ctx = ctx.clone();
+        isle.exec(move |lua| {
+            bridge::register_all(lua, &ctx)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("bridge register failed: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .map_err(|e| BlockError::Runtime(format!("bridge register: {e}")))?;
+    }
+
+    {
+        let ctx = ctx.clone();
+        handler_isle
+            .exec(move |lua| {
+                bridge::register_all_handler_side(lua, &ctx).map_err(|e| {
+                    mlua_isle::IsleError::Lua(format!("handler bridge register failed: {e}"))
+                })?;
+                Ok(String::new())
+            })
+            .await
+            .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
+    }
+
+    Ok(())
+}
+
+/// Inject the [`BlockConfig::host_tools`] Rust tools into the Lua
+/// `_TOOL_REGISTRY` so they are indistinguishable from Lua-defined tools.
+/// Each entry becomes an Anthropic-shaped tool spec table
+/// (`{ name, schema = { description, input_schema }, handler, group? }`)
+/// whose `handler` bridges back into the supplied `ToolHandler::call`.
+/// No-op when no host tools are supplied.
+async fn inject_host_tools(isle: &Arc<AsyncIsle>, host_tools: &[HostToolSpec]) -> BlockResult<()> {
+    if host_tools.is_empty() {
+        return Ok(());
+    }
+    let host_tools = host_tools.to_vec();
+    let tool_count = host_tools.len();
+    isle.exec(move |lua| {
+        let registry: mlua::Table = lua
+            .globals()
+            .get("_TOOL_REGISTRY")
+            .map_err(|e| mlua_isle::IsleError::Lua(format!("get _TOOL_REGISTRY: {e}")))?;
+        for tool in host_tools {
+            let entry = lua
+                .create_table()
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("create entry: {e}")))?;
+            entry
+                .set("name", tool.name.as_str())
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set name: {e}")))?;
+            // schema = { description, input_schema } — Anthropic shape
+            let schema = lua
+                .create_table()
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("create schema: {e}")))?;
+            schema
+                .set("description", tool.description.as_str())
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set description: {e}")))?;
+            let input_schema_lua = crate::bridge::json_to_lua(lua, tool.input_schema.clone())
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("input_schema: {e}")))?;
+            schema
+                .set("input_schema", input_schema_lua)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set input_schema: {e}")))?;
+            entry
+                .set("schema", schema)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set schema: {e}")))?;
+            if let Some(group) = &tool.group {
+                entry
+                    .set("group", group.as_str())
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set group: {e}")))?;
+            }
+            let handler_arc = Arc::clone(&tool.handler);
+            let handler_fn = lua
+                .create_async_function(move |lua, input: mlua::Value| {
+                    let handler = Arc::clone(&handler_arc);
+                    async move {
+                        let input_json = crate::bridge::lua_to_json(&lua, input)?;
+                        let result = handler
+                            .call(input_json)
+                            .await
+                            .map_err(mlua::Error::external)?;
+                        crate::bridge::json_to_lua(&lua, result)
+                    }
+                })
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("create handler: {e}")))?;
+            entry
+                .set("handler", handler_fn)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
+            registry
+                .set(tool.name.as_str(), entry)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("registry set: {e}")))?;
+        }
+        Ok(String::new())
+    })
+    .await
+    .map_err(|e| BlockError::Runtime(format!("host_tools inject: {e}")))?;
+    info!(count = tool_count, "host tools injected into Lua registry");
+    Ok(())
+}
+
+/// Execute the resolved Lua script on the main Isle, racing it against the
+/// optional caller `shutdown_token`. On cancellation the Isle is unwound via
+/// its own cancel token before returning [`BlockError::Cancelled`].
+async fn execute_script(
+    isle: &Arc<AsyncIsle>,
+    script_source: &str,
+    script_name: &str,
+    shutdown_token: Option<&CancellationToken>,
+) -> BlockResult<()> {
+    let _exec_span = info_span!("execute", script = %script_name);
+
+    let mut task = isle.spawn_coroutine_eval(script_source);
+    let task_cancel = task.cancel_token().clone();
+    match shutdown_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    task_cancel.cancel();
+                    // Wait for the Isle to unwind so the VM is in a
+                    // consistent state before driver shutdown. The
+                    // debug hook fires at the next HOOK_INTERVAL.
+                    let _ = (&mut task).await;
+                    info!("shutdown_token: cancelled by caller");
+                    Err(BlockError::Cancelled)
+                }
+                res = &mut task => res.map(|_| ()).map_err(|e| BlockError::Script(format!("{e}"))),
+            }
+        }
+        None => (&mut task)
+            .await
+            .map(|_| ())
+            .map_err(|e| BlockError::Script(format!("{e}"))),
+    }
+}
+
+/// Drain the auto-serve dispatcher: give it a grace window to flush queued
+/// events, then cancel and bound-join it. No-op when auto-serve is off.
+async fn drain_auto_serve(auto_serve_state: AutoServeState) {
+    if let Some((handle, token)) = auto_serve_state {
+        let grace_ms = crate::bridge::config::task_grace_ms();
+        let grace = Duration::from_millis(grace_ms);
+        tokio::time::sleep(grace).await;
+        token.cancel();
+        match tokio::time::timeout(grace, handle).await {
+            Ok(Ok(())) => info!("auto-serve: dispatcher shut down cleanly"),
+            Ok(Err(join_err)) => {
+                tracing::error!(error = %join_err, "auto-serve: dispatcher task join error");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    grace_ms,
+                    "auto-serve: dispatcher join timed out after cancel; forcing exit"
+                );
+            }
+        }
+    }
+}
+
+/// Tear down host resources in order: disconnect MCP servers, shut down the
+/// main Isle driver (fatal on error), then the handler Isle driver (logged,
+/// non-fatal so a handler-thread panic does not poison the process exit).
+async fn shutdown(
+    mcp_manager: &Arc<RwLock<McpManager>>,
+    driver: AsyncIsleDriver,
+    handler_driver: AsyncIsleDriver,
+) -> BlockResult<()> {
+    let _shutdown_span = info_span!("shutdown");
+
+    mcp_manager.write().await.disconnect_all().await?;
+
+    driver
+        .shutdown()
+        .await
+        .map_err(|e| BlockError::Runtime(format!("AsyncIsle shutdown failed: {e}")))?;
+
+    // Handler Isle shutdown is independent of main shutdown: a failure
+    // here (e.g. ThreadPanic on the handler thread) is logged but does
+    // not poison the main process exit. The main Isle has already
+    // been stopped cleanly above.
+    match handler_driver.shutdown().await {
+        Ok(()) => info!(
+            thread_name = "agent-block-handler-isle",
+            "handler Isle shut down"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            thread_name = "agent-block-handler-isle",
+            "handler Isle shutdown failed"
+        ),
+    }
+
+    Ok(())
+}
+
+/// Primary SDK entry point: run one agent-block execution to completion.
+///
+/// Given a fully-populated [`BlockConfig`], this drives the entire host
+/// orchestration for a single run: it resolves the script / prompt / context /
+/// secret-key sources, loads `.env` from the project root, spawns the main and
+/// handler Lua Isles, opens the kv / sql / ts SQLite connections, optionally
+/// connects to the mesh relay, initialises the MCP manager, injects the Lua
+/// stdlib bridge plus any host-supplied tools / handlers, executes the script,
+/// and finally tears everything down (MCP disconnect, Isle shutdown, auto-serve
+/// dispatcher join).
+///
+/// The returned future is `Send`, so SDK consumers may `tokio::spawn` it.
+///
+/// # Errors
+///
+/// Returns [`BlockError`] when any stage fails: source resolution / file reads
+/// ([`BlockError::Script`]), mesh connect ([`BlockError::Mesh`]), EventBus or
+/// Isle setup ([`BlockError::Bus`] / [`BlockError::Runtime`]), or a script
+/// runtime error ([`BlockError::Script`]). When a `shutdown_token` is supplied
+/// and fires before the script finishes, returns [`BlockError::Cancelled`]
+/// after the shutdown sequence completes.
+pub async fn run(config: BlockConfig) -> BlockResult<()> {
+    // ── Resolve sources ───────────────────────────────────────────
+    // Convert the `Source` enums on `BlockConfig` to their concrete
+    // payloads before any Isle setup. `File`/`Path`/`Env` variants
+    // read from disk / environment exactly once, here at the start.
+    let ResolvedSources {
+        script_source,
+        script_name,
+        script_dir: script_dir_pathbuf,
+        prompt: prompt_resolved,
+        context: context_resolved,
+        secret_key: secret_key_resolved,
+    } = resolve_sources(&config)?;
+
+    // NOTE: We previously held entered span guards across awaits for nested
+    // span context. That made the `run()` future `!Send`, which prevents
+    // SDK consumers from `tokio::spawn(run(config))`. Span context is
+    // attached to events via fields on the `info_span!` calls below; the
+    // missing nesting is an acceptable trade-off for `Send` correctness.
+    let _root_span = info_span!("agent_block", script = %script_name);
+
+    // ── .env ──────────────────────────────────────────────────────
+    // Load .env from project_root if present. Variables are merged into
+    // the process environment so Lua's `std.env.get()` picks them up.
+    load_dotenv(&config.project_root);
+
+    // ── Init ──────────────────────────────────────────────────────
+    let _init_span = info_span!("init");
+
+    // ── EventBus + host handlers + auto-serve dispatcher ──────────────
+    // Construct the bus channel, pre-install host-side Rust handlers, and
+    // (when configured) spawn the background dispatcher before the script.
+    let BusSetup {
+        event_bus,
+        bus_tx,
+        auto_serve_state,
+    } = setup_event_bus(&config)?;
+
+    let mesh_agent = connect_mesh(
+        config.relay_url.as_ref(),
+        secret_key_resolved.as_ref(),
+        &bus_tx,
+    )
+    .await?;
+
+    let mcp_manager = Arc::new(RwLock::new(McpManager::with_rpc_timeout(
+        config.mcp_rpc_timeout,
+    )?));
+
+    // Resolve project_root to absolute path.
+    // canonicalize() can fail if the path doesn't exist; fall back to
+    // joining with current_dir to guarantee an absolute path.
+    let project_root = config
+        .project_root
+        .canonicalize()
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&config.project_root)))?;
+
+    // HTTP client: prefer the SDK-supplied client if any; otherwise
+    // construct a fresh default reqwest::Client (legacy behavior).
+    let http_client = config.http_client.clone().unwrap_or_default();
+
+    // ── SQLite init (sql + kv + ts get separate DB files) ─────────────
+    // BlockConfig overrides take precedence; otherwise the env-driven
+    // resolution in `bridge::config::*` applies (see crate docs).
+    let SqliteConns {
+        sql_conn,
+        sql_interrupt,
+        kv_conn,
+        kv_interrupt,
+        ts_conn,
+        ts_interrupt,
+    } = init_sqlite(&config)?;
+
     // Use the script dir derived from the resolved `ScriptSource` for
     // `package.path` lookups. For inline / default-agent variants the dir
     // falls back to `project_root` (set during source resolution above).
@@ -837,27 +1477,19 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     let prompt = prompt_resolved.clone();
     let context = context_resolved.clone();
 
-    // ── main Isle ─────────────────────────────────────────────────
-    let (isle, driver) = AsyncIsle::spawn(build_isle_init(
-        script_name.clone(),
-        script_dir.clone(),
-        blocks_paths.clone(),
-        prompt.clone(),
-        context.clone(),
-        config.extra_globals.clone(),
-    ))
-    .await
-    .map_err(|e| BlockError::Runtime(format!("AsyncIsle spawn failed: {e}")))?;
-    let isle = Arc::new(isle);
-
-    // ── handler Isle (sequential, dependencies are trivial) ────────
-    let (handler_isle, handler_driver) = spawn_handler_isle(
-        script_name.clone(),
-        script_dir.clone(),
-        blocks_paths.clone(),
+    // ── main + handler Isles ──────────────────────────────────────
+    let SpawnedIsles {
+        isle,
+        driver,
+        handler_isle,
+        handler_driver,
+    } = spawn_isles(
+        &script_name,
+        &script_dir,
+        &blocks_paths,
         prompt,
         context,
-        config.extra_globals.clone(),
+        &config.extra_globals,
     )
     .await?;
 
@@ -893,101 +1525,11 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         event_bus: Arc::clone(&event_bus),
     };
 
-    {
-        let ctx = ctx.clone();
-        isle.exec(move |lua| {
-            bridge::register_all(lua, &ctx)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("bridge register failed: {e}")))?;
-            Ok(String::new())
-        })
-        .await
-        .map_err(|e| BlockError::Runtime(format!("bridge register: {e}")))?;
-    }
-
-    {
-        let ctx = ctx.clone();
-        handler_isle
-            .exec(move |lua| {
-                bridge::register_all_handler_side(lua, &ctx).map_err(|e| {
-                    mlua_isle::IsleError::Lua(format!("handler bridge register failed: {e}"))
-                })?;
-                Ok(String::new())
-            })
-            .await
-            .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
-    }
+    register_bridges(&ctx, &isle, &handler_isle).await?;
 
     // ── Inject host_tools into the Lua tool registry ───────────────
     // Done after `bridge::register_all` so `_TOOL_REGISTRY` exists.
-    // Each entry becomes an Anthropic-shaped tool spec table
-    //   { name, schema = { description, input_schema }, handler, group? }
-    // where `handler` is a Lua async function that bridges back into
-    // the supplied `ToolHandler::call`. Lua-side `tool.list()` /
-    // `tool.schema()` / `agent.run` see these uniformly with native
-    // Lua-defined tools.
-    if !config.host_tools.is_empty() {
-        let host_tools = config.host_tools.clone();
-        let tool_count = host_tools.len();
-        isle.exec(move |lua| {
-            let registry: mlua::Table = lua
-                .globals()
-                .get("_TOOL_REGISTRY")
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("get _TOOL_REGISTRY: {e}")))?;
-            for tool in host_tools {
-                let entry = lua
-                    .create_table()
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create entry: {e}")))?;
-                entry
-                    .set("name", tool.name.as_str())
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set name: {e}")))?;
-                // schema = { description, input_schema } — Anthropic shape
-                let schema = lua
-                    .create_table()
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create schema: {e}")))?;
-                schema
-                    .set("description", tool.description.as_str())
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set description: {e}")))?;
-                let input_schema_lua =
-                    crate::bridge::json_to_lua(lua, tool.input_schema.clone())
-                        .map_err(|e| mlua_isle::IsleError::Lua(format!("input_schema: {e}")))?;
-                schema
-                    .set("input_schema", input_schema_lua)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set input_schema: {e}")))?;
-                entry
-                    .set("schema", schema)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set schema: {e}")))?;
-                if let Some(group) = &tool.group {
-                    entry
-                        .set("group", group.as_str())
-                        .map_err(|e| mlua_isle::IsleError::Lua(format!("set group: {e}")))?;
-                }
-                let handler_arc = Arc::clone(&tool.handler);
-                let handler_fn = lua
-                    .create_async_function(move |lua, input: mlua::Value| {
-                        let handler = Arc::clone(&handler_arc);
-                        async move {
-                            let input_json = crate::bridge::lua_to_json(&lua, input)?;
-                            let result = handler
-                                .call(input_json)
-                                .await
-                                .map_err(mlua::Error::external)?;
-                            crate::bridge::json_to_lua(&lua, result)
-                        }
-                    })
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create handler: {e}")))?;
-                entry
-                    .set("handler", handler_fn)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
-                registry
-                    .set(tool.name.as_str(), entry)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("registry set: {e}")))?;
-            }
-            Ok(String::new())
-        })
-        .await
-        .map_err(|e| BlockError::Runtime(format!("host_tools inject: {e}")))?;
-        info!(count = tool_count, "host tools injected into Lua registry");
-    }
+    inject_host_tools(&isle, &config.host_tools).await?;
 
     drop(_init_span);
 
@@ -998,83 +1540,21 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // VM, then continue into the shutdown sequence below (we still want
     // to release MCP/mesh handles and join the auto-serve dispatcher
     // before returning).
-    let script_result: Result<(), BlockError> = {
-        let _exec_span = info_span!("execute", script = %script_name);
-
-        let mut task = isle.spawn_coroutine_eval(&script_source);
-        let task_cancel = task.cancel_token().clone();
-        match config.shutdown_token.as_ref() {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => {
-                        task_cancel.cancel();
-                        // Wait for the Isle to unwind so the VM is in a
-                        // consistent state before driver shutdown. The
-                        // debug hook fires at the next HOOK_INTERVAL.
-                        let _ = (&mut task).await;
-                        info!("shutdown_token: cancelled by caller");
-                        Err(BlockError::Cancelled)
-                    }
-                    res = &mut task => res.map(|_| ()).map_err(|e| BlockError::Script(format!("{e}"))),
-                }
-            }
-            None => (&mut task)
-                .await
-                .map(|_| ())
-                .map_err(|e| BlockError::Script(format!("{e}"))),
-        }
-    };
+    let script_result = execute_script(
+        &isle,
+        &script_source,
+        &script_name,
+        config.shutdown_token.as_ref(),
+    )
+    .await;
 
     // ── auto-serve drain + cancel ─────────────────────────────────
     // Let the dispatcher drain events queued by the script, then signal
     // shutdown and bound the join. Mirrors `bus.serve`'s grace pattern.
-    if let Some((handle, token)) = auto_serve_state {
-        let grace_ms = crate::bridge::config::task_grace_ms();
-        let grace = Duration::from_millis(grace_ms);
-        tokio::time::sleep(grace).await;
-        token.cancel();
-        match tokio::time::timeout(grace, handle).await {
-            Ok(Ok(())) => info!("auto-serve: dispatcher shut down cleanly"),
-            Ok(Err(join_err)) => {
-                tracing::error!(error = %join_err, "auto-serve: dispatcher task join error");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    grace_ms,
-                    "auto-serve: dispatcher join timed out after cancel; forcing exit"
-                );
-            }
-        }
-    }
+    drain_auto_serve(auto_serve_state).await;
 
     // ── Shutdown ──────────────────────────────────────────────────
-    {
-        let _shutdown_span = info_span!("shutdown");
-
-        mcp_manager.write().await.disconnect_all().await?;
-
-        driver
-            .shutdown()
-            .await
-            .map_err(|e| BlockError::Runtime(format!("AsyncIsle shutdown failed: {e}")))?;
-
-        // Handler Isle shutdown is independent of main shutdown: a failure
-        // here (e.g. ThreadPanic on the handler thread) is logged but does
-        // not poison the main process exit. The main Isle has already
-        // been stopped cleanly above.
-        match handler_driver.shutdown().await {
-            Ok(()) => info!(
-                thread_name = "agent-block-handler-isle",
-                "handler Isle shut down"
-            ),
-            Err(e) => tracing::error!(
-                error = %e,
-                thread_name = "agent-block-handler-isle",
-                "handler Isle shutdown failed"
-            ),
-        }
-    }
+    shutdown(&mcp_manager, driver, handler_driver).await?;
 
     script_result
 }

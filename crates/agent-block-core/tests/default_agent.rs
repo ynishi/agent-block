@@ -12,7 +12,6 @@
 //!   3. `PromptSource::File` reads the file at `run()` start and
 //!      forwards the contents as `_PROMPT`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,28 +56,19 @@ async fn host_handler_catches_any_emit_kind() {
         })
     "#;
 
-    let config = BlockConfig {
-        script: ScriptSource::Inline {
+    let config = BlockConfig::builder(
+        ScriptSource::Inline {
             source: stub_script.to_string(),
             name: "stub_invoker.lua".to_string(),
         },
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: Some(PromptSource::Inline("solve this".to_string())),
-        context: Some(PromptSource::Inline("you are an agent".to_string())),
-        host_handlers: HashMap::new(),
-        host_handler: Some(handler),
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .prompt(PromptSource::Inline("solve this".to_string()))
+    .context(PromptSource::Inline("you are an agent".to_string()))
+    .host_handler(handler)
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 
@@ -112,28 +102,18 @@ async fn prompt_source_file_is_read_at_run_start() {
         tx: tokio::sync::Mutex::new(Some(tx)),
     });
 
-    let config = BlockConfig {
-        script: ScriptSource::Inline {
+    let config = BlockConfig::builder(
+        ScriptSource::Inline {
             source: r#"bus.emit("anything", { prompt = _PROMPT })"#.to_string(),
             name: "echo.lua".to_string(),
         },
-        project_root: dir.path().to_path_buf(),
-        relay_url: None,
-        secret_key: None,
-        mcp_rpc_timeout: Duration::from_secs(30),
-        prompt: Some(PromptSource::File(prompt_path)),
-        context: None,
-        host_handlers: HashMap::new(),
-        host_handler: Some(handler),
-        host_tools: Vec::new(),
-        http_client: None,
-        sql_path: None,
-        kv_path: None,
-        ts_path: None,
-        extra_globals: HashMap::new(),
-        auto_serve_bus: true,
-        shutdown_token: None,
-    };
+        dir.path().to_path_buf(),
+    )
+    .mcp_rpc_timeout(Duration::from_secs(30))
+    .prompt(PromptSource::File(prompt_path))
+    .host_handler(handler)
+    .auto_serve_bus(true)
+    .build();
 
     run(config).await.expect("run ok");
 
