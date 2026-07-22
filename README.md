@@ -691,6 +691,39 @@ assert(ok, why)
 ### log.*
 - `log.info/warn/error/debug(msg)`
 
+## Testing
+
+### Rust (e2e + integration)
+
+```
+cargo test --workspace
+```
+
+### Lua block unit specs (mlua-lspec)
+
+The embedded blocks (`crates/agent-block-core/blocks/agent`, `.../compile_loop`) expose
+their pure, I/O-free helpers via a `_test_helpers()` accessor. Branch-level unit specs
+live under `crates/agent-block/tests/fixtures/*_test.lua` and run with the
+mlua-lspec framework (`describe` / `it` / `expect`) — they need no API keys and no
+network. Run them via the `lua-debugger` MCP `test_launch` tool with the block
+directory on the search path:
+
+```
+mcp__lua-debugger__test_launch(
+  code_file    = "crates/agent-block/tests/fixtures/agent_helpers_test.lua",
+  search_paths = ["crates/agent-block-core/blocks"]
+)
+mcp__lua-debugger__test_launch(
+  code_file    = "crates/agent-block/tests/fixtures/compile_loop_sr_apply_test.lua",
+  search_paths = ["crates/agent-block-core/blocks"]
+)
+```
+
+Existing companion specs: `compile_loop_state_test.lua` (mf_state / stagnation /
+temperature), `compile_loop_distill.lua` (distill subloop), and
+`compile_loop_cache_lifecycle.lua` (read-file cache). Each spec file's header
+documents its exact `test_launch` invocation.
+
 ## License
 
 Licensed under either of

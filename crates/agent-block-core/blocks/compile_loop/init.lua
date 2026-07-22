@@ -2920,6 +2920,20 @@ function M._test_helpers()
         resolve_temperature = resolve_temperature,
         -- run_loop (for unit testing bad stagnation / full-loop scenarios without handler)
         run_loop = run_loop,
+        -- Pure SR-diff / summary / stagnation branches (unit-test only exposure)
+        extract_code = extract_code,
+        make_summary = make_summary,
+        is_stagnant = is_stagnant,
+        fnv1a_hash = fnv1a_hash,
+        parse_search_replace = parse_search_replace,
+        ws_normalize = ws_normalize,
+        apply_blocks = apply_blocks,
+        build_edit_failure_msg = build_edit_failure_msg,
+        build_failure_msg = build_failure_msg,
+        filter_for_tool_output = filter_for_tool_output,
+        group_blocks_by_path = group_blocks_by_path,
+        build_multifile_edit_failure_msg = build_multifile_edit_failure_msg,
+        cl_oai_map_finish_reason = cl_oai_map_finish_reason,
     }
 end
 

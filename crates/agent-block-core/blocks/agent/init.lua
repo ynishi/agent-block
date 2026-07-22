@@ -1710,4 +1710,26 @@ end
 
 M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 
+-- Bundle of pure internal helpers exposed for unit testing only.
+-- These functions have no side effects beyond the std/log globals they read;
+-- run behaviour is unchanged (this is a read-only accessor).
+function M._test_helpers()
+    return {
+        map_finish_reason = map_finish_reason,
+        normalize_openai_response = normalize_openai_response,
+        convert_messages_to_openai = convert_messages_to_openai,
+        new_budget_tracker = new_budget_tracker,
+        count_tool_use_blocks = count_tool_use_blocks,
+        count_text_chars = count_text_chars,
+        extract_text = extract_text,
+        normalize_dump_mode = normalize_dump_mode,
+        sanitize_headers_for_dump = sanitize_headers_for_dump,
+        kv_escape = kv_escape,
+        format_kv = format_kv,
+        build_tools = build_tools,
+        resolve_mcp_group = resolve_mcp_group,
+        dispatch_tool = dispatch_tool,
+    }
+end
+
 return M
