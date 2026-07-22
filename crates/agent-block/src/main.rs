@@ -64,7 +64,19 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(err) = run_cli().await {
+        // Human-readable one-line summary + cause chain, instead of anyhow's
+        // default `{:?}` Debug dump. Keeps the non-zero exit code contract.
+        eprintln!("error: {err}");
+        for cause in err.chain().skip(1) {
+            eprintln!("caused by: {cause}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> anyhow::Result<()> {
     // rustls 0.23+ requires an explicit CryptoProvider install when multiple
     // (or zero) backends are compiled in. tokio-tungstenite + reqwest pull
     // rustls transitively; without this the first WSS connect panics.

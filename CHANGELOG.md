@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where every field addition (recently `host_tools`, `http_client`,
   `sql_path` / `kv_path` / `ts_path`, `extra_globals`) forced every
   embedder to update their literal.
+- The `agent-block` CLI now prints a human-readable error summary on
+  failure (`error: <message>` followed by one `caused by: <cause>` line
+  per link in the chain) instead of anyhow's default `{:?}` Debug dump.
+  The non-zero exit code on failure is unchanged.
+- Narrowed the workspace `tokio` dependency from `features = ["full"]` to
+  the subset actually used by the shipped crates
+  (`macros`, `rt-multi-thread`, `sync`, `time`, `process`, `signal`),
+  trimming unused compile surface. Test builds are unaffected — each
+  crate's dev-dependencies still enable the full feature set.
 
 ### Deprecated
 
