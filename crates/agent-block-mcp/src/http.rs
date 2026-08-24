@@ -1,9 +1,9 @@
 //! HTTP/SSE transport builder for `McpManager::connect_http`.
 //!
 //! Provides `connect_http_transport` which performs the full connect+handshake
-//! using rmcp's Streamable HTTP transport (reqwest backend, rmcp 1.4 internal
-//! reqwest). The `transport-streamable-http-client-reqwest` feature must be
-//! enabled in `Cargo.toml` (it is).
+//! using rmcp's Streamable HTTP transport (rmcp-internal reqwest backend). The
+//! `transport-streamable-http-client-reqwest` feature must be enabled in
+//! `Cargo.toml` (it is).
 
 use rmcp::{
     service::{RoleClient, RunningService},
@@ -39,7 +39,7 @@ pub(super) async fn connect_http_transport(
         config = config.auth_header(auth);
     }
     // `StreamableHttpClientTransport::from_config` uses rmcp's internal
-    // reqwest::Client (0.13), which correctly implements StreamableHttpClient.
+    // reqwest::Client, which correctly implements StreamableHttpClient.
     let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
 
     let safe_url = sanitize_url(url);

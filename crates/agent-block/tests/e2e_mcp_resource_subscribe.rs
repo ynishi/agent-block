@@ -64,7 +64,7 @@ impl ServerHandler for SubscribeTestServer {
                 // client before the notification is dispatched (R3 race mitigation).
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let _ = peer
-                    .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
+                    .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
                     .await;
             });
             Ok(())

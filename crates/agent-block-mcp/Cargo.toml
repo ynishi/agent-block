@@ -37,6 +37,6 @@ uuid.workspace = true
 # rmcp `server` (+ `transport-async-rw`) for in-process concurrency tests that
 # run an MCP server over tokio::io::duplex pipes; `elicitation` for the elicit
 # round-trip tests in lib.rs.
-rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server", "elicitation"] }
+rmcp = { version = "3.0.1", features = ["server", "transport-streamable-http-server", "elicitation"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7" }

@@ -4,6 +4,11 @@
 //! Subtask 2: `on_progress` wired to `handler_isle` bytecode forwarding.
 //! Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
 
+// Sampling / Roots / Logging are deprecated upstream (SEP-2577, protocol revision
+// 2026-07-28) but remain part of agent-block's Lua-facing handler surface for the
+// deprecation window; suppress the blanket rmcp deprecation warnings file-wide.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -11,10 +16,10 @@ use mlua_isle::AsyncIsle;
 use rmcp::{
     handler::client::ClientHandler,
     model::{
-        CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-        CreateMessageResult, ElicitationAction, ElicitationCreateRequestMethod, LoggingLevel,
+        CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
+        ElicitationAction, ElicitationCreateRequestMethod, LoggingLevel,
         LoggingMessageNotificationParam, ProgressNotificationParam,
-        ResourceUpdatedNotificationParam, Role, SamplingMessage, SamplingMessageContent,
+        ResourceUpdatedNotificationParam, Role, SamplingMessage, SamplingMessageContentBlock,
     },
     service::{NotificationContext, RequestContext, RoleClient},
     ErrorData as McpError,
@@ -1229,7 +1234,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         .to_string();
 
                     let message =
-                        SamplingMessage::new(role, SamplingMessageContent::text(content_str));
+                        SamplingMessage::new(role, SamplingMessageContentBlock::text(content_str));
                     let mut result = CreateMessageResult::new(message, model);
                     if let Some(sr) = stop_reason {
                         result = result.with_stop_reason(sr);
@@ -1395,39 +1400,36 @@ impl ClientHandler for AgentBlockClientHandler {
     /// declined without reaching the Lua layer (crux Form-only dispatch constraint).
     ///
     /// # Returns
-    /// - `Ok(CreateElicitationResult { action: Accept, content: Some(json), .. })` on accept.
-    /// - `Ok(CreateElicitationResult { action: Decline, .. })` on decline, cancel-as-decline,
+    /// - `Ok(ElicitResult { action: Accept, content: Some(json), .. })` on accept.
+    /// - `Ok(ElicitResult { action: Decline, .. })` on decline, cancel-as-decline,
     ///   Url variant, or no handler registered (spec neutral — not an error).
-    /// - `Ok(CreateElicitationResult { action: Cancel, .. })` on cancel.
+    /// - `Ok(ElicitResult { action: Cancel, .. })` on cancel.
     /// - `Err(McpError::method_not_found)` when no server name is wired or no handler Isle
     ///   is available (mirrors list_roots).
     /// - `Err(McpError::internal_error)` when the handler Isle exec fails or the Lua
     ///   result fails 3-action contract validation.
     fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> impl std::future::Future<Output = Result<CreateElicitationResult, McpError>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
         let isle = self.handler_isle.clone();
         let registry = Arc::clone(&self.registry);
         let server_name = self.server_name.clone();
 
         async move {
             // ── Crux: Form-only dispatch — Url variant never reaches Lua ──────────
+            // ElicitRequestParams is #[non_exhaustive]; unknown future variants take
+            // the same spec-neutral Decline path as Url.
             let (message, requested_schema) = match request {
-                CreateElicitationRequestParams::UrlElicitationParams { .. } => {
-                    return Ok(CreateElicitationResult {
-                        action: ElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    });
-                }
-                CreateElicitationRequestParams::FormElicitationParams {
+                ElicitRequestParams::FormElicitationParams {
                     message,
                     requested_schema,
                     ..
                 } => (message, requested_schema),
+                _ => {
+                    return Ok(ElicitResult::new(ElicitationAction::Decline));
+                }
             };
 
             // If no server_name wired, fall through to method_not_found.
@@ -1446,11 +1448,7 @@ impl ClientHandler for AgentBlockClientHandler {
 
             if !has_elicitation {
                 // No handler registered — spec neutral Decline (not an error).
-                return Ok(CreateElicitationResult {
-                    action: ElicitationAction::Decline,
-                    content: None,
-                    meta: None,
-                });
+                return Ok(ElicitResult::new(ElicitationAction::Decline));
             }
 
             let isle = match isle {
@@ -1527,11 +1525,7 @@ impl ClientHandler for AgentBlockClientHandler {
                 }
                 Ok(json_str) if json_str.is_empty() => {
                     // Lua returned nil — no handler registered in dispatcher → Decline.
-                    Ok(CreateElicitationResult {
-                        action: ElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    })
+                    Ok(ElicitResult::new(ElicitationAction::Decline))
                 }
                 Ok(json_str) => {
                     // ── Crux: 3-action response contract validation ────────────────
@@ -1557,23 +1551,22 @@ impl ClientHandler for AgentBlockClientHandler {
 
                     match action_str {
                         "accept" => {
-                            if content.is_none() {
-                                tracing::warn!(
-                                    target: "mcp_client",
-                                    server = %sn,
-                                    "create_elicitation: action=accept but content is nil"
-                                );
-                                return Err(McpError::internal_error(
-                                    "elicitation handler: action=accept but content is nil"
-                                        .to_string(),
-                                    None,
-                                ));
+                            match content {
+                                None => {
+                                    tracing::warn!(
+                                        target: "mcp_client",
+                                        server = %sn,
+                                        "create_elicitation: action=accept but content is nil"
+                                    );
+                                    Err(McpError::internal_error(
+                                        "elicitation handler: action=accept but content is nil"
+                                            .to_string(),
+                                        None,
+                                    ))
+                                }
+                                Some(content) => Ok(ElicitResult::new(ElicitationAction::Accept)
+                                    .with_content(content)),
                             }
-                            Ok(CreateElicitationResult {
-                                action: ElicitationAction::Accept,
-                                content,
-                                meta: None,
-                            })
                         }
                         "decline" => {
                             if content.is_some() {
@@ -1588,11 +1581,7 @@ impl ClientHandler for AgentBlockClientHandler {
                                     None,
                                 ));
                             }
-                            Ok(CreateElicitationResult {
-                                action: ElicitationAction::Decline,
-                                content: None,
-                                meta: None,
-                            })
+                            Ok(ElicitResult::new(ElicitationAction::Decline))
                         }
                         "cancel" => {
                             if content.is_some() {
@@ -1607,11 +1596,7 @@ impl ClientHandler for AgentBlockClientHandler {
                                     None,
                                 ));
                             }
-                            Ok(CreateElicitationResult {
-                                action: ElicitationAction::Cancel,
-                                content: None,
-                                meta: None,
-                            })
+                            Ok(ElicitResult::new(ElicitationAction::Cancel))
                         }
                         other => {
                             tracing::warn!(
