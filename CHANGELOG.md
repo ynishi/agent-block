@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-24
+
+### Added
+
+- **HTTPS (TLS) support for `mcp.connect_http`.** The Streamable HTTP
+  client transport was previously built without a TLS backend, so
+  `https://` MCP endpoints failed at connect with
+  `ConnectError("invalid URL, scheme is not http")`. The `mcp-http`
+  feature now enables rmcp's `reqwest-tls-no-provider` (rustls +
+  `rustls-platform-verifier`, i.e. the OS trust store), and
+  `connect_http` installs the rustls ring `CryptoProvider` idempotently
+  so SDK embedders that never pass through the CLI startup path get a
+  working TLS client instead of a panic at `reqwest::Client` build.
+  Certificate validation follows the OS trust store; self-signed
+  endpoints are not accepted (no insecure override is exposed).
+
+### Changed
+
+- **rmcp 1.4.0 → 3.x** (resolves 3.1.4), tracking MCP spec revision
+  2026-07-28 (stateless Streamable HTTP). Wire-facing fallout absorbed
+  inside `agent-block-mcp`: elicitation types renamed
+  (`CreateElicitation*` → `Elicit*`), non-exhaustive wire types are
+  built via constructors with wildcard match arms added,
+  `Content` → `ContentBlock` (`Raw*` wrappers removed),
+  `PromptMessageRole` → `Role`, and `with_stateful_mode` is replaced by
+  the `legacy_session_mode` default. Sampling / roots / logging stay on
+  the SEP-2577 deprecation window behind scoped `#[allow(deprecated)]`;
+  the legacy initialize lifecycle remains the default.
+- **MSRV 1.70 → 1.88** (required by rmcp 3.x).
+
 ## [0.31.0] - 2026-07-22
 
 ### Added
