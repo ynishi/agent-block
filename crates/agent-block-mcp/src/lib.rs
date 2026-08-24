@@ -441,8 +441,8 @@ impl McpManager {
     /// Send a `ping` keepalive to the named server and return the round-trip
     /// latency in milliseconds.
     ///
-    /// Uses `send_request(ClientRequest::PingRequest(...))` — rmcp 1.4.0 has
-    /// no dedicated `Peer::ping()` method.  Latency is measured with
+    /// Uses `send_request(ClientRequest::PingRequest(...))` — rmcp has no
+    /// dedicated client-side `Peer::ping()` method.  Latency is measured with
     /// `Instant::now()` immediately before the send and `elapsed()` immediately
     /// after the `EmptyResult` is received (crux must_not_simplify).
     ///
@@ -513,6 +513,9 @@ impl McpManager {
     /// Call `resources/subscribe` to subscribe to updates for the given URI.
     ///
     /// Immutable receiver — usable under `RwLock::read`.
+    // resources/subscribe is legacy-only under protocol 2026-07-28; kept for the
+    // deprecation window (migration target: Peer::listen / Subscription).
+    #[allow(deprecated)]
     pub async fn subscribe_resource(&self, name: &str, uri: &str) -> BlockResult<()> {
         let srv = self.servers.get(name).ok_or_else(|| {
             warn!(server = %name, uri = %uri, "mcp subscribe_resource on unknown server");
@@ -537,6 +540,9 @@ impl McpManager {
     /// Call `resources/unsubscribe` to stop receiving updates for the given URI.
     ///
     /// Immutable receiver — usable under `RwLock::read`.
+    // resources/unsubscribe is legacy-only under protocol 2026-07-28; kept for the
+    // deprecation window (migration target: cancel the Subscription handle).
+    #[allow(deprecated)]
     pub async fn unsubscribe_resource(&self, name: &str, uri: &str) -> BlockResult<()> {
         let srv = self.servers.get(name).ok_or_else(|| {
             warn!(server = %name, uri = %uri, "mcp unsubscribe_resource on unknown server");
@@ -676,10 +682,7 @@ impl McpManager {
         };
         let params = CompleteRequestParams::new(
             reference,
-            ArgumentInfo {
-                name: arg_name.to_string(),
-                value: arg_value.to_string(),
-            },
+            ArgumentInfo::new(arg_name.to_string(), arg_value.to_string()),
         );
         let srv = self.servers.get(name).ok_or_else(|| {
             warn!(server = %name, "mcp complete on unknown server");
@@ -752,10 +755,10 @@ impl McpManager {
         tokio::spawn(async move {
             // CancelledNotification is non-exhaustive; use ::new() which sets
             // method = CancelledNotificationMethod::default() and extensions = Default.
-            let notification = CancelledNotification::new(CancelledNotificationParam {
-                request_id: NumberOrString::Number(id),
-                reason: Some("cancelled".to_owned()),
-            });
+            let notification = CancelledNotification::new(CancelledNotificationParam::new(
+                Some(NumberOrString::Number(id)),
+                Some("cancelled".to_owned()),
+            ));
             if let Err(e) = peer.send_notification(notification.into()).await {
                 warn!(
                     server = %name_owned,

@@ -10,13 +10,18 @@
 //! (no lib target) and those tests need direct access to `McpManager`
 //! internals.
 
+// Logging is deprecated upstream (SEP-2577, protocol revision 2026-07-28) but
+// deliberately exercised by this test surface until the client on_log path is
+// migrated; suppress the rmcp deprecation warnings file-wide.
+#![allow(deprecated)]
+
 mod common;
 
 use predicates::prelude::*;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, ListToolsResult, LoggingLevel,
-        LoggingMessageNotificationParam, NumberOrString, PaginatedRequestParams,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+        LoggingLevel, LoggingMessageNotificationParam, NumberOrString, PaginatedRequestParams,
         ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo, Tool,
     },
     service::{MaybeSendFuture, RequestContext},
@@ -60,8 +65,8 @@ impl ServerHandler for CounterServer {
         &self,
         _params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::success(vec![Content::text("1")]))
+    ) -> Result<CallToolResponse, McpError> {
+        Ok(CallToolResult::success(vec![ContentBlock::text("1")]).into())
     }
 }
 
@@ -77,10 +82,11 @@ impl ServerHandler for CounterServer {
 async fn spawn_counter_http_server() -> (String, CancellationToken) {
     let ct = CancellationToken::new();
 
-    // Stateless mode: each POST is self-contained — no session affinity is
-    // needed for the single initialize → tools/list exchange in the fixture.
+    // rmcp 3.x default (`legacy_session_mode = true`) serves the legacy
+    // initialize handshake that `ServiceExt::serve`-based clients still use;
+    // the fully stateless path (`with_legacy_session_mode(false)`) requires a
+    // 2026-07-28 Discovery-lifecycle client.
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
         .with_sse_keep_alive(None)
         .with_cancellation_token(ct.child_token());
 
@@ -208,9 +214,9 @@ impl ServerHandler for ProgressTestServer {
         &self,
         _params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         // Extract the progressToken that the client auto-attached in _meta.
-        // In rmcp 1.4.0, _meta is deserialized into ctx.meta (not params.meta).
+        // In rmcp, _meta is deserialized into ctx.meta (not params.meta).
         // rmcp's Peer::send_request assigns a counter-based token via
         // AtomicU32ProgressTokenProvider; the fallback "tok-e2e" is never used
         // in practice but keeps the test server robust.
@@ -222,16 +228,13 @@ impl ServerHandler for ProgressTestServer {
         // Push a progress notification echoing the token back to the client.
         let _ = ctx
             .peer
-            .notify_progress(ProgressNotificationParam {
-                progress_token: ProgressToken(token),
-                progress: 1.0,
-                total: Some(1.0),
-                message: Some("done".into()),
-            })
+            .notify_progress(
+                ProgressNotificationParam::new(ProgressToken(token), 1.0)
+                    .with_total(1.0)
+                    .with_message("done"),
+            )
             .await;
-        Ok(CallToolResult::success(vec![Content::text(
-            "progress_sent",
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("progress_sent")]).into())
     }
 }
 
@@ -240,10 +243,6 @@ impl ServerHandler for ProgressTestServer {
 #[derive(Clone)]
 struct LoggingTestServer;
 
-// rmcp v1.4: `enable_logging()` / `notify_logging_message()` are deprecated
-// by SEP-2577. Kept on this test surface until the migration to the
-// post-2577 logging API lands (tracked separately).
-#[allow(deprecated)]
 impl ServerHandler for LoggingTestServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -272,17 +271,19 @@ impl ServerHandler for LoggingTestServer {
         &self,
         _params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         // Push a log notification before returning the result.
         let _ = ctx
             .peer
-            .notify_logging_message(LoggingMessageNotificationParam {
-                level: LoggingLevel::Info,
-                logger: Some("test-logger".into()),
-                data: serde_json::json!("e2e log message"),
-            })
+            .notify_logging_message(
+                LoggingMessageNotificationParam::new(
+                    LoggingLevel::Info,
+                    serde_json::json!("e2e log message"),
+                )
+                .with_logger("test-logger"),
+            )
             .await;
-        Ok(CallToolResult::success(vec![Content::text("log_sent")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("log_sent")]).into())
     }
 }
 
@@ -376,24 +377,19 @@ impl ServerHandler for NilPatternProgressServer {
         &self,
         _params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let token = ctx
             .meta
             .get_progress_token()
             .map(|t| t.0.clone())
             .unwrap_or(NumberOrString::String("tok-nil".into()));
+        // total / message stay None — triggers total=0.0 / message="" normalisation
+        // in the glue.
         let _ = ctx
             .peer
-            .notify_progress(ProgressNotificationParam {
-                progress_token: ProgressToken(token),
-                progress: 1.0,
-                total: None,   // triggers total=0.0 normalisation in glue
-                message: None, // triggers message="" normalisation in glue
-            })
+            .notify_progress(ProgressNotificationParam::new(ProgressToken(token), 1.0))
             .await;
-        Ok(CallToolResult::success(vec![Content::text(
-            "nil_progress_sent",
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("nil_progress_sent")]).into())
     }
 }
 
@@ -435,16 +431,17 @@ impl ServerHandler for NilPatternLoggingServer {
         &self,
         _params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
+        // logger stays None (triggers logger="" normalisation); data Null
+        // serialises to the "null" string.
         let _ = ctx
             .peer
-            .notify_logging_message(LoggingMessageNotificationParam {
-                level: LoggingLevel::Info,
-                logger: None,                  // triggers logger="" normalisation
-                data: serde_json::Value::Null, // serialises to "null" string
-            })
+            .notify_logging_message(LoggingMessageNotificationParam::new(
+                LoggingLevel::Info,
+                serde_json::Value::Null,
+            ))
             .await;
-        Ok(CallToolResult::success(vec![Content::text("nil_log_sent")]))
+        Ok(CallToolResult::success(vec![ContentBlock::text("nil_log_sent")]).into())
     }
 }
 

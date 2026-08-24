@@ -9,11 +9,10 @@ use super::*;
 use rmcp::{
     model::{
         CompleteRequestParams, CompleteResult, CompletionInfo, GetPromptRequestParams,
-        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        NumberOrString, PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt,
-        PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
-        ReadResourceRequestParams, ReadResourceResult, Reference, ResourceContents,
-        ServerCapabilities, ServerInfo,
+        GetPromptResponse, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, NumberOrString, PaginatedRequestParams, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Reference, ResourceContents, Role, ServerCapabilities, ServerInfo,
     },
     service::{MaybeSendFuture, RequestContext},
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -38,8 +37,8 @@ impl ServerHandler for ResourceTestServer {
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + MaybeSendFuture + '_
     {
         let resources = vec![
-            rmcp::model::Resource::new(RawResource::new("file:///hello.txt", "hello.txt"), None),
-            rmcp::model::Resource::new(RawResource::new("file:///world.txt", "world.txt"), None),
+            rmcp::model::Resource::new("file:///hello.txt", "hello.txt"),
+            rmcp::model::Resource::new("file:///world.txt", "world.txt"),
         ];
         std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
     }
@@ -48,13 +47,14 @@ impl ServerHandler for ResourceTestServer {
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResult, McpError>> + MaybeSendFuture + '_
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, McpError>> + MaybeSendFuture + '_
     {
         let uri = request.uri.clone();
         let text = format!("content of {uri}");
         std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
-        )])))
+        )])
+        .into()))
     }
 
     fn list_resource_templates(
@@ -65,14 +65,8 @@ impl ServerHandler for ResourceTestServer {
            + MaybeSendFuture
            + '_ {
         let templates = vec![
-            rmcp::model::ResourceTemplate::new(
-                RawResourceTemplate::new("file:///{name}.txt", "file-template"),
-                None,
-            ),
-            rmcp::model::ResourceTemplate::new(
-                RawResourceTemplate::new("db:///{table}/{id}", "db-template"),
-                None,
-            ),
+            rmcp::model::ResourceTemplate::new("file:///{name}.txt", "file-template"),
+            rmcp::model::ResourceTemplate::new("db:///{table}/{id}", "db-template"),
         ];
         std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(templates)))
     }
@@ -103,14 +97,11 @@ impl ServerHandler for PromptTestServer {
         &self,
         request: GetPromptRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<GetPromptResult, McpError>> + MaybeSendFuture + '_
+    ) -> impl std::future::Future<Output = Result<GetPromptResponse, McpError>> + MaybeSendFuture + '_
     {
         let name = request.name.clone();
-        let message = PromptMessage::new_text(
-            PromptMessageRole::User,
-            format!("This is the '{name}' prompt."),
-        );
-        std::future::ready(Ok(GetPromptResult::new(vec![message])))
+        let message = PromptMessage::new_text(Role::User, format!("This is the '{name}' prompt."));
+        std::future::ready(Ok(GetPromptResult::new(vec![message]).into()))
     }
 }
 
@@ -170,6 +161,9 @@ impl ServerHandler for CompleteTestServer {
                 CompletionInfo::with_pagination(vec!["file:///a.txt".to_string()], Some(1), false)
                     .expect("valid completion info")
             }
+            // Reference is #[non_exhaustive]; future variants complete to nothing.
+            _ => CompletionInfo::with_pagination(vec![], Some(0), false)
+                .expect("valid completion info"),
         };
         Ok(CompleteResult::new(info))
     }
@@ -646,12 +640,9 @@ async fn on_progress_no_op_when_no_isle() {
     handler.mark_on_progress("srv");
 
     // Simulate a progress notification arriving from rmcp task.
-    let params = ProgressNotificationParam {
-        progress_token: ProgressToken(NumberOrString::String("tok-1".into())),
-        progress: 0.5,
-        total: Some(1.0),
-        message: None,
-    };
+    let params =
+        ProgressNotificationParam::new(ProgressToken(NumberOrString::String("tok-1".into())), 0.5)
+            .with_total(1.0);
 
     // We can't construct a full NotificationContext without a live Peer.
     // The no-isle path exits immediately, so this is covered by the unit test
@@ -726,7 +717,7 @@ async fn server_info_returns_capabilities_for_prompt_server() {
 struct LoggingCapableServer;
 
 impl ServerHandler for LoggingCapableServer {
-    // rmcp v1.4: `enable_logging()` is deprecated by SEP-2577. Kept on
+    // rmcp 3.x: `enable_logging()` is deprecated by SEP-2577. Kept on
     // the test surface until the migration to the post-2577 logging
     // API lands (tracked separately).
     #[allow(deprecated)]
@@ -832,7 +823,7 @@ impl ServerHandler for RootsTestServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
     }
 
-    // rmcp v1.4: `peer.list_roots()` is deprecated by SEP-2577. Kept
+    // rmcp 3.x: `peer.list_roots()` is deprecated by SEP-2577. Kept
     // on the test surface until the migration to the post-2577 roots
     // API lands (tracked separately).
     #[allow(deprecated)]
@@ -840,7 +831,7 @@ impl ServerHandler for RootsTestServer {
         &self,
         _params: rmcp::model::CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
         // Issue a server→client `roots/list` request.
         // This triggers `AgentBlockClientHandler::list_roots` on the
         // client side, which calls the registered Lua roots handler.
@@ -854,9 +845,12 @@ impl ServerHandler for RootsTestServer {
             .first()
             .map(|r| r.uri.as_str())
             .unwrap_or("(none)");
-        Ok(rmcp::model::CallToolResult::success(vec![
-            rmcp::model::Content::text(format!("roots:{count}:{first_uri}")),
-        ]))
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(format!(
+                "roots:{count}:{first_uri}"
+            ))])
+            .into(),
+        )
     }
 }
 
@@ -1081,9 +1075,9 @@ impl ServerHandler for ElicitationTestServer {
         &self,
         _params: rmcp::model::CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
         use rmcp::model::{
-            CreateElicitationRequestParams, ElicitationSchema, PrimitiveSchema, StringSchema,
+            ElicitRequestParams, ElicitationSchema, PrimitiveSchemaDefinition, StringSchema,
         };
         use std::collections::BTreeMap;
 
@@ -1091,10 +1085,10 @@ impl ServerHandler for ElicitationTestServer {
         let mut props = BTreeMap::new();
         props.insert(
             "name".to_string(),
-            PrimitiveSchema::String(StringSchema::new()),
+            PrimitiveSchemaDefinition::String(StringSchema::new()),
         );
         let schema = ElicitationSchema::new(props);
-        let req = CreateElicitationRequestParams::FormElicitationParams {
+        let req = ElicitRequestParams::FormElicitationParams {
             meta: None,
             message: "What is your name?".to_string(),
             requested_schema: schema,
@@ -1111,14 +1105,19 @@ impl ServerHandler for ElicitationTestServer {
             rmcp::model::ElicitationAction::Accept => "accept",
             rmcp::model::ElicitationAction::Decline => "decline",
             rmcp::model::ElicitationAction::Cancel => "cancel",
+            // ElicitationAction is #[non_exhaustive].
+            _ => "unknown",
         };
         let content_str = result
             .content
             .map(|v| serde_json::to_string(&v).unwrap_or_default())
             .unwrap_or_default();
-        Ok(rmcp::model::CallToolResult::success(vec![
-            rmcp::model::Content::text(format!("elicitation:{action_str}:{content_str}")),
-        ]))
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(format!(
+                "elicitation:{action_str}:{content_str}"
+            ))])
+            .into(),
+        )
     }
 }
 
@@ -1137,11 +1136,11 @@ impl ServerHandler for ElicitationUrlTestServer {
         &self,
         _params: rmcp::model::CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
-        use rmcp::model::CreateElicitationRequestParams;
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        use rmcp::model::ElicitRequestParams;
 
         // Issue a Url variant — client must always Decline without Lua dispatch.
-        let req = CreateElicitationRequestParams::UrlElicitationParams {
+        let req = ElicitRequestParams::UrlElicitationParams {
             meta: None,
             message: "Please complete this form online".to_string(),
             url: "https://example.com/form".to_string(),
@@ -1158,10 +1157,15 @@ impl ServerHandler for ElicitationUrlTestServer {
             rmcp::model::ElicitationAction::Accept => "accept",
             rmcp::model::ElicitationAction::Decline => "decline",
             rmcp::model::ElicitationAction::Cancel => "cancel",
+            // ElicitationAction is #[non_exhaustive].
+            _ => "unknown",
         };
-        Ok(rmcp::model::CallToolResult::success(vec![
-            rmcp::model::Content::text(format!("url_elicitation:{action_str}")),
-        ]))
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(format!(
+                "url_elicitation:{action_str}"
+            ))])
+            .into(),
+        )
     }
 }
 

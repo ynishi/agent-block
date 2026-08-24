@@ -21,7 +21,10 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 
 use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities,
+        ServerInfo,
+    },
     service::{MaybeSendFuture, RequestContext},
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
@@ -43,12 +46,12 @@ impl ServerHandler for SlowToolServer {
         &self,
         _params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + MaybeSendFuture + '_
+    ) -> impl std::future::Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_
     {
         let delay = self.delay;
         async move {
             tokio::time::sleep(delay).await;
-            Ok(CallToolResult::success(vec![Content::text("ok")]))
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
         }
     }
 }
@@ -155,8 +158,8 @@ impl ServerHandler for IsErrorServer {
         &self,
         _params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::error(vec![Content::text("tool blew up")]))
+    ) -> Result<CallToolResponse, McpError> {
+        Ok(CallToolResult::error(vec![ContentBlock::text("tool blew up")]).into())
     }
 }
 

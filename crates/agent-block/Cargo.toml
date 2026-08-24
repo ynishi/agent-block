@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 keywords = ["lua", "agent", "runtime", "mcp", "mesh"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.70"
+rust-version = "1.88"
 
 [[bin]]
 name = "agent-block"
@@ -38,7 +38,7 @@ tempfile = "3"
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
 # `transport-streamable-http-server` enables the axum-backed in-process HTTP
 # server used by `tests/e2e_mcp_rich.rs`.
-rmcp = { version = "1.4.0", features = ["server", "transport-streamable-http-server", "elicitation"] }
+rmcp = { version = "3.0.1", features = ["server", "transport-streamable-http-server", "elicitation"] }
 # `test-util` enables `tokio::time::pause`/`advance`/`resume`.
 tokio = { version = "1", features = ["full", "test-util"] }
 # axum is needed by `tests/e2e_mcp_rich.rs` to serve the in-process

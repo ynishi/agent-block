@@ -23,6 +23,11 @@
 //! cargo run --example echo_mcp_server -- --transport http --port 0 --request-sampling
 //! ```
 
+// This harness deliberately exercises Sampling / Logging, which rmcp 3.x marks
+// deprecated (SEP-2577, protocol revision 2026-07-28). Kept until the client
+// paths they smoke-test are migrated; suppress the deprecation noise file-wide.
+#![allow(deprecated)]
+
 use std::{
     future::Future,
     sync::{
@@ -34,13 +39,13 @@ use std::{
 use clap::{Parser, ValueEnum};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, CreateMessageRequestParams,
-        GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
-        ListToolsResult, LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
-        ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
-        PromptMessageRole, RawResource, ReadResourceRequestParams, ReadResourceResult,
-        ResourceContents, SamplingMessage, ServerCapabilities, ServerInfo, SetLevelRequestParams,
-        Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        CreateMessageRequestParams, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+        ListPromptsResult, ListResourcesResult, ListToolsResult, LoggingLevel,
+        LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
+        ProgressToken, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, ResourceContents, Role, SamplingMessage,
+        ServerCapabilities, ServerInfo, SetLevelRequestParams, Tool,
     },
     service::{MaybeSendFuture, RequestContext},
     transport::streamable_http_server::{
@@ -104,10 +109,6 @@ impl EchoServer {
 }
 
 impl ServerHandler for EchoServer {
-    // rmcp v1.4: `enable_logging()` is deprecated by SEP-2577. Kept on
-    // this example until the migration to the post-2577 logging API
-    // lands (tracked separately).
-    #[allow(deprecated)]
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -162,15 +163,11 @@ impl ServerHandler for EchoServer {
 
     // ── tools/call ───────────────────────────────────────────────────────────
 
-    // rmcp v1.4: `peer.create_message()` and `peer.notify_logging_message()`
-    // are deprecated by SEP-2577. Kept on this example until the migration
-    // to the post-2577 sampling/logging APIs lands (tracked separately).
-    #[allow(deprecated)]
     async fn call_tool(
         &self,
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let args = params.arguments.clone().unwrap_or_default();
 
         match params.name.as_ref() {
@@ -208,17 +205,19 @@ impl ServerHandler for EchoServer {
                         for n in 1u8..=5 {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             let _ = peer
-                                .notify_logging_message(LoggingMessageNotificationParam {
-                                    level: LoggingLevel::Info,
-                                    logger: Some("echo".into()),
-                                    data: serde_json::json!(format!("tick {n}")),
-                                })
+                                .notify_logging_message(
+                                    LoggingMessageNotificationParam::new(
+                                        LoggingLevel::Info,
+                                        serde_json::json!(format!("tick {n}")),
+                                    )
+                                    .with_logger("echo"),
+                                )
                                 .await;
                         }
                     });
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
             }
 
             "slow_echo" => {
@@ -235,7 +234,7 @@ impl ServerHandler for EchoServer {
                     .max(1);
 
                 // Extract progress token from _meta if provided.
-                // In rmcp 1.4.0, `_meta` is deserialized into `ctx.meta` (via
+                // In rmcp, `_meta` is deserialized into `ctx.meta` (via
                 // extensions), not `params.meta` which is always None after the
                 // wire round-trip.
                 let token_opt: Option<ProgressToken> = ctx.meta.get_progress_token();
@@ -246,17 +245,19 @@ impl ServerHandler for EchoServer {
                     if let Some(ref token) = token_opt {
                         let _ = ctx
                             .peer
-                            .notify_progress(ProgressNotificationParam {
-                                progress_token: ProgressToken(token.0.clone()),
-                                progress: step as f64,
-                                total: Some(steps as f64),
-                                message: Some(format!("step {step}/{steps}")),
-                            })
+                            .notify_progress(
+                                ProgressNotificationParam::new(
+                                    ProgressToken(token.0.clone()),
+                                    step as f64,
+                                )
+                                .with_total(steps as f64)
+                                .with_message(format!("step {step}/{steps}")),
+                            )
                             .await;
                     }
                 }
 
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
             }
 
             other => Err(McpError::invalid_params(
@@ -274,8 +275,8 @@ impl ServerHandler for EchoServer {
         _ctx: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + MaybeSendFuture + '_ {
         let resources = vec![
-            rmcp::model::Resource::new(RawResource::new("text://hello", "hello"), None),
-            rmcp::model::Resource::new(RawResource::new("text://note", "note"), None),
+            rmcp::model::Resource::new("text://hello", "hello"),
+            rmcp::model::Resource::new("text://note", "note"),
         ];
         std::future::ready(Ok(ListResourcesResult::with_all_items(resources)))
     }
@@ -286,7 +287,7 @@ impl ServerHandler for EchoServer {
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + MaybeSendFuture + '_ {
+    ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + MaybeSendFuture + '_ {
         let uri = request.uri.clone();
         let text = match uri.as_str() {
             "text://hello" => "hello world".to_string(),
@@ -300,7 +301,8 @@ impl ServerHandler for EchoServer {
         };
         std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text, uri,
-        )])))
+        )])
+        .into()))
     }
 
     // ── prompts/list ─────────────────────────────────────────────────────────
@@ -326,7 +328,7 @@ impl ServerHandler for EchoServer {
         &self,
         request: GetPromptRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<GetPromptResult, McpError>> + MaybeSendFuture + '_ {
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + MaybeSendFuture + '_ {
         if request.name != "greet" {
             return std::future::ready(Err(McpError::invalid_params(
                 format!("unknown prompt: {}", request.name),
@@ -342,8 +344,8 @@ impl ServerHandler for EchoServer {
             .unwrap_or("world")
             .to_string();
 
-        let message = PromptMessage::new_text(PromptMessageRole::User, format!("hello, {name}"));
-        std::future::ready(Ok(GetPromptResult::new(vec![message])))
+        let message = PromptMessage::new_text(Role::User, format!("hello, {name}"));
+        std::future::ready(Ok(GetPromptResult::new(vec![message]).into()))
     }
 
     // ── logging/setLevel ─────────────────────────────────────────────────────
