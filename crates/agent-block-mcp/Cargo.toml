@@ -19,12 +19,22 @@ mcp-http = [
     "rmcp/client-side-sse",
     "rmcp/transport-streamable-http-client",
     "rmcp/transport-streamable-http-client-reqwest",
+    # TLS for https:// MCP endpoints. `reqwest-tls-no-provider` = rustls +
+    # rustls-platform-verifier (OS trust store) WITHOUT bundling a crypto
+    # provider. Chosen over `rmcp/reqwest` (rustls + aws-lc-rs) to avoid a
+    # second provider conflicting with the ring provider already used for WSS.
+    # reqwest panics at Client build unless a process-level provider is
+    # installed, so `connect_http` installs ring idempotently (see http.rs) —
+    # hence the direct rustls dep below.
+    "rmcp/reqwest-tls-no-provider",
+    "dep:rustls",
 ]
 
 [dependencies]
 agent-block-types.workspace = true
 
 rmcp.workspace = true
+rustls = { workspace = true, optional = true }
 mlua.workspace = true
 mlua-isle.workspace = true
 tokio.workspace = true

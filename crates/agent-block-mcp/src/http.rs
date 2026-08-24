@@ -30,6 +30,15 @@ pub(super) async fn connect_http_transport(
     handler: AgentBlockClientHandler,
     rpc_timeout: std::time::Duration,
 ) -> BlockResult<RunningService<RoleClient, AgentBlockClientHandler>> {
+    // reqwest is built with `rustls-no-provider`, which panics at Client build
+    // when no process-level CryptoProvider is installed. Install ring
+    // idempotently; an earlier install by the embedding process (e.g. the CLI
+    // installs it for WSS) wins and the failed re-install is ignored.
+    static INSTALL_RING_PROVIDER: std::sync::Once = std::sync::Once::new();
+    INSTALL_RING_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     if let Some(auth) = opts
         .get("auth_header")
