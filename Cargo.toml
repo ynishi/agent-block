@@ -8,19 +8,19 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 authors = ["Yutaka Nishimura"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/agent-block"
 
 [workspace.dependencies]
-agent-block-types = { path = "crates/agent-block-types", version = "0.32.0" }
+agent-block-types = { path = "crates/agent-block-types", version = "0.33.0" }
 # default-features = false so in-workspace consumers (core) control the
 # `mcp-http` transport feature explicitly. External consumers still get the
 # crate's own default (["mcp-http"]) — this only affects this workspace.
-agent-block-mcp   = { path = "crates/agent-block-mcp",   version = "0.32.0", default-features = false }
-agent-block-core  = { path = "crates/agent-block-core",  version = "0.32.0" }
+agent-block-mcp   = { path = "crates/agent-block-mcp",   version = "0.33.0", default-features = false }
+agent-block-core  = { path = "crates/agent-block-core",  version = "0.33.0" }
 
 thiserror    = "2"
 serde        = { version = "1", features = ["derive"] }
