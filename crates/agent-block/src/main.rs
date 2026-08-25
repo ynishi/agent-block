@@ -1,7 +1,7 @@
 //! agent-block CLI entry point.
 //!
-//! Parses command-line arguments and launches the Host.
-//! The binary is intentionally thin — all logic lives in Lua scripts.
+//! Parses command-line arguments, optionally enters the sandbox, and launches
+//! the Host. The binary is intentionally thin — all logic lives in Lua scripts.
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
+use agent_block_core::sandbox::{self, SandboxConfig};
 use agent_block_core::{run, BlockConfig};
 use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
 
@@ -61,11 +62,27 @@ struct Cli {
     /// Mutually exclusive with `--context`.
     #[arg(long, value_name = "FILE", conflicts_with = "context")]
     context_file: Option<PathBuf>,
+
+    /// Run inside an OS-level execution boundary (Linux only).
+    ///
+    /// Filesystem writes are confined to the project root, `AGENT_BLOCK_HOME`,
+    /// `/tmp`, a few `/dev` nodes, and `AGENT_BLOCK_SANDBOX_FS_RW`; io_uring is
+    /// denied. Reads and executes are unrestricted. The boundary is inherited
+    /// by `sh.exec` and `mcp.connect` child processes. Set
+    /// `AGENT_BLOCK_SANDBOX_TCP=0` to also deny TCP.
+    ///
+    /// Env: `AGENT_BLOCK_SANDBOX` — read manually by `SandboxConfig::from_env`
+    /// rather than bound here: clap parses before the project `.env` is loaded
+    /// and its bool binding accepts only literal `true`/`false`, while the
+    /// manual read supports the documented truthy/falsy set (`1`, `yes`, …).
+    #[arg(long)]
+    sandbox: bool,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(err) = run_cli().await {
+// Deliberately *not* `#[tokio::main]`: the sandbox has to be installed before
+// any worker thread exists (see `startup` below).
+fn main() {
+    if let Err(err) = startup() {
         // Human-readable one-line summary + cause chain, instead of anyhow's
         // default `{:?}` Debug dump. Keeps the non-zero exit code contract.
         eprintln!("error: {err}");
@@ -76,7 +93,13 @@ async fn main() {
     }
 }
 
-async fn run_cli() -> anyhow::Result<()> {
+/// Synchronous startup path: parse → sandbox → build runtime → run.
+///
+/// The ordering here is load-bearing. Landlock's `restrict_self` and the seccomp
+/// filter cover the calling thread plus everything spawned afterwards, so the
+/// sandbox must be applied before the tokio runtime creates its worker threads
+/// — hence a hand-built runtime instead of the `#[tokio::main]` macro.
+fn startup() -> anyhow::Result<()> {
     // rustls 0.23+ requires an explicit CryptoProvider install when multiple
     // (or zero) backends are compiled in. tokio-tungstenite + reqwest pull
     // rustls transitively; without this the first WSS connect panics.
@@ -91,6 +114,27 @@ async fn run_cli() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // The SDK host loads `{project}/.env` as well, but that happens far too late
+    // for the sandbox knobs. dotenvy never overwrites an already-set variable,
+    // so loading it twice is equivalent to loading it once. A missing `.env` is
+    // not an error (same fail-silent semantics as the host-side load).
+    let _ = dotenvy::from_path(cli.project.join(".env"));
+
+    let sandbox_config = SandboxConfig::from_env(cli.sandbox);
+    if sandbox_config.enabled {
+        sandbox::apply(&sandbox_config, &cli.project)
+            .context("failed to enter sandbox mode (--sandbox / AGENT_BLOCK_SANDBOX)")?;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build the tokio runtime")?;
+
+    runtime.block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let mcp_rpc_timeout = cli
         .mcp_timeout_secs
         .map(Duration::from_secs)

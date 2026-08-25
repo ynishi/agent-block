@@ -49,3 +49,9 @@ rustls       = { version = "0.23", default-features = false, features = ["ring"]
 agent-mesh-core = "0.3"
 agent-mesh-sdk  = "0.3"
 llm-extract     = "0.1"
+# Sandbox (Linux-only, pulled in under a `cfg(target_os = "linux")` target
+# table in agent-block-core): Landlock for the filesystem/TCP boundary,
+# seccompiler for the io_uring deny, libc for syscall numbers + errno.
+landlock        = "0.4.7"
+seccompiler     = "0.5.0"
+libc            = "0.2"

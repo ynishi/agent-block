@@ -2,12 +2,20 @@
 //!
 //! # Security
 //!
-//! Currently no restrictions on command execution — Lua scripts can run
-//! arbitrary shell commands via `sh -c`.  This is intentional during
-//! development; the trust boundary is the Lua script author.
+//! By default there are no restrictions on command execution — Lua scripts can
+//! run arbitrary shell commands via `sh -c`.  This is intentional; the trust
+//! boundary is the Lua script author.
 //!
-//! A proper security model (sandboxing, allowlists, capability-based
-//! policies, etc.) will be designed separately before production use.
+//! Sandbox mode (`--sandbox` / `AGENT_BLOCK_SANDBOX`, Linux only) narrows what
+//! those commands can *do* rather than what they may be: the Landlock ruleset
+//! and seccomp filter installed at startup are inherited by every child spawned
+//! here, so filesystem writes outside the allowlist and io_uring are denied for
+//! `sh -c` payloads too, without this bridge knowing about it. See
+//! [`crate::sandbox`] for the enforced semantics and its limitations.
+//!
+//! Sandbox mode is off by default, so the default trust boundary is unchanged.
+//! It is a coarse execution boundary, not a command allowlist or a
+//! capability-based policy — those remain unimplemented.
 
 use mlua::prelude::*;
 use std::path::PathBuf;

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sandbox mode (`--sandbox` / `AGENT_BLOCK_SANDBOX`, Linux only).** An
+  opt-in, process-wide execution boundary built from Landlock (filesystem
+  and TCP) plus a seccomp filter that denies the three io_uring entry
+  points with `EPERM`. Reads and executes stay unrestricted; writes are
+  confined to the project root, `AGENT_BLOCK_HOME`, `/tmp`, a few `/dev`
+  nodes, and the `:`-separated `AGENT_BLOCK_SANDBOX_FS_RW` list (missing
+  entries are skipped). `AGENT_BLOCK_SANDBOX_TCP=0` additionally denies
+  TCP bind/connect. Because Landlock rulesets and seccomp filters are
+  inherited across `fork`/`execve`, `sh.exec` payloads and `mcp.connect`
+  servers land inside the same boundary without any per-bridge wiring, and
+  the Lua `os.*` / `io.*` stdlib is caught at the OS layer rather than
+  being removed. Startup is fail-closed: if the sandbox is requested but
+  the kernel enforces nothing — or the project root cannot be resolved, or
+  an explicit TCP denial cannot be enforced (kernel older than 6.7) — the
+  process exits with an error; a partial enforcement of the default rights
+  on an older Landlock ABI warns and continues. Known limitations: Linux
+  only, UDP/DNS are not restricted, io_uring is unavailable inside the
+  sandbox (and its deny is compiled only on x86_64/aarch64), and TCP is a
+  single on/off switch. New public module `agent_block_core::sandbox`
+  (`SandboxConfig` / `apply`).
+
+### Changed
+
+- The `agent-block` binary no longer uses `#[tokio::main]`. Startup is a
+  synchronous `parse → .env → sandbox → build runtime → run` sequence,
+  because Landlock's `restrict_self` and the seccomp filter only cover the
+  calling thread and threads created afterwards — the boundary has to be
+  installed before the runtime spawns workers. Behaviour is otherwise
+  unchanged (same multi-threaded runtime with all drivers enabled). The
+  CLI also loads `{project}/.env` before reading the sandbox knobs; the
+  host-side load stays in place and `dotenvy` never overrides variables
+  that are already set.
+
 ## [0.32.0] - 2026-08-24
 
 ### Added

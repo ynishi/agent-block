@@ -46,6 +46,14 @@ dotenvy.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 
+# Sandbox backend (`crate::sandbox`). Linux-only: Landlock and seccomp have no
+# equivalent elsewhere, and `sandbox::apply` returns an explicit "Linux-only"
+# error on other targets rather than silently doing nothing.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+seccompiler.workspace = true
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7" }

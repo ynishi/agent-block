@@ -26,9 +26,18 @@
 //!   `BlockConfig::sql_path` / `kv_path` / `ts_path` are accepted but ignored
 //!   (fields retained for API stability).
 //! - `mcp-http`: `mcp.connect_http` returns an explicit error when called.
+//!
+//! # Sandbox
+//!
+//! [`sandbox`] installs an optional process-wide execution boundary (Landlock +
+//! seccomp, Linux only): filesystem writes are confined to an allowlist and
+//! io_uring is denied, while reads and executes stay open. It is inherited by
+//! `sh.exec` / `mcp.connect` children, and must be applied before any async
+//! runtime spawns worker threads — see the module docs.
 
 pub mod bridge;
 pub mod bus;
 pub mod host;
+pub mod sandbox;
 
 pub use host::{run, BlockConfig, BlockConfigBuilder, HostContext};

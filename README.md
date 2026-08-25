@@ -92,6 +92,65 @@ Both flags also accept environment variables as fallback:
 | `--prompt` | `AGENT_BLOCK_PROMPT` |
 | `-c / --context` | `AGENT_BLOCK_CONTEXT` |
 
+## Sandbox mode (Linux)
+
+`--sandbox` wraps the whole process in an OS-level execution boundary built from
+[Landlock](https://landlock.io/) (filesystem + TCP) and a seccomp filter (io_uring).
+It is off by default.
+
+```sh
+# Confine writes; TCP stays open
+agent-block --sandbox --script my_agent.lua --project .
+
+# Same, plus extra writable paths and no TCP at all
+AGENT_BLOCK_SANDBOX_FS_RW=/opt/cache:/srv/data \
+AGENT_BLOCK_SANDBOX_TCP=0 \
+    agent-block --sandbox --script my_agent.lua
+```
+
+| Flag / Env var | Default | Effect |
+|---|---|---|
+| `--sandbox` / `AGENT_BLOCK_SANDBOX` | off | Install the boundary at startup |
+| `AGENT_BLOCK_SANDBOX_FS_RW` | *(empty)* | `:`-separated extra writable paths |
+| `AGENT_BLOCK_SANDBOX_TCP` | `true` | `0` / `false` / `no` / `off` denies TCP bind + connect |
+
+What it enforces:
+
+- **Reads and executes are unrestricted.** PATH lookups, shared libraries and
+  ordinary tooling keep working — the boundary is about mutation, not secrecy.
+- **Writes are denied** except under the project root (`--project`), the
+  agent-block state dir (`AGENT_BLOCK_HOME`, default `$HOME/.agent-block`),
+  `/tmp`, `/dev/null`, `/dev/urandom`, `/dev/tty`, and anything listed in
+  `AGENT_BLOCK_SANDBOX_FS_RW`. Allowlist entries that do not exist are skipped.
+- **io_uring is denied** (`io_uring_setup` / `_enter` / `_register` return `EPERM`),
+  since a ring bypasses the syscall-level view a seccomp filter has.
+- **Child processes inherit it.** Landlock rulesets and seccomp filters survive
+  `fork`/`execve`, so `sh.exec` payloads and `mcp.connect` servers run inside the
+  same boundary with no extra wiring. The Lua `os.*` / `io.*` stdlib is left
+  intact and caught at the OS layer instead.
+- **Fail-closed startup.** If the sandbox is requested but the kernel enforces
+  nothing, the process exits with an error instead of running unconfined, and
+  an unresolvable `--project` path is a startup error (it is the primary write
+  grant). A partial enforcement of the default rights on older Landlock ABIs
+  logs a warning naming what was dropped and continues — except an explicitly
+  requested TCP denial (`AGENT_BLOCK_SANDBOX_TCP=0`), which aborts startup on
+  kernels older than 6.7 rather than silently failing open.
+
+KNOWN LIMITATIONS:
+
+1. **Linux only.** On other platforms `--sandbox` is a startup error, never a
+   silent no-op.
+2. **UDP and DNS are not restricted.** Landlock's network rights cover TCP
+   bind/connect only, so `AGENT_BLOCK_SANDBOX_TCP=0` does not stop UDP traffic
+   (DNS included) or unix-domain sockets.
+3. **io_uring cannot be used inside the sandbox**, including by dependencies
+   that would otherwise pick it up opportunistically.
+4. **TCP is a single on/off switch** — no per-host or per-port granularity. This
+   is an execution boundary, not a policy engine.
+5. **The io_uring deny only exists on x86_64 / aarch64.** On other Linux
+   architectures no seccomp filter is compiled and the deny is skipped with a
+   warning; the Landlock filesystem boundary still applies.
+
 ## MCP Echo Harness
 
 A self-contained reference MCP server for smoke-testing the agent-block MCP client bridge.
