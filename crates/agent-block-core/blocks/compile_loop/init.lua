@@ -817,7 +817,9 @@ local function parse_search_replace(text, multi_file, target_files_set)
 
         -- Try to find a path header at or after pos (before the next SEARCH marker).
         local ph_start, ph_end, ph_path = text:find("<<<%s*path=([^>]+)%s*>>>", pos)
-        local s_start, s_end = text:find("<<<<<<< SEARCH\n", pos, true)
+        -- Marker match tolerates a missing space before SEARCH ("<<<<<<<SEARCH"),
+        -- a variant some models emit that previously never recovered (issue #1 request 3).
+        local s_start, s_end = text:find("<<<<<<< ?SEARCH\n", pos)
 
         -- If both exist, pick whichever comes first.
         if ph_start and (not s_start or ph_start < s_start) then
@@ -852,8 +854,8 @@ local function parse_search_replace(text, multi_file, target_files_set)
                 return nil, "malformed SEARCH/REPLACE block: missing ======= separator"
             end
 
-            -- Find >>>>>>> REPLACE marker after separator
-            local rep_start, rep_end = text:find("\n>>>>>>> REPLACE", sep_end + 1, true)
+            -- Find >>>>>>> REPLACE marker after separator (space before REPLACE optional).
+            local rep_start, rep_end = text:find("\n>>>>>>> ?REPLACE", sep_end + 1)
             if not rep_start then
                 return nil, "malformed SEARCH/REPLACE block: missing >>>>>>> REPLACE marker"
             end
@@ -984,6 +986,23 @@ local function read_target_if_exists(path)
     return content
 end
 
+-- Write content to path, checking both the open and the write result.
+-- Shared by the single-file write paths, iterate_files, and the
+-- apply_search_replace tool handler so error shaping stays consistent.
+-- Returns true on success, or (false, err_string) on failure.
+local function write_file(path, content)
+    local f, oerr = io.open(path, "w")
+    if not f then
+        return false, tostring(oerr)
+    end
+    local wok, werr = f:write(content)
+    f:close()
+    if not wok then
+        return false, tostring(werr or "write failed")
+    end
+    return true
+end
+
 -- Build the failure-feedback user message.
 -- NOTE: This message contains ONLY spec and build feedback — no tool names,
 -- no JSON schema, no tool_use vocabulary. Child LLM action space is confined
@@ -1020,9 +1039,13 @@ end
 -- Multi-file lazy-load: tool spec + handler
 -- ============================================================
 
--- Maximum number of read_file tool calls allowed within a single iteration.
+-- Maximum number of tool calls (read_file / read_file_range / apply_search_replace)
+-- allowed within a single iteration.
 -- Prevents infinite tool-use loops when the child LLM re-requests the same file.
-local MAX_TOOL_CALLS_PER_ITER = 8
+-- Raised from 8 when apply_search_replace joined the tool set: write calls consume
+-- budget too (one call per edit), so an agentic model needs headroom for
+-- read → edit × N → done within one iter.
+local MAX_TOOL_CALLS_PER_ITER = 16
 
 -- ── Distill / cache constants (added ST1) ───────────────────────────────────
 -- Files with content length >= this threshold trigger the distill subloop (ST2-3).
@@ -1087,6 +1110,38 @@ local READ_FILE_RANGE_TOOL = {
             line_end = {
                 type = "integer",
                 description = "1-indexed end line, inclusive.",
+            },
+        },
+    },
+}
+
+-- Tool spec for the write channel (multi-file branch, tool_mode="auto" only).
+-- Mirrors the SEARCH/REPLACE text-block semantics: one call = one SR block,
+-- applied and written to disk immediately. Declared so that agentic-tuned models
+-- (which prefer tool calls over text contracts) can complete the whole loop via
+-- tools (issue #1 request 1). The SR text channel stays accepted in parallel.
+local APPLY_SEARCH_REPLACE_TOOL = {
+    name = "apply_search_replace",
+    description = "Apply ONE search/replace edit to a target file and write it to disk immediately. "
+        .. "Equivalent to emitting one SEARCH/REPLACE text block. "
+        .. "search must match the current file content exactly (whitespace included); "
+        .. "a whitespace-normalized fallback match is attempted when the exact match fails. "
+        .. "On mismatch an error is returned - re-read the file and retry with exact text.",
+    input_schema = {
+        type = "object",
+        required = { "path", "search", "replace" },
+        properties = {
+            path = {
+                type = "string",
+                description = "Absolute path. Must be one of the target_files paths provided in the spec.",
+            },
+            search = {
+                type = "string",
+                description = "Existing text to replace (character-exact, whitespace included).",
+            },
+            replace = {
+                type = "string",
+                description = "Replacement text.",
             },
         },
     },
@@ -1638,6 +1693,42 @@ local function read_file_tool_handler(path, target_files_set, mf_state, conf)
     return { ok = true, content = format_digest_response(mf_state.file_digest[path]) }
 end
 
+-- Handle an apply_search_replace tool call from the child LLM (write channel).
+-- Applies a single SEARCH/REPLACE edit to path via the same two-stage matcher
+-- as the text channel (apply_blocks: exact → ws-normalized) and writes the
+-- result to disk immediately.
+-- Returns {ok=true, content=confirmation} or {ok=false, error=string}.
+-- Never raises; errors are propagated as tool_result content so the child LLM
+-- can re-read the file and retry within the same iter.
+local function apply_search_replace_tool_handler(path, search, replace, target_files_set)
+    -- Allowlist check (same gate as the SR text channel's path-header validation).
+    if not target_files_set[path] then
+        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
+    end
+    if type(search) ~= "string" or search == "" then
+        return { ok = false, error = "search must be a non-empty string" }
+    end
+    if type(replace) ~= "string" then
+        return { ok = false, error = "replace must be a string" }
+    end
+    -- Always apply against raw disk content (digest cache is never a valid base).
+    local current = read_target_if_exists(path) or ""
+    local new_content, failed_indices = apply_blocks(current, { { path = path, search = search, replace = replace } })
+    if #failed_indices > 0 then
+        return {
+            ok = false,
+            error = "SEARCH text did not match the current content of "
+                .. path
+                .. ". Re-read the file (read_file / read_file_range) and retry with character-exact text.",
+        }
+    end
+    local wok, werr = write_file(path, new_content)
+    if not wok then
+        return { ok = false, error = "cannot write: " .. werr }
+    end
+    return { ok = true, content = "applied: " .. path }
+end
+
 -- ============================================================
 -- Multi-file helper
 -- ============================================================
@@ -1689,13 +1780,11 @@ local function iterate_files(target_files, grouped, existing_map)
                 )
             else
                 -- Write the new content.
-                local f, werr = io.open(abs_path, "w")
-                if not f then
-                    write_err = abs_path .. ": " .. tostring(werr)
+                local wok, werr = write_file(abs_path, new_content)
+                if not wok then
+                    write_err = abs_path .. ": " .. werr
                     break
                 end
-                f:write(new_content)
-                f:close()
                 new_contents_map[abs_path] = new_content
             end
         end
@@ -1734,7 +1823,7 @@ end
 -- run_loop(conf) executes the structural compile-and-fix loop.
 -- conf fields (K-96 full set, all resolved before entry):
 --   runner, lang, target_files (list<abs_path>), multi_file (bool), spec,
---   max_iters, system, edit_mode,
+--   max_iters, system, edit_mode, tool_mode ("auto"|"read_only"|"none"),
 --   provider, base_url, api_key, api_key_env, model,
 --   max_tokens, temperature, disable_thinking, timeout,
 --   on_iter (optional callback)
@@ -1750,6 +1839,12 @@ local function run_loop(conf)
     local lang = conf.lang or "lua"
     local max_iters = conf.max_iters or 5
     local multi_file = conf.multi_file or false
+    -- tool_mode governs which tools are declared to the child LLM (multi-file only):
+    --   "auto" (default): read_file + read_file_range + apply_search_replace
+    --   "read_only":      read_file + read_file_range (pre-issue-#1 behaviour)
+    --   "none":           no tools declared — for callers that inline all target
+    --                     file contents in the spec (issue #1 request 2)
+    local tool_mode = conf.tool_mode or "auto"
     local mode = resolve_dump_mode()
 
     -- In single-file mode, artifact_path is the single absolute path (backward compat).
@@ -1803,10 +1898,19 @@ local function run_loop(conf)
         for _, p in ipairs(conf.target_files) do
             table.insert(path_lines, "  " .. p)
         end
-        multi_initial_user_content = conf.spec
-            .. "\n\nFiles:\n"
-            .. table.concat(path_lines, "\n")
-            .. "\n\nUse the read_file tool to fetch file content when needed."
+        local tool_hint
+        if tool_mode == "none" then
+            -- No tools declared; the caller inlines file contents in the spec.
+            tool_hint = ""
+        elseif tool_mode == "read_only" then
+            tool_hint = "\n\nUse the read_file tool to fetch file content when needed."
+        else -- "auto"
+            tool_hint = "\n\nUse the read_file tool to fetch file content when needed."
+                .. "\nYou may apply edits either by emitting SEARCH/REPLACE text blocks,"
+                .. " or by calling the apply_search_replace tool (one edit per call)."
+                .. "\nWhen all edits have been applied via tool calls, reply with the single word DONE."
+        end
+        multi_initial_user_content = conf.spec .. "\n\nFiles:\n" .. table.concat(path_lines, "\n") .. tool_hint
     end
 
     -- ── Single-file: build initial user_content (original behaviour) ───────────
@@ -1874,6 +1978,15 @@ local function run_loop(conf)
 
     for iter = 1, max_iters do
         local iter_edits_applied = 0 -- reset each iter; incremented when >= 1 edit succeeds
+        -- Signatures (path\1search\1replace) of edits applied via the
+        -- apply_search_replace tool this iter. Mixed into the SR stagnation hash so
+        -- that iters differing only in tool-channel edits are not falsely flagged
+        -- as identical (the text content may be a constant "DONE").
+        local iter_tool_edit_sigs = {}
+        -- Errors from failed apply_search_replace calls this iter. Used to build
+        -- accurate zero-edit feedback when the model worked the tool channel but
+        -- every call missed (instead of a misleading "Output format invalid").
+        local iter_tool_edit_errors = {}
         local obs_target = artifact_path or table.concat(conf.target_files, ",")
         obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
 
@@ -1904,14 +2017,18 @@ local function run_loop(conf)
 
         -- ── LLM call 1 (multi-file: may return tool_use; single-file: returns SR/code) ──
         local call_opts = conf
-        if multi_file then
-            -- Attach tool spec so the child LLM can call read_file.
+        if multi_file and tool_mode ~= "none" then
+            -- Attach tool spec per tool_mode.
             -- We build a shallow copy of conf with tools added to avoid mutating conf.
             call_opts = {}
             for k, v in pairs(conf) do
                 call_opts[k] = v
             end
-            call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
+            if tool_mode == "read_only" then
+                call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
+            else -- "auto"
+                call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL, APPLY_SEARCH_REPLACE_TOOL }
+            end
         end
 
         local resp, err = llm_call(call_opts, messages)
@@ -1924,6 +2041,7 @@ local function run_loop(conf)
                 iters = iter - 1,
                 summary = make_summary(false, iter - 1, max_iters, "llm_call"),
                 artifact_path = artifact_path,
+                modified_files = multi_file and collect_modified_paths(mf_state.modified_set) or nil,
                 history = history,
             }
         end
@@ -1968,6 +2086,8 @@ local function run_loop(conf)
                         iters = iter,
                         summary = make_summary(false, iter, max_iters, "tool_loop"),
                         artifact_path = nil,
+                        -- crux §3: tool-channel writes may already have landed this iter.
+                        modified_files = collect_modified_paths(mf_state.modified_set),
                         history = history,
                     }
                 end
@@ -2072,6 +2192,49 @@ local function run_loop(conf)
                             tool_use_id = tb.id,
                             content = rr_text,
                         })
+                    elseif tb.name == "apply_search_replace" then
+                        -- Write channel (issue #1 request 1): apply one SR edit and
+                        -- write to disk immediately. Counts as an applied edit for
+                        -- stagnation bookkeeping, mirroring the text channel.
+                        local inp = tb.input or {}
+                        local asr_path = inp.path or ""
+                        local asr =
+                            apply_search_replace_tool_handler(asr_path, inp.search, inp.replace, target_files_set)
+                        local asr_text
+                        if asr.ok then
+                            asr_text = asr.content
+                            iter_edits_applied = iter_edits_applied + 1
+                            bad_stagnation_count = 0
+                            mf_state.modified_set[asr_path] = true
+                            -- Invalidate stale views of the file: the per-iter read
+                            -- cache and the cross-iter digest cache both predate the write.
+                            existing_map[asr_path] = nil
+                            mf_state.file_digest[asr_path] = nil
+                            table.insert(
+                                iter_tool_edit_sigs,
+                                asr_path .. "\1" .. tostring(inp.search) .. "\1" .. tostring(inp.replace)
+                            )
+                            obs_event(mode, "tool_use", {
+                                { "iter", iter },
+                                { "path", asr_path },
+                                { "tool", "apply_search_replace" },
+                                { "ok", true },
+                            })
+                        else
+                            asr_text = "ERROR: " .. tostring(asr.error)
+                            table.insert(iter_tool_edit_errors, tostring(asr.error))
+                            obs_event(mode, "tool_use_fail", {
+                                { "iter", iter },
+                                { "path", asr_path },
+                                { "tool", "apply_search_replace" },
+                                { "err", asr.error },
+                            })
+                        end
+                        table.insert(tool_result_content, {
+                            type = "tool_result",
+                            tool_use_id = tb.id,
+                            content = asr_text,
+                        })
                     else
                         -- Unknown tool name; return error to child LLM.
                         obs_event(mode, "tool_use_fail", {
@@ -2101,6 +2264,8 @@ local function run_loop(conf)
                         iters = iter,
                         summary = make_summary(false, iter, max_iters, "llm_call"),
                         artifact_path = nil,
+                        -- crux §3: tool-channel writes may already have landed this iter.
+                        modified_files = collect_modified_paths(mf_state.modified_set),
                         history = history,
                     }
                 end
@@ -2123,9 +2288,31 @@ local function run_loop(conf)
             -- Parse SEARCH/REPLACE blocks from the LLM text response.
             -- Pass multi_file flag and allowlist set for path validation.
             local blocks, parse_err = parse_search_replace(content, multi_file, target_files_set)
-            if not blocks then
-                -- Parse failure: tell the child LLM to re-emit valid blocks.
-                local fmt_msg = "Output format invalid: " .. tostring(parse_err) .. "\nRe-emit blocks correctly."
+            -- "no blocks found" is benign when the tool channel already applied edits
+            -- this iter (the model was told to reply DONE). A *malformed* block is
+            -- never benign — skipping feedback would silently discard its edit.
+            local benign_no_blocks = parse_err ~= nil
+                and tostring(parse_err):find("no SEARCH/REPLACE blocks found", 1, true) ~= nil
+            if not blocks and not (multi_file and iter_edits_applied > 0 and benign_no_blocks) then
+                local fmt_msg
+                if multi_file and benign_no_blocks and #iter_tool_edit_errors > 0 then
+                    -- The model worked the tool channel but every apply_search_replace
+                    -- call failed; restate the tool errors instead of a format complaint.
+                    fmt_msg = "No edits were applied: every apply_search_replace call failed.\n"
+                        .. table.concat(iter_tool_edit_errors, "\n")
+                        .. "\nRe-read the affected files (read_file / read_file_range) and retry with"
+                        .. " character-exact search text, or emit SEARCH/REPLACE text blocks."
+                else
+                    -- Parse failure: tell the child LLM to re-emit valid blocks.
+                    -- The feedback restates the exact marker literals so a model that
+                    -- drifted on marker format can recover (issue #1 request 3).
+                    fmt_msg = "Output format invalid: "
+                        .. tostring(parse_err)
+                        .. "\nExpected block format (markers must be exact):\n"
+                        .. (multi_file and "<<< path=<file_path> >>>\n" or "")
+                        .. "<<<<<<< SEARCH\n<existing text>\n=======\n<replacement text>\n>>>>>>> REPLACE\n"
+                        .. "Re-emit blocks correctly."
+                end
                 local entry = {
                     iter = iter,
                     code = nil,
@@ -2253,7 +2440,10 @@ local function run_loop(conf)
                 -- ── multi-file diff apply (per-iter rebuild path) ────────────────
                 -- existing_map was populated by the tool dispatch loop above.
                 -- Apply blocks using the on-demand-populated existing_map.
-                local grouped = group_blocks_by_path(blocks)
+                -- blocks may be nil here when the child LLM applied all edits via the
+                -- apply_search_replace tool and emitted no SR text (iter_edits_applied
+                -- > 0 guards this path); an empty list proceeds straight to verify.
+                local grouped = group_blocks_by_path(blocks or {})
                 local new_contents_map, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
                 -- Accumulate successfully-written paths into mf_state.modified_set for
                 -- modified_files preservation on every return path (crux §3).
@@ -2305,7 +2495,9 @@ local function run_loop(conf)
                         end
                     end
                     -- Update state via update_state (DRY trim policy).
-                    local apply_sr_hash = compute_sr_hash(content)
+                    -- Tool-channel edit signatures are mixed in so tool-only iters
+                    -- with constant text (e.g. "DONE") do not falsely hash-collide.
+                    local apply_sr_hash = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1"))
                     update_state(mf_state, {
                         last_err = fail_msg,
                         sr_digest_prev = content,
@@ -2386,7 +2578,10 @@ local function run_loop(conf)
                     if rr.ok then
                         -- Append sr_hash to sr_history on success (crux §2: every SR attempt,
                         -- regardless of ok value, must append to sr_history).
-                        update_state(mf_state, { sr_hash_append = compute_sr_hash(content) })
+                        update_state(
+                            mf_state,
+                            { sr_hash_append = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1")) }
+                        )
                         obs_event(mode, "converged", { { "iters", iter } })
                         return {
                             ok = true,
@@ -2399,8 +2594,9 @@ local function run_loop(conf)
                     end
 
                     -- Runner failed: update state via update_state (DRY trim policy).
+                    -- Tool-channel edit signatures are mixed in (see apply_sr_hash above).
                     local rr_stderr = tostring(rr.stderr or "")
-                    local runner_sr_hash = compute_sr_hash(content)
+                    local runner_sr_hash = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1"))
                     update_state(mf_state, {
                         last_err = rr_stderr,
                         sr_digest_prev = content,
@@ -2503,21 +2699,18 @@ local function run_loop(conf)
                     -- All blocks applied successfully — write new content and run.
                     iter_edits_applied = iter_edits_applied + 1
                     bad_stagnation_count = 0
-                    local f, werr = io.open(single_path, "w")
-                    if not f then
-                        local werr_str = tostring(werr)
+                    local wok, werr = write_file(single_path, new_content)
+                    if not wok then
                         return {
                             ok = false,
                             failure_reason = "open_target_file",
-                            last_error = werr_str,
+                            last_error = werr,
                             iters = iter,
                             summary = make_summary(false, iter, max_iters, "open_target_file"),
                             artifact_path = artifact_path,
                             history = history,
                         }
                     end
-                    f:write(new_content)
-                    f:close()
 
                     -- Single-file runner call with single string path (Crux #3).
                     local rr = conf.runner(single_path) or {}
@@ -2583,21 +2776,18 @@ local function run_loop(conf)
             end
 
             -- Write target file (full-file replace — next_full_file action)
-            local f, werr = io.open(single_path, "w")
-            if not f then
-                local werr_str = tostring(werr)
+            local wok, werr = write_file(single_path, code)
+            if not wok then
                 return {
                     ok = false,
                     failure_reason = "open_target_file",
-                    last_error = werr_str,
+                    last_error = werr,
                     iters = iter,
                     summary = make_summary(false, iter, max_iters, "open_target_file"),
                     artifact_path = artifact_path,
                     history = history,
                 }
             end
-            f:write(code)
-            f:close()
 
             -- Single-file runner call with single string path (Crux #3).
             local rr = conf.runner(single_path) or {}
@@ -2718,6 +2908,15 @@ end
 function M.make(conf)
     assert(type(conf) == "table", "conf table required")
     assert(type(conf.runner) == "function", "conf.runner function required")
+    -- tool_mode (multi-file only; ignored in single-file mode):
+    --   "auto" (default) declares read_file / read_file_range / apply_search_replace,
+    --   "read_only" declares only the read tools (pre-issue-#1 behaviour),
+    --   "none" declares no tools (caller inlines all file contents in the spec).
+    local tool_mode = conf.tool_mode or "auto"
+    assert(
+        tool_mode == "auto" or tool_mode == "read_only" or tool_mode == "none",
+        "conf.tool_mode must be one of 'auto' | 'read_only' | 'none'"
+    )
 
     local name = conf.name or "compile_loop"
 
@@ -2807,6 +3006,7 @@ target_file and target_files are mutually exclusive.]],
             max_iters = conf.max_iters,
             system = conf.system,
             edit_mode = effective_edit_mode,
+            tool_mode = tool_mode,
             on_iter = conf.on_iter,
 
             -- LLM fields (K-96 full set, all explicit):
@@ -2903,6 +3103,8 @@ function M._test_helpers()
         truncate_with_warning = truncate_with_warning,
         read_file_range_tool_handler = read_file_range_tool_handler,
         read_file_tool_handler = read_file_tool_handler,
+        apply_search_replace_tool_handler = apply_search_replace_tool_handler,
+        write_file = write_file,
         file_mtime = file_mtime,
         -- ST3 additions
         split_lines = split_lines,

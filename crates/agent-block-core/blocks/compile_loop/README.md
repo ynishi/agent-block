@@ -20,6 +20,7 @@ iteration ceiling is reached.
 | `name` | `string` | no | `"compile_loop"` | Tool name registered in the tool registry |
 | `system` | `string` | no | `nil` | Additional system prompt prepended to the default |
 | `edit_mode` | `"full"\|"diff"` | no | `"full"` | `"full"` rewrites the entire file; `"diff"` uses SEARCH/REPLACE patches |
+| `tool_mode` | `"auto"\|"read_only"\|"none"` | no | `"auto"` | Multi-file only. `"auto"` declares `read_file` / `read_file_range` / `apply_search_replace`; `"read_only"` declares just the read tools; `"none"` declares no tools (caller inlines all file contents in the spec) |
 
 **Tool inputs** (`spec`, `target_file` or `target_files`, `lang?`) are supplied by the
 calling LLM at tool-call time; factory `conf` fixes the runner and LLM policy at
@@ -98,6 +99,27 @@ local result = agent.run({
 })
 -- result.modified_files contains the list of absolute paths that were written
 ```
+
+### Tool channel: `apply_search_replace` (`tool_mode = "auto"`, default)
+
+Agentic-tuned models treat declared tools as the primary way to act and may never
+fall back to the SR-in-text contract. With `tool_mode = "auto"` the loop therefore
+declares a write-side tool alongside the read tools, and accepts edits from
+**either channel**:
+
+- **Text channel** — SEARCH/REPLACE blocks in the response text (unchanged).
+- **Tool channel** — `apply_search_replace {path, search, replace}` calls; each call
+  applies one SR edit (same two-stage matcher and `target_files` allowlist as the
+  text channel) and writes the file immediately. A mismatch returns a recoverable
+  error so the model can re-read and retry within the same iteration.
+
+An iteration that applied at least one tool-channel edit proceeds to verify even
+when the final response contains no SR text (the model is told to reply `DONE`).
+
+`tool_mode = "none"` is the escape hatch for callers that inline all target-file
+contents in the spec: no tools are declared at all, which measurably restores the
+text contract on newer models. `"read_only"` preserves the pre-tool-channel
+behaviour (read tools only).
 
 ### Multi-file examples (Anthropic)
 

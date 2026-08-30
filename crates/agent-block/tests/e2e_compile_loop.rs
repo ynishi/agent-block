@@ -219,6 +219,120 @@ async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
     ct.cancel();
 }
 
+/// Verifies the apply_search_replace write-channel tool (issue #1 request 1).
+///
+/// Scenario: 1 iteration, 2 LLM calls.
+///   - Call 1: mock returns two apply_search_replace tool_use blocks (file_a, file_b).
+///     compile_loop applies both edits via the tool handler and writes them to disk.
+///   - Call 2: mock returns the plain text "DONE" (no SR blocks). Because tool-channel
+///     edits were applied this iter, the loop proceeds to verify instead of treating
+///     the missing SR text as a parse failure → mock_runner sees "new" → ok=true.
+///
+/// Validates:
+///   - tool_mode default "auto" declares apply_search_replace (asserted via mock state).
+///   - Tool-channel edits count as applied edits (no zero-edit retry / no dead end).
+///   - result.modified_files carries the tool-written paths.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_apply_search_replace_tool_converges() {
+    let (base_url, state, ct) =
+        common::compile_loop_asr_anthropic_mock::spawn_compile_loop_asr_anthropic_mock_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let file_a = tmp.path().join("file_a.lua");
+        let file_b = tmp.path().join("file_b.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_asr_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET_FILES",
+                format!(
+                    "{}:{}",
+                    file_a.to_str().expect("utf8 path"),
+                    file_b.to_str().expect("utf8 path")
+                ),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_ASR_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        state.call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls (tool_use turn + DONE turn)"
+    );
+    assert!(
+        state.asr_tool_declared_count.load(Ordering::SeqCst) >= 1,
+        "tool_mode=auto must declare the apply_search_replace tool in the request"
+    );
+    ct.cancel();
+}
+
+/// Verifies tool_mode="none" declares no tools (issue #1 request 2).
+///
+/// Scenario: 1 iteration, 1 LLM call.
+///   - The caller inlines all file contents in the spec and sets tool_mode="none".
+///   - The request must NOT carry a "tools" key (mock records; asserted below).
+///   - Mock returns path-header SEARCH/REPLACE text → apply → ok=true.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_tool_mode_none_declares_no_tools() {
+    let (base_url, state, ct) =
+        common::compile_loop_asr_anthropic_mock::spawn_compile_loop_tool_mode_none_mock_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let file_a = tmp.path().join("file_a.lua");
+        let file_b = tmp.path().join("file_b.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_tool_mode_none_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET_FILES",
+                format!(
+                    "{}:{}",
+                    file_a.to_str().expect("utf8 path"),
+                    file_b.to_str().expect("utf8 path")
+                ),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "COMPILE_LOOP_TOOL_MODE_NONE_MOCK_PASS",
+            ));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        state.call_count.load(Ordering::SeqCst),
+        1,
+        "expected exactly 1 HTTP call (single-turn SR text)"
+    );
+    assert_eq!(
+        state.tools_declared_count.load(Ordering::SeqCst),
+        0,
+        "tool_mode=none must not declare any tools in the request"
+    );
+    ct.cancel();
+}
+
 /// Verifies compile_loop in multi-file diff mode converges after a SEARCH mismatch (2-iter).
 ///
 /// Scenario: 2 iterations.

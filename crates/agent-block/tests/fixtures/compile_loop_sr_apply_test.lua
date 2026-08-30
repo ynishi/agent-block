@@ -30,8 +30,19 @@ if not log then
 end
 if not std then
     std = {
-        env = { get = function() return nil end, get_or = function(_n, d) return d end },
-        json = { encode = function(v) return tostring(v) end },
+        env = {
+            get = function()
+                return nil
+            end,
+            get_or = function(_n, d)
+                return d
+            end,
+        },
+        json = {
+            encode = function(v)
+                return tostring(v)
+            end,
+        },
     }
 end
 
@@ -91,6 +102,23 @@ describe("compile_loop.parse_search_replace (single-file)", function()
         local blocks, err = parse(malformed, false, {})
         expect(blocks).to.equal(nil)
         expect(contains(err, "missing >>>>>>> REPLACE marker")).to.equal(true)
+    end)
+
+    it("tolerates the no-space SEARCH marker variant (<<<<<<<SEARCH)", function()
+        local text = "<<<<<<<SEARCH\nold line\n=======\nnew line\n>>>>>>> REPLACE"
+        local blocks, err = parse(text, false, {})
+        expect(err).to.equal(nil)
+        expect(#blocks).to.equal(1)
+        expect(blocks[1].search).to.equal("old line")
+        expect(blocks[1].replace).to.equal("new line")
+    end)
+
+    it("tolerates the no-space REPLACE marker variant (>>>>>>>REPLACE)", function()
+        local text = "<<<<<<< SEARCH\nold line\n=======\nnew line\n>>>>>>>REPLACE"
+        local blocks, err = parse(text, false, {})
+        expect(err).to.equal(nil)
+        expect(#blocks).to.equal(1)
+        expect(blocks[1].replace).to.equal("new line")
     end)
 end)
 
@@ -349,6 +377,82 @@ describe("compile_loop.filter_for_tool_output", function()
         })
         expect(out.code).to.equal(nil)
         expect(out.history).to.equal(nil)
+    end)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- apply_search_replace_tool_handler (write-channel tool, issue #1)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop.apply_search_replace_tool_handler", function()
+    local handler = H.apply_search_replace_tool_handler
+
+    -- Create a temp file with content; returns its absolute path.
+    local function make_tmp(content)
+        local path = os.tmpname()
+        local f = assert(io.open(path, "w"))
+        f:write(content)
+        f:close()
+        return path
+    end
+
+    local function read_all(path)
+        local f = assert(io.open(path, "r"))
+        local content = f:read("*a") or ""
+        f:close()
+        return content
+    end
+
+    it("applies an exact-match edit and writes it to disk", function()
+        local path = make_tmp("foo\nbar\nbaz\n")
+        local res = handler(path, "bar", "BAR", { [path] = true })
+        expect(res.ok).to.equal(true)
+        expect(contains(res.content, "applied: " .. path)).to.equal(true)
+        expect(read_all(path)).to.equal("foo\nBAR\nbaz\n")
+        os.remove(path)
+    end)
+
+    it("rejects a path outside the target_files allowlist", function()
+        local path = make_tmp("foo\n")
+        local res = handler(path, "foo", "X", { ["/some/other/file.lua"] = true })
+        expect(res.ok).to.equal(false)
+        expect(contains(res.error, "not in target_files allowlist")).to.equal(true)
+        expect(read_all(path)).to.equal("foo\n") -- untouched
+        os.remove(path)
+    end)
+
+    it("returns a recoverable error when SEARCH does not match", function()
+        local path = make_tmp("foo\n")
+        local res = handler(path, "does-not-exist", "X", { [path] = true })
+        expect(res.ok).to.equal(false)
+        expect(contains(res.error, "did not match")).to.equal(true)
+        expect(contains(res.error, "Re-read the file")).to.equal(true)
+        expect(read_all(path)).to.equal("foo\n") -- untouched
+        os.remove(path)
+    end)
+
+    it("rejects an empty search string", function()
+        local path = make_tmp("foo\n")
+        local res = handler(path, "", "X", { [path] = true })
+        expect(res.ok).to.equal(false)
+        expect(contains(res.error, "search must be a non-empty string")).to.equal(true)
+        os.remove(path)
+    end)
+
+    it("rejects a non-string replace", function()
+        local path = make_tmp("foo\n")
+        local res = handler(path, "foo", nil, { [path] = true })
+        expect(res.ok).to.equal(false)
+        expect(contains(res.error, "replace must be a string")).to.equal(true)
+        os.remove(path)
+    end)
+
+    it("falls back to a whitespace-normalized match", function()
+        local path = make_tmp("hello   world\n")
+        local res = handler(path, "hello world", "ok", { [path] = true })
+        expect(res.ok).to.equal(true)
+        expect(contains(read_all(path), "ok")).to.equal(true)
+        os.remove(path)
     end)
 end)
 
