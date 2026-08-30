@@ -278,6 +278,71 @@ async fn compile_loop_apply_search_replace_tool_converges() {
     ct.cancel();
 }
 
+/// Verifies wire-shape tolerance for the "broken OpenAI" tool_calls form.
+///
+/// Observed on OpenAI-compatible stacks in the wild (Ollama native leak-through,
+/// Gemini functionCall.args, some vLLM tool-call parsers):
+///   * function.arguments arrives as a JSON *object* instead of a string.
+///   * the id field is absent.
+///
+/// Scenario: 1 iteration, 2 LLM calls.
+///   - Call 1: two apply_search_replace tool_calls (object args, no ids).
+///     cl_oai_normalize must accept the object arguments and synthesize
+///     deterministic call_synth_N ids.
+///   - Call 2: request must carry role="tool" messages whose tool_call_id
+///     starts with "call_synth_" (asserted via mock state); mock replies "DONE"
+///     → loop proceeds to verify via tool-channel edits → ok=true.
+///
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_broken_openai_tool_calls_shape_converges() {
+    let (base_url, state, ct) =
+        common::compile_loop_broken_openai_mock::spawn_compile_loop_broken_openai_mock_server()
+            .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let file_a = tmp.path().join("file_a.lua");
+        let file_b = tmp.path().join("file_b.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_broken_openai_mock.lua")])
+            .env("OPENAI_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET_FILES",
+                format!(
+                    "{}:{}",
+                    file_a.to_str().expect("utf8 path"),
+                    file_b.to_str().expect("utf8 path")
+                ),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_BROKEN_OPENAI_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        state.call_count.load(Ordering::SeqCst),
+        2,
+        "expected exactly 2 HTTP calls (broken tool_calls turn + DONE turn)"
+    );
+    assert!(
+        state.synth_id_tool_msg_count.load(Ordering::SeqCst) >= 2,
+        "role=tool messages must carry synthesized call_synth_* ids"
+    );
+    assert_eq!(
+        state.non_synth_tool_msg_count.load(Ordering::SeqCst),
+        0,
+        "no role=tool message may carry a missing / non-synthetic tool_call_id"
+    );
+    ct.cancel();
+}
+
 /// Verifies tool_mode="none" declares no tools (issue #1 request 2).
 ///
 /// Scenario: 1 iteration, 1 LLM call.

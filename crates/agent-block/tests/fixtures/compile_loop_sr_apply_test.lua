@@ -42,6 +42,29 @@ if not std then
             encode = function(v)
                 return tostring(v)
             end,
+            -- Minimal decoder for the flat string-object shapes these tests feed
+            -- into cl_oai_normalize ('{"k":"v",...}' / '{}'); errors on anything
+            -- else so the malformed-arguments recovery path stays testable.
+            -- The real runtime provides the full std.json; this stub only exists
+            -- under mlua-probe test_launch.
+            decode = function(s)
+                if type(s) ~= "string" then
+                    error("not a string")
+                end
+                if s:match("^%s*{%s*}%s*$") then
+                    return {}
+                end
+                local t = {}
+                local found = false
+                for k, v in s:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do
+                    t[k] = v
+                    found = true
+                end
+                if not found then
+                    error("invalid json")
+                end
+                return t
+            end,
         },
     }
 end
@@ -459,6 +482,114 @@ end)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- cl_oai_map_finish_reason
 -- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- cl_oai_normalize — wire-shape tolerance (tool-calling spec survey follow-up)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop.cl_oai_normalize", function()
+    local normalize = H.cl_oai_normalize
+
+    -- Build a minimal OpenAI-shaped response with the given tool_calls array.
+    local function oai_resp(tool_calls, content)
+        return {
+            choices = {
+                {
+                    message = { role = "assistant", content = content, tool_calls = tool_calls },
+                    finish_reason = tool_calls and "tool_calls" or "stop",
+                },
+            },
+        }
+    end
+
+    it("normalizes the spec-conformant OpenAI form (string arguments + id)", function()
+        local resp = normalize(oai_resp({
+            { id = "call_1", type = "function", ["function"] = { name = "read_file", arguments = '{"path":"/a"}' } },
+        }))
+        local blocks = resp.choices[1].message.tool_use_blocks
+        expect(#blocks).to.equal(1)
+        expect(blocks[1].id).to.equal("call_1")
+        expect(blocks[1].input.path).to.equal("/a")
+        expect(resp.choices[1].message.stop_reason).to.equal("tool_use")
+    end)
+
+    it("accepts object arguments (Ollama native / Gemini args / vLLM parser variants)", function()
+        local resp = normalize(oai_resp({
+            {
+                id = "call_obj",
+                type = "function",
+                ["function"] = {
+                    name = "apply_search_replace",
+                    arguments = { path = "/a", search = "x", replace = "y" },
+                },
+            },
+        }))
+        local blocks = resp.choices[1].message.tool_use_blocks
+        expect(#blocks).to.equal(1)
+        expect(blocks[1].input.path).to.equal("/a")
+        expect(blocks[1].input.replace).to.equal("y")
+        expect(blocks[1].is_error_hint).to.equal(nil)
+    end)
+
+    it("synthesizes deterministic ids when id is missing (Ollama native shape)", function()
+        local resp = normalize(oai_resp({
+            { type = "function", ["function"] = { name = "read_file", arguments = '{"path":"/a"}' } },
+            { type = "function", ["function"] = { name = "read_file", arguments = { path = "/b" } } },
+        }))
+        local blocks = resp.choices[1].message.tool_use_blocks
+        expect(blocks[1].id).to.equal("call_synth_1")
+        expect(blocks[2].id).to.equal("call_synth_2")
+    end)
+
+    it("synthesizes an id when id is an empty string", function()
+        local resp = normalize(oai_resp({
+            { id = "", type = "function", ["function"] = { name = "read_file", arguments = '{"path":"/a"}' } },
+        }))
+        expect(resp.choices[1].message.tool_use_blocks[1].id).to.equal("call_synth_1")
+    end)
+
+    it("keeps the malformed-string-arguments recovery path (empty input + hint)", function()
+        local resp = normalize(oai_resp({
+            { type = "function", ["function"] = { name = "read_file", arguments = "{not json" } },
+        }))
+        local blocks = resp.choices[1].message.tool_use_blocks
+        expect(blocks[1].is_error_hint).to.equal("arguments_parse_failed")
+        expect(next(blocks[1].input)).to.equal(nil)
+        -- Synthetic id also applies on the malformed path.
+        expect(blocks[1].id).to.equal("call_synth_1")
+    end)
+
+    it("errors on a response with no choices", function()
+        local resp, err = normalize({ choices = {} })
+        expect(resp).to.equal(nil)
+        expect(contains(err, "missing choices")).to.equal(true)
+    end)
+end)
+
+describe("compile_loop.cl_oai_convert_messages round-trips synthetic ids", function()
+    local convert = H.cl_oai_convert_messages
+
+    it("carries a synthetic id through tool_calls and role=tool pairing", function()
+        local out = convert({
+            {
+                role = "assistant",
+                content = {
+                    { type = "tool_use", id = "call_synth_1", name = "read_file", input = { path = "/a" } },
+                },
+            },
+            {
+                role = "user",
+                content = {
+                    { type = "tool_result", tool_use_id = "call_synth_1", content = "file body" },
+                },
+            },
+        }, nil)
+        expect(#out).to.equal(2)
+        expect(out[1].tool_calls[1].id).to.equal("call_synth_1")
+        expect(out[2].role).to.equal("tool")
+        expect(out[2].tool_call_id).to.equal("call_synth_1")
+    end)
+end)
 
 describe("compile_loop.cl_oai_map_finish_reason", function()
     local map = H.cl_oai_map_finish_reason

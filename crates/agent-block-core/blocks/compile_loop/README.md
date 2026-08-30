@@ -121,6 +121,15 @@ contents in the spec: no tools are declared at all, which measurably restores th
 text contract on newer models. `"read_only"` preserves the pre-tool-channel
 behaviour (read tools only).
 
+**Wire-shape tolerance (OpenAI-compatible stacks)**: the OpenAI response
+normalizer accepts two observed deviations from the spec — `function.arguments`
+arriving as a JSON *object* instead of a string (Ollama native `/api/chat`,
+Gemini `functionCall.args`, some vLLM tool-call parsers), and a missing/empty
+`id` field (Ollama native has none; pre-Gemini-3 models make it optional), for
+which a deterministic `call_synth_<index>` id is synthesized and carried through
+the `role="tool"` result pairing. Malformed argument *strings* still fall back
+to `input={}` with an `arguments_parse_failed` hint so the model can recover.
+
 ### Multi-file examples (Anthropic)
 
 End-to-end smoke scripts under `examples/`, runnable as `agent-block -s examples/<file>.lua` (requires `ANTHROPIC_API_KEY` in `.env`):

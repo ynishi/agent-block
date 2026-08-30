@@ -465,29 +465,46 @@ local function cl_oai_normalize(raw)
     end
 
     -- tool_calls → tool_use_blocks.
-    for _, tc in ipairs(message.tool_calls or {}) do
+    for i, tc in ipairs(message.tool_calls or {}) do
         local fn = tc["function"] or {}
-        local input = {}
-        local ok, parsed = pcall(std.json.decode, fn.arguments or "{}")
-        if ok and type(parsed) == "table" then
-            input = parsed
+        -- id is mandatory per the OpenAI spec but absent on some OpenAI-compatible
+        -- stacks (Ollama's native shape has no id at all; pre-Gemini-3 models make
+        -- it optional). Synthesize a deterministic per-response id from the array
+        -- index so tool_use / tool_result pairing keeps working downstream.
+        local tc_id = tc.id
+        if tc_id == nil or tc_id == "" then
+            tc_id = "call_synth_" .. tostring(i)
+        end
+        -- arguments is a JSON *string* per the OpenAI spec, but several
+        -- OpenAI-compatible stacks emit a JSON *object* instead (Ollama native
+        -- /api/chat, Gemini functionCall.args, some vLLM tool-call parsers).
+        -- Accept both; only string arguments go through json.decode.
+        local input
+        local raw_args = fn.arguments
+        if type(raw_args) == "table" then
+            input = raw_args
         else
-            log.warn(
-                "compile_loop: OpenAI tool_call arguments JSON parse failed for tool '"
-                    .. tostring(fn.name)
-                    .. "'; using empty input"
-            )
-            -- Acceptance Criteria #7 equivalent: input={}, is_error_hint, loop continues.
-            table.insert(tool_use_blocks, {
-                id = tc.id,
-                name = fn.name or "",
-                input = {},
-                is_error_hint = "arguments_parse_failed",
-            })
-            goto continue_tc
+            local ok, parsed = pcall(std.json.decode, raw_args or "{}")
+            if ok and type(parsed) == "table" then
+                input = parsed
+            else
+                log.warn(
+                    "compile_loop: OpenAI tool_call arguments JSON parse failed for tool '"
+                        .. tostring(fn.name)
+                        .. "'; using empty input"
+                )
+                -- Acceptance Criteria #7 equivalent: input={}, is_error_hint, loop continues.
+                table.insert(tool_use_blocks, {
+                    id = tc_id,
+                    name = fn.name or "",
+                    input = {},
+                    is_error_hint = "arguments_parse_failed",
+                })
+                goto continue_tc
+            end
         end
         table.insert(tool_use_blocks, {
-            id = tc.id,
+            id = tc_id,
             name = fn.name or "",
             input = input,
         })
@@ -3136,6 +3153,8 @@ function M._test_helpers()
         group_blocks_by_path = group_blocks_by_path,
         build_multifile_edit_failure_msg = build_multifile_edit_failure_msg,
         cl_oai_map_finish_reason = cl_oai_map_finish_reason,
+        cl_oai_normalize = cl_oai_normalize,
+        cl_oai_convert_messages = cl_oai_convert_messages,
     }
 end
 
