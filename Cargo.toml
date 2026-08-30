@@ -4,6 +4,7 @@ members = [
     "crates/agent-block-mcp",
     "crates/agent-block-core",
     "crates/agent-block",
+    "crates/agent-block-testkit",
 ]
 resolver = "2"
 

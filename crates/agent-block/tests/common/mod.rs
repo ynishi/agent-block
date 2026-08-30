@@ -1,8 +1,8 @@
+// NOTE: the compile_loop multi-file / tool-channel mocks (asr / broken-openai /
+// diff-multi) were migrated to the `agent-block-testkit` crate (MockLlm +
+// shapes); the remaining modules below are migration candidates.
 pub mod compile_loop_anthropic_mock;
-pub mod compile_loop_asr_anthropic_mock;
-pub mod compile_loop_broken_openai_mock;
 pub mod compile_loop_diff_anthropic_mock;
-pub mod compile_loop_diff_multi_anthropic_mock;
 pub mod compile_loop_distill_mock;
 pub mod compile_loop_openai_mock;
 pub mod compile_loop_openai_mock_three_turn;

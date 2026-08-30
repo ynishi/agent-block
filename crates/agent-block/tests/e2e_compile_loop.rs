@@ -1,8 +1,28 @@
 mod common;
 
+use agent_block_testkit::server::MockLlm;
+use agent_block_testkit::shapes::{anthropic, openai};
 use predicates::prelude::*;
+use serde_json::json;
 use std::sync::atomic::Ordering;
 use tempfile::tempdir;
+
+/// Pick (path_a, path_b) from the request-extracted paths, with basename
+/// fallbacks (fallbacks should not be hit in normal runs).
+fn two_paths(paths: &[String]) -> (String, String) {
+    match paths.len() {
+        0 => ("file_a.lua".to_string(), "file_b.lua".to_string()),
+        1 => (paths[0].clone(), "file_b.lua".to_string()),
+        _ => (paths[0].clone(), paths[1].clone()),
+    }
+}
+
+/// Path-header SEARCH/REPLACE text patching both files (a-old→a-new, b-old→b-new).
+fn sr_text_both(path_a: &str, path_b: &str) -> String {
+    format!(
+        "<<< path={path_a} >>>\n<<<<<<< SEARCH\nprint(\"a-old\")\n=======\nprint(\"a-new\")\n>>>>>>> REPLACE\n\n<<< path={path_b} >>>\n<<<<<<< SEARCH\nprint(\"b-old\")\n=======\nprint(\"b-new\")\n>>>>>>> REPLACE"
+    )
+}
 
 /// Verifies compile_loop in diff mode (edit_mode="diff") with the Anthropic provider.
 ///
@@ -175,12 +195,15 @@ async fn compile_loop_anthropic_mock_iterates_until_pass() {
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
-    let (base_url, call_count, ct) =
-        common::compile_loop_diff_multi_anthropic_mock::spawn_compile_loop_diff_multi_anthropic_mock_server()
-            .await;
+    let handle = MockLlm::anthropic(|req| {
+        let (path_a, path_b) = two_paths(&req.paths);
+        anthropic::text_response(&sr_text_both(&path_a, &path_b))
+    })
+    .spawn()
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url_clone = base_url.clone();
+    let url_clone = handle.base_url.clone();
     tokio::task::spawn_blocking(move || {
         let tmp = tempdir().expect("tempdir");
         let file_a = tmp.path().join("file_a.lua");
@@ -212,11 +235,11 @@ async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
 
     // Happy path: exactly 1 HTTP call (both files patched in a single LLM turn).
     assert_eq!(
-        call_count.load(Ordering::SeqCst),
+        handle.state.call_count(),
         1,
         "expected exactly 1 HTTP call to the multi diff mock (happy path: 2 files in 1 turn)"
     );
-    ct.cancel();
+    handle.ct.cancel();
 }
 
 /// Verifies the apply_search_replace write-channel tool (issue #1 request 1).
@@ -236,12 +259,30 @@ async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_apply_search_replace_tool_converges() {
-    let (base_url, state, ct) =
-        common::compile_loop_asr_anthropic_mock::spawn_compile_loop_asr_anthropic_mock_server()
-            .await;
+    let handle = MockLlm::anthropic(|req| {
+        if !req.has_tool_results {
+            let (path_a, path_b) = two_paths(&req.paths);
+            anthropic::tool_use_response(vec![
+                anthropic::tool_use(
+                    "toolu_asr_1",
+                    "apply_search_replace",
+                    json!({"path": path_a, "search": "print(\"a-old\")", "replace": "print(\"a-new\")"}),
+                ),
+                anthropic::tool_use(
+                    "toolu_asr_2",
+                    "apply_search_replace",
+                    json!({"path": path_b, "search": "print(\"b-old\")", "replace": "print(\"b-new\")"}),
+                ),
+            ])
+        } else {
+            anthropic::text_response("DONE")
+        }
+    })
+    .spawn()
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url_clone = base_url.clone();
+    let url_clone = handle.base_url.clone();
     tokio::task::spawn_blocking(move || {
         let tmp = tempdir().expect("tempdir");
         let file_a = tmp.path().join("file_a.lua");
@@ -267,15 +308,15 @@ async fn compile_loop_apply_search_replace_tool_converges() {
     .expect("subprocess assertion task should not panic");
 
     assert_eq!(
-        state.call_count.load(Ordering::SeqCst),
+        handle.state.call_count(),
         2,
         "expected exactly 2 HTTP calls (tool_use turn + DONE turn)"
     );
     assert!(
-        state.asr_tool_declared_count.load(Ordering::SeqCst) >= 1,
+        handle.state.declared_count_of("apply_search_replace") >= 1,
         "tool_mode=auto must declare the apply_search_replace tool in the request"
     );
-    ct.cancel();
+    handle.ct.cancel();
 }
 
 /// Verifies wire-shape tolerance for the "broken OpenAI" tool_calls form.
@@ -296,12 +337,28 @@ async fn compile_loop_apply_search_replace_tool_converges() {
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_broken_openai_tool_calls_shape_converges() {
-    let (base_url, state, ct) =
-        common::compile_loop_broken_openai_mock::spawn_compile_loop_broken_openai_mock_server()
-            .await;
+    let handle = MockLlm::openai(|req| {
+        if !req.has_tool_results {
+            let (path_a, path_b) = two_paths(&req.paths);
+            openai::tool_calls_response(vec![
+                openai::tool_call_object_args_no_id(
+                    "apply_search_replace",
+                    json!({"path": path_a, "search": "print(\"a-old\")", "replace": "print(\"a-new\")"}),
+                ),
+                openai::tool_call_object_args_no_id(
+                    "apply_search_replace",
+                    json!({"path": path_b, "search": "print(\"b-old\")", "replace": "print(\"b-new\")"}),
+                ),
+            ])
+        } else {
+            openai::text_response("DONE")
+        }
+    })
+    .spawn()
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url_clone = base_url.clone();
+    let url_clone = handle.base_url.clone();
     tokio::task::spawn_blocking(move || {
         let tmp = tempdir().expect("tempdir");
         let file_a = tmp.path().join("file_a.lua");
@@ -327,20 +384,20 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
     .expect("subprocess assertion task should not panic");
 
     assert_eq!(
-        state.call_count.load(Ordering::SeqCst),
+        handle.state.call_count(),
         2,
         "expected exactly 2 HTTP calls (broken tool_calls turn + DONE turn)"
     );
+    let ids = handle.state.tool_result_ids();
     assert!(
-        state.synth_id_tool_msg_count.load(Ordering::SeqCst) >= 2,
-        "role=tool messages must carry synthesized call_synth_* ids"
+        ids.len() >= 2,
+        "expected >=2 role=tool messages carrying tool results, got {ids:?}"
     );
-    assert_eq!(
-        state.non_synth_tool_msg_count.load(Ordering::SeqCst),
-        0,
-        "no role=tool message may carry a missing / non-synthetic tool_call_id"
+    assert!(
+        ids.iter().all(|id| id.starts_with("call_synth_")),
+        "every role=tool message must carry a synthesized call_synth_* id, got {ids:?}"
     );
-    ct.cancel();
+    handle.ct.cancel();
 }
 
 /// Verifies tool_mode="none" declares no tools (issue #1 request 2).
@@ -353,12 +410,15 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_tool_mode_none_declares_no_tools() {
-    let (base_url, state, ct) =
-        common::compile_loop_asr_anthropic_mock::spawn_compile_loop_tool_mode_none_mock_server()
-            .await;
+    let handle = MockLlm::anthropic(|req| {
+        let (path_a, path_b) = two_paths(&req.paths);
+        anthropic::text_response(&sr_text_both(&path_a, &path_b))
+    })
+    .spawn()
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url_clone = base_url.clone();
+    let url_clone = handle.base_url.clone();
     tokio::task::spawn_blocking(move || {
         let tmp = tempdir().expect("tempdir");
         let file_a = tmp.path().join("file_a.lua");
@@ -386,16 +446,16 @@ async fn compile_loop_tool_mode_none_declares_no_tools() {
     .expect("subprocess assertion task should not panic");
 
     assert_eq!(
-        state.call_count.load(Ordering::SeqCst),
+        handle.state.call_count(),
         1,
         "expected exactly 1 HTTP call (single-turn SR text)"
     );
     assert_eq!(
-        state.tools_declared_count.load(Ordering::SeqCst),
+        handle.state.tools_declared_count(),
         0,
         "tool_mode=none must not declare any tools in the request"
     );
-    ct.cancel();
+    handle.ct.cancel();
 }
 
 /// Verifies compile_loop in multi-file diff mode converges after a SEARCH mismatch (2-iter).
@@ -413,12 +473,22 @@ async fn compile_loop_tool_mode_none_declares_no_tools() {
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
-    let (base_url, call_count, ct) =
-        common::compile_loop_diff_multi_anthropic_mock::spawn_compile_loop_diff_multi_anthropic_mock_two_iter_server()
-            .await;
+    let handle = MockLlm::anthropic(|req| {
+        let (path_a, path_b) = two_paths(&req.paths);
+        if req.call_index == 0 {
+            // Turn 1: file_a only, with deliberately wrong SEARCH text.
+            anthropic::text_response(&format!(
+                "<<< path={path_a} >>>\n<<<<<<< SEARCH\nprint(\"WRONG\")\n=======\nprint(\"a-new\")\n>>>>>>> REPLACE"
+            ))
+        } else {
+            anthropic::text_response(&sr_text_both(&path_a, &path_b))
+        }
+    })
+    .spawn()
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url_clone = base_url.clone();
+    let url_clone = handle.base_url.clone();
     tokio::task::spawn_blocking(move || {
         let tmp = tempdir().expect("tempdir");
         let file_a = tmp.path().join("file_a.lua");
@@ -450,11 +520,11 @@ async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
 
     // 2-iter: exactly 2 HTTP calls (iter1: apply-fail, iter2: pass).
     assert_eq!(
-        call_count.load(Ordering::SeqCst),
+        handle.state.call_count(),
         2,
         "expected exactly 2 HTTP calls to the multi diff mock (iter1: apply-fail, iter2: pass)"
     );
-    ct.cancel();
+    handle.ct.cancel();
 }
 
 /// Verifies the compile_loop distill subloop with an OpenAI provider mock.
