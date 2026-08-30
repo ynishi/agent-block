@@ -1064,6 +1064,13 @@ end
 -- read → edit × N → done within one iter.
 local MAX_TOOL_CALLS_PER_ITER = 16
 
+-- Adaptive tool_mode: number of consecutive zero-edit iters (bad_stagnation_count)
+-- after which tool_mode="adaptive" switches the channel from "auto" (tools
+-- declared) to "none" (no tools, file contents embedded). Kept below
+-- STAGNATION_WINDOW so the switch gets one rescue window before the
+-- no_edits_applied abort fires.
+local ADAPTIVE_SWITCH_THRESHOLD = 2
+
 -- ── Distill / cache constants (added ST1) ───────────────────────────────────
 -- Files with content length >= this threshold trigger the distill subloop (ST2-3).
 -- Below threshold: full content returned verbatim (unchanged behaviour).
@@ -1861,8 +1868,35 @@ local function run_loop(conf)
     --   "read_only":      read_file + read_file_range (pre-issue-#1 behaviour)
     --   "none":           no tools declared — for callers that inline all target
     --                     file contents in the spec (issue #1 request 2)
+    --   "adaptive":       starts as "auto"; on ADAPTIVE_SWITCH_THRESHOLD
+    --                     consecutive zero-edit iters or a tool-call-cap blowout,
+    --                     switches to "none" and embeds the current file contents
+    --                     (runtime form of the issue #1 "strip tools via proxy"
+    --                     experiment, where stripping tools restored the text
+    --                     contract on tool-preferring models)
     local tool_mode = conf.tool_mode or "auto"
+    local adaptive = tool_mode == "adaptive"
+    -- active_tool_mode is what the loop actually applies this iter; only the
+    -- adaptive path ever mutates it (auto → none).
+    local active_tool_mode = adaptive and "auto" or tool_mode
     local mode = resolve_dump_mode()
+
+    -- ── extra tools (caller-registered, agent-layer nested form) ───────────────
+    -- conf.extra_tools = list of {name, schema = {description?, input_schema}, handler}
+    -- (validated in M.make). Specs are declared alongside the built-in tools
+    -- whenever tools are declared at all; dispatch goes through extra_tools_map.
+    -- Extra-tool calls do NOT count as applied edits (read-like by contract).
+    local extra_tool_specs = {}
+    local extra_tools_map = {}
+    for _, t in ipairs(conf.extra_tools or {}) do
+        local schema = t.schema or {}
+        table.insert(extra_tool_specs, {
+            name = t.name,
+            description = schema.description or "",
+            input_schema = schema.input_schema or { type = "object", properties = {} },
+        })
+        extra_tools_map[t.name] = t.handler
+    end
 
     -- In single-file mode, artifact_path is the single absolute path (backward compat).
     -- In multi-file mode, artifact_path is nil; modified_files carries the list.
@@ -1916,10 +1950,10 @@ local function run_loop(conf)
             table.insert(path_lines, "  " .. p)
         end
         local tool_hint
-        if tool_mode == "none" then
+        if active_tool_mode == "none" then
             -- No tools declared; the caller inlines file contents in the spec.
             tool_hint = ""
-        elseif tool_mode == "read_only" then
+        elseif active_tool_mode == "read_only" then
             tool_hint = "\n\nUse the read_file tool to fetch file content when needed."
         else -- "auto"
             tool_hint = "\n\nUse the read_file tool to fetch file content when needed."
@@ -1993,6 +2027,25 @@ local function run_loop(conf)
     -- the loop terminates with failure_reason = "no_edits_applied".
     local bad_stagnation_count = 0
 
+    -- Adaptive channel switch (tool_mode="adaptive" only): drop all tool
+    -- declarations and fall back to the pure SR-text contract. The per-iter
+    -- rebuild embeds the current file contents from disk so the child LLM is
+    -- not left blind (unlike static "none", where the caller inlines contents).
+    -- bad_stagnation_count is reset so the new channel gets a full rescue window.
+    local function adaptive_switch_to_none(iter_num, reason)
+        active_tool_mode = "none"
+        bad_stagnation_count = 0
+        local path_lines = {}
+        for _, p in ipairs(conf.target_files) do
+            table.insert(path_lines, "  " .. p)
+        end
+        multi_initial_user_content = conf.spec
+            .. "\n\nFiles:\n"
+            .. table.concat(path_lines, "\n")
+            .. "\n\nDo NOT call tools. Emit SEARCH/REPLACE text blocks only."
+        obs_event(mode, "adaptive_tool_mode_switch", { { "iter", iter_num }, { "reason", reason } })
+    end
+
     for iter = 1, max_iters do
         local iter_edits_applied = 0 -- reset each iter; incremented when >= 1 edit succeeds
         -- Signatures (path\1search\1replace) of edits applied via the
@@ -2014,6 +2067,18 @@ local function run_loop(conf)
             mf_state.iter = iter
             -- Build per-iter user content: base + optional last_err + optional sr_digest_prev.
             local user_parts = { multi_initial_user_content }
+            -- Adaptive-switched "none": embed fresh file contents from disk each
+            -- iter (files change across iters). Oversized files are truncated
+            -- with a warning; static "none" is untouched (caller inlines contents).
+            if adaptive and active_tool_mode == "none" then
+                for _, p in ipairs(conf.target_files) do
+                    local c = read_target_if_exists(p) or ""
+                    if #c > READ_FILE_FULL_THRESHOLD then
+                        c = truncate_with_warning(c, nil)
+                    end
+                    table.insert(user_parts, "\n=== Current file content (path=" .. p .. ") ===\n" .. c)
+                end
+            end
             if mf_state.last_err and mf_state.last_err ~= "" then
                 table.insert(user_parts, "\n=== Last verify error (trimmed) ===\n" .. mf_state.last_err)
             end
@@ -2034,17 +2099,22 @@ local function run_loop(conf)
 
         -- ── LLM call 1 (multi-file: may return tool_use; single-file: returns SR/code) ──
         local call_opts = conf
-        if multi_file and tool_mode ~= "none" then
-            -- Attach tool spec per tool_mode.
+        if multi_file and active_tool_mode ~= "none" then
+            -- Attach tool spec per active_tool_mode.
             -- We build a shallow copy of conf with tools added to avoid mutating conf.
             call_opts = {}
             for k, v in pairs(conf) do
                 call_opts[k] = v
             end
-            if tool_mode == "read_only" then
+            if active_tool_mode == "read_only" then
                 call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
             else -- "auto"
                 call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL, APPLY_SEARCH_REPLACE_TOOL }
+            end
+            -- Caller-registered extra tools are declared whenever tools are
+            -- declared at all (both "auto" and "read_only").
+            for _, spec in ipairs(extra_tool_specs) do
+                table.insert(call_opts.tools, spec)
             end
         end
 
@@ -2093,6 +2163,13 @@ local function run_loop(conf)
                 -- Hard cap: give up if too many tool calls in one iter.
                 if tool_call_count + #cur_tool_blocks > MAX_TOOL_CALLS_PER_ITER then
                     obs_event(mode, "tool_loop_giveup", { { "iter", iter }, { "count", tool_call_count } })
+                    -- Adaptive rescue: a tool-call blowout is the "keeps reading,
+                    -- never writes" dead end — switch to the no-tools channel and
+                    -- consume this iter instead of failing the whole run.
+                    if adaptive and active_tool_mode ~= "none" then
+                        adaptive_switch_to_none(iter, "tool_loop_cap")
+                        goto iter_continue
+                    end
                     local giveup_err = "exceeded MAX_TOOL_CALLS_PER_ITER="
                         .. MAX_TOOL_CALLS_PER_ITER
                         .. " within a single iter"
@@ -2252,6 +2329,34 @@ local function run_loop(conf)
                             tool_use_id = tb.id,
                             content = asr_text,
                         })
+                    elseif extra_tools_map[tb.name] then
+                        -- Caller-registered extra tool. Contract: handler(input)
+                        -- returns a string (same as the tool-registry convention);
+                        -- errors are propagated as tool_result text so the child
+                        -- LLM can recover. Does NOT count as an applied edit.
+                        local et_ok, et_res = pcall(extra_tools_map[tb.name], tb.input or {})
+                        local et_text
+                        if et_ok then
+                            et_text = tostring(et_res)
+                            obs_event(mode, "tool_use", {
+                                { "iter", iter },
+                                { "tool", tb.name },
+                                { "ok", true },
+                                { "extra", true },
+                            })
+                        else
+                            et_text = "ERROR: " .. tostring(et_res)
+                            obs_event(mode, "tool_use_fail", {
+                                { "iter", iter },
+                                { "tool", tb.name },
+                                { "err", tostring(et_res) },
+                            })
+                        end
+                        table.insert(tool_result_content, {
+                            type = "tool_result",
+                            tool_use_id = tb.id,
+                            content = et_text,
+                        })
                     else
                         -- Unknown tool name; return error to child LLM.
                         obs_event(mode, "tool_use_fail", {
@@ -2362,7 +2467,16 @@ local function run_loop(conf)
                     -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
                     if iter_edits_applied == 0 then
                         bad_stagnation_count = bad_stagnation_count + 1
-                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                        if
+                            adaptive
+                            and active_tool_mode ~= "none"
+                            and bad_stagnation_count >= ADAPTIVE_SWITCH_THRESHOLD
+                        then
+                            -- Adaptive rescue: repeated zero-edit iters while tools
+                            -- are declared — switch to the no-tools SR-text channel
+                            -- (the channel switch supersedes the retry feedback).
+                            adaptive_switch_to_none(iter, "zero_edit_iters")
+                        elseif bad_stagnation_count >= STAGNATION_WINDOW then
                             obs_event(mode, "bad_stagnation_blocked", {
                                 { "iter", iter },
                                 { "reason", "no_edits_applied" },
@@ -2377,22 +2491,23 @@ local function run_loop(conf)
                                 modified_files = collect_modified_paths(mf_state.modified_set),
                                 history = history,
                             }
+                        else
+                            -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                            local retry_msg = "Your previous attempt produced zero successful edits."
+                                .. " You must emit a SEARCH/REPLACE block that actually applies"
+                                .. " — make sure the SEARCH section matches the current file content exactly."
+                            update_state(mf_state, { last_err = mf_state.last_err })
+                            messages = {
+                                { role = "system", content = system },
+                                {
+                                    role = "user",
+                                    content = table.concat(
+                                        { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
+                                        ""
+                                    ),
+                                },
+                            }
                         end
-                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                        local retry_msg = "Your previous attempt produced zero successful edits."
-                            .. " You must emit a SEARCH/REPLACE block that actually applies"
-                            .. " — make sure the SEARCH section matches the current file content exactly."
-                        update_state(mf_state, { last_err = mf_state.last_err })
-                        messages = {
-                            { role = "system", content = system },
-                            {
-                                role = "user",
-                                content = table.concat(
-                                    { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
-                                    ""
-                                ),
-                            },
-                        }
                     elseif is_stagnant_v2(mf_state, true) then
                         obs_event(mode, "stagnation_v2", {
                             { "iter", iter },
@@ -2524,7 +2639,16 @@ local function run_loop(conf)
                     -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
                     if iter_edits_applied == 0 then
                         bad_stagnation_count = bad_stagnation_count + 1
-                        if bad_stagnation_count >= STAGNATION_WINDOW then
+                        if
+                            adaptive
+                            and active_tool_mode ~= "none"
+                            and bad_stagnation_count >= ADAPTIVE_SWITCH_THRESHOLD
+                        then
+                            -- Adaptive rescue: repeated zero-edit iters while tools
+                            -- are declared — switch to the no-tools SR-text channel
+                            -- (the channel switch supersedes the retry feedback).
+                            adaptive_switch_to_none(iter, "zero_edit_iters")
+                        elseif bad_stagnation_count >= STAGNATION_WINDOW then
                             obs_event(mode, "bad_stagnation_blocked", {
                                 { "iter", iter },
                                 { "reason", "no_edits_applied" },
@@ -2539,22 +2663,23 @@ local function run_loop(conf)
                                 modified_files = collect_modified_paths(mf_state.modified_set),
                                 history = history,
                             }
+                        else
+                            -- Inject explicit retry feedback so the LLM knows it must emit edits.
+                            local retry_msg = "Your previous attempt produced zero successful edits."
+                                .. " You must emit a SEARCH/REPLACE block that actually applies"
+                                .. " — make sure the SEARCH section matches the current file content exactly."
+                            update_state(mf_state, { last_err = mf_state.last_err })
+                            messages = {
+                                { role = "system", content = system },
+                                {
+                                    role = "user",
+                                    content = table.concat(
+                                        { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
+                                        ""
+                                    ),
+                                },
+                            }
                         end
-                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                        local retry_msg = "Your previous attempt produced zero successful edits."
-                            .. " You must emit a SEARCH/REPLACE block that actually applies"
-                            .. " — make sure the SEARCH section matches the current file content exactly."
-                        update_state(mf_state, { last_err = mf_state.last_err })
-                        messages = {
-                            { role = "system", content = system },
-                            {
-                                role = "user",
-                                content = table.concat(
-                                    { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
-                                    ""
-                                ),
-                            },
-                        }
                     elseif is_stagnant_v2(mf_state, true) then
                         obs_event(mode, "stagnation_v2", {
                             { "iter", iter },
@@ -2882,6 +3007,7 @@ local function run_loop(conf)
             end
         end
         -- ── end of edit_mode branch ────────────────────────────────────────────
+        ::iter_continue::
     end
 
     -- max_iters reached without PASS
@@ -2928,12 +3054,40 @@ function M.make(conf)
     -- tool_mode (multi-file only; ignored in single-file mode):
     --   "auto" (default) declares read_file / read_file_range / apply_search_replace,
     --   "read_only" declares only the read tools (pre-issue-#1 behaviour),
-    --   "none" declares no tools (caller inlines all file contents in the spec).
+    --   "none" declares no tools (caller inlines all file contents in the spec),
+    --   "adaptive" starts as "auto" and falls back to "none" (with file contents
+    --   embedded) when the declared tools stall the loop (zero-edit iters /
+    --   tool-call-cap blowout).
     local tool_mode = conf.tool_mode or "auto"
     assert(
-        tool_mode == "auto" or tool_mode == "read_only" or tool_mode == "none",
-        "conf.tool_mode must be one of 'auto' | 'read_only' | 'none'"
+        tool_mode == "auto" or tool_mode == "read_only" or tool_mode == "none" or tool_mode == "adaptive",
+        "conf.tool_mode must be one of 'auto' | 'read_only' | 'none' | 'adaptive'"
     )
+
+    -- extra_tools (optional, multi-file only): caller-registered tools in the
+    -- agent-layer nested form {name, schema = {description?, input_schema}, handler}.
+    -- Declared alongside the built-in tools; dispatched inside the tool loop.
+    -- Built-in names are reserved.
+    local RESERVED_TOOL_NAMES = { read_file = true, read_file_range = true, apply_search_replace = true }
+    if conf.extra_tools ~= nil then
+        assert(type(conf.extra_tools) == "table", "conf.extra_tools must be a list")
+        for i, t in ipairs(conf.extra_tools) do
+            assert(type(t) == "table", "conf.extra_tools[" .. i .. "] must be a table")
+            assert(
+                type(t.name) == "string" and t.name ~= "",
+                "conf.extra_tools[" .. i .. "].name must be a non-empty string"
+            )
+            assert(
+                not RESERVED_TOOL_NAMES[t.name],
+                "conf.extra_tools[" .. i .. "].name '" .. t.name .. "' is reserved (built-in tool)"
+            )
+            assert(type(t.handler) == "function", "conf.extra_tools[" .. i .. "].handler must be a function")
+            assert(
+                t.schema == nil or type(t.schema) == "table",
+                "conf.extra_tools[" .. i .. "].schema must be a table when present"
+            )
+        end
+    end
 
     local name = conf.name or "compile_loop"
 
@@ -3024,6 +3178,7 @@ target_file and target_files are mutually exclusive.]],
             system = conf.system,
             edit_mode = effective_edit_mode,
             tool_mode = tool_mode,
+            extra_tools = conf.extra_tools,
             on_iter = conf.on_iter,
 
             -- LLM fields (K-96 full set, all explicit):

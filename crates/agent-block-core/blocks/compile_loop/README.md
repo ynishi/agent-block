@@ -20,7 +20,8 @@ iteration ceiling is reached.
 | `name` | `string` | no | `"compile_loop"` | Tool name registered in the tool registry |
 | `system` | `string` | no | `nil` | Additional system prompt prepended to the default |
 | `edit_mode` | `"full"\|"diff"` | no | `"full"` | `"full"` rewrites the entire file; `"diff"` uses SEARCH/REPLACE patches |
-| `tool_mode` | `"auto"\|"read_only"\|"none"` | no | `"auto"` | Multi-file only. `"auto"` declares `read_file` / `read_file_range` / `apply_search_replace`; `"read_only"` declares just the read tools; `"none"` declares no tools (caller inlines all file contents in the spec) |
+| `tool_mode` | `"auto"\|"read_only"\|"none"\|"adaptive"` | no | `"auto"` | Multi-file only. `"auto"` declares `read_file` / `read_file_range` / `apply_search_replace`; `"read_only"` declares just the read tools; `"none"` declares no tools (caller inlines all file contents in the spec); `"adaptive"` starts as `"auto"` and falls back to `"none"` when the declared tools stall the loop (see below) |
+| `extra_tools` | `array` | no | — | Multi-file only. Caller-registered tools in the agent-layer nested form `{name, schema = {description?, input_schema}, handler}`. Declared alongside the built-in tools; dispatched inside the tool loop; built-in names are reserved. `handler(input)` returns a string; errors are propagated as recoverable tool_result text. Extra-tool calls do not count as applied edits |
 
 **Tool inputs** (`spec`, `target_file` or `target_files`, `lang?`) are supplied by the
 calling LLM at tool-call time; factory `conf` fixes the runner and LLM policy at
@@ -120,6 +121,17 @@ when the final response contains no SR text (the model is told to reply `DONE`).
 contents in the spec: no tools are declared at all, which measurably restores the
 text contract on newer models. `"read_only"` preserves the pre-tool-channel
 behaviour (read tools only).
+
+**Adaptive channel rescue (`tool_mode = "adaptive"`)**: starts as `"auto"`.
+When the declared tools stall the loop — two consecutive zero-edit iterations,
+or a single response blowing past the per-iteration tool-call cap ("keeps
+reading, never writes") — the loop drops all tool declarations, embeds the
+current file contents into the prompt, and continues on the pure SR-text
+contract. This is the runtime form of the strip-tools proxy experiment from
+issue #1, where removing the `tools` field measurably restored the text
+contract on tool-preferring models. The switch resets the zero-edit stagnation
+counter so the new channel gets a full rescue window; the switch is one-way
+within a run.
 
 **Wire-shape tolerance (OpenAI-compatible stacks)**: the OpenAI response
 normalizer accepts two observed deviations from the spec — `function.arguments`
