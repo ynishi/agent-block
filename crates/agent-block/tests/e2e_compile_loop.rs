@@ -288,7 +288,10 @@ async fn compile_loop_apply_search_replace_tool_converges() {
         let file_a = tmp.path().join("file_a.lua");
         let file_b = tmp.path().join("file_b.lua");
         common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_asr_anthropic_mock.lua")])
+            .args([
+                "-s",
+                &common::fixture("compile_loop_asr_anthropic_mock.lua"),
+            ])
             .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
             .env(
                 "COMPILE_LOOP_TARGET_FILES",
@@ -364,7 +367,10 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
         let file_a = tmp.path().join("file_a.lua");
         let file_b = tmp.path().join("file_b.lua");
         common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_broken_openai_mock.lua")])
+            .args([
+                "-s",
+                &common::fixture("compile_loop_broken_openai_mock.lua"),
+            ])
             .env("OPENAI_BASE_URL_TEST", &url_clone)
             .env(
                 "COMPILE_LOOP_TARGET_FILES",
@@ -378,7 +384,9 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
             .env("RUST_LOG", "off")
             .assert()
             .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_BROKEN_OPENAI_MOCK_PASS"));
+            .stdout(predicate::str::contains(
+                "COMPILE_LOOP_BROKEN_OPENAI_MOCK_PASS",
+            ));
     })
     .await
     .expect("subprocess assertion task should not panic");
@@ -424,7 +432,10 @@ async fn compile_loop_tool_mode_none_declares_no_tools() {
         let file_a = tmp.path().join("file_a.lua");
         let file_b = tmp.path().join("file_b.lua");
         common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_tool_mode_none_mock.lua")])
+            .args([
+                "-s",
+                &common::fixture("compile_loop_tool_mode_none_mock.lua"),
+            ])
             .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
             .env(
                 "COMPILE_LOOP_TARGET_FILES",

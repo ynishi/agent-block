@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-08-30
+
+### Added
+
+- **First-class tool-calling in `compile_loop` (#1).** The multi-file loop
+  now accepts edits from either channel: SEARCH/REPLACE text blocks
+  (unchanged) or the new `apply_search_replace {path, search, replace}`
+  write-side tool, which applies one edit through the same allowlist and
+  two-stage matcher and writes to disk immediately. An iteration that
+  applied at least one tool-channel edit proceeds to verify even when the
+  final response carries no SR text. Agentic-tuned models that treat
+  declared tools as the primary way to act can now complete the whole loop
+  via tool calls instead of dead-ending in a read-only tool loop.
+- **`tool_mode` conf for `compile_loop`** — `"auto"` (default: read tools +
+  `apply_search_replace`), `"read_only"` (previous behaviour), `"none"`
+  (no tools declared; for callers that inline all file contents in the
+  spec), and `"adaptive"` (starts as `"auto"`, then drops all tool
+  declarations and embeds the current file contents when the declared
+  tools stall the loop — two consecutive zero-edit iterations or a
+  tool-call-cap blowout).
+- **`extra_tools` conf for `compile_loop`** — callers can inject
+  additional tools as `{name, schema, handler}` (the agent-layer nested
+  form); they are declared alongside the built-ins and dispatched inside
+  the tool loop, with handler errors propagated as recoverable
+  tool_result text.
+- **New `agent-block-testkit` crate** — in-process mock LLM servers
+  (`server::MockLlm`, Anthropic Messages / OpenAI Chat Completions) and a
+  provider wire-shape catalog (`shapes::*`) covering both spec-conformant
+  and deliberately broken tool-calling shapes observed on
+  OpenAI-compatible stacks in the wild. The compile_loop e2e suite is the
+  first consumer.
+
+### Changed
+
+- `compile_loop`'s OpenAI response normalizer tolerates non-conformant
+  `tool_calls` shapes: `function.arguments` arriving as a JSON object
+  (Ollama native leak-through, Gemini `functionCall.args`, some vLLM
+  tool-call parsers) and missing/empty `id` fields (a deterministic
+  `call_synth_<index>` id is synthesized and carried through the
+  `role="tool"` pairing).
+- `compile_loop` SEARCH/REPLACE parsing tolerates the no-space marker
+  variants (`<<<<<<<SEARCH` / `>>>>>>>REPLACE`), and parse-failure
+  feedback restates the exact marker literals so a model that drifted on
+  marker format can recover. `MAX_TOOL_CALLS_PER_ITER` raised 8 → 16.
+- `compile_loop` failure returns on the tool-loop and LLM-call paths now
+  carry `modified_files`, so callers can inspect files already mutated on
+  disk by tool-channel edits.
+
 ## [0.33.0] - 2026-08-25
 
 ### Added

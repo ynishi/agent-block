@@ -6,9 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-# Publishing is a separate release decision; the crate is consumed in-workspace
-# as a version-less dev-dependency (stripped at `cargo publish` of consumers).
-publish = false
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
