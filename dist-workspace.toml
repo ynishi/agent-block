@@ -7,15 +7,18 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# A GitHub repo to push Homebrew formulas to
-tap = "ynishi/homebrew-agent-block"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# The installers to generate for each app.
+# Homebrew is intentionally not enabled: the binaries target CI usage
+# (GitHub Releases + shell/powershell installer); add "homebrew" + tap +
+# publish-jobs when a tap repo and HOMEBREW_TAP_TOKEN are provisioned.
+installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# The generated release.yml carries one manual edit (permissions:
+# id-token: write, required by the cargo-dist-checker C8 gate); tell
+# `dist plan` not to fail on the resulting drift from the generated form.
+allow-dirty = ["ci"]
