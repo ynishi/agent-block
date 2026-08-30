@@ -54,6 +54,23 @@ Downstream Rust applications can depend on `agent-block-core` (or just
 └─────────────────┘    └──────────────────┘
 ```
 
+## Installation
+
+```sh
+# From crates.io
+cargo install agent-block
+
+# Prebuilt binaries (GitHub Releases, built by cargo-dist for
+# linux x86_64 / macOS x86_64 + aarch64 / windows x86_64).
+# Handy in CI where a cargo build is too slow:
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/ynishi/agent-block/releases/latest/download/agent-block-installer.sh | sh
+```
+
+Windows PowerShell: use `agent-block-installer.ps1` from the same release.
+Per-platform archives (`agent-block-<target>.tar.xz` / `.zip`) with sha256
+checksums are attached to each release for direct download.
+
 ## Usage
 
 ```sh

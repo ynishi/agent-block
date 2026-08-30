@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-08-30
+
+### Added
+
+- **Prebuilt binary distribution via cargo-dist.** Tagged releases now build
+  `agent-block` binaries for 4 platforms (linux x86_64, macOS x86_64/aarch64,
+  windows x86_64) and publish them to GitHub Releases together with shell /
+  PowerShell installers — aimed at CI usage, where
+  `curl -LsSf .../agent-block-installer.sh | sh` replaces a cargo build.
+  Homebrew tap publishing is intentionally left unconfigured for now.
+
 ## [0.34.0] - 2026-08-30
 
 ### Added
