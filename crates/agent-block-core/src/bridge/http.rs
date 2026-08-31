@@ -638,7 +638,12 @@ mod tests {
             .expect("headers must be an array")
             .iter()
             .filter(|pair| pair[0] == name)
-            .map(|pair| pair[1].as_str().expect("value must be a string").to_string())
+            .map(|pair| {
+                pair[1]
+                    .as_str()
+                    .expect("value must be a string")
+                    .to_string()
+            })
             .collect()
     }
 
