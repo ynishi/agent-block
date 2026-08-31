@@ -348,11 +348,13 @@ async fn read_sse(mut resp: reqwest::Response, on_data: &Option<LuaFunction>) ->
 // header redaction and the append-only IO, and is guaranteed never to fail a
 // request: every error path warns once and disables the sink.
 
-/// Header names (compared case-insensitively) whose values never reach the sink.
+/// Exact header names (compared case-insensitively) whose values never reach
+/// the sink. See [`is_redacted_header`]: the sink also applies the `ab.obs`
+/// substring policy on top of this list.
 ///
-/// Keep this list in sync with the other two copies:
+/// Keep these five entries in sync with the other two copies:
 /// `blocks/agent/init.lua` and `blocks/compile_loop/init.lua`
-/// (`sanitize_headers_for_dump`).
+/// (`sanitize_headers_for_dump`), which carry the exact names only.
 const REDACTED_HEADERS: [&str; 5] = [
     "x-api-key",
     "authorization",
@@ -503,19 +505,37 @@ fn sanitize_id(raw: &str) -> String {
         .collect()
 }
 
-/// Render header pairs as a JSON object, masking sensitive values.
+/// True when a header value must be masked before it reaches the sink.
+///
+/// Union of two policies: the exact header names in [`REDACTED_HEADERS`] (which
+/// the hyphenated HTTP spelling of `x-api-key` would otherwise slip past) and
+/// the `ab.obs` substring policy (`token` / `secret` / `password` / `api_key` /
+/// `access_key` / `private_key` / ...), so the sink is never laxer than the logs.
+fn is_redacted_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    REDACTED_HEADERS.contains(&lower.as_str()) || obs::is_sensitive_key(&lower)
+}
+
+/// Render header pairs as an ordered JSON array of `[name, value]` pairs,
+/// masking sensitive values.
+///
+/// An array rather than an object: HTTP allows repeated names (several
+/// `set-cookie` lines are the common case) and an object would silently collapse
+/// them. Wire order is preserved.
 fn redact_headers(pairs: &[(String, String)]) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        let lower = k.to_ascii_lowercase();
-        let value = if REDACTED_HEADERS.contains(&lower.as_str()) {
-            REDACTED_VALUE.to_string()
-        } else {
-            v.clone()
-        };
-        map.insert(k.clone(), serde_json::Value::String(value));
-    }
-    serde_json::Value::Object(map)
+    serde_json::Value::Array(
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                let value = if is_redacted_header(k) {
+                    REDACTED_VALUE
+                } else {
+                    v.as_str()
+                };
+                serde_json::json!([k, value])
+            })
+            .collect(),
+    )
 }
 
 fn dump_request_record(
@@ -533,7 +553,9 @@ fn dump_request_record(
         "agent_id": ctx.2,
         "agent_name": ctx.3,
         "method": method,
-        "url": url,
+        // Same sanitization the obs log lines use: userinfo / query / fragment
+        // are stripped, so a credential in the URL never reaches the sink.
+        "url": obs::sanitize_url(url),
         "headers": redact_headers(headers),
     });
     if let Some(b) = body {
@@ -559,7 +581,9 @@ fn dump_response_record(
         "agent_id": ctx.2,
         "agent_name": ctx.3,
         "method": method,
-        "url": url,
+        // Same sanitization the obs log lines use: userinfo / query / fragment
+        // are stripped, so a credential in the URL never reaches the sink.
+        "url": obs::sanitize_url(url),
         "status": status,
         "headers": redact_headers(headers),
     });
@@ -576,6 +600,17 @@ fn dump_response_record(
 mod tests {
     use super::*;
 
+    /// Collect the values recorded for `name` from the `[name, value]` array.
+    fn values_for(rendered: &serde_json::Value, name: &str) -> Vec<String> {
+        rendered
+            .as_array()
+            .expect("headers must be an array")
+            .iter()
+            .filter(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str().expect("value must be a string").to_string())
+            .collect()
+    }
+
     #[test]
     fn redact_headers_masks_sensitive_keys_case_insensitively() {
         let pairs = vec![
@@ -584,21 +619,57 @@ mod tests {
             ("set-cookie".to_string(), "sid=abc".to_string()),
             ("Cookie".to_string(), "session=xyz".to_string()),
             ("Proxy-Authorization".to_string(), "Basic pxy".to_string()),
+            // Not in the exact list — caught by the ab.obs substring policy.
+            ("X-Session-Token".to_string(), "tok-substring".to_string()),
             ("content-type".to_string(), "application/json".to_string()),
         ];
         let got = redact_headers(&pairs);
-        assert_eq!(got["X-Api-Key"], REDACTED_VALUE);
-        assert_eq!(got["Authorization"], REDACTED_VALUE);
-        assert_eq!(got["set-cookie"], REDACTED_VALUE);
-        assert_eq!(got["Cookie"], REDACTED_VALUE);
-        assert_eq!(got["Proxy-Authorization"], REDACTED_VALUE);
-        assert_eq!(got["content-type"], "application/json");
+        assert_eq!(values_for(&got, "X-Api-Key"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "Authorization"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "set-cookie"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "Cookie"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "Proxy-Authorization"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "X-Session-Token"), [REDACTED_VALUE]);
+        assert_eq!(values_for(&got, "content-type"), ["application/json"]);
         let rendered = got.to_string();
         assert!(!rendered.contains("secret-key"), "leaked: {rendered}");
         assert!(!rendered.contains("Bearer tok"), "leaked: {rendered}");
         assert!(!rendered.contains("sid=abc"), "leaked: {rendered}");
         assert!(!rendered.contains("session=xyz"), "leaked: {rendered}");
         assert!(!rendered.contains("Basic pxy"), "leaked: {rendered}");
+        assert!(!rendered.contains("tok-substring"), "leaked: {rendered}");
+    }
+
+    #[test]
+    fn redact_headers_keeps_repeated_names_and_order() {
+        let pairs = vec![
+            ("set-cookie".to_string(), "a=1".to_string()),
+            ("set-cookie".to_string(), "b=2".to_string()),
+            ("x-order".to_string(), "first".to_string()),
+            ("x-order".to_string(), "second".to_string()),
+        ];
+        let got = redact_headers(&pairs);
+        assert_eq!(got.as_array().expect("array").len(), 4);
+        // Both cookies survive as separate entries (an object would collapse them).
+        assert_eq!(
+            values_for(&got, "set-cookie"),
+            [REDACTED_VALUE, REDACTED_VALUE]
+        );
+        assert_eq!(values_for(&got, "x-order"), ["first", "second"]);
+    }
+
+    #[test]
+    fn records_sanitize_the_url() {
+        let ctx = ("t".into(), "r".into(), "a".into(), "n".into());
+        let raw = "https://user:pass@api.example.com/v1/messages?token=SECRET";
+        let req = dump_request_record(&ctx, "POST", raw, &[], None);
+        let resp = dump_response_record(&ctx, "POST", raw, 200, &[], None, None);
+        for rec in [&req, &resp] {
+            assert_eq!(rec["url"], "https://api.example.com/v1/messages");
+            let rendered = rec.to_string();
+            assert!(!rendered.contains("SECRET"), "leaked: {rendered}");
+            assert!(!rendered.contains("pass"), "leaked: {rendered}");
+        }
     }
 
     #[test]

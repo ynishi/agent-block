@@ -94,7 +94,13 @@ fn sanitize_value<'a>(key: &str, value: &'a str) -> Cow<'a, str> {
     Cow::Borrowed(value)
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+/// True when a key name looks credential-bearing under the `ab.obs` policy.
+///
+/// Substring match on the lowercased key, so `x-auth-token` / `apikey_v2` and
+/// similar variants are covered. Also used by the HTTP bridge JSONL dump sink,
+/// which redacts a header when this matches *or* when the name is one of its
+/// exact header names.
+pub fn is_sensitive_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     [
         "authorization",

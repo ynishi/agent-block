@@ -139,7 +139,9 @@ end
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
 -- Keep this list in sync with the other two copies: blocks/compile_loop/init.lua
--- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs.
+-- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
+-- site is a superset: these exact names plus the ab.obs substring policy
+-- (token / secret / password / api_key / access_key / private_key / ...).
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
@@ -435,6 +437,8 @@ local function llm_call_anthropic(messages, opts, trace)
         { "timeout", tonumber(opts.timeout or 120) or 120 },
         { "context_mgmt", opts.context_management ~= nil },
     })
+    -- Encoded once so the dumped payload is byte-identical to the wire body.
+    local body_json = std.json.encode(body)
     if dump_mode == "full" then
         llm_dump_event(dump_mode, "request_headers", {
             { "call", call_index },
@@ -446,7 +450,7 @@ local function llm_call_anthropic(messages, opts, trace)
             { "call", call_index },
             { "turn", turn },
             { "iter", iteration },
-            { "payload", std.json.encode(body) },
+            { "payload", body_json },
         })
     end
 
@@ -454,7 +458,7 @@ local function llm_call_anthropic(messages, opts, trace)
     local resp = http.request("https://api.anthropic.com/v1/messages", {
         method = "POST",
         headers = headers,
-        body = std.json.encode(body),
+        body = body_json,
         timeout = opts.timeout or 120,
         -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
         dump = (dump_mode == "full") and "full" or nil,
@@ -802,6 +806,8 @@ local function llm_call_openai(messages, opts, trace)
         { "context_mgmt", false },
         { "provider", "openai" },
     })
+    -- Encoded once so the dumped payload is byte-identical to the wire body.
+    local body_json = std.json.encode(body)
     if dump_mode == "full" then
         llm_dump_event(dump_mode, "request_headers", {
             { "call", call_index },
@@ -813,7 +819,7 @@ local function llm_call_openai(messages, opts, trace)
             { "call", call_index },
             { "turn", turn },
             { "iter", iteration },
-            { "payload", std.json.encode(body) },
+            { "payload", body_json },
         })
     end
 
@@ -821,7 +827,7 @@ local function llm_call_openai(messages, opts, trace)
     local resp = http.request(endpoint, {
         method = "POST",
         headers = headers,
-        body = std.json.encode(body),
+        body = body_json,
         timeout = opts.timeout or 120,
         -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
         dump = (dump_mode == "full") and "full" or nil,

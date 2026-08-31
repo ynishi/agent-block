@@ -153,6 +153,19 @@ What it enforces:
   requested TCP denial (`AGENT_BLOCK_SANDBOX_TCP=0`), which aborts startup on
   kernels older than 6.7 rather than silently failing open.
 
+Operational notes:
+
+- **A build target outside `--project` needs an explicit grant.** The default
+  write allowlist is only the project root, `AGENT_BLOCK_HOME`, `/tmp` and
+  `/dev/{null,urandom,tty}`, so when the directory being worked on is not under
+  `--project` (e.g. the checkout driving the run differs from the repo being
+  built), add that checkout to `AGENT_BLOCK_SANDBOX_FS_RW`.
+- **Toolchain cache dirs must be writable too.** `~/.cargo` is not in the
+  default allowlist, so cargo fails creating its registry cache
+  (`Permission denied`). Either list it in `AGENT_BLOCK_SANDBOX_FS_RW` or point
+  the cache at an allowed path with `CARGO_HOME=/tmp/cargo` — the latter works
+  from cold, since TCP stays open and downloads still succeed.
+
 KNOWN LIMITATIONS:
 
 1. **Linux only.** On other platforms `--sandbox` is a startup error, never a
@@ -337,6 +350,8 @@ live in `docs/architecture/mcp-support.md`.
 
 ### sh.*
 - `sh.exec(cmd, opts)` — Execute a shell command
+- Children inherit the environment **except the host's own credential variables**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `AGENT_BLOCK_MESH_SECRET_KEY` are removed from every `sh.exec` child, so code the agent runs (including code it just wrote) cannot read the keys the host itself uses.
+- A script that legitimately needs an API key must be given its own — pass it under a different variable name, or through the block conf (`api_key` / `api_key_env`). Custom `api_key_env` names are *not* stripped, and this is not an allowlist: every other variable is still inherited.
 
 ### std.json.* (mlua-batteries)
 - `std.json.encode(value)`, `std.json.decode(str)`, `std.json.encode_pretty(value)`
@@ -504,7 +519,7 @@ Key behaviours:
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
 
-`AGENT_BLOCK_LLM_DUMP_DIR=<dir>` adds a JSONL audit sink at the HTTP primitive, for CI runs that need a byte-exact trail without parsing stdout. Each process appends to a single file `<dir>/<UTC yyyymmddThhmmssZ>-<id>-p<pid>.jsonl` (`<id>` = `AGENT_BLOCK_RUN_ID`, else `AGENT_BLOCK_TRACE_ID`, else the process-scoped agent id; the pid keeps concurrent processes that share a run id in separate files), one JSON object per line: a `http_request` record before the send and a `http_response` record with the status and body. The `x-api-key`, `authorization`, `set-cookie`, `cookie` and `proxy-authorization` header values are always replaced with `***REDACTED***`. Only requests that a block flags are written — today that means LLM calls made while `AGENT_BLOCK_LLM_DUMP=full` is in effect (the blocks own the policy; the primitive owns the file). SSE streaming calls record the request plus a response record carrying `body_skipped: "sse_stream"` — streamed bodies are not dumped. Sink failures are logged once and disable dumping for the rest of the process; they never fail the HTTP request. Under `--sandbox`, the directory must fall inside the writable allowlist (project root, `AGENT_BLOCK_HOME`, `/tmp`, or a path added via `AGENT_BLOCK_SANDBOX_FS_RW`).
+`AGENT_BLOCK_LLM_DUMP_DIR=<dir>` adds a JSONL audit sink at the HTTP primitive, for CI runs that need a byte-exact trail without parsing stdout. Each process appends to a single file `<dir>/<UTC yyyymmddThhmmssZ>-<id>-p<pid>.jsonl` (`<id>` = `AGENT_BLOCK_RUN_ID`, else `AGENT_BLOCK_TRACE_ID`, else the process-scoped agent id; the pid keeps concurrent processes that share a run id in separate files), one JSON object per line: a `http_request` record before the send and a `http_response` record with the status and body. `headers` is an array of `[name, value]` pairs in wire order, so repeated names (several `set-cookie` lines) are preserved. `url` is sanitized like the obs log lines (userinfo, query and fragment stripped), and a header value is replaced with `***REDACTED***` when the name is `x-api-key`, `authorization`, `set-cookie`, `cookie` or `proxy-authorization`, or when it matches the `ab.obs` substring policy (`token`, `secret`, `password`, `api_key`, `access_key`, `private_key`, ...). Only requests that a block flags are written — today that means LLM calls made while `AGENT_BLOCK_LLM_DUMP=full` is in effect (the blocks own the policy; the primitive owns the file). SSE streaming calls record the request plus a response record carrying `body_skipped: "sse_stream"` — streamed bodies are not dumped. Sink failures are logged once and disable dumping for the rest of the process; they never fail the HTTP request. Under `--sandbox`, the directory must fall inside the writable allowlist (project root, `AGENT_BLOCK_HOME`, `/tmp`, or a path added via `AGENT_BLOCK_SANDBOX_FS_RW`).
 
 ### compile_loop (Filesystem block — `require("compile_loop")`)
 

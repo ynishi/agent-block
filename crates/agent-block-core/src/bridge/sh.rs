@@ -16,12 +16,37 @@
 //! Sandbox mode is off by default, so the default trust boundary is unchanged.
 //! It is a coarse execution boundary, not a command allowlist or a
 //! capability-based policy — those remain unimplemented.
+//!
+//! Independently of sandbox mode, the block host's *own* credential environment
+//! variables (`OWN_CREDENTIAL_ENV_VARS`) are removed from every child spawned
+//! here, so commands the host runs cannot read the keys the host itself uses.
+//! Custom per-LLM-conf key env names (`api_key_env`) are not covered by that
+//! removal, and it is not an env allowlist — everything else is still inherited.
 
 use mlua::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::host::HostContext;
+
+/// The block host's own credential environment variables.
+///
+/// These are removed from every `sh -c` child, so code executed by the agent —
+/// including code the agent just wrote — cannot read the host's keys.
+///
+/// The scope is deliberately narrow:
+///
+/// - Custom key env names configured per-LLM conf (`api_key_env`) are **not**
+///   covered; generalizing that belongs to a planned exec-tool redesign.
+/// - This is **not** an env allowlist. Every other variable is still inherited.
+const OWN_CREDENTIAL_ENV_VARS: &[&str] = &[
+    // Default key env of the anthropic provider path (blocks/agent, blocks/compile_loop).
+    "ANTHROPIC_API_KEY",
+    // Default key env of the openai-compatible provider path.
+    "OPENAI_API_KEY",
+    // Core's own mesh Ed25519 secret key (`--secret-key`).
+    "AGENT_BLOCK_MESH_SECRET_KEY",
+];
 
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let sh_tbl = lua.create_table()?;
@@ -74,14 +99,19 @@ async fn run_async(
     cwd: &PathBuf,
     timeout: Duration,
 ) -> Result<(i32, String, String), String> {
-    let child = tokio::process::Command::new("sh")
+    let mut command = tokio::process::Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("exec error: {e}"))?;
+        .stderr(std::process::Stdio::piped());
+
+    for var in OWN_CREDENTIAL_ENV_VARS {
+        command.env_remove(var);
+    }
+
+    let child = command.spawn().map_err(|e| format!("exec error: {e}"))?;
 
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await

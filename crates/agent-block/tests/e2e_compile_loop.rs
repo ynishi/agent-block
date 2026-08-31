@@ -1019,10 +1019,18 @@ async fn compile_loop_full_dump_writes_jsonl_sink() {
     );
 
     // The fixture injects api_key="dummy" as the x-api-key header value.
+    // `headers` is an array of [name, value] pairs, so repeated names survive.
+    let api_key_values: Vec<&str> = requests[0]["headers"]
+        .as_array()
+        .expect("headers must be an array of [name, value] pairs")
+        .iter()
+        .filter(|pair| pair[0] == "x-api-key")
+        .filter_map(|pair| pair[1].as_str())
+        .collect();
     assert_eq!(
-        requests[0]["headers"]["x-api-key"],
-        "***REDACTED***",
-        "x-api-key must be redacted in the sink: {}",
+        api_key_values,
+        ["***REDACTED***"],
+        "x-api-key must be present and redacted in the sink: {}",
         requests[0]
     );
     assert!(

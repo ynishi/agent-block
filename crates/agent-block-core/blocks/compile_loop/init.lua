@@ -138,7 +138,9 @@ end
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
 -- Keep this list in sync with the other two copies: blocks/agent/init.lua
--- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs.
+-- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
+-- site is a superset: these exact names plus the ab.obs substring policy
+-- (token / secret / password / api_key / access_key / private_key / ...).
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
