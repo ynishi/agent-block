@@ -844,3 +844,97 @@ async fn compile_loop_anthropic_mock_emits_obs_events() {
     );
     ct.cancel();
 }
+
+/// Verifies that AGENT_BLOCK_LLM_DUMP=full emits prompt/response bodies from the
+/// compile_loop llm_call path, and that meta mode does not.
+///
+/// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls) and runs the
+/// subprocess twice against it:
+///   Run 1 (full): stdout must carry `event=request_body component=compile_loop`
+///                 (the request body holds the full messages array — the audit trail).
+///   Run 2 (meta): the same events must NOT appear; meta output stays meta-only.
+///
+/// No `#[ignore]` — self-contained, runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_anthropic_mock_full_dump_emits_bodies() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_anthropic_mock::spawn_compile_loop_anthropic_mock_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // --- Run 1: full mode → request/response bodies present ---
+    let url_clone = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "info")
+            .env("AGENT_BLOCK_LLM_DUMP", "full")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=request_body component=compile_loop",
+            ))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=response_body component=compile_loop",
+            ))
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=request_headers component=compile_loop",
+            ))
+            .stdout(predicate::str::contains("***REDACTED***"))
+            // The fixture injects api_key="dummy"; it must never reach the dump.
+            // Global (whole-stdout) form is safe here: the key value is not logged
+            // anywhere else and the mock never echoes it back.
+            .stdout(predicate::str::contains("dummy").not());
+    })
+    .await
+    .expect("subprocess assertion task (full) should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "full run: expected exactly 2 HTTP calls to the anthropic mock"
+    );
+
+    // Reset between runs — the mock keys its fail-then-pass shape off call_count,
+    // and the run 1 subprocess has already exited.
+    call_count.store(0, Ordering::SeqCst);
+
+    // --- Run 2: meta mode → bodies must stay absent ---
+    let url_clone2 = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone2)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "info")
+            .env("AGENT_BLOCK_LLM_DUMP", "meta")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
+            .stdout(predicate::str::contains("event=request_body").not())
+            .stdout(predicate::str::contains("event=response_body").not());
+    })
+    .await
+    .expect("subprocess assertion task (meta) should not panic");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "meta run: expected exactly 2 HTTP calls to the anthropic mock"
+    );
+    ct.cancel();
+}

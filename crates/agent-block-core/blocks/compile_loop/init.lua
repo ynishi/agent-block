@@ -122,6 +122,34 @@ local function resolve_dump_mode()
     return mode
 end
 
+-- Process-lifetime cache for the dump mode. llm_call fires per iteration, per
+-- tool-loop turn and per distill chunk; env vars do not change mid-process, so
+-- resolving once avoids re-reading env and repeating the prod-downgrade warn.
+local _dump_mode_cache = nil
+
+local function resolve_dump_mode_cached()
+    if _dump_mode_cache == nil then
+        _dump_mode_cache = resolve_dump_mode()
+    end
+    return _dump_mode_cache
+end
+
+-- Redact credential-bearing headers before they are emitted in full mode.
+-- Applied to both request headers (api key / bearer token) and response
+-- headers (proxy stacks can return Set-Cookie session tokens).
+local function sanitize_headers_for_dump(headers)
+    local out = {}
+    for k, v in pairs(headers or {}) do
+        local lk = string.lower(tostring(k))
+        if lk == "x-api-key" or lk == "authorization" or lk == "set-cookie" then
+            out[k] = "***REDACTED***"
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
 local LLM_DUMP_PREFIX = "ab.obs"
 
 local function kv_escape(v)
@@ -622,6 +650,9 @@ local function llm_call(opts, messages)
         return _llm_call_override(opts, messages)
     end
 
+    -- Resolved once per process; only "full" emits prompt/response bodies below.
+    local mode = resolve_dump_mode_cached()
+
     local provider = opts.provider or "openai"
     if provider == "anthropic" then
         -- 1. Resolve api_key: opts.api_key → ANTHROPIC_API_KEY env → error
@@ -676,12 +707,23 @@ local function llm_call(opts, messages)
 
         -- 6. HTTP call
         local base_url = opts.base_url or "https://api.anthropic.com"
+        -- Encoded once so the dumped payload is byte-identical to the wire body.
+        local body_json = std.json.encode(body)
+        if mode == "full" then
+            obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
+            obs_event(mode, "request_body", { { "payload", body_json } })
+        end
         local resp = http.request(base_url .. "/v1/messages", {
             method = "POST",
             headers = headers,
-            body = std.json.encode(body),
+            body = body_json,
             timeout = opts.timeout or 120,
         })
+        if mode == "full" then
+            local resp_headers = sanitize_headers_for_dump(resp.headers)
+            obs_event(mode, "response_headers", { { "payload", std.json.encode(resp_headers) } })
+            obs_event(mode, "response_body", { { "payload", tostring(resp.body or "") } })
+        end
 
         -- 7. Status check
         if resp.status ~= 200 then
@@ -788,12 +830,23 @@ local function llm_call(opts, messages)
         ["User-Agent"] = "Mozilla/5.0", -- RunPod proxy / Cloudflare gate
     }
 
+    -- Encoded once so the dumped payload is byte-identical to the wire body.
+    local body_json = std.json.encode(body)
+    if mode == "full" then
+        obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
+        obs_event(mode, "request_body", { { "payload", body_json } })
+    end
     local resp = http.request(base_url .. "/chat/completions", {
         method = "POST",
         headers = headers,
-        body = std.json.encode(body),
+        body = body_json,
         timeout = opts.timeout or 120,
     })
+    if mode == "full" then
+        local resp_headers = sanitize_headers_for_dump(resp.headers)
+        obs_event(mode, "response_headers", { { "payload", std.json.encode(resp_headers) } })
+        obs_event(mode, "response_body", { { "payload", tostring(resp.body or "") } })
+    end
     if resp.status ~= 200 then
         return nil, "API error " .. tostring(resp.status) .. " body=" .. tostring(resp.body or "")
     end
