@@ -135,6 +135,18 @@ local function resolve_dump_mode()
     return mode
 end
 
+-- Process-lifetime cache for the dump mode. llm_call fires per turn and per
+-- tool-loop turn; env vars do not change mid-process, so resolving once avoids
+-- re-reading env and repeating the prod-downgrade warn.
+local _dump_mode_cache = nil
+
+local function resolve_dump_mode_cached()
+    if _dump_mode_cache == nil then
+        _dump_mode_cache = resolve_dump_mode()
+    end
+    return _dump_mode_cache
+end
+
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
@@ -418,7 +430,7 @@ local function llm_call_anthropic(messages, opts, trace)
         body.context_management = opts.context_management
     end
 
-    local dump_mode = resolve_dump_mode()
+    local dump_mode = resolve_dump_mode_cached()
     local call_index = trace and trace.call_index or "?"
     local turn = trace and trace.turn or "?"
     local iteration = trace and trace.iteration or "?"
@@ -786,7 +798,7 @@ local function llm_call_openai(messages, opts, trace)
         ["Content-Type"] = "application/json",
     }
 
-    local dump_mode = resolve_dump_mode()
+    local dump_mode = resolve_dump_mode_cached()
     local call_index = trace and trace.call_index or "?"
     local turn = trace and trace.turn or "?"
     local iteration = trace and trace.iteration or "?"

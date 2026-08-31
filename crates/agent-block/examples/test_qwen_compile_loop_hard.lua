@@ -10,18 +10,16 @@ end
 
 local TARGET = "/tmp/qwen_react_deepcopy.lua"
 
+local LUA_RUNNER_TIMEOUT = 60
+
 local function lua_runner(file_path)
-    local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
-    if not p then
-        return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
+    local res = sh.exec("lua " .. file_path, { timeout = LUA_RUNNER_TIMEOUT })
+    if not res.ok then
+        -- Spawn failure or timeout: no exit code exists, so report -1.
+        return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
     end
-    local out = p:read("*a") or ""
-    p:close()
-    local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
-    local exit_code = tonumber(exit_str) or 1
-    out = out:gsub("__EXIT__=%d+%s*$", "")
-    local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
-    return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+    local pass = res.code == 0 and res.stdout:find("ALL_PASS", 1, true) ~= nil
+    return { ok = pass, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
 end
 
 local SPEC =

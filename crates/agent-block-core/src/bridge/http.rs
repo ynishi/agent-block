@@ -94,6 +94,13 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .as_ref()
                     .and_then(|t| t.get::<Option<String>>("dump").ok().flatten())
                     .is_some_and(|v| v == "full");
+                // The captures below (header vecs, request body clone) are only
+                // worth taking when a sink actually exists; with
+                // AGENT_BLOCK_LLM_DUMP_DIR unset they would be built and then
+                // discarded. `dump_sink()` is a cached `OnceLock`, and `&&`
+                // short-circuits, so an unflagged request still never resolves
+                // it.
+                let dump_active: bool = dump_full && dump_sink().is_some();
 
                 // ── Build request ─────────────────────────────────
                 let reqwest_method = method.parse::<reqwest::Method>().map_err(|e| {
@@ -114,7 +121,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                         for pair in headers_tbl.pairs::<String, String>() {
                             let (k, v) = pair?;
                             explicit_headers.insert(k.to_ascii_lowercase());
-                            if dump_full {
+                            if dump_active {
                                 dump_req_headers.push((k.clone(), v.clone()));
                             }
                             req = req.header(&k, &v);
@@ -141,7 +148,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     }
                     if let Some(v) = val_opt {
                         if !v.is_empty() {
-                            if dump_full {
+                            if dump_active {
                                 dump_req_headers.push((name.to_string(), v.clone()));
                             }
                             req = req.header(name, v);
@@ -150,7 +157,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 }
 
                 // Capture the request body before it is moved into the builder.
-                let dump_req_body = if dump_full { body.clone() } else { None };
+                let dump_req_body = if dump_active { body.clone() } else { None };
 
                 if let Some(b) = body {
                     req = req.body(b);
@@ -170,7 +177,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 );
                 // `dump_sink()` is only resolved for flagged requests, so an
                 // unset AGENT_BLOCK_LLM_DUMP_DIR never touches the filesystem.
-                if let Some(sink) = dump_full.then(dump_sink).flatten() {
+                if let Some(sink) = dump_active.then(dump_sink).flatten() {
                     let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
                     sink.write_record(dump_request_record(
                         &obs_ctx,
@@ -208,7 +215,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 let resp_headers = lua.create_table()?;
                 for (k, v) in resp.headers() {
                     if let Ok(vs) = v.to_str() {
-                        if dump_full {
+                        if dump_active {
                             dump_resp_headers.push((k.as_str().to_string(), vs.to_string()));
                         }
                         resp_headers.set(k.as_str(), vs.to_string())?;
@@ -221,7 +228,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     // the Lua callback, so the record carries `body_skipped`
                     // instead of a body.  Written before the stream is read so a
                     // mid-stream error still leaves the response record behind.
-                    if let Some(sink) = dump_full.then(dump_sink).flatten() {
+                    if let Some(sink) = dump_active.then(dump_sink).flatten() {
                         let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
                         sink.write_record(dump_response_record(
                             &obs_ctx,
@@ -241,12 +248,36 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     Ok(result)
                 } else {
                     // ── Buffered mode ─────────────────────────────
-                    let body_bytes = resp
-                        .bytes()
-                        .await
-                        .map_err(|e| LuaError::external(format!("http read body error: {e}")))?;
+                    // Both failure paths below return early. Like the SSE branch
+                    // they still emit a response record — with `body_skipped`
+                    // instead of a body — so a dump never ends up holding a
+                    // request whose response silently went missing. Status and
+                    // headers are already known at this point.
+                    let write_skipped_response = |reason: &str| {
+                        if let Some(sink) = dump_active.then(dump_sink).flatten() {
+                            let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
+                            sink.write_record(dump_response_record(
+                                &obs_ctx,
+                                &method,
+                                &url,
+                                status,
+                                &dump_resp_headers,
+                                None,
+                                Some(reason),
+                            ));
+                        }
+                    };
+
+                    let body_bytes = match resp.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            write_skipped_response("read_error");
+                            return Err(LuaError::external(format!("http read body error: {e}")));
+                        }
+                    };
 
                     if body_bytes.len() > MAX_BODY_SIZE {
+                        write_skipped_response("max_body_size");
                         return Err(LuaError::external(format!(
                             "response body too large: {} bytes (max {MAX_BODY_SIZE})",
                             body_bytes.len()
@@ -257,7 +288,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
                     // Dump the exact text handed to Lua below — the body is read
                     // once (`resp.bytes()` above) and borrowed here, not re-read.
-                    if let Some(sink) = dump_full.then(dump_sink).flatten() {
+                    if let Some(sink) = dump_active.then(dump_sink).flatten() {
                         let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
                         sink.write_record(dump_response_record(
                             &obs_ctx,
@@ -711,5 +742,38 @@ mod tests {
         );
         assert_eq!(rec["body_skipped"], "sse_stream");
         assert!(rec.get("body").is_none());
+    }
+
+    /// Sync guard for the deliberately-duplicated 写経 copies of the redaction
+    /// list. Consolidating the three sites is out of scope on purpose, so this
+    /// test — not a comment — is what fails when [`REDACTED_HEADERS`] gains or
+    /// renames an entry and the two Lua `sanitize_headers_for_dump` copies are
+    /// not updated with it.
+    #[test]
+    fn redaction_list_is_mirrored_in_both_lua_blocks() {
+        /// Text of the `sanitize_headers_for_dump` body, so a name that merely
+        /// appears elsewhere in the file cannot satisfy the assertion.
+        fn sanitize_region(rel: &str) -> String {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let start = src
+                .find("local function sanitize_headers_for_dump")
+                .unwrap_or_else(|| panic!("{} has no sanitize_headers_for_dump", path.display()));
+            let rest = &src[start..];
+            let end = rest.find("\nend\n").map_or(rest.len(), |i| i + 5);
+            rest[..end].to_string()
+        }
+
+        for rel in ["blocks/agent/init.lua", "blocks/compile_loop/init.lua"] {
+            let region = sanitize_region(rel);
+            for name in REDACTED_HEADERS {
+                assert!(
+                    region.contains(name),
+                    "{rel}: sanitize_headers_for_dump does not redact '{name}' \
+                     (REDACTED_HEADERS and the two Lua copies must stay in sync)"
+                );
+            }
+        }
     }
 }

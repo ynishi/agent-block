@@ -11,6 +11,13 @@
 //!   per-server multiplexing of concurrent requests is delegated to
 //!   rmcp's `RunningService`, which tracks pending requests by ID
 //!   internally over a channel-based peer.
+//!
+//! Stdio servers spawned by `connect` do **not** inherit the host's own
+//! credential variables (`agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS`),
+//! the same set `sh.exec` strips. `opts.env` (a string→string table) is
+//! injected after that removal, so a server that genuinely needs one of those
+//! keys is handed it explicitly by the script instead of picking it up by
+//! ambient inheritance.
 
 use mlua::prelude::*;
 use mlua_isle::IsleError;
@@ -89,6 +96,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     //   trace_context (bool): if true, inject __ab_obs into call_tool args (default: false)
     //   cwd (string): working directory for the spawned MCP subprocess
     //                 (default: `BlockConfig.project_root`)
+    //   env (table): string→string variables injected into the subprocess after
+    //                the host's own credentials are stripped (explicit injection;
+    //                see the module docs). Non-string values raise a Lua error
+    //                rather than being silently dropped.
     {
         let mgr = Arc::clone(manager);
         let default_cwd: Arc<std::path::PathBuf> = Arc::new(ctx.project_root.clone());
@@ -119,8 +130,8 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             }
                             _ => Vec::new(),
                         };
-                        // Parse opts: trace_context flag + cwd override.
-                        let (trace_context, cwd_override) = match opts {
+                        // Parse opts: trace_context flag + cwd override + env injection.
+                        let (trace_context, cwd_override, env) = match opts {
                             Some(v) => {
                                 let opts_json = lua_to_json(&lua, v)?;
                                 let trace = opts_json
@@ -131,14 +142,15 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                     .get("cwd")
                                     .and_then(|v| v.as_str())
                                     .map(std::path::PathBuf::from);
-                                (trace, cwd)
+                                let env = parse_connect_env(opts_json.get("env"))?;
+                                (trace, cwd, env)
                             }
-                            None => (false, None),
+                            None => (false, None, Vec::new()),
                         };
                         let cwd_path = cwd_override.as_deref().unwrap_or(default_cwd.as_path());
                         mgr.write()
                             .await
-                            .connect(&name, &command, &args, trace_context, Some(cwd_path))
+                            .connect(&name, &command, &args, trace_context, Some(cwd_path), &env)
                             .await
                             .map_err(LuaError::external)
                     }
@@ -1075,6 +1087,34 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     Ok(())
 }
 
+/// Parse `mcp.connect` `opts.env` into the `(key, value)` pairs the manager
+/// injects into the spawned server after stripping the host's own credentials.
+///
+/// Absent / `nil` means "inject nothing". A non-string value is rejected rather
+/// than coerced or skipped: silently dropping an entry would hand the server an
+/// environment the caller did not ask for, and the caller would have no way to
+/// notice.
+fn parse_connect_env(value: Option<&serde_json::Value>) -> LuaResult<Vec<(String, String)>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| match v.as_str() {
+                Some(s) => Ok((k.clone(), s.to_string())),
+                None => Err(LuaError::external(format!(
+                    "mcp.connect: opts.env['{k}'] must be a string"
+                ))),
+            })
+            .collect(),
+        _ => Err(LuaError::external(
+            "mcp.connect: opts.env must be a table of string→string".to_string(),
+        )),
+    }
+}
+
 fn inject_obs_context(args_json: &mut serde_json::Value, fallback_agent_id: Option<&str>) {
     fn insert_obs(into: &mut Map<String, serde_json::Value>, fallback_agent_id: Option<&str>) {
         if into.contains_key("__ab_obs") {
@@ -1118,5 +1158,51 @@ fn inject_obs_context(args_json: &mut serde_json::Value, fallback_agent_id: Opti
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_connect_env;
+
+    #[test]
+    fn env_absent_or_null_injects_nothing() {
+        let null = serde_json::Value::Null;
+        assert!(parse_connect_env(None).expect("absent env").is_empty());
+        assert!(parse_connect_env(Some(&null)).expect("null env").is_empty());
+    }
+
+    #[test]
+    fn env_table_becomes_pairs() {
+        let opts = serde_json::json!({ "env": { "ANTHROPIC_API_KEY": "sk-x", "FOO": "bar" } });
+        let mut pairs = parse_connect_env(opts.get("env")).expect("string env");
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("ANTHROPIC_API_KEY".to_string(), "sk-x".to_string()),
+                ("FOO".to_string(), "bar".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_rejects_non_string_value() {
+        let opts = serde_json::json!({ "env": { "PORT": 8080 } });
+        let err = parse_connect_env(opts.get("env")).expect_err("must reject non-string");
+        assert!(
+            err.to_string().contains("opts.env['PORT']"),
+            "error must name the offending key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn env_rejects_non_table() {
+        let opts = serde_json::json!({ "env": "ANTHROPIC_API_KEY=sk-x" });
+        let err = parse_connect_env(opts.get("env")).expect_err("must reject non-table");
+        assert!(
+            err.to_string().contains("opts.env must be a table"),
+            "unexpected error: {err}"
+        );
     }
 }

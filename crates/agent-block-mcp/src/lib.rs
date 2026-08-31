@@ -21,6 +21,16 @@
 //! the bottom of this file. If rmcp alters its `Peer` concurrency model,
 //! or if this module is refactored to re-serialize RPCs, those tests fail.
 //!
+//! # Child environment
+//!
+//! Stdio servers are spawned as child processes and inherit the host's
+//! environment, minus the host's *own* credential variables
+//! ([`agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS`]), which
+//! [`McpManager::connect`] removes — the same set `sh.exec` strips. A server
+//! that legitimately needs one of those keys must be handed it explicitly via
+//! the `env` argument (`mcp.connect(name, cmd, args, { env = {...} })` from
+//! Lua), which is applied after the removals.
+//!
 //! # Usage from Lua
 //!
 //! ```lua
@@ -57,6 +67,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::warn;
 
+use agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS;
 use agent_block_types::error::{BlockError, BlockResult};
 
 pub use handler::AgentBlockClientHandler;
@@ -120,6 +131,12 @@ impl McpManager {
     /// pass `BlockConfig.project_root` so the MCP server sees the same
     /// project root as the Lua script (matters for servers that rely on
     /// path-based discovery such as `git rev-parse --show-toplevel`).
+    ///
+    /// `env`: variables explicitly injected into the child, applied **after**
+    /// the host's own credentials ([`OWN_CREDENTIAL_ENV_VARS`]) are removed.
+    /// Ordinary variables are still inherited from the parent — this is an
+    /// explicit-injection escape hatch, not an allowlist, and it is the only
+    /// way to hand a stripped variable to a server that genuinely needs it.
     pub async fn connect(
         &mut self,
         name: &str,
@@ -127,11 +144,20 @@ impl McpManager {
         args: &[String],
         trace_context: bool,
         cwd: Option<&Path>,
+        env: &[(String, String)],
     ) -> BlockResult<()> {
         let mut cmd = Command::new(command);
         cmd.args(args).stderr(Stdio::inherit());
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        // Strip the host's own credentials first, then apply caller-supplied
+        // injections so an explicit `env` entry can re-provide a stripped var.
+        for var in OWN_CREDENTIAL_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         let transport = TokioChildProcess::new(cmd).map_err(|e| {
             warn!(server = %name, command = %command, error = %e, "mcp spawn failed");

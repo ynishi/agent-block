@@ -47,14 +47,18 @@ Classic behaviour: one target file, any `edit_mode`.
 ```lua
 local compile_loop = require("blocks/compile_loop")
 
+local LUA_TIMEOUT = 60
+
 local tool = compile_loop.make({
     edit_mode = "diff",
     runner = function(path)
         -- path is an absolute string
-        local handle = io.popen("lua " .. path .. " 2>&1", "r")
-        local out = handle:read("*a")
-        local ok = handle:close()
-        return { ok = ok, stdout = out, stderr = "", exit_code = ok and 0 or 1 }
+        local res = sh.exec("lua " .. path, { timeout = LUA_TIMEOUT })
+        if not res.ok then
+            -- spawn failure or timeout: no exit code exists
+            return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
+        end
+        return { ok = res.code == 0, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
     end,
 })
 
@@ -77,15 +81,18 @@ Multiple target files edited in a single loop. Requires `edit_mode = "diff"`.
 -- pseudo (requires subtask-1 implementation)
 local compile_loop = require("blocks/compile_loop")
 
+local CARGO_TIMEOUT = 300
+
 local tool = compile_loop.make({
     edit_mode = "diff",
     runner = function(paths)
         -- paths is a list<string> of absolute paths
-        local cmd = "cargo test 2>&1"
-        local handle = io.popen(cmd, "r")
-        local out = handle:read("*a")
-        local ok = handle:close()
-        return { ok = ok, stdout = out, stderr = "", exit_code = ok and 0 or 1 }
+        local res = sh.exec("cargo test", { timeout = CARGO_TIMEOUT })
+        if not res.ok then
+            -- spawn failure or timeout: no exit code exists
+            return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
+        end
+        return { ok = res.code == 0, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
     end,
 })
 

@@ -18,8 +18,10 @@
 //! capability-based policy — those remain unimplemented.
 //!
 //! Independently of sandbox mode, the block host's *own* credential environment
-//! variables (`OWN_CREDENTIAL_ENV_VARS`) are removed from every child spawned
-//! here, so commands the host runs cannot read the keys the host itself uses.
+//! variables ([`agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS`]) are removed
+//! from every child spawned here, so commands the host runs cannot read the keys
+//! the host itself uses. The same set is stripped from MCP server subprocesses
+//! (see `agent_block_mcp::McpManager::connect`).
 //! Custom per-LLM-conf key env names (`api_key_env`) are not covered by that
 //! removal, and it is not an env allowlist — everything else is still inherited.
 
@@ -27,26 +29,9 @@ use mlua::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::host::HostContext;
+use agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS;
 
-/// The block host's own credential environment variables.
-///
-/// These are removed from every `sh -c` child, so code executed by the agent —
-/// including code the agent just wrote — cannot read the host's keys.
-///
-/// The scope is deliberately narrow:
-///
-/// - Custom key env names configured per-LLM conf (`api_key_env`) are **not**
-///   covered; generalizing that belongs to a planned exec-tool redesign.
-/// - This is **not** an env allowlist. Every other variable is still inherited.
-const OWN_CREDENTIAL_ENV_VARS: &[&str] = &[
-    // Default key env of the anthropic provider path (blocks/agent, blocks/compile_loop).
-    "ANTHROPIC_API_KEY",
-    // Default key env of the openai-compatible provider path.
-    "OPENAI_API_KEY",
-    // Core's own mesh Ed25519 secret key (`--secret-key`).
-    "AGENT_BLOCK_MESH_SECRET_KEY",
-];
+use crate::host::HostContext;
 
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let sh_tbl = lua.create_table()?;
@@ -105,7 +90,10 @@ async fn run_async(
         .arg(cmd)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Tokio does NOT kill children on drop by default; without this the
+        // timeout below would return while the command kept running.
+        .kill_on_drop(true);
 
     for var in OWN_CREDENTIAL_ENV_VARS {
         command.env_remove(var);
@@ -116,9 +104,10 @@ async fn run_async(
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| {
-            // Timeout expired — kill the child process.
-            // child is moved into wait_with_output, so we can't kill it here.
-            // tokio drops the child on timeout which sends SIGKILL.
+            // Timeout expired. `child` was moved into `wait_with_output`, so it
+            // cannot be killed by name here; cancelling that future drops the
+            // child, and `kill_on_drop(true)` above turns that drop into a
+            // SIGKILL. Without that flag the child would survive this return.
             format!("timeout after {}s", timeout.as_secs())
         })?
         .map_err(|e| format!("wait error: {e}"))?;

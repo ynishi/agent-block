@@ -41,7 +41,7 @@ async fn connect_with_cwd_does_not_fail_to_spawn() {
     // so we expect Timeout. The point is: spawn must succeed (which
     // would not be the case if `cwd` weren't a valid directory).
     let result = mgr
-        .connect("test_server", "cat", &[], false, Some(dir.path()))
+        .connect("test_server", "cat", &[], false, Some(dir.path()), &[])
         .await;
 
     match result {
@@ -66,7 +66,7 @@ async fn connect_with_nonexistent_cwd_fails_at_spawn() {
 
     let nonexistent = std::path::PathBuf::from("/this/directory/does/not/exist/anywhere");
     let result = mgr
-        .connect("test_server", "cat", &[], false, Some(&nonexistent))
+        .connect("test_server", "cat", &[], false, Some(&nonexistent), &[])
         .await;
 
     match result {

@@ -16,35 +16,61 @@ local cl = require("compile_loop")
 -- BUILTIN_RUNNERS — facade-local only (Issue §確定 5)
 -- compile_loop itself does NOT have these; callers that pass runner_kind string
 -- get them resolved here before the function-only compile_loop API is invoked.
+--
+-- Both runners go through sh.exec, not io.popen: sh.exec strips the host's own
+-- credential env vars from the child (io.popen does not), and it returns a real
+-- exit code plus separated stdout/stderr, so no "__EXIT__=$?" marker is needed.
+--
+-- cwd: sh.exec defaults to the project root, so that — not the host process's
+-- cwd, which io.popen used to inherit — is where a runner command executes.
+-- This is deliberate: it makes the working directory deterministic regardless
+-- of where agent-block was started from. The cargo runner overrides it with the
+-- target file's directory via opts.cwd; any runner needing another directory
+-- does the same.
 -- ============================================================
+
+-- Wall-clock budget per runner invocation (seconds). io.popen had none, so a
+-- hung compiler/interpreter used to stall the whole loop.
+local LUA_RUNNER_TIMEOUT = 60
+local CARGO_RUNNER_TIMEOUT = 300
+
+-- Map an sh.exec result ({ok, code, stdout, stderr} | {ok=false, error}) onto
+-- the runner contract compile_loop expects ({ok, stdout, stderr, exit_code}).
+-- `ok` on the sh.exec side means "the command ran"; `ok` on the runner side
+-- means "the code under test passed", hence the separate `pass` argument.
+local function exec_result(res, pass_fn)
+    if not res.ok then
+        -- Spawn failure or timeout: no exit code exists, so report -1.
+        return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
+    end
+    local stdout = res.stdout or ""
+    local stderr = res.stderr or ""
+    return {
+        ok = res.code == 0 and pass_fn(stdout, stderr),
+        stdout = stdout,
+        stderr = stderr,
+        exit_code = res.code,
+    }
+end
 
 local BUILTIN_RUNNERS = {
     -- "lua" runner: invoke lua interpreter, pass/fail by exit 0 + "ALL_PASS" in stdout
     lua = function(file_path)
-        local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
-        if not p then
-            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
-        end
-        local out = p:read("*a") or ""
-        p:close()
-        local exit_str = out:match("__EXIT__=(%d+)%s*$") or "1"
-        local exit_code = tonumber(exit_str) or 1
-        out = out:gsub("__EXIT__=%d+%s*$", "")
-        local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
-        return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+        local res = sh.exec("lua " .. file_path, { timeout = LUA_RUNNER_TIMEOUT })
+        return exec_result(res, function(stdout)
+            return stdout:find("ALL_PASS", 1, true) ~= nil
+        end)
     end,
-    -- "cargo" runner: cd to target dir, run cargo test --offline, pass on "test result: ok"
+    -- "cargo" runner: run cargo test --offline in the target dir, pass on
+    -- exit 0 + "test result: ok"
     cargo = function(file_path)
         local dir = file_path:match("^(.*)/[^/]+$") or "."
-        local cmd = "cd " .. dir .. " && cargo test --offline 2>&1"
-        local p = io.popen(cmd, "r")
-        if not p then
-            return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 }
-        end
-        local out = p:read("*a") or ""
-        p:close()
-        local pass = out:find("test result: ok", 1, true) ~= nil
-        return { ok = pass, stdout = out, stderr = "", exit_code = pass and 0 or 1 }
+        local res = sh.exec("cargo test --offline", { cwd = dir, timeout = CARGO_RUNNER_TIMEOUT })
+        return exec_result(res, function(stdout, stderr)
+            -- cargo reports the summary on stdout and compiler diagnostics on
+            -- stderr; the old `2>&1` form searched the merged text, so do too.
+            return (stdout .. stderr):find("test result: ok", 1, true) ~= nil
+        end)
     end,
 }
 
@@ -154,6 +180,18 @@ function M.register_tool(opts)
 
     local td = cl.make(conf)
     return td.name
+end
+
+--- Expose facade-local helpers for testing (read-only access).
+--- `register_tool` only returns a tool name, so the built-in runners are
+--- otherwise unreachable from a test; the e2e fixture
+--- `coding_agent_runner.lua` drives them through this accessor.
+function M._test_helpers()
+    return {
+        resolve_runner = resolve_runner,
+        builtin_runners = BUILTIN_RUNNERS,
+        exec_result = exec_result,
+    }
 end
 
 return M

@@ -261,7 +261,16 @@ capability).
 Support status, capability matrix, and the tool-grouping design rationale
 live in `docs/architecture/mcp-support.md`.
 
-- `mcp.connect(name, command, args)` — Spawn MCP server over stdio + initialize handshake
+- `mcp.connect(name, command, args, opts)` — Spawn MCP server over stdio + initialize handshake.
+  `opts.trace_context` (bool, default `false`) injects `__ab_obs` into `call_tool` arguments;
+  `opts.cwd` (string) overrides the subprocess working directory (default: project root).
+  The spawned server is a child process, so — exactly like `sh.exec` children — it does **not**
+  inherit the host's own credential variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `AGENT_BLOCK_MESH_SECRET_KEY`). A server that legitimately needs one is handed it explicitly:
+  `mcp.connect(name, cmd, args, { env = { ANTHROPIC_API_KEY = "..." } })` — `opts.env` is a
+  string→string table applied *after* the removal, and is the only way to pass a stripped
+  variable through. Every other variable is still inherited (this is not an allowlist); a
+  non-string `opts.env` value raises an error rather than being dropped.
 - `mcp.connect_http(name, url, opts)` — Connect to an MCP server over HTTP transport.
   `opts.transport = "sse" | "http"` (default `"http"` = Streamable HTTP; `"sse"` = SSE).
   `opts.headers` table is forwarded as request headers.
@@ -349,9 +358,10 @@ live in `docs/architecture/mcp-support.md`.
 - `std.fs.is_file(path)`, `std.fs.is_dir(path)`, `std.fs.read_binary(path)`, `std.fs.write_binary(path, bytes)`
 
 ### sh.*
-- `sh.exec(cmd, opts)` — Execute a shell command
+- `sh.exec(cmd, opts)` — Execute a shell command. `opts.cwd` (default: project root), `opts.timeout` (seconds, default 30). On timeout the child is SIGKILLed, not left running.
 - Children inherit the environment **except the host's own credential variables**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `AGENT_BLOCK_MESH_SECRET_KEY` are removed from every `sh.exec` child, so code the agent runs (including code it just wrote) cannot read the keys the host itself uses.
 - A script that legitimately needs an API key must be given its own — pass it under a different variable name, or through the block conf (`api_key` / `api_key_env`). Custom `api_key_env` names are *not* stripped, and this is not an allowlist: every other variable is still inherited.
+- The same set is removed from MCP server subprocesses spawned by `mcp.connect`; that path takes an explicit `opts.env` table for servers that need a key (see `mcp.*` above).
 
 ### std.json.* (mlua-batteries)
 - `std.json.encode(value)`, `std.json.decode(str)`, `std.json.encode_pretty(value)`
@@ -534,15 +544,16 @@ local compile_loop = require("compile_loop")
 local agent        = require("agent")
 
 -- Define a caller-supplied runner function
+local LUA_RUNNER_TIMEOUT = 60
+
 local function lua_runner(file_path)
-    local p = io.popen("lua " .. file_path .. ' 2>&1; echo "__EXIT__=$?"', "r")
-    if not p then return { ok = false, stdout = "", stderr = "popen failed", exit_code = -1 } end
-    local out = p:read("*a") or ""
-    p:close()
-    local exit_code = tonumber(out:match("__EXIT__=(%d+)%s*$") or "1")
-    out = out:gsub("__EXIT__=%d+%s*$", "")
-    local pass = exit_code == 0 and out:find("ALL_PASS", 1, true) ~= nil
-    return { ok = pass, stdout = out, stderr = "", exit_code = exit_code }
+    local res = sh.exec("lua " .. file_path, { timeout = LUA_RUNNER_TIMEOUT })
+    if not res.ok then
+        -- spawn failure or timeout: no exit code exists
+        return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
+    end
+    local pass = res.code == 0 and res.stdout:find("ALL_PASS", 1, true) ~= nil
+    return { ok = pass, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
 end
 
 -- Build a tool_def and pass it to the parent agent
@@ -717,10 +728,11 @@ local res = coding.run({
     max_iters   = 5,
     runner      = function(file_path)
         -- return { ok=bool, stdout, stderr, exit_code }
-        local p = io.popen("lua " .. file_path .. " 2>&1; echo __EXIT__=$?", "r")
-        local out = p:read("*a"); p:close()
-        local ec = tonumber(out:match("__EXIT__=(%d+)") or "1")
-        return { ok = ec == 0, stdout = out, stderr = "", exit_code = ec }
+        local res = sh.exec("lua " .. file_path, { timeout = 60 })
+        if not res.ok then  -- spawn failure or timeout: no exit code exists
+            return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
+        end
+        return { ok = res.code == 0, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
     end,
     on_iter = function(info) print("iter", info.iter, info.result.ok) end,
 })
@@ -764,9 +776,20 @@ accepts only a runner function):
 
 | `runner_kind` | Behaviour |
 |---------------|-----------|
-| `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout |
-| `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on `"test result: ok"` |
+| `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout (60 s timeout) |
+| `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on exit 0 + `"test result: ok"` (300 s timeout) |
 | function      | Called as `runner(file_path)` — must return `{ ok, stdout, stderr, exit_code }` |
+
+Both built-ins execute through `sh.exec`, so the host's own credential variables are stripped
+from the child (see `sh.*`), stdout and stderr stay separate, and a hung command is SIGKILLed
+when the timeout above expires (`sh.exec` spawns with `kill_on_drop`). Caller-supplied runner
+functions should use `sh.exec` for the same reasons — `io.popen` children inherit the host
+environment unfiltered and outlive any timeout.
+
+Runner commands execute with **cwd = the project root** (`sh.exec`'s default), not the directory
+`agent-block` was started from — deliberately deterministic, and a change from the earlier
+`io.popen` behaviour, which inherited the host process's cwd. Pass `cwd` in the `sh.exec` opts to
+override; the `"cargo"` built-in does exactly that with the target file's directory.
 
 ### lshape (Vendored package — `require("lshape")`)
 
