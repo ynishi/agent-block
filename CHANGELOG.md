@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-08-31
+
+### Changed
+
+- Updated the locked `chacha20` transitive dependency from 0.10.0 (yanked on
+  crates.io) to 0.10.2, so `cargo install --locked` no longer resolves a
+  yanked version. Lockfile-only change; no code changes.
+
 ## [0.35.0] - 2026-08-31
 
 ### Added
