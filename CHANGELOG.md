@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-08-31
+
+### Added
+
+- **JSONL dump sink at the HTTP primitive (`AGENT_BLOCK_LLM_DUMP_DIR`).** When
+  the env var is set, requests flagged `dump = "full"` by blocks append
+  byte-exact request/response records to `<dir>/<utc>-<id>-p<pid>.jsonl`
+  (one file per process) — a CI audit trail that needs no stdout parsing.
+  URLs are sanitized, credential-bearing headers are redacted (exact names
+  plus the obs substring policy), and headers are recorded as an
+  order-preserving array so repeated names like `Set-Cookie` survive. Sink
+  failures never fail the request; SSE bodies are recorded as
+  `body_skipped: "sse_stream"`.
+- **`mcp.connect` gained `opts.env`** — explicit env injection for spawned MCP
+  servers, and the only way to hand a stripped credential variable to a
+  server that legitimately needs it. Non-string values raise an error
+  instead of being dropped.
+
+### Changed
+
+- **`AGENT_BLOCK_LLM_DUMP=full` now actually emits bodies in `compile_loop`.**
+  It was previously identical to `meta`: the full-mode emit branches were
+  lost when the observability layer was mirrored from the agent block. Full
+  mode now emits request/response headers + body events, with credential
+  headers redacted; `off` / `meta` output is unchanged.
+- **Host-owned credential env vars are stripped from every child process.**
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `AGENT_BLOCK_MESH_SECRET_KEY`
+  are removed from `sh.exec` children and `mcp.connect` server
+  subprocesses, so code the agent runs cannot read the host's own keys.
+  Custom `api_key_env` names are not covered yet (planned exec-tool
+  redesign).
+- **`coding_agent` builtin runners spawn via `sh.exec`** instead of
+  `io.popen`, so the credential strip applies to the de-facto main runner
+  path. stderr is now a real channel (reaching `compile_loop`'s stagnation
+  check), and runners execute with cwd = project root (previously the host
+  process cwd; override via `opts.cwd`).
+
+### Fixed
+
+- **`sh.exec` timeout now SIGKILLs the child** (spawned with
+  `kill_on_drop`); a timed-out command no longer lingers as an orphan
+  holding locks.
+- Dump-sink response records are no longer lost when a response body read
+  fails or exceeds the size cap — a record with `body_skipped:
+  "read_error"` / `"max_body_size"` is written instead.
+
 ## [0.34.1] - 2026-08-30
 
 ### Added
