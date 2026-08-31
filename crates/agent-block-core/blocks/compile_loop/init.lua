@@ -137,11 +137,19 @@ end
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
+-- Keep this list in sync with the other two copies: blocks/agent/init.lua
+-- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs.
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
         local lk = string.lower(tostring(k))
-        if lk == "x-api-key" or lk == "authorization" or lk == "set-cookie" then
+        if
+            lk == "x-api-key"
+            or lk == "authorization"
+            or lk == "set-cookie"
+            or lk == "cookie"
+            or lk == "proxy-authorization"
+        then
             out[k] = "***REDACTED***"
         else
             out[k] = v
@@ -718,6 +726,8 @@ local function llm_call(opts, messages)
             headers = headers,
             body = body_json,
             timeout = opts.timeout or 120,
+            -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+            dump = (mode == "full") and "full" or nil,
         })
         if mode == "full" then
             local resp_headers = sanitize_headers_for_dump(resp.headers)
@@ -841,6 +851,8 @@ local function llm_call(opts, messages)
         headers = headers,
         body = body_json,
         timeout = opts.timeout or 120,
+        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+        dump = (mode == "full") and "full" or nil,
     })
     if mode == "full" then
         local resp_headers = sanitize_headers_for_dump(resp.headers)
@@ -1932,7 +1944,9 @@ local function run_loop(conf)
     -- active_tool_mode is what the loop actually applies this iter; only the
     -- adaptive path ever mutates it (auto → none).
     local active_tool_mode = adaptive and "auto" or tool_mode
-    local mode = resolve_dump_mode()
+    -- Cached: the dump mode is a single process-wide fact, and the cache also
+    -- keeps the prod-downgrade warn to at most one line per process.
+    local mode = resolve_dump_mode_cached()
 
     -- ── extra tools (caller-registered, agent-layer nested form) ───────────────
     -- conf.extra_tools = list of {name, schema = {description?, input_schema}, handler}

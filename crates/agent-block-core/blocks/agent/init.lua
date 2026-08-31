@@ -135,11 +135,22 @@ local function resolve_dump_mode()
     return mode
 end
 
+-- Redact credential-bearing headers before they are emitted in full mode.
+-- Applied to both request headers (api key / bearer token) and response
+-- headers (proxy stacks can return Set-Cookie session tokens).
+-- Keep this list in sync with the other two copies: blocks/compile_loop/init.lua
+-- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs.
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
         local lk = string.lower(tostring(k))
-        if lk == "x-api-key" or lk == "authorization" then
+        if
+            lk == "x-api-key"
+            or lk == "authorization"
+            or lk == "set-cookie"
+            or lk == "cookie"
+            or lk == "proxy-authorization"
+        then
             out[k] = "***REDACTED***"
         else
             out[k] = v
@@ -445,6 +456,8 @@ local function llm_call_anthropic(messages, opts, trace)
         headers = headers,
         body = std.json.encode(body),
         timeout = opts.timeout or 120,
+        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+        dump = (dump_mode == "full") and "full" or nil,
     })
     local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
 
@@ -464,7 +477,7 @@ local function llm_call_anthropic(messages, opts, trace)
             { "call", call_index },
             { "turn", turn },
             { "iter", iteration },
-            { "payload", std.json.encode(resp.headers or {}) },
+            { "payload", std.json.encode(sanitize_headers_for_dump(resp.headers)) },
         })
         llm_dump_event(dump_mode, "response_body", {
             { "call", call_index },
@@ -810,6 +823,8 @@ local function llm_call_openai(messages, opts, trace)
         headers = headers,
         body = std.json.encode(body),
         timeout = opts.timeout or 120,
+        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+        dump = (dump_mode == "full") and "full" or nil,
     })
     local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
 
@@ -830,7 +845,7 @@ local function llm_call_openai(messages, opts, trace)
             { "call", call_index },
             { "turn", turn },
             { "iter", iteration },
-            { "payload", std.json.encode(resp.headers or {}) },
+            { "payload", std.json.encode(sanitize_headers_for_dump(resp.headers)) },
         })
         llm_dump_event(dump_mode, "response_body", {
             { "call", call_index },

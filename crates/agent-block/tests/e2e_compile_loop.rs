@@ -938,3 +938,153 @@ async fn compile_loop_anthropic_mock_full_dump_emits_bodies() {
     );
     ct.cancel();
 }
+
+/// Verifies the primitive-level JSONL dump sink (`AGENT_BLOCK_LLM_DUMP_DIR`).
+///
+/// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls) and runs the
+/// subprocess twice:
+///   Run 1 (`AGENT_BLOCK_LLM_DUMP=full` + sink dir): exactly one `*.jsonl` file
+///          is written, carrying `http_request` / `http_response` records; the
+///          `x-api-key` header is redacted and the raw key never appears.
+///   Run 2 (`AGENT_BLOCK_LLM_DUMP=meta` + a fresh sink dir): nothing is written,
+///          because the block only flags requests under full mode.
+///
+/// No `#[ignore]` — self-contained, runs under plain `cargo test` with no API keys.
+#[tokio::test]
+async fn compile_loop_full_dump_writes_jsonl_sink() {
+    let (base_url, call_count, ct) =
+        common::compile_loop_anthropic_mock::spawn_compile_loop_anthropic_mock_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // --- Run 1: full mode + sink dir → one JSONL file ---
+    let dump_dir = tempdir().expect("dump tempdir");
+    let dump_path = dump_dir.path().to_path_buf();
+
+    let url_clone = base_url.clone();
+    let dump_path_run = dump_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "info")
+            .env("AGENT_BLOCK_LLM_DUMP", "full")
+            .env("AGENT_BLOCK_LLM_DUMP_DIR", &dump_path_run)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task (sink) should not panic");
+
+    let sink_files: Vec<std::path::PathBuf> = std::fs::read_dir(&dump_path)
+        .expect("read dump dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .collect();
+    assert_eq!(
+        sink_files.len(),
+        1,
+        "expected exactly one jsonl sink file per process, got {sink_files:?}"
+    );
+
+    let content = std::fs::read_to_string(&sink_files[0]).expect("read sink file");
+    let records: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each sink line must be valid JSON"))
+        .collect();
+
+    let requests: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["kind"] == "http_request")
+        .collect();
+    let responses: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|r| r["kind"] == "http_response")
+        .collect();
+    assert!(
+        !requests.is_empty(),
+        "sink must carry at least one http_request record: {content}"
+    );
+    assert!(
+        !responses.is_empty(),
+        "sink must carry at least one http_response record: {content}"
+    );
+
+    // The fixture injects api_key="dummy" as the x-api-key header value.
+    assert_eq!(
+        requests[0]["headers"]["x-api-key"],
+        "***REDACTED***",
+        "x-api-key must be redacted in the sink: {}",
+        requests[0]
+    );
+    assert!(
+        !content.contains("dummy"),
+        "the raw api key value must not appear anywhere in the sink file"
+    );
+
+    // The mock always answers with model "claude-haiku-mock" — a stable marker
+    // proving the response body text reached the sink verbatim.
+    assert!(
+        responses.iter().any(|r| r["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("claude-haiku-mock"))),
+        "a response record must carry the mock response body: {content}"
+    );
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "sink run: expected exactly 2 HTTP calls to the anthropic mock"
+    );
+
+    // Reset between runs — the mock keys its fail-then-pass shape off call_count.
+    call_count.store(0, Ordering::SeqCst);
+
+    // --- Run 2: meta mode + fresh sink dir → nothing written ---
+    let meta_dir = tempdir().expect("meta dump tempdir");
+    let meta_path = meta_dir.path().to_path_buf();
+
+    let url_clone2 = base_url.clone();
+    let meta_path_run = meta_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target_file = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url_clone2)
+            .env(
+                "COMPILE_LOOP_TARGET",
+                target_file.to_str().expect("utf8 path"),
+            )
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "info")
+            .env("AGENT_BLOCK_LLM_DUMP", "meta")
+            .env("AGENT_BLOCK_LLM_DUMP_DIR", &meta_path_run)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"));
+    })
+    .await
+    .expect("subprocess assertion task (meta sink) should not panic");
+
+    let meta_entries = std::fs::read_dir(&meta_path)
+        .expect("read meta dump dir")
+        .count();
+    // No request carries dump="full" under meta mode, so the sink is never opened.
+    assert_eq!(meta_entries, 0, "meta mode must not write to the sink dir");
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "meta sink run: expected exactly 2 HTTP calls to the anthropic mock"
+    );
+    ct.cancel();
+}

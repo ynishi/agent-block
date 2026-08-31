@@ -13,7 +13,11 @@ const REDACTED: &str = "[REDACTED]";
 /// invocations, but the conceptual distinction is preserved so that future
 /// deployments can evolve the two scopes independently (e.g. long-running
 /// daemon vs. per-request).
-fn process_agent_id() -> &'static str {
+///
+/// Also used as the last-resort correlation ID for process-scoped artifacts
+/// (e.g. the HTTP bridge JSONL dump sink file name) when neither
+/// `AGENT_BLOCK_RUN_ID` nor `AGENT_BLOCK_TRACE_ID` is set.
+pub fn process_agent_id() -> &'static str {
     static AGENT_ID: OnceLock<String> = OnceLock::new();
     AGENT_ID.get_or_init(|| Uuid::new_v4().to_string())
 }

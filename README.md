@@ -499,10 +499,12 @@ Key behaviours:
   - `AGENT_BLOCK_LLM_DUMP=off|meta|full` (default `off`)
   - when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
   - `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
-  - request auth headers (`x-api-key` / `authorization`) are always redacted in dump logs
+  - credential-bearing request *and* response headers (`x-api-key` / `authorization` / `set-cookie` / `cookie` / `proxy-authorization`) are always redacted in dump logs
   - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.obs component=llm`); legacy `prefix=ab.llm` lines are also emitted for compatibility
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
+
+`AGENT_BLOCK_LLM_DUMP_DIR=<dir>` adds a JSONL audit sink at the HTTP primitive, for CI runs that need a byte-exact trail without parsing stdout. Each process appends to a single file `<dir>/<UTC yyyymmddThhmmssZ>-<id>-p<pid>.jsonl` (`<id>` = `AGENT_BLOCK_RUN_ID`, else `AGENT_BLOCK_TRACE_ID`, else the process-scoped agent id; the pid keeps concurrent processes that share a run id in separate files), one JSON object per line: a `http_request` record before the send and a `http_response` record with the status and body. The `x-api-key`, `authorization`, `set-cookie`, `cookie` and `proxy-authorization` header values are always replaced with `***REDACTED***`. Only requests that a block flags are written — today that means LLM calls made while `AGENT_BLOCK_LLM_DUMP=full` is in effect (the blocks own the policy; the primitive owns the file). SSE streaming calls record the request plus a response record carrying `body_skipped: "sse_stream"` — streamed bodies are not dumped. Sink failures are logged once and disable dumping for the rest of the process; they never fail the HTTP request. Under `--sandbox`, the directory must fall inside the writable allowlist (project root, `AGENT_BLOCK_HOME`, `/tmp`, or a path added via `AGENT_BLOCK_SANDBOX_FS_RW`).
 
 ### compile_loop (Filesystem block — `require("compile_loop")`)
 
