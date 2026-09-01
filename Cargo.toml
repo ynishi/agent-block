@@ -42,6 +42,10 @@ mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "se
 # `sql` / `kv` features are NOT declared here so they can be gated behind the
 # agent-block-core `sqlite` feature (they pull in rusqlite/bundled).
 mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task"] }
+# Composable `require` resolution (Registry / FsResolver / MemoryResolver).
+# Owns module lookup for blocks/ so embedded sources and filesystem overrides
+# share one priority chain instead of two parallel mechanisms.
+mlua-pkg     = "0.6"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 anyhow       = "1"
 dotenvy      = "0.15"

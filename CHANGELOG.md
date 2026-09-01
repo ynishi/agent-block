@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `llm_proto` package (`blocks/llm_proto/`): provider-neutral LLM wire protocol
+  layer shared by the `agent` and `compile_loop` blocks. Request building,
+  `tool_choice` / `thinking` translation, and response normalization now have a
+  single implementation instead of one per block.
+- `tool_choice` on every provider path. It previously existed only on
+  agent + Anthropic; the OpenAI path and both `compile_loop` paths silently had
+  no way to express it.
+- Reasoning / extended thinking as a first-class option (`thinking`), including
+  the Anthropic manual (`type=enabled` + `budget_tokens`) vs adaptive
+  (`type=adaptive` + `output_config.effort`) split chosen by model generation,
+  `reasoning_effort` on OpenAI, and the chat-template switch on self-hosted
+  servers. Reasoning in responses is normalized to a `thinking` content block
+  whether it arrives as `reasoning_content`, `reasoning`, Anthropic thinking
+  blocks, or raw `<think>` tags left in the text.
+- Structured outputs (`response_format`), mapped to `output_config.format` plus
+  the `structured-outputs-2025-11-13` beta header on Anthropic.
+- Sampling and request options forwarded per provider: `top_p`, `top_k`, `stop`,
+  `seed`, `n`, `logit_bias`, `logprobs`, `top_logprobs`, `frequency_penalty`,
+  `presence_penalty`, `metadata`, `service_tier`, `store`, `prompt_cache_key`,
+  `safety_identifier`, `verbosity`, `betas`, and `strict` on tool definitions.
+- Retry for transient API failures (`max_retries`, default 2), driven by error
+  classification rather than status class: rate limits, overload, and 5xx are
+  retried with `retry-after` honoured, while exhausted spend / quota (HTTP 429
+  with `enforced_spend_limit_reached`, `insufficient_quota`, …) is not.
+- `usage.thinking_tokens` is accumulated in the budget tracker and emitted in
+  the `ab.llm` summary dump.
+
+### Fixed
+
+- `temperature`, `api_key`, and `api_key_env` were silently dropped on the
+  `agent` Anthropic path — the key was read straight from `ANTHROPIC_API_KEY`,
+  so callers using any other env name always failed.
+- `stop_reason = "pause_turn"` ended the loop mid-answer. It means the server
+  paused its own tool loop (web search, code execution, MCP connector) and the
+  turn is unfinished, so the run now continues.
+- A refusal (`stop_reason = "refusal"` on Anthropic, `message.refusal` on
+  OpenAI) arrives as HTTP 200 and read as an empty success; it is now reported.
+- OpenAI reasoning models (o-series, gpt-5) received `max_tokens`, which they
+  reject; they now receive `max_completion_tokens`. Models predating the rename
+  keep `max_tokens`.
+- gpt-5.6 and later reject function tools while reasoning is active on Chat
+  Completions; `reasoning_effort: "none"` is now set when tools are present.
+- Prompt cache counters were hard-coded to zero on the OpenAI path, hiding the
+  effect of caching entirely. `usage.prompt_tokens_details.cached_tokens` is now
+  mapped onto the same fields the Anthropic path uses.
+- Thinking control had no effect against Ollama, whose OpenAI-compatible
+  endpoint drops `chat_template_kwargs`. The dialect axis is now
+  `openai` / `vllm` / `llamacpp` / `ollama` and each gets a control it honours.
+- Synthesized `tool_call` ids are 9 alphanumerics; Mistral's chat template
+  rejects any other shape when the id returns on a tool result.
+- `parallel_tool_calls` is sent for `true` as well as `false` — llama.cpp keeps
+  parallel calls off unless the request asks for them.
+- Gemma chat templates have no `tool` role and require strictly alternating
+  turns; the transcript is flattened accordingly for those models.
+- `compile_loop` could not reach `tool_choice`, `thinking`, `dialect`,
+  `cache_control`, `extra_body`, or the sampling options, and its distill
+  sub-loop dropped `max_tokens` / `temperature` / `timeout` / thinking settings,
+  running that call at provider defaults.
+
+### Changed
+
+- `require` resolution moved to `mlua-pkg` (`Registry` + `FsResolver` +
+  `MemoryResolver`), replacing the hand-rolled `package.searchers` hook. The
+  priority chain is unchanged: script dir, then `project_root/blocks`, then
+  `exe_dir/blocks`, then the embedded sources.
+
 ## [0.35.1] - 2026-08-31
 
 ### Changed

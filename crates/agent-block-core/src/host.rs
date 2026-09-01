@@ -36,6 +36,25 @@ const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]
+/// but not part of the block surface reported by [`inspect_tools`].
+///
+/// `llm_proto` is the provider-neutral LLM wire protocol layer shared by the
+/// `agent` and `compile_loop` blocks (request building, tool_choice and
+/// thinking translation, response normalization). It is a library, not a
+/// runnable block, so listing it as a "tool" would be misleading.
+const EMBEDDED_LIBS: &[(&str, &str)] = &[
+    ("llm_proto", include_str!("../blocks/llm_proto/init.lua")),
+    (
+        "llm_proto.openai",
+        include_str!("../blocks/llm_proto/openai.lua"),
+    ),
+    (
+        "llm_proto.anthropic",
+        include_str!("../blocks/llm_proto/anthropic.lua"),
+    ),
+];
+
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
 ///
 /// Runs the StdPkg `agent` module with `_PROMPT` / `_CONTEXT` injected and
@@ -245,6 +264,36 @@ fn build_blocks_path(project_root: &Path) -> String {
         }
         Err(e) => {
             warn!(error = %e, "current_exe() failed; skipping exe_dir/blocks/ from package.path");
+        }
+    }
+
+    out
+}
+
+/// Filesystem roots that `require` searches, highest priority first.
+///
+/// Same two locations [`build_blocks_path`] encodes into `package.path`,
+/// returned as roots so they can also be handed to `mlua_pkg::FsResolver`
+/// (which takes a directory, not a `?.lua` pattern).
+fn build_blocks_roots(project_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    let project_blocks = project_root.join("blocks");
+    if project_blocks.is_dir() {
+        out.push(project_blocks);
+    }
+
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_blocks = exe_dir.join("blocks");
+                if exe_blocks.is_dir() {
+                    out.push(exe_blocks);
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "current_exe() failed; skipping exe_dir/blocks/ from require roots");
         }
     }
 
@@ -780,6 +829,7 @@ fn build_isle_init(
     script_name: String,
     script_dir: String,
     blocks_paths: String,
+    blocks_roots: Vec<PathBuf>,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
@@ -816,31 +866,57 @@ fn build_isle_init(
             format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
         package.set("path", new_path)?;
 
-        // ── package.searchers — embedded fallback ─────────────────────
-        // Register a custom searcher that loads blocks/ modules from the
-        // sources baked in at compile time.  This is the lowest-priority
-        // searcher so filesystem copies always win.
-        let embedded: HashMap<&'static str, &'static str> =
-            EMBEDDED_BLOCKS.iter().copied().collect();
+        // ── require resolution — mlua-pkg Registry ────────────────────
+        // One priority chain instead of two parallel mechanisms:
+        //
+        //   script_dir/  >  project_root/blocks/  >  exe_dir/blocks/  >  embedded
+        //
+        // which is exactly the order `package.path` + the old trailing
+        // searcher produced. The Registry hook installs at the FRONT of
+        // `package.searchers`, so the filesystem resolvers must be listed
+        // ahead of the embedded sources here for overrides to keep winning.
+        //
+        // `package.path` above is left in place: it still serves plain Lua
+        // files that predate the Registry and anything a script requires
+        // relative to itself.
+        let mut registry = mlua_pkg::Registry::new();
 
-        let searchers: mlua::Table = package.get("searchers")?;
-        let loader =
-            lua.create_function(move |lua, name: String| match embedded.get(name.as_str()) {
-                Some(source) => {
-                    let chunk = lua
-                        .load(*source)
-                        .set_name(format!("@embedded:blocks/{name}/init.lua"));
-                    let func = chunk.into_function()?;
-                    Ok(mlua::Value::Function(func))
+        let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
+        fs_roots.extend(blocks_roots.iter().cloned());
+        for root in fs_roots {
+            // `SymlinkAwareSandbox`, not the `FsResolver::new` default: this
+            // repo's own `blocks/agent` is a symlink into
+            // `crates/agent-block-core/blocks/`, and the default sandbox
+            // canonicalizes then rejects anything landing outside the root as
+            // a traversal attempt. A traversal error is `Some(Err)`, which by
+            // design does not fall through to the next resolver, so one
+            // symlinked block directory would break `require` for every
+            // module. Symlink targets present under the root at startup are
+            // recorded as allowed.
+            match mlua_pkg::sandbox::SymlinkAwareSandbox::new(root.clone()) {
+                Ok(sandbox) => {
+                    registry.add(mlua_pkg::resolvers::FsResolver::with_sandbox(sandbox));
                 }
-                None => {
-                    let msg = lua.create_string(format!("\n\tno embedded block '{name}'"))?;
-                    Ok(mlua::Value::String(msg))
+                Err(e) => {
+                    // A missing directory is expected (script_dir always
+                    // exists, blocks/ roots are optional); anything else is
+                    // worth surfacing without failing the whole run.
+                    warn!(root = %root.display(), error = %e, "FsResolver init skipped");
                 }
-            })?;
-        // Append as the last searcher so filesystem paths remain preferred.
-        let next_idx = searchers.raw_len() + 1;
-        searchers.raw_set(next_idx, loader)?;
+            }
+        }
+
+        // Embedded sources baked in at compile time — lowest priority, so a
+        // filesystem copy of `blocks/agent/init.lua` still overrides it.
+        let mut memory = mlua_pkg::resolvers::MemoryResolver::new();
+        for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
+            memory = memory.add(*name, *source);
+        }
+        registry.add(memory);
+
+        registry
+            .install(lua)
+            .map_err(|e| mlua::Error::external(format!("require registry install failed: {e}")))?;
 
         Ok(())
     }
@@ -859,6 +935,7 @@ async fn spawn_handler_isle(
     script_name: String,
     script_dir: String,
     blocks_paths: String,
+    blocks_roots: Vec<PathBuf>,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
@@ -867,6 +944,7 @@ async fn spawn_handler_isle(
         script_name,
         script_dir,
         blocks_paths,
+        blocks_roots,
         prompt,
         context,
         extra_globals,
@@ -1164,6 +1242,7 @@ async fn spawn_isles(
     script_name: &str,
     script_dir: &str,
     blocks_paths: &str,
+    blocks_roots: &[PathBuf],
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: &HashMap<String, serde_json::Value>,
@@ -1172,6 +1251,7 @@ async fn spawn_isles(
         script_name.to_string(),
         script_dir.to_string(),
         blocks_paths.to_string(),
+        blocks_roots.to_vec(),
         prompt.clone(),
         context.clone(),
         extra_globals.clone(),
@@ -1185,6 +1265,7 @@ async fn spawn_isles(
         script_name.to_string(),
         script_dir.to_string(),
         blocks_paths.to_string(),
+        blocks_roots.to_vec(),
         prompt,
         context,
         extra_globals.clone(),
@@ -1515,6 +1596,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
     let blocks_paths = build_blocks_path(&project_root);
+    let blocks_roots = build_blocks_roots(&project_root);
     let prompt = prompt_resolved.clone();
     let context = context_resolved.clone();
 
@@ -1528,6 +1610,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         &script_name,
         &script_dir,
         &blocks_paths,
+        &blocks_roots,
         prompt,
         context,
         &config.extra_globals,

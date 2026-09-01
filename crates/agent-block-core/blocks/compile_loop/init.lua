@@ -31,6 +31,13 @@
 
 local M = {}
 
+-- Provider wire format (request building, tool_choice / thinking translation,
+-- response normalization) is shared with blocks/agent via the `llm_proto`
+-- package. This module owns the compile-and-fix loop, not the protocol.
+local proto = require("llm_proto")
+local proto_anthropic = proto.adapter("anthropic")
+local proto_openai = proto.adapter("openai")
+
 local agent = require("agent") -- for _llm_ctx_top()
 
 -- ============================================================
@@ -430,23 +437,8 @@ end
 --   failure: nil, error_string
 
 -- ============================================================
--- Internal: OpenAI tool-use helpers (写経 from blocks/agent/init.lua, do NOT shared-extract)
+-- Internal: OpenAI tool-use helpers
 -- ============================================================
-
---- Map OpenAI finish_reason to internal stop_reason string.
---- @param finish_reason string|nil
---- @return string
-local function cl_oai_map_finish_reason(finish_reason)
-    if finish_reason == "stop" then
-        return "end_turn"
-    elseif finish_reason == "tool_calls" then
-        return "tool_use"
-    elseif finish_reason == "length" then
-        return "max_tokens"
-    else
-        return tostring(finish_reason or "end_turn")
-    end
-end
 
 --- Normalize a raw OpenAI chat completion response into compile_loop internal shape.
 --- Internal shape (tools path):
@@ -457,198 +449,40 @@ end
 --- @return table|nil  compile_loop-shape table on success
 --- @return string|nil Error string on failure
 local function cl_oai_normalize(raw)
-    if not raw or not raw.choices or #raw.choices == 0 then
-        return nil, "invalid OpenAI response: missing choices"
-    end
-    local choice = raw.choices[1]
-    local message = choice and choice.message
-    if not message then
-        return nil, "invalid OpenAI response: missing choices[0].message"
+    local decoded, perr = proto_openai.parse(raw)
+    if not decoded then
+        return nil, perr
     end
 
     local text_parts = {}
     local tool_use_blocks = {}
-
-    -- Text portion (may be nil/empty on pure tool_calls turns).
-    local text = message.content
-    if text and text ~= "" then
-        table.insert(text_parts, text)
-    end
-
-    -- DEBUG (2026-05-09): raw assistant content dump for Gemma debugging.
-    -- Gated by AGENT_BLOCK_DEBUG_RAW=1 env.
-    if std.env.get("AGENT_BLOCK_DEBUG_RAW") == "1" then
-        local tc_count = #(message.tool_calls or {})
-        local preview = (text or ""):sub(1, 1500)
-        log.info(
-            "[DEBUG_RAW] content_len="
-                .. tostring(text and #text or 0)
-                .. " tool_calls="
-                .. tostring(tc_count)
-                .. " content_preview<<<"
-                .. preview
-                .. ">>>"
-        )
-        for i, tc in ipairs(message.tool_calls or {}) do
-            local fn = tc["function"] or {}
-            log.info(
-                "[DEBUG_RAW] tool_call["
-                    .. i
-                    .. "] name="
-                    .. tostring(fn.name)
-                    .. " args="
-                    .. tostring(fn.arguments or ""):sub(1, 500)
-            )
+    for _, block in ipairs(decoded.content) do
+        if block.type == "text" then
+            table.insert(text_parts, block.text or "")
+        elseif block.type == "tool_use" then
+            -- `thinking` blocks are intentionally skipped: reasoning text must
+            -- not leak into the content that becomes a patch / answer.
+            table.insert(tool_use_blocks, {
+                id = block.id,
+                name = block.name or "",
+                input = block.input or {},
+                is_error_hint = block.is_error_hint,
+            })
         end
     end
 
-    -- tool_calls → tool_use_blocks.
-    for i, tc in ipairs(message.tool_calls or {}) do
-        local fn = tc["function"] or {}
-        -- id is mandatory per the OpenAI spec but absent on some OpenAI-compatible
-        -- stacks (Ollama's native shape has no id at all; pre-Gemini-3 models make
-        -- it optional). Synthesize a deterministic per-response id from the array
-        -- index so tool_use / tool_result pairing keeps working downstream.
-        local tc_id = tc.id
-        if tc_id == nil or tc_id == "" then
-            tc_id = "call_synth_" .. tostring(i)
-        end
-        -- arguments is a JSON *string* per the OpenAI spec, but several
-        -- OpenAI-compatible stacks emit a JSON *object* instead (Ollama native
-        -- /api/chat, Gemini functionCall.args, some vLLM tool-call parsers).
-        -- Accept both; only string arguments go through json.decode.
-        local input
-        local raw_args = fn.arguments
-        if type(raw_args) == "table" then
-            input = raw_args
-        else
-            local ok, parsed = pcall(std.json.decode, raw_args or "{}")
-            if ok and type(parsed) == "table" then
-                input = parsed
-            else
-                log.warn(
-                    "compile_loop: OpenAI tool_call arguments JSON parse failed for tool '"
-                        .. tostring(fn.name)
-                        .. "'; using empty input"
-                )
-                -- Acceptance Criteria #7 equivalent: input={}, is_error_hint, loop continues.
-                table.insert(tool_use_blocks, {
-                    id = tc_id,
-                    name = fn.name or "",
-                    input = {},
-                    is_error_hint = "arguments_parse_failed",
-                })
-                goto continue_tc
-            end
-        end
-        table.insert(tool_use_blocks, {
-            id = tc_id,
-            name = fn.name or "",
-            input = input,
-        })
-        ::continue_tc::
-    end
-
-    local joined = table.concat(text_parts, "\n")
     return {
         choices = {
             {
                 message = {
-                    content = joined,
+                    content = table.concat(text_parts, "\n"),
                     tool_use_blocks = tool_use_blocks,
-                    stop_reason = cl_oai_map_finish_reason(choice.finish_reason),
+                    stop_reason = decoded.stop_reason,
                 },
             },
         },
     },
         nil
-end
-
---- Convert compile_loop Anthropic-shaped messages to OpenAI-shaped messages.
---- Handles:
----   assistant messages with tool_use blocks → assistant + tool_calls array
----   user messages with tool_result blocks  → role="tool" + tool_call_id messages
----   string content messages                → pass-through
---- @param messages table    Anthropic-shaped messages array (role="system" already removed)
---- @param system   string|nil  Optional system prompt text
---- @return table              OpenAI-shaped messages array
-local function cl_oai_convert_messages(messages, system)
-    local out = {}
-
-    -- Insert system message first if provided.
-    if system and system ~= "" then
-        table.insert(out, { role = "system", content = system })
-    end
-
-    for _, msg in ipairs(messages) do
-        if type(msg.content) == "string" then
-            -- Simple string content (user prompt turns).
-            table.insert(out, { role = msg.role, content = msg.content })
-        elseif type(msg.content) == "table" then
-            if msg.role == "assistant" then
-                -- Assistant messages may have text + tool_use blocks.
-                local a_text_parts = {}
-                local tool_calls = {}
-                for _, block in ipairs(msg.content) do
-                    if block.type == "text" then
-                        table.insert(a_text_parts, block.text or "")
-                    elseif block.type == "tool_use" then
-                        table.insert(tool_calls, {
-                            id = block.id,
-                            type = "function",
-                            ["function"] = {
-                                name = block.name,
-                                arguments = std.json.encode(block.input or {}),
-                            },
-                        })
-                    end
-                end
-                local text_content = #a_text_parts > 0 and table.concat(a_text_parts, "\n") or nil
-                local oai_msg = { role = "assistant" }
-                if text_content then
-                    oai_msg.content = text_content
-                end
-                if #tool_calls > 0 then
-                    oai_msg.tool_calls = tool_calls
-                end
-                table.insert(out, oai_msg)
-            elseif msg.role == "user" then
-                -- User messages with tool_result blocks → expand to role="tool" messages.
-                local has_tool_result = false
-                for _, block in ipairs(msg.content) do
-                    if block.type == "tool_result" then
-                        has_tool_result = true
-                        break
-                    end
-                end
-                if has_tool_result then
-                    for _, block in ipairs(msg.content) do
-                        if block.type == "tool_result" then
-                            table.insert(out, {
-                                role = "tool",
-                                tool_call_id = block.tool_use_id,
-                                content = tostring(block.content or ""),
-                            })
-                        end
-                    end
-                else
-                    -- Regular user message with content array (e.g. text blocks).
-                    local parts = {}
-                    for _, block in ipairs(msg.content) do
-                        if block.type == "text" then
-                            table.insert(parts, block.text or "")
-                        end
-                    end
-                    table.insert(out, { role = "user", content = table.concat(parts, "\n") })
-                end
-            else
-                -- Other roles: pass content as-is (fallback).
-                table.insert(out, { role = msg.role, content = msg.content })
-            end
-        end
-    end
-
-    return out
 end
 
 -- Module-level override for test monkey-patching (set via M._test_set_llm_call).
@@ -692,38 +526,35 @@ local function llm_call(opts, messages)
             end
         end
 
-        -- 4. Build body
-        local body = {
+        -- 4-5. Body + headers via the shared protocol layer (llm_proto.anthropic).
+        --      cache_control defaults OFF here: compile_loop sends a fresh
+        --      prompt per iteration, so the markers would only add bytes.
+        local req, build_err = proto_anthropic.build({
             model = model,
-            max_tokens = opts.max_tokens or 4096,
             messages = body_messages,
-        }
-        if sys_text then
-            body.system = sys_text
+            system = sys_text,
+            tools = opts.tools,
+            max_tokens = opts.max_tokens or 4096,
+            tool_choice = opts.tool_choice,
+            parallel_tool_calls = opts.parallel_tool_calls,
+            thinking = opts.thinking,
+            cache_control = opts.cache_control or false,
+            api_key = api_key,
+            base_url = opts.base_url,
+        })
+        if not req then
+            return nil, build_err
         end
-        -- Attach tools list when provided (multi-file lazy-load path).
-        -- Omit entirely when nil to maintain backward compatibility.
-        if opts.tools ~= nil then
-            body.tools = opts.tools
-        end
-        -- disable_thinking is Qwen-specific; silent no-op for anthropic
-
-        -- 5. Headers
-        local headers = {
-            ["x-api-key"] = api_key,
-            ["anthropic-version"] = "2023-06-01",
-            ["content-type"] = "application/json",
-        }
+        local headers = req.headers
 
         -- 6. HTTP call
-        local base_url = opts.base_url or "https://api.anthropic.com"
         -- Encoded once so the dumped payload is byte-identical to the wire body.
-        local body_json = std.json.encode(body)
+        local body_json = std.json.encode(req.body)
         if mode == "full" then
             obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
             obs_event(mode, "request_body", { { "payload", body_json } })
         end
-        local resp = http.request(base_url .. "/v1/messages", {
+        local resp = http.request(req.url, {
             method = "POST",
             headers = headers,
             body = body_json,
@@ -752,9 +583,16 @@ local function llm_call(opts, messages)
         if type(decoded.content) ~= "table" or #decoded.content == 0 then
             return nil, "anthropic response missing content blocks"
         end
+        local parsed, perr = proto_anthropic.parse(decoded)
+        if not parsed then
+            return nil, perr
+        end
         local text_parts = {}
         local tool_use_blocks = {}
-        for _, block in ipairs(decoded.content) do
+        -- `thinking` / `redacted_thinking` blocks fall through both branches:
+        -- reasoning text must not become part of a patch, and compile_loop
+        -- rebuilds its prompt each iteration so nothing needs echoing back.
+        for _, block in ipairs(parsed.content) do
             if block.type == "text" then
                 table.insert(text_parts, block.text or "")
             elseif block.type == "tool_use" then
@@ -767,7 +605,7 @@ local function llm_call(opts, messages)
             end
         end
         local joined = table.concat(text_parts, "\n")
-        local stop_reason = decoded.stop_reason -- "end_turn" | "tool_use" | "max_tokens"
+        local stop_reason = parsed.stop_reason -- "end_turn" | "tool_use" | "max_tokens"
 
         -- If there are no text blocks AND no tool_use blocks, the response is empty.
         if joined == "" and #tool_use_blocks == 0 then
@@ -808,47 +646,43 @@ local function llm_call(opts, messages)
         end
     end
 
-    -- Convert Anthropic-shaped messages to OpenAI shape.
-    local oai_messages = cl_oai_convert_messages(body_messages_raw, sys_text)
+    -- Message / tool conversion and the reasoning dialect split live in
+    -- llm_proto.openai. `disable_thinking` (Qwen) maps onto the shared
+    -- `thinking` spec; an explicit opts.thinking wins when both are set.
+    local thinking_spec = opts.thinking
+    if thinking_spec == nil and opts.disable_thinking then
+        thinking_spec = { enabled = false }
+    end
 
-    local base_url = opts.base_url or "https://api.openai.com/v1"
-    local body = {
+    -- Model default stays literal (no OPENAI_MODEL env fallback) to keep the
+    -- resolution order compile_loop callers already rely on.
+    local req, build_err = proto_openai.build({
         model = opts.model or "gpt-4o-mini",
+        messages = body_messages_raw,
+        system = sys_text,
+        tools = opts.tools,
         max_tokens = opts.max_tokens or 4096,
         temperature = opts.temperature or resolve_temperature(),
-        messages = oai_messages,
-    }
-    if opts.disable_thinking then
-        body.chat_template_kwargs = { enable_thinking = false }
+        tool_choice = opts.tool_choice,
+        parallel_tool_calls = opts.parallel_tool_calls,
+        thinking = thinking_spec,
+        dialect = opts.dialect,
+        api_key = api_key,
+        base_url = opts.base_url,
+    })
+    if not req then
+        return nil, build_err
     end
-
-    -- tools conversion: input_schema → parameters (Crux #1, R2 guard).
-    if opts.tools and #opts.tools > 0 then
-        local oai_tools = {}
-        for _, t in ipairs(opts.tools) do
-            local fn_def = {
-                name = t.name,
-                description = t.description or "",
-                parameters = t.input_schema or { type = "object", properties = {} },
-            }
-            table.insert(oai_tools, { type = "function", ["function"] = fn_def })
-        end
-        body.tools = oai_tools
-    end
-
-    local headers = {
-        ["Content-Type"] = "application/json",
-        ["Authorization"] = "Bearer " .. api_key,
-        ["User-Agent"] = "Mozilla/5.0", -- RunPod proxy / Cloudflare gate
-    }
+    local headers = req.headers
+    headers["User-Agent"] = "Mozilla/5.0" -- RunPod proxy / Cloudflare gate
 
     -- Encoded once so the dumped payload is byte-identical to the wire body.
-    local body_json = std.json.encode(body)
+    local body_json = std.json.encode(req.body)
     if mode == "full" then
         obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
         obs_event(mode, "request_body", { { "payload", body_json } })
     end
-    local resp = http.request(base_url .. "/chat/completions", {
+    local resp = http.request(req.url, {
         method = "POST",
         headers = headers,
         body = body_json,
@@ -869,11 +703,6 @@ local function llm_call(opts, messages)
         return nil, "decode failed: " .. tostring(decoded)
     end
 
-    -- tools=nil: return raw decoded (backward compat for single-file qwen tests, R4 guard).
-    -- tools~=nil: normalize to compile_loop internal shape so run_loop dispatch works (Crux #1).
-    if opts.tools == nil then
-        return decoded
-    end
     return cl_oai_normalize(decoded)
 end
 
@@ -1392,8 +1221,7 @@ local function chunk_by_lines(lines, chunk_size)
 end
 
 -- Extract the text content from an llm_call response.
--- Handles both Anthropic and OpenAI-compatible paths (both return
--- resp.choices[1].message.content for tools=nil calls).
+-- Both providers land on the same internal shape, so this reads one place.
 -- Returns the content string or nil on any access failure.
 local function extract_text(resp)
     if not resp then
@@ -1423,6 +1251,15 @@ local function call_distill_llm(path, chunk, mf_state, conf)
         base_url = conf.base_url,
         api_key = conf.api_key,
         api_key_env = conf.api_key_env,
+        -- Same endpoint settings as the main loop. Without these the distill
+        -- call silently ran at the provider defaults — thinking back on, the
+        -- env temperature, and the 120s timeout.
+        max_tokens = conf.max_tokens,
+        temperature = conf.temperature,
+        timeout = conf.timeout,
+        disable_thinking = conf.disable_thinking,
+        thinking = conf.thinking,
+        dialect = conf.dialect,
     }
 
     -- Resolve target_func with type guard (subtask-3.md Constraint / Risk).
@@ -3260,6 +3097,19 @@ target_file and target_files are mutually exclusive.]],
             temperature = llm_conf.temperature,
             disable_thinking = llm_conf.disable_thinking,
             timeout = llm_conf.timeout,
+            -- Everything llm_proto understands, so the loop is not narrower
+            -- than the protocol layer it calls.
+            thinking = llm_conf.thinking,
+            dialect = llm_conf.dialect,
+            tool_choice = llm_conf.tool_choice,
+            parallel_tool_calls = llm_conf.parallel_tool_calls,
+            cache_control = llm_conf.cache_control,
+            extra_body = llm_conf.extra_body,
+            top_p = llm_conf.top_p,
+            top_k = llm_conf.top_k,
+            stop = llm_conf.stop,
+            seed = llm_conf.seed,
+            response_format = llm_conf.response_format,
         }
 
         local res = run_loop(resolved_conf)
@@ -3376,9 +3226,9 @@ function M._test_helpers()
         filter_for_tool_output = filter_for_tool_output,
         group_blocks_by_path = group_blocks_by_path,
         build_multifile_edit_failure_msg = build_multifile_edit_failure_msg,
-        cl_oai_map_finish_reason = cl_oai_map_finish_reason,
+        cl_oai_map_finish_reason = proto_openai.map_finish_reason,
         cl_oai_normalize = cl_oai_normalize,
-        cl_oai_convert_messages = cl_oai_convert_messages,
+        cl_oai_convert_messages = proto_openai.convert_messages,
     }
 end
 

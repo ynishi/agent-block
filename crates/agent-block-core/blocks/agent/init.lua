@@ -29,6 +29,15 @@
 --       context_management = true,
 --       -- Optional override for the default edits table (clear_tool_uses_20250919).
 --       context_management_config = { edits = { ... } },
+--       -- Protocol options, translated per provider by the llm_proto package:
+--       -- tool_choice / parallel_tool_calls / thinking / response_format /
+--       -- dialect / betas / temperature / top_p / top_k / stop / seed / n /
+--       -- logit_bias / logprobs / top_logprobs / frequency_penalty /
+--       -- presence_penalty / metadata / service_tier / store /
+--       -- prompt_cache_key / safety_identifier / verbosity / extra_body.
+--       tool_choice = "required",
+--       thinking    = { effort = "medium" },
+--       max_retries = 2,   -- transient failures only (rate limit / overload / 5xx)
 --   })
 --
 -- result: { ok, content, usage, num_turns, error, messages }
@@ -43,6 +52,13 @@
 --     this turn, i.e. response.context_management is nil).
 
 local M = {}
+
+-- Provider wire format (request building, tool_choice / thinking translation,
+-- response normalization) lives in the `llm_proto` package. This module owns
+-- the ReAct loop, tool dispatch, budgets, and dump logging — not the protocol.
+local proto = require("llm_proto")
+local proto_anthropic = proto.adapter("anthropic")
+local proto_openai = proto.adapter("openai")
 
 -- ============================================================
 -- Internal: parent LLM context stack (_AGENT_LLM_CTX)
@@ -290,145 +306,101 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
 ---                        context_management (table|nil — table enables the
 ---                        context-management beta header and body field; nil
 ---                        means opt-out, no header and no body field).
+--- Default number of retries for transient API failures.
+local MAX_RETRIES_DEFAULT = 2
+
+--- POST with retries for the failures that are worth retrying.
+---
+--- Rate limits, overload, and 5xx come back on their own; auth failures,
+--- malformed requests, and exhausted spend never will — retrying the last of
+--- those keeps hammering an account that cannot succeed until the billing
+--- period rolls over, so classification decides rather than the status class.
+---
+--- @param url string
+--- @param request_opts table  Options for http.request
+--- @param opts table          Call options (reads max_retries)
+--- @param trace table|nil     Call metadata, used to spread concurrent retries
+--- @return table  The final http.request response
+local function http_post_with_retry(url, request_opts, opts, trace)
+    local max_retries = tonumber(opts.max_retries) or MAX_RETRIES_DEFAULT
+    local attempt = 0
+
+    while true do
+        local resp = http.request(url, request_opts)
+        if resp.status == 200 or attempt >= max_retries then
+            return resp
+        end
+
+        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
+        if not classified.retryable then
+            return resp
+        end
+
+        attempt = attempt + 1
+        local delay = proto.retry_delay(attempt, classified, tonumber(trace and trace.call_index) or 0)
+        log.warn(
+            "agent: "
+                .. classified.kind
+                .. " (HTTP "
+                .. tostring(resp.status)
+                .. "); retry "
+                .. attempt
+                .. "/"
+                .. max_retries
+                .. " in "
+                .. string.format("%.1f", delay)
+                .. "s"
+        )
+        std.task.sleep(delay * 1000)
+    end
+end
+
 --- @param trace table|nil Optional call metadata for dump logs.
 --- @return table|nil      Parsed response JSON on success, nil on error
 --- @return string|nil     Error string on failure
 local function llm_call_anthropic(messages, opts, trace)
-    local api_key = std.env.get("ANTHROPIC_API_KEY")
-    if not api_key then
-        return nil, "ANTHROPIC_API_KEY not set"
-    end
-
     local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
-    -- ============================================================
-    -- Prompt caching (Anthropic Messages API)
-    -- ------------------------------------------------------------
-    -- Default: ON. `cache_control: {type=ephemeral}` markers are placed on
-    -- the stable prefix so turn-2+ reads the cached prefix at ~10% input-
-    -- token unit cost. Disable with `opts.cache_control = false` for A/B.
-    --
-    -- Breakpoint placement (2 of 4 budget used):
-    --   1. system block (content-array form)         → caches [tools + system]
-    --   2. tools[#opts.tools] (= last tool entry)    → caches [tools]
-    -- Messages-level marker (3rd slot) is a planned follow-up to cache the
-    -- conversation tail as well; leaving the last 2 slots free lets callers
-    -- add their own markers if needed.
-    --
-    -- API ordering contract (docs.claude.com/en/docs/build-with-claude/prompt-caching):
-    --   API processes prefix as  tools → system → messages
-    --   cache_control on block X caches the prefix up to AND INCLUDING X.
-    --   So marker on system caches [tools + system] regardless of how the
-    --   messages array grows. Messages appended across ReAct turns do not
-    --   invalidate the tools+system cache.
-    --
-    -- Minimum cacheable prefix size (Anthropic official):
-    --   Sonnet / Opus: 1024 tokens
-    --   Haiku:         2048 tokens
-    -- Below the minimum the marker is silently ignored (no cache_creation,
-    -- no cache_read, standard input-token billing).
-    --
-    -- PRACTICAL MARGIN (empirical, not documented):
-    --   At exactly ~1264 tokens on Sonnet (well above the 1024 line) we
-    --   observed stochastic cache misses — turn 1 cache_create = 0 AND
-    --   cache_read = 0 despite the prefix exceeding the documented minimum.
-    --   At ~1679 tokens the cache fires deterministically (turn 1 creates,
-    --   turn 2+ reads). The effective threshold appears to include an
-    --   undocumented safety margin.
-    --   Recommendation: aim for ≥1.5× the published minimum
-    --     (~1500 tokens for Sonnet/Opus, ~3000 tokens for Haiku)
-    --   before relying on cache hits in production.
-    --
-    -- Byte-exact keying:
-    --   The cache key is a hash of the prefix BYTES up to the marker.
-    --   Any whitespace / key-ordering / extra-field drift in tools or
-    --   system invalidates the key. `std.json.encode` orders keys
-    --   alphabetically which keeps serialization stable across runs;
-    --   avoid injecting per-turn timestamps / UUIDs / counters into
-    --   system or tool schemas.
-    --
-    -- Non-standard fields in messages:
-    --   Anthropic returns a non-spec `caller` field in tool_use blocks
-    --   (`{"type":"direct"}`) which agent-block echoes back in turn 2+
-    --   assistant messages. This does NOT affect cache matching because
-    --   cache_control is placed before the messages array (tools + system
-    --   prefix only); messages content is outside the cache scope.
-    --
-    -- Observability:
-    --   Response `usage.cache_creation_input_tokens` → `cache_create`
-    --   Response `usage.cache_read_input_tokens`     → `cache_read`
-    --   Both are emitted to the "summary" dump event and the `on_turn`
-    --   callback receives them via `info.usage`.
-    --   Hit rate ≈ cache_read / (cache_read + input_tokens).
-    --
-    -- Disabling (`opts.cache_control = false`) is useful when:
-    --   - A/B comparing with/without caching
-    --   - system + tools is known to be < minimum (marker would be wasted)
-    --   - caller wants strict byte-exact requests (no cache_control drift)
-    -- ============================================================
-    local cache_on = opts.cache_control ~= false
+    -- Prompt caching is on unless `opts.cache_control == false`; the marker
+    -- placement and its constraints are documented in llm_proto.anthropic.
+    -- Observability lands in the "summary" dump event and `on_turn`:
+    -- `usage.cache_creation_input_tokens` → cache_create,
+    -- `usage.cache_read_input_tokens` → cache_read,
+    -- hit rate ≈ cache_read / (cache_read + input_tokens).
 
-    local body = {
+    -- Wire-format construction (caching markers, tool_choice, thinking,
+    -- context-management header/body) lives in llm_proto.anthropic; this
+    -- function owns the call: dump logging, HTTP, and response accounting.
+    local req, build_err = proto_anthropic.build({
         model = model,
-        max_tokens = opts.max_tokens or 4096,
         messages = messages,
-    }
-    if opts.system and opts.system ~= "" then
-        if cache_on then
-            body.system = {
-                {
-                    type = "text",
-                    text = opts.system,
-                    cache_control = { type = "ephemeral" },
-                },
-            }
-        else
-            body.system = opts.system
-        end
+        system = opts.system,
+        tools = opts.tools,
+        max_tokens = opts.max_tokens or 4096,
+        tool_choice = opts.tool_choice,
+        parallel_tool_calls = opts.parallel_tool_calls,
+        thinking = opts.thinking,
+        temperature = opts.temperature,
+        top_p = opts.top_p,
+        top_k = opts.top_k,
+        stop = opts.stop,
+        metadata = opts.metadata,
+        safety_identifier = opts.safety_identifier,
+        service_tier = opts.service_tier,
+        response_format = opts.response_format,
+        betas = opts.betas,
+        cache_control = opts.cache_control,
+        context_management = opts.context_management,
+        extra_body = opts.extra_body,
+        api_key = opts.api_key,
+        api_key_env = opts.api_key_env or "ANTHROPIC_API_KEY",
+        base_url = opts.base_url,
+    })
+    if not req then
+        return nil, build_err
     end
-    if opts.tools and #opts.tools > 0 then
-        if cache_on then
-            -- Shallow-clone list + last entry so we don't mutate opts.tools
-            -- across calls (caller's reference is preserved intact).
-            local tools = {}
-            for i = 1, #opts.tools - 1 do
-                tools[i] = opts.tools[i]
-            end
-            local last = {}
-            for k, v in pairs(opts.tools[#opts.tools]) do
-                last[k] = v
-            end
-            last.cache_control = { type = "ephemeral" }
-            tools[#opts.tools] = last
-            body.tools = tools
-        else
-            body.tools = opts.tools
-        end
-    end
-
-    local headers = {
-        ["x-api-key"] = api_key,
-        ["anthropic-version"] = "2023-06-01",
-        ["content-type"] = "application/json",
-    }
-
-    -- Anthropic context-management (beta): add header + body only when enabled.
-    -- call_opts normalization in M.run() makes opts.context_management either
-    -- nil (opt-out) or a table (enabled: default or user-provided override).
-    -- tool_choice: "auto" | "any" | "none" | { type = "tool", name = "..." }
-    if opts.tool_choice then
-        local tc = opts.tool_choice
-        if type(tc) == "string" then
-            body.tool_choice = { type = tc }
-        elseif type(tc) == "table" then
-            body.tool_choice = tc
-        end
-    end
-
-    if opts.context_management ~= nil then
-        headers["anthropic-beta"] = "context-management-2025-06-27"
-        body.context_management = opts.context_management
-    end
+    local body = req.body
+    local headers = req.headers
 
     local dump_mode = resolve_dump_mode_cached()
     local call_index = trace and trace.call_index or "?"
@@ -467,14 +439,14 @@ local function llm_call_anthropic(messages, opts, trace)
     end
 
     local start_ts = std.time.now()
-    local resp = http.request("https://api.anthropic.com/v1/messages", {
+    local resp = http_post_with_retry(req.url, {
         method = "POST",
         headers = headers,
         body = body_json,
         timeout = opts.timeout or 120,
         -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
         dump = (dump_mode == "full") and "full" or nil,
-    })
+    }, opts, trace)
     local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
 
     llm_dump_event(dump_mode, "response", {
@@ -506,10 +478,15 @@ local function llm_call_anthropic(messages, opts, trace)
     if resp.status ~= 200 then
         -- Do not include raw body in the returned error string; caller-side
         -- logs often propagate this message verbatim.
-        return nil, "API error " .. resp.status
+        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
+        return nil, "API error " .. resp.status .. " (" .. classified.kind .. ")"
     end
 
-    local decoded = std.json.decode(resp.body)
+    local decoded, parse_err = proto_anthropic.parse(std.json.decode(resp.body))
+    if not decoded then
+        log.warn("agent: anthropic response normalization failed: " .. tostring(parse_err))
+        return nil, parse_err
+    end
     if dump_mode ~= "off" then
         local usage = decoded.usage or {}
         local in_tok = tonumber(usage.input_tokens) or 0
@@ -543,6 +520,7 @@ local function llm_call_anthropic(messages, opts, trace)
             { "usage_in", in_tok },
             { "usage_out", out_tok },
             { "usage_total", in_tok + out_tok },
+            { "usage_thinking", tonumber(usage.thinking_tokens) or 0 },
             { "cache_create", cache_create },
             { "cache_read", cache_read },
             { "context_edits", cm_applied },
@@ -554,175 +532,6 @@ end
 -- ============================================================
 -- Internal: OpenAI provider helpers
 -- ============================================================
-
---- Map OpenAI finish_reason to Anthropic stop_reason.
---- @param finish_reason string|nil
---- @return string
-local function map_finish_reason(finish_reason)
-    if finish_reason == "stop" then
-        return "end_turn"
-    elseif finish_reason == "tool_calls" then
-        return "tool_use"
-    elseif finish_reason == "length" then
-        return "max_tokens"
-    else
-        return tostring(finish_reason or "end_turn")
-    end
-end
-
---- Normalize an OpenAI chat completion response into Anthropic-shape decoded table.
---- @param raw table  Parsed OpenAI response JSON
---- @return table|nil  Anthropic-shape decoded table on success
---- @return string|nil Error string on failure
-local function normalize_openai_response(raw)
-    if not raw or not raw.choices or #raw.choices == 0 then
-        return nil, "invalid OpenAI response: missing choices"
-    end
-    local choice = raw.choices[1]
-    local message = choice and choice.message
-    if not message then
-        return nil, "invalid OpenAI response: missing choices[0].message"
-    end
-
-    local content = {}
-
-    -- Text block — skip when content is null/empty (tool-only turns)
-    local text = message.content
-    if text and text ~= "" then
-        table.insert(content, { type = "text", text = text })
-    end
-
-    -- Tool use blocks from tool_calls[]
-    for _, tc in ipairs(message.tool_calls or {}) do
-        local fn = tc["function"] or {}
-        local input = {}
-        local ok, parsed = pcall(std.json.decode, fn.arguments or "{}")
-        if ok and type(parsed) == "table" then
-            input = parsed
-        else
-            log.warn(
-                "agent: OpenAI tool_call arguments JSON parse failed for tool '"
-                    .. tostring(fn.name)
-                    .. "'; using empty input"
-            )
-            -- Acceptance Criteria #7: input={}, is_error_hint mark, loop continues
-            table.insert(content, {
-                type = "tool_use",
-                id = tc.id,
-                name = fn.name or "",
-                input = {},
-                is_error_hint = "arguments_parse_failed",
-            })
-            goto continue_tc
-        end
-        table.insert(content, {
-            type = "tool_use",
-            id = tc.id,
-            name = fn.name or "",
-            input = input,
-        })
-        ::continue_tc::
-    end
-
-    local usage_raw = raw.usage or {}
-    local decoded = {
-        content = content,
-        stop_reason = map_finish_reason(choice.finish_reason),
-        usage = {
-            input_tokens = tonumber(usage_raw.prompt_tokens) or 0,
-            output_tokens = tonumber(usage_raw.completion_tokens) or 0,
-            cache_creation_input_tokens = 0,
-            cache_read_input_tokens = 0,
-        },
-        context_management = nil,
-    }
-    return decoded, nil
-end
-
---- Convert Anthropic-shaped messages history to OpenAI-shaped messages.
---- Anthropic uses content-block arrays; OpenAI uses flat message list with
---- tool_calls on assistant messages and role="tool" for tool results.
---- @param messages table   Anthropic-shaped messages array
---- @param system string|nil  Optional system prompt
---- @return table            OpenAI-shaped messages array
-local function convert_messages_to_openai(messages, system)
-    local out = {}
-
-    -- Insert system message first if provided
-    if system and system ~= "" then
-        table.insert(out, { role = "system", content = system })
-    end
-
-    for _, msg in ipairs(messages) do
-        if type(msg.content) == "string" then
-            -- Simple string content (user prompt turns)
-            table.insert(out, { role = msg.role, content = msg.content })
-        elseif type(msg.content) == "table" then
-            if msg.role == "assistant" then
-                -- Assistant messages may have text + tool_use blocks
-                local text_parts = {}
-                local tool_calls = {}
-                for _, block in ipairs(msg.content) do
-                    if block.type == "text" then
-                        table.insert(text_parts, block.text or "")
-                    elseif block.type == "tool_use" then
-                        table.insert(tool_calls, {
-                            id = block.id,
-                            type = "function",
-                            ["function"] = {
-                                name = block.name,
-                                arguments = std.json.encode(block.input or {}),
-                            },
-                        })
-                    end
-                end
-                local text_content = #text_parts > 0 and table.concat(text_parts, "\n") or nil
-                local oai_msg = { role = "assistant" }
-                if text_content then
-                    oai_msg.content = text_content
-                end
-                if #tool_calls > 0 then
-                    oai_msg.tool_calls = tool_calls
-                end
-                table.insert(out, oai_msg)
-            elseif msg.role == "user" then
-                -- User messages with tool_result blocks → expand to role="tool" messages
-                local has_tool_result = false
-                for _, block in ipairs(msg.content) do
-                    if block.type == "tool_result" then
-                        has_tool_result = true
-                        break
-                    end
-                end
-                if has_tool_result then
-                    for _, block in ipairs(msg.content) do
-                        if block.type == "tool_result" then
-                            table.insert(out, {
-                                role = "tool",
-                                tool_call_id = block.tool_use_id,
-                                content = tostring(block.content or ""),
-                            })
-                        end
-                    end
-                else
-                    -- Regular user message with content array (e.g. text blocks)
-                    local parts = {}
-                    for _, block in ipairs(msg.content) do
-                        if block.type == "text" then
-                            table.insert(parts, block.text or "")
-                        end
-                    end
-                    table.insert(out, { role = "user", content = table.concat(parts, "\n") })
-                end
-            else
-                -- Other roles: pass content as-is (fallback)
-                table.insert(out, { role = msg.role, content = msg.content })
-            end
-        end
-    end
-
-    return out
-end
 
 --- Call OpenAI-compatible Chat Completions API via http.request.
 --- Returns Anthropic-shape decoded table (no change to dispatch_tool call sites).
@@ -756,47 +565,47 @@ local function llm_call_openai(messages, opts, trace)
         end
     end
 
-    local model = opts.model or std.env.get_or("OPENAI_MODEL", "gpt-4o-mini")
-    local base_url = opts.base_url or "https://api.openai.com/v1"
-    local endpoint = base_url .. "/chat/completions"
-
-    -- Convert messages to OpenAI shape (handles tool_use/tool_result blocks)
-    local oai_messages = convert_messages_to_openai(messages, opts.system)
-
-    -- Convert tools from Anthropic format to OpenAI format
-    local oai_tools = nil
-    if opts.tools and #opts.tools > 0 then
-        oai_tools = {}
-        for _, t in ipairs(opts.tools) do
-            -- Strip cache_control (defensive: build_tools may not add it but be safe)
-            local fn_def = {
-                name = t.name,
-                description = t.description or "",
-                parameters = t.input_schema or { type = "object", properties = {} },
-            }
-            table.insert(oai_tools, { type = "function", ["function"] = fn_def })
-        end
-    end
-
-    local body = {
-        model = model,
-        messages = oai_messages,
+    -- Message / tool conversion, tool_choice mapping, and the reasoning
+    -- dialect split (reasoning_effort vs chat_template_kwargs) live in
+    -- llm_proto.openai; this function owns dump logging, HTTP, accounting.
+    local req, build_err = proto_openai.build({
+        model = opts.model,
+        messages = messages,
+        system = opts.system,
+        tools = opts.tools,
         max_tokens = opts.max_tokens or 4096,
-    }
-    if oai_tools and #oai_tools > 0 then
-        body.tools = oai_tools
+        temperature = opts.temperature,
+        top_p = opts.top_p,
+        top_k = opts.top_k,
+        stop = opts.stop,
+        seed = opts.seed,
+        n = opts.n,
+        logit_bias = opts.logit_bias,
+        logprobs = opts.logprobs,
+        top_logprobs = opts.top_logprobs,
+        frequency_penalty = opts.frequency_penalty,
+        presence_penalty = opts.presence_penalty,
+        metadata = opts.metadata,
+        service_tier = opts.service_tier,
+        store = opts.store,
+        prompt_cache_key = opts.prompt_cache_key,
+        safety_identifier = opts.safety_identifier,
+        verbosity = opts.verbosity,
+        response_format = opts.response_format,
+        tool_choice = opts.tool_choice,
+        parallel_tool_calls = opts.parallel_tool_calls,
+        thinking = opts.thinking,
+        dialect = opts.dialect,
+        extra_body = opts.extra_body,
+        api_key = api_key,
+        base_url = opts.base_url,
+    })
+    if not req then
+        return nil, build_err
     end
-    -- extra_body pass-through (vLLM Qwen3 enable_thinking 等のための openai 互換拡張)
-    if opts.extra_body and type(opts.extra_body) == "table" then
-        for k, v in pairs(opts.extra_body) do
-            body[k] = v
-        end
-    end
-
-    local headers = {
-        ["Authorization"] = "Bearer " .. api_key,
-        ["Content-Type"] = "application/json",
-    }
+    local body = req.body
+    local headers = req.headers
+    local endpoint = req.url
 
     local dump_mode = resolve_dump_mode_cached()
     local call_index = trace and trace.call_index or "?"
@@ -836,14 +645,14 @@ local function llm_call_openai(messages, opts, trace)
     end
 
     local start_ts = std.time.now()
-    local resp = http.request(endpoint, {
+    local resp = http_post_with_retry(endpoint, {
         method = "POST",
         headers = headers,
         body = body_json,
         timeout = opts.timeout or 120,
         -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
         dump = (dump_mode == "full") and "full" or nil,
-    })
+    }, opts, trace)
     local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
 
     llm_dump_event(dump_mode, "response", {
@@ -874,7 +683,8 @@ local function llm_call_openai(messages, opts, trace)
     end
 
     if resp.status ~= 200 then
-        return nil, "API error " .. resp.status
+        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
+        return nil, "API error " .. resp.status .. " (" .. classified.kind .. ")"
     end
 
     local ok_parse, raw = pcall(std.json.decode, resp.body)
@@ -883,7 +693,7 @@ local function llm_call_openai(messages, opts, trace)
         return nil, "OpenAI response JSON decode failed"
     end
 
-    local decoded, norm_err = normalize_openai_response(raw)
+    local decoded, norm_err = proto_openai.parse(raw)
     if not decoded then
         log.warn("agent: OpenAI response normalization failed: " .. tostring(norm_err))
         return nil, norm_err
@@ -912,6 +722,7 @@ local function llm_call_openai(messages, opts, trace)
             { "usage_in", in_tok },
             { "usage_out", out_tok },
             { "usage_total", in_tok + out_tok },
+            { "usage_thinking", tonumber(usage.thinking_tokens) or 0 },
             { "cache_create", 0 },
             { "cache_read", 0 },
             { "context_edits", 0 },
@@ -949,6 +760,10 @@ local function new_budget_tracker(max_tokens_budget)
         input_tokens = 0,
         output_tokens = 0,
         total_tokens = 0,
+        -- Reasoning tokens are billed as output and already counted inside
+        -- output_tokens; tracked separately so callers can see how much of
+        -- the spend went to thinking.
+        thinking_tokens = 0,
         limit = max_tokens_budget,
     }
 
@@ -956,6 +771,7 @@ local function new_budget_tracker(max_tokens_budget)
         if usage then
             self.input_tokens = self.input_tokens + (usage.input_tokens or 0)
             self.output_tokens = self.output_tokens + (usage.output_tokens or 0)
+            self.thinking_tokens = self.thinking_tokens + (usage.thinking_tokens or 0)
             self.total_tokens = self.input_tokens + self.output_tokens
         end
     end
@@ -972,6 +788,7 @@ local function new_budget_tracker(max_tokens_budget)
             input_tokens = self.input_tokens,
             output_tokens = self.output_tokens,
             total_tokens = self.total_tokens,
+            thinking_tokens = self.thinking_tokens,
         }
     end
 
@@ -1531,9 +1348,35 @@ function M.run(opts)
         model = opts.model,
         max_tokens = opts.max_tokens or 4096,
         timeout = opts.timeout or 120,
+        max_retries = opts.max_retries, -- transient API failures; nil = default
         system = opts.system,
         tools = tools,
         tool_choice = opts.tool_choice, -- nil = API default (auto)
+        parallel_tool_calls = opts.parallel_tool_calls, -- false = at most one tool per turn
+        thinking = opts.thinking, -- nil = provider default; see llm_proto
+        dialect = opts.dialect, -- openai path: "openai" | "compat" (auto by base_url)
+        extra_body = opts.extra_body, -- raw wire-body escape hatch
+        -- Sampling / request knobs. Each adapter drops or renames what its
+        -- provider does not accept rather than forwarding a doomed request.
+        temperature = opts.temperature,
+        top_p = opts.top_p,
+        top_k = opts.top_k,
+        stop = opts.stop,
+        seed = opts.seed,
+        n = opts.n,
+        logit_bias = opts.logit_bias,
+        logprobs = opts.logprobs,
+        top_logprobs = opts.top_logprobs,
+        frequency_penalty = opts.frequency_penalty,
+        presence_penalty = opts.presence_penalty,
+        metadata = opts.metadata,
+        service_tier = opts.service_tier,
+        store = opts.store,
+        prompt_cache_key = opts.prompt_cache_key,
+        safety_identifier = opts.safety_identifier,
+        verbosity = opts.verbosity,
+        response_format = opts.response_format,
+        betas = opts.betas,
         context_management = cm_final, -- nil = opt-out, table = enabled
         -- Provider routing (new — additive, default nil = anthropic path)
         provider = opts.provider,
@@ -1637,14 +1480,33 @@ function M.run(opts)
                 end
             end
 
+            local stop_reason = response.stop_reason
+
+            -- A refusal arrives as HTTP 200 with no usable answer, so it has
+            -- to be reported rather than returned as an empty success.
+            if stop_reason == "refusal" then
+                local detail = response.stop_details or {}
+                loop_error = "model refused to respond"
+                if detail.category then
+                    loop_error = loop_error .. " (category=" .. tostring(detail.category) .. ")"
+                end
+                return
+            end
+
+            -- `pause_turn` means the server paused its own tool loop (web
+            -- search, code execution, MCP connector) at its iteration cap.
+            -- The turn is unfinished: resend with the assistant content
+            -- appended and no tool_result of ours. There are no client tool
+            -- calls to dispatch, so the empty-tool_calls exit below would
+            -- otherwise end the run mid-answer.
+            local paused = stop_reason == "pause_turn"
+
             -- No tool calls → done (end_turn or max_tokens)
-            if #tool_calls == 0 then
+            if #tool_calls == 0 and not paused then
                 break
             end
 
-            -- Check stop reason
-            local stop_reason = response.stop_reason
-            if stop_reason == "end_turn" or stop_reason == "max_tokens" then
+            if not paused and (stop_reason == "end_turn" or stop_reason == "max_tokens") then
                 break
             end
 
@@ -1658,6 +1520,10 @@ function M.run(opts)
             if budget:exceeded() then
                 log.warn("agent: token budget exceeded (" .. budget.total_tokens .. "/" .. budget.limit .. ")")
                 break
+            end
+
+            if paused then
+                goto continue_turn
             end
 
             -- Dispatch tool calls and collect results
@@ -1677,6 +1543,8 @@ function M.run(opts)
                 role = "user",
                 content = tool_results,
             })
+
+            ::continue_turn::
         end
     end)
 
@@ -1748,9 +1616,9 @@ M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 -- run behaviour is unchanged (this is a read-only accessor).
 function M._test_helpers()
     return {
-        map_finish_reason = map_finish_reason,
-        normalize_openai_response = normalize_openai_response,
-        convert_messages_to_openai = convert_messages_to_openai,
+        map_finish_reason = proto_openai.map_finish_reason,
+        normalize_openai_response = proto_openai.parse,
+        convert_messages_to_openai = proto_openai.convert_messages,
         new_budget_tracker = new_budget_tracker,
         count_tool_use_blocks = count_tool_use_blocks,
         count_text_chars = count_text_chars,

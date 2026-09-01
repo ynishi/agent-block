@@ -503,6 +503,45 @@ Environment variables used per provider:
 
 `cache_control`, `context_management`, and `context_management_config` are Anthropic-only: they are operative when `provider="anthropic"` (or unset) and emit a `warn`-level log message then are ignored when `provider="openai"`.
 
+**Protocol options (`llm_proto`)**
+
+Request building lives in the `llm_proto` package, shared by `agent` and `compile_loop`. The vocabulary is OpenAI's; each adapter renames or drops what its provider does not accept, so the same options work on both paths.
+
+```lua
+local result = agent.run({
+    prompt = "...",
+    -- "auto" | "none" | "required" | { type = "function", name = "grep" }
+    -- Anthropic spellings ("any", { type = "tool", name = ... }) are accepted too.
+    tool_choice = "required",
+    parallel_tool_calls = false,
+
+    -- Reasoning / extended thinking. `false` turns it off where that is expressible.
+    thinking = { effort = "medium" },        -- or { budget_tokens = 8000 }, or true / false
+    dialect  = "vllm",                       -- openai | vllm | llamacpp | ollama (default: from base_url)
+
+    -- Structured outputs (OpenAI shape; mapped to output_config.format on Anthropic).
+    response_format = { type = "json_schema", json_schema = { name = "out", schema = { ... } } },
+
+    -- Sampling and request knobs, forwarded where the provider supports them.
+    temperature = 0.2, top_p = 0.9, top_k = 40, stop = { "END" }, seed = 7,
+    max_retries = 2,                         -- transient failures only (rate limit / overload / 5xx)
+})
+```
+
+Notable translations:
+
+| you pass | Anthropic | OpenAI | vLLM / llama.cpp / Ollama |
+|---|---|---|---|
+| `tool_choice = "required"` | `{type="any"}` | `"required"` | as OpenAI (ignored by Ollama) |
+| `parallel_tool_calls = false` | `tool_choice.disable_parallel_tool_use` | top-level | top-level |
+| `thinking = { effort = ... }` | `{type="adaptive"}` + `output_config.effort` (4.7+) or `{type="enabled", budget_tokens}` (4.5 and earlier) | `reasoning_effort` | `chat_template_kwargs` (+ `reasoning_effort`); Ollama takes `reasoning_effort` only |
+| `stop` | `stop_sequences` | `stop` | `stop` |
+| `max_tokens` | `max_tokens` | `max_completion_tokens` on o-series / gpt-5, else `max_tokens` | `max_tokens` |
+
+Combinations the API would reject are refused locally instead: forced tool use under manual extended thinking, a thinking budget that does not fit in `max_tokens`, and tools plus reasoning on gpt-5.6+. Values a model cannot accept (`temperature` on reasoning models, `temperature ~= 1` on Claude past Opus 4.6, `top_k` on api.openai.com) are dropped with a `warn` rather than sent.
+
+Responses are normalized to one shape regardless of provider: reasoning arrives as a `thinking` content block whether the server sent `reasoning_content`, `reasoning`, Anthropic thinking blocks, or raw `<think>` tags in the text; `usage` carries `cache_read_input_tokens` / `cache_creation_input_tokens` / `thinking_tokens` on both paths.
+
 Key behaviours:
 - MCP servers listed in `mcp_servers` are connected automatically and disconnected on exit (even on error).
 - Each entry may use the stdio form `{ name, command, args }` or the HTTP form `{ name, url, transport_opts }`. Both forms can coexist in the same list.

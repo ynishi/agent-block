@@ -31,6 +31,7 @@ agent-block-mcp.workspace = true
 mlua.workspace = true
 mlua-isle.workspace = true
 mlua-batteries.workspace = true
+mlua-pkg.workspace = true
 agent-mesh-core = { workspace = true, optional = true }
 agent-mesh-sdk = { workspace = true, optional = true }
 llm-extract.workspace = true

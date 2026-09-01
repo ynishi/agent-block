@@ -401,9 +401,12 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
         ids.len() >= 2,
         "expected >=2 role=tool messages carrying tool results, got {ids:?}"
     );
+    // Synthesized ids are exactly 9 alphanumerics: Mistral's chat template
+    // rejects any other shape when the id comes back on a tool result.
     assert!(
-        ids.iter().all(|id| id.starts_with("call_synth_")),
-        "every role=tool message must carry a synthesized call_synth_* id, got {ids:?}"
+        ids.iter()
+            .all(|id| id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric())),
+        "every role=tool message must carry a synthesized 9-char alphanumeric id, got {ids:?}"
     );
     handle.ct.cancel();
 }
