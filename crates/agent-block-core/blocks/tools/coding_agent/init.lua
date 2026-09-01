@@ -1,6 +1,6 @@
--- blocks/coding_agent/init.lua — Thin backward-compatible facade over compile_loop.
+-- blocks/tools/coding_agent/init.lua — Thin backward-compatible facade over compile_loop.
 --
--- Primary surface is now compile_loop.make(conf) in blocks/compile_loop/init.lua.
+-- Primary surface is now compile_loop.make(conf) in blocks/tools/compile_loop/init.lua.
 -- This module remains for callers that used coding_agent.run() / register_tool().
 --
 -- NOTE: coding_agent.run() return shape is NOW:

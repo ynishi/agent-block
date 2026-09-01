@@ -119,7 +119,7 @@ fn extract_first_path(body: &serde_json::Value) -> Option<String> {
 ///   2. Any user message content contains the DISTILL_CHUNK_PROMPT signature string.
 ///
 /// The signature string is the first distinctive phrase in `DISTILL_CHUNK_PROMPT`
-/// (blocks/compile_loop/init.lua): "You are summarizing a chunk of a source code file".
+/// (blocks/tools/compile_loop/init.lua): "You are summarizing a chunk of a source code file".
 fn is_distill_call(body: &serde_json::Value) -> bool {
     // Criterion 1: no `tools` key.
     if body.get("tools").is_some() {

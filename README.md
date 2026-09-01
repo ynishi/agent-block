@@ -575,7 +575,7 @@ Key behaviours:
 Tool factory for the autonomous compile-and-fix loop. The primary surface is
 `compile_loop.make(conf)`, which returns a `tool_def` consumable directly by `agent.run`.
 
-Place `blocks/compile_loop/init.lua` in the project root (resolved via the filesystem
+Place `blocks/tools/compile_loop/init.lua` in the project root (resolved via the filesystem
 `blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
 
 ```lua
@@ -621,7 +621,7 @@ local result = agent.run({
 share the same function identity. The tool name defaults to `"compile_loop"`; pass
 `conf.name` to override (useful when registering multiple instances).
 
-**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. Edits are accepted from either channel: SEARCH/REPLACE text blocks, or the `apply_search_replace` tool (declared by default; agentic-tuned models complete the whole loop via tool calls). `tool_mode = "auto" | "read_only" | "none" | "adaptive"` controls which tools are declared — `"none"` is for callers that inline all file contents in the spec, `"adaptive"` auto-falls-back from tools to the SR-text contract when the declared tools stall the loop. Callers can also inject their own tools via `extra_tools = {{name, schema, handler}, ...}`. See `blocks/compile_loop/README.md` §"Multi-file mode" and the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` / `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
+**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. Edits are accepted from either channel: SEARCH/REPLACE text blocks, or the `apply_search_replace` tool (declared by default; agentic-tuned models complete the whole loop via tool calls). `tool_mode = "auto" | "read_only" | "none" | "adaptive"` controls which tools are declared — `"none"` is for callers that inline all file contents in the spec, `"adaptive"` auto-falls-back from tools to the SR-text contract when the declared tools stall the loop. Callers can also inject their own tools via `extra_tools = {{name, schema, handler}, ...}`. See `blocks/tools/compile_loop/README.md` §"Multi-file mode" and the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` / `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
 
 **Read-and-distill for large files**: in multi-file lazy-load mode, `read_file` now inspects
 file size before returning content. Files at or below `READ_FILE_FULL_THRESHOLD` (default
@@ -750,7 +750,7 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
 new code. `coding_agent` is retained for existing callers.
 
-Place `blocks/coding_agent/init.lua` in the project root.
+Place `blocks/tools/coding_agent/init.lua` in the project root.
 
 **`coding_agent.run(opts)`** — run the loop directly from Lua (facade over `compile_loop`).
 
@@ -832,7 +832,7 @@ override; the `"cargo"` built-in does exactly that with the target file's direct
 
 ### lshape (Vendored package — `require("lshape")`)
 
-`lshape` is vendored under `blocks/lshape/` so scripts can use schema validation
+`lshape` is vendored under `blocks/lib/lshape/` so scripts can use schema validation
 and LuaCATS generation without external installation.
 
 ```lua

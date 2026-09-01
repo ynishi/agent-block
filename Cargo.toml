@@ -45,9 +45,12 @@ mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "ti
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
-mlua-pkg     = "0.6"
+mlua-pkg     = "0.7"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 anyhow       = "1"
+# Content fingerprint for `std.fs.read_versioned` / `edit`'s optimistic
+# concurrency check. Already in the tree transitively.
+sha2         = "0.10"
 dotenvy      = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap         = { version = "4", features = ["derive", "env"] }

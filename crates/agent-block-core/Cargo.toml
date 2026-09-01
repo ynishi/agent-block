@@ -40,6 +40,7 @@ tokio-util.workspace = true
 rusqlite = { workspace = true, optional = true }
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 async-trait.workspace = true

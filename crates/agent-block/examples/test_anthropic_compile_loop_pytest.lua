@@ -1,6 +1,6 @@
 -- test_anthropic_compile_loop_pytest.lua — compile_loop with pytest runner (Anthropic)
 --
--- Demonstrates blocks/compile_loop: structural Edit→Run→Feedback loop
+-- Demonstrates blocks/tools/compile_loop: structural Edit→Run→Feedback loop
 -- using an inline pytest runner and the Anthropic Messages API as the LLM backend.
 --
 -- conf.llm is OMITTED from compile_loop.make() so that the parent agent's

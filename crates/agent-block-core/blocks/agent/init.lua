@@ -166,7 +166,7 @@ end
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
--- Keep this list in sync with the other two copies: blocks/compile_loop/init.lua
+-- Keep this list in sync with the other two copies: blocks/tools/compile_loop/init.lua
 -- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
 -- site is a superset: these exact names plus the ab.obs substring policy
 -- (token / secret / password / api_key / access_key / private_key / ...).
@@ -1391,7 +1391,7 @@ function M.run(opts)
     local log_meta = build_log_meta(opts)
 
     -- Initialize message history. When opts.history is provided (typically
-    -- loaded via blocks/session), prepend it before the new user prompt so
+    -- loaded via blocks/lib/session), prepend it before the new user prompt so
     -- the LLM sees the full thread. The block treats history as opaque —
     -- trimming / compaction is the caller's responsibility.
     local messages = {}

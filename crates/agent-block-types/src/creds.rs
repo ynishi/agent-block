@@ -16,7 +16,7 @@
 ///   covered; generalizing that belongs to a planned exec-tool redesign.
 /// - This is **not** an env allowlist. Every other variable is still inherited.
 pub const OWN_CREDENTIAL_ENV_VARS: &[&str] = &[
-    // Default key env of the anthropic provider path (blocks/agent, blocks/compile_loop).
+    // Default key env of the anthropic provider path (blocks/agent, blocks/tools/compile_loop).
     "ANTHROPIC_API_KEY",
     // Default key env of the openai-compatible provider path.
     "OPENAI_API_KEY",

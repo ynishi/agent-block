@@ -1,4 +1,4 @@
--- blocks/session/init.lua — Conversation session persistence (StdPkg)
+-- blocks/lib/session/init.lua — Conversation session persistence (StdPkg)
 --
 -- Thin wrapper around `std.kv` that round-trips an `agent.run` messages
 -- array across process invocations. agent-block is single-run by design;

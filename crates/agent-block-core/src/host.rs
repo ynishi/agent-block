@@ -24,34 +24,59 @@ use agent_block_mcp::McpManager;
 use agent_block_types::error::{BlockError, BlockResult};
 use tokio_util::sync::CancellationToken;
 
-/// Embedded Lua sources for blocks/ StdPkg modules.
-/// These are baked into the binary at compile time so `cargo install` works
-/// without any extra file distribution.
+/// Embedded Lua sources for the blocks that expose a tool surface.
+///
+/// Baked into the binary at compile time so `cargo install` works without any
+/// extra file distribution. The `require` name on the left is independent of
+/// the path on the right: `blocks/` is laid out by role
+/// (`agent/` runtime, `tools/`, `lib/`) while callers keep writing
+/// `require("compile_loop")`.
 const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     ("agent", include_str!("../blocks/agent/init.lua")),
-    ("session", include_str!("../blocks/session/init.lua")),
     (
         "compile_loop",
-        include_str!("../blocks/compile_loop/init.lua"),
+        include_str!("../blocks/tools/compile_loop/init.lua"),
+    ),
+    (
+        "coding_agent",
+        include_str!("../blocks/tools/coding_agent/init.lua"),
     ),
 ];
 
 /// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]
 /// but not part of the block surface reported by [`inspect_tools`].
 ///
-/// `llm_proto` is the provider-neutral LLM wire protocol layer shared by the
-/// `agent` and `compile_loop` blocks (request building, tool_choice and
-/// thinking translation, response normalization). It is a library, not a
-/// runnable block, so listing it as a "tool" would be misleading.
+/// These are required by other modules rather than registered as tools:
+/// `llm_proto` is the provider-neutral LLM wire format, `session` persists a
+/// messages array through `std.kv`, and `lshape` is a schema validator.
+/// Listing them as tools would be misleading.
 const EMBEDDED_LIBS: &[(&str, &str)] = &[
-    ("llm_proto", include_str!("../blocks/llm_proto/init.lua")),
+    ("session", include_str!("../blocks/lib/session/init.lua")),
+    (
+        "llm_proto",
+        include_str!("../blocks/lib/llm_proto/init.lua"),
+    ),
     (
         "llm_proto.openai",
-        include_str!("../blocks/llm_proto/openai.lua"),
+        include_str!("../blocks/lib/llm_proto/openai.lua"),
     ),
     (
         "llm_proto.anthropic",
-        include_str!("../blocks/llm_proto/anthropic.lua"),
+        include_str!("../blocks/lib/llm_proto/anthropic.lua"),
+    ),
+    ("lshape", include_str!("../blocks/lib/lshape/init.lua")),
+    ("lshape.t", include_str!("../blocks/lib/lshape/t.lua")),
+    (
+        "lshape.check",
+        include_str!("../blocks/lib/lshape/check.lua"),
+    ),
+    (
+        "lshape.reflect",
+        include_str!("../blocks/lib/lshape/reflect.lua"),
+    ),
+    (
+        "lshape.luacats",
+        include_str!("../blocks/lib/lshape/luacats.lua"),
     ),
 ];
 
@@ -759,6 +784,11 @@ pub struct HostContext {
     /// ownership before entering the long-lived `run()` await (avoiding the
     /// await-holding-lock anti-pattern on a `std::sync::Mutex`).
     pub event_bus: Arc<Mutex<Option<EventBus>>>,
+    /// Pre-edit file contents captured by `std.fs.edit`, consumed by
+    /// `std.fs.rollback`. One level per path — enough to discard the last
+    /// edit, which is what a build-and-fix loop needs when it decides an
+    /// iteration made things worse.
+    pub fs_snapshots: crate::bridge::fs::SnapshotStore,
 }
 
 impl HostContext {
@@ -884,18 +914,15 @@ fn build_isle_init(
         let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
         fs_roots.extend(blocks_roots.iter().cloned());
         for root in fs_roots {
-            // `SymlinkAwareSandbox`, not the `FsResolver::new` default: this
-            // repo's own `blocks/agent` is a symlink into
-            // `crates/agent-block-core/blocks/`, and the default sandbox
-            // canonicalizes then rejects anything landing outside the root as
-            // a traversal attempt. A traversal error is `Some(Err)`, which by
-            // design does not fall through to the next resolver, so one
-            // symlinked block directory would break `require` for every
-            // module. Symlink targets present under the root at startup are
-            // recorded as allowed.
-            match mlua_pkg::sandbox::SymlinkAwareSandbox::new(root.clone()) {
-                Ok(sandbox) => {
-                    registry.add(mlua_pkg::resolvers::FsResolver::with_sandbox(sandbox));
+            // Symlink-aware, not the plain constructor: this repo's own
+            // `blocks/agent` is a symlink into `crates/agent-block-core/blocks/`,
+            // and the default sandbox rejects anything whose canonical path
+            // leaves the root. That rejection is `Some(Err)`, which does not
+            // fall through to the next resolver, so one symlinked block
+            // directory would break `require` for every module.
+            match mlua_pkg::resolvers::FsResolver::new_symlink_aware(root.clone()) {
+                Ok(resolver) => {
+                    registry.add(resolver);
                 }
                 Err(e) => {
                     // A missing directory is expected (script_dir always
@@ -1654,6 +1681,7 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
         handler_isle: Arc::clone(&handler_isle),
         bus_tx: bus_tx.clone(),
         event_bus: Arc::clone(&event_bus),
+        fs_snapshots: Default::default(),
     };
 
     register_bridges(&ctx, &isle, &handler_isle).await?;

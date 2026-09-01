@@ -87,6 +87,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1770,9 +1771,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-pkg"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7afb1f3ac596de9b203f99dc381e8328e1dd070b61751e4f9c0d588849061647"
+checksum = "7664b48087260b46f45e38ee73f77d032bf273972de3ed2e610835796ad20275"
 dependencies = [
  "anyhow",
  "clap",

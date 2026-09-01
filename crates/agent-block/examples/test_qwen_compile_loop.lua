@@ -1,6 +1,6 @@
 -- test_qwen_compile_loop.lua — compile_loop e2e (Qwen vLLM)
 --
--- Demonstrates blocks/compile_loop: structural Edit→Run→Feedback loop.
+-- Demonstrates blocks/tools/compile_loop: structural Edit→Run→Feedback loop.
 -- Uses the SAME deep_merge spec that broke Qwen in 3 manual iters,
 -- now driven autonomously through the loop.
 --

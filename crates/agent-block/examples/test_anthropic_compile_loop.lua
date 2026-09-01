@@ -1,6 +1,6 @@
 -- test_anthropic_compile_loop.lua — compile_loop e2e (Anthropic)
 --
--- Demonstrates blocks/compile_loop: structural Edit→Run→Feedback loop
+-- Demonstrates blocks/tools/compile_loop: structural Edit→Run→Feedback loop
 -- using the Anthropic Messages API (claude-haiku) as the LLM backend.
 --
 -- Crux #2 smoke: conf.llm is OMITTED from compile_loop.make() call so that

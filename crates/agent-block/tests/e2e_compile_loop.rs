@@ -135,7 +135,7 @@ async fn compile_loop_openai_mock_iterates_until_pass() {
 /// sequencing via a `call_count` upvalue (Crux #2).
 ///
 /// Validates Crux #1: the fixture supplies `base_url` from `ANTHROPIC_BASE_URL_TEST`;
-/// if `blocks/compile_loop/init.lua` did not forward `opts.base_url` to the Anthropic
+/// if `blocks/tools/compile_loop/init.lua` did not forward `opts.base_url` to the Anthropic
 /// client (ST1 fix), the request would not reach the mock and the test would fail.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys (Crux #3).
@@ -242,36 +242,42 @@ async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
     handle.ct.cancel();
 }
 
-/// Verifies the apply_search_replace write-channel tool (issue #1 request 1).
+/// Verifies the fs_edit write-channel tool.
 ///
 /// Scenario: 1 iteration, 2 LLM calls.
-///   - Call 1: mock returns two apply_search_replace tool_use blocks (file_a, file_b).
+///   - Call 1: mock returns two fs_edit tool_use blocks (file_a, file_b).
 ///     compile_loop applies both edits via the tool handler and writes them to disk.
 ///   - Call 2: mock returns the plain text "DONE" (no SR blocks). Because tool-channel
 ///     edits were applied this iter, the loop proceeds to verify instead of treating
 ///     the missing SR text as a parse failure → mock_runner sees "new" → ok=true.
 ///
 /// Validates:
-///   - tool_mode default "auto" declares apply_search_replace (asserted via mock state).
+///   - tool_mode default "auto" declares fs_edit (asserted via mock state).
 ///   - Tool-channel edits count as applied edits (no zero-edit retry / no dead end).
 ///   - result.modified_files carries the tool-written paths.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
-async fn compile_loop_apply_search_replace_tool_converges() {
+async fn compile_loop_fs_edit_tool_converges() {
     let handle = MockLlm::anthropic(|req| {
         if !req.has_tool_results {
             let (path_a, path_b) = two_paths(&req.paths);
             anthropic::tool_use_response(vec![
                 anthropic::tool_use(
                     "toolu_asr_1",
-                    "apply_search_replace",
-                    json!({"path": path_a, "search": "print(\"a-old\")", "replace": "print(\"a-new\")"}),
+                    "fs_edit",
+                    json!({"path": path_a, "edits": [{
+                        "start_line": 1, "end_line": 1,
+                        "expect": "print(\"a-old\")", "replace": "print(\"a-new\")"
+                    }]}),
                 ),
                 anthropic::tool_use(
                     "toolu_asr_2",
-                    "apply_search_replace",
-                    json!({"path": path_b, "search": "print(\"b-old\")", "replace": "print(\"b-new\")"}),
+                    "fs_edit",
+                    json!({"path": path_b, "edits": [{
+                        "start_line": 1, "end_line": 1,
+                        "expect": "print(\"b-old\")", "replace": "print(\"b-new\")"
+                    }]}),
                 ),
             ])
         } else {
@@ -316,8 +322,8 @@ async fn compile_loop_apply_search_replace_tool_converges() {
         "expected exactly 2 HTTP calls (tool_use turn + DONE turn)"
     );
     assert!(
-        handle.state.declared_count_of("apply_search_replace") >= 1,
-        "tool_mode=auto must declare the apply_search_replace tool in the request"
+        handle.state.declared_count_of("fs_edit") >= 1,
+        "tool_mode=auto must declare the fs_edit tool in the request"
     );
     handle.ct.cancel();
 }
@@ -330,7 +336,7 @@ async fn compile_loop_apply_search_replace_tool_converges() {
 ///   * the id field is absent.
 ///
 /// Scenario: 1 iteration, 2 LLM calls.
-///   - Call 1: two apply_search_replace tool_calls (object args, no ids).
+///   - Call 1: two fs_edit tool_calls (object args, no ids).
 ///     cl_oai_normalize must accept the object arguments and synthesize
 ///     deterministic call_synth_N ids.
 ///   - Call 2: request must carry role="tool" messages whose tool_call_id
@@ -345,12 +351,18 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
             let (path_a, path_b) = two_paths(&req.paths);
             openai::tool_calls_response(vec![
                 openai::tool_call_object_args_no_id(
-                    "apply_search_replace",
-                    json!({"path": path_a, "search": "print(\"a-old\")", "replace": "print(\"a-new\")"}),
+                    "fs_edit",
+                    json!({"path": path_a, "edits": [{
+                        "start_line": 1, "end_line": 1,
+                        "expect": "print(\"a-old\")", "replace": "print(\"a-new\")"
+                    }]}),
                 ),
                 openai::tool_call_object_args_no_id(
-                    "apply_search_replace",
-                    json!({"path": path_b, "search": "print(\"b-old\")", "replace": "print(\"b-new\")"}),
+                    "fs_edit",
+                    json!({"path": path_b, "edits": [{
+                        "start_line": 1, "end_line": 1,
+                        "expect": "print(\"b-old\")", "replace": "print(\"b-new\")"
+                    }]}),
                 ),
             ])
         } else {

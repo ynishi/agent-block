@@ -10,7 +10,7 @@ agent-block -s examples/<file>.lua
 
 ## compile_loop
 
-Autonomous compile-and-fix loop. See `blocks/compile_loop/README.md` for the API and the SEARCH/REPLACE format.
+Autonomous compile-and-fix loop. See `blocks/tools/compile_loop/README.md` for the API and the SEARCH/REPLACE format.
 
 ### Anthropic — single-file
 

@@ -45,7 +45,7 @@ callers that supply only `target_file` continue to work unchanged.
 Classic behaviour: one target file, any `edit_mode`.
 
 ```lua
-local compile_loop = require("blocks/compile_loop")
+local compile_loop = require("blocks/tools/compile_loop")
 
 local LUA_TIMEOUT = 60
 
@@ -79,7 +79,7 @@ Multiple target files edited in a single loop. Requires `edit_mode = "diff"`.
 
 ```lua
 -- pseudo (requires subtask-1 implementation)
-local compile_loop = require("blocks/compile_loop")
+local compile_loop = require("blocks/tools/compile_loop")
 
 local CARGO_TIMEOUT = 300
 

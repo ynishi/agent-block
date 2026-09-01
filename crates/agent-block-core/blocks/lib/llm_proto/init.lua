@@ -1,7 +1,7 @@
 --- llm_proto — provider-neutral LLM wire protocol layer.
 ---
 --- Purpose
----   `blocks/agent` and `blocks/compile_loop` both talk to LLM endpoints, and
+---   `blocks/agent` and `blocks/tools/compile_loop` both talk to LLM endpoints, and
 ---   both used to build their request bodies inline. The result was drift:
 ---   `tool_choice` existed only on the agent/Anthropic path, `thinking` existed
 ---   nowhere, and every provider quirk had to be fixed twice. This module owns

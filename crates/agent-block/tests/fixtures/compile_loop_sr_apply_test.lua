@@ -1,5 +1,5 @@
 -- compile_loop_sr_apply_test.lua — mlua-lspec unit tests for the pure SEARCH/REPLACE
--- parse + apply + summary/feedback branches of blocks/compile_loop/init.lua.
+-- parse + apply + summary/feedback branches of blocks/tools/compile_loop/init.lua.
 --
 -- Run via:
 --   mcp__lua-debugger__test_launch(
@@ -403,81 +403,9 @@ describe("compile_loop.filter_for_tool_output", function()
     end)
 end)
 
--- ─────────────────────────────────────────────────────────────────────────────
--- apply_search_replace_tool_handler (write-channel tool, issue #1)
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.apply_search_replace_tool_handler", function()
-    local handler = H.apply_search_replace_tool_handler
-
-    -- Create a temp file with content; returns its absolute path.
-    local function make_tmp(content)
-        local path = os.tmpname()
-        local f = assert(io.open(path, "w"))
-        f:write(content)
-        f:close()
-        return path
-    end
-
-    local function read_all(path)
-        local f = assert(io.open(path, "r"))
-        local content = f:read("*a") or ""
-        f:close()
-        return content
-    end
-
-    it("applies an exact-match edit and writes it to disk", function()
-        local path = make_tmp("foo\nbar\nbaz\n")
-        local res = handler(path, "bar", "BAR", { [path] = true })
-        expect(res.ok).to.equal(true)
-        expect(contains(res.content, "applied: " .. path)).to.equal(true)
-        expect(read_all(path)).to.equal("foo\nBAR\nbaz\n")
-        os.remove(path)
-    end)
-
-    it("rejects a path outside the target_files allowlist", function()
-        local path = make_tmp("foo\n")
-        local res = handler(path, "foo", "X", { ["/some/other/file.lua"] = true })
-        expect(res.ok).to.equal(false)
-        expect(contains(res.error, "not in target_files allowlist")).to.equal(true)
-        expect(read_all(path)).to.equal("foo\n") -- untouched
-        os.remove(path)
-    end)
-
-    it("returns a recoverable error when SEARCH does not match", function()
-        local path = make_tmp("foo\n")
-        local res = handler(path, "does-not-exist", "X", { [path] = true })
-        expect(res.ok).to.equal(false)
-        expect(contains(res.error, "did not match")).to.equal(true)
-        expect(contains(res.error, "Re-read the file")).to.equal(true)
-        expect(read_all(path)).to.equal("foo\n") -- untouched
-        os.remove(path)
-    end)
-
-    it("rejects an empty search string", function()
-        local path = make_tmp("foo\n")
-        local res = handler(path, "", "X", { [path] = true })
-        expect(res.ok).to.equal(false)
-        expect(contains(res.error, "search must be a non-empty string")).to.equal(true)
-        os.remove(path)
-    end)
-
-    it("rejects a non-string replace", function()
-        local path = make_tmp("foo\n")
-        local res = handler(path, "foo", nil, { [path] = true })
-        expect(res.ok).to.equal(false)
-        expect(contains(res.error, "replace must be a string")).to.equal(true)
-        os.remove(path)
-    end)
-
-    it("falls back to a whitespace-normalized match", function()
-        local path = make_tmp("hello   world\n")
-        local res = handler(path, "hello world", "ok", { [path] = true })
-        expect(res.ok).to.equal(true)
-        expect(contains(read_all(path), "ok")).to.equal(true)
-        os.remove(path)
-    end)
-end)
+-- The write channel no longer has a compile_loop-local handler: the edit is
+-- std.fs's (tests/e2e_fs_edit.rs) and the loop only turns its structured
+-- rejection into tool_result text (tests/e2e_compile_loop.rs).
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- cl_oai_map_finish_reason
@@ -519,7 +447,7 @@ describe("compile_loop.cl_oai_normalize", function()
                 id = "call_obj",
                 type = "function",
                 ["function"] = {
-                    name = "apply_search_replace",
+                    name = "fs_edit",
                     arguments = { path = "/a", search = "x", replace = "y" },
                 },
             },
@@ -537,15 +465,15 @@ describe("compile_loop.cl_oai_normalize", function()
             { type = "function", ["function"] = { name = "read_file", arguments = { path = "/b" } } },
         }))
         local blocks = resp.choices[1].message.tool_use_blocks
-        expect(blocks[1].id).to.equal("call_synth_1")
-        expect(blocks[2].id).to.equal("call_synth_2")
+        expect(blocks[1].id).to.equal("tc0000001")
+        expect(blocks[2].id).to.equal("tc0000002")
     end)
 
     it("synthesizes an id when id is an empty string", function()
         local resp = normalize(oai_resp({
             { id = "", type = "function", ["function"] = { name = "read_file", arguments = '{"path":"/a"}' } },
         }))
-        expect(resp.choices[1].message.tool_use_blocks[1].id).to.equal("call_synth_1")
+        expect(resp.choices[1].message.tool_use_blocks[1].id).to.equal("tc0000001")
     end)
 
     it("keeps the malformed-string-arguments recovery path (empty input + hint)", function()
@@ -556,7 +484,7 @@ describe("compile_loop.cl_oai_normalize", function()
         expect(blocks[1].is_error_hint).to.equal("arguments_parse_failed")
         expect(next(blocks[1].input)).to.equal(nil)
         -- Synthetic id also applies on the malformed path.
-        expect(blocks[1].id).to.equal("call_synth_1")
+        expect(blocks[1].id).to.equal("tc0000001")
     end)
 
     it("errors on a response with no choices", function()
@@ -574,20 +502,20 @@ describe("compile_loop.cl_oai_convert_messages round-trips synthetic ids", funct
             {
                 role = "assistant",
                 content = {
-                    { type = "tool_use", id = "call_synth_1", name = "read_file", input = { path = "/a" } },
+                    { type = "tool_use", id = "tc0000001", name = "read_file", input = { path = "/a" } },
                 },
             },
             {
                 role = "user",
                 content = {
-                    { type = "tool_result", tool_use_id = "call_synth_1", content = "file body" },
+                    { type = "tool_result", tool_use_id = "tc0000001", content = "file body" },
                 },
             },
         }, nil)
         expect(#out).to.equal(2)
-        expect(out[1].tool_calls[1].id).to.equal("call_synth_1")
+        expect(out[1].tool_calls[1].id).to.equal("tc0000001")
         expect(out[2].role).to.equal("tool")
-        expect(out[2].tool_call_id).to.equal("call_synth_1")
+        expect(out[2].tool_call_id).to.equal("tc0000001")
     end)
 end)
 

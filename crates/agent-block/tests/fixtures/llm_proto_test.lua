@@ -1,4 +1,4 @@
--- llm_proto_test.lua — mlua-lspec unit tests for blocks/llm_proto.
+-- llm_proto_test.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
 --
 -- Run via:
 --   mcp__lua-debugger__test_launch(
@@ -7,7 +7,7 @@
 --   )
 --
 -- Covers the pieces that used to be duplicated (or missing) across
--- blocks/agent and blocks/compile_loop:
+-- blocks/agent and blocks/tools/compile_loop:
 --   * tool_choice normalization across both provider vocabularies
 --   * Anthropic manual vs adaptive extended thinking, chosen by model generation
 --   * the thinking x forced-tool-use combination Anthropic rejects

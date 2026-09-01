@@ -11,7 +11,7 @@
 //! The response shape matches the Anthropic Messages API:
 //!   `{ "content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn", ... }`
 //!
-//! `blocks/compile_loop/init.lua:173-186` expects `decoded.content` to be a table
+//! `blocks/tools/compile_loop/init.lua:173-186` expects `decoded.content` to be a table
 //! (array of objects with `type` and `text` fields) — NOT a string. This mock
 //! returns the correct array shape.
 //!
@@ -43,7 +43,7 @@ pub struct MockState {
 /// # Purpose
 /// Simulates the Anthropic Messages endpoint for the compile_loop block.
 /// Returns fenced Lua code blocks in the Anthropic `content` array shape.
-/// `blocks/compile_loop/init.lua:173-186` decodes this array format.
+/// `blocks/tools/compile_loop/init.lua:173-186` decodes this array format.
 ///
 /// # Arguments
 /// - `state`: shared `MockState` carrying the `Arc<AtomicUsize>` call counter.
@@ -127,7 +127,7 @@ async fn messages_handler(
 /// # Purpose
 /// Binds a random local port, serves POST `/v1/messages`, and returns
 /// the base URL so the Lua fixture can point `compile_loop.make({llm={base_url=...}})` at it.
-/// The Lua fixture passes this URL as `ANTHROPIC_BASE_URL_TEST`; `blocks/compile_loop/init.lua`
+/// The Lua fixture passes this URL as `ANTHROPIC_BASE_URL_TEST`; `blocks/tools/compile_loop/init.lua`
 /// appends `"/v1/messages"` to form the full endpoint URL (after ST1 base_url forward fix).
 ///
 /// # Returns

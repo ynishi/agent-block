@@ -14,6 +14,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod fs;
 pub mod http;
 #[cfg(feature = "sqlite")]
 pub mod kv;
@@ -61,6 +62,8 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     let _ = is_handler_side;
     sh::register(lua, ctx)?;
     tool::register(lua)?;
+    // After tool::register — fs_tools.lua needs the `tool` global.
+    fs::register(lua, std::sync::Arc::clone(&ctx.fs_snapshots))?;
     log::register(lua, ctx)?;
     mcp::register(lua, ctx)?;
     http::register(lua, ctx)?;

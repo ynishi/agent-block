@@ -384,7 +384,7 @@ async fn read_sse(mut resp: reqwest::Response, on_data: &Option<LuaFunction>) ->
 /// substring policy on top of this list.
 ///
 /// Keep these five entries in sync with the other two copies:
-/// `blocks/agent/init.lua` and `blocks/compile_loop/init.lua`
+/// `blocks/agent/init.lua` and `blocks/tools/compile_loop/init.lua`
 /// (`sanitize_headers_for_dump`), which carry the exact names only.
 const REDACTED_HEADERS: [&str; 5] = [
     "x-api-key",
@@ -770,7 +770,10 @@ mod tests {
             rest[..end].to_string()
         }
 
-        for rel in ["blocks/agent/init.lua", "blocks/compile_loop/init.lua"] {
+        for rel in [
+            "blocks/agent/init.lua",
+            "blocks/tools/compile_loop/init.lua",
+        ] {
             let region = sanitize_region(rel);
             for name in REDACTED_HEADERS {
                 assert!(

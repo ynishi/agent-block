@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `llm_proto` package (`blocks/llm_proto/`): provider-neutral LLM wire protocol
+- `llm_proto` package (`blocks/lib/llm_proto/`): provider-neutral LLM wire protocol
   layer shared by the `agent` and `compile_loop` blocks. Request building,
   `tool_choice` / `thinking` translation, and response normalization now have a
   single implementation instead of one per block.
@@ -464,7 +464,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The canonical home of the `compile_loop` Lua module is now
-  `crates/agent-block-core/blocks/compile_loop/` (moved from the
+  `crates/agent-block-core/blocks/tools/compile_loop/` (moved from the
   workspace-root `blocks/`). Filesystem lookups via
   `BlockConfig.project_root.join("blocks")` still take precedence over
   the embedded copy when both are present, so repo-internal hot-reload
@@ -690,7 +690,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `blocks/session` — cross-invocation conversation persistence StdPkg.
+- `blocks/lib/session` — cross-invocation conversation persistence StdPkg.
   Round-trips an `agent.run` messages array via `std.kv` (SQLite-backed)
   under namespace `_agent_block_session`. API: `session.load(id)` →
   messages array (empty `{}` when absent), `session.save(id, messages)`,
@@ -800,7 +800,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawns 2 subprocesses (with `call_count` reset) and asserts both runs produce identical
   tool-call sequence + `COMPILE_LOOP_MOCK_PASS` + `call_count == 3` (deterministic across
   runs). 1-spawn fallback forbidden per Crux constraint.
-- `blocks/compile_loop/README.md` — new `## Qwen path operational notes` section
+- `blocks/tools/compile_loop/README.md` — new `## Qwen path operational notes` section
   documenting deterministic temperature, disable_thinking recommendation, bad vs good
   stagnation distinction, and cross-ref to proxy-side documentation for RunPod proxy
   ~30s cold-start timeout.
@@ -880,7 +880,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `compile_loop` — stagnation detection threshold corrected: `is_stagnant_v2` now requires
   all `STAGNATION_WINDOW` (= 3) consecutive hashes to be identical before declaring
   stagnation, up from the previous "2-of-3" condition that fired after only a single
-  repeated pair (`blocks/compile_loop/init.lua`).
+  repeated pair (`blocks/tools/compile_loop/init.lua`).
 - `compile_loop` — `sr_history` is now appended on every SR attempt regardless of outcome.
   Previously, successful SR returns (`rr.ok=true`) never updated `sr_history`, so stagnation
   detection operated on a biased sample that excluded all successful iterations.
@@ -902,7 +902,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `blocks/compile_loop` — new Tool factory block (`blocks/compile_loop/init.lua`).
+- `blocks/tools/compile_loop` — new Tool factory block (`blocks/tools/compile_loop/init.lua`).
   Primary surface: `compile_loop.make(conf)` returns a `tool_def = {name, schema, handler}`
   that can be passed directly to `agent.run({extra_tools = {tool_def}})`. The compile-and-fix
   loop logic (previously inside `coding_agent`) now lives here.
@@ -949,7 +949,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code 2 (skip signal) rather than propagating an io.popen error.
 - README: added **External runner examples** mini-table under the `compile_loop` Provider
   support section, listing all 6 example files with their runner kind and provider.
-- `blocks/compile_loop` Anthropic path now reads `opts.base_url` instead of using a
+- `blocks/tools/compile_loop` Anthropic path now reads `opts.base_url` instead of using a
   hardcoded endpoint. When `opts.base_url` is supplied the Anthropic client forwards it
   as the base URL (`(opts.base_url or "https://api.anthropic.com") .. "/v1/messages"`),
   matching the existing OpenAI path behaviour. Existing callers that omit `base_url` are
@@ -965,14 +965,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/common/compile_loop_anthropic_mock.rs`,
   `tests/fixtures/compile_loop_openai_mock.lua`,
   `tests/fixtures/compile_loop_anthropic_mock.lua`.
-- `blocks/compile_loop` now emits `ab.obs` structured log events (`iter_start`, `iter_result`,
+- `blocks/tools/compile_loop` now emits `ab.obs` structured log events (`iter_start`, `iter_result`,
   `converged`, `stagnation`, `max_iters_reached`) gated by `AGENT_BLOCK_LLM_DUMP=meta|full`.
   Event lines use the fixed-order `prefix=ab.obs event=<name> component=compile_loop key=value`
   format identical to the agent block's obs schema. Existing tests are unaffected (default `off`).
   New e2e test `compile_loop_anthropic_mock_emits_obs_events` in `tests/e2e_compile_loop.rs`
   validates the PASS-path events (`iter_start`, `iter_result`, `converged`) with
   `predicate::str::contains`.
-- `blocks/compile_loop` — Add multi-file mode to compile_loop block (`target_files` list,
+- `blocks/tools/compile_loop` — Add multi-file mode to compile_loop block (`target_files` list,
   path-aware SEARCH/REPLACE parser with `<<< path=... >>>` headers, mode-toggle runner
   signature: single-file `runner(path: string)` / multi-file `runner(paths: list<string>)`).
   `target_file` (string) and `target_files` (list) are mutually exclusive; both forms
@@ -981,7 +981,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nil` in multi-file mode. New e2e test
   `compile_loop_diff_multi_anthropic_mock_iterates_until_pass` in
   `tests/e2e_compile_loop.rs` validates a 2-file simultaneous edit scenario.
-- `blocks/compile_loop` — OpenAI path now fully supports multi-file lazy-load
+- `blocks/tools/compile_loop` — OpenAI path now fully supports multi-file lazy-load
   (`read_file` tool dispatch loop, sliding window K=3, stderr trim). Previously the
   `llm_call` OpenAI branch returned early before processing `tool_calls`, making multi-file
   lazy-load a no-op on that path. Now the branch: (a) converts messages to OpenAI wire
@@ -997,7 +997,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI path for multi-file lazy-load: mock LLM requests `read_file` for two files across
   two turns, then produces a SEARCH/REPLACE patch that causes the runner to pass. Mirrors
   the structure of `examples/test_anthropic_compile_loop_multi_lazy_load.lua`.
-- `blocks/compile_loop` — read-and-distill subloop for large files in multi-file lazy-load
+- `blocks/tools/compile_loop` — read-and-distill subloop for large files in multi-file lazy-load
   mode. When `read_file` is called on a file whose byte length exceeds `READ_FILE_FULL_THRESHOLD`
   (default 10 000 chars), the block splits the file into line-based chunks (`DISTILL_CHUNK_LINES`
   default 200 lines, boundary-adjusted to avoid splitting mid-function) and calls the child
@@ -1021,7 +1021,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `conf.target_func` (new optional field, default nil), (3) document order. The binary
     search packs the top-K chunks within `DISTILL_DIGEST_MAX_CHARS` at 15% tolerance
     (borrowed from Aider `repomap.py`).
-- `blocks/compile_loop` — new `read_file_range` LLM-callable tool. The LLM calls
+- `blocks/tools/compile_loop` — new `read_file_range` LLM-callable tool. The LLM calls
   `read_file_range(path, line_start, line_end)` to retrieve verbatim source lines from any
   file in the `target_files` allowlist. The handler reads directly via `io.open` without
   passing through the distillation path regardless of file size (Crux §3: verbatim range
@@ -1038,7 +1038,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop calls. A third test `compile_loop_read_file_range_verbatim` exercises the
   `read_file_range` verbatim path via `tests/fixtures/compile_loop_distill_range_mock.lua`.
   All three tests run without external API keys (`api_key="dummy"`).
-- New module-level constants in `blocks/compile_loop/init.lua`:
+- New module-level constants in `blocks/tools/compile_loop/init.lua`:
   `READ_FILE_FULL_THRESHOLD` (10 000), `DISTILL_CHUNK_LINES` (200),
   `DISTILL_DIGEST_MAX_CHARS` (4 000), `DISTILL_CHUNK_DIGEST_MAX_CHARS` (400),
   `CACHE_AUTO_TTL_SEC` (10), `READ_FILE_RANGE_MAX_LINES` (500).
@@ -1049,8 +1049,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `blocks/coding_agent` reduced to a thin backward-compatible facade (~155 lines) over
-  `blocks/compile_loop`. `coding_agent.run(opts)` and `coding_agent.register_tool(opts)`
+- `blocks/tools/coding_agent` reduced to a thin backward-compatible facade (~155 lines) over
+  `blocks/tools/compile_loop`. `coding_agent.run(opts)` and `coding_agent.register_tool(opts)`
   remain available but delegate internally to `compile_loop.make()`.
   - **Breaking**: `coding_agent.run()` return shape is now
     `{ ok, iters, summary, failure_reason?, last_error?, artifact_path }`.
@@ -1234,7 +1234,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Vendored `lshape` package under `blocks/lshape/` so `require("lshape")`
+- Vendored `lshape` package under `blocks/lib/lshape/` so `require("lshape")`
   works out of the box in agent scripts, including `lshape.luacats` codegen.
 - New E2E coverage `tests/e2e_lshape.rs` + fixture `tests/fixtures/lshape_require.lua`
   to verify the vendored module loads and basic schema + LuaCATS paths execute.
