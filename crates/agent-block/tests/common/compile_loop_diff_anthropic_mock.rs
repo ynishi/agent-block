@@ -36,9 +36,28 @@ pub struct DiffMockState {
 
 /// POST /v1/messages handler for the diff-mode compile_loop test.
 ///
-/// Turn 1: emits a SEARCH/REPLACE block with a wrong SEARCH text (deliberate mismatch).
-///   compile_loop will detect apply failure and send a failure message back.
-/// Turn 2+: emits a correct SEARCH/REPLACE block matching the initial file.
+/// Turn 1: an fs_edit whose `expect` does not match the file (deliberate
+///   mismatch). std.fs rejects it, compile_loop reports zero edits, and the
+///   next iteration carries that feedback.
+/// Turn 2+: an fs_edit whose `expect` matches, so the file is written.
+/// The loop lists its target files in the prompt; the mock edits whichever
+/// path it was given rather than hard-coding a temp dir.
+///
+/// Scans for a path-shaped token anywhere in the body rather than for a line
+/// that is one. The prompt introduces the file inline (`Target file: <path>`),
+/// so a line-shaped match finds nothing on the first turn — and an empty path
+/// is not an inert failure here: `fs_edit` rejects it as `path_not_allowed`,
+/// which silently replaces the `expect_mismatch` this mock exists to produce.
+fn target_path(body: &axum::body::Bytes) -> String {
+    let text = String::from_utf8_lossy(body);
+    for token in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\\') {
+        if token.starts_with('/') && token.ends_with(".lua") {
+            return token.to_string();
+        }
+    }
+    String::new()
+}
+
 async fn diff_messages_handler(
     State(state): State<DiffMockState>,
     body: axum::body::Bytes,
@@ -55,26 +74,46 @@ async fn diff_messages_handler(
 
     let prev = state.call_count.fetch_add(1, Ordering::SeqCst);
 
-    let text = if prev == 0 {
-        // Turn 1: deliberate SEARCH mismatch — "WRONG" is not in the file.
-        "<<<<<<< SEARCH\nprint(\"WRONG\")\n=======\nprint(\"world\")\n>>>>>>> REPLACE"
+    // The fixture writes `print("hello")` as the only line of the file, so
+    // line 1 is the whole address space here.
+    let expect_text = if prev == 0 {
+        // Turn 1: `WRONG` is not what line 1 contains.
+        "print(\"WRONG\")"
     } else {
-        // Turn 2+: correct SEARCH matching the initial file content.
-        "<<<<<<< SEARCH\nprint(\"hello\")\n=======\nprint(\"world\")\n>>>>>>> REPLACE"
+        "print(\"hello\")"
+    };
+
+    // Every turn that carries a tool_result is the model's chance to stop; the
+    // loop only needs one edit per iteration, so answering DONE keeps the
+    // iteration short.
+    let carries_tool_result = String::from_utf8_lossy(&body).contains("tool_result");
+
+    let content = if carries_tool_result {
+        json!([{ "type": "text", "text": "DONE" }])
+    } else {
+        json!([{
+            "type": "tool_use",
+            "id": format!("toolu_diff_{}", prev + 1),
+            "name": "fs_edit",
+            "input": {
+                "path": target_path(&body),
+                "edits": [{
+                    "start_line": 1,
+                    "end_line": 1,
+                    "expect": expect_text,
+                    "replace": "print(\"world\")"
+                }]
+            }
+        }])
     };
 
     let response_json = json!({
         "id": format!("msg_diff_mock_{}", prev + 1),
         "type": "message",
         "role": "assistant",
-        "content": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ],
+        "content": content,
         "model": "claude-haiku-mock",
-        "stop_reason": "end_turn",
+        "stop_reason": if carries_tool_result { "end_turn" } else { "tool_use" },
         "usage": {
             "input_tokens": 10,
             "output_tokens": 20

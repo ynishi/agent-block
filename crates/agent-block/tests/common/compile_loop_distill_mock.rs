@@ -2,7 +2,7 @@
 //! Supports both Anthropic and OpenAI providers via a runtime `provider` argument.
 #![allow(dead_code)]
 //!
-//! Implements a 3-turn scenario for the compile_loop distill subloop:
+//! Implements a 4-turn scenario for the compile_loop distill subloop:
 //!
 //! - Turn 0 (main LLM, with `tools`): returns tool_use=read_file for the target file.
 //!   compile_loop dispatches read_file → file size > threshold → calls distill_subloop.
@@ -13,14 +13,22 @@
 //!   Returns a short text summary per call. Increments `distill_call_count`.
 //!   Stores the last received body in `received_distill_body` for BC5 assertion.
 //!
-//! - Turn 2 (main LLM, with `tools`, after tool results): returns a correct
-//!   SEARCH/REPLACE block that changes "REPLACE_ME" → "DONE" in the target file.
+//! - Turn 2 (main LLM, one tool result in hand): returns a tool_use=fs_edit that
+//!   changes "REPLACE_ME" → "DONE" on the marker line of the target file.
 //!   The file path is extracted from the request body (Files: section).
+//!
+//! - Turn 3 (main LLM, two tool results in hand): returns the text "DONE", which
+//!   ends the tool loop so compile_loop can run the verify step.
+//!
+//! Turns are told apart by how many tool results the request carries, which is the
+//! only monotonic signal available: every iteration starts a fresh tool loop, so
+//! neither the call index nor the mere presence of tool results distinguishes them.
 //!
 //! MockState fields:
 //!   - `call_count`:           total HTTP requests received (all turns combined)
 //!   - `distill_call_count`:   HTTP requests identified as distill calls (Turn 1)
 //!   - `received_distill_body`: last body received from a distill call (for BC5: tools absent)
+//!   - `tool_result_texts`:    every tool result text seen, in order (verbatim assertions)
 //!
 //! Shared mock for both providers — router schema is selected by the `provider`
 //! argument to `spawn_distill_mock`. No compile-time feature flags.
@@ -60,6 +68,105 @@ pub struct MockState {
     /// Last request body received from a distill call.
     /// Test side asserts that `tools` key is absent (BC5).
     pub received_distill_body: Arc<Mutex<Option<serde_json::Value>>>,
+    /// Every tool result text the mock has seen, in order of first appearance.
+    /// This is the only place a test can observe what a tool handler actually
+    /// handed the model (e.g. that read_file_range output is verbatim).
+    pub tool_result_texts: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockState {
+    fn new() -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            distill_call_count: Arc::new(AtomicUsize::new(0)),
+            received_distill_body: Arc::new(Mutex::new(None)),
+            tool_result_texts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Snapshot of the recorded tool result texts.
+    pub fn tool_result_texts(&self) -> Vec<String> {
+        self.tool_result_texts.lock().expect("lock").clone()
+    }
+}
+
+// === Tool result helpers ===
+
+/// The line the fixtures put the `REPLACE_ME` marker on.
+///
+/// Both distill fixtures write exactly 600 lines and reserve the last one for
+/// the marker, so this is the address the edit has to name.
+const MARKER_LINE: u64 = 600;
+const MARKER_EXPECT: &str = "-- marker: REPLACE_ME";
+const MARKER_REPLACE: &str = "-- marker: DONE";
+
+/// The `fs_edit` input that turns the marker line into `DONE`.
+fn marker_edit_input(path: &str) -> serde_json::Value {
+    json!({
+        "path": path,
+        "edits": [{
+            "start_line": MARKER_LINE,
+            "end_line": MARKER_LINE,
+            "expect": MARKER_EXPECT,
+            "replace": MARKER_REPLACE
+        }]
+    })
+}
+
+/// Tool result texts carried by an Anthropic request, in message order.
+fn anthropic_tool_results(body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                out.push(
+                    b.get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Tool result texts carried by an OpenAI request, in message order.
+fn openai_tool_results(body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            out.push(
+                msg.get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+    }
+    out
+}
+
+/// Record any tool result texts this request carries that we have not seen yet.
+fn record_tool_results(state: &MockState, results: &[String]) {
+    let mut seen = state.tool_result_texts.lock().expect("lock");
+    for (i, text) in results.iter().enumerate() {
+        if i >= seen.len() {
+            seen.push(text.clone());
+        }
+    }
 }
 
 // === Path extraction helper ===
@@ -150,11 +257,13 @@ fn is_distill_call(body: &serde_json::Value) -> bool {
 /// Distill call (no `tools` + DISTILL_SIG): returns a short text summary.
 ///   Increments `distill_call_count`, stores body in `received_distill_body`.
 ///
-/// Main call turn 0 (first call with `tools`): returns tool_use=read_file for
-///   the target path extracted from the request body.
+/// Main call with 0 tool results: returns tool_calls=read_file for the target
+///   path extracted from the request body.
 ///
-/// Main call turn 1+ (subsequent calls with `tools` and tool results):
-///   returns a SEARCH/REPLACE SR block to change "REPLACE_ME" → "DONE".
+/// Main call with 1 tool result: returns tool_calls=fs_edit changing
+///   "REPLACE_ME" → "DONE" on the marker line.
+///
+/// Main call with 2+ tool results: returns the text "DONE", ending the tool loop.
 async fn openai_distill_handler(
     State(state): State<MockState>,
     body: axum::body::Bytes,
@@ -202,25 +311,15 @@ async fn openai_distill_handler(
         );
     }
 
-    // Main LLM call: check how many main (non-distill) calls have been made so far.
-    // `prev` counts all calls; distill calls are interleaved. Use presence of tool results
-    // in the message list to distinguish turn 0 from turn 1.
-    let has_tool_results = req_value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                // OpenAI tool results appear as messages with role="tool".
-                msg.get("role").and_then(|r| r.as_str()) == Some("tool")
-            })
-        })
-        .unwrap_or(false);
+    // Main LLM call. `prev` counts distill calls too, so the turn is derived
+    // from how many tool results the request carries instead.
+    let results = openai_tool_results(&req_value);
+    record_tool_results(&state, &results);
+    let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
 
-    let response_json = if !has_tool_results {
-        // Turn 0: first main call — return tool_use=read_file.
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        json!({
-            "id": format!("chatcmpl-main-turn0-{}", prev + 1),
+    let response_json = match results.len() {
+        0 => json!({
+            "id": format!("chatcmpl-main-read-{}", prev + 1),
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
@@ -232,33 +331,45 @@ async fn openai_distill_handler(
                         "type": "function",
                         "function": {
                             "name": "read_file",
-                            "arguments": format!("{{\"path\":\"{}\"}}", path)
+                            "arguments": json!({ "path": path }).to_string()
                         }
                     }]
                 },
                 "finish_reason": "tool_calls"
             }],
             "usage": { "prompt_tokens": 30, "completion_tokens": 15, "total_tokens": 45 }
-        })
-    } else {
-        // Turn 1+: return SR pass block.
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        let sr_text = format!(
-            "<<< path={path} >>>\n<<<<<<< SEARCH\n-- marker: REPLACE_ME\n=======\n-- marker: DONE\n>>>>>>> REPLACE"
-        );
-        json!({
-            "id": format!("chatcmpl-main-turn1-{}", prev + 1),
+        }),
+        1 => json!({
+            "id": format!("chatcmpl-main-edit-{}", prev + 1),
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": sr_text
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_fs_edit_1",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_edit",
+                            "arguments": marker_edit_input(&path).to_string()
+                        }
+                    }]
                 },
-                "finish_reason": "stop"
+                "finish_reason": "tool_calls"
             }],
             "usage": { "prompt_tokens": 60, "completion_tokens": 30, "total_tokens": 90 }
-        })
+        }),
+        _ => json!({
+            "id": format!("chatcmpl-main-done-{}", prev + 1),
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "DONE" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 70, "completion_tokens": 5, "total_tokens": 75 }
+        }),
     };
 
     (
@@ -275,8 +386,9 @@ async fn openai_distill_handler(
 /// Same dispatch logic as `openai_distill_handler`, using Anthropic response shapes.
 ///
 /// Distill call: returns `content` array with a single text block (raw summary).
-/// Main call turn 0: returns `tool_use` block for read_file.
-/// Main call turn 1+: returns `text` block with the SEARCH/REPLACE SR.
+/// Main call, 0 tool results:  `tool_use` block for read_file.
+/// Main call, 1 tool result:   `tool_use` block for fs_edit on the marker line.
+/// Main call, 2+ tool results: `text` block "DONE", ending the tool loop.
 async fn anthropic_distill_handler(
     State(state): State<MockState>,
     body: axum::body::Bytes,
@@ -321,33 +433,15 @@ async fn anthropic_distill_handler(
         );
     }
 
-    // Main LLM call: detect turn by presence of tool_result content blocks.
-    let has_tool_results = req_value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                // Anthropic tool results: user message with content array containing tool_result blocks.
-                if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
-                    return false;
-                }
-                msg.get("content")
-                    .and_then(|c| c.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    // Main LLM call. Turn is derived from how many tool results the request
+    // carries; the call index also counts the interleaved distill calls.
+    let results = anthropic_tool_results(&req_value);
+    record_tool_results(&state, &results);
+    let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
 
-    let response_json = if !has_tool_results {
-        // Turn 0: return tool_use=read_file.
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        json!({
-            "id": format!("msg_main_turn0_{}", prev + 1),
+    let response_json = match results.len() {
+        0 => json!({
+            "id": format!("msg_main_read_{}", prev + 1),
             "type": "message",
             "role": "assistant",
             "content": [{
@@ -359,22 +453,30 @@ async fn anthropic_distill_handler(
             "model": "claude-haiku-mock",
             "stop_reason": "tool_use",
             "usage": { "input_tokens": 30, "output_tokens": 15 }
-        })
-    } else {
-        // Turn 1+: return SR pass block.
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        let sr_text = format!(
-            "<<< path={path} >>>\n<<<<<<< SEARCH\n-- marker: REPLACE_ME\n=======\n-- marker: DONE\n>>>>>>> REPLACE"
-        );
-        json!({
-            "id": format!("msg_main_turn1_{}", prev + 1),
+        }),
+        1 => json!({
+            "id": format!("msg_main_edit_{}", prev + 1),
             "type": "message",
             "role": "assistant",
-            "content": [{ "type": "text", "text": sr_text }],
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_fs_edit_1",
+                "name": "fs_edit",
+                "input": marker_edit_input(&path)
+            }],
+            "model": "claude-haiku-mock",
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 60, "output_tokens": 30 }
+        }),
+        _ => json!({
+            "id": format!("msg_main_done_{}", prev + 1),
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "DONE" }],
             "model": "claude-haiku-mock",
             "stop_reason": "end_turn",
-            "usage": { "input_tokens": 60, "output_tokens": 30 }
-        })
+            "usage": { "input_tokens": 70, "output_tokens": 5 }
+        }),
     };
 
     (
@@ -388,12 +490,14 @@ async fn anthropic_distill_handler(
 
 /// POST /v1/messages handler for the read_file_range verbatim test (Anthropic schema).
 ///
-/// 2-turn scenario:
-///   Turn 0 (no tool_results in messages): returns tool_use=read_file_range(path, 10, 20).
-///   Turn 1 (tool_results present):        returns SR pass block (REPLACE_ME → DONE).
+/// 3-turn scenario:
+///   Turn 0 (0 tool results): returns tool_use=read_file_range(path, 10, 20).
+///   Turn 1 (1 tool result):  returns tool_use=fs_edit on the marker line.
+///   Turn 2 (2 tool results): returns the text "DONE", ending the tool loop.
 ///
 /// This confirms that read_file_range is dispatched by the tool loop and returns verbatim
-/// lines regardless of file size (crux-card §3).
+/// lines regardless of file size (crux-card §3). The range output itself is recorded in
+/// `tool_result_texts` so the test can assert it line by line.
 async fn anthropic_range_handler(
     State(state): State<MockState>,
     body: axum::body::Bytes,
@@ -413,32 +517,14 @@ async fn anthropic_range_handler(
 
     let prev = state.call_count.fetch_add(1, Ordering::SeqCst);
 
-    // Detect tool_result presence to determine turn.
-    let has_tool_results = req_value
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
-                    return false;
-                }
-                msg.get("content")
-                    .and_then(|c| c.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    // Turn is derived from how many tool results the request carries.
+    let results = anthropic_tool_results(&req_value);
+    record_tool_results(&state, &results);
+    let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
 
-    let response_json = if !has_tool_results {
-        // Turn 0: request read_file_range(path, 10, 20).
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        json!({
-            "id": format!("msg_range_turn0_{}", prev + 1),
+    let response_json = match results.len() {
+        0 => json!({
+            "id": format!("msg_range_read_{}", prev + 1),
             "type": "message",
             "role": "assistant",
             "content": [{
@@ -450,22 +536,30 @@ async fn anthropic_range_handler(
             "model": "claude-haiku-mock",
             "stop_reason": "tool_use",
             "usage": { "input_tokens": 20, "output_tokens": 10 }
-        })
-    } else {
-        // Turn 1: return SR pass block (REPLACE_ME → DONE).
-        let path = extract_first_path(&req_value).unwrap_or_else(|| "/unknown/path".to_string());
-        let sr_text = format!(
-            "<<< path={path} >>>\n<<<<<<< SEARCH\n-- marker: REPLACE_ME\n=======\n-- marker: DONE\n>>>>>>> REPLACE"
-        );
-        json!({
-            "id": format!("msg_range_turn1_{}", prev + 1),
+        }),
+        1 => json!({
+            "id": format!("msg_range_edit_{}", prev + 1),
             "type": "message",
             "role": "assistant",
-            "content": [{ "type": "text", "text": sr_text }],
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_range_edit_1",
+                "name": "fs_edit",
+                "input": marker_edit_input(&path)
+            }],
+            "model": "claude-haiku-mock",
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 40, "output_tokens": 20 }
+        }),
+        _ => json!({
+            "id": format!("msg_range_done_{}", prev + 1),
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "DONE" }],
             "model": "claude-haiku-mock",
             "stop_reason": "end_turn",
-            "usage": { "input_tokens": 40, "output_tokens": 20 }
-        })
+            "usage": { "input_tokens": 50, "output_tokens": 5 }
+        }),
     };
 
     (
@@ -477,22 +571,20 @@ async fn anthropic_range_handler(
 
 /// Spawn an in-process Anthropic mock for the read_file_range verbatim e2e test.
 ///
-/// 2-turn scenario:
+/// 3-turn scenario:
 ///   Turn 0: returns tool_use=read_file_range(path, 10, 20).
-///   Turn 1: returns SR block (REPLACE_ME → DONE) after receiving the tool result.
+///   Turn 1: returns tool_use=fs_edit (REPLACE_ME → DONE) after the range result.
+///   Turn 2: returns "DONE" after the edit result, ending the tool loop.
 ///
 /// # Returns
 /// - `addr`: `SocketAddr`. Convert to URL with `format!("http://{addr}")`.
-/// - `state`: `Arc<MockState>` — `call_count` should equal 2 after the subprocess.
+/// - `state`: `Arc<MockState>` — `call_count` should equal 3 after the subprocess,
+///   and `tool_result_texts()[0]` holds the verbatim range output.
 ///
 /// # Panics
 /// Panics only on OS-level port bind failure.
 pub async fn spawn_range_mock() -> (std::net::SocketAddr, Arc<MockState>) {
-    let state = Arc::new(MockState {
-        call_count: Arc::new(AtomicUsize::new(0)),
-        distill_call_count: Arc::new(AtomicUsize::new(0)),
-        received_distill_body: Arc::new(Mutex::new(None)),
-    });
+    let state = Arc::new(MockState::new());
 
     let router = Router::new()
         .route("/v1/messages", post(anthropic_range_handler))
@@ -531,11 +623,7 @@ pub async fn spawn_range_mock() -> (std::net::SocketAddr, Arc<MockState>) {
 /// # Panics
 /// Panics only on OS-level port bind failure (fatal test infrastructure condition).
 pub async fn spawn_distill_mock(provider: &str) -> (std::net::SocketAddr, Arc<MockState>) {
-    let state = Arc::new(MockState {
-        call_count: Arc::new(AtomicUsize::new(0)),
-        distill_call_count: Arc::new(AtomicUsize::new(0)),
-        received_distill_body: Arc::new(Mutex::new(None)),
-    });
+    let state = Arc::new(MockState::new());
 
     let router = match provider {
         "anthropic" => Router::new()

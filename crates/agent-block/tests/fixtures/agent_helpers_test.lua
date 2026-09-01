@@ -10,7 +10,7 @@
 --   * map_finish_reason        — OpenAI finish_reason → Anthropic stop_reason mapping
 --   * count_tool_use_blocks    — tool_use block counting (nil / empty / mixed)
 --   * count_text_chars         — text char counting (nil text / non-text blocks)
---   * extract_text             — text block concatenation
+--   * tool_loop._text_of       — text block concatenation (agent delegates here)
 --   * normalize_dump_mode      — LLM dump mode normalization (case + alias + fallback)
 --   * sanitize_headers_for_dump— secret header redaction (case-insensitive)
 --   * kv_escape / format_kv    — structured kv-log escaping
@@ -288,8 +288,10 @@ describe("agent.count_text_chars", function()
     end)
 end)
 
-describe("agent.extract_text", function()
-    local extract = H.extract_text
+-- Text extraction moved to tool_loop when agent.run was migrated onto it; the
+-- test follows the implementation rather than a re-export kept alive for it.
+describe("tool_loop.text_of", function()
+    local extract = require("tool_loop")._text_of
 
     it("returns empty string for nil content", function()
         expect(extract(nil)).to.equal("")

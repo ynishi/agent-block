@@ -19,8 +19,8 @@ iteration ceiling is reached.
 | `lang` | `string` | no | `"lua"` | Language hint for the LLM |
 | `name` | `string` | no | `"compile_loop"` | Tool name registered in the tool registry |
 | `system` | `string` | no | `nil` | Additional system prompt prepended to the default |
-| `edit_mode` | `"full"\|"diff"` | no | `"full"` | `"full"` rewrites the entire file; `"diff"` uses SEARCH/REPLACE patches |
-| `tool_mode` | `"auto"\|"read_only"\|"none"\|"adaptive"` | no | `"auto"` | Multi-file only. `"auto"` declares `read_file` / `read_file_range` / `apply_search_replace`; `"read_only"` declares just the read tools; `"none"` declares no tools (caller inlines all file contents in the spec); `"adaptive"` starts as `"auto"` and falls back to `"none"` when the declared tools stall the loop (see below) |
+| `edit_mode` | `"full"\|"diff"` | no | `"full"` | `"full"` rewrites the entire file in one completion; `"diff"` edits through tools |
+| `tool_mode` | `"auto"\|"read_only"` | no | `"auto"` | `"diff"` mode only. `"auto"` declares `read_file` / `read_file_range` / `fs_edit`; `"read_only"` declares just the read tools, which can inspect but never converge |
 | `extra_tools` | `array` | no | — | Multi-file only. Caller-registered tools in the agent-layer nested form `{name, schema = {description?, input_schema}, handler}`. Declared alongside the built-in tools; dispatched inside the tool loop; built-in names are reserved. `handler(input)` returns a string; errors are propagated as recoverable tool_result text. Extra-tool calls do not count as applied edits |
 
 **Tool inputs** (`spec`, `target_file` or `target_files`, `lang?`) are supplied by the
@@ -108,108 +108,52 @@ local result = agent.run({
 -- result.modified_files contains the list of absolute paths that were written
 ```
 
-### Tool channel: `apply_search_replace` (`tool_mode = "auto"`, default)
+### How `diff` mode edits
 
-Agentic-tuned models treat declared tools as the primary way to act and may never
-fall back to the SR-in-text contract. With `tool_mode = "auto"` the loop therefore
-declares a write-side tool alongside the read tools, and accepts edits from
-**either channel**:
+Editing goes through tools; there is no text contract. Each iteration runs
+`tool_loop` (`blocks/lib/tool_loop`) with exactly three tools and nothing else:
 
-- **Text channel** — SEARCH/REPLACE blocks in the response text (unchanged).
-- **Tool channel** — `apply_search_replace {path, search, replace}` calls; each call
-  applies one SR edit (same two-stage matcher and `target_files` allowlist as the
-  text channel) and writes the file immediately. A mismatch returns a recoverable
-  error so the model can re-read and retry within the same iteration.
+- `read_file` / `read_file_range` — the loop's own readers, so a large file goes
+  through the digest/distill path instead of the context. Their output is
+  line-numbered, and those line numbers are what the edit tool addresses.
+- `fs_edit` — `std.fs`'s editor, scoped to `target_files` by `path_lock`. Edits
+  are addressed by line range and verified against the `expect`ed text there;
+  a rejection reports what is actually at those lines. There is no fuzzy match.
 
-An iteration that applied at least one tool-channel edit proceeds to verify even
-when the final response contains no SR text (the model is told to reply `DONE`).
+Caller-supplied `extra_tools` are declared alongside these. Their calls never
+count as edits: they are read-like by contract, and counting them would let a
+loop that only queried the caller's tool look like it was making progress.
 
-`tool_mode = "none"` is the escape hatch for callers that inline all target-file
-contents in the spec: no tools are declared at all, which measurably restores the
-text contract on newer models. `"read_only"` preserves the pre-tool-channel
-behaviour (read tools only).
+**The build is not a tool.** The loop runs the runner itself after the editing
+turns finish. That is what the block's guarantee rests on — "it compiles" has to
+be something the loop verified, not something the model reported, so the runner
+is never something the model can decline to call.
 
-**Adaptive channel rescue (`tool_mode = "adaptive"`)**: starts as `"auto"`.
-When the declared tools stall the loop — two consecutive zero-edit iterations,
-or a single response blowing past the per-iteration tool-call cap ("keeps
-reading, never writes") — the loop drops all tool declarations, embeds the
-current file contents into the prompt, and continues on the pure SR-text
-contract. This is the runtime form of the strip-tools proxy experiment from
-issue #1, where removing the `tools` field measurably restored the text
-contract on tool-preferring models. The switch resets the zero-edit stagnation
-counter so the new channel gets a full rescue window; the switch is one-way
-within a run.
+An iteration that applied no edits skips the runner (it would report what it
+already reported) and carries the rejection text into the next one.
 
-**Wire-shape tolerance (OpenAI-compatible stacks)**: the OpenAI response
-normalizer accepts two observed deviations from the spec — `function.arguments`
-arriving as a JSON *object* instead of a string (Ollama native `/api/chat`,
-Gemini `functionCall.args`, some vLLM tool-call parsers), and a missing/empty
-`id` field (Ollama native has none; pre-Gemini-3 models make it optional), for
-which a deterministic `call_synth_<index>` id is synthesized and carried through
-the `role="tool"` result pairing. Malformed argument *strings* still fall back
-to `input={}` with an `arguments_parse_failed` hint so the model can recover.
+## Edit format
 
-### Multi-file examples (Anthropic)
+`fs_edit` takes a path and a list of edits:
 
-End-to-end smoke scripts under `examples/`, runnable as `agent-block -s examples/<file>.lua` (requires `ANTHROPIC_API_KEY` in `.env`):
-
-| Script | Scenario |
-|---|---|
-| `test_anthropic_compile_loop_multi.lua` | Add a function to **both** files (basic additive multi-file diff) |
-| `test_anthropic_compile_loop_multi_delete.lua` | Remove a function + assertions from both files (REPLACE-empty deletion) |
-| `test_anthropic_compile_loop_multi_selective.lua` | Edit one file only; verifies the untouched file is byte-identical |
-| `test_anthropic_compile_loop_multi_stagnation.lua` | Forced-fail runner; asserts `max_iters` bound and `ok=false` return |
-
-Single-file equivalents live alongside (`test_anthropic_compile_loop.lua` etc.).
-
-## SEARCH/REPLACE format
-
-### Single-file (`target_file`)
-
-The LLM produces one or more SEARCH/REPLACE blocks. No path header is needed.
-
-```
-<<<<<<< SEARCH
-<existing text to find>
-=======
-<replacement text>
->>>>>>> REPLACE
+```json
+{
+  "path": "/abs/path/to/file.lua",
+  "base": "<version from read_file, optional>",
+  "edits": [
+    { "start_line": 12, "end_line": 14,
+      "expect": "the current text of those lines",
+      "replace": "the new text" }
+  ]
+}
 ```
 
-Path headers in single-file mode are accepted but ignored (lenient parse). All blocks are
-applied to `target_file`.
-
-### Multi-file (`target_files`)
-
-Each group of SEARCH/REPLACE blocks must be preceded by a path header line that identifies
-the target file:
-
-```
-<<< path=src/file_a.lua >>>
-<<<<<<< SEARCH
-<existing text in file_a>
-=======
-<replacement text>
->>>>>>> REPLACE
-
-<<< path=src/file_b.lua >>>
-<<<<<<< SEARCH
-<existing text in file_b>
-=======
-<replacement text>
->>>>>>> REPLACE
-```
-
-Rules:
-
-- The `<<< path=<relpath> >>>` line must appear **before** the first SEARCH/REPLACE block
-  for that file.
-- Consecutive SEARCH/REPLACE blocks under the same path header all apply to that file.
-- A new path header switches the active file.
-- Path headers are **required** in multi-file mode. A block with no preceding path header
-  is a parse error.
-- The path must appear in `target_files`. A path not in the allowlist is a parse error.
-- Duplicate path headers (same path appearing twice) are a parse error.
+Line numbers are 1-based and inclusive, and come from the numbered `read_file`
+output. `expect` must match exactly; it verifies the address rather than being
+the address, so a wrong guess is reported with the text actually present instead
+of landing the edit somewhere else. Every edit in a call is checked before any
+is applied, so a rejected call changes nothing. Passing `base` makes the call
+fail if the file changed since it was read.
 
 ## Runner signature
 
@@ -260,9 +204,9 @@ In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
 - `target_files` must be a non-empty list of strings.
 - Stagnation detection: when `STAGNATION_WINDOW = 3` consecutive iterations produce identical
   runner `stderr`, the loop exits immediately with `failure_reason = "stagnation"`.
-- Bad stagnation: when `STAGNATION_WINDOW = 3` consecutive iterations apply zero edits (LLM
-  emitted no valid SEARCH/REPLACE blocks, or all blocks failed SEARCH matching), the loop exits
-  with `failure_reason = "no_edits_applied"`. See §Qwen path operational notes for details.
+- Bad stagnation: when `STAGNATION_WINDOW = 3` consecutive iterations apply zero edits (every
+  `fs_edit` call was rejected, or the model never called it), the loop exits with
+  `failure_reason = "no_edits_applied"`. See §Qwen path operational notes for details.
 
 ## Background
 
@@ -320,12 +264,11 @@ The loop distinguishes two failure modes when iterations do not converge:
   edit. This is the "good" stagnation case: the LLM is editing, but the runner
   is stuck on the same error.
 - `failure_reason = "no_edits_applied"` — `STAGNATION_WINDOW = 3` consecutive
-  iterations produced zero successful SEARCH/REPLACE applies (parse failure or
-  all blocks failed to match). The "bad" stagnation case: the LLM is not making
-  progress in edits at all. Before terminating, the loop injects an explicit
-  retry message asking the LLM to emit a SEARCH/REPLACE block that actually
-  applies; only after the third consecutive zero-edit iteration does the loop
-  exit with `failure_reason = "no_edits_applied"`.
+  iterations reached disk with nothing: every `fs_edit` was rejected, or the
+  model never called it. The "bad" stagnation case: the LLM is not making
+  progress in edits at all. Each such iteration carries the rejection text back
+  into the next prompt; only after the third consecutive zero-edit iteration
+  does the loop exit.
 
 Callers should treat `no_edits_applied` as a stronger failure signal than
 `stagnation` — it suggests the prompt or model is incompatible with the target

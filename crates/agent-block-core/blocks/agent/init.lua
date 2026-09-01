@@ -54,11 +54,14 @@
 local M = {}
 
 -- Provider wire format (request building, tool_choice / thinking translation,
--- response normalization) lives in the `llm_proto` package. This module owns
--- the ReAct loop, tool dispatch, budgets, and dump logging — not the protocol.
-local proto = require("llm_proto")
-local proto_anthropic = proto.adapter("anthropic")
-local proto_openai = proto.adapter("openai")
+-- response normalization) lives in `llm_proto`; the call-dispatch-repeat loop
+-- lives in `tool_loop`. What this module owns is the agent part: assembling the
+-- tool set from the registry and MCP, the token budget, and the dump.
+local tool_loop = require("tool_loop")
+
+-- Re-exported through `M._test_helpers` only; the run path reaches llm_proto
+-- through tool_loop.
+local proto_openai = require("llm_proto").adapter("openai")
 
 -- ============================================================
 -- Internal: parent LLM context stack (_AGENT_LLM_CTX)
@@ -297,455 +300,130 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
 }
 
 -- ============================================================
--- Internal: LLM API call (Anthropic Messages API)
+-- Internal: dump hooks
 -- ============================================================
 
---- Call Anthropic Messages API via http.request.
---- @param messages table  Messages array
---- @param opts table      Options: system, model, max_tokens, tools, timeout,
----                        context_management (table|nil — table enables the
----                        context-management beta header and body field; nil
----                        means opt-out, no header and no body field).
---- Default number of retries for transient API failures.
-local MAX_RETRIES_DEFAULT = 2
-
---- POST with retries for the failures that are worth retrying.
+--- Build the `ab.llm` observability hooks handed to tool_loop.
 ---
---- Rate limits, overload, and 5xx come back on their own; auth failures,
---- malformed requests, and exhausted spend never will — retrying the last of
---- those keeps hammering an account that cannot succeed until the billing
---- period rolls over, so classification decides rather than the status class.
+--- The loop owns the HTTP call now, so the dump is expressed as callbacks over
+--- it: `request` / `response` from the wire, `summary` from the decoded reply.
+--- Field order and names are unchanged — `AGENT_BLOCK_LLM_DUMP` consumers parse
+--- these lines.
 ---
---- @param url string
---- @param request_opts table  Options for http.request
---- @param opts table          Call options (reads max_retries)
---- @param trace table|nil     Call metadata, used to spread concurrent retries
---- @return table  The final http.request response
-local function http_post_with_retry(url, request_opts, opts, trace)
-    local max_retries = tonumber(opts.max_retries) or MAX_RETRIES_DEFAULT
-    local attempt = 0
-
-    while true do
-        local resp = http.request(url, request_opts)
-        if resp.status == 200 or attempt >= max_retries then
-            return resp
-        end
-
-        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-        if not classified.retryable then
-            return resp
-        end
-
-        attempt = attempt + 1
-        local delay = proto.retry_delay(attempt, classified, tonumber(trace and trace.call_index) or 0)
-        log.warn(
-            "agent: "
-                .. classified.kind
-                .. " (HTTP "
-                .. tostring(resp.status)
-                .. "); retry "
-                .. attempt
-                .. "/"
-                .. max_retries
-                .. " in "
-                .. string.format("%.1f", delay)
-                .. "s"
-        )
-        std.task.sleep(delay * 1000)
-    end
-end
-
---- @param trace table|nil Optional call metadata for dump logs.
---- @return table|nil      Parsed response JSON on success, nil on error
---- @return string|nil     Error string on failure
-local function llm_call_anthropic(messages, opts, trace)
-    local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-
-    -- Prompt caching is on unless `opts.cache_control == false`; the marker
-    -- placement and its constraints are documented in llm_proto.anthropic.
-    -- Observability lands in the "summary" dump event and `on_turn`:
-    -- `usage.cache_creation_input_tokens` → cache_create,
-    -- `usage.cache_read_input_tokens` → cache_read,
-    -- hit rate ≈ cache_read / (cache_read + input_tokens).
-
-    -- Wire-format construction (caching markers, tool_choice, thinking,
-    -- context-management header/body) lives in llm_proto.anthropic; this
-    -- function owns the call: dump logging, HTTP, and response accounting.
-    local req, build_err = proto_anthropic.build({
-        model = model,
-        messages = messages,
-        system = opts.system,
-        tools = opts.tools,
-        max_tokens = opts.max_tokens or 4096,
-        tool_choice = opts.tool_choice,
-        parallel_tool_calls = opts.parallel_tool_calls,
-        thinking = opts.thinking,
-        temperature = opts.temperature,
-        top_p = opts.top_p,
-        top_k = opts.top_k,
-        stop = opts.stop,
-        metadata = opts.metadata,
-        safety_identifier = opts.safety_identifier,
-        service_tier = opts.service_tier,
-        response_format = opts.response_format,
-        betas = opts.betas,
-        cache_control = opts.cache_control,
-        context_management = opts.context_management,
-        extra_body = opts.extra_body,
-        api_key = opts.api_key,
-        api_key_env = opts.api_key_env or "ANTHROPIC_API_KEY",
-        base_url = opts.base_url,
-    })
-    if not req then
-        return nil, build_err
-    end
-    local body = req.body
-    local headers = req.headers
-
+--- @param opts table      Agent run options (reads provider, timeout, context_management)
+--- @param cm table|nil    Resolved context-management config
+--- @param log_meta table  trace_id / agent_id / agent_name / run_id
+--- @return function on_request, function on_response, function on_summary
+local function new_dump_hooks(opts, cm, log_meta)
     local dump_mode = resolve_dump_mode_cached()
-    local call_index = trace and trace.call_index or "?"
-    local turn = trace and trace.turn or "?"
-    local iteration = trace and trace.iteration or "?"
-    llm_dump_event(dump_mode, "request", {
-        { "call", call_index },
-        { "turn", turn },
-        { "iter", iteration },
-        { "trace_id", trace and trace.trace_id or nil },
-        { "run_id", trace and trace.run_id or nil },
-        { "agent_id", trace and trace.agent_id or nil },
-        { "agent_name", trace and trace.agent_name or nil },
-        { "model", body.model },
-        { "messages", #messages },
-        { "tools", #(body.tools or {}) },
-        { "max_tokens", tonumber(body.max_tokens) or 0 },
-        { "timeout", tonumber(opts.timeout or 120) or 120 },
-        { "context_mgmt", opts.context_management ~= nil },
-    })
-    -- Encoded once so the dumped payload is byte-identical to the wire body.
-    local body_json = std.json.encode(body)
-    if dump_mode == "full" then
-        llm_dump_event(dump_mode, "request_headers", {
-            { "call", call_index },
+    local is_openai = (opts.provider or "anthropic") == "openai"
+
+    -- call / turn / iter were always the same number; they stay as three keys
+    -- so existing dump parsers keep matching.
+    local function trace_fields(turn)
+        return {
+            { "call", turn },
             { "turn", turn },
-            { "iter", iteration },
-            { "payload", std.json.encode(sanitize_headers_for_dump(headers)) },
-        })
-        llm_dump_event(dump_mode, "request_body", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", body_json },
-        })
+            { "iter", turn },
+            { "trace_id", log_meta.trace_id },
+            { "run_id", log_meta.run_id },
+            { "agent_id", log_meta.agent_id },
+            { "agent_name", log_meta.agent_name },
+        }
     end
 
-    local start_ts = std.time.now()
-    local resp = http_post_with_retry(req.url, {
-        method = "POST",
-        headers = headers,
-        body = body_json,
-        timeout = opts.timeout or 120,
-        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-        dump = (dump_mode == "full") and "full" or nil,
-    }, opts, trace)
-    local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
+    local function with(turn, extra)
+        local fields = trace_fields(turn)
+        for _, kv in ipairs(extra) do
+            table.insert(fields, kv)
+        end
+        if is_openai then
+            table.insert(fields, { "provider", "openai" })
+        end
+        return fields
+    end
 
-    llm_dump_event(dump_mode, "response", {
-        { "call", call_index },
-        { "turn", turn },
-        { "iter", iteration },
-        { "trace_id", trace and trace.trace_id or nil },
-        { "run_id", trace and trace.run_id or nil },
-        { "agent_id", trace and trace.agent_id or nil },
-        { "agent_name", trace and trace.agent_name or nil },
-        { "status", resp.status },
-        { "latency_ms", elapsed_ms },
-    })
-    if dump_mode == "full" then
-        llm_dump_event(dump_mode, "response_headers", {
-            { "call", call_index },
+    local function payload_event(name, turn, payload)
+        llm_dump_event(dump_mode, name, {
+            { "call", turn },
             { "turn", turn },
-            { "iter", iteration },
-            { "payload", std.json.encode(sanitize_headers_for_dump(resp.headers)) },
-        })
-        llm_dump_event(dump_mode, "response_body", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", tostring(resp.body or "") },
+            { "iter", turn },
+            { "payload", payload },
         })
     end
 
-    if resp.status ~= 200 then
-        -- Do not include raw body in the returned error string; caller-side
-        -- logs often propagate this message verbatim.
-        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-        return nil, "API error " .. resp.status .. " (" .. classified.kind .. ")"
+    local function on_request(info)
+        local body = info.body or {}
+        llm_dump_event(
+            dump_mode,
+            "request",
+            with(info.turn, {
+                { "model", body.model },
+                { "messages", #(body.messages or {}) },
+                { "tools", #(body.tools or {}) },
+                { "max_tokens", tonumber(body.max_tokens) or 0 },
+                { "timeout", tonumber(opts.timeout or 120) or 120 },
+                { "context_mgmt", (not is_openai) and cm ~= nil },
+            })
+        )
+        if dump_mode == "full" then
+            payload_event("request_headers", info.turn, std.json.encode(sanitize_headers_for_dump(info.headers)))
+            payload_event("request_body", info.turn, info.body_json)
+        end
     end
 
-    local decoded, parse_err = proto_anthropic.parse(std.json.decode(resp.body))
-    if not decoded then
-        log.warn("agent: anthropic response normalization failed: " .. tostring(parse_err))
-        return nil, parse_err
+    local function on_response(info)
+        llm_dump_event(
+            dump_mode,
+            "response",
+            with(info.turn, {
+                { "status", info.status },
+                { "latency_ms", info.latency_ms },
+            })
+        )
+        if dump_mode == "full" then
+            payload_event("response_headers", info.turn, std.json.encode(sanitize_headers_for_dump(info.headers)))
+            payload_event("response_body", info.turn, tostring(info.body or ""))
+        end
     end
-    if dump_mode ~= "off" then
+
+    --- Emitted from the turn callback, which is the first place the decoded
+    --- reply exists.
+    local function on_summary(turn, decoded)
+        if dump_mode == "off" then
+            return
+        end
         local usage = decoded.usage or {}
         local in_tok = tonumber(usage.input_tokens) or 0
         local out_tok = tonumber(usage.output_tokens) or 0
-        -- Prompt-cache accounting (Anthropic: cache_* are disjoint from input_tokens).
-        --   cache_create = bytes written to the cache on this call (~1.25x input price)
-        --   cache_read   = bytes read from the cache on this call (~0.1x input price)
-        -- hit_rate ≈ cache_read / (cache_read + in_tok).
-        local cache_create = tonumber(usage.cache_creation_input_tokens) or 0
-        local cache_read = tonumber(usage.cache_read_input_tokens) or 0
-        local stop_reason = tostring(decoded.stop_reason or "unknown")
-        local content_blocks = #(decoded.content or {})
-        local tool_uses = count_tool_use_blocks(decoded.content)
-        local text_chars = count_text_chars(decoded.content)
+        -- Prompt-cache accounting (Anthropic: cache_* are disjoint from
+        -- input_tokens). cache_create is written this call (~1.25x input
+        -- price), cache_read is served from cache (~0.1x); the hit rate is
+        -- cache_read / (cache_read + usage_in). Absent on OpenAI, hence 0.
         local cm_applied = 0
         if decoded.context_management and decoded.context_management.applied_edits then
             cm_applied = #decoded.context_management.applied_edits
         end
-        llm_dump_event(dump_mode, "summary", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "trace_id", trace and trace.trace_id or nil },
-            { "run_id", trace and trace.run_id or nil },
-            { "agent_id", trace and trace.agent_id or nil },
-            { "agent_name", trace and trace.agent_name or nil },
-            { "stop_reason", stop_reason },
-            { "blocks", content_blocks },
-            { "tool_uses", tool_uses },
-            { "text_chars", text_chars },
-            { "usage_in", in_tok },
-            { "usage_out", out_tok },
-            { "usage_total", in_tok + out_tok },
-            { "usage_thinking", tonumber(usage.thinking_tokens) or 0 },
-            { "cache_create", cache_create },
-            { "cache_read", cache_read },
-            { "context_edits", cm_applied },
-        })
-    end
-    return decoded, nil
-end
-
--- ============================================================
--- Internal: OpenAI provider helpers
--- ============================================================
-
---- Call OpenAI-compatible Chat Completions API via http.request.
---- Returns Anthropic-shape decoded table (no change to dispatch_tool call sites).
---- @param messages table  Anthropic-shaped messages array
---- @param opts table      Options: provider, base_url, api_key, api_key_env, model,
----                        max_tokens, timeout, system, tools.
----                        Anthropic-only opts (cache_control, context_management,
----                        context_management_config) are warn+ignored.
---- @param trace table|nil Optional call metadata for dump logs.
---- @return table|nil      Anthropic-shape decoded table on success, nil on error
---- @return string|nil     Error string on failure
-local function llm_call_openai(messages, opts, trace)
-    -- Warn on anthropic-only opts (crux #2: warn+ignore, not silent drop or error)
-    if opts.cache_control ~= nil then
-        log.warn("agent: cache_control is anthropic-only; ignored for provider=openai")
-    end
-    if opts.context_management ~= nil then
-        log.warn("agent: context_management is anthropic-only; ignored for provider=openai")
-    end
-    if opts.context_management_config ~= nil then
-        log.warn("agent: context_management_config is anthropic-only; ignored for provider=openai")
+        llm_dump_event(
+            dump_mode,
+            "summary",
+            with(turn, {
+                { "stop_reason", tostring(decoded.stop_reason or "unknown") },
+                { "blocks", #(decoded.content or {}) },
+                { "tool_uses", count_tool_use_blocks(decoded.content) },
+                { "text_chars", count_text_chars(decoded.content) },
+                { "usage_in", in_tok },
+                { "usage_out", out_tok },
+                { "usage_total", in_tok + out_tok },
+                { "usage_thinking", tonumber(usage.thinking_tokens) or 0 },
+                { "cache_create", tonumber(usage.cache_creation_input_tokens) or 0 },
+                { "cache_read", tonumber(usage.cache_read_input_tokens) or 0 },
+                { "context_edits", cm_applied },
+            })
+        )
     end
 
-    -- Auth: opts.api_key > opts.api_key_env > OPENAI_API_KEY
-    local api_key = opts.api_key
-    if not api_key then
-        local key_env = opts.api_key_env or "OPENAI_API_KEY"
-        api_key = std.env.get(key_env)
-        if not api_key then
-            return nil, "API key not set: env=" .. key_env
-        end
-    end
-
-    -- Message / tool conversion, tool_choice mapping, and the reasoning
-    -- dialect split (reasoning_effort vs chat_template_kwargs) live in
-    -- llm_proto.openai; this function owns dump logging, HTTP, accounting.
-    local req, build_err = proto_openai.build({
-        model = opts.model,
-        messages = messages,
-        system = opts.system,
-        tools = opts.tools,
-        max_tokens = opts.max_tokens or 4096,
-        temperature = opts.temperature,
-        top_p = opts.top_p,
-        top_k = opts.top_k,
-        stop = opts.stop,
-        seed = opts.seed,
-        n = opts.n,
-        logit_bias = opts.logit_bias,
-        logprobs = opts.logprobs,
-        top_logprobs = opts.top_logprobs,
-        frequency_penalty = opts.frequency_penalty,
-        presence_penalty = opts.presence_penalty,
-        metadata = opts.metadata,
-        service_tier = opts.service_tier,
-        store = opts.store,
-        prompt_cache_key = opts.prompt_cache_key,
-        safety_identifier = opts.safety_identifier,
-        verbosity = opts.verbosity,
-        response_format = opts.response_format,
-        tool_choice = opts.tool_choice,
-        parallel_tool_calls = opts.parallel_tool_calls,
-        thinking = opts.thinking,
-        dialect = opts.dialect,
-        extra_body = opts.extra_body,
-        api_key = api_key,
-        base_url = opts.base_url,
-    })
-    if not req then
-        return nil, build_err
-    end
-    local body = req.body
-    local headers = req.headers
-    local endpoint = req.url
-
-    local dump_mode = resolve_dump_mode_cached()
-    local call_index = trace and trace.call_index or "?"
-    local turn = trace and trace.turn or "?"
-    local iteration = trace and trace.iteration or "?"
-    llm_dump_event(dump_mode, "request", {
-        { "call", call_index },
-        { "turn", turn },
-        { "iter", iteration },
-        { "trace_id", trace and trace.trace_id or nil },
-        { "run_id", trace and trace.run_id or nil },
-        { "agent_id", trace and trace.agent_id or nil },
-        { "agent_name", trace and trace.agent_name or nil },
-        { "model", body.model },
-        { "messages", #messages },
-        { "tools", #(body.tools or {}) },
-        { "max_tokens", tonumber(body.max_tokens) or 0 },
-        { "timeout", tonumber(opts.timeout or 120) or 120 },
-        { "context_mgmt", false },
-        { "provider", "openai" },
-    })
-    -- Encoded once so the dumped payload is byte-identical to the wire body.
-    local body_json = std.json.encode(body)
-    if dump_mode == "full" then
-        llm_dump_event(dump_mode, "request_headers", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", std.json.encode(sanitize_headers_for_dump(headers)) },
-        })
-        llm_dump_event(dump_mode, "request_body", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", body_json },
-        })
-    end
-
-    local start_ts = std.time.now()
-    local resp = http_post_with_retry(endpoint, {
-        method = "POST",
-        headers = headers,
-        body = body_json,
-        timeout = opts.timeout or 120,
-        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-        dump = (dump_mode == "full") and "full" or nil,
-    }, opts, trace)
-    local elapsed_ms = math.floor((std.time.now() - start_ts) * 1000)
-
-    llm_dump_event(dump_mode, "response", {
-        { "call", call_index },
-        { "turn", turn },
-        { "iter", iteration },
-        { "trace_id", trace and trace.trace_id or nil },
-        { "run_id", trace and trace.run_id or nil },
-        { "agent_id", trace and trace.agent_id or nil },
-        { "agent_name", trace and trace.agent_name or nil },
-        { "status", resp.status },
-        { "latency_ms", elapsed_ms },
-        { "provider", "openai" },
-    })
-    if dump_mode == "full" then
-        llm_dump_event(dump_mode, "response_headers", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", std.json.encode(sanitize_headers_for_dump(resp.headers)) },
-        })
-        llm_dump_event(dump_mode, "response_body", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "payload", tostring(resp.body or "") },
-        })
-    end
-
-    if resp.status ~= 200 then
-        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-        return nil, "API error " .. resp.status .. " (" .. classified.kind .. ")"
-    end
-
-    local ok_parse, raw = pcall(std.json.decode, resp.body)
-    if not ok_parse then
-        log.warn("agent: OpenAI response JSON decode failed: " .. tostring(raw))
-        return nil, "OpenAI response JSON decode failed"
-    end
-
-    local decoded, norm_err = proto_openai.parse(raw)
-    if not decoded then
-        log.warn("agent: OpenAI response normalization failed: " .. tostring(norm_err))
-        return nil, norm_err
-    end
-
-    if dump_mode ~= "off" then
-        local usage = decoded.usage or {}
-        local in_tok = tonumber(usage.input_tokens) or 0
-        local out_tok = tonumber(usage.output_tokens) or 0
-        local stop_reason = tostring(decoded.stop_reason or "unknown")
-        local content_blocks = #(decoded.content or {})
-        local tool_uses = count_tool_use_blocks(decoded.content)
-        local text_chars = count_text_chars(decoded.content)
-        llm_dump_event(dump_mode, "summary", {
-            { "call", call_index },
-            { "turn", turn },
-            { "iter", iteration },
-            { "trace_id", trace and trace.trace_id or nil },
-            { "run_id", trace and trace.run_id or nil },
-            { "agent_id", trace and trace.agent_id or nil },
-            { "agent_name", trace and trace.agent_name or nil },
-            { "stop_reason", stop_reason },
-            { "blocks", content_blocks },
-            { "tool_uses", tool_uses },
-            { "text_chars", text_chars },
-            { "usage_in", in_tok },
-            { "usage_out", out_tok },
-            { "usage_total", in_tok + out_tok },
-            { "usage_thinking", tonumber(usage.thinking_tokens) or 0 },
-            { "cache_create", 0 },
-            { "cache_read", 0 },
-            { "context_edits", 0 },
-            { "provider", "openai" },
-        })
-    end
-
-    return decoded, nil
-end
-
---- Dispatcher: route to llm_call_anthropic or llm_call_openai based on opts.provider.
---- Default is "anthropic" for full backward compatibility.
---- @param messages table  Messages array
---- @param opts table      Options (provider, base_url, api_key, api_key_env, ...)
---- @param trace table|nil Optional call metadata for dump logs.
---- @return table|nil      Parsed response on success, nil on error
---- @return string|nil     Error string on failure
-local function llm_call(messages, opts, trace)
-    if (opts.provider or "anthropic") == "openai" then
-        return llm_call_openai(messages, opts, trace)
-    else
-        return llm_call_anthropic(messages, opts, trace)
-    end
+    return on_request, on_response, on_summary
 end
 
 -- ============================================================
@@ -1189,23 +867,6 @@ local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
 end
 
 -- ============================================================
--- Internal: Extract text content from Anthropic response
--- ============================================================
-
---- Collect all text blocks from the Anthropic content array and concatenate.
---- @param content table  Array of content blocks from Anthropic response
---- @return string        Concatenated text, or empty string
-local function extract_text(content)
-    local parts = {}
-    for _, block in ipairs(content or {}) do
-        if block.type == "text" and block.text then
-            table.insert(parts, block.text)
-        end
-    end
-    return table.concat(parts, "\n")
-end
-
--- ============================================================
 -- Public: agent.run(opts)
 -- ============================================================
 
@@ -1343,14 +1004,21 @@ function M.run(opts)
         cm_final = opts.context_management_config or DEFAULT_CONTEXT_MANAGEMENT
     end
 
-    -- Build call options for llm_call
-    local call_opts = {
+    -- Anthropic-only knobs are warned about rather than dropped in silence.
+    if (opts.provider or "anthropic") == "openai" then
+        for _, name in ipairs({ "cache_control", "context_management", "context_management_config" }) do
+            if opts[name] ~= nil then
+                log.warn("agent: " .. name .. " is anthropic-only; ignored for provider=openai")
+            end
+        end
+    end
+
+    -- Wire options for the loop. `system` and `tools` are not here: tool_loop
+    -- owns them (the tool set is re-resolved per turn).
+    local llm_opts = {
         model = opts.model,
         max_tokens = opts.max_tokens or 4096,
         timeout = opts.timeout or 120,
-        max_retries = opts.max_retries, -- transient API failures; nil = default
-        system = opts.system,
-        tools = tools,
         tool_choice = opts.tool_choice, -- nil = API default (auto)
         parallel_tool_calls = opts.parallel_tool_calls, -- false = at most one tool per turn
         thinking = opts.thinking, -- nil = provider default; see llm_proto
@@ -1383,10 +1051,9 @@ function M.run(opts)
         base_url = opts.base_url,
         api_key = opts.api_key,
         api_key_env = opts.api_key_env,
-        -- Pass through cache_control so llm_call_openai can warn on it
         cache_control = opts.cache_control,
-        -- Pass through context_management_config so llm_call_openai can warn on it
-        context_management_config = opts.context_management_config,
+        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+        dump = (resolve_dump_mode_cached() == "full") and "full" or nil,
     }
     local log_meta = build_log_meta(opts)
 
@@ -1412,158 +1079,91 @@ function M.run(opts)
     end
     table.insert(messages, { role = "user", content = opts.prompt })
 
-    -- ReAct loop state
-    local num_turns = 0
-    local llm_call_index = 0
-    local final_content = ""
-    local loop_error = nil
+    -- The loop itself lives in blocks/lib/tool_loop: one implementation of
+    -- "call, dispatch, repeat" shared with every other block that iterates.
+    -- What stays here is what makes this an agent rather than a loop — the
+    -- registry- and MCP-backed tool set, the token budget, the iteration cap,
+    -- and the dump.
+    local specs = {}
+    for _, t in ipairs(tools) do
+        table.insert(specs, {
+            name = t.name,
+            description = t.description,
+            input_schema = t.input_schema,
+            handler = function(input)
+                return dispatch_tool(t.name, input, mcp_tool_map, extra_tools_map)
+            end,
+        })
+    end
 
-    -- pcall wrapper for guaranteed MCP cleanup
-    local loop_ok, loop_err = pcall(function()
-        local iter = 0
+    local on_request, on_response, on_summary = new_dump_hooks(opts, cm_final, log_meta)
 
-        while true do
-            -- Call LLM
-            llm_call_index = llm_call_index + 1
-            local response, api_err = llm_call(messages, call_opts, {
-                call_index = llm_call_index,
-                -- num_turns increments after a successful assistant response append.
-                -- For request-side correlation, report the upcoming turn number.
-                turn = num_turns + 1,
-                iteration = iter + 1,
-                trace_id = log_meta.trace_id,
-                agent_id = log_meta.agent_id,
-                agent_name = log_meta.agent_name,
-                run_id = log_meta.run_id,
-            })
-            if not response then
-                loop_error = api_err
-                return
-            end
+    local res = tool_loop.run({
+        prompt = opts.prompt,
+        system = opts.system,
+        messages = messages,
+        tools = specs,
+        llm = llm_opts,
+        -- One over the cap: the loop's own bound is a backstop, because the
+        -- cap below is what stops the run and it does so with ok = true.
+        max_turns = max_iter + 1,
+        max_retries = opts.max_retries,
+        on_request = on_request,
+        on_response = on_response,
+        on_turn = function(info)
+            on_summary(info.turn, info.decoded)
+            budget:add(info.usage)
 
-            -- Append assistant message
-            table.insert(messages, {
-                role = "assistant",
-                content = response.content,
-            })
-
-            -- Track usage BEFORE budget check
-            budget:add(response.usage)
-            num_turns = num_turns + 1
-
-            -- Collect tool calls from response
-            local tool_calls = {}
-            for _, block in ipairs(response.content or {}) do
-                if block.type == "tool_use" then
-                    table.insert(tool_calls, block)
-                end
-            end
-
-            -- Extract current text content
-            final_content = extract_text(response.content)
-
-            -- Fire on_turn callback (errors are logged, not propagated)
             if opts.on_turn then
                 local cb_ok, cb_err = pcall(opts.on_turn, {
-                    turn_number = num_turns,
-                    content = response.content,
-                    tool_calls = tool_calls,
-                    usage = response.usage,
+                    turn_number = info.turn,
+                    content = info.decoded.content,
+                    tool_calls = info.tool_calls,
+                    usage = info.usage,
                     -- Pass-through of Anthropic response.context_management.
-                    -- When the server didn't apply any edits this turn the
-                    -- field is nil and Lua removes the key from the payload,
-                    -- preserving the historical 4-key shape for existing callbacks.
-                    context_management = response.context_management,
+                    -- Nil when the server applied no edits this turn, which
+                    -- drops the key and preserves the historical 4-key shape.
+                    context_management = info.decoded.context_management,
                 })
                 if not cb_ok then
                     log.warn("agent: on_turn callback error: " .. tostring(cb_err))
                 end
             end
 
-            local stop_reason = response.stop_reason
-
-            -- A refusal arrives as HTTP 200 with no usable answer, so it has
-            -- to be reported rather than returned as an empty success.
-            if stop_reason == "refusal" then
-                local detail = response.stop_details or {}
-                loop_error = "model refused to respond"
-                if detail.category then
-                    loop_error = loop_error .. " (category=" .. tostring(detail.category) .. ")"
-                end
+            -- A turn that asked for nothing and was not paused ends the run
+            -- on its own; stopping it here would only relabel why.
+            local unfinished = #info.tool_calls > 0 or info.decoded.stop_reason == "pause_turn"
+            if not unfinished then
                 return
             end
-
-            -- `pause_turn` means the server paused its own tool loop (web
-            -- search, code execution, MCP connector) at its iteration cap.
-            -- The turn is unfinished: resend with the assistant content
-            -- appended and no tool_result of ours. There are no client tool
-            -- calls to dispatch, so the empty-tool_calls exit below would
-            -- otherwise end the run mid-answer.
-            local paused = stop_reason == "pause_turn"
-
-            -- No tool calls → done (end_turn or max_tokens)
-            if #tool_calls == 0 and not paused then
-                break
-            end
-
-            if not paused and (stop_reason == "end_turn" or stop_reason == "max_tokens") then
-                break
-            end
-
-            -- Budget checks
-            iter = iter + 1
-            if iter >= max_iter then
+            if info.turn >= max_iter then
                 log.warn("agent: max iterations (" .. max_iter .. ") reached")
-                break
+                return false
             end
-
             if budget:exceeded() then
                 log.warn("agent: token budget exceeded (" .. budget.total_tokens .. "/" .. budget.limit .. ")")
-                break
+                return false
             end
+        end,
+    })
 
-            if paused then
-                goto continue_turn
-            end
-
-            -- Dispatch tool calls and collect results
-            local tool_results = {}
-            for _, tc in ipairs(tool_calls) do
-                local content_str, is_error = dispatch_tool(tc.name, tc.input, mcp_tool_map, extra_tools_map)
-                table.insert(tool_results, {
-                    type = "tool_result",
-                    tool_use_id = tc.id,
-                    content = content_str,
-                    is_error = is_error or nil,
-                })
-            end
-
-            -- Append tool results as user message
-            table.insert(messages, {
-                role = "user",
-                content = tool_results,
-            })
-
-            ::continue_turn::
+    local num_turns = res.turns or 0
+    local final_content = res.content or ""
+    local loop_error = nil
+    if not res.ok then
+        loop_error = res.error
+        -- A refusal names its category when the provider supplies one.
+        if res.stop_reason == "refusal" and res.stop_details and res.stop_details.category then
+            loop_error = loop_error .. " (category=" .. tostring(res.stop_details.category) .. ")"
         end
-    end)
+    end
+    messages = res.messages or messages
 
     -- Pop parent LLM context (both success and error paths — stack must stay balanced).
     table.remove(_AGENT_LLM_CTX)
 
     -- Always disconnect MCP servers, regardless of loop outcome
     disconnect_mcp_servers(connected_servers)
-
-    -- Propagate unexpected pcall error
-    if not loop_ok then
-        return {
-            ok = false,
-            error = tostring(loop_err),
-            usage = budget:summary(),
-            num_turns = num_turns,
-            messages = messages,
-        }
-    end
 
     -- Propagate structured API error
     if loop_error then
@@ -1622,7 +1222,6 @@ function M._test_helpers()
         new_budget_tracker = new_budget_tracker,
         count_tool_use_blocks = count_tool_use_blocks,
         count_text_chars = count_text_chars,
-        extract_text = extract_text,
         normalize_dump_mode = normalize_dump_mode,
         sanitize_headers_for_dump = sanitize_headers_for_dump,
         kv_escape = kv_escape,

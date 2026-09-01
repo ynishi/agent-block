@@ -53,6 +53,10 @@ const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 const EMBEDDED_LIBS: &[(&str, &str)] = &[
     ("session", include_str!("../blocks/lib/session/init.lua")),
     (
+        "tool_loop",
+        include_str!("../blocks/lib/tool_loop/init.lua"),
+    ),
+    (
         "llm_proto",
         include_str!("../blocks/lib/llm_proto/init.lua"),
     ),

@@ -11,7 +11,7 @@
 --     lang      = string?, -- default "lua"
 --     name      = string?, -- default "compile_loop"
 --     system    = string?,
---     edit_mode = "full"|"diff"?, -- default "full"; "diff" uses SEARCH/REPLACE patches
+--     edit_mode = "full"|"diff"?, -- default "full"; "diff" edits through tools
 -- }
 --
 -- target_file (string) XOR target_files (list<string>): mutually exclusive.
@@ -37,6 +37,10 @@ local M = {}
 local proto = require("llm_proto")
 local proto_anthropic = proto.adapter("anthropic")
 local proto_openai = proto.adapter("openai")
+
+-- The ReAct mechanics of one iteration: call, dispatch the tools we handed
+-- it, repeat. The build stays out here.
+local tool_loop = require("tool_loop")
 
 local agent = require("agent") -- for _llm_ctx_top()
 
@@ -216,41 +220,32 @@ No prose before or after the block.
 On retry, output the WHOLE corrected file (not a diff). Keep changes minimal.]]
 
 local DIFF_SYSTEM = [[You are an expert programmer editing an existing file.
-Output only SEARCH/REPLACE blocks in this exact format:
 
-<<<<<<< SEARCH
-<existing text to replace, character-exact>
-=======
-<replacement text>
->>>>>>> REPLACE
+Edit through the tools, not by printing code:
+- read_file / read_file_range to see the current content. Their output is
+  line-numbered, and those line numbers are what fs_edit addresses.
+- fs_edit to change it: give start_line, end_line and the expected current text
+  of those lines. expect must be exact. A rejected edit tells you what is
+  actually at those lines — correct it from that.
+- Make the SMALLEST changes that satisfy the spec.
 
-- Multiple blocks allowed.
-- SEARCH text must match the file character-exactly (whitespace included).
-- Do NOT output the full file. Do NOT use code fences.
-- Make the SMALLEST changes that satisfy the spec.]]
+When every edit has been applied, reply with the single word DONE.]]
 
--- System prompt for multi-file diff mode.
--- Each group of SEARCH/REPLACE blocks must be preceded by a path header line:
---   <<< path=<relative/or/absolute/path> >>>
--- All SEARCH/REPLACE blocks that follow a path header apply to that file until the
--- next path header appears. The path must exactly match one of the provided target files.
-local DIFF_SYSTEM_MULTI = [[You are an expert programmer editing multiple existing files simultaneously.
-Output SEARCH/REPLACE blocks grouped by file. Each group must start with a path header:
+-- Multi-file differs only in that a path is named on every call; the editing
+-- contract is the same, so the two prompts stay parallel.
+local DIFF_SYSTEM_MULTI = [[You are an expert programmer editing several existing files.
 
-<<< path=<file_path> >>>
-<<<<<<< SEARCH
-<existing text to replace, character-exact>
-=======
-<replacement text>
->>>>>>> REPLACE
+Edit through the tools, not by printing code:
+- read_file / read_file_range to see a file's current content. Their output is
+  line-numbered, and those line numbers are what fs_edit addresses.
+- fs_edit to change it: pass the path, plus edits giving start_line, end_line
+  and the expected current text of those lines. expect must be exact. A
+  rejected edit tells you what is actually at those lines — correct it from
+  that.
+- Every path must be one of the target files you were given.
+- Make the SMALLEST changes that satisfy the spec.
 
-Rules:
-- Every SEARCH/REPLACE block MUST be preceded by a <<< path=... >>> header.
-- The path must exactly match one of the target files provided.
-- Multiple SEARCH/REPLACE blocks for the same file: repeat the path header before each block, or place all blocks consecutively under one header.
-- SEARCH text must match the file character-exactly (whitespace included).
-- Do NOT output full file contents. Do NOT use code fences.
-- Make the SMALLEST changes that satisfy the spec.]]
+When every edit has been applied, reply with the single word DONE.]]
 
 -- ============================================================
 -- Internal helpers (moved from coding_agent/init.lua)
@@ -317,7 +312,7 @@ local function fnv1a_hash(s)
     return tostring(hash)
 end
 
--- Compute a stable hash for an SR block text (path header + SEARCH/REPLACE content).
+-- Compute a stable hash for an iteration's edit signature.
 -- Normalises whitespace before hashing to avoid collisions due to trivial formatting differences.
 local function compute_sr_hash(sr_text)
     local text = tostring(sr_text or "")
@@ -706,182 +701,6 @@ local function llm_call(opts, messages)
     return cl_oai_normalize(decoded)
 end
 
--- Parse Aider-style SEARCH/REPLACE blocks from LLM output.
--- Returns (blocks, nil) on success or (nil, error_string) on failure.
--- Each block = { path = nil|string, search = string, replace = string }.
--- Marker lines are excluded; inner text is preserved verbatim (no strip).
---
--- multi_file (bool): when true, <<< path=... >>> headers are required before each
---   SEARCH/REPLACE block. target_files_set (table keyed by path string) is used
---   to validate that every path header names an allowed file.
---   When false (single-file mode), path headers are tolerated but ignored (path = nil).
---
--- Path header format: <<< path=<filepath> >>>  (on its own line, optionally preceded by whitespace)
-local function parse_search_replace(text, multi_file, target_files_set)
-    local blocks = {}
-    local pos = 1
-    local len = #text
-    local current_path = nil -- tracks the most recently seen path header
-
-    while pos <= len do
-        -- Before looking for SEARCH marker, check if the text at pos is a path header.
-        -- Path header pattern: <<< path=<anything> >>> followed by newline (or end).
-        -- We scan forward to find either a path header or a SEARCH marker.
-
-        -- Try to find a path header at or after pos (before the next SEARCH marker).
-        local ph_start, ph_end, ph_path = text:find("<<<%s*path=([^>]+)%s*>>>", pos)
-        -- Marker match tolerates a missing space before SEARCH ("<<<<<<<SEARCH"),
-        -- a variant some models emit that previously never recovered (issue #1 request 3).
-        local s_start, s_end = text:find("<<<<<<< ?SEARCH\n", pos)
-
-        -- If both exist, pick whichever comes first.
-        if ph_start and (not s_start or ph_start < s_start) then
-            -- Path header comes before next SEARCH (or there is no SEARCH yet).
-            local raw_path = ph_path:match("^%s*(.-)%s*$") -- trim whitespace
-            if multi_file then
-                -- Validate against allowlist.
-                if not target_files_set[raw_path] then
-                    return nil, "path '" .. raw_path .. "' not in target_files allowlist"
-                end
-            end
-            -- In single-file mode, we accept but ignore path headers (current_path stays nil).
-            if multi_file then
-                current_path = raw_path
-            end
-            -- Advance past the path header line.
-            pos = ph_end + 1
-            -- Skip optional newline after path header.
-            if pos <= len and text:sub(pos, pos) == "\n" then
-                pos = pos + 1
-            end
-        elseif s_start then
-            -- Next thing is a SEARCH marker.
-            -- In multi-file mode, a SEARCH without a preceding path header is an error.
-            if multi_file and current_path == nil then
-                return nil, "missing path header for multi-file mode at offset " .. tostring(s_start)
-            end
-
-            -- Find ======= separator after SEARCH marker
-            local sep_start, sep_end = text:find("\n=======\n", s_end + 1, true)
-            if not sep_start then
-                return nil, "malformed SEARCH/REPLACE block: missing ======= separator"
-            end
-
-            -- Find >>>>>>> REPLACE marker after separator (space before REPLACE optional).
-            local rep_start, rep_end = text:find("\n>>>>>>> ?REPLACE", sep_end + 1)
-            if not rep_start then
-                return nil, "malformed SEARCH/REPLACE block: missing >>>>>>> REPLACE marker"
-            end
-
-            local search_text = text:sub(s_end + 1, sep_start - 1)
-            local replace_text = text:sub(sep_end + 1, rep_start - 1)
-
-            -- path is current_path (nil for single-file mode, string for multi-file mode).
-            table.insert(blocks, { path = current_path, search = search_text, replace = replace_text })
-            pos = rep_end + 1
-        else
-            -- No more path headers or SEARCH markers.
-            break
-        end
-    end
-
-    if #blocks == 0 then
-        return nil, "no SEARCH/REPLACE blocks found"
-    end
-    return blocks, nil
-end
-
--- Whitespace-normalize a string: collapse runs of whitespace to a single space
--- and strip leading/trailing whitespace. Used for the fallback ws-normalized match.
-local function ws_normalize(s)
-    return (s:gsub("%s+", " "):match("^%s*(.-)%s*$"))
-end
-
--- Apply parsed SEARCH/REPLACE blocks to content.
--- Returns (new_content, failed_indices).
--- Two-stage match:
---   1. exact: content:find(search, 1, true)
---   2. ws-normalized: collapse whitespace in both search and content scan window
--- Blocks that fail both stages are appended to failed_indices and skipped.
--- Successful blocks are applied in order; applied content is updated after each success.
-local function apply_blocks(content, blocks)
-    local failed_indices = {}
-    local current = content
-
-    for i, block in ipairs(blocks) do
-        local search = block.search
-        local replace = block.replace
-
-        -- Stage 1: exact match
-        local found_s, found_e = current:find(search, 1, true)
-        if found_s then
-            current = current:sub(1, found_s - 1) .. replace .. current:sub(found_e + 1)
-        else
-            -- Stage 2: whitespace-normalized match
-            -- Scan current content line by line to find a region that ws-normalizes to the same
-            -- normalized form as the search text.
-            local norm_search = ws_normalize(search)
-            local matched = false
-            -- We slide a window over content to find a matching substring.
-            -- For simplicity, we scan each possible start position in current.
-            local cur_len = #current
-            local search_len = #search
-            -- Heuristic: limit scan to a window that's at most 3× the search length
-            -- to avoid O(n²) for large files. We still check all positions.
-            local cpos = 1
-            while cpos <= cur_len do
-                -- Try windows of varying sizes (search_len ± 50% for ws variance)
-                local min_win = math.max(1, search_len - math.floor(search_len / 2))
-                local max_win = search_len + math.floor(search_len / 2) + 10
-                if max_win > cur_len - cpos + 1 then
-                    max_win = cur_len - cpos + 1
-                end
-                local found_window = false
-                for wlen = min_win, max_win do
-                    local window = current:sub(cpos, cpos + wlen - 1)
-                    if ws_normalize(window) == norm_search then
-                        current = current:sub(1, cpos - 1) .. replace .. current:sub(cpos + wlen)
-                        matched = true
-                        found_window = true
-                        break
-                    end
-                end
-                if found_window then
-                    break
-                end
-                cpos = cpos + 1
-            end
-
-            if not matched then
-                table.insert(failed_indices, i)
-            end
-        end
-    end
-
-    return current, failed_indices
-end
-
--- Build the failure-feedback user message for SEARCH/REPLACE apply failures.
--- Called when one or more blocks could not be applied (SEARCH text not found).
-local function build_edit_failure_msg(failed_indices, blocks, current_content)
-    local parts = {}
-    for _, idx in ipairs(failed_indices) do
-        local blk = blocks[idx]
-        table.insert(
-            parts,
-            string.format(
-                "Edit FAILED: block %d could not be applied. The SEARCH text did not match.\n=== SEARCH (block %d) ===\n%s",
-                idx,
-                idx,
-                blk and blk.search or "(nil)"
-            )
-        )
-    end
-    table.insert(parts, "=== Current file content ===\n" .. (current_content or ""))
-    table.insert(parts, "Re-emit ALL blocks from scratch with corrected SEARCH text.")
-    return table.concat(parts, "\n\n")
-end
-
 -- Read target file if it already exists and is non-empty.
 -- Returns file content as a string, or nil when the file is absent, empty, or unreadable.
 -- Uses to_abs so that relative paths are resolved before io.open.
@@ -959,13 +778,6 @@ end
 -- budget too (one call per edit), so an agentic model needs headroom for
 -- read → edit × N → done within one iter.
 local MAX_TOOL_CALLS_PER_ITER = 16
-
--- Adaptive tool_mode: number of consecutive zero-edit iters (bad_stagnation_count)
--- after which tool_mode="adaptive" switches the channel from "auto" (tools
--- declared) to "none" (no tools, file contents embedded). Kept below
--- STAGNATION_WINDOW so the switch gets one rescue window before the
--- no_edits_applied abort fires.
-local ADAPTIVE_SWITCH_THRESHOLD = 2
 
 -- ── Distill / cache constants (added ST1) ───────────────────────────────────
 -- Files with content length >= this threshold trigger the distill subloop (ST2-3).
@@ -1611,93 +1423,6 @@ local function read_file_tool_handler(path, target_files_set, mf_state, conf)
 end
 
 -- ============================================================
--- Multi-file helper
--- ============================================================
-
--- Group parsed blocks by their path field.
--- Returns a table: { [path_string] = {block, ...}, ... }
--- Blocks with path == nil (single-file mode) all map to the key false.
-local function group_blocks_by_path(blocks)
-    local grouped = {}
-    for _, block in ipairs(blocks) do
-        local key = block.path or false
-        if not grouped[key] then
-            grouped[key] = {}
-        end
-        table.insert(grouped[key], block)
-    end
-    return grouped
-end
-
--- Apply parsed blocks to each file in target_files and write results.
--- target_files: list of absolute paths (strings).
--- grouped: output of group_blocks_by_path (keyed by path string matching target_files entries).
--- existing_map: { [abs_path] = content_string|nil } — pre-read content.
---
--- Returns:
---   new_contents_map: { [abs_path] = new_content_string }   — only files that had blocks applied
---   all_failed:       list of { path, indices }             — failed blocks per file
---   write_err:        nil or "path: error_string"            — first write failure
-local function iterate_files(target_files, grouped, existing_map)
-    local new_contents_map = {}
-    local all_failed = {}
-    local write_err = nil
-
-    for _, abs_path in ipairs(target_files) do
-        local file_blocks = grouped[abs_path]
-        if file_blocks and #file_blocks > 0 then
-            -- Always read raw file content from disk for SR application.
-            -- existing_map may contain a distilled digest (not raw content) when the
-            -- file exceeded READ_FILE_FULL_THRESHOLD; applying SR against a digest
-            -- would cause block matching to fail. Raw content is the correct base.
-            -- When the file has not been written yet (LLM emitting SR before read_file),
-            -- read_target_if_exists returns nil and we default to "".
-            local current = read_target_if_exists(abs_path) or ""
-            local new_content, failed_indices = apply_blocks(current, file_blocks)
-            if #failed_indices > 0 then
-                table.insert(
-                    all_failed,
-                    { path = abs_path, indices = failed_indices, blocks = file_blocks, current_content = current }
-                )
-            else
-                -- Write the new content.
-                local wok, werr = write_file(abs_path, new_content)
-                if not wok then
-                    write_err = abs_path .. ": " .. werr
-                    break
-                end
-                new_contents_map[abs_path] = new_content
-            end
-        end
-    end
-
-    return new_contents_map, all_failed, write_err
-end
-
--- Build a failure-feedback message for multi-file apply failures.
-local function build_multifile_edit_failure_msg(all_failed, existing_map)
-    local parts = {}
-    for _, entry in ipairs(all_failed) do
-        for _, idx in ipairs(entry.indices) do
-            local blk = entry.blocks[idx]
-            table.insert(
-                parts,
-                string.format(
-                    "Edit FAILED in %s: block %d could not be applied. The SEARCH text did not match.\n=== SEARCH (block %d) ===\n%s",
-                    entry.path,
-                    idx,
-                    idx,
-                    blk and blk.search or "(nil)"
-                )
-            )
-        end
-        table.insert(parts, "=== Current file content (" .. entry.path .. ") ===\n" .. (existing_map[entry.path] or ""))
-    end
-    table.insert(parts, "Re-emit ALL blocks from scratch with corrected SEARCH text.")
-    return table.concat(parts, "\n\n")
-end
-
--- ============================================================
 -- Internal loop body (non-public; called only via make().handler)
 -- ============================================================
 
@@ -1720,42 +1445,21 @@ local function run_loop(conf)
     local lang = conf.lang or "lua"
     local max_iters = conf.max_iters or 5
     local multi_file = conf.multi_file or false
-    -- tool_mode governs which tools are declared to the child LLM (multi-file only):
+    -- tool_mode governs which tools diff mode declares:
     --   "auto" (default): read_file + read_file_range + fs_edit
-    --   "read_only":      read_file + read_file_range (pre-issue-#1 behaviour)
-    --   "none":           no tools declared — for callers that inline all target
-    --                     file contents in the spec (issue #1 request 2)
-    --   "adaptive":       starts as "auto"; on ADAPTIVE_SWITCH_THRESHOLD
-    --                     consecutive zero-edit iters or a tool-call-cap blowout,
-    --                     switches to "none" and embeds the current file contents
-    --                     (runtime form of the issue #1 "strip tools via proxy"
-    --                     experiment, where stripping tools restored the text
-    --                     contract on tool-preferring models)
+    --   "read_only":      reads only — can inspect, cannot converge
+    --
+    -- "none" and "adaptive" are gone with the SEARCH/REPLACE text channel they
+    -- depended on: "none" meant "no tools, edit through text", and "adaptive"
+    -- meant "fall back to that text channel when the tools stall". Without a
+    -- text channel there is nothing to fall back to, and a diff run with no
+    -- edit tool cannot change a file at all. Callers that need a no-tools path
+    -- want edit_mode = "full".
     local tool_mode = conf.tool_mode or "auto"
-    local adaptive = tool_mode == "adaptive"
-    -- active_tool_mode is what the loop actually applies this iter; only the
-    -- adaptive path ever mutates it (auto → none).
-    local active_tool_mode = adaptive and "auto" or tool_mode
+    local active_tool_mode = tool_mode
     -- Cached: the dump mode is a single process-wide fact, and the cache also
     -- keeps the prod-downgrade warn to at most one line per process.
     local mode = resolve_dump_mode_cached()
-
-    -- ── extra tools (caller-registered, agent-layer nested form) ───────────────
-    -- conf.extra_tools = list of {name, schema = {description?, input_schema}, handler}
-    -- (validated in M.make). Specs are declared alongside the built-in tools
-    -- whenever tools are declared at all; dispatch goes through extra_tools_map.
-    -- Extra-tool calls do NOT count as applied edits (read-like by contract).
-    local extra_tool_specs = {}
-    local extra_tools_map = {}
-    for _, t in ipairs(conf.extra_tools or {}) do
-        local schema = t.schema or {}
-        table.insert(extra_tool_specs, {
-            name = t.name,
-            description = schema.description or "",
-            input_schema = schema.input_schema or { type = "object", properties = {} },
-        })
-        extra_tools_map[t.name] = t.handler
-    end
 
     -- In single-file mode, artifact_path is the single absolute path (backward compat).
     -- In multi-file mode, artifact_path is nil; modified_files carries the list.
@@ -1770,12 +1474,6 @@ local function run_loop(conf)
     -- Write channel: std.fs owns the edit semantics, scoped to this run's
     -- target files. `tool_specs` rather than `register_tools` — the registry is
     -- global and this lock is per-invocation.
-    local fs_tool_specs = std.fs.tool_specs({ allowed = { "edit" }, path_lock = conf.target_files })
-    local fs_tool_handlers = {}
-    for _, spec in ipairs(fs_tool_specs) do
-        fs_tool_handlers[spec.name] = spec.handler
-    end
-
     -- Resolve edit_mode.
     -- For single-file: "diff" requires a non-empty target file; fallback to "full".
     -- For multi-file: edit_mode="diff" is required (enforced in handler, but guard here too).
@@ -1809,51 +1507,26 @@ local function run_loop(conf)
         system = conf.system or DEFAULT_SYSTEM
     end
 
-    -- ── Multi-file: build lazy-load initial user_content (path list only) ──────
-    -- File content is NOT embedded. The child LLM fetches files via read_file tool.
-    local multi_initial_user_content
-    if multi_file then
-        local path_lines = {}
-        for _, p in ipairs(conf.target_files) do
-            table.insert(path_lines, "  " .. p)
-        end
-        local tool_hint
-        if active_tool_mode == "none" then
-            -- No tools declared; the caller inlines file contents in the spec.
-            tool_hint = ""
-        elseif active_tool_mode == "read_only" then
-            tool_hint = "\n\nUse the read_file tool to fetch file content when needed."
-        else -- "auto"
-            tool_hint = "\n\nUse the read_file tool to fetch file content when needed;"
-                .. " its output is line-numbered and fs_edit addresses those line numbers."
-                .. "\nApply edits with the fs_edit tool."
-                .. "\nWhen all edits have been applied via tool calls, reply with the single word DONE."
-        end
-        multi_initial_user_content = conf.spec .. "\n\nFiles:\n" .. table.concat(path_lines, "\n") .. tool_hint
+    -- Path list shown to the model each iteration; diff mode assembles the rest
+    -- of its prompt per iteration from the last verify error.
+    local path_lines = {}
+    for _, p in ipairs(conf.target_files) do
+        table.insert(path_lines, "  " .. p)
     end
 
-    -- ── Single-file: build initial user_content (original behaviour) ───────────
+    -- Full mode embeds the file and asks for the whole thing back.
     local single_initial_user_content
-    if not multi_file then
-        if edit_mode == "diff" then
-            -- Single-file diff mode: embed current content.
-            -- existing is guaranteed non-nil here (fallback already applied above).
+    if edit_mode == "full" then
+        local existing = existing_map[conf.target_files[1]]
+        if existing then
             single_initial_user_content = conf.spec
-                .. "\n\n=== Current file content ===\n"
-                .. (existing_map[conf.target_files[1]] or "")
+                .. "\n\n=== Current file content ===\n```"
+                .. lang
+                .. "\n"
+                .. existing
+                .. "\n```"
         else
-            -- full mode: embed content if present.
-            local existing = existing_map[conf.target_files[1]]
-            if existing then
-                single_initial_user_content = conf.spec
-                    .. "\n\n=== Current file content ===\n```"
-                    .. lang
-                    .. "\n"
-                    .. existing
-                    .. "\n```"
-            else
-                single_initial_user_content = conf.spec
-            end
+            single_initial_user_content = conf.spec
         end
     end
 
@@ -1880,9 +1553,202 @@ local function run_loop(conf)
     assert(mf_state.file_digest_refresh == "auto", "mf_state.file_digest_refresh must default to 'auto'")
     assert(type(mf_state.modified_set) == "table", "mf_state.modified_set must be initialized")
 
-    -- For single-file mode, messages accumulate across iters (original behaviour).
+    -- ── Tool set handed to tool_loop ────────────────────────────────────────
+    --
+    -- std.fs owns the edit; this wrapper owns what an edit means to the loop
+    -- (which files changed, which caches are now stale, whether the iteration
+    -- made progress). The build is deliberately not among these: a tool the
+    -- model can decline to call cannot carry the "it compiles" guarantee.
+    -- Which cached reads are the file verbatim (vs a distilled digest);
+    -- only the verbatim ones may be line-numbered for fs_edit.
+    local verbatim_reads = {}
+    local edit_count = 0
+    local iter_edit_sigs = {}
+    local iter_edit_errors = {}
+
+    -- The tool set is built once, but its calls belong to an iteration. The
+    -- loop below advances this cursor so each obs line can say which one —
+    -- without it, a run with max_iters > 1 logs reads and edits that cannot be
+    -- attributed to the iteration that made them. Iterations are sequential,
+    -- so a single cursor is exact.
+    local current_iter = 0
+
+    local fs_edit_spec = std.fs.tool_specs({ allowed = { "edit" }, path_lock = conf.target_files })[1]
+    local raw_fs_edit = fs_edit_spec.handler
+
+    local function on_edit(input)
+        local path = input.path or ""
+        local res = raw_fs_edit(input)
+        if res.ok then
+            edit_count = edit_count + 1
+            mf_state.modified_set[path] = true
+            -- Both views of the file predate the write.
+            existing_map[path] = nil
+            mf_state.file_digest[path] = nil
+            -- Signature by resulting version: two different edits that land on
+            -- the same content are the same lack of progress.
+            table.insert(iter_edit_sigs, path .. "\1" .. tostring(res.version))
+            obs_event(
+                mode,
+                "tool_use",
+                { { "iter", current_iter }, { "path", path }, { "tool", "fs_edit" }, { "ok", true } }
+            )
+            return "applied " .. tostring(res.applied) .. " edit(s) to " .. path
+        end
+
+        local detail = res.reason or "edit rejected"
+        if res.reason == "expect_mismatch" then
+            detail = "expect did not match lines "
+                .. tostring(res.start_line)
+                .. "-"
+                .. tostring(res.end_line)
+                .. "; those lines currently contain:\n"
+                .. tostring(res.actual)
+        elseif res.reason == "stale_base" then
+            detail = path .. " changed since you read it; re-read and retry"
+        elseif res.reason == "out_of_range" then
+            detail = "line "
+                .. tostring(res.end_line)
+                .. " is past the end of the file ("
+                .. tostring(res.file_lines)
+                .. " lines)"
+        elseif res.reason == "path_not_allowed" then
+            detail = "path '" .. path .. "' is not one of the target files"
+        end
+        table.insert(iter_edit_errors, detail)
+        obs_event(
+            mode,
+            "tool_use_fail",
+            { { "iter", current_iter }, { "path", path }, { "tool", "fs_edit" }, { "err", res.reason } }
+        )
+        return "ERROR: " .. detail
+    end
+
+    -- read_file keeps compile_loop's own handler: it is not a plain read but
+    -- the loop's context management (size branch, digest cache, distill).
+    local function on_read(input)
+        local path = input.path or ""
+        local cached = existing_map[path]
+        local res
+        if cached ~= nil then
+            res = { ok = true, content = cached, verbatim = verbatim_reads[path] }
+        else
+            res = read_file_tool_handler(path, target_files_set, mf_state, conf)
+            if res.ok then
+                existing_map[path] = res.content
+                verbatim_reads[path] = res.verbatim
+            end
+        end
+        if not res.ok then
+            obs_event(
+                mode,
+                "tool_use_fail",
+                { { "iter", current_iter }, { "path", path }, { "tool", READ_FILE_TOOL.name }, { "err", res.error } }
+            )
+            return "ERROR: " .. tostring(res.error)
+        end
+        obs_event(mode, "tool_use", {
+            { "iter", current_iter },
+            { "path", path },
+            { "tool", READ_FILE_TOOL.name },
+            { "ok", true },
+            -- Served from this iteration's cache rather than re-read from disk.
+            { "cached", cached ~= nil },
+        })
+        -- Numbered only when it is the file itself; a digest has no line
+        -- correspondence, and numbering it would invite edits to nowhere.
+        if res.verbatim then
+            return with_line_numbers(res.content, 1)
+        end
+        return res.content
+    end
+
+    local function on_read_range(input)
+        local path = input.path or ""
+        local res = read_file_range_tool_handler(path, input.line_start, input.line_end, target_files_set)
+        if not res.ok then
+            obs_event(
+                mode,
+                "tool_use_fail",
+                {
+                    { "iter", current_iter },
+                    { "path", path },
+                    { "tool", READ_FILE_RANGE_TOOL.name },
+                    { "err", res.error },
+                }
+            )
+            return "ERROR: " .. tostring(res.error)
+        end
+        obs_event(mode, "tool_use", {
+            { "iter", current_iter },
+            { "path", path },
+            { "tool", READ_FILE_RANGE_TOOL.name },
+            { "ok", true },
+        })
+        return with_line_numbers(res.content, res.first_line)
+    end
+
+    local edit_tools = {
+        {
+            name = READ_FILE_TOOL.name,
+            description = READ_FILE_TOOL.description,
+            input_schema = READ_FILE_TOOL.input_schema,
+            handler = on_read,
+        },
+        {
+            name = READ_FILE_RANGE_TOOL.name,
+            description = READ_FILE_RANGE_TOOL.description,
+            input_schema = READ_FILE_RANGE_TOOL.input_schema,
+            handler = on_read_range,
+        },
+        {
+            name = fs_edit_spec.name,
+            description = fs_edit_spec.description,
+            input_schema = fs_edit_spec.input_schema,
+            handler = on_edit,
+        },
+    }
+
+    -- read_only withholds the write tool. It cannot converge on its own, so it
+    -- is for inspecting what the model would do, not for fixing.
+    local read_only_tools = { edit_tools[1], edit_tools[2] }
+
+    -- Caller-registered tools ride along with both sets: they are declared
+    -- whenever any tool is. Their calls never count as edits — by contract they
+    -- are read-like, and counting them would let a loop that only queried the
+    -- caller's tool look like it was making progress.
+    for _, t in ipairs(conf.extra_tools or {}) do
+        local schema = t.schema or {}
+        local spec = {
+            name = t.name,
+            description = schema.description or "",
+            input_schema = schema.input_schema or { type = "object", properties = {} },
+            handler = function(input)
+                local ok, res = pcall(t.handler, input or {})
+                if not ok then
+                    obs_event(
+                        mode,
+                        "tool_use_fail",
+                        { { "iter", current_iter }, { "tool", t.name }, { "err", tostring(res) } }
+                    )
+                    return "ERROR: " .. tostring(res)
+                end
+                obs_event(
+                    mode,
+                    "tool_use",
+                    { { "iter", current_iter }, { "tool", t.name }, { "ok", true }, { "extra", true } }
+                )
+                return res
+            end,
+        }
+        table.insert(edit_tools, spec)
+        table.insert(read_only_tools, spec)
+    end
+
+    -- Full mode accumulates one conversation across iters; diff mode's turns
+    -- live inside tool_loop and do not survive the iteration.
     local messages
-    if not multi_file then
+    if edit_mode == "full" then
         messages = {
             { role = "system", content = system },
             { role = "user", content = single_initial_user_content },
@@ -1895,463 +1761,88 @@ local function run_loop(conf)
     -- the loop terminates with failure_reason = "no_edits_applied".
     local bad_stagnation_count = 0
 
-    -- Adaptive channel switch (tool_mode="adaptive" only): drop all tool
-    -- declarations and fall back to the pure SR-text contract. The per-iter
-    -- rebuild embeds the current file contents from disk so the child LLM is
-    -- not left blind (unlike static "none", where the caller inlines contents).
-    -- bad_stagnation_count is reset so the new channel gets a full rescue window.
-    local function adaptive_switch_to_none(iter_num, reason)
-        active_tool_mode = "none"
-        bad_stagnation_count = 0
-        local path_lines = {}
-        for _, p in ipairs(conf.target_files) do
-            table.insert(path_lines, "  " .. p)
-        end
-        multi_initial_user_content = conf.spec
-            .. "\n\nFiles:\n"
-            .. table.concat(path_lines, "\n")
-            .. "\n\nDo NOT call tools. Emit SEARCH/REPLACE text blocks only."
-        obs_event(mode, "adaptive_tool_mode_switch", { { "iter", iter_num }, { "reason", reason } })
-    end
-
     for iter = 1, max_iters do
-        local iter_edits_applied = 0 -- reset each iter; incremented when >= 1 edit succeeds
-        -- Signatures (path\1search\1replace) of edits applied via the
-        -- fs_edit tool this iter. Mixed into the SR stagnation hash so
-        -- that iters differing only in tool-channel edits are not falsely flagged
-        -- as identical (the text content may be a constant "DONE").
-        local iter_tool_edit_sigs = {}
-        -- Errors from failed fs_edit calls this iter. Used to build
-        -- accurate zero-edit feedback when the model worked the tool channel but
-        -- every call missed (instead of a misleading "Output format invalid").
-        local iter_tool_edit_errors = {}
+        current_iter = iter
         local obs_target = artifact_path or table.concat(conf.target_files, ",")
         obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
 
-        -- ── Multi-file: per-iter messages rebuild ───────────────────────────────
-        -- messages[] is constructed fresh each iter from system + per-iter user content.
-        -- tool_use/tool_result pairs are appended within the iter and dropped at iter end.
-        if multi_file then
-            mf_state.iter = iter
-            -- Build per-iter user content: base + optional last_err + optional sr_digest_prev.
-            local user_parts = { multi_initial_user_content }
-            -- Adaptive-switched "none": embed fresh file contents from disk each
-            -- iter (files change across iters). Oversized files are truncated
-            -- with a warning; static "none" is untouched (caller inlines contents).
-            if adaptive and active_tool_mode == "none" then
-                for _, p in ipairs(conf.target_files) do
-                    local c = read_target_if_exists(p) or ""
-                    if #c > READ_FILE_FULL_THRESHOLD then
-                        c = truncate_with_warning(c, nil)
-                    end
-                    table.insert(user_parts, "\n=== Current file content (path=" .. p .. ") ===\n" .. c)
-                end
-            end
-            if mf_state.last_err and mf_state.last_err ~= "" then
-                table.insert(user_parts, "\n=== Last verify error (trimmed) ===\n" .. mf_state.last_err)
-            end
-            if mf_state.sr_digest_prev and mf_state.sr_digest_prev ~= "" then
-                table.insert(user_parts, "\n=== Previous SR digest ===\n" .. mf_state.sr_digest_prev)
-            end
-            local iter_user_content = table.concat(user_parts, "")
-            messages = {
-                { role = "system", content = system },
-                { role = "user", content = iter_user_content },
-            }
-            obs_event(mode, "iter_messages_size", {
-                { "iter", iter },
-                { "messages_len", #messages },
-                { "user_len", #iter_user_content },
-            })
-        end
-
-        -- ── LLM call 1 (multi-file: may return tool_use; single-file: returns SR/code) ──
-        local call_opts = conf
-        if multi_file and active_tool_mode ~= "none" then
-            -- Attach tool spec per active_tool_mode.
-            -- We build a shallow copy of conf with tools added to avoid mutating conf.
-            call_opts = {}
-            for k, v in pairs(conf) do
-                call_opts[k] = v
-            end
-            if active_tool_mode == "read_only" then
-                call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
-            else -- "auto"
-                call_opts.tools = { READ_FILE_TOOL, READ_FILE_RANGE_TOOL }
-                for _, spec in ipairs(fs_tool_specs) do
-                    table.insert(call_opts.tools, {
-                        name = spec.name,
-                        description = spec.description,
-                        input_schema = spec.input_schema,
-                    })
-                end
-            end
-            -- Caller-registered extra tools are declared whenever tools are
-            -- declared at all (both "auto" and "read_only").
-            for _, spec in ipairs(extra_tool_specs) do
-                table.insert(call_opts.tools, spec)
-            end
-        end
-
-        local resp, err = llm_call(call_opts, messages)
-        if not resp then
-            local err_str = tostring(err)
-            return {
-                ok = false,
-                failure_reason = "llm_call",
-                last_error = err_str:sub(-800),
-                iters = iter - 1,
-                summary = make_summary(false, iter - 1, max_iters, "llm_call"),
-                artifact_path = artifact_path,
-                modified_files = multi_file and collect_modified_paths(mf_state.modified_set) or nil,
-                history = history,
-            }
-        end
-
-        -- ── Multi-file: tool_use dispatch loop ──────────────────────────────────
-        -- The child LLM may issue read_file calls before emitting SR blocks.
-        -- We resolve up to MAX_TOOL_CALLS_PER_ITER calls within this iter,
-        -- then do a final LLM call to obtain SR blocks (or accept the SR directly
-        -- if no tool_use was requested).
-        --
-        -- existing_map also serves as a cache (R2 fallback): if the LLM requests the
-        -- same path twice, return the cached content instead of re-reading.
-        -- The cache is scoped to this iter (existing_map reset per-iter below).
-        if multi_file then
-            -- Reset per-iter read cache before tool dispatch.
-            existing_map = {}
-            -- Which cached reads are the file verbatim (vs a distilled digest).
-            -- Only the verbatim ones may be line-numbered for fs_edit.
-            local verbatim_reads = {}
-
-            local tool_call_count = 0
-            local cur_resp = resp
-
-            while true do
-                local cur_choice = (cur_resp.choices or {})[1] or {}
-                local cur_msg = cur_choice.message or {}
-                local cur_tool_blocks = cur_msg.tool_use_blocks or {}
-
-                if #cur_tool_blocks == 0 then
-                    -- No tool_use requested; fall through to SR parse below.
-                    resp = cur_resp
-                    break
-                end
-
-                -- Hard cap: give up if too many tool calls in one iter.
-                if tool_call_count + #cur_tool_blocks > MAX_TOOL_CALLS_PER_ITER then
-                    obs_event(mode, "tool_loop_giveup", { { "iter", iter }, { "count", tool_call_count } })
-                    -- Adaptive rescue: a tool-call blowout is the "keeps reading,
-                    -- never writes" dead end — switch to the no-tools channel and
-                    -- consume this iter instead of failing the whole run.
-                    if adaptive and active_tool_mode ~= "none" then
-                        adaptive_switch_to_none(iter, "tool_loop_cap")
-                        goto iter_continue
-                    end
-                    local giveup_err = "exceeded MAX_TOOL_CALLS_PER_ITER="
-                        .. MAX_TOOL_CALLS_PER_ITER
-                        .. " within a single iter"
-                    return {
-                        ok = false,
-                        failure_reason = "tool_loop",
-                        last_error = giveup_err,
-                        iters = iter,
-                        summary = make_summary(false, iter, max_iters, "tool_loop"),
-                        artifact_path = nil,
-                        -- crux §3: tool-channel writes may already have landed this iter.
-                        modified_files = collect_modified_paths(mf_state.modified_set),
-                        history = history,
-                    }
-                end
-
-                -- Build assistant message carrying the tool_use blocks.
-                -- content field: text portion (may be empty string).
-                local assistant_content = {}
-                -- Include text blocks if present.
-                if cur_msg.content and cur_msg.content ~= "" then
-                    table.insert(assistant_content, { type = "text", text = cur_msg.content })
-                end
-                -- Include tool_use blocks (raw form: id, name, input).
-                for _, tb in ipairs(cur_tool_blocks) do
-                    table.insert(assistant_content, {
-                        type = "tool_use",
-                        id = tb.id,
-                        name = tb.name,
-                        input = tb.input,
-                    })
-                end
-                table.insert(messages, { role = "assistant", content = assistant_content })
-
-                -- Dispatch each tool_use block and collect tool_result blocks.
-                local tool_result_content = {}
-                for _, tb in ipairs(cur_tool_blocks) do
-                    tool_call_count = tool_call_count + 1
-                    if tb.name == "read_file" then
-                        local path = (tb.input or {}).path or ""
-                        -- Use cached result if available (R2 fallback: dedup repeated reads).
-                        local cached = existing_map[path]
-                        local dispatch_result
-                        if cached ~= nil then
-                            dispatch_result = { ok = true, content = cached, verbatim = verbatim_reads[path] }
-                            obs_event(mode, "tool_use", {
-                                { "iter", iter },
-                                { "path", path },
-                                { "ok", true },
-                                { "cached", true },
-                            })
-                        else
-                            -- ST2: pass mf_state and conf so size-branch + cache works.
-                            dispatch_result = read_file_tool_handler(path, target_files_set, mf_state, conf)
-                            if dispatch_result.ok then
-                                -- Cache the result for this iter.
-                                existing_map[path] = dispatch_result.content
-                                verbatim_reads[path] = dispatch_result.verbatim
-                                obs_event(mode, "tool_use", {
-                                    { "iter", iter },
-                                    { "path", path },
-                                    { "ok", true },
-                                })
-                            else
-                                obs_event(mode, "tool_use_fail", {
-                                    { "iter", iter },
-                                    { "path", path },
-                                    { "err", dispatch_result.error },
-                                })
-                            end
-                        end
-
-                        -- Build tool_result block (error string propagated to child LLM).
-                        local result_text
-                        if dispatch_result.ok then
-                            -- Numbered only when the content is the file itself;
-                            -- a distilled digest has no line correspondence.
-                            if dispatch_result.verbatim then
-                                result_text = with_line_numbers(dispatch_result.content, 1)
-                            else
-                                result_text = dispatch_result.content
-                            end
-                        else
-                            result_text = "ERROR: " .. tostring(dispatch_result.error)
-                        end
-                        table.insert(tool_result_content, {
-                            type = "tool_result",
-                            tool_use_id = tb.id,
-                            content = result_text,
-                        })
-                    elseif tb.name == "read_file_range" then
-                        -- ST2: verbatim line-range retrieval; never passes through distill
-                        -- (crux-card §3: verbatim range access after distill).
-                        local inp = tb.input or {}
-                        local path = inp.path or ""
-                        local line_start = inp.line_start
-                        local line_end = inp.line_end
-                        local rr_result = read_file_range_tool_handler(path, line_start, line_end, target_files_set)
-                        local rr_text
-                        if rr_result.ok then
-                            rr_text = with_line_numbers(rr_result.content, rr_result.first_line)
-                            obs_event(mode, "tool_use", {
-                                { "iter", iter },
-                                { "path", path },
-                                { "tool", "read_file_range" },
-                                { "line_start", tostring(line_start) },
-                                { "line_end", tostring(line_end) },
-                                { "ok", true },
-                            })
-                        else
-                            rr_text = "ERROR: " .. tostring(rr_result.error)
-                            obs_event(mode, "tool_use_fail", {
-                                { "iter", iter },
-                                { "path", path },
-                                { "tool", "read_file_range" },
-                                { "err", rr_result.error },
-                            })
-                        end
-                        table.insert(tool_result_content, {
-                            type = "tool_result",
-                            tool_use_id = tb.id,
-                            content = rr_text,
-                        })
-                    elseif fs_tool_handlers[tb.name] then
-                        -- Write channel: std.fs owns the edit; the loop owns what
-                        -- an edit means for its own state (modified set, caches,
-                        -- stagnation bookkeeping).
-                        local inp = tb.input or {}
-                        local asr_path = inp.path or ""
-                        local asr = fs_tool_handlers[tb.name](inp)
-                        local asr_text
-                        if asr.ok then
-                            asr_text = "applied "
-                                .. tostring(asr.applied)
-                                .. " edit(s) to "
-                                .. asr_path
-                                .. " (version "
-                                .. tostring(asr.version)
-                                .. ")"
-                            iter_edits_applied = iter_edits_applied + 1
-                            bad_stagnation_count = 0
-                            mf_state.modified_set[asr_path] = true
-                            -- Invalidate stale views of the file: the per-iter read
-                            -- cache and the cross-iter digest cache both predate the write.
-                            existing_map[asr_path] = nil
-                            mf_state.file_digest[asr_path] = nil
-                            -- Stagnation signature: the resulting version is a
-                            -- better identity than the request, since two
-                            -- different edits that produce the same file are the
-                            -- same lack of progress.
-                            table.insert(iter_tool_edit_sigs, asr_path .. "\1" .. tostring(asr.version))
-                            obs_event(mode, "tool_use", {
-                                { "iter", iter },
-                                { "path", asr_path },
-                                { "tool", tb.name },
-                                { "ok", true },
-                            })
-                        else
-                            -- The rejection is already actionable (it names the
-                            -- line range and, on a mismatch, the text actually
-                            -- there); hand it over rather than re-wording it.
-                            local detail = asr.reason or "edit rejected"
-                            if asr.reason == "expect_mismatch" then
-                                detail = "expect did not match lines "
-                                    .. tostring(asr.start_line)
-                                    .. "-"
-                                    .. tostring(asr.end_line)
-                                    .. "; those lines currently contain:\n"
-                                    .. tostring(asr.actual)
-                            elseif asr.reason == "stale_base" then
-                                detail = asr_path .. " changed since you read it; re-read and retry"
-                            elseif asr.reason == "out_of_range" then
-                                detail = "line "
-                                    .. tostring(asr.end_line)
-                                    .. " is past the end of the file ("
-                                    .. tostring(asr.file_lines)
-                                    .. " lines)"
-                            elseif asr.reason == "path_not_allowed" then
-                                detail = "path '" .. asr_path .. "' is not one of the target files"
-                            end
-                            asr_text = "ERROR: " .. detail
-                            table.insert(iter_tool_edit_errors, detail)
-                            obs_event(mode, "tool_use_fail", {
-                                { "iter", iter },
-                                { "path", asr_path },
-                                { "tool", tb.name },
-                                { "err", asr.reason },
-                            })
-                        end
-                        table.insert(tool_result_content, {
-                            type = "tool_result",
-                            tool_use_id = tb.id,
-                            content = asr_text,
-                        })
-                    elseif extra_tools_map[tb.name] then
-                        -- Caller-registered extra tool. Contract: handler(input)
-                        -- returns a string (same as the tool-registry convention);
-                        -- errors are propagated as tool_result text so the child
-                        -- LLM can recover. Does NOT count as an applied edit.
-                        local et_ok, et_res = pcall(extra_tools_map[tb.name], tb.input or {})
-                        local et_text
-                        if et_ok then
-                            et_text = tostring(et_res)
-                            obs_event(mode, "tool_use", {
-                                { "iter", iter },
-                                { "tool", tb.name },
-                                { "ok", true },
-                                { "extra", true },
-                            })
-                        else
-                            et_text = "ERROR: " .. tostring(et_res)
-                            obs_event(mode, "tool_use_fail", {
-                                { "iter", iter },
-                                { "tool", tb.name },
-                                { "err", tostring(et_res) },
-                            })
-                        end
-                        table.insert(tool_result_content, {
-                            type = "tool_result",
-                            tool_use_id = tb.id,
-                            content = et_text,
-                        })
-                    else
-                        -- Unknown tool name; return error to child LLM.
-                        obs_event(mode, "tool_use_fail", {
-                            { "iter", iter },
-                            { "path", tostring((tb.input or {}).path or "") },
-                            { "err", "unknown tool: " .. tostring(tb.name) },
-                        })
-                        table.insert(tool_result_content, {
-                            type = "tool_result",
-                            tool_use_id = tb.id,
-                            content = "ERROR: unknown tool '" .. tostring(tb.name) .. "'",
-                        })
-                    end
-                end
-
-                -- Append user message containing all tool_result blocks.
-                table.insert(messages, { role = "user", content = tool_result_content })
-
-                -- Second LLM call: provide tool results so the child LLM can emit SR blocks.
-                local resp2, err2 = llm_call(call_opts, messages)
-                if not resp2 then
-                    local err_str = tostring(err2)
-                    return {
-                        ok = false,
-                        failure_reason = "llm_call",
-                        last_error = err_str:sub(-800),
-                        iters = iter,
-                        summary = make_summary(false, iter, max_iters, "llm_call"),
-                        artifact_path = nil,
-                        -- crux §3: tool-channel writes may already have landed this iter.
-                        modified_files = collect_modified_paths(mf_state.modified_set),
-                        history = history,
-                    }
-                end
-                cur_resp = resp2
-                -- Loop: if the child LLM issues more tool_use calls, repeat.
-            end
-            -- resp now holds the final response (no more tool_use blocks).
-        end
-        -- ── end of multi-file tool dispatch loop ────────────────────────────────
-
-        local choice = (resp.choices or {})[1] or {}
-        local msg_obj = choice.message or {}
-
-        -- Extract text-only content for SR parse (tool_use blocks must NOT be passed
-        -- to parse_search_replace — only text content is valid SR source).
-        local content = msg_obj.content or ""
-
         -- ── diff mode ──────────────────────────────────────────────────────────
+        --
+        -- tool_loop does the read/edit turns with exactly the tools above; the
+        -- build is this loop's own step. That split is the guarantee
+        -- compile_loop sells: "it compiles" has to be something the loop
+        -- verified, so the runner is never a tool the model can skip.
         if edit_mode == "diff" then
-            -- Parse SEARCH/REPLACE blocks from the LLM text response.
-            -- Pass multi_file flag and allowlist set for path validation.
-            local blocks, parse_err = parse_search_replace(content, multi_file, target_files_set)
-            -- "no blocks found" is benign when the tool channel already applied edits
-            -- this iter (the model was told to reply DONE). A *malformed* block is
-            -- never benign — skipping feedback would silently discard its edit.
-            local benign_no_blocks = parse_err ~= nil
-                and tostring(parse_err):find("no SEARCH/REPLACE blocks found", 1, true) ~= nil
-            if not blocks and not (multi_file and iter_edits_applied > 0 and benign_no_blocks) then
-                local fmt_msg
-                if multi_file and benign_no_blocks and #iter_tool_edit_errors > 0 then
-                    -- The model worked the tool channel but every fs_edit
-                    -- call failed; restate the tool errors instead of a format complaint.
-                    fmt_msg = "No edits were applied: every fs_edit call failed.\n"
-                        .. table.concat(iter_tool_edit_errors, "\n")
-                        .. "\nRe-read the affected files (read_file / read_file_range) and retry with"
-                        .. " character-exact search text, or emit SEARCH/REPLACE text blocks."
-                else
-                    -- Parse failure: tell the child LLM to re-emit valid blocks.
-                    -- The feedback restates the exact marker literals so a model that
-                    -- drifted on marker format can recover (issue #1 request 3).
-                    fmt_msg = "Output format invalid: "
-                        .. tostring(parse_err)
-                        .. "\nExpected block format (markers must be exact):\n"
-                        .. (multi_file and "<<< path=<file_path> >>>\n" or "")
-                        .. "<<<<<<< SEARCH\n<existing text>\n=======\n<replacement text>\n>>>>>>> REPLACE\n"
-                        .. "Re-emit blocks correctly."
+            local edits_before = edit_count
+            iter_edit_sigs = {}
+            iter_edit_errors = {}
+            -- The per-iter read cache: files change under it between iters.
+            existing_map = {}
+            verbatim_reads = {}
+            mf_state.iter = iter
+
+            local prompt_parts = { conf.spec, "\n\nFiles:\n" .. table.concat(path_lines, "\n") }
+            if mf_state.last_err and mf_state.last_err ~= "" then
+                table.insert(prompt_parts, "\n\n=== Last verify error (trimmed) ===\n" .. mf_state.last_err)
+            end
+
+            local tl = tool_loop.run({
+                prompt = table.concat(prompt_parts, ""),
+                system = system,
+                tools = active_tool_mode == "read_only" and read_only_tools or edit_tools,
+                max_turns = MAX_TOOL_CALLS_PER_ITER,
+                llm = {
+                    provider = conf.provider,
+                    base_url = conf.base_url,
+                    api_key = conf.api_key,
+                    api_key_env = conf.api_key_env,
+                    model = conf.model,
+                    max_tokens = conf.max_tokens,
+                    temperature = conf.temperature,
+                    thinking = conf.thinking,
+                    dialect = conf.dialect,
+                    tool_choice = conf.tool_choice,
+                    timeout = conf.timeout,
+                },
+            })
+
+            local iter_edits_applied = edit_count - edits_before
+            local content = tl.content or ""
+
+            -- A transport / protocol failure is not the model failing to edit;
+            -- it ends the run rather than counting as a stagnant iteration.
+            if
+                not tl.ok
+                and iter_edits_applied == 0
+                and tl.error
+                and not tostring(tl.error):find("max_turns", 1, true)
+            then
+                return {
+                    ok = false,
+                    failure_reason = "llm_call",
+                    last_error = tostring(tl.error):sub(-800),
+                    iters = iter - 1,
+                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
+                    artifact_path = artifact_path,
+                    modified_files = collect_modified_paths(mf_state.modified_set),
+                    history = history,
+                }
+            end
+
+            -- Nothing reached disk: the build would report what it already
+            -- reported, so feed the tool errors back instead of re-running it.
+            if iter_edits_applied == 0 then
+                bad_stagnation_count = bad_stagnation_count + 1
+                local zero_msg = "No edits were applied."
+                if #iter_edit_errors > 0 then
+                    zero_msg = zero_msg .. " Every fs_edit call was rejected:\n" .. table.concat(iter_edit_errors, "\n")
                 end
+                zero_msg = zero_msg
+                    .. "\nRe-read the file (read_file output is line-numbered) and retry with an exact expect."
                 local entry = {
                     iter = iter,
                     code = nil,
-                    result = { ok = false, stderr = fmt_msg, stdout = "", exit_code = -1 },
+                    result = { ok = false, stderr = zero_msg, stdout = "", exit_code = -1 },
                     raw = content,
                 }
                 table.insert(history, entry)
@@ -2359,7 +1850,7 @@ local function run_loop(conf)
                     { "iter", iter },
                     { "ok", false },
                     { "exit_code", -1 },
-                    { "stderr_len", #fmt_msg },
+                    { "stderr_len", #zero_msg },
                 })
                 if conf.on_iter then
                     local cb_ok, cb_err = pcall(conf.on_iter, entry)
@@ -2367,460 +1858,105 @@ local function run_loop(conf)
                         log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                     end
                 end
-                -- For multi-file: update state; messages[] will be rebuilt next iter.
-                if multi_file then
-                    -- Compute sr_hash for parse-error case: hash the raw content (LLM output).
-                    -- Using a tagged prefix to distinguish parse errors from valid SR blocks.
-                    local parse_sr_hash = compute_sr_hash("<parse_err:" .. compute_sr_hash(fmt_msg) .. ">")
-                    update_state(mf_state, {
-                        last_err = fmt_msg,
-                        sr_hash_append = parse_sr_hash,
+                update_state(mf_state, {
+                    last_err = zero_msg,
+                    sr_hash_append = compute_sr_hash("<no_edits:" .. tostring(iter) .. ">"),
+                })
+                if bad_stagnation_count >= STAGNATION_WINDOW then
+                    obs_event(mode, "bad_stagnation_blocked", {
+                        { "iter", iter },
+                        { "reason", "no_edits_applied" },
                     })
-                    -- Stagnation check using sr_history (messages[] independent).
-                    -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
-                    if iter_edits_applied == 0 then
-                        bad_stagnation_count = bad_stagnation_count + 1
-                        if
-                            adaptive
-                            and active_tool_mode ~= "none"
-                            and bad_stagnation_count >= ADAPTIVE_SWITCH_THRESHOLD
-                        then
-                            -- Adaptive rescue: repeated zero-edit iters while tools
-                            -- are declared — switch to the no-tools SR-text channel
-                            -- (the channel switch supersedes the retry feedback).
-                            adaptive_switch_to_none(iter, "zero_edit_iters")
-                        elseif bad_stagnation_count >= STAGNATION_WINDOW then
-                            obs_event(mode, "bad_stagnation_blocked", {
-                                { "iter", iter },
-                                { "reason", "no_edits_applied" },
-                            })
-                            return {
-                                ok = false,
-                                failure_reason = "no_edits_applied",
-                                last_error = mf_state.last_err or "",
-                                iters = iter,
-                                summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                                artifact_path = nil,
-                                modified_files = collect_modified_paths(mf_state.modified_set),
-                                history = history,
-                            }
-                        else
-                            -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                            local retry_msg = "Your previous attempt produced zero successful edits."
-                                .. " You must emit a SEARCH/REPLACE block that actually applies"
-                                .. " — make sure the SEARCH section matches the current file content exactly."
-                            update_state(mf_state, { last_err = mf_state.last_err })
-                            messages = {
-                                { role = "system", content = system },
-                                {
-                                    role = "user",
-                                    content = table.concat(
-                                        { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
-                                        ""
-                                    ),
-                                },
-                            }
-                        end
-                    elseif is_stagnant_v2(mf_state, true) then
-                        obs_event(mode, "stagnation_v2", {
-                            { "iter", iter },
-                            { "sr_hash_recent", parse_sr_hash:sub(1, 8) },
-                            { "reason", "sr_history_repeat" },
-                        })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = mf_state.last_err or "",
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = nil,
-                            modified_files = collect_modified_paths(mf_state.modified_set),
-                            history = history,
-                        }
-                    end
-                    -- messages[] for next iter is rebuilt from state; drop current iter messages.
-                else
-                    -- Single-file parse failure: LLM emitted zero edits — bad stagnation check.
-                    -- Bad stagnation takes priority over good stagnation (stderr-based).
-                    if iter_edits_applied == 0 then
-                        bad_stagnation_count = bad_stagnation_count + 1
-                        if bad_stagnation_count >= STAGNATION_WINDOW then
-                            obs_event(mode, "bad_stagnation_blocked", {
-                                { "iter", iter },
-                                { "reason", "no_edits_applied" },
-                            })
-                            return {
-                                ok = false,
-                                failure_reason = "no_edits_applied",
-                                last_error = fmt_msg:sub(-800),
-                                iters = iter,
-                                summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                                artifact_path = artifact_path,
-                                history = history,
-                            }
-                        end
-                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                        local retry_msg = "Your previous attempt produced zero successful edits."
-                            .. " You must emit a SEARCH/REPLACE block that actually applies"
-                            .. " — make sure the SEARCH section matches the current file content exactly."
-                        table.insert(messages, { role = "assistant", content = content })
-                        table.insert(messages, { role = "user", content = retry_msg })
-                    elseif is_stagnant(history) then
-                        obs_event(mode, "stagnation", { { "iters", iter } })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = fmt_msg:sub(-800),
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = artifact_path,
-                            history = history,
-                        }
-                    else
-                        table.insert(messages, { role = "assistant", content = content })
-                        table.insert(messages, { role = "user", content = fmt_msg })
-                    end
-                end
-            elseif multi_file then
-                -- ── multi-file diff apply (per-iter rebuild path) ────────────────
-                -- existing_map was populated by the tool dispatch loop above.
-                -- Apply blocks using the on-demand-populated existing_map.
-                -- blocks may be nil here when the child LLM applied all edits via the
-                -- fs_edit tool and emitted no SR text (iter_edits_applied
-                -- > 0 guards this path); an empty list proceeds straight to verify.
-                local grouped = group_blocks_by_path(blocks or {})
-                local new_contents_map, all_failed, write_err = iterate_files(conf.target_files, grouped, existing_map)
-                -- Accumulate successfully-written paths into mf_state.modified_set for
-                -- modified_files preservation on every return path (crux §3).
-                if new_contents_map and next(new_contents_map) ~= nil then
-                    iter_edits_applied = iter_edits_applied + 1
-                    bad_stagnation_count = 0
-                    for path in pairs(new_contents_map) do
-                        mf_state.modified_set[path] = true
-                    end
-                elseif new_contents_map then
-                    for path in pairs(new_contents_map) do
-                        mf_state.modified_set[path] = true
-                    end
-                end
-
-                if write_err then
-                    local werr_str = tostring(write_err)
                     return {
                         ok = false,
-                        failure_reason = "open_target_file",
-                        last_error = werr_str,
+                        failure_reason = "no_edits_applied",
+                        last_error = mf_state.last_err or "",
                         iters = iter,
-                        summary = make_summary(false, iter, max_iters, "open_target_file"),
-                        artifact_path = nil,
+                        summary = make_summary(false, iter, max_iters, "no_edits_applied"),
+                        artifact_path = artifact_path,
                         modified_files = collect_modified_paths(mf_state.modified_set),
                         history = history,
                     }
                 end
+                goto iter_continue
+            end
 
-                if #all_failed > 0 then
-                    local fail_msg = build_multifile_edit_failure_msg(all_failed, existing_map)
-                    local entry = {
-                        iter = iter,
-                        code = nil,
-                        result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 },
-                        raw = content,
-                    }
-                    table.insert(history, entry)
-                    obs_event(mode, "iter_result", {
-                        { "iter", iter },
-                        { "ok", false },
-                        { "exit_code", -1 },
-                        { "stderr_len", #fail_msg },
-                    })
-                    if conf.on_iter then
-                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                        if not cb_ok then
-                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                        end
-                    end
-                    -- Update state via update_state (DRY trim policy).
-                    -- Tool-channel edit signatures are mixed in so tool-only iters
-                    -- with constant text (e.g. "DONE") do not falsely hash-collide.
-                    local apply_sr_hash = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1"))
-                    update_state(mf_state, {
-                        last_err = fail_msg,
-                        sr_digest_prev = content,
-                        sr_hash_append = apply_sr_hash,
-                    })
-                    -- Stagnation check using sr_history (messages[] independent).
-                    -- Bad stagnation (no edits applied at all) takes priority over good stagnation.
-                    if iter_edits_applied == 0 then
-                        bad_stagnation_count = bad_stagnation_count + 1
-                        if
-                            adaptive
-                            and active_tool_mode ~= "none"
-                            and bad_stagnation_count >= ADAPTIVE_SWITCH_THRESHOLD
-                        then
-                            -- Adaptive rescue: repeated zero-edit iters while tools
-                            -- are declared — switch to the no-tools SR-text channel
-                            -- (the channel switch supersedes the retry feedback).
-                            adaptive_switch_to_none(iter, "zero_edit_iters")
-                        elseif bad_stagnation_count >= STAGNATION_WINDOW then
-                            obs_event(mode, "bad_stagnation_blocked", {
-                                { "iter", iter },
-                                { "reason", "no_edits_applied" },
-                            })
-                            return {
-                                ok = false,
-                                failure_reason = "no_edits_applied",
-                                last_error = mf_state.last_err or "",
-                                iters = iter,
-                                summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                                artifact_path = nil,
-                                modified_files = collect_modified_paths(mf_state.modified_set),
-                                history = history,
-                            }
-                        else
-                            -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                            local retry_msg = "Your previous attempt produced zero successful edits."
-                                .. " You must emit a SEARCH/REPLACE block that actually applies"
-                                .. " — make sure the SEARCH section matches the current file content exactly."
-                            update_state(mf_state, { last_err = mf_state.last_err })
-                            messages = {
-                                { role = "system", content = system },
-                                {
-                                    role = "user",
-                                    content = table.concat(
-                                        { multi_initial_user_content, "\n=== Retry required ===\n" .. retry_msg },
-                                        ""
-                                    ),
-                                },
-                            }
-                        end
-                    elseif is_stagnant_v2(mf_state, true) then
-                        obs_event(mode, "stagnation_v2", {
-                            { "iter", iter },
-                            { "sr_hash_recent", apply_sr_hash:sub(1, 8) },
-                            { "reason", "sr_history_repeat" },
-                        })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = mf_state.last_err or "",
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = nil,
-                            modified_files = collect_modified_paths(mf_state.modified_set),
-                            history = history,
-                        }
-                    end
-                    -- messages[] for next iter is rebuilt from state (no accumulation).
-                else
-                    -- All blocks applied and written. Call runner with paths list (Crux #3).
-                    local rr = conf.runner(conf.target_files) or {}
-                    local entry = { iter = iter, code = nil, result = rr, raw = content }
-                    table.insert(history, entry)
-                    obs_event(mode, "iter_result", {
-                        { "iter", iter },
-                        { "ok", rr.ok and true or false },
-                        { "exit_code", rr.exit_code },
-                        { "stderr_len", #(tostring(rr.stderr or "")) },
-                    })
+            bad_stagnation_count = 0
 
-                    if conf.on_iter then
-                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                        if not cb_ok then
-                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                        end
-                    end
-
-                    if rr.ok then
-                        -- Append sr_hash to sr_history on success (crux §2: every SR attempt,
-                        -- regardless of ok value, must append to sr_history).
-                        update_state(
-                            mf_state,
-                            { sr_hash_append = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1")) }
-                        )
-                        obs_event(mode, "converged", { { "iters", iter } })
-                        return {
-                            ok = true,
-                            artifact_path = nil,
-                            modified_files = collect_modified_paths(mf_state.modified_set),
-                            iters = iter,
-                            summary = make_summary(true, iter, max_iters, nil),
-                            history = history,
-                        }
-                    end
-
-                    -- Runner failed: update state via update_state (DRY trim policy).
-                    -- Tool-channel edit signatures are mixed in (see apply_sr_hash above).
-                    local rr_stderr = tostring(rr.stderr or "")
-                    local runner_sr_hash = compute_sr_hash(content .. table.concat(iter_tool_edit_sigs, "\1"))
-                    update_state(mf_state, {
-                        last_err = rr_stderr,
-                        sr_digest_prev = content,
-                        sr_hash_append = runner_sr_hash,
-                    })
-                    -- Stagnation check (multi-file): use sr_history, independent of messages[].
-                    local runner_failed = (rr.ok == false)
-                    if is_stagnant_v2(mf_state, runner_failed) then
-                        obs_event(mode, "stagnation_v2", {
-                            { "iter", iter },
-                            { "sr_hash_recent", runner_sr_hash:sub(1, 8) },
-                            { "reason", "sr_history_repeat" },
-                        })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = mf_state.last_err or "",
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = nil,
-                            modified_files = collect_modified_paths(mf_state.modified_set),
-                            history = history,
-                        }
-                    end
-                    -- messages[] for next iter is rebuilt from mf_state (no accumulation).
-                end
-            else
-                -- ── single-file diff apply (original path) ───────────────────────
-                local single_path = conf.target_files[1]
-                local current_content = read_target_if_exists(single_path) or existing_map[single_path]
-                local new_content, failed_indices = apply_blocks(current_content, blocks)
-
-                if #failed_indices > 0 then
-                    -- Partial or total apply failure: report and ask for re-emit.
-                    -- Partial success (some blocks applied) counts as edits_applied.
-                    if #failed_indices < #blocks then
-                        iter_edits_applied = iter_edits_applied + 1
-                        bad_stagnation_count = 0
-                    end
-                    local fail_msg = build_edit_failure_msg(failed_indices, blocks, current_content)
-                    local entry = {
-                        iter = iter,
-                        code = nil,
-                        result = { ok = false, stderr = fail_msg, stdout = "", exit_code = -1 },
-                        raw = content,
-                    }
-                    table.insert(history, entry)
-                    obs_event(mode, "iter_result", {
-                        { "iter", iter },
-                        { "ok", false },
-                        { "exit_code", -1 },
-                        { "stderr_len", #fail_msg },
-                    })
-                    if conf.on_iter then
-                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                        if not cb_ok then
-                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                        end
-                    end
-                    -- Bad stagnation (zero edits) takes priority over good stagnation.
-                    if iter_edits_applied == 0 then
-                        bad_stagnation_count = bad_stagnation_count + 1
-                        if bad_stagnation_count >= STAGNATION_WINDOW then
-                            obs_event(mode, "bad_stagnation_blocked", {
-                                { "iter", iter },
-                                { "reason", "no_edits_applied" },
-                            })
-                            return {
-                                ok = false,
-                                failure_reason = "no_edits_applied",
-                                last_error = fail_msg:sub(-800),
-                                iters = iter,
-                                summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                                artifact_path = artifact_path,
-                                history = history,
-                            }
-                        end
-                        -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                        local retry_msg = "Your previous attempt produced zero successful edits."
-                            .. " You must emit a SEARCH/REPLACE block that actually applies"
-                            .. " — make sure the SEARCH section matches the current file content exactly."
-                        table.insert(messages, { role = "assistant", content = content })
-                        table.insert(messages, { role = "user", content = retry_msg })
-                    elseif is_stagnant(history) then
-                        obs_event(mode, "stagnation", { { "iters", iter } })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = fail_msg:sub(-800),
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = artifact_path,
-                            history = history,
-                        }
-                    else
-                        table.insert(messages, { role = "assistant", content = content })
-                        table.insert(messages, { role = "user", content = fail_msg })
-                    end
-                else
-                    -- All blocks applied successfully — write new content and run.
-                    iter_edits_applied = iter_edits_applied + 1
-                    bad_stagnation_count = 0
-                    local wok, werr = write_file(single_path, new_content)
-                    if not wok then
-                        return {
-                            ok = false,
-                            failure_reason = "open_target_file",
-                            last_error = werr,
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "open_target_file"),
-                            artifact_path = artifact_path,
-                            history = history,
-                        }
-                    end
-
-                    -- Single-file runner call with single string path (Crux #3).
-                    local rr = conf.runner(single_path) or {}
-                    local entry = { iter = iter, code = new_content, result = rr, raw = content }
-                    table.insert(history, entry)
-                    obs_event(mode, "iter_result", {
-                        { "iter", iter },
-                        { "ok", rr.ok and true or false },
-                        { "exit_code", rr.exit_code },
-                        { "stderr_len", #(tostring(rr.stderr or "")) },
-                    })
-
-                    if conf.on_iter then
-                        local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                        if not cb_ok then
-                            log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                        end
-                    end
-
-                    if rr.ok then
-                        obs_event(mode, "converged", { { "iters", iter } })
-                        return {
-                            ok = true,
-                            code = new_content,
-                            artifact_path = artifact_path,
-                            iters = iter,
-                            summary = make_summary(true, iter, max_iters, nil),
-                            history = history,
-                        }
-                    end
-
-                    if is_stagnant(history) then
-                        local last_stderr = tostring(rr.stderr or ""):sub(-800)
-                        obs_event(mode, "stagnation", { { "iters", iter } })
-                        return {
-                            ok = false,
-                            failure_reason = "stagnation",
-                            last_error = last_stderr,
-                            code = new_content,
-                            iters = iter,
-                            summary = make_summary(false, iter, max_iters, "stagnation"),
-                            artifact_path = artifact_path,
-                            history = history,
-                        }
-                    end
-
-                    -- Runner failed — provide runner feedback for next iteration.
-                    table.insert(messages, { role = "assistant", content = content })
-                    table.insert(messages, { role = "user", content = build_failure_msg(lang, rr) })
+            -- Verify. The loop's step, not the model's.
+            local rr = conf.runner(multi_file and conf.target_files or conf.target_files[1]) or {}
+            local entry = { iter = iter, code = nil, result = rr, raw = content }
+            table.insert(history, entry)
+            obs_event(mode, "iter_result", {
+                { "iter", iter },
+                { "ok", rr.ok and true or false },
+                { "exit_code", rr.exit_code },
+                { "stderr_len", #(tostring(rr.stderr or "")) },
+            })
+            if conf.on_iter then
+                local cb_ok, cb_err = pcall(conf.on_iter, entry)
+                if not cb_ok then
+                    log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
                 end
             end
 
+            local iter_sig = table.concat(iter_edit_sigs, "\1")
+            if rr.ok then
+                update_state(mf_state, { sr_hash_append = compute_sr_hash(iter_sig) })
+                obs_event(mode, "converged", { { "iters", iter } })
+                return {
+                    ok = true,
+                    artifact_path = artifact_path,
+                    modified_files = collect_modified_paths(mf_state.modified_set),
+                    iters = iter,
+                    summary = make_summary(true, iter, max_iters, nil),
+                    history = history,
+                }
+            end
+
+            update_state(mf_state, {
+                last_err = tostring(rr.stderr or ""),
+                sr_digest_prev = iter_sig,
+                sr_hash_append = compute_sr_hash(iter_sig),
+            })
+            -- The same edits producing the same failure twice: the model is
+            -- circling rather than converging.
+            if is_stagnant_v2(mf_state, true) then
+                obs_event(mode, "stagnation_v2", { { "iter", iter }, { "reason", "sr_history_repeat" } })
+                return {
+                    ok = false,
+                    failure_reason = "stagnation",
+                    last_error = mf_state.last_err or "",
+                    iters = iter,
+                    summary = make_summary(false, iter, max_iters, "stagnation"),
+                    artifact_path = artifact_path,
+                    modified_files = collect_modified_paths(mf_state.modified_set),
+                    history = history,
+                }
+            end
+
         -- ── full mode (default) ────────────────────────────────────────────────
+        --
+        -- Single-file whole-file rewrite: no tools, one completion per iter.
+        -- This is the path for models that cannot call tools at all, so it
+        -- talks to the provider directly rather than through tool_loop.
         else
             local single_path = conf.target_files[1]
+            local iter_edits_applied = 0
+
+            local resp, call_err = llm_call(conf, messages)
+            if not resp then
+                return {
+                    ok = false,
+                    failure_reason = "llm_call",
+                    last_error = tostring(call_err):sub(-800),
+                    iters = iter - 1,
+                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
+                    artifact_path = artifact_path,
+                    history = history,
+                }
+            end
+            local content = (((resp.choices or {})[1] or {}).message or {}).content or ""
             local code = extract_code(content, lang)
 
             -- Full mode: empty code means the LLM produced zero usable edits (bad stagnation).
@@ -2895,9 +2031,8 @@ local function run_loop(conf)
                     }
                 end
                 -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                local retry_msg = "Your previous attempt produced zero successful edits."
-                    .. " You must emit a SEARCH/REPLACE block that actually applies"
-                    .. " — make sure the SEARCH section matches the current file content exactly."
+                local retry_msg = "Your previous attempt produced no usable code."
+                    .. " Output the whole corrected file in a single fenced code block."
                 table.insert(messages, { role = "assistant", content = content })
                 table.insert(messages, { role = "user", content = retry_msg })
             elseif is_stagnant(history) then
@@ -2964,17 +2099,14 @@ end
 function M.make(conf)
     assert(type(conf) == "table", "conf table required")
     assert(type(conf.runner) == "function", "conf.runner function required")
-    -- tool_mode (multi-file only; ignored in single-file mode):
+    -- tool_mode (diff mode only):
     --   "auto" (default) declares read_file / read_file_range / fs_edit,
-    --   "read_only" declares only the read tools (pre-issue-#1 behaviour),
-    --   "none" declares no tools (caller inlines all file contents in the spec),
-    --   "adaptive" starts as "auto" and falls back to "none" (with file contents
-    --   embedded) when the declared tools stall the loop (zero-edit iters /
-    --   tool-call-cap blowout).
+    --   "read_only" declares only the read tools — it can inspect but never
+    --   converge, so it is a dry run rather than a fix.
     local tool_mode = conf.tool_mode or "auto"
     assert(
-        tool_mode == "auto" or tool_mode == "read_only" or tool_mode == "none" or tool_mode == "adaptive",
-        "conf.tool_mode must be one of 'auto' | 'read_only' | 'none' | 'adaptive'"
+        tool_mode == "auto" or tool_mode == "read_only",
+        "conf.tool_mode must be 'auto' or 'read_only' (use edit_mode='full' for a no-tools run)"
     )
 
     -- extra_tools (optional, multi-file only): caller-registered tools in the
@@ -3224,14 +2356,8 @@ function M._test_helpers()
         make_summary = make_summary,
         is_stagnant = is_stagnant,
         fnv1a_hash = fnv1a_hash,
-        parse_search_replace = parse_search_replace,
-        ws_normalize = ws_normalize,
-        apply_blocks = apply_blocks,
-        build_edit_failure_msg = build_edit_failure_msg,
         build_failure_msg = build_failure_msg,
         filter_for_tool_output = filter_for_tool_output,
-        group_blocks_by_path = group_blocks_by_path,
-        build_multifile_edit_failure_msg = build_multifile_edit_failure_msg,
         cl_oai_map_finish_reason = proto_openai.map_finish_reason,
         cl_oai_normalize = cl_oai_normalize,
         cl_oai_convert_messages = proto_openai.convert_messages,

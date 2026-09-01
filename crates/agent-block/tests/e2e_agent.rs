@@ -52,7 +52,7 @@ fn agent_run_emits_structured_meta_logs() {
         .env("AGENT_BLOCK_RUN_ID", "e2e-run-01")
         .assert()
         .success()
-        .stdout(predicate::str::contains("prefix=ab.llm event=request"))
+        .stdout(predicate::str::contains("prefix=ab.obs event=request component=llm"))
         .stdout(predicate::str::contains("trace_id=e2e-trace-01"))
         .stdout(predicate::str::contains("agent_id=e2e-agent-01"))
         .stdout(predicate::str::contains("run_id=e2e-run-01"));
@@ -80,10 +80,29 @@ async fn agent_run_openai_mock_dispatches_tool() {
             .args(["-s", &common::fixture("agent_openai_mock.lua")])
             .env("OPENAI_BASE_URL_TEST", &url_clone)
             .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "off")
+            .env("RUST_LOG", "info")
+            // The dump is emitted by hooks the agent hands to
+            // tool_loop; without this the only coverage is the live-API test
+            // above, which is ignored in CI.
+            .env("AGENT_BLOCK_LLM_DUMP", "meta")
+            .env("AGENT_BLOCK_TRACE_ID", "mock-trace-01")
+            .env("AGENT_BLOCK_RUN_ID", "mock-run-01")
             .assert()
             .success()
-            .stdout(predicate::str::contains("OPENAI_MOCK_TOOL_DISPATCHED_OK"));
+            .stdout(predicate::str::contains("OPENAI_MOCK_TOOL_DISPATCHED_OK"))
+            // request / response / summary, correlated by turn, on both turns
+            .stdout(predicate::str::contains(
+                "prefix=ab.obs event=request component=llm call=1 turn=1 iter=1 trace_id=mock-trace-01",
+            ))
+            .stdout(predicate::str::contains("run_id=mock-run-01"))
+            .stdout(predicate::str::contains("event=response component=llm call=1 turn=1"))
+            .stdout(predicate::str::contains("event=summary component=llm call=1 turn=1"))
+            .stdout(predicate::str::contains("event=request component=llm call=2 turn=2"))
+            // provider tag and decoded accounting survive the move to hooks
+            .stdout(predicate::str::contains("provider=openai"))
+            .stdout(predicate::str::contains("stop_reason=tool_use"))
+            .stdout(predicate::str::contains("tool_uses=1"))
+            .stdout(predicate::str::contains("status=200"));
     })
     .await
     .expect("subprocess assertion task should not panic");
