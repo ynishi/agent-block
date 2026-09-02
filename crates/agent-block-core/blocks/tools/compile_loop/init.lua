@@ -213,6 +213,45 @@ local function obs_event(mode, event_name, fields)
     log.info(format_kv(entries))
 end
 
+-- Summarize an fs_edit `edits` array for the observability line.
+--
+-- Where an edit landed exists only in the call that made it: `modified_set`
+-- keeps which files changed, not which lines. Dropping that leaves the two
+-- questions worth asking about a fix — did it touch the lines it was pointed
+-- at, and how far did it move beyond them — answerable only by argument.
+-- Recording it costs nothing here because edits are addressed by line: a
+-- search-and-replace protocol would have to reconstruct the position after the
+-- fact, if it could at all.
+--
+-- Positions and magnitudes only. `expect` and `replace` are source text and do
+-- not belong in a log line.
+--
+-- @param edits table|nil  Array of { start_line, end_line, expect, replace }
+-- @return string  Addressed ranges, "12-15,40-40" ("" when there are none)
+-- @return integer Lines the edits replace
+-- @return integer Lines they put back
+local function summarize_edits(edits)
+    local ranges, removed, added = {}, 0, 0
+    for _, e in ipairs(edits or {}) do
+        local first, last = tonumber(e.start_line), tonumber(e.end_line)
+        -- An entry without an address is not an edit, so it contributes
+        -- nothing rather than inflating the magnitudes with a phantom range.
+        if first and last then
+            table.insert(ranges, first .. "-" .. last)
+            removed = removed + (last - first + 1)
+            -- An empty replacement deletes the range, so it adds no lines.
+            if type(e.replace) == "string" and e.replace ~= "" then
+                local n = 1
+                for _ in e.replace:gmatch("\n") do
+                    n = n + 1
+                end
+                added = added + n
+            end
+        end
+    end
+    return table.concat(ranges, ","), removed, added
+end
+
 local DEFAULT_SYSTEM = [[You are an expert programmer.
 You will be given a spec and asked to write code that runs and passes its self-checks.
 Output ONLY the complete file contents in a single fenced code block (e.g. ```lua\n...\n```).
@@ -1583,11 +1622,16 @@ local function run_loop(conf)
             -- Signature by resulting version: two different edits that land on
             -- the same content are the same lack of progress.
             table.insert(iter_edit_sigs, path .. "\1" .. tostring(res.version))
-            obs_event(
-                mode,
-                "tool_use",
-                { { "iter", current_iter }, { "path", path }, { "tool", "fs_edit" }, { "ok", true } }
-            )
+            local ranges, removed, added = summarize_edits(input.edits)
+            obs_event(mode, "tool_use", {
+                { "iter", current_iter },
+                { "path", path },
+                { "tool", "fs_edit" },
+                { "ok", true },
+                { "ranges", ranges },
+                { "lines_removed", removed },
+                { "lines_added", added },
+            })
             return "applied " .. tostring(res.applied) .. " edit(s) to " .. path
         end
 
@@ -1611,11 +1655,17 @@ local function run_loop(conf)
             detail = "path '" .. path .. "' is not one of the target files"
         end
         table.insert(iter_edit_errors, detail)
-        obs_event(
-            mode,
-            "tool_use_fail",
-            { { "iter", current_iter }, { "path", path }, { "tool", "fs_edit" }, { "err", res.reason } }
-        )
+        -- A rejected batch changes nothing, so there are no magnitudes to
+        -- report — but where it aimed is what separates an edit that was
+        -- refused from one that landed somewhere other than the lines meant.
+        local attempted = summarize_edits(input.edits)
+        obs_event(mode, "tool_use_fail", {
+            { "iter", current_iter },
+            { "path", path },
+            { "tool", "fs_edit" },
+            { "err", res.reason },
+            { "ranges", attempted },
+        })
         return "ERROR: " .. detail
     end
 
@@ -2340,6 +2390,7 @@ function M._test_helpers()
         is_stagnant_v2 = is_stagnant_v2,
         compute_sr_hash = compute_sr_hash,
         collect_modified_paths = collect_modified_paths,
+        summarize_edits = summarize_edits,
         update_state = update_state,
         build_line_index = build_line_index,
         -- Temperature resolution (for unit testing env override)
