@@ -221,7 +221,11 @@ local run_loop = compile_loop._test_helpers().run_loop
 
 -- A non-empty target is required: single-file diff mode falls back to
 -- whole-file rewriting when the file is empty, and never builds the tool.
-local function run_one_iter(edit_input, edit_result)
+--
+-- Returns the pcall pair so the contract test can inspect a raised error while
+-- the temp file and the pending edit still get cleaned up. Tests that expect a
+-- clean run assert on the lines it emitted, which cannot appear if it threw.
+local function run_one_iter(edit_input, edit_result, runner)
     reset_log()
     pending_edit_input = edit_input
     fs_edit_result = edit_result
@@ -231,13 +235,13 @@ local function run_one_iter(edit_input, edit_result)
     f:write("local a = 1\nlocal b = 2\nreturn a + b\n")
     f:close()
 
-    run_loop({
+    local ok, err = pcall(run_loop, {
         target_files = { path },
         multi_file = false,
         edit_mode = "diff",
         lang = "lua",
         spec = "test",
-        runner = function(_p)
+        runner = runner or function(_p)
             return { ok = true }
         end,
         max_iters = 1,
@@ -245,7 +249,7 @@ local function run_one_iter(edit_input, edit_result)
 
     os.remove(path)
     pending_edit_input = nil
-    return path
+    return ok, err
 end
 
 -- Two edits over five lines, replaced by three. Shared so the range, total and
@@ -308,6 +312,32 @@ describe("compile_loop obs correlation", function()
         local line = find_line("event=iter_start")
         expect(line ~= nil).to.be.truthy()
         expect(line:find("component=compile_loop iter=", 1, true) ~= nil).to.be.truthy()
+    end)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The runner contract, at the call site rather than as data. shapes_test covers
+-- the schema itself; what is checked here is that the loop actually applies it.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop runner contract", function()
+    it("raises on a runner whose result does not match, in dev mode", function()
+        local ok, err = run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" }, function(_p)
+            return { ok = "yes" }
+        end)
+
+        expect(ok).to.equal(false)
+        expect(tostring(err):find("shape violation", 1, true) ~= nil).to.be.truthy()
+        expect(tostring(err):find("conf.runner result", 1, true) ~= nil).to.be.truthy()
+    end)
+
+    it("lets a conforming runner through", function()
+        local ok = run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" }, function(_p)
+            return { ok = true, stdout = "", stderr = "", exit_code = 0 }
+        end)
+
+        expect(ok).to.equal(true)
+        expect(find_line("event=converged") ~= nil).to.be.truthy()
     end)
 end)
 

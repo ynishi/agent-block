@@ -42,7 +42,32 @@ local proto_openai = proto.adapter("openai")
 -- it, repeat. The build stays out here.
 local tool_loop = require("tool_loop")
 
-local agent = require("agent") -- for _llm_ctx_top()
+local agent = require("agent") -- for _llm_ctx_top() and _log_meta()
+
+local lshape = require("lshape")
+local T = lshape.t
+local shape = lshape.check
+
+-- ============================================================
+-- Boundary contracts
+--
+-- These were doc comments, which are worth what the next caller's attention is
+-- worth. Checking is dev-mode only (LSHAPE_CHECK=1), so production pays nothing
+-- and the specs run with it on.
+-- ============================================================
+
+--- What `conf.runner` hands back.
+---
+--- Open: a caller's runner may carry whatever else it likes, and these are the
+--- keys the loop reads. `ok` is the one it branches on — a runner that returns
+--- the wrong thing does not fail at the call, it fails several iterations later
+--- as a run that will not converge, with the log blaming the model.
+local RUNNER_RESULT = T.shape({
+    ok = T.boolean,
+    stdout = T.string:is_optional(),
+    stderr = T.string:is_optional(),
+    exit_code = T.number:is_optional(),
+})
 
 -- ============================================================
 -- Internal constants
@@ -1981,7 +2006,11 @@ local function run_loop(conf)
             bad_stagnation_count = 0
 
             -- Verify. The loop's step, not the model's.
-            local rr = conf.runner(multi_file and conf.target_files or conf.target_files[1]) or {}
+            local rr = shape.assert_dev(
+                conf.runner(multi_file and conf.target_files or conf.target_files[1]),
+                RUNNER_RESULT,
+                "compile_loop conf.runner result (multi-file)"
+            ) or {}
             local entry = { iter = iter, code = nil, result = rr, raw = content }
             table.insert(history, entry)
             obs_event(mode, "iter_result", {
@@ -2082,7 +2111,11 @@ local function run_loop(conf)
             end
 
             -- Single-file runner call with single string path (Crux #3).
-            local rr = conf.runner(single_path) or {}
+            local rr = shape.assert_dev(
+                conf.runner(single_path),
+                RUNNER_RESULT,
+                "compile_loop conf.runner result (single-file)"
+            ) or {}
             local entry = { iter = iter, code = code, result = rr, raw = content }
             table.insert(history, entry)
             obs_event(mode, "iter_result", {
@@ -2428,6 +2461,15 @@ end
 
 --- Expose internal helpers for unit testing (read-only access).
 --- Returns a table of helper functions so tests can call them directly.
+--- The contracts this module holds callers to, as data.
+---
+--- Public rather than test-only: a caller writing a `runner` should be able to
+--- check its own return against the same schema the loop checks it against,
+--- instead of reading a doc comment and hoping.
+M.shapes = {
+    runner_result = RUNNER_RESULT,
+}
+
 function M._test_helpers()
     return {
         should_use_cache = should_use_cache,

@@ -63,6 +63,27 @@ local tool_loop = require("tool_loop")
 -- through tool_loop.
 local proto_openai = require("llm_proto").adapter("openai")
 
+local lshape = require("lshape")
+local T = lshape.t
+local shape = lshape.check
+
+--- The four ab.obs correlation fields.
+---
+--- Closed: this stopped being an internal detail when compile_loop began
+--- resolving its own obs ids through `_log_meta`. Every field is optional
+--- because an unset environment is the ordinary case, but an unexpected key
+--- means the two components have drifted apart on what the fields are — which
+--- is the failure the convention exists to prevent, and it would otherwise show
+--- up as a run that cannot be selected rather than as an error.
+---
+--- Checked only in dev mode (LSHAPE_CHECK=1).
+local LOG_META = T.shape({
+    trace_id = T.string:is_optional(),
+    run_id = T.string:is_optional(),
+    agent_id = T.string:is_optional(),
+    agent_name = T.string:is_optional(),
+}, { open = false })
+
 -- ============================================================
 -- Internal: parent LLM context stack (_AGENT_LLM_CTX)
 -- ============================================================
@@ -251,12 +272,12 @@ local function build_log_meta(opts)
             log.warn("agent: log_meta.task_id / AGENT_BLOCK_TASK_ID is deprecated; use trace_id / AGENT_BLOCK_TRACE_ID")
         end
     end
-    return {
+    return shape.assert_dev({
         trace_id = trace_id,
         agent_id = meta.agent_id or std.env.get("AGENT_BLOCK_AGENT_ID") or std.env.agent_id(),
         agent_name = meta.agent_name or std.env.get("AGENT_BLOCK_AGENT_NAME"),
         run_id = meta.run_id or std.env.get("AGENT_BLOCK_RUN_ID"),
-    }
+    }, LOG_META, "agent log_meta")
 end
 
 --- The four ab.obs correlation fields, resolved from `opts.log_meta` and the
@@ -1229,6 +1250,14 @@ M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 -- Bundle of pure internal helpers exposed for unit testing only.
 -- These functions have no side effects beyond the std/log globals they read;
 -- run behaviour is unchanged (this is a read-only accessor).
+--- The contracts this module holds itself to, as data.
+---
+--- Public so a sibling block consuming `_log_meta` can check against the same
+--- schema rather than a doc comment.
+M.shapes = {
+    log_meta = LOG_META,
+}
+
 function M._test_helpers()
     return {
         map_finish_reason = proto_openai.map_finish_reason,

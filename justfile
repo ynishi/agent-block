@@ -31,8 +31,12 @@ test:
 # mlua-batteries does not compile under, so the runner is its own crate outside
 # the workspace. Rationale: crates/lua-spec-runner/src/main.rs.
 # Optional argument filters fixtures by filename substring.
+#
+# LSHAPE_CHECK=1 turns on the lshape boundary contracts, which are otherwise
+# inert. A contract nothing runs is a comment, so the specs are where they get
+# enforced; production stays unchecked and pays nothing.
 test-lua filter="":
-    cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- {{ filter }}
+    LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- {{ filter }}
 
 # [allow-agent]
 # Format and lint
