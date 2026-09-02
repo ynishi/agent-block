@@ -273,6 +273,54 @@ describe("agent.shapes.run_result", function()
     end)
 end)
 
+-- The call site for this one is exercised by the Rust e2e tests, which run real
+-- MCP servers through the bridge; these cases pin the shape itself.
+describe("agent.shapes.mcp_call_result", function()
+    local schema = agent.shapes.mcp_call_result
+
+    it("accepts a tool that ran and succeeded", function()
+        local ok = check.check({
+            ok = true,
+            content = { { type = "text", text = "result" } },
+            is_error = false,
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    it("accepts a tool that ran and reported failure", function()
+        local ok = check.check({
+            ok = true,
+            content = { { type = "text", text = "boom" } },
+            is_error = true,
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    it("accepts a transport failure", function()
+        expect(check.check({ ok = false, error = "connection refused" }, schema)).to.equal(true)
+    end)
+
+    it("accepts structured content when the server sends it", function()
+        local ok = check.check({
+            ok = true,
+            content = {},
+            is_error = false,
+            structured_content = { rows = 3 },
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    -- Closed on purpose: the bridge builds this table in Rust, and a field
+    -- appearing here that this side does not know about is the drift.
+    it("rejects a field the Lua side does not know about", function()
+        expect(check.check({ ok = true, content = {}, cost_usd = 0.01 }, schema)).to.equal(false)
+    end)
+
+    it("rejects is_error arriving as a string", function()
+        expect(check.check({ ok = true, content = {}, is_error = "true" }, schema)).to.equal(false)
+    end)
+end)
+
 describe("agent._log_meta", function()
     it("returns a value its own contract accepts", function()
         expect(check.check(agent._log_meta(nil), agent.shapes.log_meta)).to.equal(true)

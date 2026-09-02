@@ -18,12 +18,17 @@ build:
 # per binary at roughly 2.5GB each, and this is a shared machine. Doing it in
 # parallel is what exhausted memory and stalled the box for every user on
 # 2026-08-15. Sequential per-crate keeps one linker resident at a time.
+# LSHAPE_CHECK=1 for the same reason as test-lua, and for a reason only this
+# side can serve: the e2e tests drive the blocks through the real bridges, so
+# the contracts on values the host produces get checked against what the host
+# actually produces rather than against a fixture's stub of it. The variable
+# reaches the spawned agent-block process, which is where the assert runs.
 test:
-    cargo test -p agent-block-types
-    cargo test -p agent-block-mcp
-    cargo test -p agent-block-core
-    cargo test -p agent-block
-    cargo test -p agent-block-testkit
+    LSHAPE_CHECK=1 cargo test -p agent-block-types
+    LSHAPE_CHECK=1 cargo test -p agent-block-mcp
+    LSHAPE_CHECK=1 cargo test -p agent-block-core
+    LSHAPE_CHECK=1 cargo test -p agent-block
+    LSHAPE_CHECK=1 cargo test -p agent-block-testkit
 
 # [allow-agent]
 # Run the Lua spec fixtures (mlua-lspec) in crates/agent-block/tests/fixtures/.

@@ -120,6 +120,25 @@ local RUN_ERR = T.shape({
 
 local RUN_RESULT = T.any_of({ RUN_OK, RUN_ERR })
 
+--- What `mcp.call` hands back across the host boundary.
+---
+--- The bridge builds this table field by field in Rust and nothing on this side
+--- described it, so the two languages agreed by coincidence and review. Closed:
+--- a field added on the Rust side that this side does not know about is exactly
+--- the drift worth catching, and the e2e tests run real servers through this
+--- path, so the check has somewhere to fire.
+---
+--- `ok = false` covers transport, protocol and timeout failures and carries
+--- `error`. A tool that ran and reported failure comes back `ok = true` with
+--- `is_error = true`, which is why the two are separate fields rather than one.
+local MCP_CALL_RESULT = T.shape({
+    ok = T.boolean,
+    error = T.string:is_optional(),
+    content = T.table:is_optional(),
+    is_error = T.boolean:is_optional(),
+    structured_content = T.any:is_optional(),
+}, { open = false })
+
 -- ============================================================
 -- Internal: parent LLM context stack (_AGENT_LLM_CTX)
 -- ============================================================
@@ -889,7 +908,8 @@ local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
     -- 1. MCP path (namespaced tools)
     if mcp_tool_map[name] then
         local entry = mcp_tool_map[name]
-        local call_result = mcp.call(entry.server, entry.tool, input)
+        local call_result =
+            shape.assert_dev(mcp.call(entry.server, entry.tool, input), MCP_CALL_RESULT, "mcp.call result")
         -- ok=false covers transport / protocol / timeout failures only.
         if not call_result.ok then
             return tostring(call_result.error or "mcp.call failed"), true
@@ -1303,6 +1323,7 @@ M.shapes = {
     log_meta = LOG_META,
     usage = USAGE,
     run_result = RUN_RESULT,
+    mcp_call_result = MCP_CALL_RESULT,
 }
 
 function M._test_helpers()

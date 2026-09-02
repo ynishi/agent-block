@@ -26,4 +26,18 @@ end
 assert(found, "increment tool not found in list_tools response")
 
 print("LIST_TOOLS_OK")
+
+-- Call it for real, then check the result against the shape the Lua side
+-- publishes for mcp.call. The bridge assembles that table field by field in
+-- Rust; this is the success branch checked against a running server rather than
+-- against a fixture's idea of one.
+local call = mcp.call("counter", "increment", {})
+assert(call.ok == true, "call_tool ok=false: " .. tostring(call.error))
+
+local shape_check = require("lshape").check
+local mcp_call_result = require("agent").shapes.mcp_call_result
+local shape_ok, why = shape_check.check(call, mcp_call_result)
+assert(shape_ok, "mcp.call result violated its shape: " .. tostring(why))
+print("CALL_TOOL_SHAPE_OK")
+
 print("FIXTURE_DONE")
