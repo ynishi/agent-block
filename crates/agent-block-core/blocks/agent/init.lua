@@ -84,6 +84,42 @@ local LOG_META = T.shape({
     agent_name = T.string:is_optional(),
 }, { open = false })
 
+--- Token accounting. `thinking_tokens` is optional because the two
+--- fail-before-we-started paths return a literal zeroed table rather than a
+--- tracker summary.
+local USAGE = T.shape({
+    input_tokens = T.number,
+    output_tokens = T.number,
+    total_tokens = T.number,
+    thinking_tokens = T.number:is_optional(),
+})
+
+--- What `run` returns, as the two things it can be.
+---
+--- `run` never throws; every failure comes back as `ok = false` with an
+--- `error`. Two closed alternatives say that in a way that can be checked:
+--- success carries `content` and no `error`, failure carries `error` and no
+--- `content`. A single shape with both optional would accept the result that
+--- has neither, which is the shape a caller cannot do anything with and the one
+--- a half-finished error path produces.
+local RUN_OK = T.shape({
+    ok = T.literal(true),
+    content = T.string,
+    usage = USAGE,
+    num_turns = T.number,
+    messages = T.array_of(T.table),
+}, { open = false })
+
+local RUN_ERR = T.shape({
+    ok = T.literal(false),
+    error = T.string,
+    usage = USAGE,
+    num_turns = T.number,
+    messages = T.array_of(T.table),
+}, { open = false })
+
+local RUN_RESULT = T.any_of({ RUN_OK, RUN_ERR })
+
 -- ============================================================
 -- Internal: parent LLM context stack (_AGENT_LLM_CTX)
 -- ============================================================
@@ -964,7 +1000,16 @@ end
 ---   error      string  (when ok=false)
 ---   messages   table   (full conversation history)
 --- }
+---
+--- The contract is checked on the way out in dev mode (LSHAPE_CHECK=1); see
+--- `M.shapes.run_result`. Wrapped rather than asserted at each `return` because
+--- there are five of them and a sixth added later would be the one that skips
+--- the check.
 function M.run(opts)
+    return shape.assert_dev(M._run_impl(opts), RUN_RESULT, "agent.run result")
+end
+
+function M._run_impl(opts)
     opts = opts or {}
 
     -- Validate required fields
@@ -1256,6 +1301,8 @@ M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 --- schema rather than a doc comment.
 M.shapes = {
     log_meta = LOG_META,
+    usage = USAGE,
+    run_result = RUN_RESULT,
 }
 
 function M._test_helpers()

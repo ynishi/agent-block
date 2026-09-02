@@ -133,6 +133,146 @@ describe("agent.shapes.log_meta", function()
     end)
 end)
 
+describe("compile_loop.shapes.tool_output", function()
+    local schema = compile_loop.shapes.tool_output
+
+    it("accepts the single-file form", function()
+        local ok = check.check({
+            ok = true,
+            iters = 4,
+            summary = "PASS in 4 iters",
+            artifact_path = "/abs/x.lua",
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    it("accepts the multi-file form", function()
+        local ok = check.check({
+            ok = true,
+            iters = 2,
+            summary = "PASS in 2 iters",
+            modified_files = { "/abs/a.lua", "/abs/b.lua" },
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    it("accepts a failure carrying its reason", function()
+        local ok = check.check({
+            ok = false,
+            iters = 5,
+            summary = "give-up: max_iters reached (5)",
+            failure_reason = "max_iters",
+            last_error = "still failing",
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    -- The Counter WF-A defence, as something that fails rather than something
+    -- that is written down next to the fields it is about.
+    it("rejects leaked code", function()
+        local ok = check.check({
+            ok = true,
+            iters = 1,
+            summary = "PASS in 1 iters",
+            code = "print('leaked source')",
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects leaked history", function()
+        local ok = check.check({
+            ok = true,
+            iters = 1,
+            summary = "PASS in 1 iters",
+            history = { { iter = 1 } },
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects modified_files holding something other than paths", function()
+        local ok = check.check({
+            ok = true,
+            iters = 1,
+            summary = "PASS in 1 iters",
+            modified_files = { 1, 2 },
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+end)
+
+describe("agent.shapes.run_result", function()
+    local schema = agent.shapes.run_result
+    local usage = { input_tokens = 1, output_tokens = 2, total_tokens = 3 }
+
+    it("accepts a success carrying content", function()
+        local ok = check.check({
+            ok = true,
+            content = "done",
+            usage = usage,
+            num_turns = 2,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    it("accepts a failure carrying an error", function()
+        local ok = check.check({
+            ok = false,
+            error = "prompt is required",
+            usage = usage,
+            num_turns = 0,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+
+    -- Neither alternative admits this, which is the reason for two shapes
+    -- rather than one with both fields optional.
+    it("rejects a result that says neither what happened nor what went wrong", function()
+        local ok = check.check({
+            ok = true,
+            usage = usage,
+            num_turns = 1,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects a success that also carries an error", function()
+        local ok = check.check({
+            ok = true,
+            content = "done",
+            error = "but also this",
+            usage = usage,
+            num_turns = 1,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects usage missing its counters", function()
+        local ok = check.check({
+            ok = true,
+            content = "done",
+            usage = { input_tokens = 1 },
+            num_turns = 1,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(false)
+    end)
+
+    it("accepts a tracker summary carrying thinking_tokens", function()
+        local ok = check.check({
+            ok = true,
+            content = "done",
+            usage = { input_tokens = 1, output_tokens = 2, total_tokens = 3, thinking_tokens = 4 },
+            num_turns = 1,
+            messages = {},
+        }, schema)
+        expect(ok).to.equal(true)
+    end)
+end)
+
 describe("agent._log_meta", function()
     it("returns a value its own contract accepts", function()
         expect(check.check(agent._log_meta(nil), agent.shapes.log_meta)).to.equal(true)

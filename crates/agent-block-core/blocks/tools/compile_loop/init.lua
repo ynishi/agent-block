@@ -69,6 +69,28 @@ local RUNNER_RESULT = T.shape({
     exit_code = T.number:is_optional(),
 })
 
+--- What the tool handler gives back to whoever called it.
+---
+--- Closed, and that is the point: the loop's own result carries `code` and
+--- `history`, and the reason they are stripped here is that handing a caller a
+--- transcript of every iteration contaminates its context — the Counter WF-A
+--- defence. Stated as a comment, that invariant holds until someone adds a
+--- field; stated as a closed shape, adding one fails.
+---
+--- `artifact_path` and `modified_files` are each other's alternative rather than
+--- both optional in spirit: single-file mode sets the first, multi-file the
+--- second. Expressed as two optionals because a run that edited nothing in
+--- multi-file mode legitimately has neither.
+local TOOL_OUTPUT = T.shape({
+    ok = T.boolean,
+    iters = T.number,
+    summary = T.string,
+    artifact_path = T.string:is_optional(),
+    modified_files = T.array_of(T.string):is_optional(),
+    failure_reason = T.string:is_optional(),
+    last_error = T.string:is_optional(),
+}, { open = false })
+
 -- ============================================================
 -- Internal constants
 -- ============================================================
@@ -844,7 +866,7 @@ end
 -- For single-file mode: artifact_path is the absolute path, modified_files is nil.
 -- For multi-file mode: artifact_path is nil, modified_files is list<path>.
 local function filter_for_tool_output(res)
-    return {
+    return shape.assert_dev({
         ok = res.ok,
         artifact_path = res.artifact_path, -- single-file: abs path; multi-file: nil
         modified_files = res.modified_files, -- multi-file: list<path>; single-file: nil
@@ -854,7 +876,7 @@ local function filter_for_tool_output(res)
         last_error = res.last_error,
         -- code:    excluded (Counter WF-A defence)
         -- history: excluded (circular-ref risk + context contamination)
-    }
+    }, TOOL_OUTPUT, "compile_loop tool output")
 end
 
 -- ============================================================
@@ -2468,6 +2490,7 @@ end
 --- instead of reading a doc comment and hoping.
 M.shapes = {
     runner_result = RUNNER_RESULT,
+    tool_output = TOOL_OUTPUT,
 }
 
 function M._test_helpers()

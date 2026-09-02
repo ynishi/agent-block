@@ -193,10 +193,14 @@ describe("compile_loop.filter_for_tool_output", function()
         expect(out.summary).to.equal("PASS in 4 iters")
     end)
 
+    -- `summary` is present on every run_loop return path, so leaving it out
+    -- here made the input a shape the loop never actually produces. The tool
+    -- output contract says so now, and says it by failing.
     it("strips code and history to prevent context contamination", function()
         local out = filter({
             ok = false,
             iters = 1,
+            summary = "give-up: max_iters reached (1)",
             code = "print('leaked source')",
             history = { { anything = true } },
         })
