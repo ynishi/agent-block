@@ -1,8 +1,8 @@
 -- compile_loop_state_test.lua — mlua-lspec unit tests for ST1 mf_state field additions.
 --
 -- Run via:
---   just test-lua compile_loop_state   # this file
---   just test-lua                      # every spec fixture
+--   just test-lua compile_loop_state_test   # this file
+--   just test-lua                           # every spec fixture
 --
 -- Verifies:
 --   1. mf_state.file_digest is an empty table (not nil, not any other type)
@@ -185,19 +185,6 @@ end
 if not tool then
     tool = { register = function() end }
 end
--- `llm` comes from the runtime's llm bridge (llm-extract behind it), which the
--- spec runner does not load. compile_loop calls llm.extract_code() on every
--- model reply; the fake replies below carry no code fence, and for unfenced
--- input the real function returns the text unchanged — so identity here is what
--- production does, not an approximation of it. Fence handling has its own tests
--- in agent-block-core/src/bridge/llm.rs.
-if not llm then
-    llm = {
-        extract_code = function(text, _lang)
-            return text
-        end,
-    }
-end
 if not std then
     std = {
         env  = {
@@ -205,9 +192,9 @@ if not std then
             get_or = function(_name, default) return default end,
         },
         json = { encode = function(v) return tostring(v) end },
-        -- std.fs comes from the runtime's fs bridge, which the spec runner does
-        -- not load. run_loop builds the edit tool spec unconditionally — even in
-        -- edit_mode="full", which is what these tests use and which writes
+        -- std.fs comes from the runtime's fs bridge, which the harness does not
+        -- load. run_loop builds the edit tool spec unconditionally — even in
+        -- edit_mode="full", which is what the tests below use and which writes
         -- through io.open — so shape alone is enough to reach them.
         --
         -- The handler raises instead of reporting success: a diff-mode test
@@ -296,7 +283,7 @@ describe("temperature in OpenAI body via _test_set_llm_call capture", function()
             return {
                 choices = { {
                     message = {
-                        content = "print('hi')",
+                        content = "```lua\nprint('hi')\n```",
                         role    = "assistant",
                     },
                 } },
@@ -396,7 +383,7 @@ end
 -- This exercises the good stagnation path (is_stagnant fires after 3 identical stderr runs).
 local function run_good_stagnation()
     compile_loop._test_set_llm_call(function(_opts, _msgs)
-        return { choices = { { message = { content = "print('x')", role = "assistant" } } } }
+        return { choices = { { message = { content = "```lua\nprint('x')\n```", role = "assistant" } } } }
     end)
     local conf = make_run_conf({
         runner = function(_path)
@@ -447,7 +434,7 @@ describe("bad stagnation reset — count resets on successful edit", function()
             if is_empty then
                 return { choices = { { message = { content = "", role = "assistant" } } } }
             else
-                return { choices = { { message = { content = "print('hi')", role = "assistant" } } } }
+                return { choices = { { message = { content = "```lua\nprint('hi')\n```", role = "assistant" } } } }
             end
         end)
 

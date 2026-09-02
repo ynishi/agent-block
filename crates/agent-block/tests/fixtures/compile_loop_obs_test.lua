@@ -1,10 +1,8 @@
 -- compile_loop_obs_test.lua — mlua-lspec unit tests for edit observability.
 --
 -- Run via:
---   mcp__lua-debugger__test_launch(
---     code_file    = "tests/fixtures/compile_loop_obs_test.lua",
---     search_paths = ["blocks"]
---   )
+--   just test-lua compile_loop_obs_test   # this file
+--   just test-lua                         # every spec fixture
 --
 -- Covers summarize_edits, which turns the `edits` array of an fs_edit call into
 -- the position and magnitude fields of the tool_use / tool_use_fail obs lines,

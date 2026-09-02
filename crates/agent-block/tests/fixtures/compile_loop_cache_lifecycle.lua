@@ -1,8 +1,8 @@
 -- compile_loop_cache_lifecycle.lua — mlua-lspec unit tests for ST2 cache lifecycle.
 --
 -- Run via:
---   just test-lua cache_lifecycle      # this file
---   just test-lua                      # every spec fixture
+--   just test-lua compile_loop_cache_lifecycle   # this file
+--   just test-lua                                # every spec fixture
 --
 -- Tests cover AC #12 (subtask-2.md):
 --   #1 cache hit (mtime match + auto TTL): distill call_count unchanged

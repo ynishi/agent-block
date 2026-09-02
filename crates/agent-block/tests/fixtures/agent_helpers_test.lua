@@ -1,7 +1,7 @@
 -- agent_helpers_test.lua — mlua-lspec unit tests for pure helpers in blocks/agent/init.lua.
 --
 -- Run via:
---   just test-lua agent_helpers        # this file
+--   just test-lua agent_helpers_test   # this file
 --   just test-lua                      # every spec fixture
 --
 -- These exercise the I/O-free branches exposed by agent._test_helpers():

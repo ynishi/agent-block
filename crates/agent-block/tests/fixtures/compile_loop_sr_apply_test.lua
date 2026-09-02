@@ -2,10 +2,11 @@
 -- summary / feedback / normalization branches of blocks/tools/compile_loop/init.lua.
 --
 -- Run via:
---   just test-lua sr_apply             # this file
---   just test-lua                      # every spec fixture
+--   just test-lua compile_loop_sr_apply_test   # this file
+--   just test-lua                              # every spec fixture
 --
 -- Covers the I/O-free helpers exposed via compile_loop._test_helpers():
+--   * extract_code           — fenced code extraction (lang fence / any fence / raw)
 --   * make_summary           — PASS / give-up summary strings per failure_reason
 --   * fnv1a_hash/compute_sr_hash — stable hashing + whitespace normalization
 --   * build_failure_msg      — runner stdout/stderr/exit_code feedback body
@@ -78,10 +79,25 @@ end
 -- against `expect` and a `base` version — is covered by tests/e2e_fs_edit.rs
 -- and the unit tests in agent-block-core/src/bridge/fs.rs.
 
--- extract_code is a one-line delegate to the `llm` bridge; the fence-matching
--- cases live with the implementation in agent-block-core/src/bridge/llm.rs.
--- Calling it here would need an `llm` stub, and the test would then assert
--- against the stub rather than the matcher.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- extract_code
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop.extract_code", function()
+    local extract = H.extract_code
+
+    it("extracts a language-specific fenced block", function()
+        expect(extract("```lua\nprint('x')\n```", "lua")).to.equal("print('x')")
+    end)
+
+    it("falls back to any fence when the lang fence is absent", function()
+        expect(extract("```python\nx = 1\n```", "lua")).to.equal("x = 1")
+    end)
+
+    it("returns raw text when no fence is present", function()
+        expect(extract("no fences here", "lua")).to.equal("no fences here")
+    end)
+end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- make_summary

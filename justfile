@@ -1,11 +1,10 @@
 # task-mcp justfile (rust)
 
 # [allow-agent]
-# Pre-commit quality check (fmt → clippy → test)
-check:
-    cargo fmt --all
-    cargo clippy --workspace --no-deps -- -D warnings
-    cargo test --workspace
+# Everything a commit has to pass: format, lint, Rust tests, Lua specs.
+# Run this — not a hand-assembled cargo line — so the gate is the same every
+# time and the Lua side is never the part that gets skipped.
+check: lint test test-lua
 
 # [allow-agent]
 # Build only
@@ -13,9 +12,18 @@ build:
     cargo build --workspace
 
 # [allow-agent]
-# Run tests only
+# Rust tests, one crate at a time.
+#
+# Deliberately not `--workspace`: that links every test binary at once, one mold
+# per binary at roughly 2.5GB each, and this is a shared machine. Doing it in
+# parallel is what exhausted memory and stalled the box for every user on
+# 2026-08-15. Sequential per-crate keeps one linker resident at a time.
 test:
-    cargo test --workspace
+    cargo test -p agent-block-types
+    cargo test -p agent-block-mcp
+    cargo test -p agent-block-core
+    cargo test -p agent-block
+    cargo test -p agent-block-testkit
 
 # [allow-agent]
 # Run the Lua spec fixtures (mlua-lspec) in crates/agent-block/tests/fixtures/.

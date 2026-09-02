@@ -436,15 +436,21 @@ local function update_state(state, opts)
     end
 end
 
--- Extract the fenced code block matching the lang label, falling back to any
--- fence and then to the text itself.
---
--- The matching lives in the `llm` bridge rather than in Lua patterns: the
--- pattern version failed every branch when the model left the closing fence
--- off, and handed back the whole response — think-text included — as if it
--- were code.
+-- Extract the FIRST fenced code block matching the lang label, falling back to any fence.
 local function extract_code(text, lang)
-    return llm.extract_code(text, lang or "lua")
+    lang = lang or "lua"
+    -- Try language-specific fence first
+    local m = text:match("```" .. lang .. "%s*\n(.-)\n```")
+    if m then
+        return m
+    end
+    -- Fallback: any fence
+    m = text:match("```%w*%s*\n(.-)\n```")
+    if m then
+        return m
+    end
+    -- Last resort: raw text (LLM forgot fences)
+    return text
 end
 
 -- Minimal OpenAI-compatible chat call. Mirrors agent/init.lua llm_call_openai
@@ -1498,8 +1504,7 @@ local function run_loop(conf)
     -- In multi-file mode, artifact_path is nil; modified_files carries the list.
     local artifact_path = (not multi_file) and conf.target_files[1] or nil
 
-    -- Membership set for the read tools: a path outside the target list is
-    -- refused rather than read.
+    -- Build a set for fast path-header validation in parse_search_replace.
     local target_files_set = {}
     for _, p in ipairs(conf.target_files) do
         target_files_set[p] = true

@@ -52,7 +52,9 @@ fn agent_run_emits_structured_meta_logs() {
         .env("AGENT_BLOCK_RUN_ID", "e2e-run-01")
         .assert()
         .success()
-        .stdout(predicate::str::contains("prefix=ab.obs event=request component=llm"))
+        .stdout(predicate::str::contains(
+            "prefix=ab.obs event=request component=llm",
+        ))
         .stdout(predicate::str::contains("trace_id=e2e-trace-01"))
         .stdout(predicate::str::contains("agent_id=e2e-agent-01"))
         .stdout(predicate::str::contains("run_id=e2e-run-01"));

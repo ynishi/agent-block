@@ -1,8 +1,8 @@
 -- compile_loop_distill.lua — mlua-lspec unit tests for ST3 distill subloop.
 --
 -- Run via:
---   just test-lua distill              # this file
---   just test-lua                      # every spec fixture
+--   just test-lua compile_loop_distill   # this file
+--   just test-lua                        # every spec fixture
 --
 -- Tests cover subtask-3.md AC #10:
 --   #1 chunk_by_lines: 600 line input → 200-line chunks × 3
