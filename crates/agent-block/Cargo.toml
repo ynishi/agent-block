@@ -27,10 +27,15 @@ agent-block-mcp.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rustls.workspace = true
+# `server` (and transitively `transport-async-rw`, which the stdio transport is
+# built from) for `agent-block mcp`. The workspace default enables the client
+# features the SDK needs; cargo unions the two.
+rmcp = { workspace = true, features = ["server"] }
 
 [dev-dependencies]
 assert_cmd = "2"

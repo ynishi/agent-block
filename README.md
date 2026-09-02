@@ -109,6 +109,66 @@ Both flags also accept environment variables as fallback:
 | `--prompt` | `AGENT_BLOCK_PROMPT` |
 | `-c / --context` | `AGENT_BLOCK_CONTEXT` |
 
+## Serving blocks over MCP
+
+`agent-block mcp` serves a directory of `.lua` blocks to an MCP client as one
+`run_block` tool. The same scripts the CLI runs become callable from an agent
+that speaks MCP, without that agent knowing where they live:
+
+```sh
+agent-block mcp --block-dir ./blocks
+```
+
+```json
+{
+  "mcpServers": {
+    "agent-block": {
+      "command": "agent-block",
+      "args": ["mcp", "--block-dir", "/abs/path/to/blocks", "--project", "/abs/path/to/project"]
+    }
+  }
+}
+```
+
+A block runs against its own model with its own credentials, so its LLM turns
+never enter the calling agent's context — only its return value does. That is
+the point of the mode: a caller strong at planning and review hands the loop
+off and gets one value back.
+
+**The contract is one line: a block returns a JSON string.**
+
+```lua
+-- blocks/summarize.lua
+-- Summarize the prompt. Returns { ok, text }.
+local agent = require("agent")
+local r = agent.run({ prompt = _PROMPT, system = _CONTEXT })
+return std.json.encode({ ok = r.ok, text = r.text })
+```
+
+The host stringifies whatever the chunk evaluates to, and a Lua table
+stringifies to `table: 0x…` — hence `std.json.encode`. `_PROMPT` / `_CONTEXT`
+carry the tool's `prompt` / `context` arguments, exactly as the CLI flags do.
+
+| Surface | Meaning |
+|---|---|
+| tool `run_block` | run one registered block; `block` is an enum of the registered names |
+| resource `agent-block://guide` | the authoring contract, in full |
+| resource `agent-block://blocks` | the registry as JSON |
+| resource `agent-block://blocks/<name>` | one block's source |
+
+Only `.lua` files directly inside a `--block-dir` are callable, and the
+directories are re-scanned per request — a new block is callable as soon as the
+file lands, without restarting the server. A block's leading `--` comment is
+what the caller reads as its description, so it is worth writing.
+
+A Lua error comes back as a failed tool call carrying the message. A block that
+ran and concluded "no" should return normally and say so in its JSON: the two
+are different events and only the block knows which happened.
+
+Because stdio transport owns stdout, this mode writes its logs to stderr, which
+is where MCP clients surface server logs — including the `ab.obs` lines when
+`AGENT_BLOCK_LLM_DUMP=meta` is set.
+
 ## Sandbox mode (Linux)
 
 `--sandbox` wraps the whole process in an OS-level execution boundary built from

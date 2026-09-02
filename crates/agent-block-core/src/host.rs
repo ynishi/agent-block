@@ -1422,12 +1422,17 @@ async fn inject_host_tools(isle: &Arc<AsyncIsle>, host_tools: &[HostToolSpec]) -
 /// Execute the resolved Lua script on the main Isle, racing it against the
 /// optional caller `shutdown_token`. On cancellation the Isle is unwound via
 /// its own cancel token before returning [`BlockError::Cancelled`].
+///
+/// The returned string is the chunk's value, stringified by the Isle: a Lua
+/// string passes through unchanged, `nil` becomes empty, and a table becomes
+/// `table: 0x…`. A caller that wants structured data back therefore has the
+/// script `return std.json.encode(t)` — see [`run_capture`].
 async fn execute_script(
     isle: &Arc<AsyncIsle>,
     script_source: &str,
     script_name: &str,
     shutdown_token: Option<&CancellationToken>,
-) -> BlockResult<()> {
+) -> BlockResult<String> {
     let _exec_span = info_span!("execute", script = %script_name);
 
     let mut task = isle.spawn_coroutine_eval(script_source);
@@ -1445,12 +1450,11 @@ async fn execute_script(
                     info!("shutdown_token: cancelled by caller");
                     Err(BlockError::Cancelled)
                 }
-                res = &mut task => res.map(|_| ()).map_err(|e| BlockError::Script(format!("{e}"))),
+                res = &mut task => res.map_err(|e| BlockError::Script(format!("{e}"))),
             }
         }
         None => (&mut task)
             .await
-            .map(|_| ())
             .map_err(|e| BlockError::Script(format!("{e}"))),
     }
 }
@@ -1535,7 +1539,30 @@ async fn shutdown(
 /// runtime error ([`BlockError::Script`]). When a `shutdown_token` is supplied
 /// and fires before the script finishes, returns [`BlockError::Cancelled`]
 /// after the shutdown sequence completes.
+///
+/// Use [`run_capture`] when the caller needs the script's value rather than
+/// only its success.
 pub async fn run(config: BlockConfig) -> BlockResult<()> {
+    run_capture(config).await.map(|_| ())
+}
+
+/// [`run`], returning what the script evaluated to.
+///
+/// Same orchestration, one difference: the chunk's value comes back instead of
+/// being dropped. It arrives stringified — a Lua string unchanged, `nil` as the
+/// empty string, a table as `table: 0x…`, which is useless to a caller. So the
+/// contract for a script meant to be consumed this way is to **return a JSON
+/// string**:
+///
+/// ```lua
+/// return std.json.encode({ ok = true, summary = "…" })
+/// ```
+///
+/// This exists for hosts that invoke a block on someone else's behalf and have
+/// to hand the outcome back across a boundary — the MCP server mode
+/// (`agent-block mcp`) is the first such caller. Nothing about the run differs;
+/// a script that returns nothing simply yields an empty string.
+pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // ── Resolve sources ───────────────────────────────────────────
     // Convert the `Source` enums on `BlockConfig` to their concrete
     // payloads before any Isle setup. `File`/`Path`/`Env` variants

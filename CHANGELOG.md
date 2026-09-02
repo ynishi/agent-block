@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent-block mcp` — serve a directory of `.lua` blocks to an MCP client over
+  stdio as one `run_block` tool. The CLI could already run a block per process,
+  but a Bash invocation is in no tool list, so a calling agent had no way to
+  discover that a block exists. The `block` argument is an enum of the
+  registered names, so the callable set is exactly the registered set. A block
+  returns a JSON string and that string is the tool result; its own LLM turns
+  stay out of the caller's context. Resources carry the authoring contract
+  (`agent-block://guide`), the registry (`agent-block://blocks`) and each
+  block's source (`agent-block://blocks/<name>`). Block directories are
+  re-scanned per request, so a new block needs no restart.
+- `host::run_capture` — `run` returning what the script evaluated to instead of
+  discarding it. The value was already produced and dropped; a host invoking a
+  block on someone else's behalf has to hand the outcome back across a
+  boundary. `run` is now a wrapper over it and behaves as before.
 - `llm_proto` package (`blocks/lib/llm_proto/`): provider-neutral LLM wire protocol
   layer shared by the `agent` and `compile_loop` blocks. Request building,
   `tool_choice` / `thinking` translation, and response normalization now have a
@@ -74,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MemoryResolver`), replacing the hand-rolled `package.searchers` hook. The
   priority chain is unchanged: script dir, then `project_root/blocks`, then
   `exe_dir/blocks`, then the embedded sources.
+- `-s / --script` is no longer required by clap, because a subcommand can now
+  stand in for it; omitting both is still an error, raised by the CLI with a
+  message naming both ways forward. `-p / --project` and `--mcp-timeout-secs`
+  became global arguments, so they may be written on either side of a
+  subcommand. `agent-block -s <script> …` is unchanged.
 
 ## [0.35.1] - 2026-08-31
 

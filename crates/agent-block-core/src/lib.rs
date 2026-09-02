@@ -40,4 +40,4 @@ pub mod bus;
 pub mod host;
 pub mod sandbox;
 
-pub use host::{run, BlockConfig, BlockConfigBuilder, HostContext};
+pub use host::{run, run_capture, BlockConfig, BlockConfigBuilder, HostContext};

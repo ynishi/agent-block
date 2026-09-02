@@ -3,8 +3,10 @@
 //! Parses command-line arguments, optionally enters the sandbox, and launches
 //! the Host. The binary is intentionally thin — all logic lives in Lua scripts.
 
+mod mcp_serve;
+
 use anyhow::Context as _;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -19,9 +21,14 @@ use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
     about = "Single-purpose agent building block with built-in mesh communication"
 )]
 struct Cli {
-    /// Lua script path
+    /// Subcommand. Omit to run a single script via `-s` — the original and
+    /// still the default form.
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Lua script path. Required unless a subcommand is given.
     #[arg(short = 's', long)]
-    script: PathBuf,
+    script: Option<PathBuf>,
 
     /// Relay URL (optional; mesh features disabled if not set)
     #[arg(short = 'r', long)]
@@ -33,12 +40,16 @@ struct Cli {
     secret_key: Option<String>,
 
     /// Project root directory
-    #[arg(short = 'p', long, default_value = ".")]
+    ///
+    /// `global` so it can be written on either side of a subcommand: it means
+    /// the same thing for a single script and for a served block, and having to
+    /// remember which side it goes on is a usage error waiting to happen.
+    #[arg(short = 'p', long, default_value = ".", global = true)]
     project: PathBuf,
 
     /// Per-RPC timeout for MCP round-trips (seconds). Must be > 0.
     /// Applied uniformly to connect / list_tools / call_tool.
-    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..), global = true)]
     mcp_timeout_secs: Option<u64>,
 
     /// Prompt string injected as `_PROMPT` Lua global.
@@ -79,6 +90,18 @@ struct Cli {
     sandbox: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Serve registered `.lua` blocks to an MCP client over stdio.
+    ///
+    /// Register it with an MCP client the way any stdio server is registered:
+    ///
+    /// ```json
+    /// { "command": "agent-block", "args": ["mcp", "--block-dir", "/path/to/blocks"] }
+    /// ```
+    Mcp(mcp_serve::McpArgs),
+}
+
 // Deliberately *not* `#[tokio::main]`: the sandbox has to be installed before
 // any worker thread exists (see `startup` below).
 fn main() {
@@ -105,14 +128,22 @@ fn startup() -> anyhow::Result<()> {
     // rustls transitively; without this the first WSS connect panics.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Parsed before tracing is installed because the destination depends on the
+    // subcommand: `mcp` speaks JSON-RPC on stdout, so a log line written there
+    // is a protocol violation, not noise. Nothing logs before this point.
     let cli = Cli::parse();
+    let log_to_stderr = matches!(cli.command, Some(Command::Mcp(_)));
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if log_to_stderr {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // The SDK host loads `{project}/.env` as well, but that happens far too late
     // for the sandbox knobs. dotenvy never overwrites an already-set variable,
@@ -139,6 +170,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         .mcp_timeout_secs
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RPC_TIMEOUT);
+
+    if let Some(Command::Mcp(args)) = cli.command {
+        return mcp_serve::serve(args, &cli.project, mcp_rpc_timeout).await;
+    }
+
+    // clap cannot mark `script` required now that a subcommand can stand in for
+    // it, so the check moves here. The message names both spellings because it
+    // replaces clap's own missing-argument error, which named `--script`.
+    let script = cli
+        .script
+        .context("no script given: pass -s/--script <PATH>, or use a subcommand (see --help)")?;
 
     // Map the CLI argument shapes to the SDK `Source` enums. File-backed
     // variants are read eagerly here so the error message carries the
@@ -170,7 +212,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    let mut builder = BlockConfig::builder(ScriptSource::Path(cli.script), cli.project)
+    let mut builder = BlockConfig::builder(ScriptSource::Path(script), cli.project)
         .mcp_rpc_timeout(mcp_rpc_timeout);
     if let Some(relay) = cli.relay {
         builder = builder.relay_url(relay);
