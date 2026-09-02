@@ -1,23 +1,23 @@
--- compile_loop_sr_apply_test.lua — mlua-lspec unit tests for the pure SEARCH/REPLACE
--- parse + apply + summary/feedback branches of blocks/tools/compile_loop/init.lua.
+-- compile_loop_sr_apply_test.lua — mlua-lspec unit tests for the pure
+-- summary / feedback / normalization branches of blocks/tools/compile_loop/init.lua.
 --
 -- Run via:
 --   mcp__lua-debugger__test_launch(
 --     code_file    = "crates/agent-block/tests/fixtures/compile_loop_sr_apply_test.lua",
---     search_paths = ["crates/agent-block-core/blocks"]
+--     search_paths = [
+--       "crates/agent-block-core/blocks/tools",   -- compile_loop
+--       "crates/agent-block-core/blocks/lib",     -- llm_proto, tool_loop
+--       "crates/agent-block-core/blocks",         -- agent
+--     ]
 --   )
 --
 -- Covers the I/O-free helpers exposed via compile_loop._test_helpers():
---   * parse_search_replace   — single / multi-file marker parsing + malformed inputs
---   * ws_normalize           — whitespace collapse
---   * apply_blocks           — exact + whitespace-normalized match, failures
---   * extract_code           — fenced code extraction (lang fence / any fence / raw)
 --   * make_summary           — PASS / give-up summary strings per failure_reason
 --   * fnv1a_hash/compute_sr_hash — stable hashing + whitespace normalization
---   * group_blocks_by_path   — grouping SR blocks by path (nil → false key)
---   * build_edit_failure_msg / build_multifile_edit_failure_msg / build_failure_msg
+--   * build_failure_msg      — runner stdout/stderr/exit_code feedback body
 --   * filter_for_tool_output — code/history stripping (context-contamination defence)
---   * cl_oai_map_finish_reason — OpenAI finish_reason mapping
+--   * cl_oai_normalize / cl_oai_convert_messages / cl_oai_map_finish_reason
+--                            — OpenAI-compatible response normalization
 --
 -- These helpers are pure string/table transforms and read no runtime globals.
 -- require("compile_loop") does not touch std/log/tool at load time; harmless stubs
@@ -77,174 +77,17 @@ local function contains(haystack, needle)
     return haystack:find(needle, 1, true) ~= nil
 end
 
--- SEARCH/REPLACE markers (must match the block grammar exactly).
-local function sr_block(search, replace)
-    return "<<<<<<< SEARCH\n" .. search .. "\n=======\n" .. replace .. "\n>>>>>>> REPLACE"
-end
+-- The SEARCH/REPLACE machinery these tests used to cover (parse_search_replace,
+-- ws_normalize, apply_blocks, group_blocks_by_path, build_edit_failure_msg,
+-- build_multifile_edit_failure_msg) was removed when compile_loop's diff mode
+-- moved onto the std.fs edit tools. Its successor — line-range edits checked
+-- against `expect` and a `base` version — is covered by tests/e2e_fs_edit.rs
+-- and the unit tests in agent-block-core/src/bridge/fs.rs.
 
--- ─────────────────────────────────────────────────────────────────────────────
--- parse_search_replace
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.parse_search_replace (single-file)", function()
-    local parse = H.parse_search_replace
-
-    it("parses one well-formed block with nil path", function()
-        local blocks, err = parse(sr_block("old line", "new line"), false, {})
-        expect(err).to.equal(nil)
-        expect(#blocks).to.equal(1)
-        expect(blocks[1].path).to.equal(nil)
-        expect(blocks[1].search).to.equal("old line")
-        expect(blocks[1].replace).to.equal("new line")
-    end)
-
-    it("parses two consecutive blocks", function()
-        local text = sr_block("a", "A") .. "\n" .. sr_block("b", "B")
-        local blocks, err = parse(text, false, {})
-        expect(err).to.equal(nil)
-        expect(#blocks).to.equal(2)
-        expect(blocks[1].replace).to.equal("A")
-        expect(blocks[2].replace).to.equal("B")
-    end)
-
-    it("errors with no blocks found on plain text", function()
-        local blocks, err = parse("just some prose, no markers", false, {})
-        expect(blocks).to.equal(nil)
-        expect(contains(err, "no SEARCH/REPLACE blocks found")).to.equal(true)
-    end)
-
-    it("errors on a missing ======= separator", function()
-        local malformed = "<<<<<<< SEARCH\nold\n>>>>>>> REPLACE"
-        local blocks, err = parse(malformed, false, {})
-        expect(blocks).to.equal(nil)
-        expect(contains(err, "missing ======= separator")).to.equal(true)
-    end)
-
-    it("errors on a missing >>>>>>> REPLACE marker", function()
-        local malformed = "<<<<<<< SEARCH\nold\n=======\nnew\n"
-        local blocks, err = parse(malformed, false, {})
-        expect(blocks).to.equal(nil)
-        expect(contains(err, "missing >>>>>>> REPLACE marker")).to.equal(true)
-    end)
-
-    it("tolerates the no-space SEARCH marker variant (<<<<<<<SEARCH)", function()
-        local text = "<<<<<<<SEARCH\nold line\n=======\nnew line\n>>>>>>> REPLACE"
-        local blocks, err = parse(text, false, {})
-        expect(err).to.equal(nil)
-        expect(#blocks).to.equal(1)
-        expect(blocks[1].search).to.equal("old line")
-        expect(blocks[1].replace).to.equal("new line")
-    end)
-
-    it("tolerates the no-space REPLACE marker variant (>>>>>>>REPLACE)", function()
-        local text = "<<<<<<< SEARCH\nold line\n=======\nnew line\n>>>>>>>REPLACE"
-        local blocks, err = parse(text, false, {})
-        expect(err).to.equal(nil)
-        expect(#blocks).to.equal(1)
-        expect(blocks[1].replace).to.equal("new line")
-    end)
-end)
-
-describe("compile_loop.parse_search_replace (multi-file)", function()
-    local parse = H.parse_search_replace
-
-    it("attaches the preceding path header to the block", function()
-        local text = "<<< path=foo.lua >>>\n" .. sr_block("x", "y")
-        local blocks, err = parse(text, true, { ["foo.lua"] = true })
-        expect(err).to.equal(nil)
-        expect(#blocks).to.equal(1)
-        expect(blocks[1].path).to.equal("foo.lua")
-    end)
-
-    it("errors when a path is not in the allowlist", function()
-        local text = "<<< path=evil.lua >>>\n" .. sr_block("x", "y")
-        local blocks, err = parse(text, true, { ["foo.lua"] = true })
-        expect(blocks).to.equal(nil)
-        expect(contains(err, "not in target_files allowlist")).to.equal(true)
-    end)
-
-    it("errors on a SEARCH block with no preceding path header", function()
-        local blocks, err = parse(sr_block("x", "y"), true, { ["foo.lua"] = true })
-        expect(blocks).to.equal(nil)
-        expect(contains(err, "missing path header for multi-file mode")).to.equal(true)
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- ws_normalize
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.ws_normalize", function()
-    local norm = H.ws_normalize
-
-    it("collapses internal whitespace runs to a single space", function()
-        expect(norm("a   b\t c")).to.equal("a b c")
-    end)
-
-    it("strips leading and trailing whitespace", function()
-        expect(norm("  hi  ")).to.equal("hi")
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- apply_blocks
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.apply_blocks", function()
-    local apply = H.apply_blocks
-
-    it("applies an exact-match block", function()
-        local content = "foo\nbar\nbaz"
-        local new, failed = apply(content, { { search = "bar", replace = "BAR" } })
-        expect(new).to.equal("foo\nBAR\nbaz")
-        expect(#failed).to.equal(0)
-    end)
-
-    it("records a failed index when the SEARCH text is absent", function()
-        local content = "foo\nbar"
-        local new, failed = apply(content, { { search = "missing", replace = "X" } })
-        expect(new).to.equal(content) -- unchanged
-        expect(#failed).to.equal(1)
-        expect(failed[1]).to.equal(1)
-    end)
-
-    it("falls back to a whitespace-normalized match when exact fails", function()
-        -- content has a 3-space run; search uses a single space → exact miss, ws hit.
-        local new, failed = apply("hello   world", { { search = "hello world", replace = "ok" } })
-        expect(#failed).to.equal(0)
-        expect(new).to.equal("ok")
-    end)
-
-    it("applies multiple blocks in order, updating content between each", function()
-        local content = "one\ntwo\nthree"
-        local new, failed = apply(content, {
-            { search = "one", replace = "1" },
-            { search = "three", replace = "3" },
-        })
-        expect(#failed).to.equal(0)
-        expect(new).to.equal("1\ntwo\n3")
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- extract_code
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.extract_code", function()
-    local extract = H.extract_code
-
-    it("extracts a language-specific fenced block", function()
-        expect(extract("```lua\nprint('x')\n```", "lua")).to.equal("print('x')")
-    end)
-
-    it("falls back to any fence when the lang fence is absent", function()
-        expect(extract("```python\nx = 1\n```", "lua")).to.equal("x = 1")
-    end)
-
-    it("returns raw text when no fence is present", function()
-        expect(extract("no fences here", "lua")).to.equal("no fences here")
-    end)
-end)
+-- extract_code is a one-line delegate to the `llm` bridge; the fence-matching
+-- cases live with the implementation in agent-block-core/src/bridge/llm.rs.
+-- Calling it here would need an `llm` stub, and the test would then assert
+-- against the stub rather than the matcher.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- make_summary
@@ -302,59 +145,8 @@ describe("compile_loop.fnv1a_hash / compute_sr_hash", function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- group_blocks_by_path
+-- build_failure_msg
 -- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.group_blocks_by_path", function()
-    local group = H.group_blocks_by_path
-
-    it("groups blocks by their path key", function()
-        local grouped = group({
-            { path = "a.lua", search = "s1" },
-            { path = "a.lua", search = "s2" },
-            { path = "b.lua", search = "s3" },
-        })
-        expect(#grouped["a.lua"]).to.equal(2)
-        expect(#grouped["b.lua"]).to.equal(1)
-    end)
-
-    it("uses the boolean false key for nil-path blocks", function()
-        local grouped = group({ { path = nil, search = "s" } })
-        expect(#grouped[false]).to.equal(1)
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- build_edit_failure_msg / build_multifile_edit_failure_msg / build_failure_msg
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("compile_loop.build_edit_failure_msg", function()
-    local build = H.build_edit_failure_msg
-
-    it("names the failing block, echoes its SEARCH, and asks for a re-emit", function()
-        local blocks = { { search = "target_text", replace = "r" } }
-        local msg = build({ 1 }, blocks, "current file body")
-        expect(contains(msg, "block 1")).to.equal(true)
-        expect(contains(msg, "target_text")).to.equal(true)
-        expect(contains(msg, "Current file content")).to.equal(true)
-        expect(contains(msg, "current file body")).to.equal(true)
-        expect(contains(msg, "Re-emit ALL blocks")).to.equal(true)
-    end)
-end)
-
-describe("compile_loop.build_multifile_edit_failure_msg", function()
-    local build = H.build_multifile_edit_failure_msg
-
-    it("scopes the failure message to the file path", function()
-        local all_failed = {
-            { path = "mod.lua", indices = { 1 }, blocks = { { search = "needle" } } },
-        }
-        local msg = build(all_failed, { ["mod.lua"] = "file contents here" })
-        expect(contains(msg, "Edit FAILED in mod.lua")).to.equal(true)
-        expect(contains(msg, "needle")).to.equal(true)
-        expect(contains(msg, "file contents here")).to.equal(true)
-    end)
-end)
 
 describe("compile_loop.build_failure_msg", function()
     local build = H.build_failure_msg
