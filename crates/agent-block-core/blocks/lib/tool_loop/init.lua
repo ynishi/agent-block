@@ -35,7 +35,42 @@
 
 local proto = require("llm_proto")
 
+local lshape = require("lshape")
+local T = lshape.t
+local shape = lshape.check
+
 local M = {}
+
+--- What `run` hands back.
+---
+--- Closed, and deliberately not split into ok / error alternatives the way
+--- `agent.run`'s is: a refusal comes back with `ok = false` *and* the content
+--- the model produced before refusing, so the two are not exclusive here. What
+--- the shape pins instead is the set of keys and the type of each — `ok`,
+--- `turns`, `tool_calls` and `messages` are on every one of the ten return
+--- paths, and the rest depend on how far the loop got.
+---
+--- `usage` stays `T.table` rather than the agent's usage shape: the two early
+--- returns fire before a tracker exists, and tightening it would describe the
+--- accounting rather than this boundary.
+---
+--- Checked only in dev mode (LSHAPE_CHECK=1).
+local RESULT = T.shape({
+    ok = T.boolean,
+    turns = T.number,
+    tool_calls = T.array_of(T.table),
+    messages = T.array_of(T.table),
+    content = T.string:is_optional(),
+    error = T.string:is_optional(),
+    usage = T.table:is_optional(),
+    stop_reason = T.string:is_optional(),
+    stop_details = T.table:is_optional(),
+}, { open = false })
+
+--- The contract this module holds itself to, as data.
+M.shapes = {
+    result = RESULT,
+}
 
 --- Turns before the loop gives up on the model ever finishing.
 local DEFAULT_MAX_TURNS = 16
@@ -180,7 +215,15 @@ end
 --- @return table {
 ---   ok, content, turns, tool_calls, usage, messages, stop_reason, error?
 --- }
+---
+--- The contract is checked on the way out in dev mode (LSHAPE_CHECK=1); see
+--- `M.shapes.result`. Wrapped rather than asserted at each `return` because
+--- there are ten of them.
 function M.run(opts)
+    return shape.assert_dev(M._run_impl(opts), RESULT, "tool_loop.run result")
+end
+
+function M._run_impl(opts)
     opts = opts or {}
     if type(opts.prompt) ~= "string" or opts.prompt == "" then
         return { ok = false, error = "prompt is required", turns = 0, tool_calls = {}, messages = {} }
