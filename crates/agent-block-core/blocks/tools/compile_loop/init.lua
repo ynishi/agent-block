@@ -198,6 +198,18 @@ local function format_kv(parts)
     return table.concat(out, " ")
 end
 
+-- Process-lifetime cache for the ab.obs correlation fields. They come from the
+-- environment, which does not change mid-process, and obs_event fires per
+-- iteration and per tool call.
+local _log_meta_cache = nil
+
+local function resolve_log_meta_cached()
+    if _log_meta_cache == nil then
+        _log_meta_cache = agent._log_meta(nil)
+    end
+    return _log_meta_cache
+end
+
 local function obs_event(mode, event_name, fields)
     if mode == "off" then
         return
@@ -210,6 +222,20 @@ local function obs_event(mode, event_name, fields)
     for _, f in ipairs(fields or {}) do
         table.insert(entries, f)
     end
+    -- Without these, two runs' lines are indistinguishable once they share a
+    -- log, so nothing can be counted per run or compared between runs — which
+    -- is the whole point of emitting them. Resolved through the agent block so
+    -- both components read the environment the same way.
+    --
+    -- Appended rather than placed after `component`, where the Rust obs_line
+    -- puts them: parsers and tests already match on the
+    -- `component=compile_loop iter=N` prefix, and a run is selected by
+    -- `run_id=` wherever on the line it sits.
+    local meta = resolve_log_meta_cached()
+    table.insert(entries, { "trace_id", meta.trace_id })
+    table.insert(entries, { "run_id", meta.run_id })
+    table.insert(entries, { "agent_id", meta.agent_id })
+    table.insert(entries, { "agent_name", meta.agent_name })
     log.info(format_kv(entries))
 end
 
@@ -1605,6 +1631,24 @@ local function run_loop(conf)
     local iter_edit_sigs = {}
     local iter_edit_errors = {}
 
+    -- Run totals, carried on whichever event ends the run. Per-edit lines say
+    -- where each change landed; these say what the run came to, so two runs can
+    -- be set against each other without folding their logs back together.
+    local run_lines_removed = 0
+    local run_lines_added = 0
+
+    local function run_summary_fields(leading)
+        local fields = {}
+        for _, f in ipairs(leading or {}) do
+            fields[#fields + 1] = f
+        end
+        fields[#fields + 1] = { "edits", edit_count }
+        fields[#fields + 1] = { "files", #collect_modified_paths(mf_state.modified_set) }
+        fields[#fields + 1] = { "lines_removed", run_lines_removed }
+        fields[#fields + 1] = { "lines_added", run_lines_added }
+        return fields
+    end
+
     -- The tool set is built once, but its calls belong to an iteration. The
     -- loop below advances this cursor so each obs line can say which one —
     -- without it, a run with max_iters > 1 logs reads and edits that cannot be
@@ -1628,6 +1672,8 @@ local function run_loop(conf)
             -- the same content are the same lack of progress.
             table.insert(iter_edit_sigs, path .. "\1" .. tostring(res.version))
             local ranges, removed, added = summarize_edits(input.edits)
+            run_lines_removed = run_lines_removed + removed
+            run_lines_added = run_lines_added + added
             obs_event(mode, "tool_use", {
                 { "iter", current_iter },
                 { "path", path },
@@ -1913,10 +1959,11 @@ local function run_loop(conf)
                     sr_hash_append = compute_sr_hash("<no_edits:" .. tostring(iter) .. ">"),
                 })
                 if bad_stagnation_count >= STAGNATION_WINDOW then
-                    obs_event(mode, "bad_stagnation_blocked", {
-                        { "iter", iter },
-                        { "reason", "no_edits_applied" },
-                    })
+                    obs_event(
+                        mode,
+                        "bad_stagnation_blocked",
+                        run_summary_fields({ { "iter", iter }, { "reason", "no_edits_applied" } })
+                    )
                     return {
                         ok = false,
                         failure_reason = "no_edits_applied",
@@ -1953,7 +2000,7 @@ local function run_loop(conf)
             local iter_sig = table.concat(iter_edit_sigs, "\1")
             if rr.ok then
                 update_state(mf_state, { sr_hash_append = compute_sr_hash(iter_sig) })
-                obs_event(mode, "converged", { { "iters", iter } })
+                obs_event(mode, "converged", run_summary_fields({ { "iters", iter } }))
                 return {
                     ok = true,
                     artifact_path = artifact_path,
@@ -1972,7 +2019,11 @@ local function run_loop(conf)
             -- The same edits producing the same failure twice: the model is
             -- circling rather than converging.
             if is_stagnant_v2(mf_state, true) then
-                obs_event(mode, "stagnation_v2", { { "iter", iter }, { "reason", "sr_history_repeat" } })
+                obs_event(
+                    mode,
+                    "stagnation_v2",
+                    run_summary_fields({ { "iter", iter }, { "reason", "sr_history_repeat" } })
+                )
                 return {
                     ok = false,
                     failure_reason = "stagnation",
@@ -2049,7 +2100,7 @@ local function run_loop(conf)
             end
 
             if rr.ok then
-                obs_event(mode, "converged", { { "iters", iter } })
+                obs_event(mode, "converged", run_summary_fields({ { "iters", iter } }))
                 return {
                     ok = true,
                     code = code,
@@ -2065,10 +2116,11 @@ local function run_loop(conf)
                 bad_stagnation_count = bad_stagnation_count + 1
                 if bad_stagnation_count >= STAGNATION_WINDOW then
                     local last_stderr = tostring(rr.stderr or ""):sub(-800)
-                    obs_event(mode, "bad_stagnation_blocked", {
-                        { "iter", iter },
-                        { "reason", "no_edits_applied" },
-                    })
+                    obs_event(
+                        mode,
+                        "bad_stagnation_blocked",
+                        run_summary_fields({ { "iter", iter }, { "reason", "no_edits_applied" } })
+                    )
                     return {
                         ok = false,
                         failure_reason = "no_edits_applied",
@@ -2087,7 +2139,7 @@ local function run_loop(conf)
                 table.insert(messages, { role = "user", content = retry_msg })
             elseif is_stagnant(history) then
                 local last_stderr = tostring(rr.stderr or ""):sub(-800)
-                obs_event(mode, "stagnation", { { "iters", iter } })
+                obs_event(mode, "stagnation", run_summary_fields({ { "iters", iter } }))
                 return {
                     ok = false,
                     failure_reason = "stagnation",
@@ -2111,7 +2163,7 @@ local function run_loop(conf)
     -- max_iters reached without PASS
     local last = history[#history] or {}
     local last_stderr = tostring((last.result or {}).stderr or ""):sub(-800)
-    obs_event(mode, "max_iters_reached", { { "iters", max_iters } })
+    obs_event(mode, "max_iters_reached", run_summary_fields({ { "iters", max_iters } }))
     local max_iters_result = {
         ok = false,
         failure_reason = "max_iters",

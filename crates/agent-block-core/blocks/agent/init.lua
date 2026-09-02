@@ -259,6 +259,21 @@ local function build_log_meta(opts)
     }
 end
 
+--- The four ab.obs correlation fields, resolved from `opts.log_meta` and the
+--- environment.
+---
+--- Exposed because a sibling block emitting its own ab.obs lines has to resolve
+--- the ids the same way this one does — `compile_loop` runs its own loop, and a
+--- convention where each component reaches for the environment slightly
+--- differently is one that cannot be relied on to select a run. Underscore
+--- prefix marks it as cross-block reach, like `_llm_ctx_top`, not agent API.
+---
+--- @param opts table|nil  May carry `log_meta` with any of the four fields.
+--- @return table  { trace_id, run_id, agent_id, agent_name }, any of them nil.
+function M._log_meta(opts)
+    return build_log_meta(opts)
+end
+
 local function count_tool_use_blocks(content)
     local n = 0
     for _, block in ipairs(content or {}) do

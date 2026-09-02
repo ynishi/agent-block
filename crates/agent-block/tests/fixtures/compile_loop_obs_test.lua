@@ -74,10 +74,22 @@ if not std then
                 if name == "AGENT_BLOCK_LLM_DUMP" then
                     return "meta"
                 end
-                return nil
+                -- The four ab.obs correlation ids, so the run-scoping
+                -- assertions below have something to match on.
+                return ({
+                    AGENT_BLOCK_TRACE_ID = "trace-obs-01",
+                    AGENT_BLOCK_RUN_ID = "run-obs-01",
+                    AGENT_BLOCK_AGENT_ID = "agent-obs-01",
+                    AGENT_BLOCK_AGENT_NAME = "obs-fixture",
+                })[name]
             end,
             get_or = function(_name, default)
                 return default
+            end,
+            -- Reached only when AGENT_BLOCK_AGENT_ID is unset; the stub above
+            -- sets it, but build_log_meta calls this unconditionally otherwise.
+            agent_id = function()
+                return nil
             end,
         },
         json = {
@@ -205,54 +217,57 @@ end)
 -- useless if the wiring that fills them is not exercised.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+local run_loop = compile_loop._test_helpers().run_loop
+
+-- A non-empty target is required: single-file diff mode falls back to
+-- whole-file rewriting when the file is empty, and never builds the tool.
+local function run_one_iter(edit_input, edit_result)
+    reset_log()
+    pending_edit_input = edit_input
+    fs_edit_result = edit_result
+
+    local path = "/tmp/cl_obs_test_" .. tostring(os.time()) .. "_" .. tostring(math.random(1e6)) .. ".lua"
+    local f = assert(io.open(path, "w"))
+    f:write("local a = 1\nlocal b = 2\nreturn a + b\n")
+    f:close()
+
+    run_loop({
+        target_files = { path },
+        multi_file = false,
+        edit_mode = "diff",
+        lang = "lua",
+        spec = "test",
+        runner = function(_p)
+            return { ok = true }
+        end,
+        max_iters = 1,
+    })
+
+    os.remove(path)
+    pending_edit_input = nil
+    return path
+end
+
+-- Two edits over five lines, replaced by three. Shared so the range, total and
+-- correlation assertions are all reading the same run.
+local TWO_EDITS = {
+    path = "/tmp/target.lua",
+    base = "v1",
+    edits = {
+        { start_line = 12, end_line = 15, expect = "old", replace = "a\nb" },
+        { start_line = 40, end_line = 40, expect = "x", replace = "y" },
+    },
+}
+
 describe("compile_loop edit obs line", function()
-    local run_loop = compile_loop._test_helpers().run_loop
-
-    -- A non-empty target is required: single-file diff mode falls back to
-    -- whole-file rewriting when the file is empty, and never builds the tool.
-    local function run_one_iter(edit_input, edit_result)
-        reset_log()
-        pending_edit_input = edit_input
-        fs_edit_result = edit_result
-
-        local path = "/tmp/cl_obs_test_" .. tostring(os.time()) .. "_" .. tostring(math.random(1e6)) .. ".lua"
-        local f = assert(io.open(path, "w"))
-        f:write("local a = 1\nlocal b = 2\nreturn a + b\n")
-        f:close()
-
-        run_loop({
-            target_files = { path },
-            multi_file = false,
-            edit_mode = "diff",
-            lang = "lua",
-            spec = "test",
-            runner = function(_p)
-                return { ok = true }
-            end,
-            max_iters = 1,
-        })
-
-        os.remove(path)
-        pending_edit_input = nil
-        return path
-    end
-
     it("records the addressed ranges and the size of the change", function()
-        local path = run_one_iter({
-            path = "/tmp/target.lua",
-            base = "v1",
-            edits = {
-                { start_line = 12, end_line = 15, expect = "old", replace = "a\nb" },
-                { start_line = 40, end_line = 40, expect = "x", replace = "y" },
-            },
-        }, { ok = true, applied = 2, version = "v2" })
+        run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" })
 
         local line = find_line("event=tool_use", "tool=fs_edit")
         expect(line ~= nil).to.be.truthy()
         expect(line:find("ranges=12-15,40-40", 1, true) ~= nil).to.be.truthy()
         expect(line:find("lines_removed=5", 1, true) ~= nil).to.be.truthy()
         expect(line:find("lines_added=3", 1, true) ~= nil).to.be.truthy()
-        expect(path ~= nil).to.be.truthy()
     end)
 
     it("records where a rejected edit aimed, on the fail line", function()
@@ -268,5 +283,58 @@ describe("compile_loop edit obs line", function()
         expect(line ~= nil).to.be.truthy()
         expect(line:find("err=expect_mismatch", 1, true) ~= nil).to.be.truthy()
         expect(line:find("ranges=7-9", 1, true) ~= nil).to.be.truthy()
+    end)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Run scoping. Without the ids, two runs' lines are indistinguishable once they
+-- share a log, and nothing can be counted per run or compared between runs.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop obs correlation", function()
+    it("carries the four ab.obs ids on every line", function()
+        run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" })
+
+        local line = find_line("event=tool_use", "tool=fs_edit")
+        expect(line:find("trace_id=trace-obs-01", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("run_id=run-obs-01", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("agent_id=agent-obs-01", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("agent_name=obs-fixture", 1, true) ~= nil).to.be.truthy()
+    end)
+
+    it("keeps the component=compile_loop iter= prefix parsers match on", function()
+        run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" })
+
+        local line = find_line("event=iter_start")
+        expect(line ~= nil).to.be.truthy()
+        expect(line:find("component=compile_loop iter=", 1, true) ~= nil).to.be.truthy()
+    end)
+end)
+
+describe("compile_loop run totals", function()
+    it("closes the run with what it amounted to", function()
+        run_one_iter(TWO_EDITS, { ok = true, applied = 2, version = "v2" })
+
+        local line = find_line("event=converged")
+        expect(line ~= nil).to.be.truthy()
+        -- One accepted fs_edit call carrying two edits: one edit, one file.
+        expect(line:find("edits=1", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("files=1", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("lines_removed=5", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("lines_added=3", 1, true) ~= nil).to.be.truthy()
+    end)
+
+    -- A zero-edit iteration never reaches the verifier, so this run ends by
+    -- exhausting max_iters rather than converging — the totals ride on whichever
+    -- event ends the run, which is the property under test.
+    it("reports zeros for a run that changed nothing", function()
+        run_one_iter(nil, { ok = true, applied = 0, version = "v1" })
+
+        local line = find_line("event=max_iters_reached")
+        expect(line ~= nil).to.be.truthy()
+        expect(line:find("edits=0", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("files=0", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("lines_removed=0", 1, true) ~= nil).to.be.truthy()
+        expect(line:find("lines_added=0", 1, true) ~= nil).to.be.truthy()
     end)
 end)
