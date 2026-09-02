@@ -6,6 +6,11 @@ members = [
     "crates/agent-block",
     "crates/agent-block-testkit",
 ]
+# `lua-spec-runner` is deliberately out of the workspace: it depends on
+# mlua-lspec, which pulls mlua with `send`, and feature unification would then
+# turn `send` on for mlua-batteries — which does not compile with it. Run it
+# via `just test-lua`. Rationale in full: crates/lua-spec-runner/src/main.rs.
+exclude = ["crates/lua-spec-runner"]
 resolver = "2"
 
 [workspace.package]

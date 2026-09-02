@@ -18,6 +18,15 @@ test:
     cargo test --workspace
 
 # [allow-agent]
+# Run the Lua spec fixtures (mlua-lspec) in crates/agent-block/tests/fixtures/.
+# `cargo test` cannot host these: mlua-lspec needs mlua's `send` feature, which
+# mlua-batteries does not compile under, so the runner is its own crate outside
+# the workspace. Rationale: crates/lua-spec-runner/src/main.rs.
+# Optional argument filters fixtures by filename substring.
+test-lua filter="":
+    cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- {{ filter }}
+
+# [allow-agent]
 # Format and lint
 lint:
     cargo fmt --all

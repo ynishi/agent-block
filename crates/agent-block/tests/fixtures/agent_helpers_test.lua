@@ -1,10 +1,8 @@
 -- agent_helpers_test.lua — mlua-lspec unit tests for pure helpers in blocks/agent/init.lua.
 --
 -- Run via:
---   mcp__lua-debugger__test_launch(
---     code_file    = "crates/agent-block/tests/fixtures/agent_helpers_test.lua",
---     search_paths = ["crates/agent-block-core/blocks"]
---   )
+--   just test-lua agent_helpers        # this file
+--   just test-lua                      # every spec fixture
 --
 -- These exercise the I/O-free branches exposed by agent._test_helpers():
 --   * map_finish_reason        — OpenAI finish_reason → Anthropic stop_reason mapping

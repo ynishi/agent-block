@@ -1,10 +1,8 @@
 -- llm_proto_test.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
 --
 -- Run via:
---   mcp__lua-debugger__test_launch(
---     code_file    = "crates/agent-block/tests/fixtures/llm_proto_test.lua",
---     search_paths = ["crates/agent-block-core/blocks"]
---   )
+--   just test-lua llm_proto            # this file
+--   just test-lua                      # every spec fixture
 --
 -- Covers the pieces that used to be duplicated (or missing) across
 -- blocks/agent and blocks/tools/compile_loop:

@@ -1,0 +1,9 @@
+[package]
+name = "lua-spec-runner"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Runs the repository's mlua-lspec fixtures. Not part of the workspace — see src/main.rs."
+
+[dependencies]
+mlua-lspec = "0.3"

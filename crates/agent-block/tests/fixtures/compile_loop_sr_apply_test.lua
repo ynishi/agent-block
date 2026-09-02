@@ -2,14 +2,8 @@
 -- summary / feedback / normalization branches of blocks/tools/compile_loop/init.lua.
 --
 -- Run via:
---   mcp__lua-debugger__test_launch(
---     code_file    = "crates/agent-block/tests/fixtures/compile_loop_sr_apply_test.lua",
---     search_paths = [
---       "crates/agent-block-core/blocks/tools",   -- compile_loop
---       "crates/agent-block-core/blocks/lib",     -- llm_proto, tool_loop
---       "crates/agent-block-core/blocks",         -- agent
---     ]
---   )
+--   just test-lua sr_apply             # this file
+--   just test-lua                      # every spec fixture
 --
 -- Covers the I/O-free helpers exposed via compile_loop._test_helpers():
 --   * make_summary           — PASS / give-up summary strings per failure_reason

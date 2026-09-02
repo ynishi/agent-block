@@ -1,10 +1,8 @@
 -- compile_loop_distill.lua — mlua-lspec unit tests for ST3 distill subloop.
 --
 -- Run via:
---   mcp__lua-debugger__test_launch(
---     code_file = "tests/fixtures/compile_loop_distill.lua",
---     search_paths = ["blocks"]
---   )
+--   just test-lua distill              # this file
+--   just test-lua                      # every spec fixture
 --
 -- Tests cover subtask-3.md AC #10:
 --   #1 chunk_by_lines: 600 line input → 200-line chunks × 3
