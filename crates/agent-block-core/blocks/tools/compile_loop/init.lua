@@ -25,7 +25,7 @@
 --   and the returned tool_def share the same handler identity.
 --
 -- LLM resolution order (per field, at call time):
---   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil (llm_call env fallback)
+--   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil (llm_proto env fallback)
 --
 -- Counter WF-A defence: handler output JSON never contains "code" or "history".
 
@@ -595,6 +595,9 @@ end
 -- Module-level override for test monkey-patching (set via M._test_set_llm_call).
 local _llm_call_override = nil
 
+-- The block's own transport. Its remaining caller is the distill subloop; the
+-- iteration branches both go through `tool_loop` (diff since it was written,
+-- full since the two paths were merged — see `call_tool_loop` below).
 local function llm_call(opts, messages)
     -- Allow test monkey-patch to intercept all calls.
     if _llm_call_override then
@@ -811,6 +814,30 @@ local function llm_call(opts, messages)
     end
 
     return cl_oai_normalize(decoded)
+end
+
+-- ============================================================
+-- Internal: the completion full mode asks for
+-- ============================================================
+
+-- Module-level override for test monkey-patching (set via M._test_set_tool_loop_run).
+local _tool_loop_run_override = nil
+
+--- The model call the full-mode branch makes.
+---
+--- Handed no tools, `tool_loop.run` is a completion: it calls once, finds
+--- nothing to dispatch, and hands back the text. Going through it rather than
+--- through `llm_call` is what gives full mode the transient retry, the refusal
+--- check and the verbatim thinking blocks that the tool-using path already had
+--- — one implementation of "call the model" instead of two that drifted.
+---
+--- @param opts table  `tool_loop.run` options
+--- @return table  `tool_loop.run` result
+local function call_tool_loop(opts)
+    if _tool_loop_run_override then
+        return _tool_loop_run_override(opts)
+    end
+    return tool_loop.run(opts)
 end
 
 -- Read target file if it already exists and is non-empty.
@@ -1890,12 +1917,89 @@ local function run_loop(conf)
 
     -- Full mode accumulates one conversation across iters; diff mode's turns
     -- live inside tool_loop and do not survive the iteration.
+    --
+    -- The system prompt is not part of that conversation: it rides beside the
+    -- messages (`opts.system`) instead of being the first of them, so the
+    -- transcript holds what was said and the wire form is the adapter's
+    -- business. `next_prompt` is the user turn the coming iteration opens with;
+    -- everything before it is history.
+    --
+    -- `full_llm` is what those iterations hand tool_loop; it is resolved here
+    -- because none of it changes between them.
     local messages
+    local next_prompt
+    local full_llm
     if edit_mode == "full" then
-        messages = {
-            { role = "system", content = system },
-            { role = "user", content = single_initial_user_content },
+        messages = {}
+        next_prompt = single_initial_user_content
+
+        -- Defaulted here rather than left to llm_proto, whose default is
+        -- anthropic: full mode has always resolved an unset provider to
+        -- openai, and a caller that set neither would otherwise find itself
+        -- talking to a different endpoint after this refactor.
+        local provider = conf.provider or "openai"
+
+        -- Qwen's switch, said in the shared vocabulary. An explicit
+        -- conf.thinking wins when both are set.
+        local thinking = conf.thinking
+        if thinking == nil and conf.disable_thinking then
+            thinking = { enabled = false }
+        end
+
+        full_llm = {
+            provider = provider,
+            base_url = conf.base_url,
+            api_key = conf.api_key,
+            api_key_env = conf.api_key_env,
+            model = conf.model,
+            max_tokens = conf.max_tokens,
+            thinking = thinking,
+            dialect = conf.dialect,
+            tool_choice = conf.tool_choice,
+            parallel_tool_calls = conf.parallel_tool_calls,
+            -- cache_control defaults OFF here: compile_loop sends the whole
+            -- file back every iteration, so the markers would only add bytes.
+            cache_control = conf.cache_control or false,
+            timeout = conf.timeout,
+            -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
+            dump = (mode == "full") and "full" or nil,
         }
+
+        if provider ~= "anthropic" then
+            -- compile_loop's own temperature tier (caller →
+            -- COMPILE_LOOP_LLM_TEMPERATURE → 0.0) has only ever been sent on
+            -- the OpenAI path; Anthropic full-mode requests carried no
+            -- temperature at all. Sending one there now would change every
+            -- existing run rather than unify anything.
+            full_llm.temperature = conf.temperature or resolve_temperature()
+            -- RunPod's proxy and Cloudflare's gate answer an unfamiliar
+            -- User-Agent with a challenge page instead of the model, so the
+            -- OpenAI-compatible request has always carried a browser one. It is
+            -- a transport quirk rather than a protocol field: llm_proto merges
+            -- it onto the request and reads nothing from it.
+            full_llm.headers = { ["User-Agent"] = "Mozilla/5.0" }
+        end
+    end
+
+    -- Full mode's request/response trail. tool_loop owns the HTTP call now, so
+    -- the bodies are observed through its hooks; the event names are the ones
+    -- the dump consumers already match on. Built only under full dump mode —
+    -- obs_event would drop them anyway, and the encoding is not free.
+    local on_request, on_response
+    if edit_mode == "full" and mode == "full" then
+        on_request = function(ev)
+            obs_event(mode, "request_headers", {
+                { "payload", std.json.encode(sanitize_headers_for_dump(ev.headers)) },
+            })
+            -- The bytes that went on the wire, not a re-encoding of them.
+            obs_event(mode, "request_body", { { "payload", ev.body_json } })
+        end
+        on_response = function(ev)
+            obs_event(mode, "response_headers", {
+                { "payload", std.json.encode(sanitize_headers_for_dump(ev.headers)) },
+            })
+            obs_event(mode, "response_body", { { "payload", tostring(ev.body or "") } })
+        end
     end
 
     local history = {}
@@ -2090,25 +2194,73 @@ local function run_loop(conf)
         -- ── full mode (default) ────────────────────────────────────────────────
         --
         -- Single-file whole-file rewrite: no tools, one completion per iter.
-        -- This is the path for models that cannot call tools at all, so it
-        -- talks to the provider directly rather than through tool_loop.
+        -- This is the path for models that cannot call tools at all — which is
+        -- a tool set of size zero, not a reason to call the provider by hand.
         else
             local single_path = conf.target_files[1]
             local iter_edits_applied = 0
 
-            local resp, call_err = llm_call(conf, messages)
-            if not resp then
+            local tl = call_tool_loop({
+                prompt = next_prompt,
+                system = system,
+                messages = messages,
+                -- One completion per iteration: with no tools there is nothing
+                -- a second turn could do, and the loop that verifies is out here.
+                max_turns = 1,
+                llm = full_llm,
+                on_request = on_request,
+                on_response = on_response,
+            })
+
+            -- A transport failure, a refusal, a response the adapter could not
+            -- parse: none of them are a model that failed to write code, so
+            -- they end the run instead of counting as a stagnant iteration.
+            if not tl.ok then
                 return {
                     ok = false,
                     failure_reason = "llm_call",
-                    last_error = tostring(call_err):sub(-800),
+                    last_error = tostring(tl.error):sub(-800),
                     iters = iter - 1,
                     summary = make_summary(false, iter - 1, max_iters, "llm_call"),
                     artifact_path = artifact_path,
                     history = history,
                 }
             end
-            local content = (((resp.choices or {})[1] or {}).message or {}).content or ""
+
+            -- A response cut off at max_tokens is half a file. Writing it would
+            -- hand the runner code the model never finished — and the runner
+            -- would then blame the model for a syntax error the transport
+            -- caused — so the truncation ends the run.
+            if tl.stop_reason == "max_tokens" then
+                return {
+                    ok = false,
+                    failure_reason = "llm_call",
+                    last_error = "response truncated at max_tokens; nothing written (raise llm.max_tokens)",
+                    iters = iter - 1,
+                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
+                    artifact_path = artifact_path,
+                    history = history,
+                }
+            end
+
+            local content = tl.content or ""
+            -- The turn that just happened becomes the history the next
+            -- iteration continues from: the prompt that was sent and the
+            -- assistant blocks verbatim, thinking included (Anthropic requires
+            -- them back unmodified, and `content` above already holds only the
+            -- text ones, so no reasoning reaches the file).
+            messages = tl.messages
+
+            -- A model that answered with no blocks at all would go back as an
+            -- assistant turn carrying nothing, which the providers reject — and
+            -- the next iteration is exactly the one that has to tell it so. The
+            -- turn is kept as the empty text it amounts to, which is the shape
+            -- this loop sent before the two call paths were merged.
+            local last_msg = messages[#messages]
+            if last_msg and last_msg.role == "assistant" and #(last_msg.content or {}) == 0 then
+                last_msg.content = { { type = "text", text = "" } }
+            end
+
             local code = extract_code(content, lang)
 
             -- Full mode: empty code means the LLM produced zero usable edits (bad stagnation).
@@ -2188,10 +2340,10 @@ local function run_loop(conf)
                     }
                 end
                 -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                local retry_msg = "Your previous attempt produced no usable code."
+                -- The assistant turn is already in `messages`; this is the user
+                -- turn the next iteration opens with.
+                next_prompt = "Your previous attempt produced no usable code."
                     .. " Output the whole corrected file in a single fenced code block."
-                table.insert(messages, { role = "assistant", content = content })
-                table.insert(messages, { role = "user", content = retry_msg })
             elseif is_stagnant(history) then
                 local last_stderr = tostring(rr.stderr or ""):sub(-800)
                 obs_event(mode, "stagnation", run_summary_fields({ { "iters", iter } }))
@@ -2206,9 +2358,9 @@ local function run_loop(conf)
                     history = history,
                 }
             else
-                -- Append assistant + failure user message for the next turn.
-                table.insert(messages, { role = "assistant", content = content })
-                table.insert(messages, { role = "user", content = build_failure_msg(lang, rr) })
+                -- The assistant turn is already in `messages`; the failure
+                -- feedback is the user turn the next iteration opens with.
+                next_prompt = build_failure_msg(lang, rr)
             end
         end
         -- ── end of edit_mode branch ────────────────────────────────────────────
@@ -2249,7 +2401,7 @@ end
 --- registry and tool_def.handler are identity-equal.
 ---
 --- LLM resolution (at handler call time, i.e. when the parent agent invokes the tool):
----   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil → llm_call env fallback
+---   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil → llm_proto env fallback
 ---
 --- conf.runner is required and must be a function. Providing conf.llm is optional;
 --- omitting it causes the parent agent's provider/model/api_key to be inherited.
@@ -2361,7 +2513,7 @@ target_file and target_files are mutually exclusive.]],
         assert(not (multi_file and effective_edit_mode == "full"), "multi-file mode requires edit_mode=diff")
 
         -- Resolve LLM fields at call time.
-        -- Priority: conf.llm.<field> → _AGENT_LLM_CTX top → nil (env fallback in llm_call)
+        -- Priority: conf.llm.<field> → _AGENT_LLM_CTX top → nil (env fallback in llm_proto)
         local parent_ctx = agent._llm_ctx_top() or {}
         local llm_conf = conf.llm or {}
 
@@ -2436,6 +2588,20 @@ end
 --- Reset the llm_call override installed by M._test_set_llm_call().
 function M._test_reset_llm_call()
     _llm_call_override = nil
+end
+
+--- Override the tool_loop call the full-mode branch makes.
+--- fn signature: (opts: table) → tool_loop result table
+--- Call M._test_reset_tool_loop_run() after the test to restore production behaviour.
+--- Production callers must never call this.
+function M._test_set_tool_loop_run(fn)
+    assert(type(fn) == "function", "_test_set_tool_loop_run requires a function")
+    _tool_loop_run_override = fn
+end
+
+--- Reset the override installed by M._test_set_tool_loop_run().
+function M._test_reset_tool_loop_run()
+    _tool_loop_run_override = nil
 end
 
 --- Override std.env.get for test monkey-patching of resolve_temperature().
