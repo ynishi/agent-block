@@ -25,14 +25,21 @@
 ---   only makes sense after the first result).
 ---
 --- Kernel session (optional)
----   Pass `session` and the run records what it does — the prompt, every model
----   response with its usage, every tool call and its result — into that
----   session, each fact written before the loop moves past it, and charges the
----   reported tokens against the session's budget. The loop still keeps no
----   budget of its own: it asks the session whether anything is left before
----   opening another turn, and stops with `stop_reason = "budget_exhausted"`
----   when there is not. Without a session none of this happens and the result
----   is what it always was.
+---   Pass `session` and the model call goes through it: `s:call` records the
+---   response and charges its tokens before it returns, so there is no
+---   arrangement of this loop's code in which a call happened and the history
+---   does not say so. The loop records the facts around it — the prompt, every
+---   tool call and its result — and keeps no budget of its own: it asks the
+---   session whether anything is left before opening another turn, and stops
+---   with `stop_reason = "budget_exhausted"` when there is not. Without a
+---   session none of this happens and the result is what it always was.
+---
+--- The model call
+---   Whatever the wire needs — the provider dialect, the retries, the parse —
+---   belongs to `llm_proto.backend`, and this loop holds one of those closures
+---   rather than any provider knowledge. A session that was opened with a
+---   backend of its own uses that one instead; one that was not is handed this
+---   loop's, per call, so a caller that has not been rewired keeps working.
 ---
 --- Usage
 ---   local loop = require("tool_loop")
@@ -125,38 +132,6 @@ local function wire_tools(specs)
     return out
 end
 
---- POST with retries for the failures worth retrying.
----
---- Rate limits, overload and 5xx come back on their own; auth failures,
---- malformed requests and exhausted spend never will, so the classification
---- decides rather than the status class.
-local function post_with_retry(url, request_opts, max_retries)
-    local attempt = 0
-    while true do
-        local resp = http.request(url, request_opts)
-        if resp.status == 200 or attempt >= max_retries then
-            return resp
-        end
-        local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-        if not classified.retryable then
-            return resp
-        end
-        attempt = attempt + 1
-        local delay = proto.retry_delay(attempt, classified, attempt)
-        log.warn(
-            "tool_loop: "
-                .. classified.kind
-                .. " (HTTP "
-                .. tostring(resp.status)
-                .. "); retry "
-                .. attempt
-                .. "/"
-                .. max_retries
-        )
-        std.task.sleep(delay * 1000)
-    end
-end
-
 --- Run one tool call and render its result as tool_result text.
 ---
 --- A name outside this turn's set is answered, not raised: the model gets to
@@ -215,38 +190,6 @@ local function record(session, event)
     return "session append failed: " .. tostring(err)
 end
 
---- Charge `amount` tokens against the session's budget.
----
---- @param session table|nil
---- @param amount number
---- @return string|nil  error message, or nil when the charge landed
-local function charge(session, amount)
-    if not session then
-        return nil
-    end
-    local ok, err = pcall(function()
-        session:spend(amount)
-    end)
-    if ok then
-        return nil
-    end
-    return "session spend failed: " .. tostring(err)
-end
-
---- The content blocks to record for a model response.
----
---- A recorded response carries a non-empty array of blocks. A response with no
---- blocks at all is recorded as the one empty text block it amounts to — the
---- same thing `text_of` derives from it — because an empty Lua table reaches
---- the kernel as an empty mapping rather than an empty array, and losing the
---- response (with its usage) over that would be worse than the placeholder.
-local function response_blocks(content)
-    if type(content) ~= "table" or #content == 0 then
-        return { { type = "text", text = "" } }
-    end
-    return content
-end
-
 -- ============================================================
 -- Public
 -- ============================================================
@@ -264,13 +207,14 @@ end
 ---   messages (optional) prior turns to continue from
 ---   max_turns   (optional, default 16)
 ---   max_retries (optional, default 2) transient API failures only
----   session  (optional) kernel session (`knl.session`). When given, the run
----            records `msg_user` / `model_response` / `tool_call` /
----            `tool_result` into it — each before the loop advances past the
----            fact — and spends the tokens each response reports against its
----            budget. A run that exhausts the budget stops before the next
----            turn with `ok = true, stop_reason = "budget_exhausted"`; a
----            session that refuses a write ends the run with `ok = false`.
+---   session  (optional) kernel session (`knl.session`). When given, the model
+---            call goes through `s:call`, which records `model_response` and
+---            charges its tokens before it returns; the loop records
+---            `msg_user` / `tool_call` / `tool_result` around it, each before
+---            it advances past the fact, with the turn the kernel stamped. A
+---            run that exhausts the budget stops before the next turn with
+---            `ok = true, stop_reason = "budget_exhausted"`; a session that
+---            refuses a write ends the run with `ok = false`.
 ---   state    (optional) caller value handed to the tools function and on_turn
 ---   on_turn  (optional) function({ turn, content, tool_calls, usage, decoded,
 ---            state }), fired once per model call including paused ones.
@@ -281,9 +225,13 @@ end
 ---            fired before the call; `body` is the table, `body_json` the wire bytes
 ---   on_response (optional) function({ turn, status, body, headers, latency_ms })
 ---            Observability only — the loop does not read what they return.
+---            Both are the backend's hooks with this loop's turn added, so a
+---            session that brought a backend of its own fires neither: the
+---            wire it talks is that backend's business, and its hooks are too.
 ---   llm      (optional) { provider, model, base_url, api_key, api_key_env,
 ---                         max_tokens, temperature, thinking, tool_choice,
----                         dialect, timeout, ... } — forwarded to llm_proto
+---                         dialect, timeout, ... } — the conf of the backend
+---                         this loop builds (see `llm_proto.backend`)
 --- }
 --- @return table {
 ---   ok, content, turns, tool_calls, usage, messages, stop_reason, error?
@@ -303,15 +251,70 @@ function M._run_impl(opts)
     end
 
     local llm = opts.llm or {}
-    local adapter, aerr = proto.adapter(llm.provider)
-    if not adapter then
-        return { ok = false, error = aerr, turns = 0, tool_calls = {}, messages = {} }
-    end
-
     local max_turns = tonumber(opts.max_turns) or DEFAULT_MAX_TURNS
     local max_retries = tonumber(opts.max_retries) or DEFAULT_MAX_RETRIES
     local state = opts.state
     local session = opts.session
+
+    -- The turn the observability hooks report, and the reply the backend
+    -- parsed. Both are written once per turn, just before the call, and read
+    -- from inside it: the backend is handed neither, because neither is
+    -- anything the wire needs.
+    local current_turn = 0
+    local parsed = nil
+
+    --- The caller's hook with the turn the backend cannot know added.
+    local function relay(hook)
+        if not hook then
+            return nil
+        end
+        return function(info)
+            info.turn = current_turn
+            hook(info)
+        end
+    end
+
+    -- `llm` is forwarded whole rather than through a whitelist: the adapters
+    -- already drop what their provider does not accept, and a whitelist here
+    -- would silently strip every knob added upstream.
+    local backend_conf = {}
+    for k, v in pairs(llm) do
+        backend_conf[k] = v
+    end
+    backend_conf.max_retries = max_retries
+    backend_conf.on_request = relay(opts.on_request)
+    backend_conf.on_response = relay(opts.on_response)
+    backend_conf.on_decoded = function(decoded)
+        parsed = decoded
+    end
+
+    -- Built even when the session brings its own: an unusable provider is a
+    -- refusal to start rather than a failure five turns in.
+    local backend, berr = proto.backend(backend_conf)
+    if not backend then
+        return { ok = false, error = berr, turns = 0, tool_calls = {}, messages = {} }
+    end
+
+    --- Ask the model: through the session when there is one, so the answer is
+    --- recorded and charged before it comes back here.
+    ---
+    --- Which backend makes the call is the session's answer, not a guess: a
+    --- session opened with one of its own uses it, and one that was not is
+    --- handed this loop's, per call. Asked once per turn rather than
+    --- remembered, because the answer cannot change and there is nothing to
+    --- gain from caching it.
+    ---
+    --- @param req table  provider-neutral request
+    --- @return table|nil out, string|nil err
+    local function ask(req)
+        if not session then
+            return backend(req)
+        end
+        if session:has_backend() then
+            return session:call(req)
+        end
+        return session:call(req, { backend = backend })
+    end
 
     local messages = {}
     for _, m in ipairs(opts.messages or {}) do
@@ -324,9 +327,10 @@ function M._run_impl(opts)
     local last_stop_reason = nil
     local last_tool_calls = {}
 
-    --- The result for a session that refused a write. Named because the run
-    --- can hit it at five points and they all report the same thing.
-    local function session_failed(reason, turns_done)
+    --- The result for a run that cannot go on — a session that refused a
+    --- write, a model call that produced no answer. Named because the run can
+    --- hit it at five points and they all report the same thing.
+    local function stopped(reason, turns_done)
         return {
             ok = false,
             error = reason,
@@ -340,7 +344,7 @@ function M._run_impl(opts)
     -- Recorded before the prompt becomes part of the conversation.
     local prompt_err = record(session, { kind = "msg_user", content = opts.prompt })
     if prompt_err then
-        return session_failed(prompt_err, 0)
+        return stopped(prompt_err, 0)
     end
     table.insert(messages, { role = "user", content = opts.prompt })
 
@@ -367,128 +371,50 @@ function M._run_impl(opts)
             state = state,
         })
 
-        -- `llm` is forwarded whole rather than through a whitelist: the
-        -- adapters already drop what their provider does not accept, and a
-        -- whitelist here would silently strip every knob added upstream.
-        local build_args = {}
-        for k, v in pairs(llm) do
-            build_args[k] = v
-        end
-        build_args.messages = messages
-        build_args.system = opts.system
-        build_args.tools = wire_tools(specs)
-        build_args.max_tokens = llm.max_tokens or 4096
-
-        local req, build_err = adapter.build(build_args)
-        if not req then
-            return {
-                ok = false,
-                error = build_err,
-                turns = turn - 1,
-                tool_calls = all_tool_calls,
-                usage = usage,
-                messages = messages,
-            }
-        end
-
-        local body_json = std.json.encode(req.body)
-        if opts.on_request then
-            pcall(opts.on_request, {
-                turn = turn,
-                url = req.url,
-                headers = req.headers,
-                body = req.body,
-                body_json = body_json,
-            })
-        end
-
-        local started = std.time.now()
-        local resp = post_with_retry(req.url, {
-            method = "POST",
-            headers = req.headers,
-            body = body_json,
-            timeout = llm.timeout or 120,
-            dump = llm.dump,
-        }, max_retries)
-        if opts.on_response then
-            pcall(opts.on_response, {
-                turn = turn,
-                status = resp.status,
-                headers = resp.headers,
-                body = resp.body,
-                latency_ms = math.floor((std.time.now() - started) * 1000),
-            })
-        end
-
-        if resp.status ~= 200 then
-            local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-            return {
-                ok = false,
-                error = "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")",
-                turns = turn - 1,
-                tool_calls = all_tool_calls,
-                usage = usage,
-                messages = messages,
-            }
-        end
-
-        local ok_decode, raw = pcall(std.json.decode, resp.body)
-        if not ok_decode then
-            return {
-                ok = false,
-                error = "response JSON decode failed",
-                turns = turn - 1,
-                tool_calls = all_tool_calls,
-                usage = usage,
-                messages = messages,
-            }
-        end
-
-        local decoded, perr = adapter.parse(raw)
-        if not decoded then
-            return {
-                ok = false,
-                error = perr,
-                turns = turn - 1,
-                tool_calls = all_tool_calls,
-                usage = usage,
-                messages = messages,
-            }
-        end
-
-        local u = decoded.usage or {}
-
-        -- Recorded before the response becomes part of the conversation the
-        -- next turn is built from, and charged from what was just recorded
-        -- rather than from a total kept somewhere else.
-        local response_err = record(session, {
-            kind = "model_response",
-            turn = turn,
-            content = response_blocks(decoded.content),
-            usage = u,
+        -- Provider-neutral: what to ask, not how to ask it. The backend turns
+        -- this into a request, and a session that brought its own turns it
+        -- into whatever that one speaks.
+        current_turn = turn
+        parsed = nil
+        local out, ask_err = ask({
+            messages = messages,
+            system = opts.system,
+            tools = wire_tools(specs),
         })
-        if response_err then
-            return session_failed(response_err, turn - 1)
+
+        -- One shape for every way a call can produce nothing: the transport
+        -- failed, the provider refused the request, the session would not
+        -- record the answer. The run ends either way, and the message says
+        -- which it was.
+        if not out then
+            return stopped(ask_err, turn - 1)
         end
-        local spent = (u.input_tokens or 0) + (u.output_tokens or 0) + (u.thinking_tokens or 0)
-        local spend_err = charge(session, spent)
-        if spend_err then
-            return session_failed(spend_err, turn - 1)
-        end
+
+        -- The answer as the backend parsed it, which carries what the neutral
+        -- result does not: `stop_details`, and the provider extras `on_turn`
+        -- hands on. A session that brought its own backend leaves only the
+        -- kernel's checked copy — three fields, and no way to reach behind
+        -- them, which is the price of not knowing whose wire it was.
+        local answer = parsed or out
+        local u = answer.usage or {}
+        -- The kernel owns the numbering once there is a session, so the facts
+        -- around the response are filed under the turn it stamped rather than
+        -- under this loop's count, which restarts every run.
+        local model_turn = out.turn or turn
 
         -- Appended verbatim: Anthropic requires thinking blocks to come back
         -- unmodified during tool use, so the content is never filtered here.
-        table.insert(messages, { role = "assistant", content = decoded.content })
+        table.insert(messages, { role = "assistant", content = answer.content })
 
         usage.input_tokens = usage.input_tokens + (u.input_tokens or 0)
         usage.output_tokens = usage.output_tokens + (u.output_tokens or 0)
         usage.thinking_tokens = usage.thinking_tokens + (u.thinking_tokens or 0)
 
-        last_content = text_of(decoded.content)
-        last_stop_reason = decoded.stop_reason
+        last_content = text_of(answer.content)
+        last_stop_reason = answer.stop_reason
 
         local calls = {}
-        for _, block in ipairs(decoded.content or {}) do
+        for _, block in ipairs(answer.content or {}) do
             if block.type == "tool_use" then
                 table.insert(calls, block)
             end
@@ -496,7 +422,7 @@ function M._run_impl(opts)
         last_tool_calls = calls
 
         -- A refusal is not an empty answer; report it rather than looping.
-        if decoded.stop_reason == "refusal" then
+        if answer.stop_reason == "refusal" then
             return {
                 ok = false,
                 error = "model refused to respond",
@@ -505,8 +431,8 @@ function M._run_impl(opts)
                 tool_calls = all_tool_calls,
                 usage = usage,
                 messages = messages,
-                stop_reason = decoded.stop_reason,
-                stop_details = decoded.stop_details,
+                stop_reason = answer.stop_reason,
+                stop_details = answer.stop_details,
             }
         end
 
@@ -519,8 +445,8 @@ function M._run_impl(opts)
                 turn = turn,
                 content = last_content,
                 tool_calls = calls,
-                usage = decoded.usage,
-                decoded = decoded,
+                usage = answer.usage,
+                decoded = answer,
                 state = state,
             })
             if not cb_ok then
@@ -541,7 +467,7 @@ function M._run_impl(opts)
         if #calls == 0 then
             -- `pause_turn` means the server paused its own tool loop; the turn
             -- is unfinished even though it asked us for nothing.
-            if decoded.stop_reason == "pause_turn" then
+            if answer.stop_reason == "pause_turn" then
                 goto continue_turn
             end
             return {
@@ -557,7 +483,7 @@ function M._run_impl(opts)
 
         -- Tool calls that arrive with `max_tokens` were cut off mid-emission,
         -- so their arguments cannot be trusted enough to run.
-        if decoded.stop_reason == "max_tokens" then
+        if answer.stop_reason == "max_tokens" then
             return {
                 ok = true,
                 content = last_content,
@@ -574,13 +500,13 @@ function M._run_impl(opts)
             local call_id = tostring(block.id or "")
             local call_err = record(session, {
                 kind = "tool_call",
-                turn = turn,
+                turn = model_turn,
                 call_id = call_id,
                 name = tostring(block.name or ""),
                 args = block.input or {},
             })
             if call_err then
-                return session_failed(call_err, turn)
+                return stopped(call_err, turn)
             end
 
             local text, is_error = dispatch(by_name, block)
@@ -589,13 +515,13 @@ function M._run_impl(opts)
             -- and the record is the only place that says one happened.
             local result_err = record(session, {
                 kind = "tool_result",
-                turn = turn,
+                turn = model_turn,
                 call_id = call_id,
                 ok = not is_error,
                 result = text,
             })
             if result_err then
-                return session_failed(result_err, turn)
+                return stopped(result_err, turn)
             end
 
             table.insert(results, {
@@ -633,6 +559,5 @@ M._resolve_tools = resolve_tools
 M._wire_tools = wire_tools
 M._dispatch = dispatch
 M._text_of = text_of
-M._response_blocks = response_blocks
 
 return M

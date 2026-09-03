@@ -47,7 +47,12 @@ pub const OPT_N: &str = "n";
 pub const DEFAULT_TAIL_N: usize = 20;
 
 /// Usage counters summed by the `usage` view.
-const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
+///
+/// `pub(super)` because the budget charge of a model call sums exactly
+/// these, read exactly the way [`whole`] reads them: what a run is charged
+/// and what its `usage` view reports are then the same arithmetic over the
+/// same fields, rather than two definitions that can drift apart.
+pub(super) const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
 /// Usage field: number of `model_response` events folded.
 const FIELD_MODEL_CALLS: &str = "model_calls";
 
@@ -151,7 +156,7 @@ impl UsageFold {
 
 /// A usage counter as a whole number (`0` when absent or not numeric —
 /// the counters are provider-supplied and optional).
-fn whole(value: &Value) -> i64 {
+pub(super) fn whole(value: &Value) -> i64 {
     value
         .as_i64()
         .or_else(|| value.as_f64().map(|f| f.trunc() as i64))

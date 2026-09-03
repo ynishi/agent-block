@@ -27,8 +27,14 @@
 ---   -- req = { url, headers, body }   (body is a table; caller encodes)
 ---   local decoded, perr = ad.parse(raw_response_json)
 ---
---- Adapters are pure: they never perform I/O. HTTP, retries, and dump logging
---- stay with the caller.
+--- Adapters are pure: they never perform I/O. What performs it is
+--- `proto.backend(conf)`, which closes build, POST-with-retries and parse into
+--- one function of a provider-neutral request — the shape a kernel session
+--- binds and a loop without one calls directly, so "ask the model" has a
+--- single implementation and its callers hold no provider knowledge.
+---
+---   local backend = proto.backend({ provider = "anthropic", model = ... })
+---   local res, err = backend({ messages = ..., system = ..., tools = ... })
 
 local M = {}
 
@@ -339,5 +345,210 @@ function M.providers()
     table.sort(out)
     return out
 end
+
+-- ============================================================
+-- Backend
+-- ============================================================
+
+--- Retries for transient API failures (rate limit / overload / 5xx).
+local DEFAULT_MAX_RETRIES = 2
+
+--- Output cap when neither the request nor the conf names one.
+local DEFAULT_MAX_TOKENS = 4096
+
+--- Seconds a request may take when the conf does not say.
+local DEFAULT_TIMEOUT = 120
+
+--- Conf keys that configure the closure rather than the request. They are
+--- kept back when the adapter spec is assembled: an adapter ignores what it
+--- does not know, but forwarding a callback as if it were a wire field is the
+--- kind of thing that stops being harmless the day an adapter grows a field of
+--- the same name.
+local BACKEND_CONF = {
+    max_retries = true,
+    on_request = true,
+    on_response = true,
+    on_decoded = true,
+}
+
+--- POST with retries for the failures worth retrying.
+---
+--- Rate limits, overload and 5xx come back on their own; auth failures,
+--- malformed requests and exhausted spend never will, so the classification
+--- decides rather than the status class.
+local function post_with_retry(url, request_opts, max_retries)
+    local attempt = 0
+    while true do
+        local resp = http.request(url, request_opts)
+        if resp.status == 200 or attempt >= max_retries then
+            return resp
+        end
+        local classified = M.classify_error(resp.status, resp.body, resp.headers)
+        if not classified.retryable then
+            return resp
+        end
+        attempt = attempt + 1
+        local delay = M.retry_delay(attempt, classified, attempt)
+        log.warn(
+            "llm_proto: "
+                .. classified.kind
+                .. " (HTTP "
+                .. tostring(resp.status)
+                .. "); retry "
+                .. attempt
+                .. "/"
+                .. max_retries
+        )
+        std.task.sleep(delay * 1000)
+    end
+end
+
+--- The content blocks to report for a model response.
+---
+--- An answer carries a non-empty array of blocks. An answer with no blocks at
+--- all is reported as the one empty text block it amounts to, because an empty
+--- Lua table crosses into the kernel as an empty mapping rather than an empty
+--- array — and losing the response, with the usage it reports, would be the
+--- worse trade.
+local function response_blocks(content)
+    if type(content) ~= "table" or #content == 0 then
+        return { { type = "text", text = "" } }
+    end
+    return content
+end
+
+--- Build a model backend: one closure that turns a provider-neutral request
+--- into an answer.
+---
+--- This is the whole transport in one value — wire format, retries, parse —
+--- so a caller that wants a model call holds a function rather than a
+--- provider. Two of them use it:
+---
+---   * the kernel, when a session is opened with `backend = ...`: `s:call(req)`
+---     runs it and records what it returns
+---   * a loop with no session, which calls it directly
+---
+--- so there is one implementation of "ask the model" and neither side carries
+--- provider knowledge.
+---
+--- The closure answers `result | nil, err`, which is the contract `knl.call`
+--- checks: `content` is a non-empty array of blocks, `usage` a table and
+--- `stop_reason` a string. `status` and `latency_ms` ride along for callers
+--- that want them; the kernel drops anything beyond the three.
+---
+--- @param conf table {
+---   provider, model, api_key, api_key_env, base_url, headers, max_tokens,
+---   timeout, dump, thinking, tool_choice, ... — forwarded to the adapter,
+---   max_retries  (default 2) transient API failures only
+---   on_request   function({ url, headers, body, body_json }) before the POST
+---   on_response  function({ status, headers, body, latency_ms }) after it
+---   on_decoded   function(decoded) with the adapter's parse, which carries
+---                what the neutral answer does not (stop_details, provider
+---                extras). Observability only: what they return is not read.
+--- }
+--- @return function|nil backend  function(req) -> result | nil, err
+--- @return string|nil err  when the provider is not one this build speaks
+function M.backend(conf)
+    conf = conf or {}
+
+    local adapter, aerr = M.adapter(conf.provider)
+    if not adapter then
+        return nil, aerr
+    end
+
+    -- Resolved once: the conf is fixed for the life of the closure, and only
+    -- the request changes per call.
+    local base = {}
+    for key, value in pairs(conf) do
+        if not BACKEND_CONF[key] then
+            base[key] = value
+        end
+    end
+    local max_retries = tonumber(conf.max_retries) or DEFAULT_MAX_RETRIES
+
+    --- @param req table  { messages, system, tools, ... } — provider-neutral
+    return function(req)
+        req = req or {}
+
+        -- The request wins over the conf, field by field: the conf says how to
+        -- reach the provider, the request says what to ask it, and a caller
+        -- that wants to override a knob for one call can.
+        local spec = {}
+        for key, value in pairs(base) do
+            spec[key] = value
+        end
+        for key, value in pairs(req) do
+            spec[key] = value
+        end
+        spec.max_tokens = req.max_tokens or conf.max_tokens or DEFAULT_MAX_TOKENS
+
+        local built, berr = adapter.build(spec)
+        if not built then
+            return nil, berr
+        end
+
+        local body_json = std.json.encode(built.body)
+        if conf.on_request then
+            pcall(conf.on_request, {
+                url = built.url,
+                headers = built.headers,
+                body = built.body,
+                body_json = body_json,
+            })
+        end
+
+        local started = std.time.now()
+        local resp = post_with_retry(built.url, {
+            method = "POST",
+            headers = built.headers,
+            body = body_json,
+            timeout = conf.timeout or DEFAULT_TIMEOUT,
+            dump = conf.dump,
+        }, max_retries)
+        local latency_ms = math.floor((std.time.now() - started) * 1000)
+
+        if conf.on_response then
+            pcall(conf.on_response, {
+                status = resp.status,
+                headers = resp.headers,
+                body = resp.body,
+                latency_ms = latency_ms,
+            })
+        end
+
+        if resp.status ~= 200 then
+            local classified = M.classify_error(resp.status, resp.body, resp.headers)
+            return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
+        end
+
+        local ok_decode, raw = pcall(std.json.decode, resp.body)
+        if not ok_decode then
+            return nil, "response JSON decode failed"
+        end
+
+        local decoded, perr = adapter.parse(raw)
+        if not decoded then
+            return nil, perr
+        end
+
+        if conf.on_decoded then
+            pcall(conf.on_decoded, decoded)
+        end
+
+        return {
+            content = response_blocks(decoded.content),
+            usage = decoded.usage or {},
+            -- A string because the contract asks for one; a provider that
+            -- names no reason still produced an answer, and refusing to
+            -- record it over a missing label would be the worse failure.
+            stop_reason = decoded.stop_reason or "",
+            status = resp.status,
+            latency_ms = latency_ms,
+        }
+    end,
+        nil
+end
+
+M._response_blocks = response_blocks
 
 return M

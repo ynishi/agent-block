@@ -28,6 +28,13 @@
 //! | `tool_call`      | `turn: integer`, `call_id: string`, `name: string`, `args: table` |
 //! | `tool_result`    | `turn: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
 //!
+//! Three of the reserved kinds are also *kernel-authored*
+//! ([`KERNEL_AUTHORED_KINDS`]): `run_started` and `run_finished` bracket
+//! the run scope and `model_response` is written as the response is
+//! charged, so a caller cannot append any of them — see
+//! [`super::Session::append`].  The remaining three are the shell's to
+//! write and only their shape is checked.
+//!
 //! The literal request/response bytes are not stored: they are derivable
 //! from these facts by a projection, and byte-level fidelity is the dump
 //! sink's job.  Storing both would be two sources of truth.
@@ -60,6 +67,9 @@ pub const KIND_TOOL_RESULT: &str = "tool_result";
 
 /// Payload field of `run_finished`.
 pub const FIELD_REASON: &str = "reason";
+/// Payload field of `model_response` / `tool_call` / `tool_result`: which
+/// model call the fact belongs to.
+pub const FIELD_TURN: &str = "turn";
 /// Payload field of `msg_user` / `model_response`.
 pub const FIELD_CONTENT: &str = "content";
 /// Payload field of `model_response`.
@@ -124,20 +134,20 @@ const RUN_FINISHED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
 const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
 /// Required fields of `model_response`.
 const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CONTENT, Shape::Array),
     (FIELD_USAGE, Shape::Object),
 ];
 /// Required fields of `tool_call`.
 const TOOL_CALL_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     ("name", Shape::Str),
     ("args", Shape::Object),
 ];
 /// Required fields of `tool_result`.
 const TOOL_RESULT_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     (FIELD_OK, Shape::Bool),
     (FIELD_RESULT, Shape::Any),
@@ -161,6 +171,38 @@ fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
 /// Whether `kind` is part of the reserved (kernel-checked) vocabulary.
 pub fn is_reserved(kind: &str) -> bool {
     required_fields(kind).is_some()
+}
+
+/// The kinds the kernel writes itself, and a caller therefore may not.
+///
+/// A subset of the reserved vocabulary: these three are not merely
+/// *shaped* by the kernel, they are *authored* by it — the two run
+/// boundaries come from [`super::Session::new`] / `close`, and a
+/// `model_response` is stamped with the kernel's turn and charged as it
+/// is recorded.  The other three reserved kinds (`msg_user`,
+/// `tool_call`, `tool_result`) are the shell's to write: the kernel has
+/// no way to observe them and only checks their shape.
+///
+/// [`super::Session::append`] is where the refusal happens, and its
+/// documentation says what accepting one would make legal.
+pub const KERNEL_AUTHORED_KINDS: &[&str] =
+    &[KIND_RUN_STARTED, KIND_RUN_FINISHED, KIND_MODEL_RESPONSE];
+
+/// Whether `kind` is one only the kernel may write.
+pub fn is_kernel_authored(kind: &str) -> bool {
+    KERNEL_AUTHORED_KINDS.contains(&kind)
+}
+
+/// The `kind` of an event about to be appended, when it has a usable one.
+///
+/// `None` covers both "absent" and "not a string": deciding what to do
+/// with those is [`validate_event`]'s job, and the kernel-authored gate
+/// has nothing to say about an event that has no kind at all.
+pub fn kind_field(obj: &Map<String, Value>) -> Option<&str> {
+    match obj.get(FIELD_KIND) {
+        Some(Value::String(kind)) => Some(kind.as_str()),
+        _ => None,
+    }
 }
 
 /// Whether `value` is a number without a fractional part.
@@ -435,5 +477,28 @@ mod tests {
         for kind in ["note", "decision", "carry", "user_msg", "run_start", ""] {
             assert!(!is_reserved(kind), "{kind} must be open");
         }
+    }
+
+    #[test]
+    fn the_kernel_authors_three_of_the_six_reserved_kinds() {
+        for kind in ["run_started", "run_finished", "model_response"] {
+            assert!(is_kernel_authored(kind), "{kind} must be kernel-authored");
+            assert!(is_reserved(kind), "a kernel-authored kind is reserved");
+        }
+        // The shell writes the rest: the kernel checks their shape but
+        // never produces one.
+        for kind in ["msg_user", "tool_call", "tool_result", "note", ""] {
+            assert!(
+                !is_kernel_authored(kind),
+                "{kind} must be writable by a caller"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_field_reads_a_string_kind_and_nothing_else() {
+        assert_eq!(kind_field(&obj(json!({ "kind": "note" }))), Some("note"));
+        assert_eq!(kind_field(&obj(json!({ "kind": 42 }))), None);
+        assert_eq!(kind_field(&obj(json!({ "text": "hi" }))), None);
     }
 }

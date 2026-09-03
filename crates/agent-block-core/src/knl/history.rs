@@ -39,12 +39,16 @@ impl History {
         Ok(self.push(obj))
     }
 
-    /// Append a kernel-authored event (`run_started` / `run_finished`).
+    /// Append a kernel-authored event (`run_started` / `run_finished` /
+    /// `model_response` / `model_call_failed`).
     ///
     /// Validation is skipped because the payload is built inside this
     /// module from the reserved vocabulary itself — re-checking it would
     /// only add a failure path that cannot be reached.  Caller-authored
-    /// events must go through [`History::append`].
+    /// events go through [`History::append`]; what stops a caller from
+    /// imitating one of these lives a layer up, in
+    /// [`super::Session::append`], next to the turn counter, budget and
+    /// run scope a forgery would put out of step.
     pub(super) fn append_kernel(&mut self, obj: Map<String, Value>) -> u64 {
         self.push(obj)
     }
