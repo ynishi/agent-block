@@ -220,11 +220,11 @@ describe("what the backend returns", function()
         expect(type(res.latency_ms)).to.equal("number")
     end)
 
-    -- The contract is a non-empty array of blocks. An empty Lua table crosses
-    -- into the kernel as a mapping rather than an empty array, so an answer
-    -- that produced nothing needs a shape that survives the crossing — and
-    -- losing the answer, with the usage it reports, would be the worse trade.
-    it("stands in one empty text block for an answer with no blocks", function()
+    -- An answer with no blocks is an answer. It is reported as the empty array
+    -- it was, tagged so the empty Lua table crosses into the kernel as an array
+    -- rather than as a mapping — which is the whole reason a block used to be
+    -- invented here, and the invented block is what the record then held.
+    it("reports an answer with no blocks as an empty array", function()
         reset()
         queue_ok({
             id = "msg_empty",
@@ -236,9 +236,8 @@ describe("what the backend returns", function()
 
         local res = ask(anthropic_backend())
 
-        expect(#res.content).to.equal(1)
-        expect(res.content[1].type).to.equal("text")
-        expect(res.content[1].text).to.equal("")
+        expect(#res.content).to.equal(0)
+        expect(getmetatable(res.content).__jsontype).to.equal("array")
         expect(res.usage.input_tokens).to.equal(1)
     end)
 
@@ -246,24 +245,28 @@ describe("what the backend returns", function()
         local blocks = { { type = "thinking", thinking = "..." }, { type = "text", text = "hi" } }
         expect(proto._response_blocks(blocks)).to.equal(blocks)
 
-        for _, empty in ipairs({ {}, "not a table", 42 }) do
-            local out = proto._response_blocks(empty)
-            expect(#out).to.equal(1)
-            expect(out[1].type).to.equal("text")
-            expect(out[1].text).to.equal("")
+        -- No blocks: an empty array, said in the one way an empty Lua table
+        -- can say it.
+        local empty = proto._response_blocks({})
+        expect(#empty).to.equal(0)
+        expect(getmetatable(empty).__jsontype).to.equal("array")
+
+        -- Not blocks at all: handed on as it came, for the kernel to refuse.
+        for _, odd in ipairs({ "not a table", 42 }) do
+            expect(proto._response_blocks(odd)).to.equal(odd)
         end
     end)
 
-    -- `stop_reason` is a string because the contract asks for one; a provider
-    -- that names no reason still produced an answer worth recording.
-    it("reports an unnamed stop reason as an empty string", function()
+    -- A provider that names no reason still produced an answer, and the record
+    -- says which of the two happened: the field is absent rather than empty.
+    it("leaves an unnamed stop reason absent", function()
         reset()
         local response = text_response("hello")
         response.stop_reason = nil
         queue_ok(response)
 
         local res = ask(anthropic_backend())
-        expect(res.stop_reason).to.equal("")
+        expect(res.stop_reason).to.equal(nil)
     end)
 end)
 

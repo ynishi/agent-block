@@ -2256,6 +2256,11 @@ local function run_loop(conf)
             -- the next iteration is exactly the one that has to tell it so. The
             -- turn is kept as the empty text it amounts to, which is the shape
             -- this loop sent before the two call paths were merged.
+            --
+            -- This edits the request, not the record: what the model said is
+            -- already in the history as the empty answer it was, and the empty
+            -- text below exists only because the next HTTP call needs a turn
+            -- with something in it. The two layers disagree on purpose.
             local last_msg = messages[#messages]
             if last_msg and last_msg.role == "assistant" and #(last_msg.content or {}) == 0 then
                 last_msg.content = { { type = "text", text = "" } }
