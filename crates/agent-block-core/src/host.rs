@@ -82,6 +82,7 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "lshape.luacats",
         include_str!("../blocks/lib/lshape/luacats.lua"),
     ),
+    ("knl", include_str!("../blocks/lib/knl/init.lua")),
 ];
 
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
