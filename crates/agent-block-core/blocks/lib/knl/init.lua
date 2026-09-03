@@ -2,26 +2,37 @@
 ---
 --- What this is
 ---   The driving half of the kernel/shell split: Rust is the pure syscall
----   layer (session / append / events / view / spend / close / call /
----   has_backend), and this module runs a Turn — one model call plus the
----   tools that call asks for — over it, returning an `Outcome`. See
----   `knl-kernel-design.md` rev 5 for the whole design; this file is the
----   POC skeleton (§2 turn, §4 run, §5 fold, §8 Outcome), not the full one.
+---   layer (session / append / events / view / spend / close), and this
+---   module runs a Turn — one model call plus the tools that call asks for —
+---   over it, returning an `Outcome`. See `knl-kernel-design.md` rev 6 (§1
+---   ctx-handle, §2 the full beat) for the design; this file is the POC
+---   skeleton (§2 turn, §4 run, §5 fold, §8 Outcome), not the full one.
 ---
---- The name collision (design §0.5)
----   The Rust syscall bridge installs itself as the global `knl`. This module
----   is loaded as `require("knl")`, so a caller writes `local knl =
----   require("knl")` and shadows that global in its own scope. To keep the
----   two apart the module captures the bridge here, at load time, before the
----   name is shadowed — the design slates the bridge to be renamed `syscall`,
----   and this indirection is what lets both share the name until then.
+--- The B-plan shape (design rev 6, §1/§2)
+---   `knl.turn(conf)` takes one argument. The state handle — the "ctx", an
+---   fd-like handle onto History / Budget — travels in `conf.ctx`, so a
+---   driver is free to build its own loop by carrying `conf` (ctx included)
+---   between beats. turn does NOT use the composite `session:call`; it calls
+---   `conf.backend(request)` itself and lays down the record (`ctx:append`),
+---   the charge (`ctx:spend`) and the turn number in that order — turn owns
+---   the beat, no syscall bundles the steps for it.
+---
+--- Turn numbering, and the bridge gap (report this)
+---   The design has the ctx be the numbering authority via `ctx:next_turn()`.
+---   The current Rust bridge (crates/agent-block-core/src/bridge/knl.rs) does
+---   NOT expose that method (the Rust *core* has `Session::next_turn`, it is
+---   simply unbound). So this POC numbers a turn by counting the
+---   `model_response` events already in the ctx and adding one
+---   (`next_turn_of`). This is the one place the implementation diverges from
+---   §2's `ctx:next_turn()`.
 ---
 --- What the POC deliberately leaves out
 ---   Real provider adapters (backend is a stub `fn(req) -> {status, content,
 ---   usage, stop_reason}` passed via conf), the full fold vocabulary, and
 ---   realistic tool / filter / backend-selection policies. The skeleton
 ---   carries only the invariants: Outcome's three values, a Turn that folds
----   events into a request, records it write-ahead, calls, and closes every
+---   events into a request, records it write-ahead, calls the backend
+---   directly, records + charges the response itself, and closes every
 ---   tool_use with a tool_result; and a run driver that cannot loop forever.
 
 --- The Rust syscall bridge, captured before `require("knl")` shadows the
@@ -199,8 +210,187 @@ function M.fold(events, conf)
 end
 
 -- ============================================================
+-- scope handle (§1 In, §2 single write path) + usage (§3 projection)
+-- ============================================================
+--
+-- The ownership fix (scope-design.md). The old code stamped an `author`
+-- (kernel|caller) from *which append method was called*, so turn's
+-- model_response — laid down through the plain append path — read back as
+-- author=caller and fell out of the account (usage=0, the confused-deputy
+-- bug). Here ownership is intrinsic to a *scope handle*: `open` mints a
+-- scope id once (§1), every write through the handle carries that scope
+-- automatically (§2), and aggregation is a projection filtered by that
+-- scope (§3). The consumer (turn) never decides ownership — it just writes
+-- through the handle it was handed.
+--
+-- POC boundary (scope-design.md §5/§6, stated so it is not mistaken for the
+-- finished thing):
+--   * NOT enforced at the Rust boundary. A raw `ctx:append` can still
+--     bypass scope stamping — the handle stamps scope in Lua, it is not yet
+--     the *only* reachable write path. Making a raw append unable to skip
+--     the stamp is the follow-up Rust hardening step, out of scope here;
+--     this POC validates the *behaviour* of the model.
+--   * NO multi-scope continuation. The lineage branch in `Handle:append`
+--     (leave an already-set scope alone) is here so a carried-over event
+--     keeps its origin scope, but nothing in this POC drives continuation
+--     across scopes — that is the persistence step (§6.5), flagged only.
+
+local Handle = {}
+Handle.__index = Handle
+
+--- The single consumer-facing write path (§2). Stamp this handle's scope
+--- onto an event that does not carry one, then delegate to the underlying
+--- ctx, returning the seq it assigns.
+---
+--- An event that *already* carries a scope keeps it: that is a carried-over
+--- event holding its origin scope (§4 lineage), and overwriting it would
+--- re-bill another scope's work to this one. The consumer sets no scope of
+--- its own — routing the write through the handle is what stamps it.
+---
+--- Mutates `event` in place, by contract: auto-stamping scope on the way
+--- through is the whole point of the single write path (a caller that keeps
+--- a reference sees the scope the write was recorded under).
+function Handle:append(event)
+    if event.scope == nil then
+        event.scope = self.scope
+    end
+    return self.ctx:append(event)
+end
+
+--- Read / budget / lifecycle delegate straight to the underlying ctx: the
+--- handle adds ownership to writes, it does not reinterpret the rest.
+function Handle:events(from)
+    return self.ctx:events(from)
+end
+
+function Handle:spend(n)
+    return self.ctx:spend(n)
+end
+
+function Handle:remaining()
+    return self.ctx:remaining()
+end
+
+function Handle:exhausted()
+    return self.ctx:exhausted()
+end
+
+function Handle:close(reason)
+    return self.ctx:close(reason)
+end
+
+function Handle:id()
+    return self.ctx:id()
+end
+
+--- Open a scope (§1 In) and return its handle — the only capability the
+--- consumer needs to write to the scope.
+---
+--- The session already mints a UUID (`ctx:id()`); that id *is* the scope id
+--- (no extra field — the session's identity and the scope's are one). owner
+--- / user are the scope's incidental identity (whose scope it is, for later
+--- multi-app separation) and do not affect accounting.
+---
+--- @param opts table  { owner?, user?, budget?, backend? }
+--- @return table handle  { scope, owner, user, ctx } + Handle methods
+function M.open(opts)
+    opts = opts or {}
+    if syscall == nil then
+        error("knl.open: the knl syscall bridge is not available in this VM")
+    end
+    local ctx = syscall.session({ budget = opts.budget, backend = opts.backend })
+    return setmetatable({
+        ctx = ctx,
+        scope = ctx:id(),
+        owner = opts.owner,
+        user = opts.user,
+    }, Handle)
+end
+
+--- Usage as a scope-keyed projection (§3). Fold the handle's events and
+--- count only the model_response events stamped with *this* handle's scope:
+--- those are the calls this scope made and paid for. A model_response
+--- carrying a different scope (a carried-over, lineage event) stays in the
+--- record but out of this account.
+---
+--- This is the design's "aggregation is a projection filtered by scope",
+--- and the reason it does not lean on the Rust `view("usage")`: that view
+--- keys on `author`, the stamp the model replaced — a turn's own response,
+--- written through the plain path, reads back author=caller and the Rust
+--- view scores it 0. Keying on scope is what makes the count come out right.
+---
+--- @param handle table  a handle from `M.open`
+--- @return table  { input_tokens, output_tokens, thinking_tokens, model_calls }
+function M.usage(handle)
+    local totals = {
+        input_tokens = 0,
+        output_tokens = 0,
+        thinking_tokens = 0,
+        model_calls = 0,
+    }
+    for _, ev in ipairs(handle:events()) do
+        if ev.kind == "model_response" and ev.scope == handle.scope then
+            totals.model_calls = totals.model_calls + 1
+            local usage = ev.usage
+            if type(usage) == "table" then
+                for _, counter in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
+                    local n = usage[counter]
+                    if type(n) == "number" then
+                        totals[counter] = totals[counter] + n
+                    end
+                end
+            end
+        end
+    end
+    return totals
+end
+
+-- ============================================================
 -- turn (§2) — one complete beat
 -- ============================================================
+
+--- The three usage counters the budget charges on, summed. Mirrors the Rust
+--- `ModelResult::charge` (input + output + thinking, a missing counter is 0
+--- and the total floors at 0), because turn now does the charge itself with
+--- `ctx:spend` rather than leaning on the composite `session:call`.
+local function tokens_of(usage)
+    if type(usage) ~= "table" then
+        return 0
+    end
+    local total = 0
+    for _, counter in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
+        local n = usage[counter]
+        if type(n) == "number" and n > 0 then
+            total = total + n
+        end
+    end
+    return total
+end
+
+--- The turn number the next recorded response takes — scope-keyed.
+---
+--- The design (§2) reads this off the ctx (`ctx:next_turn()`), which is the
+--- Rust authority. The bridge does not expose that method today, so the POC
+--- derives the same number the Rust core would: one past the count of
+--- `model_response` events already in the history *under this scope*
+--- (scope-design.md §2/§3 — numbering is scope-keyed, exactly like usage).
+--- Called before the append, so a fresh scope's first turn is 1.
+---
+--- `ctx.scope` is the handle's scope; a model_response from a different
+--- scope (lineage) does not advance this scope's counter. A raw session
+--- brought in without a handle reads `ctx.scope == nil`, and its unstamped
+--- model_responses (`ev.scope == nil`) match it — the pre-handle path keeps
+--- numbering as it did.
+local function next_turn_of(ctx)
+    local n = 0
+    local scope = ctx.scope
+    for _, ev in ipairs(ctx:events()) do
+        if ev.kind == "model_response" and ev.scope == scope then
+            n = n + 1
+        end
+    end
+    return n + 1
+end
 
 --- Minimal conf shape check (§2 [0] ShapePort). Returns an error string, or
 --- nil when the conf is usable.
@@ -224,13 +414,15 @@ local function conf_problem(conf)
 end
 
 --- Run the tool_use blocks of a response, closing every one with a
---- tool_result (§2 [5], skeleton). What runs / is skipped is `conf.tool_policy`
+--- tool_result (§2 [6], skeleton). What runs / is skipped is `conf.tool_policy`
 --- (a `fn(tc, out) -> action`), the success result is the handler's, and the
 --- pair-closing record — including the machine-minimal error for an unknown
---- tool or a raising handler — is the kernel's.
+--- tool or a raising handler — is the kernel's. `out.turn` (set by turn
+--- before this runs) stamps both halves of every pair.
 ---
+--- @param ctx userdata  a `knl.session()` handle (conf.ctx)
 --- @return table summary  one { call_id, name, ok } per tool_use
-local function execute_tools(session, conf, out)
+local function execute_tools(ctx, conf, out)
     local summary = {}
     local tools = conf.tools or {}
     local policy = conf.tool_policy
@@ -243,7 +435,7 @@ local function execute_tools(session, conf, out)
 
             -- Record the call before running it: a run that dies mid-tool
             -- leaves a history that says a call was made.
-            session:append({
+            ctx:append({
                 kind = "tool_call",
                 turn = out.turn,
                 call_id = call_id,
@@ -285,7 +477,7 @@ local function execute_tools(session, conf, out)
                 result = ""
             end
 
-            session:append({
+            ctx:append({
                 kind = "tool_result",
                 turn = out.turn,
                 call_id = call_id,
@@ -300,15 +492,18 @@ local function execute_tools(session, conf, out)
     return summary
 end
 
---- One complete beat: gate, fold, filter, record, call, run its tools (§2).
+--- One complete beat: gate, fold, filter, record, call, record + charge, run
+--- its tools (§2, B-plan). turn calls the backend itself and lays down the
+--- record / charge / turn number — no `session:call` bundles the steps.
 ---
---- Re-entrant and stateless: it is decided entirely by `(session, conf)`, so
---- it can be called from any driver, resumed, or interleaved.
+--- Re-entrant and stateless: it is decided entirely by `conf` (the ctx
+--- handle included), so it can be called from any driver, resumed, or
+--- interleaved. The state handle is `conf.ctx`; turn never opens it.
 ---
---- @param session userdata  a `knl.session()` (the Rust bridge)
---- @param conf table
+--- @param conf table  { ctx = <knl.session handle>, backend, fold?, filters?,
+---                      tools?, tool_policy?, system? }
 --- @return table outcome  an `Outcome` (§8)
-function M.turn(session, conf)
+function M.turn(conf)
     conf = conf or {}
 
     -- [0] gate ------------------------------------------------------------
@@ -316,21 +511,23 @@ function M.turn(session, conf)
     if problem then
         return Outcome.err("conf", problem)
     end
-    -- A backend must be reachable: brought by conf (the POC stub) or bound
-    -- to the session. The stub means the session need not have one of its
-    -- own, which is the property the POC is checking.
-    local backend_available = conf.backend ~= nil or session:has_backend()
-    if not backend_available then
-        return Outcome.err("conf", "no backend available (pass conf.backend or open the session with one)")
+    local ctx = conf.ctx
+    if ctx == nil then
+        return Outcome.err("conf", "no ctx (pass conf.ctx, a knl.session handle)")
+    end
+    -- The backend is turn's to call now, so it must be in conf. There is no
+    -- session-bound fallback here — that path belonged to `session:call`.
+    if conf.backend == nil then
+        return Outcome.err("conf", "no backend (pass conf.backend)")
     end
     -- Budget stop is a planned stop, not a failure: Ok before the call.
-    if session:exhausted() then
+    if ctx:exhausted() then
         return Outcome.ok({ budget_stopped = true })
     end
 
     -- [1] request <- fold(events, conf) -----------------------------------
     local fold_fn = conf.fold or M.fold
-    local folded_ok, request = pcall(fold_fn, session:events(), conf)
+    local folded_ok, request = pcall(fold_fn, ctx:events(), conf)
     if not folded_ok then
         return Outcome.err("conf", "fold failed: " .. tostring(request))
     end
@@ -349,53 +546,42 @@ function M.turn(session, conf)
     -- [3] record the request write-ahead (open kind "request") ------------
     -- The request as actually sent is a fact in the history before the call,
     -- so a call that then fails leaves the request event behind (§6).
-    session:append({ kind = "request", request = request })
+    ctx:append({ kind = "request", request = request })
 
-    -- [4] call ------------------------------------------------------------
-    -- The current `session:call` IF returns { turn, content, usage,
-    -- stop_reason, remaining, exhausted } — it drops any `status` the backend
-    -- returns (Rust `validate_backend_result`). So when the backend is the
-    -- POC stub (which returns a status), we wrap it: the wrapper captures the
-    -- status and hands `session:call` only the fields it records, and we read
-    -- the status back after the call. A status of "error" is turned into a
-    -- failed call so no model_response is recorded for it.
-    local captured_status
-    local out, call_err
-    if conf.backend then
-        local wrapped = function(req)
-            local raw, raw_err = conf.backend(req)
-            if raw == nil then
-                return nil, raw_err
-            end
-            captured_status = raw.status
-            if raw.status == "error" then
-                return nil, raw.detail or "backend reported error"
-            end
-            return { content = raw.content, usage = raw.usage, stop_reason = raw.stop_reason }
-        end
-        out, call_err = session:call(request, { backend = wrapped })
-    else
-        -- Session-bound backend: the current IF gives no status back, so a
-        -- successful call is taken as Ok (see the POC take-aways).
-        out, call_err = session:call(request)
-        captured_status = out and "ok" or nil
+    -- [4] turn calls the backend directly ---------------------------------
+    -- resp = { status = "ok"|"refused"|"error", content, usage, stop_reason }.
+    -- The status is the adapter's judgement; turn reads it, it does not
+    -- invent one (§8, status is backend-supplied).
+    local resp, berr = conf.backend(request)
+
+    -- [5] status branch — turn lays down the record and the charge ---------
+    -- error / transport failure: the beat did not come off. Note it and stop.
+    if resp == nil or resp.status == "error" then
+        local reason = berr or (resp and resp.detail) or "backend reported error"
+        ctx:append({ kind = "model_call_failed", error = tostring(reason) })
+        return Outcome.err("call", tostring(reason))
+    end
+    -- ok / refused: the model answered. Record it, then charge it
+    -- (write-ahead: append before spend), numbering the turn ourselves.
+    local turn_no = next_turn_of(ctx)
+    resp.turn = turn_no
+    ctx:append({
+        kind = "model_response",
+        turn = turn_no,
+        content = resp.content,
+        usage = resp.usage,
+        stop_reason = resp.stop_reason,
+    })
+    ctx:spend(tokens_of(resp.usage))
+    -- A refusal is a recorded, charged response the model would not build on.
+    if resp.status == "refused" then
+        return Outcome.refused(resp.stop_reason or "refused", resp)
     end
 
-    if out == nil then
-        -- Transport failure, an unrecordable result, or status == "error":
-        -- the beat did not come off.
-        return Outcome.err("call", tostring(call_err))
-    end
+    -- [6] tool execution (skeleton) --------------------------------------
+    resp.tools = execute_tools(ctx, conf, resp)
 
-    -- The kernel does not invent the status; it loads what the backend gave.
-    if captured_status == "refused" then
-        return Outcome.refused(out.stop_reason or "refused", out)
-    end
-
-    -- [5] tool execution (skeleton) --------------------------------------
-    out.tools = execute_tools(session, conf, out)
-
-    return Outcome.ok(out)
+    return Outcome.ok(resp)
 end
 
 -- ============================================================
@@ -416,71 +602,81 @@ end
 --- until the model settles, the budget stops it, or a turn fails (§4).
 ---
 --- @param conf table {
----   budget    (optional) { tokens = N } — opens a session with this budget
+---   budget    (optional) { tokens = N } — opens a ctx with this budget
 ---   max_turns (optional) cap on the number of model calls this run makes
----   session   (optional) a session to continue (not closed by run)
+---   ctx       (optional) a ctx handle to continue (not closed by run);
+---             `session` is accepted as an alias for a brought-in handle
 ---   backend   (optional) POC stub fn(req) -> { status, content, usage, stop_reason }
 ---   input     (optional) first user message, appended before the first beat
 ---   system / tools / filters / tool_policy / fold — passed to each turn
 --- }
---- Either `budget` or `max_turns` (or a brought-in session with a budget)
---- must bound the run: neither is Error(conf) at the door — the one place
---- run refuses to loop forever.
+--- Either `budget` or `max_turns` (or a brought-in ctx with a budget) must
+--- bound the run: neither is Error(conf) at the door — the one place run
+--- refuses to loop forever.
+---
+--- run is the sugar that opens a ctx when conf.ctx is absent (§1/§4); turn
+--- itself never does. The opened ctx is placed on `conf.ctx` and handed to
+--- every beat, and closed on the way out. A brought-in ctx is left open.
 ---
 --- @return table outcome  an `Outcome` (§8)
---- @return userdata|nil session  the (closed, when run opened it) session
+--- @return userdata|nil ctx  the (closed, when run opened it) ctx handle
 function M.run(conf)
     conf = conf or {}
     if type(conf) ~= "table" then
         return Outcome.err("conf", "conf must be a table"), nil
     end
 
-    local session = conf.session
+    -- The state handle: conf.ctx is the design name, conf.session an alias
+    -- for a handle a caller brings in.
+    local ctx = conf.ctx or conf.session
 
     -- Infinite-loop prevention, at the door: bounded by max_turns, by
-    -- conf.budget, or by a brought-in session that already has a budget.
+    -- conf.budget, or by a brought-in ctx that already has a budget.
     -- A self-written `while knl.turn` loop does not pass through here, so its
     -- finiteness is the writer's responsibility.
-    local bounded_by_budget = conf.budget ~= nil
-        or (session ~= nil and session.remaining and session:remaining() ~= nil)
+    local bounded_by_budget = conf.budget ~= nil or (ctx ~= nil and ctx.remaining and ctx:remaining() ~= nil)
     if conf.max_turns == nil and not bounded_by_budget then
-        return Outcome.err("conf", "run needs a budget or max_turns (infinite-loop prevention)"), session
+        return Outcome.err("conf", "run needs a budget or max_turns (infinite-loop prevention)"), ctx
     end
 
-    -- Acquire the session: continue a brought-in one (never closed here), or
-    -- open our own (closed on the way out).
-    local own_session = false
-    if session == nil then
+    -- Acquire the ctx: continue a brought-in one (never closed here), or open
+    -- our own (closed on the way out). run opens a *scope handle* via
+    -- M.open (§1/§4), so run drives a scope like turn does — its writes get
+    -- scope-stamped automatically. A brought-in handle is used as-is.
+    local own_ctx = false
+    if ctx == nil then
         if syscall == nil then
             return Outcome.err("conf", "knl syscall bridge is not available in this VM"), nil
         end
-        local opts = {}
-        if conf.budget ~= nil then
-            opts.budget = conf.budget
-        end
-        local opened_ok, opened = pcall(syscall.session, opts)
+        local opened_ok, opened = pcall(M.open, {
+            budget = conf.budget,
+            backend = conf.backend,
+        })
         if not opened_ok then
-            return Outcome.err("conf", "session open failed: " .. tostring(opened)), nil
+            return Outcome.err("conf", "ctx open failed: " .. tostring(opened)), nil
         end
-        session = opened
-        own_session = true
+        ctx = opened
+        own_ctx = true
     end
+
+    -- Hand the ctx to each beat through conf.ctx, the handle turn reads.
+    conf.ctx = ctx
 
     -- Seed the first user message (sugar for the initial input).
     if conf.input ~= nil then
-        session:append({ kind = "msg_user", content = conf.input })
+        ctx:append({ kind = "msg_user", content = conf.input })
     end
 
     local function finish(outcome)
-        if own_session then
-            session:close("done")
+        if own_ctx then
+            ctx:close("done")
         end
-        return outcome, session
+        return outcome, ctx
     end
 
     local calls = 0
     while true do
-        local o = M.turn(session, conf)
+        local o = M.turn(conf)
 
         if Outcome.is_error(o) then
             return finish(o) -- the beat did not come off; run is Error too

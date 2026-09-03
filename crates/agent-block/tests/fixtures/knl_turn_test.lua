@@ -186,7 +186,7 @@ end
 do
     local s = knl.session({ budget = { tokens = 100 } })
     s:append({ kind = "msg_user", content = "hi" })
-    local o = kernel.turn(s, { backend = stub(response("ok", { { type = "text", text = "hello" } })) })
+    local o = kernel.turn({ ctx = s, backend = stub(response("ok", { { type = "text", text = "hello" } })) })
     assert(Outcome.is_ok(o))
 
     -- request is recorded before the model_response (write-ahead, §2 [3][4])
@@ -208,7 +208,8 @@ end
 do
     local ran = {}
     local s = knl.session({ budget = { tokens = 100 } })
-    local o = kernel.turn(s, {
+    local o = kernel.turn({
+        ctx = s,
         backend = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
         tools = {
             echo = {
@@ -231,7 +232,8 @@ do
 
     -- unknown tool: the pair is still closed, ok=false, machine-minimal error
     local s2 = knl.session({ budget = { tokens = 100 } })
-    local o2 = kernel.turn(s2, {
+    local o2 = kernel.turn({
+        ctx = s2,
         backend = stub(response("ok", { tool_use("c9", "ghost", {}) })),
         tools = {},
     })
@@ -242,7 +244,8 @@ do
 
     -- a handler that raises also closes the pair ok=false
     local s3 = knl.session({ budget = { tokens = 100 } })
-    local o3 = kernel.turn(s3, {
+    local o3 = kernel.turn({
+        ctx = s3,
         backend = stub(response("ok", { tool_use("c3", "boom", {}) })),
         tools = { boom = {
             handler = function()
@@ -264,19 +267,20 @@ end
 do
     -- ok
     local so = knl.session({ budget = { tokens = 100 } })
-    assert(Outcome.is_ok(kernel.turn(so, { backend = stub(response("ok")) })))
+    assert(Outcome.is_ok(kernel.turn({ ctx = so, backend = stub(response("ok")) })))
 
     -- refused: the model answered (recorded + charged) but refused to proceed
     local sr = knl.session({ budget = { tokens = 100 } })
     local before = sr:remaining()
-    local orf = kernel.turn(sr, { backend = stub(response("refused", { { type = "text", text = "no" } })) })
+    local orf = kernel.turn({ ctx = sr, backend = stub(response("refused", { { type = "text", text = "no" } })) })
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
     assert(first_of(sr, "model_response") ~= nil, "a refusal is still a recorded response")
     assert(sr:remaining() < before, "a refusal still costs its tokens")
 
     -- error: the beat did not come off — no model_response, a model_call_failed
     local se = knl.session({ budget = { tokens = 100 } })
-    local oe = kernel.turn(se, {
+    local oe = kernel.turn({
+        ctx = se,
         backend = stub({ status = "error", detail = "boom", content = {}, usage = {} }),
     })
     assert(Outcome.is_error(oe) and oe.kind == "call", "error status must map to Error(call)")
@@ -285,7 +289,8 @@ do
 
     -- a transport failure (nil, err) is also Error(call)
     local st = knl.session({ budget = { tokens = 100 } })
-    local ot = kernel.turn(st, {
+    local ot = kernel.turn({
+        ctx = st,
         backend = function()
             return nil, "network down"
         end,
@@ -304,7 +309,7 @@ do
     local s = knl.session({ budget = { tokens = 10 } })
     s:spend(10)
     assert(s:exhausted())
-    local o = kernel.turn(s, { backend = stub(response("ok")) })
+    local o = kernel.turn({ ctx = s, backend = stub(response("ok")) })
     assert(Outcome.is_ok(o) and o.out.budget_stopped == true, "exhausted turn must be Ok(budget_stopped)")
     assert(first_of(s, "request") == nil, "no call is made once the budget is gone")
 
