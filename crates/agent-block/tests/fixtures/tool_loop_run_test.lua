@@ -168,22 +168,6 @@ describe("tool_loop.run result contract", function()
     end)
 end)
 
--- A recorded model response carries an array of blocks. An empty Lua table
--- reaches the kernel as a mapping rather than an empty array, so a response
--- that produced nothing needs a shape that survives the crossing — and losing
--- the response, with the usage it reports, would be the worse trade.
-describe("tool_loop response blocks", function()
-    it("passes the model's blocks through untouched", function()
-        local blocks = { { type = "thinking", thinking = "..." }, { type = "text", text = "hi" } }
-        expect(tool_loop._response_blocks(blocks)).to.equal(blocks)
-    end)
-
-    it("stands in one empty text block for a response with none", function()
-        for _, empty in ipairs({ {}, "not a table", 42 }) do
-            local out = tool_loop._response_blocks(empty)
-            expect(#out).to.equal(1)
-            expect(out[1].type).to.equal("text")
-            expect(out[1].text).to.equal("")
-        end
-    end)
-end)
+-- The block normalization that used to live here moved to `llm_proto.backend`
+-- along with the rest of the transport; its cases are in
+-- llm_proto_backend_test.

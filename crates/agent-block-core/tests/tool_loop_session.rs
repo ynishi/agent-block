@@ -208,6 +208,68 @@ fn a_run_records_its_turns_in_order() {
     );
 }
 
+/// A session opened with a backend of its own is the one that takes the call:
+/// the loop hands it a provider-neutral request and never reaches for the
+/// transport its `llm` conf describes. The facts around the response are filed
+/// under the turn the kernel stamped, not under the loop's own count.
+#[test]
+fn a_session_backend_takes_the_call_instead_of_the_wire() {
+    let lua = vm();
+    exec(
+        &lua,
+        r#"
+        -- Queued and never asked for: the wire is what a session without a
+        -- backend falls back to, and this one does not need it.
+        queue_responses(text_response("from the wire"))
+
+        local calls = 0
+        local s = knl.session({
+            backend = function(req)
+                calls = calls + 1
+                assert(type(req.messages) == "table", "the request must carry the conversation")
+                assert(req.system == "sys", "system: " .. tostring(req.system))
+                assert(req.tools[1].name == "echo", "the tool set must reach the backend")
+                if calls == 1 then
+                    return {
+                        content = {
+                            { type = "tool_use", id = "call_1", name = "echo",
+                              input = { path = "a.txt" } },
+                        },
+                        usage = { input_tokens = 10, output_tokens = 5 },
+                        stop_reason = "tool_use",
+                    }
+                end
+                return {
+                    content = { { type = "text", text = "from the session backend" } },
+                    usage = { input_tokens = 3, output_tokens = 4 },
+                    stop_reason = "end_turn",
+                }
+            end,
+        })
+
+        local res = run({ prompt = "ask", system = "sys", tools = { echo_tool }, session = s })
+
+        assert(res.ok == true, "run failed: " .. tostring(res.error))
+        assert(res.content == "from the session backend", "content: " .. tostring(res.content))
+        assert(res.turns == 2, "turns: " .. tostring(res.turns))
+        assert(calls == 2, "the bound backend ran " .. tostring(calls) .. " times")
+        assert(queued_left() == 1, "the loop went to the wire despite the bound backend")
+        assert(res.usage.input_tokens == 13, "input: " .. tostring(res.usage.input_tokens))
+        assert(res.usage.output_tokens == 9, "output: " .. tostring(res.usage.output_tokens))
+
+        assert(
+            kinds_of(s) == "run_started,msg_user,model_response,tool_call,tool_result,model_response",
+            "recorded: " .. kinds_of(s)
+        )
+        local evs = s:events()
+        assert(evs[3].turn == 1, "the kernel stamped turn: " .. tostring(evs[3].turn))
+        assert(evs[4].turn == 1 and evs[5].turn == 1, "the tool facts must echo the response's turn")
+        assert(evs[5].result == "read a.txt", "result: " .. tostring(evs[5].result))
+        assert(evs[6].turn == 2, "second response turn: " .. tostring(evs[6].turn))
+    "#,
+    );
+}
+
 /// A tool that fails is answered to the model *and* recorded, with `ok = false`
 /// rather than as an absence.
 #[test]

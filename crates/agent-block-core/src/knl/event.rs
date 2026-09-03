@@ -60,6 +60,9 @@ pub const KIND_TOOL_RESULT: &str = "tool_result";
 
 /// Payload field of `run_finished`.
 pub const FIELD_REASON: &str = "reason";
+/// Payload field of `model_response` / `tool_call` / `tool_result`: which
+/// model call the fact belongs to.
+pub const FIELD_TURN: &str = "turn";
 /// Payload field of `msg_user` / `model_response`.
 pub const FIELD_CONTENT: &str = "content";
 /// Payload field of `model_response`.
@@ -124,20 +127,20 @@ const RUN_FINISHED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
 const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
 /// Required fields of `model_response`.
 const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CONTENT, Shape::Array),
     (FIELD_USAGE, Shape::Object),
 ];
 /// Required fields of `tool_call`.
 const TOOL_CALL_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     ("name", Shape::Str),
     ("args", Shape::Object),
 ];
 /// Required fields of `tool_result`.
 const TOOL_RESULT_FIELDS: &[(&str, Shape)] = &[
-    ("turn", Shape::Integer),
+    (FIELD_TURN, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     (FIELD_OK, Shape::Bool),
     (FIELD_RESULT, Shape::Any),

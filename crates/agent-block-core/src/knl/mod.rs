@@ -20,12 +20,19 @@
 //! - **I6 run scope.**  All state lives inside a [`Session`] value — no
 //!   statics — so two sessions are fully independent, and `close` ends
 //!   the run scope (later `append` / `spend` are errors).
+//! - **K2 model call.**  [`call`] holds the kernel half of the model-call
+//!   syscall: a backend result is checked before anything is written, the
+//!   response is recorded before the budget is charged, and the turn it
+//!   is stamped with is the kernel's own count of the responses it took.
+//!   Calling the backend is the adapter's job — it is a Lua function, and
+//!   the kernel must not be holding its own state while the shell runs.
 //!
 //! Projections ([`projection`]) are *derived*: folding never changes the
 //! history and a fold result is a cache, not a capture — it can always be
 //! recomputed from the events.
 
 pub mod budget;
+pub mod call;
 pub mod event;
 pub mod history;
 pub mod projection;
@@ -34,6 +41,7 @@ pub mod session;
 use std::fmt;
 
 pub use budget::Budget;
+pub use call::{validate_backend_result, CallOutcome, ModelResult};
 pub use event::{now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use history::History;
 pub use projection::{DialogueFold, UsageFold, Views};
