@@ -21,7 +21,7 @@
 //!   charge, the `usage` view, the turn numbering — fold over the
 //!   kernel's events only.  So no kind has to be kept from a caller:
 //!   appending a `model_response` from an earlier conversation puts it in
-//!   the dialogue (which reads the kind) and nowhere in the accounting
+//!   the record (which every reader sees) and nowhere in the accounting
 //!   (which reads the author), and appending a `run_finished` records a
 //!   line without ending a run that only [`Session::close`] can end.
 //! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative
@@ -39,7 +39,10 @@
 //!
 //! Projections ([`projection`]) are *derived*: folding never changes the
 //! history and a fold result is a cache, not a capture — it can always be
-//! recomputed from the events.
+//! recomputed from the events.  The kernel names only the folds whose
+//! consumer is fixed in its own terms (`usage`, `tail`); one whose shape
+//! is a caller's decision is built on the shell side from
+//! [`Session::events`].
 
 pub mod budget;
 pub mod call;
@@ -57,7 +60,7 @@ pub use event::{
     FIELD_AUTHOR, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
 };
 pub use history::History;
-pub use projection::{DialogueFold, UsageFold, Views};
+pub use projection::{UsageFold, Views};
 pub use session::Session;
 
 /// Failure reason produced by the kernel core.

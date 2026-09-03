@@ -23,9 +23,8 @@
 //! what a caller appends cannot alter the run's account of itself — and
 //! because that is guarded by the right key, no kind has to be withheld
 //! from a caller to keep it true.  A `model_response` carried over from
-//! an earlier conversation is an ordinary append: it joins the dialogue
-//! fold, which reads `kind` and not `author`, and the usage view never
-//! sees it.
+//! an earlier conversation is an ordinary append: it is in the record for
+//! whoever reads the events back, and the usage view never sees it.
 //!
 //! # Two layers of `kind`
 //!

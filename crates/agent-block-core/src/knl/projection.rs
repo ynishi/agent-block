@@ -6,50 +6,49 @@
 //! folds only the events appended since the previous one.  Reading a view
 //! is therefore amortised in the number of *new* events, not in the size
 //! of the history, and the cached value is always reproducible by
-//! [`dialogue_of`] / [`usage_of`] from scratch.
+//! [`usage_of`] from scratch.
 //!
-//! The vocabulary is closed on purpose: named folds live here rather than
-//! being handed to a caller-supplied callback, so the kernel never calls
-//! back into the shell while it holds kernel state.  A projection the
-//! kernel does not name is built on the shell side from the incremental
-//! event read instead.
+//! The vocabulary is closed on purpose — named folds live here rather
+//! than being handed to a caller-supplied callback, so the kernel never
+//! calls back into the shell while it holds kernel state — and it is
+//! deliberately short: the events themselves, `usage` (the token
+//! account), `tail` (the last events, for a post-mortem).
 //!
-//! # `dialogue` fold rules (provider neutral)
-//!
-//! | event kind       | dialogue row                                        |
-//! |------------------|-----------------------------------------------------|
-//! | `msg_user`       | `{ role = "user", content = <content> }`            |
-//! | `model_response` | `{ role = "assistant", content = <content> }`       |
-//! | `tool_result`    | `{ role = "tool", call_id, ok, result }`            |
-//! | (anything else)  | — (does not appear)                                 |
-//!
-//! Rows are in `seq` order.  Wire shaping for a specific provider is a
-//! shell concern; this view is its provider-neutral input.
-//!
-//! The dialogue fold reads `kind` and ignores `author`, on purpose: a
-//! conversation the caller carried in — an earlier assistant turn, say —
-//! is material for the next request whoever recorded it, so continuing a
-//! conversation is an ordinary `append` and needs no syscall of its own.
+//! A fold is named here only when its consumer is fixed in kernel terms:
+//! `usage` is the arithmetic the budget charge already does, `tail` is
+//! the record read from the end.  A projection whose shape depends on
+//! what the caller means to do with it is policy and stays out — the
+//! conversation rendered for a provider is the case in point (which role
+//! each kind maps to, whether a system message belongs in it, where to
+//! cut it off are all decisions of the shell assembling a request), and
+//! naming it here would accumulate those decisions in the kernel.  Such a
+//! projection is built on the shell side from the incremental event read
+//! (`events(from)`) instead.
 //!
 //! # What `usage` counts
 //!
-//! The other way round: [`UsageFold`] adds up the `model_response` events
-//! the *kernel* wrote and no others.  Those are exactly the responses the
-//! budget was charged for, so the view and the balance are two readings
-//! of one set of facts rather than two counts that can drift.  A caller's
-//! `model_response` is a fact about some other run — it cost this one
-//! nothing, and it is reported as costing nothing.
+//! [`UsageFold`] adds up the `model_response` events the *kernel* wrote
+//! and no others.  Those are exactly the responses the budget was charged
+//! for, so the view and the balance are two readings of one set of facts
+//! rather than two counts that can drift.  A caller's `model_response` is
+//! a fact about some other run — it cost this one nothing, and it is
+//! reported as costing nothing.
+//!
+//! # The position a fold has reached
+//!
+//! `usage` carries `at_seq`: the `seq` of the last event folded into it,
+//! `0` for a history with nothing in it.  It answers "as of what?" for
+//! the totals, and it is the point a shell-side fold reads on from —
+//! `events(at_seq + 1)` is the rest of the history — so a projection the
+//! kernel does not name can still be caught up against one it does.
+//! Events keep their own `seq` in the envelope, so an incremental read
+//! needs no separate position of its own.
 
 use serde_json::{Map, Value};
 
-use super::event::{
-    is_kernel_authored, kind_of, seq_of, FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT,
-    FIELD_USAGE, KIND_MODEL_RESPONSE, KIND_MSG_USER, KIND_TOOL_RESULT,
-};
+use super::event::{is_kernel_authored, kind_of, seq_of, FIELD_USAGE, KIND_MODEL_RESPONSE};
 use super::{History, KnlError, KnlResult};
 
-/// View name: the conversation as provider-neutral rows.
-pub const VIEW_DIALOGUE: &str = "dialogue";
 /// View name: usage totals.
 pub const VIEW_USAGE: &str = "usage";
 /// View name: the last `n` events, verbatim.
@@ -69,61 +68,8 @@ pub const DEFAULT_TAIL_N: usize = 20;
 pub(super) const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
 /// Usage field: number of kernel-authored `model_response` events folded.
 const FIELD_MODEL_CALLS: &str = "model_calls";
-
-/// Incremental fold of the `dialogue` view.
-#[derive(Debug, Clone, Default)]
-pub struct DialogueFold {
-    /// Highest `seq` already folded.
-    folded_seq: u64,
-    /// Rows accumulated so far, in `seq` order.
-    rows: Vec<Value>,
-}
-
-impl DialogueFold {
-    /// Fold every event newer than the last fold.
-    pub fn advance(&mut self, history: &History) {
-        for event in history.slice_after(self.folded_seq) {
-            if let Some(row) = dialogue_row(event) {
-                self.rows.push(row);
-            }
-            self.folded_seq = seq_of(event);
-        }
-    }
-
-    /// Highest `seq` folded so far.
-    pub fn folded_seq(&self) -> u64 {
-        self.folded_seq
-    }
-
-    /// The rows as a JSON array (a fresh copy each call).
-    pub fn value(&self) -> Value {
-        Value::Array(self.rows.clone())
-    }
-}
-
-/// The dialogue row an event contributes, if any.
-fn dialogue_row(event: &Value) -> Option<Value> {
-    let field = |name: &str| event.get(name).cloned().unwrap_or(Value::Null);
-    let mut row = Map::new();
-    match kind_of(event) {
-        KIND_MSG_USER => {
-            row.insert("role".to_string(), Value::from("user"));
-            row.insert(FIELD_CONTENT.to_string(), field(FIELD_CONTENT));
-        }
-        KIND_MODEL_RESPONSE => {
-            row.insert("role".to_string(), Value::from("assistant"));
-            row.insert(FIELD_CONTENT.to_string(), field(FIELD_CONTENT));
-        }
-        KIND_TOOL_RESULT => {
-            row.insert("role".to_string(), Value::from("tool"));
-            row.insert(FIELD_CALL_ID.to_string(), field(FIELD_CALL_ID));
-            row.insert(FIELD_OK.to_string(), field(FIELD_OK));
-            row.insert(FIELD_RESULT.to_string(), field(FIELD_RESULT));
-        }
-        _ => return None,
-    }
-    Some(Value::Object(row))
-}
+/// Usage field: `seq` of the last event the totals include.
+const FIELD_AT_SEQ: &str = "at_seq";
 
 /// Incremental fold of the `usage` view.
 ///
@@ -163,12 +109,17 @@ impl UsageFold {
     }
 
     /// The totals as a JSON object (a fresh copy each call).
+    ///
+    /// `at_seq` says how far the totals reach, so a reader can tell
+    /// "nothing was spent" from "nothing has happened yet", and a
+    /// shell-side fold has a point to read on from.
     pub fn value(&self) -> Value {
         let mut obj = Map::new();
         for (total, counter) in self.totals.iter().zip(USAGE_COUNTERS) {
             obj.insert(counter.to_string(), Value::from(*total));
         }
         obj.insert(FIELD_MODEL_CALLS.to_string(), Value::from(self.model_calls));
+        obj.insert(FIELD_AT_SEQ.to_string(), Value::from(self.folded_seq));
         Value::Object(obj)
     }
 }
@@ -185,31 +136,16 @@ pub(super) fn whole(value: &Value) -> i64 {
 /// The cached folds a session carries.
 #[derive(Debug, Clone, Default)]
 pub struct Views {
-    /// `dialogue` fold state.
-    dialogue: DialogueFold,
     /// `usage` fold state.
     usage: UsageFold,
 }
 
 impl Views {
-    /// The `dialogue` view, folding only what is new.
-    pub fn dialogue(&mut self, history: &History) -> Value {
-        self.dialogue.advance(history);
-        self.dialogue.value()
-    }
-
     /// The `usage` view, folding only what is new.
     pub fn usage(&mut self, history: &History) -> Value {
         self.usage.advance(history);
         self.usage.value()
     }
-}
-
-/// The `dialogue` view computed from scratch (the cache's reference).
-pub fn dialogue_of(history: &History) -> Value {
-    let mut fold = DialogueFold::default();
-    fold.advance(history);
-    fold.value()
 }
 
 /// The `usage` view computed from scratch (the cache's reference).
@@ -247,6 +183,7 @@ pub fn tail_count(opts: Option<&Map<String, Value>>) -> KnlResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knl::event::{FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -300,46 +237,53 @@ mod tests {
                 "ok": false, "result": "boom"
             }),
         );
-        append(&mut h, json!({ "kind": "note", "text": "not dialogue" }));
+        append(
+            &mut h,
+            json!({ "kind": "note", "text": "no part of a request" }),
+        );
         h
     }
 
+    /// The conversational kinds are read from the record itself: the
+    /// events come back in `seq` order with their payloads verbatim, which
+    /// is what a shell assembling a request works from now that no named
+    /// fold shapes one for it.
     #[test]
-    fn dialogue_folds_only_the_three_conversational_kinds_in_seq_order() {
-        let rows = dialogue_of(&mixed_history());
-        let rows = rows.as_array().expect("dialogue is an array").clone();
-        assert_eq!(rows.len(), 3, "{rows:?}");
-
-        assert_eq!(rows[0]["role"], json!("user"));
-        assert_eq!(rows[0][FIELD_CONTENT], json!("hi"));
-
-        assert_eq!(rows[1]["role"], json!("assistant"));
+    fn the_conversation_is_read_from_the_events_in_seq_order() {
+        let events = mixed_history().since(0);
+        let kinds: Vec<&str> = events.iter().map(kind_of).collect();
         assert_eq!(
-            rows[1][FIELD_CONTENT],
-            json!([{ "type": "text", "text": "ok" }])
+            kinds,
+            [
+                "run_started",
+                "msg_user",
+                "model_response",
+                "tool_call",
+                "tool_result",
+                "note"
+            ]
         );
 
-        assert_eq!(rows[2]["role"], json!("tool"));
-        assert_eq!(rows[2][FIELD_CALL_ID], json!("c1"));
-        assert_eq!(rows[2][FIELD_OK], json!(false));
-        assert_eq!(rows[2][FIELD_RESULT], json!("boom"));
+        assert_eq!(events[1][FIELD_CONTENT], json!("hi"));
+        assert_eq!(
+            events[2][FIELD_CONTENT],
+            json!([{ "type": "text", "text": "ok" }])
+        );
+        assert_eq!(events[4][FIELD_CALL_ID], json!("c1"));
+        assert_eq!(events[4][FIELD_OK], json!(false));
+        assert_eq!(events[4][FIELD_RESULT], json!("boom"));
+
+        // The envelope stays on: an event read hands back the record, not
+        // a row shaped for a particular reader.
+        assert!(events[1].get("seq").is_some(), "{}", events[1]);
+        assert!(events[1].get("author").is_some(), "{}", events[1]);
     }
 
+    /// A conversation the caller carried in is material like any other:
+    /// the events read back in `seq` order whoever wrote them, so
+    /// continuing a conversation is an ordinary `append`.
     #[test]
-    fn dialogue_rows_carry_no_envelope_fields() {
-        let rows = dialogue_of(&mixed_history());
-        for row in rows.as_array().expect("array") {
-            assert!(row.get("seq").is_none(), "{row}");
-            assert!(row.get("kind").is_none(), "{row}");
-            assert!(row.get("author").is_none(), "{row}");
-        }
-    }
-
-    /// A conversation the caller carried in is dialogue material like any
-    /// other: the fold reads the kind, so a `model_response` that came
-    /// from an earlier run takes its place in `seq` order.
-    #[test]
-    fn dialogue_reads_the_kind_whoever_wrote_it() {
+    fn events_read_back_in_order_whoever_wrote_them() {
         let mut h = History::new();
         append(
             &mut h,
@@ -351,15 +295,15 @@ mod tests {
         );
         append(&mut h, json!({ "kind": "msg_user", "content": "and now?" }));
 
-        let rows = dialogue_of(&h);
-        let rows = rows.as_array().expect("array");
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["role"], json!("assistant"));
+        let events = h.since(0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(kind_of(&events[0]), KIND_MODEL_RESPONSE);
         assert_eq!(
-            rows[0][FIELD_CONTENT],
+            events[0][FIELD_CONTENT],
             json!([{ "type": "text", "text": "said last time" }])
         );
-        assert_eq!(rows[1]["role"], json!("user"));
+        assert!(!is_kernel_authored(&events[0]), "{}", events[0]);
+        assert_eq!(kind_of(&events[1]), "msg_user");
     }
 
     /// …and it is invisible to the accounting: the usage view reports what
@@ -380,8 +324,10 @@ mod tests {
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "thinking_tokens": 0,
-                "model_calls": 0
-            })
+                "model_calls": 0,
+                "at_seq": 1
+            }),
+            "the event was folded — it just counts for nothing"
         );
 
         // The same payload on the kernel's path is counted in full, so it
@@ -399,7 +345,8 @@ mod tests {
                 "input_tokens": 4,
                 "output_tokens": 2,
                 "thinking_tokens": 0,
-                "model_calls": 1
+                "model_calls": 1,
+                "at_seq": 2
             })
         );
     }
@@ -422,11 +369,15 @@ mod tests {
                 "input_tokens": 15,
                 "output_tokens": 3,
                 "thinking_tokens": 7,
-                "model_calls": 2
+                "model_calls": 2,
+                "at_seq": 7
             })
         );
     }
 
+    /// An empty history has folded nothing, and says so: `at_seq` is `0`,
+    /// which is the one position `events(from)` can be asked to start
+    /// before.
     #[test]
     fn usage_of_an_empty_history_is_all_zero() {
         assert_eq!(
@@ -435,9 +386,43 @@ mod tests {
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "thinking_tokens": 0,
-                "model_calls": 0
+                "model_calls": 0,
+                "at_seq": 0
             })
         );
+    }
+
+    /// `at_seq` names the last event the totals include — every event,
+    /// not only the ones that moved a counter — so it is the point a
+    /// shell-side fold reads on from.
+    #[test]
+    fn at_seq_advances_with_the_history_not_with_the_totals() {
+        let mut h = History::new();
+        let mut views = Views::default();
+        assert_eq!(views.usage(&h)["at_seq"], json!(0));
+
+        append(
+            &mut h,
+            json!({ "kind": "note", "text": "counts for nothing" }),
+        );
+        append(&mut h, json!({ "kind": "msg_user", "content": "hi" }));
+        let usage = views.usage(&h);
+        assert_eq!(usage["at_seq"], json!(2), "{usage}");
+        assert_eq!(usage["model_calls"], json!(0), "{usage}");
+
+        // And the rest of the history is exactly what it has not seen.
+        let at_seq = usage["at_seq"].as_u64().expect("a position");
+        assert!(h.since(at_seq + 1).is_empty(), "nothing is left to read");
+        append_kernel(
+            &mut h,
+            json!({
+                "kind": "model_response", "turn": 1, "content": [],
+                "usage": { "input_tokens": 4 }
+            }),
+        );
+        let rest = h.since(at_seq + 1);
+        assert_eq!(rest.len(), 1, "{rest:?}");
+        assert_eq!(views.usage(&h)["at_seq"], json!(3));
     }
 
     #[test]
@@ -446,7 +431,6 @@ mod tests {
         let mut views = Views::default();
 
         // Reading before anything is appended must not poison the cache.
-        assert_eq!(views.dialogue(&h), dialogue_of(&h));
         assert_eq!(views.usage(&h), usage_of(&h));
 
         // `true` where the kernel is the one writing, so the script mixes
@@ -481,9 +465,9 @@ mod tests {
                 json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
             ),
             (
-                // A caller's response: dialogue takes it, usage does not,
-                // and the cache has to reach the same conclusion as a
-                // fold from scratch.
+                // A caller's response: the record takes it, usage does
+                // not, and the cache has to reach the same conclusion as
+                // a fold from scratch.
                 false,
                 json!({
                     "kind": "model_response", "turn": 1, "content": [],
@@ -507,36 +491,36 @@ mod tests {
             }
             // Read after every append: the incremental result must equal
             // the from-scratch one at each step, not only at the end.
-            assert_eq!(views.dialogue(&h), dialogue_of(&h), "step {i}");
             assert_eq!(views.usage(&h), usage_of(&h), "step {i}");
         }
 
         // Reading twice without an append repeats the same value rather
         // than double-folding.
-        assert_eq!(views.dialogue(&h), dialogue_of(&h));
         assert_eq!(views.usage(&h), usage_of(&h));
 
         // Agreeing with a from-scratch fold that made the same mistake
-        // would prove nothing, so the totals are named: three assistant
-        // rows in the dialogue, two calls in the usage, and the caller's
-        // 9000 tokens nowhere.
+        // would prove nothing, so the totals are named: two calls counted,
+        // nine events folded, and the caller's 9000 tokens nowhere.
         assert_eq!(
             views.usage(&h),
             json!({
                 "input_tokens": 10,
                 "output_tokens": 2,
                 "thinking_tokens": 1,
-                "model_calls": 2
+                "model_calls": 2,
+                "at_seq": 9
             })
         );
-        let rows = views.dialogue(&h);
-        let assistants = rows
-            .as_array()
-            .expect("array")
+
+        // The record holds three responses all the same — the count the
+        // account keeps is the kernel's own, not the number of events of
+        // that kind.
+        let responses = h
+            .since(0)
             .iter()
-            .filter(|row| row["role"] == json!("assistant"))
+            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
             .count();
-        assert_eq!(assistants, 3, "{rows}");
+        assert_eq!(responses, 3, "{:?}", h.since(0));
     }
 
     #[test]
@@ -549,8 +533,8 @@ mod tests {
                 json!({ "kind": "msg_user", "content": format!("m{i}") }),
             );
         }
-        assert_eq!(views.dialogue(&h), dialogue_of(&h));
-        assert_eq!(views.dialogue.folded_seq(), 10);
+        assert_eq!(views.usage(&h), usage_of(&h));
+        assert_eq!(views.usage.folded_seq(), 10);
     }
 
     #[test]

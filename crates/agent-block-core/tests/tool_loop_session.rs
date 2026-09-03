@@ -468,10 +468,13 @@ fn a_response_without_blocks_is_recorded_empty() {
                "the empty answer was recorded as a mapping")
         assert(s:view("usage").input_tokens == 1, "the usage of the response was kept")
 
-        -- And it is in the conversation, as the empty assistant row it is.
-        local d = s:view("dialogue")
-        assert(#d == 2 and d[2].role == "assistant", "dialogue rows: " .. tostring(#d))
-        assert(#d[2].content == 0, "the dialogue row grew blocks")
+        -- And it is in the conversation, in seq order, as the empty answer
+        -- it is: the record is what a next request would be built from.
+        local evs = s:events()
+        assert(#evs == 3, "events: " .. tostring(#evs))
+        assert(evs[2].kind == "msg_user" and evs[3].kind == "model_response",
+               "order: " .. tostring(evs[2].kind) .. "," .. tostring(evs[3].kind))
+        assert(#evs[3].content == 0, "the recorded answer grew blocks")
     "#,
     );
 }

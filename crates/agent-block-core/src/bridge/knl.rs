@@ -24,10 +24,11 @@
 //! - **Author.**  Every event carries `author = "kernel"` or `"caller"`,
 //!   stamped from the path it took.  `append` takes any kind, the ones
 //!   the kernel writes included — a `model_response` from an earlier
-//!   conversation belongs in the dialogue and is appended like anything
-//!   else — while `view("usage")`, the budget charge and the turn
-//!   numbering read the kernel's events only.  So the one way to add to
-//!   what this run is accounted for is to make the call that pays for it.
+//!   conversation is appended like anything else and reads back from
+//!   `events()` like anything else — while `view("usage")`, the budget
+//!   charge and the turn numbering read the kernel's events only.  So the
+//!   one way to add to what this run is accounted for is to make the call
+//!   that pays for it.
 //! - **I3 budget monotonicity.**  `spend(n)` accepts non-negative whole
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.
@@ -49,10 +50,17 @@
 //! s:append({ kind = "msg_user", content = "hi" })
 //! local mine = s:has_backend()                  -- who makes the call
 //! local out, err = s:call({ messages = ... })   -- records + charges
-//! local dialogue = s:view("dialogue")   -- provider-neutral rows
-//! local usage    = s:view("usage")      -- token totals
+//! local events = s:events(from)          -- the record, from `from` on
+//! local usage  = s:view("usage")         -- token totals + `at_seq`
+//! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
 //! s:close("done")
 //! ```
+//!
+//! Three read faces and no more: the events, the account, the last of the
+//! record.  Turning events into a request for a provider — which role a
+//! kind takes, whether a system message goes in front, where to cut the
+//! history off — is the shell's policy, so it is written in Lua over
+//! `events(from)` rather than named as a view here.
 //!
 //! Scope: in-memory only.  Effect execution, the Lua-side projection seam
 //! and persistence are separate steps of the kernel/shell base design.
@@ -481,7 +489,10 @@ impl LuaUserData for Session {
 
         // s:view(name, opts?) -> projection (fresh table each call)
         //
-        // Named folds only; an unknown name is an error.
+        // `usage` (totals plus the `at_seq` they reach) and `tail`
+        // (`opts.n` events from the end).  Named folds only, and an
+        // unknown name is an error: a projection the kernel does not name
+        // is the shell's to build from `events(from)`.
         methods.add_method("view", |lua, this, (name, opts): (LuaValue, LuaValue)| {
             let LuaValue::String(name) = name else {
                 return Err(err(
@@ -1187,9 +1198,8 @@ mod tests {
 
     /// (author) A shell continuing an earlier conversation appends the
     /// assistant turns it already has: they take their place in the
-    /// dialogue and change nothing the kernel accounts for.  The
-    /// difference is the `author` stamp, which the shell does not get to
-    /// write.
+    /// record and change nothing the kernel accounts for.  The difference
+    /// is the `author` stamp, which the shell does not get to write.
     #[test]
     fn a_carried_over_conversation_is_appended_and_never_billed() {
         let lua = vm();
@@ -1209,10 +1219,10 @@ mod tests {
             assert(carried.author == "caller", "author: " .. tostring(carried.author))
             assert(s:events()[1].author == "kernel", "run_started must be the kernel's")
 
-            -- In the dialogue, which is what it was appended for.
-            local d = s:view("dialogue")
-            assert(#d == 2 and d[2].role == "assistant", "dialogue rows: " .. tostring(#d))
-            assert(d[2].content[1].text == "answered before")
+            -- In the record, verbatim, which is what it was appended for:
+            -- the shell reads it back when it builds the next request.
+            assert(carried.content[1].text == "answered before")
+            assert(s:events()[2].content == "asked before", "the user turn is there too")
 
             -- Out of the account: nothing counted, nothing charged, and
             -- the turn the kernel is about to hand out is still 1.
@@ -1284,10 +1294,12 @@ mod tests {
         .expect("open kind chunk");
     }
 
-    /// `view("dialogue")` folds the conversational kinds, in seq order,
-    /// and drops everything else.
+    /// The conversation is read from `events()`: the kinds come back in
+    /// seq order with their payloads verbatim, whoever wrote them, which
+    /// is what a shell shapes a request out of.  There is no view for it —
+    /// what a request looks like is the shell's policy.
     #[test]
-    fn view_dialogue_folds_the_conversation() {
+    fn the_conversation_is_read_from_the_events() {
         let lua = vm();
         lua.load(
             r#"
@@ -1299,25 +1311,35 @@ mod tests {
                        name = "sh", args = { cmd = "ls" } })
             s:append({ kind = "tool_result", turn = 1, call_id = "c1",
                        ok = false, result = "boom" })
-            s:append({ kind = "note", text = "not dialogue" })
+            s:append({ kind = "note", text = "no part of a request" })
 
-            local d = s:view("dialogue")
-            assert(#d == 3, "dialogue rows: " .. tostring(#d))
-            assert(d[1].role == "user" and d[1].content == "hi")
-            assert(d[2].role == "assistant" and d[2].content[1].text == "ok")
-            assert(d[3].role == "tool" and d[3].call_id == "c1")
-            assert(d[3].ok == false and d[3].result == "boom")
-            -- Envelope fields do not leak into a dialogue row.
-            assert(d[1].seq == nil and d[1].kind == nil)
+            assert(kinds_of(s) ==
+                   "run_started,msg_user,model_response,tool_call,tool_result,note",
+                   "recorded: " .. kinds_of(s))
 
-            -- The fold grows with the history and stays consistent.
+            local evs = s:events()
+            assert(evs[2].content == "hi")
+            assert(evs[3].content[1].text == "ok")
+            assert(evs[5].call_id == "c1" and evs[5].ok == false and evs[5].result == "boom")
+            -- The envelope comes with it: this is the record, not a row
+            -- shaped for a particular reader.
+            assert(evs[2].seq == 2 and evs[2].kind == "msg_user")
+            assert(evs[2].author == "caller" and evs[3].author == "kernel")
+
+            -- And the kernel names no fold over it.
+            local ok, err = pcall(function() return s:view("dialogue") end)
+            assert(not ok, "the kernel served a conversation view")
+            assert(tostring(err):find('unknown view "dialogue"', 1, true),
+                   "message: " .. tostring(err))
+
+            -- Reading on from a position returns only what is new.
             s:append({ kind = "msg_user", content = "again" })
-            local d2 = s:view("dialogue")
-            assert(#d2 == 4 and d2[4].content == "again")
+            local new = s:events(7)
+            assert(#new == 1 and new[1].content == "again", "new rows: " .. tostring(#new))
         "#,
         )
         .exec()
-        .expect("dialogue view chunk");
+        .expect("conversation-from-events chunk");
     }
 
     /// `view("usage")` sums the model responses and counts the calls.
@@ -1332,6 +1354,7 @@ mod tests {
             })
             local u = s:view("usage")
             assert(u.input_tokens == 0 and u.model_calls == 0, "empty totals")
+            assert(u.at_seq == 1, "at_seq: " .. tostring(u.at_seq))
 
             assert(s:call({}) ~= nil, "first call failed")
             s:append({ kind = "msg_user", content = "ignored by usage" })
@@ -1343,9 +1366,16 @@ mod tests {
             assert(u.thinking_tokens == 7, "thinking: " .. tostring(u.thinking_tokens))
             assert(u.model_calls == 2, "calls: " .. tostring(u.model_calls))
 
+            -- The totals say how far they reach: every event folded, not
+            -- only the ones that moved a counter.
+            assert(u.at_seq == 4, "at_seq: " .. tostring(u.at_seq))
+            assert(u.at_seq == s:len(), "at_seq must be the last event folded")
+            assert(#s:events(u.at_seq + 1) == 0, "nothing is left to read")
+
             -- Reading twice does not double-fold.
             local again = s:view("usage")
             assert(again.input_tokens == 15 and again.model_calls == 2)
+            assert(again.at_seq == 4)
         "#,
         )
         .exec()
@@ -1530,9 +1560,9 @@ mod tests {
     }
 
     /// (K2 §2) An answer with no blocks is recorded as the answer it is.
-    /// It costs its tokens, takes its turn and reaches the dialogue as an
-    /// empty assistant row — because the alternative, standing an invented
-    /// block in for it, puts words in the history the model never said.
+    /// It costs its tokens, takes its turn and reads back with its content
+    /// empty — because the alternative, standing an invented block in for
+    /// it, puts words in the history the model never said.
     #[test]
     fn an_answer_with_no_blocks_is_recorded_as_it_arrived() {
         let lua = vm();
@@ -1566,10 +1596,10 @@ mod tests {
                    "the record holds a mapping where the answer had an array")
             assert(s:view("usage").input_tokens == 7, "an empty answer was not counted")
 
-            -- The row is in the conversation, empty and all.
-            local d = s:view("dialogue")
-            assert(#d == 1 and d[1].role == "assistant", "dialogue rows: " .. tostring(#d))
-            assert(#d[1].content == 0, "the dialogue row grew blocks")
+            -- And it reads back from the record the same way, empty and all.
+            local last = s:events(2)[1]
+            assert(last.kind == "model_response" and #last.content == 0,
+                   "the recorded answer grew blocks")
         "#,
         )
         .exec()
@@ -1988,19 +2018,22 @@ mod tests {
             local s = knl.session()
             s:append({ kind = "msg_user", content = "hi" })
 
-            local d = s:view("dialogue")
-            d[1].role = "TAMPERED"
-            d[1].content = nil
-            table.insert(d, { role = "ghost" })
+            local t = s:view("tail", { n = 1 })
+            t[1].kind = "TAMPERED"
+            t[1].content = nil
+            table.insert(t, { kind = "ghost" })
 
-            local again = s:view("dialogue")
-            assert(#again == 1, "fold length changed: " .. tostring(#again))
-            assert(again[1].role == "user", "role changed: " .. tostring(again[1].role))
+            local again = s:view("tail", { n = 1 })
+            assert(#again == 1, "tail length changed: " .. tostring(#again))
+            assert(again[1].kind == "msg_user", "kind changed: " .. tostring(again[1].kind))
             assert(again[1].content == "hi", "content changed")
 
             local u = s:view("usage")
             u.input_tokens = 999
-            assert(s:view("usage").input_tokens == 0, "usage cache was reachable")
+            u.at_seq = 999
+            local fresh = s:view("usage")
+            assert(fresh.input_tokens == 0, "usage cache was reachable")
+            assert(fresh.at_seq == 2, "at_seq: " .. tostring(fresh.at_seq))
         "#,
         )
         .exec()
