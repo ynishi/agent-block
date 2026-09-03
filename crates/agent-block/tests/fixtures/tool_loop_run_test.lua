@@ -142,4 +142,48 @@ describe("tool_loop.run result contract", function()
         expect(check.check(res, tool_loop.shapes.result)).to.equal(true)
         http_status = 200
     end)
+
+    -- `opts.session` is opt-in, and this is what "opt-in" has to mean for the
+    -- callers that pass nothing: the same keys, the same values, no field
+    -- appearing because the feature exists. The session cases themselves need
+    -- the kernel bridge, which no spec fixture has, so they run against the
+    -- real one from the Rust side (tool_loop_session).
+    it("adds nothing to the result when no session is passed", function()
+        http_status = 200
+        canned_response = text_response("hello")
+        local res = run({ prompt = "ask" })
+
+        local keys = {}
+        for k in pairs(res) do
+            table.insert(keys, k)
+        end
+        table.sort(keys)
+        expect(table.concat(keys, ",")).to.equal("content,messages,ok,stop_reason,tool_calls,turns,usage")
+        expect(res.ok).to.equal(true)
+        expect(res.content).to.equal("hello")
+        expect(res.turns).to.equal(1)
+        expect(#res.messages).to.equal(2)
+        expect(res.usage.input_tokens).to.equal(1)
+        expect(res.usage.output_tokens).to.equal(2)
+    end)
+end)
+
+-- A recorded model response carries an array of blocks. An empty Lua table
+-- reaches the kernel as a mapping rather than an empty array, so a response
+-- that produced nothing needs a shape that survives the crossing — and losing
+-- the response, with the usage it reports, would be the worse trade.
+describe("tool_loop response blocks", function()
+    it("passes the model's blocks through untouched", function()
+        local blocks = { { type = "thinking", thinking = "..." }, { type = "text", text = "hi" } }
+        expect(tool_loop._response_blocks(blocks)).to.equal(blocks)
+    end)
+
+    it("stands in one empty text block for a response with none", function()
+        for _, empty in ipairs({ {}, "not a table", 42 }) do
+            local out = tool_loop._response_blocks(empty)
+            expect(#out).to.equal(1)
+            expect(out[1].type).to.equal("text")
+            expect(out[1].text).to.equal("")
+        end
+    end)
 end)

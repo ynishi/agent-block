@@ -5,5 +5,11 @@ edition = "2021"
 publish = false
 description = "Runs the repository's mlua-lspec fixtures. Not part of the workspace — see src/main.rs."
 
+# Standalone by declaration, not just by the parent's `exclude`: inside a
+# nested git worktree cargo walks past this crate's checkout root and finds
+# the outer repository's manifest, whose relative `exclude` no longer
+# matches. The empty table stops the walk here in every checkout layout.
+[workspace]
+
 [dependencies]
 mlua-lspec = "0.3"

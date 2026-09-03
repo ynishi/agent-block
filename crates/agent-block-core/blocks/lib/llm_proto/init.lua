@@ -274,6 +274,34 @@ function M.retry_delay(attempt, classified, salt)
 end
 
 -- ============================================================
+-- Headers
+-- ============================================================
+
+--- Merge caller-supplied headers into the ones an adapter built.
+---
+--- A request sometimes has to carry something the protocol does not model: the
+--- browser `User-Agent` a RunPod proxy or a Cloudflare gate wants to see, a
+--- gateway's routing header. Without a way through, the caller has to rebuild
+--- the request by hand — which is how a second copy of the wire format starts.
+---
+--- The caller's value wins on a name collision, including the auth headers:
+--- passing a header explicitly is a statement about the wire, and honouring
+--- half of them would be the worse surprise.
+---
+--- @param headers table  The adapter's headers (mutated in place)
+--- @param extra table|nil  Caller headers, name -> value
+--- @return table headers
+function M.merge_headers(headers, extra)
+    if type(extra) ~= "table" then
+        return headers
+    end
+    for name, value in pairs(extra) do
+        headers[name] = tostring(value)
+    end
+    return headers
+end
+
+-- ============================================================
 -- Adapter registry
 -- ============================================================
 

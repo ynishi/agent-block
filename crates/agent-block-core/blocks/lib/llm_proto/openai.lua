@@ -305,7 +305,7 @@ end
 --- @param spec table {
 ---   model, messages, system, tools, max_tokens, temperature, timeout,
 ---   tool_choice, parallel_tool_calls, thinking, dialect,
----   extra_body, api_key, api_key_env, base_url
+---   extra_body, api_key, api_key_env, base_url, headers
 --- }
 --- @return table|nil req  { url, headers, body }
 --- @return string|nil err
@@ -495,15 +495,18 @@ function M.build(spec)
         end
     end
 
+    -- `spec.headers` is applied last, so a caller can put on the wire what this
+    -- adapter has no field for (see `proto.merge_headers`).
+    local headers = proto.merge_headers({
+        ["Authorization"] = "Bearer " .. api_key,
+        ["Content-Type"] = "application/json",
+    }, spec.headers)
+
     return {
         url = base_url .. "/chat/completions",
-        headers = {
-            ["Authorization"] = "Bearer " .. api_key,
-            ["Content-Type"] = "application/json",
-        },
+        headers = headers,
         body = body,
-    },
-        nil
+    }, nil
 end
 
 -- ============================================================

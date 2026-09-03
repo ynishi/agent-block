@@ -140,7 +140,7 @@ end
 ---   model, messages, system, tools, max_tokens, timeout,
 ---   tool_choice, parallel_tool_calls, thinking,
 ---   cache_control (default true), context_management, extra_body,
----   api_key, api_key_env, base_url
+---   api_key, api_key_env, base_url, headers
 --- }
 --- @return table|nil req  { url, headers, body }
 --- @return string|nil err
@@ -319,6 +319,10 @@ function M.build(spec)
     if #betas > 0 then
         headers["anthropic-beta"] = table.concat(betas, ",")
     end
+
+    -- `spec.headers` is applied last, so a caller can put on the wire what this
+    -- adapter has no field for (see `proto.merge_headers`).
+    proto.merge_headers(headers, spec.headers)
 
     if spec.extra_body and type(spec.extra_body) == "table" then
         for k, v in pairs(spec.extra_body) do

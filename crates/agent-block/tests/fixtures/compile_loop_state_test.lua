@@ -264,29 +264,23 @@ describe("resolve_temperature — default 0.0 when env unset", function()
     end)
 end)
 
-describe("temperature in OpenAI body via _test_set_llm_call capture", function()
-    -- Helper: capture the effective temperature (opts.temperature or resolve_temperature()).
-    -- The llm_call override fires before the OpenAI body is constructed, so opts.temperature
-    -- at that point is what the caller set.  The body logic is:
-    --   body.temperature = opts.temperature or resolve_temperature()
-    -- We replicate that logic in the capture function to test the full priority chain.
-    local h_temp = compile_loop._test_helpers()
-    local resolve_temperature = h_temp.resolve_temperature
+describe("temperature reaching the model call via opts.llm", function()
+    -- Full mode resolves the temperature before it hands tool_loop its `llm`
+    -- table, so the captured value is the one the request will carry — the
+    -- priority chain itself (caller > COMPILE_LOOP_LLM_TEMPERATURE > 0.0)
+    -- rather than a copy of it made here.
 
     local function capture_temperature(caller_temp)
         local captured_temperature = nil
-        compile_loop._test_set_llm_call(function(opts, _msgs)
-            -- Mirror the production OpenAI body construction:
-            --   temperature = opts.temperature or resolve_temperature()
-            captured_temperature = opts.temperature or resolve_temperature()
-            -- Return a minimal fake response to end the loop on first call.
+        compile_loop._test_set_tool_loop_run(function(opts)
+            captured_temperature = (opts.llm or {}).temperature
+            -- A minimal successful result, so the loop converges on iter 1.
             return {
-                choices = { {
-                    message = {
-                        content = "```lua\nprint('hi')\n```",
-                        role    = "assistant",
-                    },
-                } },
+                ok = true,
+                content = "```lua\nprint('hi')\n```",
+                turns = 1,
+                tool_calls = {},
+                messages = {},
             }
         end)
         -- Write a temp target file so run_loop has a real path.
@@ -308,7 +302,7 @@ describe("temperature in OpenAI body via _test_set_llm_call capture", function()
         end
         local run_loop_fn = compile_loop._test_helpers().run_loop
         run_loop_fn(conf)
-        compile_loop._test_reset_llm_call()
+        compile_loop._test_reset_tool_loop_run()
         os.remove(tmp)
         return captured_temperature
     end
@@ -367,14 +361,27 @@ local function make_run_conf(opts)
     return conf
 end
 
+-- A successful model call whose text is `content`, in the shape tool_loop
+-- returns it. The full-mode branch reads `ok`, `stop_reason`, `content` and
+-- `messages`; the rest is there because the result contract carries it.
+local function model_result(content)
+    return {
+        ok = true,
+        content = content,
+        turns = 1,
+        tool_calls = {},
+        messages = {},
+    }
+end
+
 -- Helper: run with LLM always returning empty code (bad stagnation every iter).
 local function run_bad_stagnation(max_iters)
-    compile_loop._test_set_llm_call(function(_opts, _msgs)
-        return { choices = { { message = { content = "", role = "assistant" } } } }
+    compile_loop._test_set_tool_loop_run(function(_opts)
+        return model_result("")
     end)
     local conf = make_run_conf({ max_iters = max_iters })
     local result = run_loop(conf)
-    compile_loop._test_reset_llm_call()
+    compile_loop._test_reset_tool_loop_run()
     os.remove(conf._tmp_path)
     return result
 end
@@ -382,8 +389,8 @@ end
 -- Helper: run with LLM returning valid code each iter, runner always fails with same stderr.
 -- This exercises the good stagnation path (is_stagnant fires after 3 identical stderr runs).
 local function run_good_stagnation()
-    compile_loop._test_set_llm_call(function(_opts, _msgs)
-        return { choices = { { message = { content = "```lua\nprint('x')\n```", role = "assistant" } } } }
+    compile_loop._test_set_tool_loop_run(function(_opts)
+        return model_result("```lua\nprint('x')\n```")
     end)
     local conf = make_run_conf({
         runner = function(_path)
@@ -392,7 +399,7 @@ local function run_good_stagnation()
         max_iters = 10,
     })
     local result = run_loop(conf)
-    compile_loop._test_reset_llm_call()
+    compile_loop._test_reset_tool_loop_run()
     os.remove(conf._tmp_path)
     return result
 end
@@ -428,13 +435,13 @@ describe("bad stagnation reset — count resets on successful edit", function()
         local call_n = 0
         -- seq: true=empty(bad), false=code(good+runner-fail with unique stderr)
         local seq = { true, true, false, true, true, true }
-        compile_loop._test_set_llm_call(function(_opts, _msgs)
+        compile_loop._test_set_tool_loop_run(function(_opts)
             call_n = call_n + 1
             local is_empty = (seq[call_n] ~= false)
             if is_empty then
-                return { choices = { { message = { content = "", role = "assistant" } } } }
+                return model_result("")
             else
-                return { choices = { { message = { content = "```lua\nprint('hi')\n```", role = "assistant" } } } }
+                return model_result("```lua\nprint('hi')\n```")
             end
         end)
 
@@ -450,7 +457,7 @@ describe("bad stagnation reset — count resets on successful edit", function()
             max_iters = 20,
         })
         local result = run_loop(conf)
-        compile_loop._test_reset_llm_call()
+        compile_loop._test_reset_tool_loop_run()
         os.remove(conf._tmp_path)
 
         expect(result.ok).to.equal(false)
