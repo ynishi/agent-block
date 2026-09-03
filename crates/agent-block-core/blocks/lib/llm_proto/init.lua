@@ -403,16 +403,30 @@ local function post_with_retry(url, request_opts, max_retries)
     end
 end
 
---- The content blocks to report for a model response.
+--- Marks a table as a JSON array, for the one case Lua cannot express: an
+--- empty table is an array and a mapping at once, and the host bridge reads
+--- an untagged one as a mapping.
+local ARRAY_TAG = { __jsontype = "array" }
+
+--- The content blocks of a model response, as they arrived.
 ---
---- An answer carries a non-empty array of blocks. An answer with no blocks at
---- all is reported as the one empty text block it amounts to, because an empty
---- Lua table crosses into the kernel as an empty mapping rather than an empty
---- array — and losing the response, with the usage it reports, would be the
---- worse trade.
+--- The one thing done to them is to say what an empty Lua table cannot say
+--- for itself: no blocks is an empty *array*, not an empty mapping. An answer
+--- that carried nothing is an answer providers do send, and what is recorded
+--- has to be what was said — so no block is invented to stand in for it, and
+--- the empty answer keeps the usage it reports.
+---
+--- This is about the record, not about the wire. A request that has to carry
+--- an empty assistant turn back to a provider that will not take one is the
+--- business of whatever builds that request; putting the fix here would put
+--- a sentence in the history to satisfy a later HTTP call.
+---
+--- Anything that is not a table is handed on untouched: the kernel refuses it
+--- and notes the call as failed, which is the honest ending for a response
+--- nobody can read.
 local function response_blocks(content)
-    if type(content) ~= "table" or #content == 0 then
-        return { { type = "text", text = "" } }
+    if type(content) == "table" and #content == 0 then
+        return setmetatable({}, ARRAY_TAG)
     end
     return content
 end
@@ -432,9 +446,10 @@ end
 --- provider knowledge.
 ---
 --- The closure answers `result | nil, err`, which is the contract `knl.call`
---- checks: `content` is a non-empty array of blocks, `usage` a table and
---- `stop_reason` a string. `status` and `latency_ms` ride along for callers
---- that want them; the kernel drops anything beyond the three.
+--- checks: `content` is an array of blocks (empty when the model sent none),
+--- `usage` a table, and `stop_reason` a string when the provider named one.
+--- `status` and `latency_ms` ride along for callers that want them; the
+--- kernel drops anything beyond the three.
 ---
 --- @param conf table {
 ---   provider, model, api_key, api_key_env, base_url, headers, max_tokens,
@@ -538,10 +553,10 @@ function M.backend(conf)
         return {
             content = response_blocks(decoded.content),
             usage = decoded.usage or {},
-            -- A string because the contract asks for one; a provider that
-            -- names no reason still produced an answer, and refusing to
-            -- record it over a missing label would be the worse failure.
-            stop_reason = decoded.stop_reason or "",
+            -- Absent when the provider named no reason: the kernel takes it
+            -- that way, and a label nobody sent would be a fact this file
+            -- made up.
+            stop_reason = decoded.stop_reason,
             status = resp.status,
             latency_ms = latency_ms,
         }

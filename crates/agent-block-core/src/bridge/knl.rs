@@ -232,6 +232,11 @@ fn backend_error(err: &LuaValue) -> String {
 /// Built from the checked result rather than from the table the backend
 /// returned, so a caller that mutates what it gets back reaches neither
 /// the backend's value nor the history.
+///
+/// `content` is the array the model answered with, empty included — an
+/// empty one crosses back as an array rather than as an empty mapping
+/// because the JSON bridge tags it.  `stop_reason` is absent when the
+/// provider named none, which is the same thing the record says.
 fn out_table(
     lua: &Lua,
     result: &knl::ModelResult,
@@ -247,7 +252,9 @@ fn out_table(
         "usage",
         json_to_lua(lua, Value::Object(result.usage().clone()))?,
     )?;
-    out.set("stop_reason", result.stop_reason())?;
+    if let Some(stop_reason) = result.stop_reason() {
+        out.set("stop_reason", stop_reason)?;
+    }
     // Absent rather than zero when the run has no budget: there is no
     // balance to report, which is not the same as having none left.
     if let Some(remaining) = outcome.remaining {
@@ -1479,12 +1486,14 @@ mod tests {
         lua.load(
             r#"
             local cases = {
+                -- An untagged empty table is a mapping, which is not an
+                -- array however few blocks an answer has: a backend with
+                -- nothing to report says so with a tagged empty array.
                 { content = {}, usage = {}, stop_reason = "end_turn" },
                 { content = "text", usage = {}, stop_reason = "end_turn" },
                 { usage = {}, stop_reason = "end_turn" },
                 { content = { { type = "text" } }, stop_reason = "end_turn" },
                 { content = { { type = "text" } }, usage = 5, stop_reason = "end_turn" },
-                { content = { { type = "text" } }, usage = {} },
                 { content = { { type = "text" } }, usage = {}, stop_reason = 7 },
                 "not a table",
             }
@@ -1518,6 +1527,85 @@ mod tests {
         )
         .exec()
         .expect("contract violation chunk");
+    }
+
+    /// (K2 §2) An answer with no blocks is recorded as the answer it is.
+    /// It costs its tokens, takes its turn and reaches the dialogue as an
+    /// empty assistant row — because the alternative, standing an invented
+    /// block in for it, puts words in the history the model never said.
+    #[test]
+    fn an_answer_with_no_blocks_is_recorded_as_it_arrived() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.session({
+                budget = { tokens = 100 },
+                backend = function()
+                    return {
+                        content = setmetatable({}, { __jsontype = "array" }),
+                        usage = { input_tokens = 7, output_tokens = 0 },
+                        stop_reason = "end_turn",
+                    }
+                end,
+            })
+
+            local out, err = s:call({})
+            assert(err == nil, "an empty answer was refused: " .. tostring(err))
+            assert(out.turn == 1, "turn: " .. tostring(out.turn))
+            assert(type(out.content) == "table" and #out.content == 0,
+                   "blocks came back: " .. tostring(#out.content))
+            assert(getmetatable(out.content).__jsontype == "array",
+                   "the empty answer came back as a mapping")
+            assert(out.stop_reason == "end_turn")
+            assert(out.remaining == 93, "remaining: " .. tostring(out.remaining))
+
+            local recorded = s:events()[2]
+            assert(recorded.kind == "model_response", "recorded: " .. kinds_of(s))
+            assert(#recorded.content == 0, "the record grew blocks")
+            assert(getmetatable(recorded.content).__jsontype == "array",
+                   "the record holds a mapping where the answer had an array")
+            assert(s:view("usage").input_tokens == 7, "an empty answer was not counted")
+
+            -- The row is in the conversation, empty and all.
+            local d = s:view("dialogue")
+            assert(#d == 1 and d[1].role == "assistant", "dialogue rows: " .. tostring(#d))
+            assert(#d[1].content == 0, "the dialogue row grew blocks")
+        "#,
+        )
+        .exec()
+        .expect("empty answer chunk");
+    }
+
+    /// (K2 §2) A provider that names no stop reason still answered.  The
+    /// field is absent from what comes back and from the record, which is
+    /// the same thing said twice rather than an empty label invented once.
+    #[test]
+    fn an_answer_without_a_stop_reason_is_recorded_without_one() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.session({
+                backend = function()
+                    return {
+                        content = { { type = "text", text = "ok" } },
+                        usage = { input_tokens = 3 },
+                    }
+                end,
+            })
+
+            local out, err = s:call({})
+            assert(err == nil, "an unlabelled answer was refused: " .. tostring(err))
+            assert(out.stop_reason == nil, "stop_reason: " .. tostring(out.stop_reason))
+            assert(out.content[1].text == "ok")
+
+            local recorded = s:events()[2]
+            assert(recorded.kind == "model_response", "recorded: " .. kinds_of(s))
+            assert(recorded.stop_reason == nil, "the record named a reason nobody gave")
+            assert(s:view("usage").model_calls == 1)
+        "#,
+        )
+        .exec()
+        .expect("unlabelled answer chunk");
     }
 
     /// (K2 §4) A backend that raises and one that returns `nil, err` are

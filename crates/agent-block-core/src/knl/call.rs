@@ -48,15 +48,16 @@ pub const FIELD_ERROR: &str = "error";
 ///
 /// Holding one is the proof that the contract was met: it can only be
 /// built by [`validate_backend_result`], so nothing downstream has to
-/// re-check the three fields.
+/// re-check the fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelResult {
-    /// The response blocks, verbatim and non-empty.
+    /// The response blocks, verbatim — thinking included, and empty when
+    /// that is what the model answered.
     content: Vec<Value>,
     /// The provider's usage counters (any subset, all optional).
     usage: Map<String, Value>,
-    /// Why the model stopped.
-    stop_reason: String,
+    /// Why the model stopped, when the provider named a reason.
+    stop_reason: Option<String>,
 }
 
 impl ModelResult {
@@ -70,9 +71,9 @@ impl ModelResult {
         &self.usage
     }
 
-    /// Why the model stopped.
-    pub fn stop_reason(&self) -> &str {
-        &self.stop_reason
+    /// Why the model stopped, or `None` when the provider named no reason.
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
     }
 
     /// What this response costs the budget: input + output + thinking.
@@ -90,6 +91,11 @@ impl ModelResult {
     }
 
     /// The `model_response` event this result becomes at `turn`.
+    ///
+    /// A stop reason the provider did not give is absent from the event
+    /// rather than present and empty: the history says what happened, and
+    /// "no reason was named" is not the same fact as "the reason was the
+    /// empty string".
     pub fn to_event(&self, turn: u64) -> Map<String, Value> {
         let mut event = Map::new();
         event.insert(FIELD_KIND.to_string(), Value::from(KIND_MODEL_RESPONSE));
@@ -99,10 +105,12 @@ impl ModelResult {
             Value::Array(self.content.clone()),
         );
         event.insert(FIELD_USAGE.to_string(), Value::Object(self.usage.clone()));
-        event.insert(
-            FIELD_STOP_REASON.to_string(),
-            Value::from(self.stop_reason.clone()),
-        );
+        if let Some(stop_reason) = &self.stop_reason {
+            event.insert(
+                FIELD_STOP_REASON.to_string(),
+                Value::from(stop_reason.clone()),
+            );
+        }
         event
     }
 }
@@ -135,14 +143,24 @@ pub fn failure_event(turn: u64, error: &str) -> Map<String, Value> {
 
 /// Check a backend result against the call contract.
 ///
-/// `content` must be a non-empty array of blocks, `usage` a table and
-/// `stop_reason` a string; anything else the backend returns is ignored
-/// here and never reaches the history — a latency or a status code is the
-/// backend's own business.  Nothing is written by this function: a
-/// rejected result costs no `model_response` and no charge, and the turn
-/// stays with the call that gets it right.  What the adapter does on top
-/// is note the attempt as a [`KIND_MODEL_CALL_FAILED`], the same way it
-/// notes a transport failure.
+/// `content` must be an array of blocks and `usage` a table;
+/// `stop_reason`, when it is there, must be a string.  Anything else the
+/// backend returns is ignored here and never reaches the history — a
+/// latency or a status code is the backend's own business.  Nothing is
+/// written by this function: a rejected result costs no `model_response`
+/// and no charge, and the turn stays with the call that gets it right.
+/// What the adapter does on top is note the attempt as a
+/// [`KIND_MODEL_CALL_FAILED`], the same way it notes a transport failure.
+///
+/// The array may be empty, and the stop reason may be absent, because
+/// both are things a provider does: an answer that is thinking and
+/// nothing else carries no blocks, and not every provider names a reason
+/// for stopping.  A contract that refused them would not stop those
+/// answers arriving — it would only make the backend in front of it
+/// invent a block and a label so the response could be recorded at all,
+/// and the history would then hold something the model never said.  What
+/// the kernel insists on is the shape it needs to record and account for
+/// a response, which neither of those two facts breaks.
 pub fn validate_backend_result(value: &Value) -> KnlResult<ModelResult> {
     let Value::Object(obj) = value else {
         return Err(KnlError::new(format!(
@@ -152,10 +170,9 @@ pub fn validate_backend_result(value: &Value) -> KnlResult<ModelResult> {
     };
 
     let content = match obj.get(FIELD_CONTENT) {
-        Some(Value::Array(blocks)) if !blocks.is_empty() => blocks.clone(),
-        Some(Value::Array(_)) => return Err(mistyped(FIELD_CONTENT, "an empty array")),
+        Some(Value::Array(blocks)) => blocks.clone(),
         Some(other) => return Err(mistyped(FIELD_CONTENT, json_type_name(other))),
-        None => return Err(missing(FIELD_CONTENT, "a non-empty array")),
+        None => return Err(missing(FIELD_CONTENT, "an array")),
     };
 
     let usage = match obj.get(FIELD_USAGE) {
@@ -165,9 +182,11 @@ pub fn validate_backend_result(value: &Value) -> KnlResult<ModelResult> {
     };
 
     let stop_reason = match obj.get(FIELD_STOP_REASON) {
-        Some(Value::String(reason)) => reason.clone(),
+        Some(Value::String(reason)) => Some(reason.clone()),
+        // Absent and null are the same answer from a Lua table: the
+        // provider named no reason.
+        None | Some(Value::Null) => None,
         Some(other) => return Err(mistyped(FIELD_STOP_REASON, json_type_name(other))),
-        None => return Err(missing(FIELD_STOP_REASON, "a string")),
     };
 
     Ok(ModelResult {
@@ -180,7 +199,7 @@ pub fn validate_backend_result(value: &Value) -> KnlResult<ModelResult> {
 /// What each field of the contract must be, for an error message.
 fn expected(field: &str) -> &'static str {
     match field {
-        FIELD_CONTENT => "a non-empty array",
+        FIELD_CONTENT => "an array",
         FIELD_USAGE => "a table",
         _ => "a string",
     }
@@ -222,7 +241,7 @@ mod tests {
         let result = validate_backend_result(&value).expect("contract met");
         assert_eq!(result.content(), &[json!({ "type": "text", "text": "ok" })]);
         assert_eq!(result.usage()["input_tokens"], json!(10));
-        assert_eq!(result.stop_reason(), "end_turn");
+        assert_eq!(result.stop_reason(), Some("end_turn"));
 
         // The surplus never reaches the event either.
         let event = result.to_event(1);
@@ -237,20 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn content_must_be_a_non_empty_array() {
+    fn content_must_be_an_array() {
         for (value, expected) in [
             (json!({}), "requires \"content\""),
             (
-                json!({ "content": [], "usage": {}, "stop_reason": "end_turn" }),
-                "got an empty array",
-            ),
-            (
                 json!({ "content": "text", "usage": {}, "stop_reason": "end_turn" }),
-                "must be a non-empty array",
+                "must be an array",
             ),
             (
                 json!({ "content": {}, "usage": {}, "stop_reason": "end_turn" }),
-                "must be a non-empty array",
+                "must be an array",
             ),
         ] {
             let err = validate_backend_result(&value).expect_err("content check");
@@ -258,8 +273,28 @@ mod tests {
         }
     }
 
+    /// An answer with no blocks is an answer: it is recorded as the empty
+    /// array it is, with the usage it reports, rather than turned away for
+    /// a shape the provider is entitled to send.
     #[test]
-    fn usage_and_stop_reason_are_required_with_their_shapes() {
+    fn content_may_be_empty_and_is_recorded_as_it_arrived() {
+        let value = json!({
+            "content": [],
+            "usage": { "input_tokens": 7 },
+            "stop_reason": "end_turn"
+        });
+
+        let result = validate_backend_result(&value).expect("an empty answer is an answer");
+        assert!(result.content().is_empty(), "blocks were invented");
+        assert_eq!(result.charge(), 7, "an empty answer still costs its tokens");
+
+        let event = result.to_event(1);
+        assert_eq!(event[FIELD_CONTENT], json!([]));
+        super::super::validate_event(&event).expect("a recordable model_response");
+    }
+
+    #[test]
+    fn usage_is_required_with_its_shape() {
         let mut value = ok_result();
         value.as_object_mut().expect("object").remove("usage");
         let err = validate_backend_result(&value).expect_err("usage is required");
@@ -269,12 +304,31 @@ mod tests {
         value["usage"] = json!(120);
         let err = validate_backend_result(&value).expect_err("usage must be a table");
         assert!(err.reason().contains("must be a table"), "{err}");
+    }
 
-        let mut value = ok_result();
-        value.as_object_mut().expect("object").remove("stop_reason");
-        let err = validate_backend_result(&value).expect_err("stop_reason is required");
-        assert!(err.reason().contains("stop_reason"), "{err}");
+    /// A provider that names no stop reason still produced an answer.  The
+    /// field is absent from the record rather than present and empty, so
+    /// the history does not claim a label that was never sent.
+    #[test]
+    fn a_missing_stop_reason_is_absent_rather_than_invented() {
+        for value in [
+            json!({ "content": [{ "type": "text" }], "usage": {} }),
+            json!({ "content": [{ "type": "text" }], "usage": {}, "stop_reason": null }),
+        ] {
+            let result = validate_backend_result(&value).expect("contract met");
+            assert_eq!(result.stop_reason(), None, "{value}");
 
+            let event = result.to_event(1);
+            assert!(
+                !event.contains_key(FIELD_STOP_REASON),
+                "{value}: an unnamed reason was written as one"
+            );
+            super::super::validate_event(&event).expect("a recordable model_response");
+        }
+    }
+
+    #[test]
+    fn a_stop_reason_that_is_there_must_be_a_string() {
         let mut value = ok_result();
         value["stop_reason"] = json!(7);
         let err = validate_backend_result(&value).expect_err("stop_reason must be a string");

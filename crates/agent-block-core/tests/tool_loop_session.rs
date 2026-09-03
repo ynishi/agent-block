@@ -7,8 +7,8 @@
 //! there. A fake session written in Lua would test the loop against a mirror of
 //! the kernel's rules rather than the rules, and the part most worth pinning is
 //! exactly the part a mirror would drift from: which fields the reserved kinds
-//! require, and that an empty Lua table reaches the kernel as a mapping rather
-//! than an array. So the session cases run against the real bridge here, and
+//! require, and which empty table crosses into the kernel as an array — the
+//! tagged one. So the session cases run against the real bridge here, and
 //! the fixture keeps the cases that need no kernel (the result contract, and
 //! that a run without a session is untouched).
 //!
@@ -440,11 +440,10 @@ fn the_reported_usage_is_what_was_spent() {
     );
 }
 
-/// A response with no blocks is still recorded, as the one empty text block it
-/// amounts to: an empty Lua table would reach the kernel as a mapping and be
-/// rejected, and dropping the response would lose its usage with it.
+/// A response with no blocks is recorded as the empty answer it was — no
+/// block invented to stand in for it — and keeps the usage it reported.
 #[test]
-fn a_response_without_blocks_is_still_recorded() {
+fn a_response_without_blocks_is_recorded_empty() {
     let lua = vm();
     exec(
         &lua,
@@ -464,9 +463,45 @@ fn a_response_without_blocks_is_still_recorded() {
 
         local recorded = s:events()[3]
         assert(recorded.kind == "model_response", "kind: " .. tostring(recorded.kind))
-        assert(#recorded.content == 1, "blocks: " .. tostring(#recorded.content))
-        assert(recorded.content[1].type == "text" and recorded.content[1].text == "")
+        assert(#recorded.content == 0, "blocks: " .. tostring(#recorded.content))
+        assert(getmetatable(recorded.content).__jsontype == "array",
+               "the empty answer was recorded as a mapping")
         assert(s:view("usage").input_tokens == 1, "the usage of the response was kept")
+
+        -- And it is in the conversation, as the empty assistant row it is.
+        local d = s:view("dialogue")
+        assert(#d == 2 and d[2].role == "assistant", "dialogue rows: " .. tostring(#d))
+        assert(#d[2].content == 0, "the dialogue row grew blocks")
+    "#,
+    );
+}
+
+/// A provider that names no stop reason still answered: the response is
+/// recorded, and the field is absent rather than an empty label the run
+/// would have made up for it.
+#[test]
+fn a_response_without_a_stop_reason_is_recorded_without_one() {
+    let lua = vm();
+    exec(
+        &lua,
+        r#"
+        local s = knl.session()
+        queue_responses({
+            id = "msg_unlabelled",
+            role = "assistant",
+            content = { { type = "text", text = "done" } },
+            usage = { input_tokens = 2, output_tokens = 1 },
+        })
+
+        local res = run({ prompt = "ask", session = s })
+        assert(res.ok == true, "error: " .. tostring(res.error))
+        assert(res.content == "done", "content: " .. tostring(res.content))
+        assert(res.stop_reason == nil, "stop_reason: " .. tostring(res.stop_reason))
+
+        local recorded = s:events()[3]
+        assert(recorded.kind == "model_response", "kind: " .. tostring(recorded.kind))
+        assert(recorded.stop_reason == nil, "the record named a reason nobody gave")
+        assert(s:view("usage").input_tokens == 2, "the usage of the response was kept")
     "#,
     );
 }
