@@ -60,6 +60,11 @@ libc.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7" }
 tempfile = "3"
+# `tests/tool_loop_session.rs` builds a VM by hand — the knl bridge plus the
+# embedded Lua libraries — instead of starting the host, so it needs the same
+# two crates the host uses to do it.
+mlua.workspace = true
+mlua-pkg.workspace = true
 
 # SIGTERM / SIGINT delivery for EventBus dispatcher unit tests.
 [target.'cfg(unix)'.dev-dependencies]
