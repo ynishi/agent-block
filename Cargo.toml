@@ -46,7 +46,7 @@ mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
 mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
 # `sql` / `kv` features are NOT declared here so they can be gated behind the
 # agent-block-core `sqlite` feature (they pull in rusqlite/bundled).
-mlua-batteries = { version = "0.3", features = ["json", "fs", "env", "path", "time", "task"] }
+mlua-batteries = { version = "0.3.1", features = ["json", "fs", "env", "path", "time", "task"] }
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
