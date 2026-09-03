@@ -38,6 +38,7 @@
 pub mod bridge;
 pub mod bus;
 pub mod host;
+pub mod knl;
 pub mod sandbox;
 
 pub use host::{run, BlockConfig, BlockConfigBuilder, HostContext};
