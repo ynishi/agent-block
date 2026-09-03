@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use super::call::{failure_event, CallOutcome, ModelResult};
 use super::event::{kernel_event, FIELD_REASON, KIND_RUN_FINISHED, KIND_RUN_STARTED};
-use super::projection::{tail_count, Views, VIEW_DIALOGUE, VIEW_TAIL, VIEW_USAGE};
+use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
 use super::{projection, Budget, History, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
@@ -77,9 +77,10 @@ impl Session {
     ///
     /// - a `model_response` a caller brought is not in the `usage` view
     ///   and was never charged, so the view and the budget still describe
-    ///   the same set of calls.  It *is* in the dialogue, which is the
+    ///   the same set of calls.  It *is* in the record, which is the
     ///   point: this is how a conversation from an earlier run is carried
-    ///   into this one.
+    ///   into this one, and [`Session::events`] hands it back like any
+    ///   other event.
     /// - its `turn` field is payload.  The kernel numbers turns from its
     ///   own count of the responses it recorded
     ///   ([`Session::record_model_response`]), so whatever number a
@@ -223,13 +224,15 @@ impl Session {
 
     /// A named projection over the history.
     ///
-    /// `dialogue` and `usage` are served from the incremental caches;
-    /// `tail` reads `opts.n` (default
+    /// `usage` is served from the incremental cache and reports `at_seq`,
+    /// the position it folded to; `tail` reads `opts.n` (default
     /// [`projection::DEFAULT_TAIL_N`]).  An unknown name is an error —
-    /// the vocabulary is closed on purpose.
+    /// the vocabulary is closed on purpose, and short: a projection whose
+    /// shape depends on what the caller does with it (a conversation
+    /// rendered for a provider, say) is built from [`Session::events`] on
+    /// the shell side rather than named here.
     pub fn view(&mut self, name: &str, opts: Option<&Map<String, Value>>) -> KnlResult<Value> {
         match name {
-            VIEW_DIALOGUE => Ok(self.views.dialogue(&self.history)),
             VIEW_USAGE => Ok(self.views.usage(&self.history)),
             VIEW_TAIL => Ok(projection::tail_of(&self.history, tail_count(opts)?)),
             other => Err(KnlError::new(format!("unknown view {other:?}"))),
@@ -341,12 +344,14 @@ mod tests {
         // Through the kernel: a call this run made and was charged for.
         s.record_model_response(&result(9)).expect("recorded");
 
-        let dialogue = s.view(VIEW_DIALOGUE, None).expect("dialogue");
-        assert_eq!(dialogue.as_array().map(Vec::len), Some(2));
-
         let usage = s.view(VIEW_USAGE, None).expect("usage");
         assert_eq!(usage["input_tokens"], json!(9));
         assert_eq!(usage["model_calls"], json!(1));
+        assert_eq!(
+            usage["at_seq"],
+            json!(3),
+            "run_started + msg_user + response"
+        );
 
         let tail = s
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
@@ -357,12 +362,31 @@ mod tests {
         assert_eq!(err.reason(), r#"unknown view "nope""#);
     }
 
+    /// The conversation is not one of the names: how a record becomes a
+    /// request — which role each kind takes, whether a system message
+    /// belongs in it, where to cut it off — is the shell's decision, and
+    /// it builds it from `events` rather than asking the kernel for it.
+    #[test]
+    fn the_conversation_is_not_a_named_view() {
+        let mut s = Session::new(None);
+        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
+            .expect("append");
+
+        let err = s.view("dialogue", None).expect_err("dialogue was served");
+        assert_eq!(err.reason(), r#"unknown view "dialogue""#);
+
+        // What it used to fold is in the record, in seq order.
+        let events = s.events(0);
+        assert_eq!(kind_of(&events[1]), "msg_user");
+        assert_eq!(events[1]["content"], json!("hi"));
+    }
+
     /// A caller may append the kinds the kernel also writes — this is how
     /// an earlier conversation is carried in — and doing so moves nothing
     /// the kernel accounts for: not the usage totals, not the charge, not
     /// the turn the next call takes.
     #[test]
-    fn a_carried_over_response_joins_the_dialogue_and_not_the_account() {
+    fn a_carried_over_response_joins_the_record_and_not_the_account() {
         let mut s = Session::new(Some(100));
         s.append(obj(
             json!({ "kind": "msg_user", "content": "asked before" }),
@@ -375,11 +399,16 @@ mod tests {
         })))
         .expect("a response from an earlier run");
 
-        // It is dialogue material, which is what it was appended for.
-        let dialogue = s.view(VIEW_DIALOGUE, None).expect("dialogue");
-        let dialogue = dialogue.as_array().expect("array");
-        assert_eq!(dialogue.len(), 2, "{dialogue:?}");
-        assert_eq!(dialogue[1]["role"], json!("assistant"));
+        // It is in the record, verbatim, which is what it was appended
+        // for: the shell reads it back when it builds the next request.
+        let events = s.events(0);
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(kind_of(&events[2]), "model_response");
+        assert_eq!(
+            events[2]["content"],
+            json!([{ "type": "text", "text": "answered before" }])
+        );
+        assert_eq!(author_of(&events[2]), AUTHOR_CALLER);
 
         // And it is invisible to everything that has to agree with the
         // budget: no call counted, no tokens summed, nothing charged.
@@ -544,14 +573,20 @@ mod tests {
     #[test]
     fn views_stay_readable_and_correct_after_close() {
         let mut s = Session::new(None);
-        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
-            .expect("append");
-        let before = s.view(VIEW_DIALOGUE, None).expect("dialogue");
+        s.record_model_response(&result(9)).expect("recorded");
+        let before = s.view(VIEW_USAGE, None).expect("usage");
         s.close(None);
-        let after = s.view(VIEW_DIALOGUE, None).expect("dialogue after close");
-        // run_finished is not a dialogue kind, so the fold is unchanged
-        // even though the history grew.
-        assert_eq!(before, after);
+        let after = s.view(VIEW_USAGE, None).expect("usage after close");
+
+        // `run_finished` costs nothing, so the totals are unchanged even
+        // though the history grew — and `at_seq` says the fold saw it.
+        assert_eq!(before["input_tokens"], after["input_tokens"]);
+        assert_eq!(before["model_calls"], after["model_calls"]);
+        assert_eq!(before["at_seq"], json!(2));
+        assert_eq!(after["at_seq"], json!(3));
+
+        // The record is readable too, close and all.
         assert_eq!(s.len(), 3);
+        assert_eq!(kind_of(&s.events(0)[2]), KIND_RUN_FINISHED);
     }
 }
