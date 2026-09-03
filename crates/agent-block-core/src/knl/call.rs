@@ -31,7 +31,11 @@ use super::{KnlError, KnlResult};
 
 /// Payload field of `model_response`: why the model stopped.
 pub const FIELD_STOP_REASON: &str = "stop_reason";
-/// Open kind recorded when a backend fails.
+/// Open kind recorded when a call produced no response the kernel could
+/// take: the backend failed, or what it handed back does not meet the
+/// contract below.  Both mean the same thing to the run — a model call
+/// was attempted and there is nothing to show for it — so they are one
+/// kind, and the reason is what tells them apart.
 ///
 /// Open rather than reserved: a failed call is a fact about the shell's
 /// transport, not one of the Turn facts the kernel checks, and v1 keeps
@@ -134,8 +138,11 @@ pub fn failure_event(turn: u64, error: &str) -> Map<String, Value> {
 /// `content` must be a non-empty array of blocks, `usage` a table and
 /// `stop_reason` a string; anything else the backend returns is ignored
 /// here and never reaches the history — a latency or a status code is the
-/// backend's own business.  Nothing is written by this function: a result
-/// that fails the check leaves no trace at all.
+/// backend's own business.  Nothing is written by this function: a
+/// rejected result costs no `model_response` and no charge, and the turn
+/// stays with the call that gets it right.  What the adapter does on top
+/// is note the attempt as a [`KIND_MODEL_CALL_FAILED`], the same way it
+/// notes a transport failure.
 pub fn validate_backend_result(value: &Value) -> KnlResult<ModelResult> {
     let Value::Object(obj) = value else {
         return Err(KnlError::new(format!(

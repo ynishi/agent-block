@@ -13,7 +13,12 @@
 //!   `delete` or `replace`.  `seq` is assigned by the kernel, starts at
 //!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
 //!   overwritten rather than trusted.  Reads hand back clones, so a
-//!   caller cannot reach recorded state through a returned value.
+//!   caller cannot reach recorded state through a returned value.  The
+//!   three kinds the kernel authors — `run_started`, `run_finished`,
+//!   `model_response` — cannot be appended by a caller at all
+//!   ([`Session::append`]): a forged one would be an uncharged call in
+//!   the usage view, a turn number the kernel did not hand out, or a run
+//!   that says it finished while it is still open.
 //! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.

@@ -13,7 +13,9 @@
 use serde_json::{Map, Value};
 
 use super::call::{failure_event, CallOutcome, ModelResult};
-use super::event::{kernel_event, FIELD_REASON, KIND_RUN_FINISHED, KIND_RUN_STARTED};
+use super::event::{
+    is_kernel_authored, kernel_event, kind_field, FIELD_REASON, KIND_RUN_FINISHED, KIND_RUN_STARTED,
+};
 use super::projection::{tail_count, Views, VIEW_DIALOGUE, VIEW_TAIL, VIEW_USAGE};
 use super::{projection, Budget, History, KnlError, KnlResult};
 
@@ -60,12 +62,54 @@ impl Session {
         &self.id
     }
 
-    /// Record an event, returning its `seq`.
+    /// Record a caller-authored event, returning its `seq`.
+    ///
+    /// The kinds the kernel authors itself
+    /// ([`super::event::KERNEL_AUTHORED_KINDS`]) are refused here, before
+    /// the run scope is even consulted: a caller may echo the facts it
+    /// owns, not manufacture the ones the kernel produces.  Accepting a
+    /// forged one would make three things legal that the rest of this
+    /// module exists to rule out:
+    ///
+    /// - a `model_response` nobody was charged for.  The budget is only
+    ///   deducted on the way through [`Session::record_model_response`],
+    ///   while the `usage` fold counts whatever events say
+    ///   `model_response` — so a direct append shows up in the usage view
+    ///   as a call that cost nothing, and the two stop agreeing.
+    /// - a turn the kernel did not number.  `turn` is a required field of
+    ///   the kind, so a caller supplies one, and nothing stops it from
+    ///   being a number the kernel is about to hand out itself — leaving
+    ///   two responses claiming the same turn with no way to order them.
+    /// - a `run_finished` in a session that is still open.  `close()` is
+    ///   what ends the scope; writing the event without it leaves a
+    ///   history that says the run ended while `append` / `spend` keep
+    ///   working.
+    ///
+    /// The kernel's own writes go through [`Session::append_kernel`],
+    /// which skips this gate and nothing else.
     pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
+        if let Some(kind) = kind_field(&event) {
+            if is_kernel_authored(kind) {
+                return Err(KnlError::new(format!("kind {kind:?} is kernel-authored")));
+            }
+        }
         if self.closed {
             return Err(KnlError::new("session is closed"));
         }
         self.history.append(event)
+    }
+
+    /// Record a kernel-authored event, returning its `seq`.
+    ///
+    /// The run-scope check of [`Session::append`] without its
+    /// kernel-authored gate: the payload was built here from the reserved
+    /// vocabulary, and it is precisely what the gate keeps a caller from
+    /// imitating.  Private, so the bypass has no way out of this module.
+    fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
+        if self.closed {
+            return Err(KnlError::new("session is closed"));
+        }
+        Ok(self.history.append_kernel(event))
     }
 
     /// Events with `seq >= from`, cloned.
@@ -121,7 +165,7 @@ impl Session {
     /// never recorded leaves the numbering where it was.
     pub fn record_model_response(&mut self, result: &ModelResult) -> KnlResult<CallOutcome> {
         let turn = self.next_turn();
-        self.append(result.to_event(turn))?;
+        self.append_kernel(result.to_event(turn))?;
         self.turns = turn;
         let remaining = self.spend(result.charge())?;
         Ok(CallOutcome {
@@ -138,7 +182,7 @@ impl Session {
     /// being reported — the caller is already returning an error.
     pub fn record_model_call_failure(&mut self, error: &str) -> bool {
         let event = failure_event(self.next_turn(), error);
-        self.append(event).is_ok()
+        self.append_kernel(event).is_ok()
     }
 
     /// The remaining balance (`None` without a budget).
@@ -290,11 +334,9 @@ mod tests {
         let mut s = Session::new(None);
         s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
             .expect("append");
-        s.append(obj(json!({
-            "kind": "model_response", "turn": 1, "content": [],
-            "usage": { "input_tokens": 9 }
-        })))
-        .expect("append");
+        // Through the kernel, because a `model_response` is not a caller's
+        // to append.
+        s.record_model_response(&result(9)).expect("recorded");
 
         let dialogue = s.view(VIEW_DIALOGUE, None).expect("dialogue");
         assert_eq!(dialogue.as_array().map(Vec::len), Some(2));
@@ -310,6 +352,70 @@ mod tests {
 
         let err = s.view("nope", None).expect_err("unknown view");
         assert_eq!(err.reason(), r#"unknown view "nope""#);
+    }
+
+    /// The three kinds the kernel authors are refused to a caller, and
+    /// refused on their own terms: the message names the kind rather than
+    /// the state of the run, and a rejected event costs neither a `seq`
+    /// nor a turn.
+    #[test]
+    fn a_caller_cannot_author_the_kinds_the_kernel_writes_itself() {
+        let mut s = Session::new(Some(100));
+        for (kind, event) in [
+            ("run_started", json!({ "kind": "run_started" })),
+            (
+                "run_finished",
+                json!({ "kind": "run_finished", "reason": "faked" }),
+            ),
+            (
+                "model_response",
+                json!({
+                    "kind": "model_response", "turn": 1,
+                    "content": [{ "type": "text", "text": "never happened" }],
+                    "usage": { "input_tokens": 9_000 }
+                }),
+            ),
+        ] {
+            let err = s.append(obj(event)).expect_err("a forged kernel event");
+            assert_eq!(err.reason(), format!("kind {kind:?} is kernel-authored"));
+        }
+
+        // Nothing landed: the usage view still says no call was made, the
+        // run is still open, and the next seq is the one the first
+        // rejected event would have taken.
+        assert_eq!(s.len(), 1, "run_started only");
+        assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["model_calls"], 0);
+        assert!(!s.is_closed());
+        assert_eq!(s.append(obj(json!({ "kind": "note" }))), Ok(2));
+
+        // And the kernel still writes all three itself.
+        assert_eq!(
+            s.record_model_response(&result(10)).expect("recorded").turn,
+            1
+        );
+        s.close(Some("done"));
+        assert_eq!(kind_of(&s.events(0)[3]), KIND_RUN_FINISHED);
+    }
+
+    /// The gate is ahead of the run-scope check: a closed session refuses
+    /// a forged `model_response` as a forgery, not as a late write.
+    #[test]
+    fn a_forged_kind_is_refused_by_kind_before_the_run_scope_is_consulted() {
+        let mut s = Session::new(None);
+        s.close(None);
+
+        let err = s
+            .append(obj(json!({
+                "kind": "model_response", "turn": 1, "content": [], "usage": {}
+            })))
+            .expect_err("a forged kernel event");
+        assert_eq!(err.reason(), r#"kind "model_response" is kernel-authored"#);
+
+        // An open kind on the same closed session still reports the scope.
+        let err = s
+            .append(obj(json!({ "kind": "note" })))
+            .expect_err("append after close");
+        assert_eq!(err.reason(), "session is closed");
     }
 
     #[test]

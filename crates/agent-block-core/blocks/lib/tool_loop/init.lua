@@ -95,13 +95,6 @@ local DEFAULT_MAX_TURNS = 16
 --- Retries for transient API failures (rate limit / overload / 5xx).
 local DEFAULT_MAX_RETRIES = 2
 
---- How the kernel says the session has no backend of its own.
----
---- Matched rather than asked because there is nothing to ask: a session does
---- not report what it is bound to, and it refuses a call it has nowhere to
---- send before running anything, which makes finding out by trying free.
-local NO_BACKEND = "no backend bound"
-
 -- ============================================================
 -- Internal
 -- ============================================================
@@ -302,12 +295,14 @@ function M._run_impl(opts)
         return { ok = false, error = berr, turns = 0, tool_calls = {}, messages = {} }
     end
 
-    -- Whether the session was opened with a backend. Unknown until the first
-    -- call answers it (see `NO_BACKEND`), and remembered from then on.
-    local session_brought_a_backend = true
-
     --- Ask the model: through the session when there is one, so the answer is
     --- recorded and charged before it comes back here.
+    ---
+    --- Which backend makes the call is the session's answer, not a guess: a
+    --- session opened with one of its own uses it, and one that was not is
+    --- handed this loop's, per call. Asked once per turn rather than
+    --- remembered, because the answer cannot change and there is nothing to
+    --- gain from caching it.
     ---
     --- @param req table  provider-neutral request
     --- @return table|nil out, string|nil err
@@ -315,12 +310,8 @@ function M._run_impl(opts)
         if not session then
             return backend(req)
         end
-        if session_brought_a_backend then
-            local out, err = session:call(req)
-            if out or not tostring(err):find(NO_BACKEND, 1, true) then
-                return out, err
-            end
-            session_brought_a_backend = false
+        if session:has_backend() then
+            return session:call(req)
         end
         return session:call(req, { backend = backend })
     end

@@ -20,7 +20,10 @@
 //!   `replace`.  `events()` / `view()` hand back freshly built tables, so
 //!   a caller that mutates a returned value cannot reach recorded state.
 //!   `seq` and `epoch_ms` are assigned by the kernel and overwrite any
-//!   caller-supplied field of the same name.
+//!   caller-supplied field of the same name.  `append` also refuses the
+//!   three kinds the kernel authors — `run_started`, `run_finished`,
+//!   `model_response` — so the only way to put a response in the history
+//!   is to make the call that pays for it.
 //! - **I3 budget monotonicity.**  `spend(n)` accepts non-negative whole
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.
@@ -40,6 +43,7 @@
 //!     backend = function(req) ... end,   -- optional, see `s:call`
 //! })
 //! s:append({ kind = "msg_user", content = "hi" })
+//! local mine = s:has_backend()                  -- who makes the call
 //! local out, err = s:call({ messages = ... })   -- records + charges
 //! local dialogue = s:view("dialogue")   -- provider-neutral rows
 //! local usage    = s:view("usage")      -- token totals
@@ -59,10 +63,19 @@ use crate::knl;
 
 /// A backend as the session keeps it between calls.
 enum Bound {
-    /// A Lua closure, held in the registry so it lives exactly as long as
-    /// the session userdata does: dropping the session drops the key,
-    /// which returns the slot to Lua's registry for reuse.
-    Lua(LuaRegistryKey),
+    /// A Lua closure.  Only the marker is here: the function itself is
+    /// the session userdata's *user value*, which is the one place a
+    /// closure can live for exactly the session's lifetime while staying
+    /// visible to Lua's collector.
+    ///
+    /// The alternative — a registry key held in this struct — keeps the
+    /// closure alive just as reliably and is invisible to the GC, so a
+    /// backend that captures its own session (`local s; s = knl.session {
+    /// backend = function() s:append(...) end }`, which the tests and
+    /// `tool_loop` both do) forms a cycle the collector cannot see
+    /// through and neither half is ever freed.  As a user value the same
+    /// cycle is an ordinary Lua one: unreachable, and collected.
+    Lua,
     /// The name of a built-in (Rust) backend.  The slot is reserved so
     /// the interface does not have to change when the first one lands;
     /// today no name resolves, and `call` says so.
@@ -83,9 +96,10 @@ struct Session {
     // thread, and every borrow below is released before control returns
     // to Lua, so no borrow can overlap another.
     state: RefCell<knl::Session>,
-    /// The backend `call` uses when a call does not bring its own.  Not
-    /// inside the `RefCell`: it is fixed at open, and the call sequence
-    /// reads it while the backend is running.
+    /// Which backend `call` uses when a call does not bring its own — a
+    /// built-in name, or the marker saying the closure is in the user
+    /// value.  Not inside the `RefCell`: it is fixed at open, and the
+    /// call sequence reads it while the backend is running.
     backend: Option<Bound>,
 }
 
@@ -239,97 +253,145 @@ fn out_table(
     Ok(LuaValue::Table(out))
 }
 
-impl Session {
-    /// The kernel sequence of `s:call` — steps [1]–[6] of the design.
-    ///
-    /// Returns the `out` table, or the reason for a `nil, err` return.
-    /// Nothing in here raises: a caller then has one failure shape to
-    /// handle, and a loop that already treats every failure as a result
-    /// does not have to wrap its own syscall in a `pcall`.
-    fn call(&self, lua: &Lua, req: LuaValue, meta: LuaValue) -> Result<LuaValue, String> {
-        // [1] Resolved first, so a call with nowhere to go is not
-        // reported as one that failed at the provider.
-        let backend = match self.resolve(lua, parse_meta_backend(meta)?)? {
-            Callable::Lua(backend) => backend,
-            Callable::Builtin(name) => return Err(format!("unknown builtin backend: {name}")),
-        };
+/// Note a call that produced no result and hand back its reason.
+///
+/// Every way a call can fail once the backend was reachable comes through
+/// here — the transport, and a result the kernel refuses to record — so
+/// the history says a call was attempted in each of them.  Best effort by
+/// design: a closed run cannot take the note, and turning that into a
+/// second failure would replace the one actually worth reporting.  A
+/// userdata that will not borrow is the same case: step [1] borrowed it
+/// already and nothing takes it mutably, so it does not happen, and if it
+/// did the failure being reported is still the one to keep.
+fn failed(this: &LuaAnyUserData, reason: &str) -> String {
+    if let Ok(session) = this.borrow::<Session>() {
+        session.state.borrow_mut().record_model_call_failure(reason);
+    }
+    reason.to_string()
+}
 
-        // Not one of the six steps, and deliberately ahead of [2]: a
-        // closed run can record nothing, so running the backend would
-        // spend a real model call to produce a response the kernel must
-        // then drop — the one thing `call` exists to rule out.  What the
-        // caller sees is what the closed case gives anyway (`nil, err`,
-        // nothing written), reached without the call.
-        if self.state.borrow().is_closed() {
-            return Err("session is closed".to_string());
-        }
+/// The kernel sequence of `s:call` — steps [1]–[6] of the design.
+///
+/// Returns the `out` table, or the reason for a `nil, err` return.
+/// Nothing in here raises: a caller then has one failure shape to handle,
+/// and a loop that already treats every failure as a result does not have
+/// to wrap its own syscall in a `pcall`.
+///
+/// Takes the userdata rather than a borrow of what is inside it, because
+/// step [1] reads the bound closure out of its user value (see
+/// [`Bound::Lua`]).  Each borrow below is taken and released inside one
+/// step: none is held while the backend runs or while a Lua value is
+/// walked, both of which re-enter Lua.
+fn call(
+    lua: &Lua,
+    this: &LuaAnyUserData,
+    req: LuaValue,
+    meta: LuaValue,
+) -> Result<LuaValue, String> {
+    // [1] Resolved first, so a call with nowhere to go is not reported as
+    // one that failed at the provider.
+    let backend = match resolve(this, parse_meta_backend(meta)?)? {
+        Callable::Lua(backend) => backend,
+        Callable::Builtin(name) => return Err(format!("unknown builtin backend: {name}")),
+    };
 
-        // [2] Run with no borrow held: the backend may re-enter the
-        // session (`s:append`), and what it records lands ahead of the
-        // response, which is where it happened.
-        let value = match backend.call::<(LuaValue, LuaValue)>(req) {
-            Ok((LuaValue::Nil, err)) => Err(backend_error(&err)),
-            Ok((value, _)) => Ok(value),
-            // A raise and a `nil, err` are one event to the kernel: no
-            // result came back.
-            Err(raised) => Err(raised.to_string()),
-        };
-        let value = match value {
-            Ok(value) => value,
-            Err(reason) => return Err(self.failed(&format!("backend: {reason}"))),
-        };
-
-        // [3] Converted outside any borrow — walking a Lua table can call
-        // back into Lua — and checked before a single write.  A result
-        // the kernel cannot record leaves the history and the budget
-        // exactly as they were.
-        let value = lua_to_json(lua, value)
-            .map_err(|e| format!("backend result is not representable: {e}"))?;
-        let result = knl::validate_backend_result(&value).map_err(|e| e.to_string())?;
-
-        // [4][5] The only borrow of the sequence, taken after the shell
-        // is done and released before the return value is built.
-        let outcome = self
-            .state
-            .borrow_mut()
-            .record_model_response(&result)
-            .map_err(|e| e.to_string())?;
-
-        // [6] The record is already in place, so a failure to build the
-        // return value says so rather than implying nothing happened.
-        out_table(lua, &result, &outcome).map_err(|e| {
-            format!(
-                "turn {} was recorded and charged, but its result could not be built: {e}",
-                outcome.turn
-            )
-        })
+    // Not one of the six steps, and deliberately ahead of [2]: a closed
+    // run can record nothing, so running the backend would spend a real
+    // model call to produce a response the kernel must then drop — the one
+    // thing `call` exists to rule out.  What the caller sees is what the
+    // closed case gives anyway (`nil, err`, nothing written), reached
+    // without the call.
+    let closed = this
+        .borrow::<Session>()
+        .map_err(|e| e.to_string())?
+        .state
+        .borrow()
+        .is_closed();
+    if closed {
+        return Err("session is closed".to_string());
     }
 
-    /// Step [1]: the backend for this call — the one it brought, else the
-    /// bound one.  An override applies to this call only; the binding is
-    /// never replaced.
-    fn resolve(&self, lua: &Lua, over: Option<Callable>) -> Result<Callable, String> {
-        if let Some(over) = over {
-            return Ok(over);
-        }
-        match &self.backend {
-            Some(Bound::Lua(key)) => lua
-                .registry_value::<LuaFunction>(key)
-                .map(Callable::Lua)
-                .map_err(|e| format!("bound backend is unreachable: {e}")),
-            Some(Bound::Builtin(name)) => Ok(Callable::Builtin(name.clone())),
-            None => Err("no backend bound".to_string()),
-        }
-    }
+    // [2] Run with no borrow held: the backend may re-enter the session
+    // (`s:append`), and what it records lands ahead of the response, which
+    // is where it happened.
+    let value = match backend.call::<(LuaValue, LuaValue)>(req) {
+        Ok((LuaValue::Nil, err)) => Err(backend_error(&err)),
+        Ok((value, _)) => Ok(value),
+        // A raise and a `nil, err` are one event to the kernel: no result
+        // came back.
+        Err(raised) => Err(raised.to_string()),
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(reason) => return Err(failed(this, &format!("backend: {reason}"))),
+    };
 
-    /// Note a call that produced no result and hand back its reason.
-    ///
-    /// Best effort by design: a closed run cannot take the note, and
-    /// turning that into a second failure would replace the one actually
-    /// worth reporting.
-    fn failed(&self, reason: &str) -> String {
-        self.state.borrow_mut().record_model_call_failure(reason);
-        reason.to_string()
+    // [3] Converted outside any borrow — walking a Lua table can call back
+    // into Lua — and checked before a single write.  A result the kernel
+    // cannot record changes neither the history's account of the run nor
+    // the budget: no `model_response`, no charge, and the turn stays
+    // available for the call that gets it right.  What it does leave is a
+    // `model_call_failed`, the same note a transport failure leaves — the
+    // model was asked and this run has nothing to show for it either way,
+    // and the two differ only in the reason the note carries.
+    let value = match lua_to_json(lua, value) {
+        Ok(value) => value,
+        Err(e) => {
+            return Err(failed(
+                this,
+                &format!("backend result is not representable: {e}"),
+            ))
+        }
+    };
+    let result = match knl::validate_backend_result(&value) {
+        Ok(result) => result,
+        Err(e) => return Err(failed(this, &e.to_string())),
+    };
+
+    // [4][5] The only mutable borrow of the sequence, taken after the
+    // shell is done and released before the return value is built.
+    let outcome = this
+        .borrow::<Session>()
+        .map_err(|e| e.to_string())?
+        .state
+        .borrow_mut()
+        .record_model_response(&result)
+        .map_err(|e| e.to_string())?;
+
+    // [6] The record is already in place, so a failure to build the return
+    // value says so rather than implying nothing happened.
+    out_table(lua, &result, &outcome).map_err(|e| {
+        format!(
+            "turn {} was recorded and charged, but its result could not be built: {e}",
+            outcome.turn
+        )
+    })
+}
+
+/// Step [1]: the backend for this call — the one it brought, else the
+/// bound one.  An override applies to this call only; the binding is
+/// never replaced.
+fn resolve(this: &LuaAnyUserData, over: Option<Callable>) -> Result<Callable, String> {
+    if let Some(over) = over {
+        return Ok(over);
+    }
+    // The name is copied out and the borrow released before the user value
+    // is read: that read goes through Lua, which must not find a borrow of
+    // the userdata held across it.
+    let builtin = {
+        let session = this.borrow::<Session>().map_err(|e| e.to_string())?;
+        match &session.backend {
+            None => return Err("no backend bound".to_string()),
+            Some(Bound::Lua) => None,
+            Some(Bound::Builtin(name)) => Some(name.clone()),
+        }
+    };
+    match builtin {
+        Some(name) => Ok(Callable::Builtin(name)),
+        None => this
+            .user_value::<LuaFunction>()
+            .map(Callable::Lua)
+            .map_err(|e| format!("bound backend is unreachable: {e}")),
     }
 }
 
@@ -361,9 +423,16 @@ impl LuaUserData for Session {
         // Failures come back as `nil, err` rather than as a raise; `out`
         // carries the kernel-stamped turn plus the budget state after the
         // charge.
-        methods.add_method(
+        //
+        // A function rather than a method: the sequence needs the userdata
+        // itself to reach the bound backend in its user value, which a
+        // `&Session` cannot get to.  Called as `s:call(...)`, so the first
+        // argument is the session either way.
+        methods.add_function(
             "call",
-            |lua, this, (req, meta): (LuaValue, LuaValue)| match this.call(lua, req, meta) {
+            |lua, (this, req, meta): (LuaAnyUserData, LuaValue, LuaValue)| match call(
+                lua, &this, req, meta,
+            ) {
                 Ok(out) => Ok((out, LuaValue::Nil)),
                 Err(reason) => {
                     let message = lua.create_string(attributed("call", reason))?;
@@ -371,6 +440,20 @@ impl LuaUserData for Session {
                 }
             },
         );
+
+        // s:has_backend() -> boolean
+        //
+        // Whether the session was opened with a backend of its own — the
+        // one thing a caller with a backend to lend has to know before it
+        // calls, because it decides whether to pass one.  Asked rather
+        // than discovered by making a call and reading the failure: that
+        // works, but it ties the caller to the wording of an error
+        // message, and it answers only after a call has already been
+        // attempted.
+        //
+        // A per-call override says nothing about the binding, so this
+        // does not move: it reports what `knl.session(opts)` was given.
+        methods.add_method("has_backend", |_, this, ()| Ok(this.backend.is_some()));
 
         // s:events(from?) -> array of event tables (deep copy)
         //
@@ -502,22 +585,18 @@ fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<i64>> {
     })
 }
 
-/// Read `opts.backend` into the session's backend slot.
+/// Read `opts.backend`: what the session will remember between calls.
 ///
-/// A closure is moved into the registry here: the session userdata then
-/// holds it for as long as it lives, which is what makes `s:call(req)`
-/// possible at all — the call site names no backend, so the run scope has
-/// to be the thing that remembers it.
-fn parse_session_backend(lua: &Lua, opts: Option<&LuaTable>) -> LuaResult<Option<Bound>> {
+/// The session has to be the thing that remembers it, because `s:call(req)`
+/// names no backend.  Where a closure is kept is [`register`]'s business —
+/// it goes in the userdata's user value, which only exists once the
+/// userdata does.
+fn parse_session_backend(opts: Option<&LuaTable>) -> LuaResult<Option<Callable>> {
     let Some(opts) = opts else {
         return Ok(None);
     };
     let value: LuaValue = opts.get("backend")?;
-    match parse_backend(value, "backend").map_err(|e| err("session", e))? {
-        None => Ok(None),
-        Some(Callable::Lua(backend)) => Ok(Some(Bound::Lua(lua.create_registry_value(backend)?))),
-        Some(Callable::Builtin(name)) => Ok(Some(Bound::Builtin(name))),
-    }
+    parse_backend(value, "backend").map_err(|e| err("session", e))
 }
 
 /// Register the `knl` global.  No [`crate::host::HostContext`] is needed —
@@ -540,8 +619,21 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
                 }
             };
             let budget_tokens = parse_budget(opts.as_ref())?;
-            let backend = parse_session_backend(lua, opts.as_ref())?;
-            lua.create_userdata(Session::new(budget_tokens, backend))
+            let backend = parse_session_backend(opts.as_ref())?;
+            let bound = match &backend {
+                None => None,
+                Some(Callable::Lua(_)) => Some(Bound::Lua),
+                Some(Callable::Builtin(name)) => Some(Bound::Builtin(name.clone())),
+            };
+
+            // The closure is parked in the userdata's user value rather
+            // than in the registry, so that a backend which captures this
+            // very session is a cycle Lua can collect (see `Bound::Lua`).
+            let session = lua.create_userdata(Session::new(budget_tokens, bound))?;
+            if let Some(Callable::Lua(closure)) = backend {
+                session.set_user_value(closure)?;
+            }
+            Ok(session)
         })?,
     )?;
 
@@ -1036,19 +1128,17 @@ mod tests {
         assert!(msg.contains("reason must be a string"), "{msg}");
     }
 
-    /// Reserved kinds are checked by the kernel; the required fields are
-    /// named in an attributed error and nothing is recorded.
+    /// The reserved kinds the shell writes are checked by the kernel; the
+    /// required fields are named in an attributed error and nothing is
+    /// recorded.
     #[test]
     fn reserved_kinds_are_validated_with_attributed_errors() {
         let lua = vm();
 
-        let msg = expect_err(
-            &lua,
-            r#"knl.session():append({ kind = "model_response", turn = 1, content = { { type = "text" } } })"#,
-        );
+        let msg = expect_err(&lua, r#"knl.session():append({ kind = "msg_user" })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("model_response"), "{msg}");
-        assert!(msg.contains("usage"), "{msg}");
+        assert!(msg.contains("msg_user"), "{msg}");
+        assert!(msg.contains("content"), "{msg}");
 
         let msg = expect_err(
             &lua,
@@ -1057,9 +1147,12 @@ mod tests {
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("a boolean"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.session():append({ kind = "run_finished" })"#);
+        let msg = expect_err(
+            &lua,
+            r#"knl.session():append({ kind = "tool_call", turn = 1, call_id = "c1", args = {} })"#,
+        );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("reason"), "{msg}");
+        assert!(msg.contains("name"), "{msg}");
 
         lua.load(
             r#"
@@ -1069,18 +1162,59 @@ mod tests {
 
             -- The documented shapes are accepted.
             s:append({ kind = "msg_user", content = "hi" })
-            s:append({ kind = "model_response", turn = 1,
-                       content = { { type = "text", text = "ok" } },
-                       usage = { input_tokens = 10, output_tokens = 3 } })
             s:append({ kind = "tool_call", turn = 1, call_id = "c1",
                        name = "sh", args = { cmd = "ls" } })
             s:append({ kind = "tool_result", turn = 1, call_id = "c1",
                        ok = false, result = "boom" })
-            assert(s:len() == 5)
+            assert(s:len() == 4)
         "#,
         )
         .exec()
         .expect("reserved kind chunk");
+    }
+
+    /// (I1) The three kinds the kernel authors are refused to the shell,
+    /// by kind and with the attribution: `s:append` is for the facts the
+    /// caller owns, and a response it did not pay for is not one of them.
+    #[test]
+    fn the_kinds_the_kernel_authors_cannot_be_appended() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.session({ budget = { tokens = 100 }, backend = backend(result("real")) })
+
+            for _, event in ipairs({
+                { kind = "run_started" },
+                { kind = "run_finished", reason = "faked" },
+                { kind = "model_response", turn = 1,
+                  content = { { type = "text", text = "never happened" } },
+                  usage = { input_tokens = 9000 } },
+            }) do
+                local ok, msg = pcall(function() s:append(event) end)
+                assert(not ok, event.kind .. " was accepted")
+                msg = tostring(msg)
+                assert(msg:find("knl: append:", 1, true) ~= nil, "attribution: " .. msg)
+                assert(msg:find('kind "' .. event.kind .. '" is kernel-authored', 1, true) ~= nil, msg)
+            end
+
+            -- None of it landed: no uncharged call in the usage view, no
+            -- turn taken, and the run is still open.
+            assert(kinds_of(s) == "run_started", "recorded: " .. kinds_of(s))
+            assert(s:view("usage").model_calls == 0, "a forged response reached the usage view")
+            assert(s:remaining() == 100)
+
+            -- Making the call is the only way to put a response in the
+            -- history, and closing is the only way to end the run.
+            local out, err = s:call({})
+            assert(err == nil, "call failed: " .. tostring(err))
+            assert(out.turn == 1 and s:view("usage").model_calls == 1)
+            s:close("done")
+            assert(kinds_of(s) == "run_started,model_response,run_finished",
+                   "recorded: " .. kinds_of(s))
+        "#,
+        )
+        .exec()
+        .expect("kernel-authored kind chunk");
     }
 
     /// Open kinds carry any payload: the shell owns their shape.
@@ -1111,11 +1245,10 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.session()
+            local s = knl.session({ backend = backend(result("ok")) })
             s:append({ kind = "msg_user", content = "hi" })
-            s:append({ kind = "model_response", turn = 1,
-                       content = { { type = "text", text = "ok" } },
-                       usage = { input_tokens = 10 } })
+            -- Through a call, because a response is not the shell's to append.
+            assert(s:call({}) ~= nil, "call failed")
             s:append({ kind = "tool_call", turn = 1, call_id = "c1",
                        name = "sh", args = { cmd = "ls" } })
             s:append({ kind = "tool_result", turn = 1, call_id = "c1",
@@ -1147,15 +1280,16 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.session()
+            local s = knl.session({
+                backend = backend(result("a", { input_tokens = 10, output_tokens = 3 }),
+                                  result("b", { input_tokens = 5, thinking_tokens = 7 })),
+            })
             local u = s:view("usage")
             assert(u.input_tokens == 0 and u.model_calls == 0, "empty totals")
 
-            s:append({ kind = "model_response", turn = 1, content = { { type = "text" } },
-                       usage = { input_tokens = 10, output_tokens = 3 } })
+            assert(s:call({}) ~= nil, "first call failed")
             s:append({ kind = "msg_user", content = "ignored by usage" })
-            s:append({ kind = "model_response", turn = 2, content = { { type = "text" } },
-                       usage = { input_tokens = 5, thinking_tokens = 7 } })
+            assert(s:call({}) ~= nil, "second call failed")
 
             u = s:view("usage")
             assert(u.input_tokens == 15, "input: " .. tostring(u.input_tokens))
@@ -1295,11 +1429,13 @@ mod tests {
         .expect("opaque request chunk");
     }
 
-    /// (K2) A result the kernel cannot record is refused before anything
-    /// is written: no event, no charge, and the turn stays available for
-    /// the call that gets it right.
+    /// (K2) A result the kernel cannot record buys the run nothing: no
+    /// `model_response`, no charge, and the turn stays available for the
+    /// call that gets it right.  What it does leave is the note a failed
+    /// call leaves — the model was asked either way, and a run whose
+    /// history says nothing happened would be the misleading one.
     #[test]
-    fn a_result_that_breaks_the_contract_writes_nothing() {
+    fn a_result_that_breaks_the_contract_is_noted_and_charges_nothing() {
         let lua = vm();
         lua.load(
             r#"
@@ -1322,8 +1458,19 @@ mod tests {
                 local out, err = s:call({})
                 assert(out == nil, "case " .. i .. " was accepted")
                 assert(err:find("knl: call:", 1, true) == 1, "case " .. i .. ": " .. tostring(err))
-                assert(s:len() == 1, "case " .. i .. " wrote " .. kinds_of(s))
+
+                -- The response is not in the history; the attempt is.
+                assert(kinds_of(s) == "run_started,model_call_failed",
+                       "case " .. i .. " wrote " .. kinds_of(s))
+                local noted = s:events()[2]
+                assert(noted.turn == 1, "case " .. i .. " noted turn: " .. tostring(noted.turn))
+                assert(tostring(noted.error):find("backend result", 1, true) ~= nil,
+                       "case " .. i .. " noted: " .. tostring(noted.error))
+                assert(err:find(noted.error, 1, true) ~= nil,
+                       "case " .. i .. ": the note and the return disagree")
+
                 assert(s:remaining() == 50, "case " .. i .. " charged the budget")
+                assert(s:view("usage").model_calls == 0, "case " .. i .. " counted as a call")
 
                 local good = s:call({})
                 assert(good.turn == 1, "case " .. i .. " consumed a turn: " .. tostring(good.turn))
@@ -1492,6 +1639,99 @@ mod tests {
         )
         .exec()
         .expect("override chunk");
+    }
+
+    /// (K2 §1) `has_backend` answers the one question a caller with a
+    /// backend to lend has: does this session already have one?  It
+    /// reports the binding — an override is not one, and asking costs
+    /// neither a call nor an event.
+    #[test]
+    fn has_backend_reports_the_binding_without_making_a_call() {
+        let lua = vm();
+        lua.load(
+            r#"
+            assert(knl.session():has_backend() == false, "a session with nothing claimed a backend")
+            assert(knl.session({}):has_backend() == false)
+            assert(knl.session({ budget = { tokens = 1 } }):has_backend() == false)
+            assert(knl.session({ backend = function() end }):has_backend() == true)
+            -- A named built-in is a binding too, even though no name resolves yet.
+            assert(knl.session({ backend = "genai" }):has_backend() == true)
+
+            -- Asking records nothing and calls nobody.
+            local none = knl.session()
+            assert(none:has_backend() == false)
+            assert(kinds_of(none) == "run_started", "asking recorded " .. kinds_of(none))
+            assert(calls == 0)
+
+            -- A per-call backend answers that call and nothing else, so the
+            -- binding — and the answer — is what it was.
+            local out, err = none:call({}, { backend = function() return result() end })
+            assert(err == nil, "call failed: " .. tostring(err))
+            assert(none:has_backend() == false, "an override was mistaken for a binding")
+
+            local bound = knl.session({ backend = backend(result()) })
+            assert(bound:has_backend() == true)
+            bound:call({})
+            assert(bound:has_backend() == true, "the binding did not survive its call")
+
+            -- Still true once the run is over: it describes how the session
+            -- was opened, not what it can still do.
+            bound:close()
+            assert(bound:has_backend() == true)
+        "#,
+        )
+        .exec()
+        .expect("has_backend chunk");
+    }
+
+    /// (I6) A bound backend lives in the session's user value, so a
+    /// closure that captures its own session — the shape every caller
+    /// that records around its calls writes — is an ordinary Lua cycle:
+    /// unreachable, and collected.  Held in the registry instead, the two
+    /// would keep each other alive for the life of the VM, and nothing in
+    /// the run's own behaviour would ever say so.
+    #[test]
+    fn a_session_and_a_backend_that_captures_it_are_collected_together() {
+        let lua = vm();
+        lua.load(
+            r#"
+            collected = false
+
+            -- Control: the same sentinel, captured by a closure a global
+            -- holds. Nothing about it may be collected, which is what makes
+            -- the case below mean something.
+            local rooted = setmetatable({}, { __gc = function() rooted_collected = true end })
+            rooted_collected = false
+            still_reachable = function() return rooted end
+
+            do
+                -- Reachable only through the backend closure, which is
+                -- reachable only through the session: its finalizer runs
+                -- exactly when the pair is collected.
+                local sentinel = setmetatable({}, { __gc = function() collected = true end })
+                local s
+                s = knl.session({
+                    backend = function()
+                        local _ = sentinel
+                        s:append({ kind = "note", text = "asked the provider" })
+                        return result()
+                    end,
+                })
+
+                local out, err = s:call({})
+                assert(err == nil, "call failed: " .. tostring(err))
+                assert(kinds_of(s) == "run_started,note,model_response", "recorded: " .. kinds_of(s))
+                assert(collected == false, "collected while still in use")
+            end
+
+            collectgarbage("collect")
+            collectgarbage("collect")
+            assert(collected, "the session and its backend kept each other alive")
+            assert(rooted_collected == false, "the control was collected while still reachable")
+        "#,
+        )
+        .exec()
+        .expect("gc cycle chunk");
     }
 
     /// (I1) What a call returns is a copy: mutating it reaches neither
