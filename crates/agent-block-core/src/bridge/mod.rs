@@ -11,11 +11,13 @@
 //! | `http` | `http.*`     | Async HTTP client |
 //! | `log`  | `log.*`, `env.*` | Logging and environment access |
 //! | `ts`   | `std.ts.*`   | SQLite-backed time-series primitive (in-tree) |
+//! | `knl`  | `knl.*`      | Kernel syscall layer (session / append-only history / budget) |
 
 pub mod bus;
 pub mod config;
 pub mod fs;
 pub mod http;
+pub mod knl;
 #[cfg(feature = "sqlite")]
 pub mod kv;
 pub mod llm;
@@ -68,6 +70,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     mcp::register(lua, ctx)?;
     http::register(lua, ctx)?;
     llm::register(lua)?;
+    knl::register(lua)?;
     #[cfg(feature = "sqlite")]
     kv::register(lua, ctx)?;
     #[cfg(feature = "sqlite")]
