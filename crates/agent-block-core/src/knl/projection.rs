@@ -25,12 +25,26 @@
 //!
 //! Rows are in `seq` order.  Wire shaping for a specific provider is a
 //! shell concern; this view is its provider-neutral input.
+//!
+//! The dialogue fold reads `kind` and ignores `author`, on purpose: a
+//! conversation the caller carried in — an earlier assistant turn, say —
+//! is material for the next request whoever recorded it, so continuing a
+//! conversation is an ordinary `append` and needs no syscall of its own.
+//!
+//! # What `usage` counts
+//!
+//! The other way round: [`UsageFold`] adds up the `model_response` events
+//! the *kernel* wrote and no others.  Those are exactly the responses the
+//! budget was charged for, so the view and the balance are two readings
+//! of one set of facts rather than two counts that can drift.  A caller's
+//! `model_response` is a fact about some other run — it cost this one
+//! nothing, and it is reported as costing nothing.
 
 use serde_json::{Map, Value};
 
 use super::event::{
-    kind_of, seq_of, FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT, FIELD_USAGE,
-    KIND_MODEL_RESPONSE, KIND_MSG_USER, KIND_TOOL_RESULT,
+    is_kernel_authored, kind_of, seq_of, FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT,
+    FIELD_USAGE, KIND_MODEL_RESPONSE, KIND_MSG_USER, KIND_TOOL_RESULT,
 };
 use super::{History, KnlError, KnlResult};
 
@@ -53,7 +67,7 @@ pub const DEFAULT_TAIL_N: usize = 20;
 /// and what its `usage` view reports are then the same arithmetic over the
 /// same fields, rather than two definitions that can drift apart.
 pub(super) const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
-/// Usage field: number of `model_response` events folded.
+/// Usage field: number of kernel-authored `model_response` events folded.
 const FIELD_MODEL_CALLS: &str = "model_calls";
 
 /// Incremental fold of the `dialogue` view.
@@ -112,13 +126,18 @@ fn dialogue_row(event: &Value) -> Option<Value> {
 }
 
 /// Incremental fold of the `usage` view.
+///
+/// Keyed on `author`: what this run spent is what the kernel recorded
+/// spending, and a `model_response` a caller appended is somebody else's
+/// bill.  Reading the kind alone would count it, and the totals would
+/// then disagree with the budget the run was actually charged.
 #[derive(Debug, Clone, Default)]
 pub struct UsageFold {
     /// Highest `seq` already folded.
     folded_seq: u64,
     /// Running totals, in the order of [`USAGE_COUNTERS`].
     totals: [i64; 3],
-    /// Number of `model_response` events folded.
+    /// Number of kernel-authored `model_response` events folded.
     model_calls: u64,
 }
 
@@ -126,7 +145,7 @@ impl UsageFold {
     /// Fold every event newer than the last fold.
     pub fn advance(&mut self, history: &History) {
         for event in history.slice_after(self.folded_seq) {
-            if kind_of(event) == KIND_MODEL_RESPONSE {
+            if kind_of(event) == KIND_MODEL_RESPONSE && is_kernel_authored(event) {
                 self.model_calls = self.model_calls.saturating_add(1);
                 let usage = event.get(FIELD_USAGE);
                 for (slot, counter) in self.totals.iter_mut().zip(USAGE_COUNTERS) {
@@ -238,7 +257,7 @@ mod tests {
         }
     }
 
-    /// Append an event, panicking on a rejected fixture.
+    /// Append a caller-authored event, panicking on a rejected fixture.
     fn append(history: &mut History, value: Value) {
         let event = value.clone();
         history
@@ -246,12 +265,19 @@ mod tests {
             .unwrap_or_else(|e| panic!("append {event}: {e}"));
     }
 
-    /// A history covering every reserved kind plus an open one.
+    /// Append an event the way the kernel does — the path `run_started`,
+    /// `run_finished` and a recorded `model_response` take.
+    fn append_kernel(history: &mut History, value: Value) {
+        history.append_kernel(obj(value));
+    }
+
+    /// A history covering every reserved kind plus an open one, each on
+    /// the path it takes in a real run.
     fn mixed_history() -> History {
         let mut h = History::new();
-        append(&mut h, json!({ "kind": "run_started" }));
+        append_kernel(&mut h, json!({ "kind": "run_started" }));
         append(&mut h, json!({ "kind": "msg_user", "content": "hi" }));
-        append(
+        append_kernel(
             &mut h,
             json!({
                 "kind": "model_response",
@@ -305,13 +331,83 @@ mod tests {
         for row in rows.as_array().expect("array") {
             assert!(row.get("seq").is_none(), "{row}");
             assert!(row.get("kind").is_none(), "{row}");
+            assert!(row.get("author").is_none(), "{row}");
         }
+    }
+
+    /// A conversation the caller carried in is dialogue material like any
+    /// other: the fold reads the kind, so a `model_response` that came
+    /// from an earlier run takes its place in `seq` order.
+    #[test]
+    fn dialogue_reads_the_kind_whoever_wrote_it() {
+        let mut h = History::new();
+        append(
+            &mut h,
+            json!({
+                "kind": "model_response", "turn": 1,
+                "content": [{ "type": "text", "text": "said last time" }],
+                "usage": { "input_tokens": 9_000 }
+            }),
+        );
+        append(&mut h, json!({ "kind": "msg_user", "content": "and now?" }));
+
+        let rows = dialogue_of(&h);
+        let rows = rows.as_array().expect("array");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["role"], json!("assistant"));
+        assert_eq!(
+            rows[0][FIELD_CONTENT],
+            json!([{ "type": "text", "text": "said last time" }])
+        );
+        assert_eq!(rows[1]["role"], json!("user"));
+    }
+
+    /// …and it is invisible to the accounting: the usage view reports what
+    /// this run was charged for, which is what the kernel recorded.
+    #[test]
+    fn usage_ignores_a_model_response_the_caller_brought() {
+        let mut h = History::new();
+        append(
+            &mut h,
+            json!({
+                "kind": "model_response", "turn": 1, "content": [],
+                "usage": { "input_tokens": 9_000, "output_tokens": 9_000 }
+            }),
+        );
+        assert_eq!(
+            usage_of(&h),
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "model_calls": 0
+            })
+        );
+
+        // The same payload on the kernel's path is counted in full, so it
+        // is the author and nothing else that decides.
+        append_kernel(
+            &mut h,
+            json!({
+                "kind": "model_response", "turn": 1, "content": [],
+                "usage": { "input_tokens": 4, "output_tokens": 2 }
+            }),
+        );
+        assert_eq!(
+            usage_of(&h),
+            json!({
+                "input_tokens": 4,
+                "output_tokens": 2,
+                "thinking_tokens": 0,
+                "model_calls": 1
+            })
+        );
     }
 
     #[test]
     fn usage_sums_model_responses_and_counts_the_calls() {
         let mut h = mixed_history();
-        append(
+        append_kernel(
             &mut h,
             json!({
                 "kind": "model_response",
@@ -353,31 +449,62 @@ mod tests {
         assert_eq!(views.dialogue(&h), dialogue_of(&h));
         assert_eq!(views.usage(&h), usage_of(&h));
 
+        // `true` where the kernel is the one writing, so the script mixes
+        // both authors and the cache has to agree about both.
         let script = [
-            json!({ "kind": "run_started" }),
-            json!({ "kind": "msg_user", "content": "one" }),
-            json!({ "kind": "note", "text": "ignored" }),
-            json!({
-                "kind": "model_response", "turn": 1, "content": [],
-                "usage": { "input_tokens": 4, "output_tokens": 2 }
-            }),
-            json!({
-                "kind": "tool_call", "turn": 1, "call_id": "c",
-                "name": "sh", "args": {}
-            }),
-            json!({
-                "kind": "tool_result", "turn": 1, "call_id": "c",
-                "ok": true, "result": { "out": "ok" }
-            }),
-            json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
-            json!({
-                "kind": "model_response", "turn": 2, "content": [],
-                "usage": { "input_tokens": 6, "thinking_tokens": 1 }
-            }),
+            (true, json!({ "kind": "run_started" })),
+            (false, json!({ "kind": "msg_user", "content": "one" })),
+            (false, json!({ "kind": "note", "text": "ignored" })),
+            (
+                true,
+                json!({
+                    "kind": "model_response", "turn": 1, "content": [],
+                    "usage": { "input_tokens": 4, "output_tokens": 2 }
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "kind": "tool_call", "turn": 1, "call_id": "c",
+                    "name": "sh", "args": {}
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "kind": "tool_result", "turn": 1, "call_id": "c",
+                    "ok": true, "result": { "out": "ok" }
+                }),
+            ),
+            (
+                false,
+                json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
+            ),
+            (
+                // A caller's response: dialogue takes it, usage does not,
+                // and the cache has to reach the same conclusion as a
+                // fold from scratch.
+                false,
+                json!({
+                    "kind": "model_response", "turn": 1, "content": [],
+                    "usage": { "input_tokens": 9_000 }
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "kind": "model_response", "turn": 2, "content": [],
+                    "usage": { "input_tokens": 6, "thinking_tokens": 1 }
+                }),
+            ),
         ];
 
-        for (i, event) in script.into_iter().enumerate() {
-            append(&mut h, event);
+        for (i, (by_kernel, event)) in script.into_iter().enumerate() {
+            if by_kernel {
+                append_kernel(&mut h, event);
+            } else {
+                append(&mut h, event);
+            }
             // Read after every append: the incremental result must equal
             // the from-scratch one at each step, not only at the end.
             assert_eq!(views.dialogue(&h), dialogue_of(&h), "step {i}");
@@ -388,6 +515,28 @@ mod tests {
         // than double-folding.
         assert_eq!(views.dialogue(&h), dialogue_of(&h));
         assert_eq!(views.usage(&h), usage_of(&h));
+
+        // Agreeing with a from-scratch fold that made the same mistake
+        // would prove nothing, so the totals are named: three assistant
+        // rows in the dialogue, two calls in the usage, and the caller's
+        // 9000 tokens nowhere.
+        assert_eq!(
+            views.usage(&h),
+            json!({
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "thinking_tokens": 1,
+                "model_calls": 2
+            })
+        );
+        let rows = views.dialogue(&h);
+        let assistants = rows
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter(|row| row["role"] == json!("assistant"))
+            .count();
+        assert_eq!(assistants, 3, "{rows}");
     }
 
     #[test]

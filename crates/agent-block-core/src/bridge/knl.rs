@@ -19,11 +19,15 @@
 //! - **I1 append-only.**  There is deliberately no `update`, `delete` or
 //!   `replace`.  `events()` / `view()` hand back freshly built tables, so
 //!   a caller that mutates a returned value cannot reach recorded state.
-//!   `seq` and `epoch_ms` are assigned by the kernel and overwrite any
-//!   caller-supplied field of the same name.  `append` also refuses the
-//!   three kinds the kernel authors — `run_started`, `run_finished`,
-//!   `model_response` — so the only way to put a response in the history
-//!   is to make the call that pays for it.
+//!   `seq`, `epoch_ms` and `author` are assigned by the kernel and
+//!   overwrite any caller-supplied field of the same name.
+//! - **Author.**  Every event carries `author = "kernel"` or `"caller"`,
+//!   stamped from the path it took.  `append` takes any kind, the ones
+//!   the kernel writes included — a `model_response` from an earlier
+//!   conversation belongs in the dialogue and is appended like anything
+//!   else — while `view("usage")`, the budget charge and the turn
+//!   numbering read the kernel's events only.  So the one way to add to
+//!   what this run is accounted for is to make the call that pays for it.
 //! - **I3 budget monotonicity.**  `spend(n)` accepts non-negative whole
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.
@@ -806,19 +810,20 @@ mod tests {
         .expect("deep copy chunk");
     }
 
-    /// (I1) `seq` / `epoch_ms` are kernel-owned: a caller-supplied value
-    /// is overwritten rather than trusted.
+    /// (I1) `seq` / `epoch_ms` / `author` are kernel-owned: a
+    /// caller-supplied value is overwritten rather than trusted.
     #[test]
     fn kernel_owned_fields_override_caller_values() {
         let lua = vm();
         lua.load(
             r#"
             local s = knl.session()
-            local seq = s:append({ kind = "user_msg", seq = 999, epoch_ms = 1 })
+            local seq = s:append({ kind = "user_msg", seq = 999, epoch_ms = 1, author = "kernel" })
             assert(seq == 2, "returned seq: " .. tostring(seq))
             local e = s:events(2)[1]
             assert(e.seq == 2, "stored seq: " .. tostring(e.seq))
             assert(e.epoch_ms ~= 1, "epoch_ms must be kernel-assigned")
+            assert(e.author == "caller", "author: " .. tostring(e.author))
         "#,
         )
         .exec()
@@ -1173,48 +1178,82 @@ mod tests {
         .expect("reserved kind chunk");
     }
 
-    /// (I1) The three kinds the kernel authors are refused to the shell,
-    /// by kind and with the attribution: `s:append` is for the facts the
-    /// caller owns, and a response it did not pay for is not one of them.
+    /// (author) A shell continuing an earlier conversation appends the
+    /// assistant turns it already has: they take their place in the
+    /// dialogue and change nothing the kernel accounts for.  The
+    /// difference is the `author` stamp, which the shell does not get to
+    /// write.
     #[test]
-    fn the_kinds_the_kernel_authors_cannot_be_appended() {
+    fn a_carried_over_conversation_is_appended_and_never_billed() {
         let lua = vm();
         lua.load(
             r#"
             local s = knl.session({ budget = { tokens = 100 }, backend = backend(result("real")) })
 
-            for _, event in ipairs({
-                { kind = "run_started" },
-                { kind = "run_finished", reason = "faked" },
-                { kind = "model_response", turn = 1,
-                  content = { { type = "text", text = "never happened" } },
-                  usage = { input_tokens = 9000 } },
-            }) do
-                local ok, msg = pcall(function() s:append(event) end)
-                assert(not ok, event.kind .. " was accepted")
-                msg = tostring(msg)
-                assert(msg:find("knl: append:", 1, true) ~= nil, "attribution: " .. msg)
-                assert(msg:find('kind "' .. event.kind .. '" is kernel-authored', 1, true) ~= nil, msg)
-            end
+            s:append({ kind = "msg_user", content = "asked before" })
+            s:append({ kind = "model_response", turn = 1,
+                       content = { { type = "text", text = "answered before" } },
+                       usage = { input_tokens = 9000, output_tokens = 9000 },
+                       author = "kernel" })
 
-            -- None of it landed: no uncharged call in the usage view, no
-            -- turn taken, and the run is still open.
-            assert(kinds_of(s) == "run_started", "recorded: " .. kinds_of(s))
-            assert(s:view("usage").model_calls == 0, "a forged response reached the usage view")
-            assert(s:remaining() == 100)
+            -- Recorded, and recorded as the caller's however it was labelled.
+            assert(kinds_of(s) == "run_started,msg_user,model_response", "recorded: " .. kinds_of(s))
+            local carried = s:events()[3]
+            assert(carried.author == "caller", "author: " .. tostring(carried.author))
+            assert(s:events()[1].author == "kernel", "run_started must be the kernel's")
 
-            -- Making the call is the only way to put a response in the
-            -- history, and closing is the only way to end the run.
+            -- In the dialogue, which is what it was appended for.
+            local d = s:view("dialogue")
+            assert(#d == 2 and d[2].role == "assistant", "dialogue rows: " .. tostring(#d))
+            assert(d[2].content[1].text == "answered before")
+
+            -- Out of the account: nothing counted, nothing charged, and
+            -- the turn the kernel is about to hand out is still 1.
+            assert(s:view("usage").model_calls == 0, "a carried-over response was counted")
+            assert(s:view("usage").input_tokens == 0, "a carried-over response was summed")
+            assert(s:remaining() == 100, "a carried-over response was charged")
+
             local out, err = s:call({})
             assert(err == nil, "call failed: " .. tostring(err))
-            assert(out.turn == 1 and s:view("usage").model_calls == 1)
-            s:close("done")
-            assert(kinds_of(s) == "run_started,model_response,run_finished",
-                   "recorded: " .. kinds_of(s))
+            assert(out.turn == 1, "turn: " .. tostring(out.turn))
+            assert(s:view("usage").model_calls == 1, "the call the run made is the one it counts")
+            assert(s:view("usage").input_tokens == 10)
+            assert(s:remaining() == 87, "remaining: " .. tostring(s:remaining()))
+            assert(s:events()[4].author == "kernel", "the kernel's own record")
         "#,
         )
         .exec()
-        .expect("kernel-authored kind chunk");
+        .expect("carried-over conversation chunk");
+    }
+
+    /// (author) The run scope is `close`, not an event: appending
+    /// `run_finished` writes a line and leaves the session open.
+    #[test]
+    fn an_appended_run_finished_does_not_close_the_run() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.session({ budget = { tokens = 100 } })
+            s:append({ kind = "run_finished", reason = "carried over" })
+
+            -- Still open: the writes a closed run refuses both go through.
+            assert(s:append({ kind = "note" }) == 3, "the appended event ended the run")
+            assert(s:spend(10) == 90)
+
+            s:close("done")
+            local evs = s:events()
+            assert(kinds_of(s) == "run_started,run_finished,note,run_finished",
+                   "recorded: " .. kinds_of(s))
+            assert(evs[2].author == "caller" and evs[4].author == "kernel",
+                   "the two run_finished events must differ by author")
+            assert(evs[4].reason == "done")
+
+            local ok = pcall(function() s:append({ kind = "note" }) end)
+            assert(not ok, "a closed run took a write")
+        "#,
+        )
+        .exec()
+        .expect("appended run_finished chunk");
     }
 
     /// Open kinds carry any payload: the shell owns their shape.
@@ -1247,7 +1286,7 @@ mod tests {
             r#"
             local s = knl.session({ backend = backend(result("ok")) })
             s:append({ kind = "msg_user", content = "hi" })
-            -- Through a call, because a response is not the shell's to append.
+            -- Through a call: this run's own turn, recorded as it is charged.
             assert(s:call({}) ~= nil, "call failed")
             s:append({ kind = "tool_call", turn = 1, call_id = "c1",
                        name = "sh", args = { cmd = "ls" } })

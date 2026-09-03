@@ -11,14 +11,19 @@
 //!
 //! - **I1 append-only.**  [`History`] has no mutation API — no `update`,
 //!   `delete` or `replace`.  `seq` is assigned by the kernel, starts at
-//!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
-//!   overwritten rather than trusted.  Reads hand back clones, so a
-//!   caller cannot reach recorded state through a returned value.  The
-//!   three kinds the kernel authors — `run_started`, `run_finished`,
-//!   `model_response` — cannot be appended by a caller at all
-//!   ([`Session::append`]): a forged one would be an uncharged call in
-//!   the usage view, a turn number the kernel did not hand out, or a run
-//!   that says it finished while it is still open.
+//!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` /
+//!   `author` is overwritten rather than trusted.  Reads hand back
+//!   clones, so a caller cannot reach recorded state through a returned
+//!   value.
+//! - **Author, not vocabulary.**  Every event is stamped `author =
+//!   "kernel"` or `"caller"` by the path it took ([`event::Author`]), and
+//!   the derivations a caller must not be able to move — the budget
+//!   charge, the `usage` view, the turn numbering — fold over the
+//!   kernel's events only.  So no kind has to be kept from a caller:
+//!   appending a `model_response` from an earlier conversation puts it in
+//!   the dialogue (which reads the kind) and nowhere in the accounting
+//!   (which reads the author), and appending a `run_finished` records a
+//!   line without ending a run that only [`Session::close`] can end.
 //! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.
@@ -47,7 +52,10 @@ use std::fmt;
 
 pub use budget::Budget;
 pub use call::{validate_backend_result, CallOutcome, ModelResult};
-pub use event::{now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
+pub use event::{
+    author_of, is_kernel_authored, now_ms, validate_event, Author, AUTHOR_CALLER, AUTHOR_KERNEL,
+    FIELD_AUTHOR, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
+};
 pub use history::History;
 pub use projection::{DialogueFold, UsageFold, Views};
 pub use session::Session;
