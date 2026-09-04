@@ -11,31 +11,29 @@
 //!
 //! - **I1 append-only.**  [`History`] has no mutation API — no `update`,
 //!   `delete` or `replace`.  `seq` is assigned by the kernel, starts at
-//!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` /
-//!   `author` is overwritten rather than trusted.  Reads hand back
-//!   clones, so a caller cannot reach recorded state through a returned
-//!   value.
-//! - **Author, not vocabulary.**  Every event is stamped `author =
-//!   "kernel"` or `"caller"` by the path it took ([`event::Author`]), and
-//!   the derivations a caller must not be able to move — the budget
-//!   charge, the `usage` view, the turn numbering — fold over the
-//!   kernel's events only.  So no kind has to be kept from a caller:
-//!   appending a `model_response` from an earlier conversation puts it in
-//!   the record (which every reader sees) and nowhere in the accounting
-//!   (which reads the author), and appending a `run_finished` records a
-//!   line without ending a run that only [`Session::close`] can end.
+//!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
+//!   overwritten rather than trusted.  Reads hand back clones, so a caller
+//!   cannot reach recorded state through a returned value.
+//! - **Scope is the session.**  There is no per-event author.  A session
+//!   holds only its own events, so ownership is the session-level
+//!   [`Session::owner`] — a real principal id, or the reserved
+//!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
+//!   layer above the kernel.  The accounting keys on the `kind`: the
+//!   `usage` view and the budget charge fold over every `model_response`,
+//!   because in a session's own log a `model_response` is a call it made.
+//!   Appending a `model_response` is that recorded, numbered, charged
+//!   call; appending a `run_finished` records a line without ending a run
+//!   that only [`Session::close`] can end.
 //! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative
 //!   amounts only and the balance can only decrease (floored at `0`).
 //!   There is no API to raise or reset it.
 //! - **I6 run scope.**  All state lives inside a [`Session`] value — no
 //!   statics — so two sessions are fully independent, and `close` ends
 //!   the run scope (later `append` / `spend` are errors).
-//! - **K2 model call.**  [`call`] holds the kernel half of the model-call
-//!   syscall: a backend result is checked before anything is written, the
-//!   response is recorded before the budget is charged, and the turn it
-//!   is stamped with is the kernel's own count of the responses it took.
-//!   Calling the backend is the adapter's job — it is a Lua function, and
-//!   the kernel must not be holding its own state while the shell runs.
+//! - **Turn numbering.**  The turn a `model_response` carries is the
+//!   kernel's own count of the responses recorded, assigned on
+//!   [`Session::append`] (like `seq`), so a loop cannot restart or forge
+//!   it.
 //!
 //! Projections ([`projection`]) are *derived*: folding never changes the
 //! history and a fold result is a cache, not a capture — it can always be
@@ -54,14 +52,11 @@ pub mod session;
 use std::fmt;
 
 pub use budget::Budget;
-pub use call::{validate_backend_result, CallOutcome, ModelResult};
-pub use event::{
-    author_of, is_kernel_authored, now_ms, validate_event, Author, AUTHOR_CALLER, AUTHOR_KERNEL,
-    FIELD_AUTHOR, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
-};
+pub use call::charge_of;
+pub use event::{now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use history::History;
 pub use projection::{UsageFold, Views};
-pub use session::Session;
+pub use session::{Session, ANON, SYSTEM};
 
 /// Failure reason produced by the kernel core.
 ///

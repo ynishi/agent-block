@@ -184,7 +184,7 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-    local s = knl.session({ budget = { tokens = 100 } })
+    local s = knl.open({ owner = "test", budget = { tokens = 100 } })
     s:append({ kind = "msg_user", content = "hi" })
     local o = kernel.turn({ ctx = s, backend = stub(response("ok", { { type = "text", text = "hello" } })) })
     assert(Outcome.is_ok(o))
@@ -197,8 +197,18 @@ do
     assert(req_ev ~= nil and req_ev.request ~= nil)
     assert(#req_ev.request.messages == 1 and req_ev.request.messages[1].content == "hi")
 
+    -- The appended model_response was numbered and counted by the kernel:
+    -- turn 1, and usage counts it (no author, no Lua-side spend).
+    local resp = first_of(s, "model_response")
+    assert(resp ~= nil and resp.turn == 1, "kernel turn: " .. tostring(resp and resp.turn))
+    assert(o.out.turn == 1, "out turn: " .. tostring(o.out.turn))
+    assert(s:turns() == 1, "s:turns(): " .. tostring(s:turns()))
+    assert(s:view("usage").model_calls == 1, "usage did not count the response")
+    assert(s:remaining() < 100, "the response was not charged")
+
     mark("inv2_writeahead")
     mark("inv4_request_event")
+    mark("inv_usage_counts_append")
 end
 
 -- ---------------------------------------------------------------------------
@@ -207,7 +217,7 @@ end
 
 do
     local ran = {}
-    local s = knl.session({ budget = { tokens = 100 } })
+    local s = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o = kernel.turn({
         ctx = s,
         backend = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
@@ -231,7 +241,7 @@ do
     assert(#o.out.tools == 1 and o.out.tools[1].ok == true and o.out.tools[1].name == "echo")
 
     -- unknown tool: the pair is still closed, ok=false, machine-minimal error
-    local s2 = knl.session({ budget = { tokens = 100 } })
+    local s2 = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o2 = kernel.turn({
         ctx = s2,
         backend = stub(response("ok", { tool_use("c9", "ghost", {}) })),
@@ -243,7 +253,7 @@ do
     assert(tostring(tr2.result):find("not found", 1, true) ~= nil, tostring(tr2.result))
 
     -- a handler that raises also closes the pair ok=false
-    local s3 = knl.session({ budget = { tokens = 100 } })
+    local s3 = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o3 = kernel.turn({
         ctx = s3,
         backend = stub(response("ok", { tool_use("c3", "boom", {}) })),
@@ -266,11 +276,11 @@ end
 
 do
     -- ok
-    local so = knl.session({ budget = { tokens = 100 } })
+    local so = knl.open({ owner = "test", budget = { tokens = 100 } })
     assert(Outcome.is_ok(kernel.turn({ ctx = so, backend = stub(response("ok")) })))
 
     -- refused: the model answered (recorded + charged) but refused to proceed
-    local sr = knl.session({ budget = { tokens = 100 } })
+    local sr = knl.open({ owner = "test", budget = { tokens = 100 } })
     local before = sr:remaining()
     local orf = kernel.turn({ ctx = sr, backend = stub(response("refused", { { type = "text", text = "no" } })) })
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
@@ -278,7 +288,7 @@ do
     assert(sr:remaining() < before, "a refusal still costs its tokens")
 
     -- error: the beat did not come off — no model_response, a model_call_failed
-    local se = knl.session({ budget = { tokens = 100 } })
+    local se = knl.open({ owner = "test", budget = { tokens = 100 } })
     local oe = kernel.turn({
         ctx = se,
         backend = stub({ status = "error", detail = "boom", content = {}, usage = {} }),
@@ -288,7 +298,7 @@ do
     assert(first_of(se, "model_call_failed") ~= nil, "an errored call is noted as a failed call")
 
     -- a transport failure (nil, err) is also Error(call)
-    local st = knl.session({ budget = { tokens = 100 } })
+    local st = knl.open({ owner = "test", budget = { tokens = 100 } })
     local ot = kernel.turn({
         ctx = st,
         backend = function()
@@ -306,7 +316,7 @@ end
 
 do
     -- turn-level: an exhausted session stops at the gate, before any call
-    local s = knl.session({ budget = { tokens = 10 } })
+    local s = knl.open({ owner = "test", budget = { tokens = 10 } })
     s:spend(10)
     assert(s:exhausted())
     local o = kernel.turn({ ctx = s, backend = stub(response("ok")) })

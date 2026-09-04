@@ -27,12 +27,12 @@
 //!
 //! # What `usage` counts
 //!
-//! [`UsageFold`] adds up the `model_response` events the *kernel* wrote
-//! and no others.  Those are exactly the responses the budget was charged
-//! for, so the view and the balance are two readings of one set of facts
-//! rather than two counts that can drift.  A caller's `model_response` is
-//! a fact about some other run — it cost this one nothing, and it is
-//! reported as costing nothing.
+//! [`UsageFold`] adds up every `model_response` in the session.  A session
+//! holds only its own events, so a `model_response` in it is a call this
+//! run made — there is nothing foreign to exclude, and no author to key
+//! on.  Those are exactly the responses the budget was charged for, so the
+//! view and the balance are two readings of one set of facts rather than
+//! two counts that can drift.
 //!
 //! # The position a fold has reached
 //!
@@ -46,7 +46,7 @@
 
 use serde_json::{Map, Value};
 
-use super::event::{is_kernel_authored, kind_of, seq_of, FIELD_USAGE, KIND_MODEL_RESPONSE};
+use super::event::{kind_of, seq_of, FIELD_USAGE, KIND_MODEL_RESPONSE};
 use super::{History, KnlError, KnlResult};
 
 /// View name: usage totals.
@@ -66,24 +66,24 @@ pub const DEFAULT_TAIL_N: usize = 20;
 /// and what its `usage` view reports are then the same arithmetic over the
 /// same fields, rather than two definitions that can drift apart.
 pub(super) const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
-/// Usage field: number of kernel-authored `model_response` events folded.
+/// Usage field: number of `model_response` events folded.
 const FIELD_MODEL_CALLS: &str = "model_calls";
 /// Usage field: `seq` of the last event the totals include.
 const FIELD_AT_SEQ: &str = "at_seq";
 
 /// Incremental fold of the `usage` view.
 ///
-/// Keyed on `author`: what this run spent is what the kernel recorded
-/// spending, and a `model_response` a caller appended is somebody else's
-/// bill.  Reading the kind alone would count it, and the totals would
-/// then disagree with the budget the run was actually charged.
+/// Keyed on the `kind` alone: a session holds only its own events, so every
+/// `model_response` in it is a call this run made and was charged for.
+/// There is no foreign response to filter out — that was the point of
+/// dropping the per-event author.
 #[derive(Debug, Clone, Default)]
 pub struct UsageFold {
     /// Highest `seq` already folded.
     folded_seq: u64,
     /// Running totals, in the order of [`USAGE_COUNTERS`].
     totals: [i64; 3],
-    /// Number of kernel-authored `model_response` events folded.
+    /// Number of `model_response` events folded.
     model_calls: u64,
 }
 
@@ -91,7 +91,7 @@ impl UsageFold {
     /// Fold every event newer than the last fold.
     pub fn advance(&mut self, history: &History) {
         for event in history.slice_after(self.folded_seq) {
-            if kind_of(event) == KIND_MODEL_RESPONSE && is_kernel_authored(event) {
+            if kind_of(event) == KIND_MODEL_RESPONSE {
                 self.model_calls = self.model_calls.saturating_add(1);
                 let usage = event.get(FIELD_USAGE);
                 for (slot, counter) in self.totals.iter_mut().zip(USAGE_COUNTERS) {
@@ -194,7 +194,8 @@ mod tests {
         }
     }
 
-    /// Append a caller-authored event, panicking on a rejected fixture.
+    /// Append an event, panicking on a rejected fixture.  The one write
+    /// path, whoever the event is "from": there is no separate kernel path.
     fn append(history: &mut History, value: Value) {
         let event = value.clone();
         history
@@ -202,19 +203,12 @@ mod tests {
             .unwrap_or_else(|e| panic!("append {event}: {e}"));
     }
 
-    /// Append an event the way the kernel does — the path `run_started`,
-    /// `run_finished` and a recorded `model_response` take.
-    fn append_kernel(history: &mut History, value: Value) {
-        history.append_kernel(obj(value));
-    }
-
-    /// A history covering every reserved kind plus an open one, each on
-    /// the path it takes in a real run.
+    /// A history covering every reserved kind plus an open one.
     fn mixed_history() -> History {
         let mut h = History::new();
-        append_kernel(&mut h, json!({ "kind": "run_started" }));
+        append(&mut h, json!({ "kind": "run_started" }));
         append(&mut h, json!({ "kind": "msg_user", "content": "hi" }));
-        append_kernel(
+        append(
             &mut h,
             json!({
                 "kind": "model_response",
@@ -276,14 +270,13 @@ mod tests {
         // The envelope stays on: an event read hands back the record, not
         // a row shaped for a particular reader.
         assert!(events[1].get("seq").is_some(), "{}", events[1]);
-        assert!(events[1].get("author").is_some(), "{}", events[1]);
     }
 
     /// A conversation the caller carried in is material like any other:
-    /// the events read back in `seq` order whoever wrote them, so
-    /// continuing a conversation is an ordinary `append`.
+    /// the events read back in `seq` order, so continuing a conversation
+    /// is an ordinary `append`.
     #[test]
-    fn events_read_back_in_order_whoever_wrote_them() {
+    fn events_read_back_in_order() {
         let mut h = History::new();
         append(
             &mut h,
@@ -302,50 +295,36 @@ mod tests {
             events[0][FIELD_CONTENT],
             json!([{ "type": "text", "text": "said last time" }])
         );
-        assert!(!is_kernel_authored(&events[0]), "{}", events[0]);
         assert_eq!(kind_of(&events[1]), "msg_user");
     }
 
-    /// …and it is invisible to the accounting: the usage view reports what
-    /// this run was charged for, which is what the kernel recorded.
+    /// `usage` counts every `model_response` in the session — there is no
+    /// foreign response to exclude, because a session holds only its own
+    /// events.
     #[test]
-    fn usage_ignores_a_model_response_the_caller_brought() {
+    fn usage_counts_every_model_response() {
         let mut h = History::new();
         append(
-            &mut h,
-            json!({
-                "kind": "model_response", "turn": 1, "content": [],
-                "usage": { "input_tokens": 9_000, "output_tokens": 9_000 }
-            }),
-        );
-        assert_eq!(
-            usage_of(&h),
-            json!({
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "thinking_tokens": 0,
-                "model_calls": 0,
-                "at_seq": 1
-            }),
-            "the event was folded — it just counts for nothing"
-        );
-
-        // The same payload on the kernel's path is counted in full, so it
-        // is the author and nothing else that decides.
-        append_kernel(
             &mut h,
             json!({
                 "kind": "model_response", "turn": 1, "content": [],
                 "usage": { "input_tokens": 4, "output_tokens": 2 }
             }),
         );
+        append(
+            &mut h,
+            json!({
+                "kind": "model_response", "turn": 2, "content": [],
+                "usage": { "input_tokens": 5, "thinking_tokens": 7 }
+            }),
+        );
         assert_eq!(
             usage_of(&h),
             json!({
-                "input_tokens": 4,
+                "input_tokens": 9,
                 "output_tokens": 2,
-                "thinking_tokens": 0,
-                "model_calls": 1,
+                "thinking_tokens": 7,
+                "model_calls": 2,
                 "at_seq": 2
             })
         );
@@ -354,7 +333,7 @@ mod tests {
     #[test]
     fn usage_sums_model_responses_and_counts_the_calls() {
         let mut h = mixed_history();
-        append_kernel(
+        append(
             &mut h,
             json!({
                 "kind": "model_response",
@@ -410,10 +389,9 @@ mod tests {
         assert_eq!(usage["at_seq"], json!(2), "{usage}");
         assert_eq!(usage["model_calls"], json!(0), "{usage}");
 
-        // And the rest of the history is exactly what it has not seen.
         let at_seq = usage["at_seq"].as_u64().expect("a position");
         assert!(h.since(at_seq + 1).is_empty(), "nothing is left to read");
-        append_kernel(
+        append(
             &mut h,
             json!({
                 "kind": "model_response", "turn": 1, "content": [],
@@ -433,62 +411,35 @@ mod tests {
         // Reading before anything is appended must not poison the cache.
         assert_eq!(views.usage(&h), usage_of(&h));
 
-        // `true` where the kernel is the one writing, so the script mixes
-        // both authors and the cache has to agree about both.
         let script = [
-            (true, json!({ "kind": "run_started" })),
-            (false, json!({ "kind": "msg_user", "content": "one" })),
-            (false, json!({ "kind": "note", "text": "ignored" })),
-            (
-                true,
-                json!({
-                    "kind": "model_response", "turn": 1, "content": [],
-                    "usage": { "input_tokens": 4, "output_tokens": 2 }
-                }),
-            ),
-            (
-                false,
-                json!({
-                    "kind": "tool_call", "turn": 1, "call_id": "c",
-                    "name": "sh", "args": {}
-                }),
-            ),
-            (
-                false,
-                json!({
-                    "kind": "tool_result", "turn": 1, "call_id": "c",
-                    "ok": true, "result": { "out": "ok" }
-                }),
-            ),
-            (
-                false,
-                json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
-            ),
-            (
-                // A caller's response: the record takes it, usage does
-                // not, and the cache has to reach the same conclusion as
-                // a fold from scratch.
-                false,
-                json!({
-                    "kind": "model_response", "turn": 1, "content": [],
-                    "usage": { "input_tokens": 9_000 }
-                }),
-            ),
-            (
-                true,
-                json!({
-                    "kind": "model_response", "turn": 2, "content": [],
-                    "usage": { "input_tokens": 6, "thinking_tokens": 1 }
-                }),
-            ),
+            json!({ "kind": "run_started" }),
+            json!({ "kind": "msg_user", "content": "one" }),
+            json!({ "kind": "note", "text": "ignored" }),
+            json!({
+                "kind": "model_response", "turn": 1, "content": [],
+                "usage": { "input_tokens": 4, "output_tokens": 2 }
+            }),
+            json!({
+                "kind": "tool_call", "turn": 1, "call_id": "c",
+                "name": "sh", "args": {}
+            }),
+            json!({
+                "kind": "tool_result", "turn": 1, "call_id": "c",
+                "ok": true, "result": { "out": "ok" }
+            }),
+            json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
+            json!({
+                "kind": "model_response", "turn": 2, "content": [],
+                "usage": { "input_tokens": 9_000 }
+            }),
+            json!({
+                "kind": "model_response", "turn": 3, "content": [],
+                "usage": { "input_tokens": 6, "thinking_tokens": 1 }
+            }),
         ];
 
-        for (i, (by_kernel, event)) in script.into_iter().enumerate() {
-            if by_kernel {
-                append_kernel(&mut h, event);
-            } else {
-                append(&mut h, event);
-            }
+        for (i, event) in script.into_iter().enumerate() {
+            append(&mut h, event);
             // Read after every append: the incremental result must equal
             // the from-scratch one at each step, not only at the end.
             assert_eq!(views.usage(&h), usage_of(&h), "step {i}");
@@ -498,23 +449,19 @@ mod tests {
         // than double-folding.
         assert_eq!(views.usage(&h), usage_of(&h));
 
-        // Agreeing with a from-scratch fold that made the same mistake
-        // would prove nothing, so the totals are named: two calls counted,
-        // nine events folded, and the caller's 9000 tokens nowhere.
+        // Every model_response counts now: three calls, and the 9000-token
+        // one is summed in with the rest.
         assert_eq!(
             views.usage(&h),
             json!({
-                "input_tokens": 10,
+                "input_tokens": 9_010,
                 "output_tokens": 2,
                 "thinking_tokens": 1,
-                "model_calls": 2,
+                "model_calls": 3,
                 "at_seq": 9
             })
         );
 
-        // The record holds three responses all the same — the count the
-        // account keeps is the kernel's own, not the number of events of
-        // that kind.
         let responses = h
             .since(0)
             .iter()

@@ -17,14 +17,12 @@
 ---   the charge (`ctx:spend`) and the turn number in that order — turn owns
 ---   the beat, no syscall bundles the steps for it.
 ---
---- Turn numbering, and the bridge gap (report this)
----   The design has the ctx be the numbering authority via `ctx:next_turn()`.
----   The current Rust bridge (crates/agent-block-core/src/bridge/knl.rs) does
----   NOT expose that method (the Rust *core* has `Session::next_turn`, it is
----   simply unbound). So this POC numbers a turn by counting the
----   `model_response` events already in the ctx and adding one
----   (`next_turn_of`). This is the one place the implementation diverges from
----   §2's `ctx:next_turn()`.
+--- Turn numbering (kernel-owned)
+---   The ctx is the numbering authority. Appending a `model_response` through
+---   `ctx:append` is what numbers it: the Rust kernel assigns the turn (like
+---   `seq`) and charges the usage in the same step. turn reads the number
+---   back with `ctx:turns()` afterwards and stamps it onto the tool_call /
+---   tool_result events. There is no Lua-side counting or scope stamping.
 ---
 --- What the POC deliberately leaves out
 ---   Real provider adapters (backend is a stub `fn(req) -> {status, content,
@@ -210,187 +208,44 @@ function M.fold(events, conf)
 end
 
 -- ============================================================
--- scope handle (§1 In, §2 single write path) + usage (§3 projection)
+-- open (§1 In) — a thin wrapper over the Rust ctx
 -- ============================================================
 --
--- The ownership fix (scope-design.md). The old code stamped an `author`
--- (kernel|caller) from *which append method was called*, so turn's
+-- The ownership fix (scope-design.md rev 3). The old code stamped an
+-- `author` (kernel|caller) from *which append method was called*, so turn's
 -- model_response — laid down through the plain append path — read back as
 -- author=caller and fell out of the account (usage=0, the confused-deputy
--- bug). Here ownership is intrinsic to a *scope handle*: `open` mints a
--- scope id once (§1), every write through the handle carries that scope
--- automatically (§2), and aggregation is a projection filtered by that
--- scope (§3). The consumer (turn) never decides ownership — it just writes
--- through the handle it was handed.
---
--- POC boundary (scope-design.md §5/§6, stated so it is not mistaken for the
--- finished thing):
---   * NOT enforced at the Rust boundary. A raw `ctx:append` can still
---     bypass scope stamping — the handle stamps scope in Lua, it is not yet
---     the *only* reachable write path. Making a raw append unable to skip
---     the stamp is the follow-up Rust hardening step, out of scope here;
---     this POC validates the *behaviour* of the model.
---   * NO multi-scope continuation. The lineage branch in `Handle:append`
---     (leave an already-set scope alone) is here so a carried-over event
---     keeps its origin scope, but nothing in this POC drives continuation
---     across scopes — that is the persistence step (§6.5), flagged only.
+-- bug). rev 2's per-event scope stamp / lineage / scope-keyed usage was the
+-- wrong fix and is gone. rev 3: scope IS the session, ownership is the
+-- session's total `owner`, and the Rust kernel numbers + charges +
+-- accounts every model_response by kind. So there is nothing for Lua to
+-- stamp or fold: `open` just returns the raw ctx (the session handle), and
+-- usage is `ctx:view("usage")`.
 
-local Handle = {}
-Handle.__index = Handle
-
---- The single consumer-facing write path (§2). Stamp this handle's scope
---- onto an event that does not carry one, then delegate to the underlying
---- ctx, returning the seq it assigns.
+--- Open a session (§1 In) and return its ctx handle.
 ---
---- An event that *already* carries a scope keeps it: that is a carried-over
---- event holding its origin scope (§4 lineage), and overwriting it would
---- re-bill another scope's work to this one. The consumer sets no scope of
---- its own — routing the write through the handle is what stamps it.
+--- A thin pass-through to `knl.open` (the Rust bridge): `owner` is the
+--- principal (the bridge defaults it to the reserved "anon" when absent),
+--- `budget` / `backend` are forwarded as-is. The returned handle is the ctx
+--- itself — the only capability needed to write to the session.
 ---
---- Mutates `event` in place, by contract: auto-stamping scope on the way
---- through is the whole point of the single write path (a caller that keeps
---- a reference sees the scope the write was recorded under).
-function Handle:append(event)
-    if event.scope == nil then
-        event.scope = self.scope
-    end
-    return self.ctx:append(event)
-end
-
---- Read / budget / lifecycle delegate straight to the underlying ctx: the
---- handle adds ownership to writes, it does not reinterpret the rest.
-function Handle:events(from)
-    return self.ctx:events(from)
-end
-
-function Handle:spend(n)
-    return self.ctx:spend(n)
-end
-
-function Handle:remaining()
-    return self.ctx:remaining()
-end
-
-function Handle:exhausted()
-    return self.ctx:exhausted()
-end
-
-function Handle:close(reason)
-    return self.ctx:close(reason)
-end
-
-function Handle:id()
-    return self.ctx:id()
-end
-
---- Open a scope (§1 In) and return its handle — the only capability the
---- consumer needs to write to the scope.
----
---- The session already mints a UUID (`ctx:id()`); that id *is* the scope id
---- (no extra field — the session's identity and the scope's are one). owner
---- / user are the scope's incidental identity (whose scope it is, for later
---- multi-app separation) and do not affect accounting.
----
---- @param opts table  { owner?, user?, budget?, backend? }
---- @return table handle  { scope, owner, user, ctx } + Handle methods
+--- @param opts table  { owner?, budget?, backend? }
+--- @return userdata ctx  a `knl.open` session handle
 function M.open(opts)
     opts = opts or {}
     if syscall == nil then
         error("knl.open: the knl syscall bridge is not available in this VM")
     end
-    local ctx = syscall.session({ budget = opts.budget, backend = opts.backend })
-    return setmetatable({
-        ctx = ctx,
-        scope = ctx:id(),
+    return syscall.open({
         owner = opts.owner,
-        user = opts.user,
-    }, Handle)
-end
-
---- Usage as a scope-keyed projection (§3). Fold the handle's events and
---- count only the model_response events stamped with *this* handle's scope:
---- those are the calls this scope made and paid for. A model_response
---- carrying a different scope (a carried-over, lineage event) stays in the
---- record but out of this account.
----
---- This is the design's "aggregation is a projection filtered by scope",
---- and the reason it does not lean on the Rust `view("usage")`: that view
---- keys on `author`, the stamp the model replaced — a turn's own response,
---- written through the plain path, reads back author=caller and the Rust
---- view scores it 0. Keying on scope is what makes the count come out right.
----
---- @param handle table  a handle from `M.open`
---- @return table  { input_tokens, output_tokens, thinking_tokens, model_calls }
-function M.usage(handle)
-    local totals = {
-        input_tokens = 0,
-        output_tokens = 0,
-        thinking_tokens = 0,
-        model_calls = 0,
-    }
-    for _, ev in ipairs(handle:events()) do
-        if ev.kind == "model_response" and ev.scope == handle.scope then
-            totals.model_calls = totals.model_calls + 1
-            local usage = ev.usage
-            if type(usage) == "table" then
-                for _, counter in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
-                    local n = usage[counter]
-                    if type(n) == "number" then
-                        totals[counter] = totals[counter] + n
-                    end
-                end
-            end
-        end
-    end
-    return totals
+        budget = opts.budget,
+        backend = opts.backend,
+    })
 end
 
 -- ============================================================
 -- turn (§2) — one complete beat
 -- ============================================================
-
---- The three usage counters the budget charges on, summed. Mirrors the Rust
---- `ModelResult::charge` (input + output + thinking, a missing counter is 0
---- and the total floors at 0), because turn now does the charge itself with
---- `ctx:spend` rather than leaning on the composite `session:call`.
-local function tokens_of(usage)
-    if type(usage) ~= "table" then
-        return 0
-    end
-    local total = 0
-    for _, counter in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
-        local n = usage[counter]
-        if type(n) == "number" and n > 0 then
-            total = total + n
-        end
-    end
-    return total
-end
-
---- The turn number the next recorded response takes — scope-keyed.
----
---- The design (§2) reads this off the ctx (`ctx:next_turn()`), which is the
---- Rust authority. The bridge does not expose that method today, so the POC
---- derives the same number the Rust core would: one past the count of
---- `model_response` events already in the history *under this scope*
---- (scope-design.md §2/§3 — numbering is scope-keyed, exactly like usage).
---- Called before the append, so a fresh scope's first turn is 1.
----
---- `ctx.scope` is the handle's scope; a model_response from a different
---- scope (lineage) does not advance this scope's counter. A raw session
---- brought in without a handle reads `ctx.scope == nil`, and its unstamped
---- model_responses (`ev.scope == nil`) match it — the pre-handle path keeps
---- numbering as it did.
-local function next_turn_of(ctx)
-    local n = 0
-    local scope = ctx.scope
-    for _, ev in ipairs(ctx:events()) do
-        if ev.kind == "model_response" and ev.scope == scope then
-            n = n + 1
-        end
-    end
-    return n + 1
-end
 
 --- Minimal conf shape check (§2 [0] ShapePort). Returns an error string, or
 --- nil when the conf is usable.
@@ -420,7 +275,7 @@ end
 --- tool or a raising handler — is the kernel's. `out.turn` (set by turn
 --- before this runs) stamps both halves of every pair.
 ---
---- @param ctx userdata  a `knl.session()` handle (conf.ctx)
+--- @param ctx userdata  a `knl.open()` handle (conf.ctx)
 --- @return table summary  one { call_id, name, ok } per tool_use
 local function execute_tools(ctx, conf, out)
     local summary = {}
@@ -500,7 +355,7 @@ end
 --- handle included), so it can be called from any driver, resumed, or
 --- interleaved. The state handle is `conf.ctx`; turn never opens it.
 ---
---- @param conf table  { ctx = <knl.session handle>, backend, fold?, filters?,
+--- @param conf table  { ctx = <knl.open handle>, backend, fold?, filters?,
 ---                      tools?, tool_policy?, system? }
 --- @return table outcome  an `Outcome` (§8)
 function M.turn(conf)
@@ -513,7 +368,7 @@ function M.turn(conf)
     end
     local ctx = conf.ctx
     if ctx == nil then
-        return Outcome.err("conf", "no ctx (pass conf.ctx, a knl.session handle)")
+        return Outcome.err("conf", "no ctx (pass conf.ctx, a knl.open handle)")
     end
     -- The backend is turn's to call now, so it must be in conf. There is no
     -- session-bound fallback here — that path belonged to `session:call`.
@@ -561,18 +416,18 @@ function M.turn(conf)
         ctx:append({ kind = "model_call_failed", error = tostring(reason) })
         return Outcome.err("call", tostring(reason))
     end
-    -- ok / refused: the model answered. Record it, then charge it
-    -- (write-ahead: append before spend), numbering the turn ourselves.
-    local turn_no = next_turn_of(ctx)
-    resp.turn = turn_no
+    -- ok / refused: the model answered. Appending the model_response is
+    -- what records it, numbers it and charges it — the kernel does all
+    -- three in the one append (no Lua-side spend, no Lua-side counting).
+    -- Read the kernel-assigned turn back afterwards to stamp the tools.
     ctx:append({
         kind = "model_response",
-        turn = turn_no,
         content = resp.content,
         usage = resp.usage,
         stop_reason = resp.stop_reason,
     })
-    ctx:spend(tokens_of(resp.usage))
+    local turn_no = ctx:turns()
+    resp.turn = turn_no
     -- A refusal is a recorded, charged response the model would not build on.
     if resp.status == "refused" then
         return Outcome.refused(resp.stop_reason or "refused", resp)
@@ -640,9 +495,10 @@ function M.run(conf)
     end
 
     -- Acquire the ctx: continue a brought-in one (never closed here), or open
-    -- our own (closed on the way out). run opens a *scope handle* via
-    -- M.open (§1/§4), so run drives a scope like turn does — its writes get
-    -- scope-stamped automatically. A brought-in handle is used as-is.
+    -- our own (closed on the way out). run opens the session via M.open
+    -- (§1/§4) — a thin wrapper over the Rust ctx; the kernel owns numbering
+    -- and accounting, so there is nothing for run to stamp. A brought-in ctx
+    -- is used as-is.
     local own_ctx = false
     if ctx == nil then
         if syscall == nil then

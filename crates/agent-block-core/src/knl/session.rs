@@ -4,11 +4,32 @@
 //! together and is the only handle on kernel state.  All of it lives in
 //! the value: two sessions share nothing.
 //!
-//! The kernel writes the run's own boundaries: [`Session::new`] appends
-//! `run_started` and [`Session::close`] appends `run_finished`, so a run
-//! is bracketed in the history whether or not the shell remembers to say
-//! so.  After a close, `append` / `spend` are errors while reads keep
-//! working — the record outlives the run.
+//! # The session *is* the scope
+//!
+//! A session holds only its own events, so ownership is not a per-event
+//! question: the session carries one `owner` — a real principal id, or the
+//! reserved [`ANON`] / [`SYSTEM`] id — and it is *total* (never `Option`,
+//! never a "kernel vs caller" flag).  System-originated work is a session
+//! whose owner is [`SYSTEM`]; unspecified is [`ANON`].  The policy layer
+//! above the kernel reads [`Session::owner`] to authorize; the kernel
+//! itself does not branch on it.
+//!
+//! # One append
+//!
+//! There is a single write path.  [`Session::append`] validates, stamps
+//! the kernel-owned `seq` / `epoch_ms`, and pushes.  When the event is a
+//! `model_response` it also *numbers and charges* it: the kernel assigns
+//! the `turn` from its own count (overwriting any the caller supplied) and
+//! deducts the usage from the budget.  So appending a `model_response` is
+//! the recorded, numbered, charged call — there is no separate step a
+//! driver has to remember, and no path by which a response reaches the
+//! history without being accounted for.
+//!
+//! The kernel writes the run's own boundaries through the same append:
+//! [`Session::new`] appends `run_started` and [`Session::close`] appends
+//! `run_finished`, so a run is bracketed in the history whether or not the
+//! shell remembers to say so.  After a close, `append` / `spend` are errors
+//! while reads keep working — the record outlives the run.
 //!
 //! The scope itself is the `closed` flag, not the `run_finished` event.
 //! An event is a record of something; what ends the run is [`close`], and
@@ -19,19 +40,30 @@
 
 use serde_json::{Map, Value};
 
-use super::call::{failure_event, CallOutcome, ModelResult};
-use super::event::{kernel_event, FIELD_REASON, KIND_RUN_FINISHED, KIND_RUN_STARTED};
+use super::call::charge_of;
+use super::event::{
+    kernel_event, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE, KIND_MODEL_RESPONSE,
+    KIND_RUN_FINISHED, KIND_RUN_STARTED,
+};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
 use super::{projection, Budget, History, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
 pub const DEFAULT_CLOSE_REASON: &str = "closed";
 
+/// Reserved owner: no principal was named when the session opened.
+pub const ANON: &str = "anon";
+/// Reserved owner: the session belongs to the system itself.
+pub const SYSTEM: &str = "system";
+
 /// One run scope.
 #[derive(Debug)]
 pub struct Session {
     /// Run-correlation id, unique per session.
     id: String,
+    /// Whose scope this is: a real principal id, or [`ANON`] / [`SYSTEM`].
+    /// Total — never absent, read by the policy layer above the kernel.
+    owner: String,
     /// K1 append-only history.
     history: History,
     /// K4 budget counter.
@@ -45,21 +77,26 @@ pub struct Session {
 }
 
 impl Session {
-    /// Open a run with an optional token budget.
+    /// Open a run for `owner` with an optional token budget.
     ///
-    /// The `run_started` event is appended here, so a fresh session
-    /// already has one event.
-    pub fn new(budget_tokens: Option<i64>) -> Self {
-        let mut history = History::new();
-        history.append_kernel(kernel_event(KIND_RUN_STARTED));
-        Self {
+    /// `owner` is total: pass a real principal id, or [`ANON`] / [`SYSTEM`]
+    /// for the reserved ones.  The `run_started` event is appended here, so
+    /// a fresh session already has one event.
+    pub fn new(owner: String, budget_tokens: Option<i64>) -> Self {
+        let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
-            history,
+            owner,
+            history: History::new(),
             budget: Budget::new(budget_tokens),
             views: Views::default(),
             turns: 0,
             closed: false,
-        }
+        };
+        // `run_started` is well-formed and the session is open, so this
+        // append cannot fail; the same one path records it as records
+        // everything else.
+        let _ = session.append(kernel_event(KIND_RUN_STARTED));
+        session
     }
 
     /// The run-correlation id.
@@ -67,49 +104,57 @@ impl Session {
         &self.id
     }
 
-    /// Record a caller-authored event, returning its `seq`.
-    ///
-    /// Any kind is welcome, the reserved ones included, as long as it
-    /// meets the shape its kind requires.  What a caller writes is
-    /// stamped `author = "caller"` and stays a *record*: it does not move
-    /// the state the kernel keeps, because the derivations that could be
-    /// moved read the author rather than the kind.
-    ///
-    /// - a `model_response` a caller brought is not in the `usage` view
-    ///   and was never charged, so the view and the budget still describe
-    ///   the same set of calls.  It *is* in the record, which is the
-    ///   point: this is how a conversation from an earlier run is carried
-    ///   into this one, and [`Session::events`] hands it back like any
-    ///   other event.
-    /// - its `turn` field is payload.  The kernel numbers turns from its
-    ///   own count of the responses it recorded
-    ///   ([`Session::record_model_response`]), so whatever number a
-    ///   caller writes names nothing but itself.
-    /// - a `run_finished` is a line in the history, not a close.  The run
-    ///   scope is the `closed` flag, and only [`Session::close`] sets it.
-    ///
-    /// The kernel's own writes go through [`Session::append_kernel`],
-    /// which differs in the stamp it leaves and in skipping a validation
-    /// its payloads cannot fail.
-    pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
-        if self.closed {
-            return Err(KnlError::new("session is closed"));
-        }
-        self.history.append(event)
+    /// Whose scope this is (a principal id, or [`ANON`] / [`SYSTEM`]).
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
 
-    /// Record a kernel-authored event, returning its `seq`.
+    /// Record an event, returning its `seq`.  The one write path.
     ///
-    /// The run-scope check of [`Session::append`] on the kernel's own
-    /// path: the payload was built here from the reserved vocabulary, so
-    /// there is nothing to validate, and the append is stamped
-    /// `author = "kernel"` — the mark every accounting fold keys on.
-    /// Private, so that stamp cannot be reached from outside this module.
-    fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
+    /// Any kind is welcome, the reserved ones included, as long as it meets
+    /// the shape its kind requires.  The kernel-owned `seq` / `epoch_ms`
+    /// are stamped here and overwrite any caller-supplied value.
+    ///
+    /// A `model_response` is more than a record: appending one *is* the
+    /// recorded, numbered, charged call.  The kernel
+    ///
+    /// - assigns the `turn` from its own count (overwriting whatever the
+    ///   caller put there — the number is kernel-owned, like `seq`), and
+    /// - charges the usage against the budget, write-ahead: the response is
+    ///   in the history before the balance moves, so a charge that somehow
+    ///   failed would over-record and under-charge (visible, recoverable)
+    ///   rather than bill for a turn no event names.  In practice it cannot
+    ///   fail — the amount is non-negative by construction.
+    ///
+    /// A `run_finished` a caller appends is a line in the history, not a
+    /// close: the run scope is the `closed` flag, and only
+    /// [`Session::close`] sets it.
+    pub fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
             return Err(KnlError::new("session is closed"));
         }
-        Ok(self.history.append_kernel(event))
+
+        let is_response =
+            event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
+        if !is_response {
+            return self.history.append(event);
+        }
+
+        // Kernel-owned turn, assigned before the event is stored so the
+        // record carries the number the run will refer to it by.
+        let turn = self.next_turn();
+        event.insert(FIELD_TURN.to_string(), Value::from(turn));
+        let charge = event
+            .get(FIELD_USAGE)
+            .and_then(Value::as_object)
+            .map_or(0, charge_of);
+
+        // Validate + stamp + push.  A malformed response is rejected here,
+        // before the turn counter advances or the budget is touched.
+        let seq = self.history.append(event)?;
+        self.turns = turn;
+        let _ = self.budget.spend(charge);
+        Ok(seq)
     }
 
     /// Events with `seq >= from`, cloned.
@@ -143,9 +188,9 @@ impl Session {
     /// the same one and the successful turns stay 1, 2, 3 … without gaps.
     ///
     /// A counter, not a scan of the history: it advances in
-    /// [`Session::record_model_response`] and nowhere else, so the `turn`
-    /// field of an appended event — whatever it says — cannot renumber
-    /// the run.
+    /// [`Session::append`]'s `model_response` branch and nowhere else, so
+    /// the `turn` field of an appended event — whatever it says — cannot
+    /// renumber the run.
     pub fn next_turn(&self) -> u64 {
         self.turns.saturating_add(1)
     }
@@ -153,41 +198,6 @@ impl Session {
     /// How many model responses this session has recorded.
     pub fn turns(&self) -> u64 {
         self.turns
-    }
-
-    /// Record a model response and charge what it cost — steps [4] and
-    /// [5] of the call sequence, in that order and in one place.
-    ///
-    /// The write comes first on purpose: if the history takes the response
-    /// and the charge is what fails, the run is over-recorded and
-    /// under-charged, which is visible and recoverable; the other order
-    /// can bill for a turn that no event mentions.  In practice the charge
-    /// cannot fail here — the amount is non-negative by construction and
-    /// the append just proved the session open — so the failure path is
-    /// kept only because the types say it exists.
-    ///
-    /// The turn counter advances only on the way through: a call that is
-    /// never recorded leaves the numbering where it was.
-    pub fn record_model_response(&mut self, result: &ModelResult) -> KnlResult<CallOutcome> {
-        let turn = self.next_turn();
-        self.append_kernel(result.to_event(turn))?;
-        self.turns = turn;
-        let remaining = self.spend(result.charge())?;
-        Ok(CallOutcome {
-            turn,
-            remaining,
-            exhausted: self.exhausted(),
-        })
-    }
-
-    /// Note a call that produced no result, best effort.
-    ///
-    /// Returns whether the note landed: a closed run cannot take it, and
-    /// that is not worth turning into a second failure on top of the one
-    /// being reported — the caller is already returning an error.
-    pub fn record_model_call_failure(&mut self, error: &str) -> bool {
-        let event = failure_event(self.next_turn(), error);
-        self.append_kernel(event).is_ok()
     }
 
     /// The remaining balance (`None` without a budget).
@@ -218,7 +228,9 @@ impl Session {
             FIELD_REASON.to_string(),
             Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
         );
-        self.history.append_kernel(event);
+        // The same append records the boundary; it is well-formed and the
+        // session is still open, so it cannot fail.
+        let _ = self.append(event);
         self.closed = true;
     }
 
@@ -243,8 +255,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::call::validate_backend_result;
-    use crate::knl::event::{author_of, kind_of, seq_of, AUTHOR_CALLER, AUTHOR_KERNEL, FIELD_TURN};
+    use crate::knl::event::{kind_of, seq_of};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -255,19 +266,24 @@ mod tests {
         }
     }
 
-    /// A backend result charging `tokens`, as the kernel accepts it.
-    fn result(tokens: i64) -> ModelResult {
-        validate_backend_result(&json!({
+    /// A session owned by the reserved anonymous principal.
+    fn new_session(budget: Option<i64>) -> Session {
+        Session::new(ANON.to_string(), budget)
+    }
+
+    /// A `model_response` event charging `tokens`, as the kernel accepts it.
+    fn response(tokens: i64) -> Map<String, Value> {
+        obj(json!({
+            "kind": "model_response",
             "content": [{ "type": "text", "text": "ok" }],
             "usage": { "input_tokens": tokens },
             "stop_reason": "end_turn"
         }))
-        .expect("contract met")
     }
 
     #[test]
     fn a_new_session_already_carries_run_started() {
-        let s = Session::new(None);
+        let s = new_session(None);
         assert_eq!(s.len(), 1);
         let events = s.events(0);
         assert_eq!(kind_of(&events[0]), KIND_RUN_STARTED);
@@ -277,8 +293,18 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_is_total_and_read_back_verbatim() {
+        assert_eq!(new_session(None).owner(), ANON);
+        assert_eq!(Session::new(SYSTEM.to_string(), None).owner(), SYSTEM);
+        assert_eq!(
+            Session::new("user-42".to_string(), None).owner(),
+            "user-42"
+        );
+    }
+
+    #[test]
     fn close_records_run_finished_once_with_the_given_reason() {
-        let mut s = Session::new(None);
+        let mut s = new_session(None);
         s.close(Some("budget_exhausted"));
         s.close(Some("ignored"));
         assert_eq!(s.len(), 2, "close must be idempotent");
@@ -291,7 +317,7 @@ mod tests {
 
     #[test]
     fn close_without_a_reason_records_the_default() {
-        let mut s = Session::new(None);
+        let mut s = new_session(None);
         s.close(None);
         let last = s.events(2).pop().expect("run_finished");
         assert_eq!(last["reason"], json!(DEFAULT_CLOSE_REASON));
@@ -299,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_closed_session_rejects_writes_but_keeps_serving_reads() {
-        let mut s = Session::new(Some(10));
+        let mut s = new_session(Some(10));
         s.append(obj(json!({ "kind": "note" }))).expect("append");
         s.spend(4).expect("spend");
         s.close(None);
@@ -319,8 +345,8 @@ mod tests {
 
     #[test]
     fn two_sessions_share_nothing() {
-        let mut a = Session::new(Some(100));
-        let mut b = Session::new(Some(100));
+        let mut a = new_session(Some(100));
+        let mut b = new_session(Some(100));
         assert_ne!(a.id(), b.id());
 
         a.append(obj(json!({ "kind": "only_in_a" })))
@@ -338,11 +364,10 @@ mod tests {
 
     #[test]
     fn view_serves_the_named_projections_and_rejects_anything_else() {
-        let mut s = Session::new(None);
+        let mut s = new_session(None);
         s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
             .expect("append");
-        // Through the kernel: a call this run made and was charged for.
-        s.record_model_response(&result(9)).expect("recorded");
+        s.append(response(9)).expect("recorded");
 
         let usage = s.view(VIEW_USAGE, None).expect("usage");
         assert_eq!(usage["input_tokens"], json!(9));
@@ -368,93 +393,45 @@ mod tests {
     /// it builds it from `events` rather than asking the kernel for it.
     #[test]
     fn the_conversation_is_not_a_named_view() {
-        let mut s = Session::new(None);
+        let mut s = new_session(None);
         s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
             .expect("append");
 
         let err = s.view("dialogue", None).expect_err("dialogue was served");
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
-        // What it used to fold is in the record, in seq order.
         let events = s.events(0);
         assert_eq!(kind_of(&events[1]), "msg_user");
         assert_eq!(events[1]["content"], json!("hi"));
     }
 
-    /// A caller may append the kinds the kernel also writes — this is how
-    /// an earlier conversation is carried in — and doing so moves nothing
-    /// the kernel accounts for: not the usage totals, not the charge, not
-    /// the turn the next call takes.
+    /// Appending a `model_response` is the recorded, numbered, charged
+    /// call: the kernel stamps the turn, the usage view counts it, and the
+    /// budget is charged — all through the one write path, whoever appended
+    /// it, because a session holds only its own events.
     #[test]
-    fn a_carried_over_response_joins_the_record_and_not_the_account() {
-        let mut s = Session::new(Some(100));
-        s.append(obj(
-            json!({ "kind": "msg_user", "content": "asked before" }),
-        ))
-        .expect("the caller's own fact");
-        s.append(obj(json!({
-            "kind": "model_response", "turn": 1,
-            "content": [{ "type": "text", "text": "answered before" }],
-            "usage": { "input_tokens": 9_000, "output_tokens": 9_000 }
-        })))
-        .expect("a response from an earlier run");
+    fn appending_a_model_response_numbers_charges_and_counts_it() {
+        let mut s = new_session(Some(100));
+        let seq = s
+            .append(obj(json!({
+                "kind": "model_response",
+                // A turn the caller supplied is ignored: the kernel owns it.
+                "turn": 99,
+                "content": [{ "type": "text", "text": "hi" }],
+                "usage": { "input_tokens": 20, "output_tokens": 10 }
+            })))
+            .expect("append");
 
-        // It is in the record, verbatim, which is what it was appended
-        // for: the shell reads it back when it builds the next request.
-        let events = s.events(0);
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert_eq!(kind_of(&events[2]), "model_response");
-        assert_eq!(
-            events[2]["content"],
-            json!([{ "type": "text", "text": "answered before" }])
-        );
-        assert_eq!(author_of(&events[2]), AUTHOR_CALLER);
+        let recorded = s.events(seq).pop().expect("model_response");
+        assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
+        assert_eq!(recorded[FIELD_TURN], json!(1), "the kernel numbered it 1");
 
-        // And it is invisible to everything that has to agree with the
-        // budget: no call counted, no tokens summed, nothing charged.
-        let usage = s.view(VIEW_USAGE, None).expect("usage");
-        assert_eq!(usage["model_calls"], json!(0));
-        assert_eq!(usage["input_tokens"], json!(0));
-        assert_eq!(s.remaining(), Some(100));
-        assert_eq!(s.turns(), 0, "an appended turn field is payload");
-        assert_eq!(s.next_turn(), 1);
-
-        // The first real call is turn 1, and it is the one that shows up.
-        // What the budget lost and what the view reports are the same
-        // number, which is the property the author key exists to keep:
-        // both are folds over the kernel's events, so the caller's 18000
-        // tokens are absent from each of them.
-        let outcome = s.record_model_response(&result(30)).expect("recorded");
-        assert_eq!(outcome.turn, 1);
+        assert_eq!(s.turns(), 1);
+        assert_eq!(s.remaining(), Some(70), "20 + 10 charged");
         let usage = s.view(VIEW_USAGE, None).expect("usage");
         assert_eq!(usage["model_calls"], json!(1));
-        assert_eq!(usage["input_tokens"], json!(30));
-        assert_eq!(s.remaining(), Some(70));
-        assert_eq!(100 - s.remaining().expect("a budget"), 30, "spent");
-    }
-
-    /// Whatever the payload claims, the author is the path: an event a
-    /// caller appended reads back as `caller`, and only the kernel's own
-    /// writes read back as `kernel`.
-    #[test]
-    fn the_author_stamp_cannot_be_supplied_by_the_caller() {
-        let mut s = Session::new(None);
-        s.append(obj(json!({
-            "kind": "model_response", "turn": 1, "content": [], "usage": {},
-            "author": "kernel"
-        })))
-        .expect("append");
-        s.record_model_response(&result(1)).expect("recorded");
-
-        let events = s.events(0);
-        assert_eq!(author_of(&events[0]), AUTHOR_KERNEL, "run_started");
-        assert_eq!(author_of(&events[1]), AUTHOR_CALLER, "{}", events[1]);
-        assert_eq!(author_of(&events[2]), AUTHOR_KERNEL, "{}", events[2]);
-        assert_eq!(
-            s.view(VIEW_USAGE, None).expect("usage")["model_calls"],
-            json!(1),
-            "the claimed author was believed"
-        );
+        assert_eq!(usage["input_tokens"], json!(20));
+        assert_eq!(usage["output_tokens"], json!(10));
     }
 
     /// The run scope is the flag, so a `run_finished` a caller writes is a
@@ -462,7 +439,7 @@ mod tests {
     /// keeps taking writes.
     #[test]
     fn an_appended_run_finished_records_a_fact_without_ending_the_run() {
-        let mut s = Session::new(Some(100));
+        let mut s = new_session(Some(100));
         s.append(obj(
             json!({ "kind": "run_finished", "reason": "carried over" }),
         ))
@@ -478,7 +455,6 @@ mod tests {
         assert!(s.is_closed());
         let last = s.events(0).pop().expect("run_finished");
         assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
-        assert_eq!(author_of(&last), AUTHOR_KERNEL);
         assert_eq!(last["reason"], json!("done"));
         assert_eq!(
             s.append(obj(json!({ "kind": "note" })))
@@ -490,14 +466,13 @@ mod tests {
 
     #[test]
     fn a_recorded_response_is_in_the_history_before_it_is_charged() {
-        let mut s = Session::new(Some(100));
-        let outcome = s.record_model_response(&result(30)).expect("recorded");
+        let mut s = new_session(Some(100));
+        s.append(response(30)).expect("recorded");
 
-        assert_eq!(outcome.turn, 1);
-        assert_eq!(outcome.remaining, Some(70));
-        assert!(!outcome.exhausted);
+        assert_eq!(s.turns(), 1);
+        assert_eq!(s.remaining(), Some(70));
+        assert!(!s.exhausted());
 
-        // The record says the same thing the outcome does.
         let recorded = s.events(2).pop().expect("model_response");
         assert_eq!(kind_of(&recorded), "model_response");
         assert_eq!(recorded[FIELD_TURN], json!(1));
@@ -507,40 +482,32 @@ mod tests {
     }
 
     #[test]
-    fn turns_are_numbered_by_the_kernel_and_a_failure_takes_no_number() {
-        let mut s = Session::new(None);
+    fn turns_are_numbered_by_the_kernel_over_the_recorded_responses() {
+        let mut s = new_session(None);
         assert_eq!(s.next_turn(), 1);
 
-        assert_eq!(s.record_model_response(&result(1)).expect("first").turn, 1);
-        assert!(s.record_model_call_failure("backend: boom"), "recorded");
-        assert_eq!(s.turns(), 1, "a failure must not advance the counter");
-        assert_eq!(s.next_turn(), 2);
-        assert_eq!(s.record_model_response(&result(1)).expect("second").turn, 2);
-        assert_eq!(s.record_model_response(&result(1)).expect("third").turn, 3);
+        s.append(response(1)).expect("first");
+        assert_eq!(s.turns(), 1);
 
-        // The note names the turn the retry then took.
-        let noted = s
-            .events(0)
-            .into_iter()
-            .find(|e| kind_of(e) == "model_call_failed")
-            .expect("model_call_failed");
-        assert_eq!(noted[FIELD_TURN], json!(2));
-        assert_eq!(noted["error"], json!("backend: boom"));
+        // An open-kind event between responses does not advance the counter.
+        s.append(obj(json!({ "kind": "model_call_failed", "turn": 2, "error": "boom" })))
+            .expect("note");
+        assert_eq!(s.turns(), 1, "a non-response must not advance the counter");
+        assert_eq!(s.next_turn(), 2);
+
+        s.append(response(1)).expect("second");
+        assert_eq!(s.turns(), 2);
+        s.append(response(1)).expect("third");
+        assert_eq!(s.turns(), 3);
     }
 
     #[test]
-    fn a_closed_session_records_neither_a_response_nor_a_failure() {
-        let mut s = Session::new(Some(100));
+    fn a_closed_session_records_nothing() {
+        let mut s = new_session(Some(100));
         s.close(None);
 
-        let err = s
-            .record_model_response(&result(10))
-            .expect_err("closed session");
+        let err = s.append(response(10)).expect_err("closed session");
         assert_eq!(err.reason(), "session is closed");
-        assert!(
-            !s.record_model_call_failure("backend: boom"),
-            "a closed run cannot take the note either"
-        );
 
         assert_eq!(s.len(), 2, "run_started + run_finished only");
         assert_eq!(s.remaining(), Some(100), "nothing was charged");
@@ -549,31 +516,31 @@ mod tests {
 
     #[test]
     fn the_budget_is_only_a_flag_when_a_call_uses_it_up() {
-        let mut s = Session::new(Some(10));
-        let outcome = s.record_model_response(&result(25)).expect("recorded");
-        assert_eq!(outcome.remaining, Some(0), "the charge floors at zero");
-        assert!(outcome.exhausted, "the flag is set");
+        let mut s = new_session(Some(10));
+        s.append(response(25)).expect("recorded");
+        assert_eq!(s.remaining(), Some(0), "the charge floors at zero");
+        assert!(s.exhausted(), "the flag is set");
 
         // Exhausted does not stop the kernel: the next call is recorded
         // and charged too.  Stopping is the caller's decision.
-        let outcome = s.record_model_response(&result(5)).expect("recorded");
-        assert_eq!(outcome.turn, 2);
-        assert!(outcome.exhausted);
+        s.append(response(5)).expect("recorded");
+        assert_eq!(s.turns(), 2);
+        assert!(s.exhausted());
         assert_eq!(s.len(), 3);
     }
 
     #[test]
     fn without_a_budget_a_call_reports_no_remaining_and_is_never_exhausted() {
-        let mut s = Session::new(None);
-        let outcome = s.record_model_response(&result(9_000)).expect("recorded");
-        assert_eq!(outcome.remaining, None);
-        assert!(!outcome.exhausted);
+        let mut s = new_session(None);
+        s.append(response(9_000)).expect("recorded");
+        assert_eq!(s.remaining(), None);
+        assert!(!s.exhausted());
     }
 
     #[test]
     fn views_stay_readable_and_correct_after_close() {
-        let mut s = Session::new(None);
-        s.record_model_response(&result(9)).expect("recorded");
+        let mut s = new_session(None);
+        s.append(response(9)).expect("recorded");
         let before = s.view(VIEW_USAGE, None).expect("usage");
         s.close(None);
         let after = s.view(VIEW_USAGE, None).expect("usage after close");
@@ -585,7 +552,6 @@ mod tests {
         assert_eq!(before["at_seq"], json!(2));
         assert_eq!(after["at_seq"], json!(3));
 
-        // The record is readable too, close and all.
         assert_eq!(s.len(), 3);
         assert_eq!(kind_of(&s.events(0)[2]), KIND_RUN_FINISHED);
     }

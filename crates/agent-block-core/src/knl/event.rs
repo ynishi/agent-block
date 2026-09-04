@@ -3,28 +3,27 @@
 //! # Envelope
 //!
 //! Every stored event is a JSON object carrying the kernel-owned fields
-//! [`FIELD_SEQ`] (`u64`, starts at 1, strictly increasing),
-//! [`FIELD_EPOCH_MS`] (`u64`, wall clock at append time) and
-//! [`FIELD_AUTHOR`] ([`AUTHOR_KERNEL`] or [`AUTHOR_CALLER`]) plus the
-//! caller-owned [`FIELD_KIND`] (string) and an arbitrary payload.  The
-//! three kernel-owned fields are stamped by [`stamp`] and overwrite any
+//! [`FIELD_SEQ`] (`u64`, starts at 1, strictly increasing) and
+//! [`FIELD_EPOCH_MS`] (`u64`, wall clock at append time), plus the
+//! caller-owned [`FIELD_KIND`] (string) and an arbitrary payload.  The two
+//! kernel-owned fields are stamped by [`stamp`] and overwrite any
 //! caller-supplied field of the same name.
 //!
-//! # `author` — where the event came from
+//! # No per-event author
 //!
-//! `author` records whether an event is the outcome of a kernel command
-//! or a fact the caller brought along.  It is not forgeable, for the same
-//! reason `seq` is not: [`stamp`] writes it from the path the append took
-//! rather than from the payload, so a caller that supplies
-//! `author = "kernel"` gets `"caller"` anyway.
+//! There is no `author` on an event, and no "kernel vs caller" tag.  A
+//! session holds only its own events, so who "owns" them is not a per-event
+//! question: ownership is a session-level `owner` (a real principal id, or
+//! the reserved `anon` / `system` id), total and read by the policy layer
+//! above the kernel — see [`super::Session`].  The earlier design inferred
+//! ownership from which append path was taken, which made a response the
+//! kernel recorded read back as the caller's and fall out of the account
+//! (the `usage = 0` bug); that mechanism is gone.
 //!
-//! It is also the key the accounting reads.  The budget charge, the
-//! `usage` view and the turn numbering fold over `kernel` events only, so
-//! what a caller appends cannot alter the run's account of itself — and
-//! because that is guarded by the right key, no kind has to be withheld
-//! from a caller to keep it true.  A `model_response` carried over from
-//! an earlier conversation is an ordinary append: it is in the record for
-//! whoever reads the events back, and the usage view never sees it.
+//! Because a session's log is exactly the calls it made, the accounting
+//! keys on the `kind` alone: [`super::projection::UsageFold`] counts every
+//! `model_response` in the session, and the budget charge sums the same
+//! usage.  A `model_response` in the history is one this run made.
 //!
 //! # Two layers of `kind`
 //!
@@ -41,14 +40,15 @@
 //! | `run_started`    | — (appended by the kernel when a session opens)        |
 //! | `run_finished`   | `reason: string` (appended by the kernel on close)    |
 //! | `msg_user`       | `content: string \| array`                            |
-//! | `model_response` | `turn: integer`, `content: array`, `usage: table`     |
+//! | `model_response` | `content: array`, `usage: table` (`turn` is kernel-assigned) |
 //! | `tool_call`      | `turn: integer`, `call_id: string`, `name: string`, `args: table` |
 //! | `tool_result`    | `turn: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
 //!
-//! Every reserved kind is appendable by either author: the kernel writes
-//! `run_started` / `run_finished` / `model_response` on its own paths,
-//! and a caller may write any of the six as long as it meets the shape
-//! above.  What separates the two is the `author` stamp, not the kind.
+//! `model_response` does not require a caller-supplied `turn`: the kernel
+//! numbers it from its own count of the responses recorded (like `seq`), so
+//! the number cannot be forged or restarted by a loop.  `tool_call` /
+//! `tool_result` keep their `turn` field — they reference the model call's
+//! turn, which the shell learns after the response is appended and supplies.
 //!
 //! The literal request/response bytes are not stored: they are derivable
 //! from these facts by a projection, and byte-level fidelity is the dump
@@ -64,41 +64,8 @@ use super::{KnlError, KnlResult};
 pub const FIELD_SEQ: &str = "seq";
 /// Kernel-owned event field: wall-clock append time in milliseconds.
 pub const FIELD_EPOCH_MS: &str = "epoch_ms";
-/// Kernel-owned event field: which side put the event in the history.
-pub const FIELD_AUTHOR: &str = "author";
 /// Caller-owned event field that every event must carry.
 pub const FIELD_KIND: &str = "kind";
-
-/// [`FIELD_AUTHOR`] of an event the kernel produced.
-pub const AUTHOR_KERNEL: &str = "kernel";
-/// [`FIELD_AUTHOR`] of an event a caller brought.
-pub const AUTHOR_CALLER: &str = "caller";
-
-/// Which side an event came from.
-///
-/// Chosen by the append path, never read from the payload: a caller
-/// reaches the history through one entry point and the kernel through
-/// another, and [`stamp`] records which one was taken.  Derivations that
-/// must not be moved by a caller — the budget charge, the `usage` view,
-/// the turn numbering — filter on this rather than on [`FIELD_KIND`],
-/// which is why the kind vocabulary can stay open to both sides.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Author {
-    /// The kernel wrote it (a run boundary, or a call it recorded).
-    Kernel,
-    /// A caller appended it.
-    Caller,
-}
-
-impl Author {
-    /// The value stamped into [`FIELD_AUTHOR`].
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Author::Kernel => AUTHOR_KERNEL,
-            Author::Caller => AUTHOR_CALLER,
-        }
-    }
-}
 
 /// Reserved kind: a run opened (appended by the kernel).
 pub const KIND_RUN_STARTED: &str = "run_started";
@@ -116,7 +83,8 @@ pub const KIND_TOOL_RESULT: &str = "tool_result";
 /// Payload field of `run_finished`.
 pub const FIELD_REASON: &str = "reason";
 /// Payload field of `model_response` / `tool_call` / `tool_result`: which
-/// model call the fact belongs to.
+/// model call the fact belongs to.  On a `model_response` the kernel
+/// assigns it; on `tool_call` / `tool_result` the shell supplies it.
 pub const FIELD_TURN: &str = "turn";
 /// Payload field of `msg_user` / `model_response`.
 pub const FIELD_CONTENT: &str = "content";
@@ -181,11 +149,11 @@ const RUN_FINISHED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
 /// Required fields of `msg_user`.
 const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
 /// Required fields of `model_response`.
-const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] = &[
-    (FIELD_TURN, Shape::Integer),
-    (FIELD_CONTENT, Shape::Array),
-    (FIELD_USAGE, Shape::Object),
-];
+///
+/// `turn` is not among them: the kernel assigns it on append, so a caller
+/// does not have to supply it and cannot renumber the run by doing so.
+const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] =
+    &[(FIELD_CONTENT, Shape::Array), (FIELD_USAGE, Shape::Object)];
 /// Required fields of `tool_call`.
 const TOOL_CALL_FIELDS: &[(&str, Shape)] = &[
     (FIELD_TURN, Shape::Integer),
@@ -288,13 +256,11 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
 
 /// Stamp the kernel-owned envelope fields, overwriting caller values.
 ///
-/// `author` comes from the call site — the append path the event took —
-/// so it is as much the kernel's to assign as `seq` is, and just as
-/// immune to what the payload claims.
-pub fn stamp(obj: &mut Map<String, Value>, seq: u64, epoch_ms: u64, author: Author) {
+/// `seq` and `epoch_ms` are the kernel's to assign, so a payload that
+/// carries either gets the kernel's value instead.
+pub fn stamp(obj: &mut Map<String, Value>, seq: u64, epoch_ms: u64) {
     obj.insert(FIELD_SEQ.to_string(), Value::from(seq));
     obj.insert(FIELD_EPOCH_MS.to_string(), Value::from(epoch_ms));
-    obj.insert(FIELD_AUTHOR.to_string(), Value::from(author.as_str()));
 }
 
 /// The `seq` of a stored event (`0` when absent, which cannot happen for
@@ -303,30 +269,12 @@ pub fn seq_of(event: &Value) -> u64 {
     event.get(FIELD_SEQ).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// The `author` of a stored event (empty when absent, which cannot happen
-/// for an event that went through [`stamp`]).
-pub fn author_of(event: &Value) -> &str {
-    event
-        .get(FIELD_AUTHOR)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-}
-
-/// Whether the kernel wrote this event.
-///
-/// The predicate the accounting folds are built on: `usage`, the charge
-/// it must agree with, and the turn count all read the events this
-/// returns `true` for and no others.
-pub fn is_kernel_authored(event: &Value) -> bool {
-    author_of(event) == AUTHOR_KERNEL
-}
-
 /// The `kind` of a stored event (empty when absent).
 pub fn kind_of(event: &Value) -> &str {
     event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Build a kernel-authored event with `kind` set.
+/// Build an event with `kind` set, for the kernel's own reserved writes.
 pub fn kernel_event(kind: &str) -> Map<String, Value> {
     let mut obj = Map::new();
     obj.insert(FIELD_KIND.to_string(), Value::String(kind.to_string()));
@@ -383,6 +331,13 @@ mod tests {
             json!({ "kind": "run_finished", "reason": "closed" }),
             json!({ "kind": "msg_user", "content": "hi" }),
             json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "hi" }] }),
+            // A model_response with no turn is valid: the kernel assigns it.
+            json!({
+                "kind": "model_response",
+                "content": [{ "type": "text", "text": "ok" }],
+                "usage": { "input_tokens": 3 }
+            }),
+            // …and one that carries a turn is valid too (an extra field).
             json!({
                 "kind": "model_response",
                 "turn": 1,
@@ -417,7 +372,6 @@ mod tests {
 
         let err = validate_event(&obj(json!({
             "kind": "model_response",
-            "turn": 1,
             "content": []
         })))
         .expect_err("usage is required");
@@ -434,6 +388,17 @@ mod tests {
     }
 
     #[test]
+    fn model_response_does_not_require_a_turn() {
+        // No turn field at all is fine — the kernel numbers it on append.
+        validate_event(&obj(json!({
+            "kind": "model_response",
+            "content": [],
+            "usage": {}
+        })))
+        .expect("turn is kernel-assigned, not caller-required");
+    }
+
+    #[test]
     fn reserved_kinds_reject_a_mistyped_required_field() {
         let err = validate_event(&obj(json!({ "kind": "run_finished", "reason": 7 })))
             .expect_err("reason must be a string");
@@ -442,7 +407,6 @@ mod tests {
 
         let err = validate_event(&obj(json!({
             "kind": "model_response",
-            "turn": 1,
             "content": "not blocks",
             "usage": {}
         })))
@@ -477,14 +441,15 @@ mod tests {
 
     #[test]
     fn whole_floats_count_as_integers() {
-        // Lua numbers arrive as floats when they are written `1.0`.
+        // Lua numbers arrive as floats when they are written `1.0`.  A
+        // tool_call's turn is a caller-supplied integer.
         validate_event(&obj(json!({
-            "kind": "model_response", "turn": 1.0, "content": [], "usage": {}
+            "kind": "tool_call", "turn": 1.0, "call_id": "c", "name": "sh", "args": {}
         })))
         .expect("1.0 is a whole number");
 
         let err = validate_event(&obj(json!({
-            "kind": "model_response", "turn": 1.5, "content": [], "usage": {}
+            "kind": "tool_call", "turn": 1.5, "call_id": "c", "name": "sh", "args": {}
         })))
         .expect_err("1.5 is not whole");
         assert!(err.reason().contains("whole number"), "{err}");
@@ -493,58 +458,14 @@ mod tests {
     #[test]
     fn stamp_overwrites_caller_supplied_envelope_fields() {
         let mut event = obj(json!({
-            "kind": "note", "seq": 999, "epoch_ms": 1, "author": "kernel"
+            "kind": "note", "seq": 999, "epoch_ms": 1
         }));
-        stamp(&mut event, 7, 12_345, Author::Caller);
+        stamp(&mut event, 7, 12_345);
         assert_eq!(event.get(FIELD_SEQ).and_then(Value::as_u64), Some(7));
         assert_eq!(
             event.get(FIELD_EPOCH_MS).and_then(Value::as_u64),
             Some(12_345)
         );
-        assert_eq!(
-            event.get(FIELD_AUTHOR).and_then(Value::as_str),
-            Some(AUTHOR_CALLER),
-            "the payload claimed an author it does not get to choose"
-        );
-    }
-
-    /// The stamp names the path, not the payload: the same event object
-    /// is `kernel` or `caller` depending only on which side stamped it.
-    #[test]
-    fn the_author_is_the_path_the_append_took() {
-        let claim = json!({
-            "kind": "model_response", "turn": 1, "content": [], "usage": {},
-            "author": "kernel"
-        });
-
-        let mut as_caller = obj(claim.clone());
-        stamp(&mut as_caller, 1, 0, Author::Caller);
-        let as_caller = Value::Object(as_caller);
-        assert_eq!(author_of(&as_caller), AUTHOR_CALLER);
-        assert!(!is_kernel_authored(&as_caller));
-
-        let mut as_kernel = obj(claim);
-        stamp(&mut as_kernel, 1, 0, Author::Kernel);
-        let as_kernel = Value::Object(as_kernel);
-        assert_eq!(author_of(&as_kernel), AUTHOR_KERNEL);
-        assert!(is_kernel_authored(&as_kernel));
-    }
-
-    /// An event that never went through [`stamp`] is nobody's: reading it
-    /// answers "not the kernel's", which is the safe side for a fold that
-    /// only ever adds up what the kernel wrote.
-    #[test]
-    fn an_unstamped_event_is_not_kernel_authored() {
-        let event = json!({ "kind": "model_response", "author": 7 });
-        assert_eq!(author_of(&event), "");
-        assert!(!is_kernel_authored(&event));
-        assert!(!is_kernel_authored(&json!({ "kind": "model_response" })));
-    }
-
-    #[test]
-    fn the_two_authors_render_as_the_documented_strings() {
-        assert_eq!(Author::Kernel.as_str(), "kernel");
-        assert_eq!(Author::Caller.as_str(), "caller");
     }
 
     #[test]
@@ -565,15 +486,17 @@ mod tests {
     }
 
     /// Validation is about shape only: the kinds the kernel writes for
-    /// itself are as acceptable from a caller as any other, which is what
-    /// makes `author` — and not the kind — the thing the accounting reads.
+    /// itself are as acceptable from a caller as any other.  What keeps a
+    /// caller from moving the account is not the validator — it is that a
+    /// session holds only its own events, so the fold has nothing foreign
+    /// to count.
     #[test]
     fn the_kinds_the_kernel_writes_are_valid_from_either_side() {
         for event in [
             json!({ "kind": "run_started" }),
             json!({ "kind": "run_finished", "reason": "carried over" }),
             json!({
-                "kind": "model_response", "turn": 4,
+                "kind": "model_response",
                 "content": [{ "type": "text", "text": "said last time" }],
                 "usage": { "input_tokens": 9_000 }
             }),

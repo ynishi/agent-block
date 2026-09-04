@@ -1,28 +1,28 @@
--- scope_spec.lua — mlua-lspec unit tests for the scope-handle model of the
--- Lua kernel (knl.open / knl.usage + scope-keyed turn numbering).
+-- scope_spec.lua — mlua-lspec unit tests for the session-scope model of the
+-- Lua kernel (knl.open + kernel-assigned turn numbering via ctx:append).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/scope_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
--- What this proves (scope-design.md §6 POC checklist):
---   1 turn's model_response counts under its scope — the old usage=0
---     divergence is gone (and the author-keyed view still scores it 0,
---     which is the bug the scope model replaces).
---   2 turn numbering is scope-keyed: two successive responses are 1 then 2.
---   3 every event written through the handle carries the handle's scope.
---   4 a carried-over model_response (foreign scope) is excluded from usage
---     and is NOT re-stamped (lineage, §4).
---   5 one model response with two tool_use blocks: both tool_call/tool_result
---     pairs share the response's turn number.
+-- What this proves (scope-design.md rev 3 checklist, pure-VM half):
+--   1 appending a model_response is counted by usage and gets a kernel turn
+--     (the old usage=0 divergence, and the per-event scope stamp, are both
+--     gone — the kernel numbers/charges/counts by kind).
+--   2 turn numbering is kernel-owned: two successive responses are 1 then 2.
+--   3 one model response with two tool_use blocks: both tool_call/tool_result
+--     pairs share the response's kernel-assigned turn.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
--- a faithful Lua fake stands in below. It reproduces the one fact the model
--- rests on: `append` overwrites the kernel-owned seq/epoch_ms/author and
--- passes every other field (scope included) through untouched — exactly
--- what crates/agent-block-core/src/bridge/knl.rs does. It also serves an
--- author-keyed view("usage"), the Rust view the scope projection replaces,
--- so the divergence and its fix can be shown side by side.
+-- a faithful Lua fake stands in below. It reproduces the facts the model
+-- rests on, mirroring crates/agent-block-core/src/bridge/knl.rs:
+--   * append overwrites the kernel-owned seq/epoch_ms and passes every other
+--     field through untouched (there is no author field);
+--   * appending a model_response assigns the turn (turns + 1), charges the
+--     usage, and advances the counter — read back with s:turns();
+--   * view("usage") counts every model_response in the session.
+-- The e2e coverage against the *real* bridge lives in
+-- crates/agent-block/tests/fixtures/knl_turn_test.lua.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -33,15 +33,36 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 
 local uuid_counter = 0
 
+local COUNTERS = { "input_tokens", "output_tokens", "thinking_tokens" }
+
+local function charge_of(usage)
+    if type(usage) ~= "table" then
+        return 0
+    end
+    local total = 0
+    for _, counter in ipairs(COUNTERS) do
+        local n = usage[counter]
+        if type(n) == "number" then
+            total = total + n
+        end
+    end
+    if total < 0 then
+        total = 0
+    end
+    return total
+end
+
 local function fake_session(opts)
     opts = opts or {}
+    local owner = opts.owner or "anon"
     local budget = opts.budget and opts.budget.tokens or nil
     uuid_counter = uuid_counter + 1
-    local id = string.format("scope-%08d-0000-4000-8000-000000000000", uuid_counter)
+    local id = string.format("sess-%08d-0000-4000-8000-000000000000", uuid_counter)
     local events = {}
     local seq = 0
     local remaining = budget
     local closed = false
+    local turns = 0
 
     local function deep_copy(v)
         if type(v) ~= "table" then
@@ -54,19 +75,18 @@ local function fake_session(opts)
         return out
     end
 
-    -- Kernel-owned seq/epoch_ms/author overwrite any caller value; every
-    -- other field (scope included) passes through — mirrors the Rust bridge.
-    local function store(event, author)
+    -- Kernel-owned seq/epoch_ms overwrite any caller value; every other
+    -- field passes through. There is no author.
+    local function store(event)
         seq = seq + 1
         local rec = deep_copy(event)
         rec.seq = seq
         rec.epoch_ms = 1000 + seq
-        rec.author = author
         events[#events + 1] = rec
         return seq
     end
 
-    store({ kind = "run_started" }, "kernel")
+    store({ kind = "run_started" })
 
     local s = {}
 
@@ -74,13 +94,31 @@ local function fake_session(opts)
         return id
     end
 
-    -- The write path via the userdata method: author is "caller" (stamped
-    -- from the path), scope and the rest pass through.
+    function s:owner()
+        return owner
+    end
+
+    -- The one write path. A model_response is numbered, charged and counted
+    -- here (mirrors the Rust Session::append).
     function s:append(event)
         assert(not closed, "knl: append: session is closed")
         assert(type(event) == "table", "knl: append: event must be a table")
         assert(type(event.kind) == "string", "knl: append: kind is required")
-        return store(event, "caller")
+        if event.kind == "model_response" then
+            turns = turns + 1
+            local rec = deep_copy(event)
+            rec.turn = turns -- kernel-owned, overwrites any caller value
+            local charged = charge_of(rec.usage)
+            if remaining ~= nil then
+                remaining = math.max(0, remaining - charged)
+            end
+            return store(rec)
+        end
+        return store(event)
+    end
+
+    function s:turns()
+        return turns
     end
 
     function s:events(from)
@@ -117,20 +155,27 @@ local function fake_session(opts)
 
     function s:close(reason)
         if not closed then
-            store({ kind = "run_finished", reason = reason or "closed" }, "kernel")
+            store({ kind = "run_finished", reason = reason or "closed" })
             closed = true
         end
     end
 
-    -- Author-keyed usage: the Rust view("usage") the scope model replaces.
-    -- Counts only kernel-authored model_responses, so a handle-written
-    -- response (author="caller") scores 0 here — the confused-deputy bug.
+    -- Usage counts every model_response in the session (kind-keyed, no
+    -- author) — the Rust view("usage") under the new model.
     function s:view(name)
         assert(name == "usage", "knl: view: unknown view")
         local u = { input_tokens = 0, output_tokens = 0, thinking_tokens = 0, model_calls = 0 }
         for _, e in ipairs(events) do
-            if e.kind == "model_response" and e.author == "kernel" then
+            if e.kind == "model_response" then
                 u.model_calls = u.model_calls + 1
+                if type(e.usage) == "table" then
+                    for _, counter in ipairs(COUNTERS) do
+                        local n = e.usage[counter]
+                        if type(n) == "number" then
+                            u[counter] = u[counter] + n
+                        end
+                    end
+                end
             end
         end
         return u
@@ -139,8 +184,9 @@ local function fake_session(opts)
     return s
 end
 
--- Global the module captures as `local syscall = knl` at load time.
-knl = { session = fake_session }
+-- Global the module captures as `local syscall = knl` at load time. Both
+-- names resolve to the same constructor, as the Rust bridge registers them.
+knl = { open = fake_session, session = fake_session }
 
 local kernel = require("knl")
 local Outcome = kernel.Outcome
@@ -149,8 +195,6 @@ local Outcome = kernel.Outcome
 -- Backend / event helpers
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- A backend stub handing back queued responses (a queued function is called
--- with the request instead).
 local function stub(...)
     local queue = { ... }
     return function(req)
@@ -177,10 +221,10 @@ local function tool_use(id, name, input)
 end
 
 -- Every model_response's turn number, in seq order.
-local function response_turns(h, scope)
+local function response_turns(h)
     local turns = {}
     for _, ev in ipairs(h:events()) do
-        if ev.kind == "model_response" and (scope == nil or ev.scope == scope) then
+        if ev.kind == "model_response" then
             turns[#turns + 1] = ev.turn
         end
     end
@@ -191,9 +235,10 @@ end
 -- Tests
 -- ─────────────────────────────────────────────────────────────────────────────
 
-describe("knl scope handle", function()
-    it("counts turn's model_response under its own scope (the usage=0 divergence is gone)", function()
-        local h = kernel.open({ budget = { tokens = 100 } })
+describe("knl turn (session-scope model)", function()
+    it("counts a turn's model_response in usage and gives it a kernel turn", function()
+        local h = kernel.open({ owner = "test", budget = { tokens = 100 } })
+        expect(h:owner()).to.equal("test")
         h:append({ kind = "msg_user", content = "hi" })
 
         local o = kernel.turn({
@@ -204,20 +249,19 @@ describe("knl scope handle", function()
             })),
         })
         expect(Outcome.is_ok(o)).to.equal(true)
+        expect(o.out.turn).to.equal(1)
 
-        local u = kernel.usage(h)
+        local u = h:view("usage")
         expect(u.model_calls).to.equal(1)
         expect(u.input_tokens).to.equal(10)
         expect(u.output_tokens).to.equal(3)
 
-        -- The divergence, made concrete: the author-keyed view (what the Rust
-        -- view("usage") does) scores the very same response 0, because turn
-        -- wrote it through the plain path and it reads back author="caller".
-        -- Keying on scope is what makes the count right.
-        expect(h.ctx:view("usage").model_calls).to.equal(0)
+        -- Charged: the append deducted the usage from the budget.
+        expect(h:remaining()).to.equal(87)
+        expect(h:turns()).to.equal(1)
     end)
 
-    it("numbers successive turns 1 then 2 (scope-keyed)", function()
+    it("numbers successive turns 1 then 2 (kernel-owned)", function()
         local h = kernel.open({ budget = { tokens = 1000 } })
 
         kernel.turn({ ctx = h, backend = stub(response("ok")) })
@@ -227,77 +271,6 @@ describe("knl scope handle", function()
         expect(#turns).to.equal(2)
         expect(turns[1]).to.equal(1)
         expect(turns[2]).to.equal(2)
-    end)
-
-    it("stamps every event written through the handle with the handle's scope", function()
-        local h = kernel.open({ budget = { tokens = 100 } })
-        h:append({ kind = "msg_user", content = "hi" })
-
-        kernel.turn({
-            ctx = h,
-            backend = stub(response("ok", { tool_use("c1", "echo", { v = 1 }) })),
-            tools = {
-                echo = {
-                    handler = function()
-                        return "r"
-                    end,
-                },
-            },
-        })
-
-        -- run_started / run_finished are the kernel's own writes (not through
-        -- the handle). Everything the handle wrote — msg_user, request,
-        -- model_response, tool_call, tool_result — carries this scope.
-        local kernel_written = { run_started = true, run_finished = true }
-        local checked = 0
-        for _, ev in ipairs(h:events()) do
-            if not kernel_written[ev.kind] then
-                expect(ev.scope).to.equal(h.scope)
-                checked = checked + 1
-            end
-        end
-        expect(checked).to.equal(5)
-    end)
-
-    it("excludes a carried-over model_response (foreign scope) and does not re-stamp it", function()
-        local h = kernel.open({ budget = { tokens = 100 } })
-
-        -- A carried-over response keeping its origin scope (lineage, §4).
-        h:append({
-            kind = "model_response",
-            turn = 1,
-            content = { { type = "text", text = "from before" } },
-            usage = { input_tokens = 9000, output_tokens = 9000 },
-            scope = "other-scope-id",
-        })
-
-        -- One real turn under this scope.
-        kernel.turn({
-            ctx = h,
-            backend = stub(response("ok", nil, { input_tokens = 10, output_tokens = 3 })),
-        })
-
-        -- Only the real call counts; the carried 9000 tokens are not summed.
-        local u = kernel.usage(h)
-        expect(u.model_calls).to.equal(1)
-        expect(u.input_tokens).to.equal(10)
-
-        -- Lineage kept: the carried event still carries its origin scope,
-        -- un-re-stamped.
-        local carried
-        for _, ev in ipairs(h:events()) do
-            if ev.kind == "model_response" and ev.scope == "other-scope-id" then
-                carried = ev
-            end
-        end
-        expect(carried ~= nil).to.equal(true)
-        expect(carried.scope).to.equal("other-scope-id")
-
-        -- And this scope's own response is numbered 1: the foreign one did
-        -- not advance the counter.
-        local mine_turns = response_turns(h, h.scope)
-        expect(#mine_turns).to.equal(1)
-        expect(mine_turns[1]).to.equal(1)
     end)
 
     it("shares one turn number across a response's tool_call/tool_result pairs", function()
