@@ -744,21 +744,23 @@ pub struct HostContext {
     pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
-    /// Shared SQLite connection for `sql.*` bridge (user tables).
+    /// Handle to the SQLite connection thread behind the `sql.*` bridge
+    /// (user tables).
+    ///
+    /// The connection itself lives on that thread and is never shared: a
+    /// statement is a closure sent to it, so no lock guard and no blocking
+    /// call crosses an `.await`. Cancelling a query is the isle's own
+    /// business — it holds the interrupt handle — which is why there is no
+    /// second field for one here.
     #[cfg(feature = "sqlite")]
-    pub sql_conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Interrupt handle for the sql connection.
-    /// Used to cancel in-flight queries on timeout (see `bridge/sql.rs`).
+    pub sql_isle: rusqlite_isle::AsyncIsle,
+    /// Handle to the SQLite connection thread behind the `kv.*` bridge
+    /// (`__kv` table only).
+    ///
+    /// A separate isle from `sql_isle`, so KV scratch state and user SQL data
+    /// do not share WAL, page cache, or backup lifecycle.
     #[cfg(feature = "sqlite")]
-    pub sql_interrupt: Arc<rusqlite::InterruptHandle>,
-    /// Shared SQLite connection for `kv.*` bridge (`__kv` table only).
-    /// Separate from sql_conn so KV scratch state and user SQL data don't
-    /// share WAL, page cache, or backup lifecycle.
-    #[cfg(feature = "sqlite")]
-    pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Interrupt handle for the kv connection.
-    #[cfg(feature = "sqlite")]
-    pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
+    pub kv_isle: rusqlite_isle::AsyncIsle,
     /// Shared SQLite connection for `ts.*` bridge (TSDB — time-series table).
     /// Separate DB file so TSDB WAL does not share page cache with kv/sql.
     #[cfg(feature = "sqlite")]
@@ -823,12 +825,33 @@ impl HostContext {
     }
 }
 
+/// Create the parent directory of a database file, unless the path names an
+/// in-memory database (which has no parent to create).
+///
+/// `label` names the database in the error (`sql` / `kv` / `ts`).
+#[cfg(feature = "sqlite")]
+fn prepare_sqlite_dir(path: &Path, label: &'static str) -> BlockResult<bool> {
+    let is_memory = crate::bridge::config::is_memory_sql(path);
+    if !is_memory {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BlockError::Runtime(format!("{label} dir create: {e}")))?;
+        }
+    }
+    Ok(is_memory)
+}
+
 /// Open a SQLite connection at `path` (or `:memory:`) and apply the shared
 /// pragmas driven by ENV (`journal_mode`, `busy_timeout`). Returns the
 /// connection wrapped in Arc<Mutex<_>> together with its interrupt handle.
 ///
-/// `label` is used only for the init log line (`sql` / `kv`) so that the two
-/// databases are distinguishable in tracing output.
+/// This is the `ts.*` bridge's form: it drives the connection itself, from
+/// Lua's synchronous side, so it wants the connection rather than a handle to
+/// a thread that owns one. `sql.*` and `kv.*` take
+/// [`open_sqlite_isle`] instead.
+///
+/// `label` is used only for the init log line so the databases are
+/// distinguishable in tracing output.
 #[cfg(feature = "sqlite")]
 fn open_sqlite(
     path: &Path,
@@ -837,13 +860,7 @@ fn open_sqlite(
     Arc<Mutex<rusqlite::Connection>>,
     Arc<rusqlite::InterruptHandle>,
 )> {
-    let is_memory = crate::bridge::config::is_memory_sql(path);
-    if !is_memory {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| BlockError::Runtime(format!("{label} dir create: {e}")))?;
-        }
-    }
+    let is_memory = prepare_sqlite_dir(path, label)?;
     let conn = rusqlite::Connection::open(path)
         .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", path.display())))?;
     if !is_memory {
@@ -858,6 +875,41 @@ fn open_sqlite(
     let interrupt = Arc::new(conn.get_interrupt_handle());
     let conn = Arc::new(Mutex::new(conn));
     Ok((conn, interrupt))
+}
+
+/// Open the SQLite database at `path` (or `:memory:`) on a connection thread
+/// of its own, and return the handle plus the driver that shuts it down.
+///
+/// The same ENV-driven pragmas [`open_sqlite`] applies are applied here — the
+/// busy timeout through the builder (which sets it before anything else runs)
+/// and `journal_mode` in the init closure, which runs on the connection thread
+/// before any job does. What changes is who owns the connection: the isle
+/// does, so `std.sql` / `std.kv` never take a lock and never block the Lua
+/// runtime waiting for SQLite.
+///
+/// The caller must keep the returned [`rusqlite_isle::AsyncIsleDriver`] and
+/// shut it down; dropping it alone does not stop the thread.
+#[cfg(feature = "sqlite")]
+async fn open_sqlite_isle(
+    path: &Path,
+    label: &'static str,
+) -> BlockResult<(rusqlite_isle::AsyncIsle, rusqlite_isle::AsyncIsleDriver)> {
+    let is_memory = prepare_sqlite_dir(path, label)?;
+    let busy = crate::bridge::config::sql_busy_timeout();
+    let journal = crate::bridge::config::sql_journal_mode();
+    let (isle, driver) = rusqlite_isle::AsyncIsle::builder()
+        .thread_name(label)
+        .busy_timeout(busy)
+        .spawn(path, move |conn| {
+            if !is_memory {
+                conn.pragma_update(None, "journal_mode", &journal)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", path.display())))?;
+    info!(label, path = %path.display(), busy_ms = busy.as_millis() as i64, "sqlite initialized");
+    Ok((isle, driver))
 }
 
 /// Build the init closure shared between the main Isle and the handler
@@ -1223,33 +1275,44 @@ async fn connect_mesh(
     Ok(Some(Arc::new(agent)))
 }
 
-/// The three SQLite connections (with interrupt handles) backing the
-/// `sql.*`, `kv.*`, and `ts.*` Lua bridges.
+/// The three SQLite databases backing the `sql.*`, `kv.*`, and `ts.*` Lua
+/// bridges: two connection threads with their drivers, and the `ts`
+/// connection, which is still driven in-line.
 #[cfg(feature = "sqlite")]
 struct SqliteConns {
-    sql_conn: Arc<Mutex<rusqlite::Connection>>,
-    sql_interrupt: Arc<rusqlite::InterruptHandle>,
-    kv_conn: Arc<Mutex<rusqlite::Connection>>,
-    kv_interrupt: Arc<rusqlite::InterruptHandle>,
+    sql_isle: rusqlite_isle::AsyncIsle,
+    kv_isle: rusqlite_isle::AsyncIsle,
+    drivers: SqliteDrivers,
     ts_conn: Arc<Mutex<rusqlite::Connection>>,
     ts_interrupt: Arc<rusqlite::InterruptHandle>,
+}
+
+/// The lifecycle owners of the sql / kv connection threads.
+///
+/// Kept out of [`HostContext`] (which is cloned into every bridge) because a
+/// driver is not clonable by design: there is exactly one of each, held by the
+/// run loop until [`shutdown`] joins the threads.
+#[cfg(feature = "sqlite")]
+struct SqliteDrivers {
+    sql: rusqlite_isle::AsyncIsleDriver,
+    kv: rusqlite_isle::AsyncIsleDriver,
 }
 
 /// Open the sql / kv / ts SQLite databases, honoring the [`BlockConfig`]
 /// path overrides and otherwise falling back to the env-driven resolution.
 #[cfg(feature = "sqlite")]
-fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
+async fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
     let sql_path = match &config.sql_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::sql_path().map_err(BlockError::Runtime)?,
     };
-    let (sql_conn, sql_interrupt) = open_sqlite(&sql_path, "sql")?;
+    let (sql_isle, sql_driver) = open_sqlite_isle(&sql_path, "sql").await?;
 
     let kv_path = match &config.kv_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::kv_path().map_err(BlockError::Runtime)?,
     };
-    let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
+    let (kv_isle, kv_driver) = open_sqlite_isle(&kv_path, "kv").await?;
 
     let ts_path = match &config.ts_path {
         Some(p) => p.clone(),
@@ -1258,10 +1321,12 @@ fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
     let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
 
     Ok(SqliteConns {
-        sql_conn,
-        sql_interrupt,
-        kv_conn,
-        kv_interrupt,
+        sql_isle,
+        kv_isle,
+        drivers: SqliteDrivers {
+            sql: sql_driver,
+            kv: kv_driver,
+        },
         ts_conn,
         ts_interrupt,
     })
@@ -1492,12 +1557,14 @@ async fn drain_auto_serve(auto_serve_state: AutoServeState) {
 }
 
 /// Tear down host resources in order: disconnect MCP servers, shut down the
-/// main Isle driver (fatal on error), then the handler Isle driver (logged,
-/// non-fatal so a handler-thread panic does not poison the process exit).
+/// main Isle driver (fatal on error), then the handler Isle driver and the
+/// SQLite connection threads (logged, non-fatal so a worker-thread panic does
+/// not poison the process exit).
 async fn shutdown(
     mcp_manager: &Arc<RwLock<McpManager>>,
     driver: AsyncIsleDriver,
     handler_driver: AsyncIsleDriver,
+    #[cfg(feature = "sqlite")] sqlite_drivers: SqliteDrivers,
 ) -> BlockResult<()> {
     let _shutdown_span = info_span!("shutdown");
 
@@ -1522,6 +1589,23 @@ async fn shutdown(
             thread_name = "agent-block-handler-isle",
             "handler Isle shutdown failed"
         ),
+    }
+
+    // The sql / kv connection threads: a graceful shutdown drains whatever
+    // the script left queued before the thread exits. Logged rather than
+    // fatal, for the same reason as the handler Isle above — the script has
+    // already run, and its result is what the caller asked for.
+    #[cfg(feature = "sqlite")]
+    {
+        let SqliteDrivers { sql, kv } = sqlite_drivers;
+        for (label, driver) in [("sql", sql), ("kv", kv)] {
+            match driver.shutdown().await {
+                Ok(()) => info!(label, "sqlite connection thread shut down"),
+                Err(e) => {
+                    tracing::error!(error = %e, label, "sqlite shutdown failed")
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1644,13 +1728,12 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // (which remain present for API stability) are ignored.
     #[cfg(feature = "sqlite")]
     let SqliteConns {
-        sql_conn,
-        sql_interrupt,
-        kv_conn,
-        kv_interrupt,
+        sql_isle,
+        kv_isle,
+        drivers: sqlite_drivers,
         ts_conn,
         ts_interrupt,
-    } = init_sqlite(&config)?;
+    } = init_sqlite(&config).await?;
 
     // Use the script dir derived from the resolved `ScriptSource` for
     // `package.path` lookups. For inline / default-agent variants the dir
@@ -1706,13 +1789,9 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         mcp_manager: Arc::clone(&mcp_manager),
         http_client,
         #[cfg(feature = "sqlite")]
-        sql_conn,
+        sql_isle,
         #[cfg(feature = "sqlite")]
-        sql_interrupt,
-        #[cfg(feature = "sqlite")]
-        kv_conn,
-        #[cfg(feature = "sqlite")]
-        kv_interrupt,
+        kv_isle,
         #[cfg(feature = "sqlite")]
         ts_conn,
         #[cfg(feature = "sqlite")]
@@ -1753,7 +1832,14 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     drain_auto_serve(auto_serve_state).await;
 
     // ── Shutdown ──────────────────────────────────────────────────
-    shutdown(&mcp_manager, driver, handler_driver).await?;
+    shutdown(
+        &mcp_manager,
+        driver,
+        handler_driver,
+        #[cfg(feature = "sqlite")]
+        sqlite_drivers,
+    )
+    .await?;
 
     script_result
 }

@@ -15,16 +15,17 @@ default = ["mesh", "sqlite", "mcp-http"]
 # identity). Pulls in agent-mesh-core / agent-mesh-sdk.
 mesh = ["dep:agent-mesh-core", "dep:agent-mesh-sdk"]
 # `sqlite` — SQLite-backed `sql.*` / `kv.*` / `ts.*` Lua bridges. Pulls in the
-# mlua-batteries sql/kv batteries.
+# `mlua-batteries-sqlite` batteries (`std.sql` / `std.kv`), which since 0.5 are
+# a crate of their own rather than features of `mlua-batteries`.
 #
-# It no longer gates rusqlite itself: the kernel (`knl`) keeps every session's
-# event log in a SQLite table — a file for a durable session, an in-memory
-# database for an ephemeral one — because the log is read with SQL
-# (`session:query`), and a build where that was optional would be a build with
-# a second, lesser kind of session. So rusqlite is an ordinary dependency
-# below, and this feature is what it always was for the *batteries*: the
-# `sql.*` / `kv.*` / `ts.*` Lua surface.
-sqlite = ["mlua-batteries/sql", "mlua-batteries/kv"]
+# It does not gate rusqlite: the kernel (`knl`) keeps every session's event log
+# in a SQLite table — a file for a durable session, an in-memory database for
+# an ephemeral one — because the log is read with SQL (`session:query`), and a
+# build where that was optional would be a build with a second, lesser kind of
+# session. So rusqlite / rusqlite-isle are ordinary dependencies below, and
+# this feature is what it always was for the *batteries*: the `sql.*` /
+# `kv.*` / `ts.*` Lua surface.
+sqlite = ["dep:mlua-batteries-sqlite", "dep:futures-executor"]
 # `mcp-http` — Streamable HTTP / SSE MCP transport (`mcp.connect_http`).
 # Forwards to agent-block-mcp's `mcp-http` feature (stdio transport is always on).
 mcp-http = ["agent-block-mcp/mcp-http"]
@@ -39,6 +40,11 @@ agent-block-mcp.workspace = true
 mlua.workspace = true
 mlua-isle.workspace = true
 mlua-batteries.workspace = true
+# The `std.sql` / `std.kv` batteries, behind the `sqlite` feature.
+mlua-batteries-sqlite = { workspace = true, optional = true }
+# Drives `std.kv`'s async registration from the Lua Isle's sync closure; see
+# `bridge/kv.rs`. Behind `sqlite` because that is its only caller.
+futures-executor = { workspace = true, optional = true }
 mlua-pkg.workspace = true
 agent-mesh-core = { workspace = true, optional = true }
 agent-mesh-sdk = { workspace = true, optional = true }
@@ -46,8 +52,13 @@ llm-extract.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 # Not optional: the kernel's event store is a SQLite table in every build
-# (see the `sqlite` feature note above).
+# (see the `sqlite` feature note above). `rusqlite-isle` owns the connection —
+# on its own thread, with the transaction, retry and cancellation behaviour the
+# store used to hand-roll — and `rusqlite` supplies the types its closures are
+# written in. Both come from the cluster `mlua-batteries-sqlite` builds on, so
+# there is one libsqlite3-sys in the graph.
 rusqlite = { workspace = true }
+rusqlite-isle = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
@@ -72,9 +83,9 @@ tokio-util = { version = "0.7" }
 tempfile = "3"
 # `mlua` / `mlua-pkg` were dev-dependencies for `tests/tool_loop_session.rs`,
 # which built a VM by hand instead of starting the host. That test covered
-# tool_loop's kernel-session path, which is retired
-# (session-device-design.md §11 R1/R2), and both crates are ordinary
-# dependencies above, so the duplicates went with it.
+# tool_loop's kernel-session path, which is retired (the loop over a
+# recorded session is `knl.beat`, see the knl module doc), and both crates
+# are ordinary dependencies above, so the duplicates went with it.
 
 # SIGTERM / SIGINT delivery for EventBus dispatcher unit tests.
 [target.'cfg(unix)'.dev-dependencies]

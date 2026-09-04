@@ -71,40 +71,60 @@
 //! and the connection it runs on has no write capability to lend it.  Values
 //! are bound, never interpolated — including the ids `$sessions` expands to.
 //!
-//! A query runs under a deadline: a watchdog interrupts the connection if the
-//! statement has not finished in time, and the interrupt surfaces as
+//! A query runs under a deadline: [`Isle::call_timeout`] interrupts the
+//! statement if it has not finished in time, and that surfaces as
 //! [`KnlError::Timeout`].
+//!
+//! # The connection lives on a thread of its own
+//!
+//! Neither connection is held by this struct: each is owned by a
+//! [`rusqlite_isle::Isle`], a thread that takes closures and runs them one at
+//! a time.  A store method is therefore a closure sent to that thread and a
+//! result sent back, which is what makes the whole log safe to touch from a
+//! host that is otherwise asynchronous — SQLite blocks the isle's thread, not
+//! the caller's runtime — and it is why the writer and the reader are two
+//! isles rather than two connections behind a lock.
 //!
 //! # Concurrency
 //!
 //! `append`, `append_many` and `append_if` read-then-write, so each runs in an
-//! `IMMEDIATE` transaction: the `RESERVED` lock is taken at `BEGIN` rather than promoted
-//! from `SHARED` on the first write, which is the point `busy_timeout`
-//! actually covers — a `DEFERRED` transaction can still hit `SQLITE_BUSY` on
-//! lock *promotion* even with a timeout set. On top of the timeout, a
-//! contended `BEGIN`/insert/commit is retried a bounded number of times when
-//! SQLite reports a retryable code (`SQLITE_BUSY` / `SQLITE_LOCKED`, matched
-//! on the error code, not the message). If every attempt is still contended
-//! the write surfaces as a busy/locked [`KnlError`] rather than looping
-//! forever.
+//! `IMMEDIATE` transaction: the `RESERVED` lock is taken at `BEGIN` rather
+//! than promoted from `SHARED` on the first write, which is the point
+//! `busy_timeout` actually covers — a `DEFERRED` transaction can still hit
+//! `SQLITE_BUSY` on lock *promotion* even with a timeout set.  Contention with
+//! another connection is waited out by the busy timeout the isle was opened
+//! with, and `append` / `append_many` sit inside [`Isle::call_retry`], which
+//! re-submits the whole job on `SQLITE_BUSY` with exponential backoff.  A
+//! write that is still contended after that surfaces as [`KnlError::Busy`],
+//! which is the one class that tells the caller another try is worth making.
+//!
+//! `append_if` is the exception, and for a structural reason: its decision
+//! runs on the *caller's* thread (it is a borrowed closure, so it cannot be
+//! sent anywhere), which means the caller cannot be sitting inside a blocking
+//! `call_retry` while the job waits for its answer.  It gets the busy timeout
+//! and the retryable error, not the backoff loop.
 //!
 //! That is what makes the SPI's promise true here: appends to one stream are
 //! *serialized* — two handles both write and the log interleaves in arrival
 //! order — a batch is one transaction, so it lands whole or not at all, and a
 //! decision taken by `append_if` runs against the stream inside the same
 //! transaction that records its answer, so no concurrent writer can slip
-//! between the two.
+//! between the two.  The decision is asked for over a channel while that
+//! transaction is open and the write lock is held, so where the closure
+//! *runs* changes nothing about when it is answered.
 //!
 //! [`MemEventStore`]: super::event_store::MemEventStore
+//! [`Isle::call_timeout`]: rusqlite_isle::Isle::call_timeout
+//! [`Isle::call_retry`]: rusqlite_isle::Isle::call_retry
 
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, TransactionBehavior};
+use rusqlite_isle::{Isle, IsleError, RetryPolicy};
 use serde_json::{Map, Value};
 
 use super::event::{
@@ -194,17 +214,22 @@ impl Db {
         format!("file:knl-{stream}?mode=memory&cache=shared")
     }
 
-    /// Open a connection with `flags`.
-    fn open(&self, flags: OpenFlags) -> rusqlite::Result<Connection> {
-        // `SQLITE_OPEN_URI` is what makes the `file:` form a URI rather than a
-        // relative path called "file:…"; it is in `OpenFlags::default()` and
-        // added explicitly for the read-only flags built below.
+    /// What SQLite is asked to open: a path for a file, the shared-cache URI
+    /// for an in-memory database.
+    ///
+    /// The URI goes through the same argument the path does, which is why
+    /// `SQLITE_OPEN_URI` is in both flag sets below: it is what makes the
+    /// `file:` form a URI rather than a relative path called "file:…".
+    fn target(&self) -> PathBuf {
         match self {
-            Self::File(path) => Connection::open_with_flags(path, flags),
-            Self::Memory(uri) => {
-                Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)
-            }
+            Self::File(path) => path.clone(),
+            Self::Memory(uri) => PathBuf::from(uri),
         }
+    }
+
+    /// The flags the writing connection is opened with.
+    fn write_flags() -> OpenFlags {
+        OpenFlags::default() | OpenFlags::SQLITE_OPEN_URI
     }
 
     /// The flags a read-only connection is opened with.
@@ -213,20 +238,65 @@ impl Db {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI
     }
+
+    /// Start the writing isle: the thread that owns the connection every
+    /// append goes through, with the `events` table ensured before it takes
+    /// its first job.
+    fn spawn_writer(&self) -> KnlResult<Isle> {
+        Isle::builder()
+            .thread_name("knl-events")
+            .open_flags(Self::write_flags())
+            .wal(BUSY_TIMEOUT)
+            .spawn(self.target(), |conn| conn.execute_batch(SCHEMA_DDL))
+            .map_err(KnlError::from)
+    }
+
+    /// Start the reading isle: a second thread, a second connection, and no
+    /// write capability on it at all.
+    fn spawn_reader(&self) -> KnlResult<Isle> {
+        Isle::builder()
+            .thread_name("knl-events-read")
+            .open_flags(Self::read_only_flags())
+            .busy_timeout(BUSY_TIMEOUT)
+            .spawn(self.target(), |conn| {
+                conn.execute_batch("PRAGMA query_only = 1;")
+            })
+            .map_err(KnlError::from)
+    }
 }
 
-/// How many times a write is retried when SQLite reports a retryable code
-/// (`SQLITE_BUSY` / `SQLITE_LOCKED`) before the busy/locked error surfaces.
-const MAX_TX_ATTEMPTS: u32 = 5;
+/// How a busy write is retried: the isle re-submits the whole job on
+/// `SQLITE_BUSY`, backing off between attempts.
+///
+/// The defaults (3 retries from 50 ms, doubling) are the isle's, and so is the
+/// decision of what counts as busy — this store no longer classifies lock
+/// contention for the purpose of retrying it.
+fn retry_policy() -> RetryPolicy {
+    RetryPolicy::default()
+}
 
-/// A single transactional attempt's failure: a retryable SQLite fault, or a
-/// terminal error (a rejected event, a corrupt row, an encode failure) that
-/// no retry can fix.
-enum TxError {
-    /// A rusqlite fault; retried when its code is busy/locked.
+/// A job's failure, split by who should see it.
+///
+/// [`Sqlite`](Self::Sqlite) is handed back to the isle, which is what lets it
+/// recognise a contended write and try again; a
+/// [`Terminal`](Self::Terminal) kernel error (a rejected event, a corrupt row,
+/// an encode failure) is carried out through the job's *value* instead, so no
+/// retry is spent on something no retry can fix.
+enum JobError {
+    /// A rusqlite fault, returned to the isle.
     Sqlite(rusqlite::Error),
     /// A terminal kernel error — never retried.
     Terminal(KnlError),
+}
+
+/// Hand a job's outcome to the isle in the shape it expects: SQLite's errors
+/// as errors (retryable), the kernel's as a value (terminal).
+fn finish<T>(outcome: Result<T, JobError>) -> Result<KnlResult<T>, rusqlite::Error> {
+    match outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(JobError::Sqlite(error)) => Err(error),
+        Err(JobError::Terminal(error)) => Ok(Err(error)),
+    }
 }
 
 /// Whether a rusqlite error is a retryable lock contention (matched on the
@@ -247,19 +317,20 @@ fn is_retryable(error: &rusqlite::Error) -> bool {
 /// The session *is* the stream: one instance serves one session's log.
 /// Several instances may point at the same DB file with different streams.
 pub struct SqliteEventStore {
-    /// The write connection to the database.
+    /// The thread that owns the writing connection.
     ///
     /// Held for the store's whole life, which for an in-memory database is
     /// not merely convenient: a shared-cache in-memory database exists only
-    /// while a connection to it is open, so this handle *is* the database.
-    conn: Connection,
+    /// while a connection to it is open, so this isle *is* the database.
+    writer: Isle,
     /// Where the database is, so a second connection can be opened to it.
     db: Db,
-    /// The read-only connection, opened on the first query and reused.
+    /// The read-only isle, started on the first query and reused.
     ///
     /// Lazy because most sessions never run one: a store that only appends
-    /// and folds pays nothing for the read side existing.
-    reader: OnceCell<Connection>,
+    /// and folds pays nothing — not even a thread — for the read side
+    /// existing.
+    reader: OnceCell<Isle>,
     /// The stream this store is scoped to — the session id.
     stream: String,
 }
@@ -286,37 +357,34 @@ impl SqliteEventStore {
         Self::init(Db::Memory(Db::memory_uri(&stream)), stream)
     }
 
-    /// Open the writer, set the busy timeout, ensure the table and its index.
+    /// Start the writing isle — which sets the busy timeout, applies the WAL
+    /// preset and ensures the table and its indexes before it takes a job.
     fn init(db: Db, stream: String) -> KnlResult<Self> {
-        let conn = db.open(OpenFlags::default())?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.execute_batch(SCHEMA_DDL)?;
+        let writer = db.spawn_writer()?;
         Ok(Self {
-            conn,
+            writer,
             db,
             reader: OnceCell::new(),
             stream,
         })
     }
 
-    /// The read-only connection, opened on first use.
+    /// The read-only isle, started on first use.
     ///
-    /// A *second* connection to the same database, with no write capability:
-    /// `SQLITE_OPEN_READ_ONLY` is what SQLite was asked for, and
-    /// `query_only` is the same answer said again inside the connection, so a
-    /// statement that slipped past the checks on the text still has nothing
-    /// to write with.
-    fn reader(&self) -> KnlResult<&Connection> {
+    /// A *second* connection to the same database, on a thread of its own and
+    /// with no write capability: `SQLITE_OPEN_READ_ONLY` is what SQLite was
+    /// asked for, and `query_only` is the same answer said again inside the
+    /// connection, so a statement that slipped past the checks on the text
+    /// still has nothing to write with.
+    fn reader(&self) -> KnlResult<&Isle> {
         if let Some(reader) = self.reader.get() {
             return Ok(reader);
         }
-        let reader = self.db.open(Db::read_only_flags())?;
-        reader.busy_timeout(BUSY_TIMEOUT)?;
-        reader.execute_batch("PRAGMA query_only = 1;")?;
+        let reader = self.db.spawn_reader()?;
         // `set` cannot fail here — nothing else can have filled the cell,
         // since `&self` is not shared across threads — and the value is
-        // fetched back rather than moved out so the connection stays owned by
-        // the cell for every later query.
+        // fetched back rather than moved out so the isle stays owned by the
+        // cell for every later query.
         let _ = self.reader.set(reader);
         Ok(self
             .reader
@@ -330,17 +398,35 @@ impl SqliteEventStore {
     /// caller's SQL may name. `PRAGMA table_info` rather than a list written
     /// out here, so the published schema cannot drift from the table.
     pub fn schema(&self) -> KnlResult<Vec<SchemaColumn>> {
-        let reader = self.reader()?;
-        let mut stmt = reader.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SchemaColumn {
-                name: row.get::<_, String>("name")?,
-                declared_type: row.get::<_, String>("type")?,
-                pk: row.get::<_, i64>("pk")? > 0,
+        self.reader()?
+            .call(|conn| {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(SchemaColumn {
+                        name: row.get::<_, String>("name")?,
+                        declared_type: row.get::<_, String>("type")?,
+                        pk: row.get::<_, i64>("pk")? > 0,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
             })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(KnlError::from)
+    }
+}
+
+/// Stop both connection threads when the store goes.
+///
+/// Best-effort: a shutdown that fails has nothing left to report to — the
+/// store is being dropped — and the isle's own `Drop` still signals the
+/// thread, so the connection is released either way.  For an in-memory
+/// database this is the moment it ceases to exist, which is what "ephemeral"
+/// means here.
+impl Drop for SqliteEventStore {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.get() {
+            let _ = reader.shutdown();
+        }
+        let _ = self.writer.shutdown();
     }
 }
 
@@ -354,15 +440,26 @@ pub fn events_schema() -> KnlResult<Vec<SchemaColumn>> {
     SqliteEventStore::open_memory(format!("schema-{}", uuid::Uuid::new_v4()))?.schema()
 }
 
+/// The kinds a read was asked for, owned, so the selection can be sent to the
+/// isle's thread along with the closure that uses it.
+fn owned_kinds(kinds: Option<&[&str]>) -> Option<Vec<String>> {
+    kinds.map(|kinds| kinds.iter().map(|kind| (*kind).to_string()).collect())
+}
+
 impl EventStore for SqliteEventStore {
     fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<Committed> {
         // Reject before touching the stream: a rejected event burns no seq.
         validate_event(&event)?;
-        // Stamp the schema version once, before the retry loop; the
+        // Stamp the schema version once, before the job is submitted; the
         // kernel-owned seq / epoch_ms are stamped per attempt inside the
         // transaction, recomputed from the live head each time.
         stamp_schema_version(&mut event);
-        run_with_retry(|| append_attempt(&mut self.conn, &self.stream, &event))
+        let stream = self.stream.clone();
+        self.writer
+            .call_retry(retry_policy(), move |conn| {
+                finish(append_in(conn, &stream, &event))
+            })
+            .map_err(KnlError::from)?
     }
 
     fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
@@ -378,7 +475,12 @@ impl EventStore for SqliteEventStore {
         // belong together land together.  A contended attempt is retried
         // whole; nothing outside the transaction has been changed by a failed
         // one, so re-running it is the correct thing to do.
-        run_with_retry(|| append_many_attempt(&mut self.conn, &self.stream, &events))
+        let stream = self.stream.clone();
+        self.writer
+            .call_retry(retry_policy(), move |conn| {
+                finish(append_many_in(conn, &stream, &events))
+            })
+            .map_err(KnlError::from)?
     }
 
     fn append_if(
@@ -388,10 +490,37 @@ impl EventStore for SqliteEventStore {
     ) -> KnlResult<Option<Committed>> {
         // The read, the decision and the insert share one IMMEDIATE
         // transaction, so the invariant `decide` checks holds at the instant
-        // the event lands.  A contended attempt is retried whole — `decide` is
-        // a pure fold over the events it is handed, so running it again on the
-        // freshly read stream is the correct thing to do.
-        run_with_retry(|| append_if_attempt(&mut self.conn, &self.stream, kinds, &mut *decide))
+        // the event lands.
+        //
+        // `decide` is borrowed from the caller, so it cannot travel to the
+        // isle's thread; instead the job asks for its answer over a channel
+        // while the transaction is open, and the caller — which is *not*
+        // blocked, because the job was spawned rather than called — answers
+        // it.  The write lock is held for the whole exchange, so the decision
+        // still sees, and still answers about, the stream it writes into.
+        let stream = self.stream.clone();
+        let kinds = owned_kinds(kinds);
+        let (ask, asked) = mpsc::channel::<Vec<Value>>();
+        let (answer, answered) = mpsc::channel::<Option<Map<String, Value>>>();
+        let job = self
+            .writer
+            .spawn_call(move |conn| {
+                finish(append_if_in(
+                    conn,
+                    &stream,
+                    kinds.as_deref(),
+                    &ask,
+                    &answered,
+                ))
+            })
+            .map_err(KnlError::from)?;
+        // A `recv` that fails means the job ended before it asked — a
+        // contended `BEGIN`, say — and the error it ended with is what
+        // `job.wait()` is about to return.
+        if let Ok(events) = asked.recv() {
+            let _ = answer.send(decide(&events));
+        }
+        job.wait().map_err(KnlError::from)?
     }
 
     fn read_kinds(
@@ -408,40 +537,46 @@ impl EventStore for SqliteEventStore {
         // `usize::MAX` (an unbounded read) caps at i64::MAX, which SQLite
         // treats as "no limit"; `0` reads nothing.
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
-        let (sql, args) = read_query(&self.stream, kinds, from_seq, capped);
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args.iter()), read_row)?;
-        // A read that cannot prepare/query is a fault, and a row whose stored
-        // objects do not decode is corruption — both surface as an error
-        // rather than being silently dropped, so a caller (resume) never
-        // re-folds a truncated log into the wrong state.
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(event_of(row?)?);
-        }
-        Ok(events)
+        let kinds = owned_kinds(kinds);
+        let stream = self.stream.clone();
+        self.writer
+            .call(move |conn| finish(read_in(conn, &stream, kinds.as_deref(), from_seq, capped)))
+            .map_err(KnlError::from)?
     }
 
     fn head(&self) -> KnlResult<Option<u64>> {
         // A transient busy read must surface, not read as "empty": a caller
         // deciding open-vs-resume (or a CAS) on a swallowed error would
         // treat a populated stream as fresh.  Same discipline as read().
-        head_in(&self.conn, &self.stream).map_err(KnlError::from)
+        let stream = self.stream.clone();
+        self.writer
+            .call(move |conn| head_in(conn, &stream))
+            .map_err(KnlError::from)
     }
 
     fn len(&self) -> KnlResult<usize> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE stream = ?1",
-                params![self.stream],
-                |row| row.get::<_, i64>(0),
-            )
+        let stream = self.stream.clone();
+        self.writer
+            .call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE stream = ?1",
+                    params![stream],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
             .map(|n| n as usize)
             .map_err(KnlError::from)
     }
 
     fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
-        run_query(self.reader()?, plan)
+        // The deadline is the isle's: it interrupts the statement when the
+        // time is up and reports `Timeout`, so there is no watchdog thread
+        // here to outlive the query it was watching.
+        let timeout = plan.timeout;
+        let plan = plan.clone();
+        self.reader()?
+            .call_timeout(timeout, move |conn| Ok(run_query(conn, &plan)))
+            .map_err(KnlError::from)?
     }
 }
 
@@ -470,55 +605,14 @@ fn query_error(error: rusqlite::Error) -> KnlError {
     }
 }
 
-/// The watchdog that ends a query that is taking too long.
-///
-/// SQLite has no per-statement timeout — `busy_timeout` bounds waiting for a
-/// *lock*, which is a different thing from a statement that is simply
-/// expensive — so a deadline has to come from outside: a thread that waits,
-/// and interrupts the connection if the query has not said it is done.
-/// (`Connection::progress_handler`, which would do this in-thread, is behind
-/// rusqlite's `hooks` feature and this build does not enable it.)
-///
-/// The wait ends either way: the query signals completion by dropping the
-/// sender, which wakes the thread immediately, so the interrupt only ever
-/// fires while the statement it belongs to is still running.
-struct Deadline {
-    /// Dropped when the query finishes; that is the signal.
-    done: Option<mpsc::Sender<()>>,
-    /// The waiting thread, joined on drop so no watchdog outlives its query.
-    watchdog: Option<JoinHandle<()>>,
-}
-
-impl Deadline {
-    /// Start watching `conn` for `timeout`.
-    fn arm(conn: &Connection, timeout: Duration) -> Self {
-        let interrupt = conn.get_interrupt_handle();
-        let (done, finished) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            // A disconnect means the query finished first: nothing to do.
-            if finished.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
-                interrupt.interrupt();
-            }
-        });
-        Self {
-            done: Some(done),
-            watchdog: Some(watchdog),
-        }
-    }
-}
-
-impl Drop for Deadline {
-    fn drop(&mut self) {
-        // Dropping the sender wakes the watchdog at once; joining it means the
-        // interrupt cannot land on whatever this connection does next.
-        drop(self.done.take());
-        if let Some(watchdog) = self.watchdog.take() {
-            let _ = watchdog.join();
-        }
-    }
-}
-
 /// Prepare, check, bind and run one query.
+///
+/// Runs on the reading isle's thread, under the deadline that thread was given
+/// ([`EventStore::query`]): SQLite has no per-statement timeout — `busy_timeout`
+/// bounds waiting for a *lock*, which is a different thing from a statement
+/// that is simply expensive — so the isle interrupts the connection when the
+/// time is up.  The interrupt reaches this function as `SQLITE_INTERRUPT` on
+/// whichever step was running, and [`query_error`] names it a timeout.
 fn run_query(conn: &Connection, plan: &QueryPlan) -> KnlResult<QueryRows> {
     // A statement that will not compile is the caller's SQL, not the store
     // failing: report it as the refusal it is, unless the database was too
@@ -548,7 +642,6 @@ fn run_query(conn: &Connection, plan: &QueryPlan) -> KnlResult<QueryRows> {
         .map(str::to_string)
         .collect();
 
-    let _deadline = Deadline::arm(conn, plan.timeout);
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
     while out.len() < plan.limit {
@@ -737,42 +830,26 @@ fn read_value(value: ValueRef<'_>) -> KnlResult<Option<Value>> {
     })
 }
 
-/// Run one transactional `attempt`, retrying up to [`MAX_TX_ATTEMPTS`] times
-/// while SQLite reports a retryable lock code, then surfacing the busy/locked
-/// error rather than looping forever. A terminal error is returned at once.
-fn run_with_retry<T, F>(mut attempt: F) -> KnlResult<T>
-where
-    F: FnMut() -> Result<T, TxError>,
-{
-    let mut tries = 1;
-    loop {
-        match attempt() {
-            Ok(committed) => return Ok(committed),
-            Err(TxError::Sqlite(error)) if is_retryable(&error) && tries < MAX_TX_ATTEMPTS => {
-                tries += 1;
-            }
-            Err(TxError::Sqlite(error)) => return Err(error.into()),
-            Err(TxError::Terminal(error)) => return Err(error),
-        }
-    }
-}
-
 /// One `IMMEDIATE` append: take the reserved lock up front, compute the next
 /// `seq` from the live head, stamp and insert, then commit.
-fn append_attempt(
+///
+/// Runs on the writing isle's thread, and may run more than once: a contended
+/// `BEGIN` is a [`JobError::Sqlite`], which is what the isle's retry keys on,
+/// and nothing outside the transaction was changed by an attempt that failed.
+fn append_in(
     conn: &mut Connection,
     stream: &str,
     event: &Map<String, Value>,
-) -> Result<Committed, TxError> {
+) -> Result<Committed, JobError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(TxError::Sqlite)?;
-    let seq = next_seq(&tx, stream).map_err(TxError::Sqlite)?;
+        .map_err(JobError::Sqlite)?;
+    let seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
     let epoch_ms = now_ms();
     let mut row = event.clone();
     stamp(&mut row, seq, epoch_ms);
     insert_row(&tx, stream, seq, epoch_ms, &row)?;
-    tx.commit().map_err(TxError::Sqlite)?;
+    tx.commit().map_err(JobError::Sqlite)?;
     Ok(Committed { seq, epoch_ms })
 }
 
@@ -782,15 +859,15 @@ fn append_attempt(
 /// All or nothing: an event that will not encode, or a contended insert
 /// part-way through, drops the transaction and leaves the stream exactly as
 /// it was — which is what lets a caller write two facts that are one fact.
-fn append_many_attempt(
+fn append_many_in(
     conn: &mut Connection,
     stream: &str,
     events: &[Map<String, Value>],
-) -> Result<Vec<Committed>, TxError> {
+) -> Result<Vec<Committed>, JobError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(TxError::Sqlite)?;
-    let mut seq = next_seq(&tx, stream).map_err(TxError::Sqlite)?;
+        .map_err(JobError::Sqlite)?;
+    let mut seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
     let mut committed = Vec::with_capacity(events.len());
     for event in events {
         let epoch_ms = now_ms();
@@ -801,12 +878,19 @@ fn append_many_attempt(
         committed.push(Committed { seq, epoch_ms });
         seq = seq.saturating_add(1);
     }
-    tx.commit().map_err(TxError::Sqlite)?;
+    tx.commit().map_err(JobError::Sqlite)?;
     Ok(committed)
 }
 
-/// One `IMMEDIATE` decide-then-append: read the stream, ask `decide` what to
+/// One `IMMEDIATE` decide-then-append: read the stream, ask the caller what to
 /// record, and insert its answer in the same transaction.
+///
+/// The decision itself is the caller's closure and stays on the caller's
+/// thread; this job sends it the events over `ask` and waits on `answered`
+/// with the write lock still held, so the decision is taken against the stream
+/// it is about to be written into.  A channel that is gone means the caller
+/// went away mid-decision — the transaction is dropped and the stream is as it
+/// was.
 ///
 /// `kinds` narrows what the decision is shown, not where its answer lands:
 /// the new event's `seq` comes from the stream's live head, so a filtered
@@ -815,33 +899,46 @@ fn append_many_attempt(
 ///
 /// A `None` decision commits nothing — the transaction is dropped, so the
 /// stream is exactly as it was — and reports `Ok(None)`.
-fn append_if_attempt(
+fn append_if_in(
     conn: &mut Connection,
     stream: &str,
-    kinds: Option<&[&str]>,
-    decide: &mut Decision<'_>,
-) -> Result<Option<Committed>, TxError> {
+    kinds: Option<&[String]>,
+    ask: &mpsc::Sender<Vec<Value>>,
+    answered: &mpsc::Receiver<Option<Map<String, Value>>>,
+) -> Result<Option<Committed>, JobError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(TxError::Sqlite)?;
-    let events = read_in(&tx, stream, kinds)?;
-    let Some(event) = decide(&events) else {
+        .map_err(JobError::Sqlite)?;
+    let events = read_in(&tx, stream, kinds, 0, i64::MAX)?;
+    ask.send(events).map_err(|_| gone())?;
+    let Some(event) = answered.recv().map_err(|_| gone())? else {
         // Nothing to write: the transaction is rolled back on drop.
         return Ok(None);
     };
     // The decision's event is validated like any other: a malformed one is
     // refused and the transaction goes no further.
-    validate_event(&event).map_err(TxError::Terminal)?;
+    validate_event(&event).map_err(JobError::Terminal)?;
     // The head of the whole stream, not of the events the decision was shown:
     // a filtered read says nothing about where the next event goes.
-    let seq = next_seq(&tx, stream).map_err(TxError::Sqlite)?;
+    let seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
     let epoch_ms = now_ms();
     let mut row = event.clone();
     stamp_schema_version(&mut row);
     stamp(&mut row, seq, epoch_ms);
     insert_row(&tx, stream, seq, epoch_ms, &row)?;
-    tx.commit().map_err(TxError::Sqlite)?;
+    tx.commit().map_err(JobError::Sqlite)?;
     Ok(Some(Committed { seq, epoch_ms }))
+}
+
+/// The caller of `append_if` disappeared before it answered.
+///
+/// Storage rather than busy: nothing about the database was wrong, and
+/// nothing about it will be different next time, so this is not an invitation
+/// to try again.
+fn gone() -> JobError {
+    JobError::Terminal(KnlError::Storage(
+        "sqlite: the caller of append_if went away before deciding".to_string(),
+    ))
 }
 
 /// The columns a read selects, in the order [`read_row`] takes them.
@@ -934,7 +1031,7 @@ fn decode_object(text: &str, column: &str) -> KnlResult<Value> {
 /// written into the SQL, so a kind is data here as it is everywhere else.
 fn read_query(
     stream: &str,
-    kinds: Option<&[&str]>,
+    kinds: Option<&[String]>,
     from_seq: u64,
     limit: i64,
 ) -> (String, Vec<SqlValue>) {
@@ -946,32 +1043,41 @@ fn read_query(
     if let Some(kinds) = kinds {
         let placeholders = vec!["?"; kinds.len()].join(", ");
         sql.push_str(&format!(" AND kind IN ({placeholders})"));
-        args.extend(kinds.iter().map(|kind| SqlValue::Text((*kind).to_string())));
+        args.extend(kinds.iter().map(|kind| SqlValue::Text(kind.clone())));
     }
     sql.push_str(" ORDER BY seq ASC LIMIT ?");
     args.push(SqlValue::Integer(limit));
     (sql, args)
 }
 
-/// The events of `stream` a decision is shown, in `seq` order, read inside a
-/// transaction.
+/// The events of `stream`, in `seq` order, read on the isle's thread.
 ///
-/// The in-transaction twin of [`EventStore::read_kinds`]: a decode failure is
-/// corruption and terminal, a fault on the read itself is retryable.
-fn read_in(conn: &Connection, stream: &str, kinds: Option<&[&str]>) -> Result<Vec<Value>, TxError> {
+/// The one read both paths take — a plain [`EventStore::read_kinds`] and the
+/// input a decision is shown from inside its transaction — so they select the
+/// same rows by the same rule.  A fault on the read itself is SQLite's (and so
+/// retryable); a row whose stored objects do not decode is corruption and
+/// terminal, and it surfaces as an error rather than being silently dropped,
+/// so a caller (resume) never re-folds a truncated log into the wrong state.
+fn read_in(
+    conn: &Connection,
+    stream: &str,
+    kinds: Option<&[String]>,
+    from_seq: u64,
+    limit: i64,
+) -> Result<Vec<Value>, JobError> {
     // An empty selection selects nothing, and `kind IN ()` is not SQL.
-    if kinds.is_some_and(<[&str]>::is_empty) {
+    if kinds.is_some_and(<[String]>::is_empty) {
         return Ok(Vec::new());
     }
-    let (sql, args) = read_query(stream, kinds, 0, i64::MAX);
-    let mut stmt = conn.prepare(&sql).map_err(TxError::Sqlite)?;
+    let (sql, args) = read_query(stream, kinds, from_seq, limit);
+    let mut stmt = conn.prepare(&sql).map_err(JobError::Sqlite)?;
     let rows = stmt
         .query_map(params_from_iter(args.iter()), read_row)
-        .map_err(TxError::Sqlite)?;
+        .map_err(JobError::Sqlite)?;
     let mut events = Vec::new();
     for row in rows {
-        let row = row.map_err(TxError::Sqlite)?;
-        events.push(event_of(row).map_err(TxError::Terminal)?);
+        let row = row.map_err(JobError::Sqlite)?;
+        events.push(event_of(row).map_err(JobError::Terminal)?);
     }
     Ok(events)
 }
@@ -1011,7 +1117,7 @@ fn insert_row(
     seq: u64,
     epoch_ms: u64,
     event: &Map<String, Value>,
-) -> Result<(), TxError> {
+) -> Result<(), JobError> {
     let kind = event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("");
     let schema_version = event
         .get(SCHEMA_VERSION_FIELD)
@@ -1037,7 +1143,7 @@ fn insert_row(
             data
         ],
     )
-    .map_err(TxError::Sqlite)?;
+    .map_err(JobError::Sqlite)?;
     Ok(())
 }
 
@@ -1051,12 +1157,12 @@ fn insert_row(
 /// An event that will not encode never reaches the disk, so a failure here is
 /// the store failing to do the work rather than data that came back wrong —
 /// `Storage`, not `Corruption`.
-fn encode_object(value: Option<&Value>, column: &str) -> Result<String, TxError> {
+fn encode_object(value: Option<&Value>, column: &str) -> Result<String, JobError> {
     let Some(value) = value else {
         return Ok("{}".to_string());
     };
     serde_json::to_string(value).map_err(|e| {
-        TxError::Terminal(KnlError::Storage(format!(
+        JobError::Terminal(KnlError::Storage(format!(
             "sqlite: encode event {column}: {e}"
         )))
     })
@@ -1066,11 +1172,16 @@ fn encode_object(value: Option<&Value>, column: &str) -> Result<String, TxError>
 ///
 /// This is the one place the backend's error language is translated, and the
 /// split is the one the caller can act on: a contended lock is
-/// [`KnlError::Busy`] — the same call may succeed if it is made again, which
-/// is exactly what [`run_with_retry`] does with it — and everything else is
-/// [`KnlError::Storage`], a fault the kernel cannot promise anything about.
-/// Matched on the SQLite error *code*, never the message text, so the
-/// classification does not drift with a library's wording.
+/// [`KnlError::Busy`] — the same call may succeed if it is made again — and
+/// everything else is [`KnlError::Storage`], a fault the kernel cannot promise
+/// anything about.  Matched on the SQLite error *code*, never the message
+/// text, so the classification does not drift with a library's wording.
+///
+/// This is a wider net than the isle's own retry uses: the isle re-submits on
+/// `SQLITE_BUSY` alone, because that is contention with another connection and
+/// clears on its own, while `SQLITE_LOCKED` within one connection does not.
+/// What the *caller* is told is the coarser question — "is another attempt
+/// worth making at all" — and for that both are worth a try.
 ///
 /// Corruption is not produced here: a row that comes back and will not decode
 /// is a fault of the data rather than of the store, so it is raised where the
@@ -1081,6 +1192,37 @@ impl From<rusqlite::Error> for KnlError {
             return KnlError::Busy(format!("sqlite: busy/locked: {error}"));
         }
         KnlError::Storage(format!("sqlite: {error}"))
+    }
+}
+
+/// Translate an isle-level failure into the kernel's vocabulary.
+///
+/// The isle answers two kinds of question, and they map onto two kinds of
+/// kernel error.  A SQL fault is passed straight through to the translation
+/// above, so a contended write still reads as [`KnlError::Busy`] however it
+/// arrived.  The isle's own conditions are about the *thread*, and they split
+/// on whether waiting could help:
+///
+/// - `QueueFull` is backpressure — the connection thread is alive and behind,
+///   so this is [`KnlError::Busy`], the one class that says "ask again";
+/// - `Timeout` and `Cancelled` both mean a job was cut short rather than
+///   answered, which is [`KnlError::Timeout`]: the deadline was the caller's,
+///   and another identical attempt buys nothing;
+/// - `Closed` (the thread is gone) and `Panicked` are [`KnlError::Storage`] —
+///   the store could not do the work, and no retry changes that.
+impl From<IsleError> for KnlError {
+    fn from(error: IsleError) -> Self {
+        match error {
+            IsleError::Sqlite(error) => KnlError::from(error),
+            IsleError::QueueFull => {
+                KnlError::Busy("sqlite: the connection thread is at capacity".to_string())
+            }
+            IsleError::Timeout => KnlError::Timeout("sqlite: the deadline elapsed".to_string()),
+            IsleError::Cancelled => KnlError::Timeout("sqlite: the job was cancelled".to_string()),
+            // `IsleError` is `#[non_exhaustive]`: anything not named above is
+            // the store failing to do the work, which is what `Storage` is.
+            other => KnlError::Storage(format!("sqlite: {other}")),
+        }
     }
 }
 
@@ -1427,11 +1569,13 @@ mod tests {
 
         // Grouping a run by beat is a range of an index, not a scan.
         let indexes = store
-            .conn
-            .prepare("PRAGMA index_list(events)")
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get::<_, String>("name"))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
+            .writer
+            .call(|conn| {
+                let mut stmt = conn.prepare("PRAGMA index_list(events)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>("name"))?
+                    .collect::<rusqlite::Result<Vec<_>>>();
+                names
             })
             .expect("index_list");
         assert!(
@@ -1519,23 +1663,26 @@ mod tests {
 
             // Sneak in a row the store itself could not have written.
             let stream = store.stream.clone();
+            let (meta, data) = (meta.to_string(), data.to_string());
             store
-                .conn
-                .execute(
-                    "INSERT INTO events \
-                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        stream,
-                        seq,
-                        0_i64,
-                        "note",
-                        1_i64,
-                        None::<String>,
-                        meta,
-                        data
-                    ],
-                )
+                .writer
+                .call(move |conn| {
+                    conn.execute(
+                        "INSERT INTO events \
+                         (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            stream,
+                            seq,
+                            0_i64,
+                            "note",
+                            1_i64,
+                            None::<String>,
+                            meta,
+                            data
+                        ],
+                    )
+                })
                 .expect("insert corrupt row");
 
             let err = store
@@ -1618,8 +1765,8 @@ mod tests {
             .execute_batch("BEGIN EXCLUSIVE")
             .expect("take the write lock");
         store
-            .conn
-            .busy_timeout(Duration::from_millis(0))
+            .writer
+            .call(|conn| conn.busy_timeout(Duration::from_millis(0)))
             .expect("no waiting");
 
         let err = store
@@ -1885,12 +2032,14 @@ mod tests {
         let reader = store.reader().expect("open the reader");
 
         let err = reader
-            .execute(
-                "INSERT INTO events \
-                 (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-                 VALUES ('x', 1, 0, 'note', 1, NULL, '{}', '{}')",
-                [],
-            )
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO events \
+                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+                     VALUES ('x', 1, 0, 'note', 1, NULL, '{}', '{}')",
+                    [],
+                )
+            })
             .expect_err("the reader must not be able to write");
         assert!(
             matches!(KnlError::from(err), KnlError::Storage(_)),

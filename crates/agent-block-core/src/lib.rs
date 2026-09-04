@@ -13,7 +13,7 @@
 //! | Feature    | Enables                                                          | Pulls in |
 //! |------------|------------------------------------------------------------------|----------|
 //! | `mesh`     | `mesh.*` Lua bridge, relay connect, Ed25519 mesh identity        | `agent-mesh-core`, `agent-mesh-sdk` |
-//! | `sqlite`   | `sql.*` / `kv.*` / `ts.*` Lua bridges (SQLite-backed)            | `mlua-batteries/{sql,kv}` |
+//! | `sqlite`   | `sql.*` / `kv.*` / `ts.*` Lua bridges (SQLite-backed)            | `mlua-batteries-sqlite` |
 //! | `mcp-http` | `mcp.connect_http` (Streamable HTTP / SSE MCP transport)         | `agent-block-mcp/mcp-http` → rmcp HTTP-client transports |
 //!
 //! The stdio MCP transport (`mcp.connect`), `http.*`, `tool.*`, `sh.*`,
@@ -24,10 +24,14 @@
 //!   / `secret_key` are accepted but ignored.
 //! - `sqlite`: the `sql.*` / `kv.*` / `ts.*` bridges are not registered;
 //!   `BlockConfig::sql_path` / `kv_path` / `ts_path` are accepted but ignored
-//!   (fields retained for API stability).  It does not gate `rusqlite`
-//!   itself: the kernel ([`knl`]) keeps every session's event log in a
-//!   SQLite table — the log is read with SQL — so `rusqlite` is an ordinary
-//!   dependency and a session is a session in every build.
+//!   (fields retained for API stability).  It does not gate SQLite itself:
+//!   the kernel ([`knl`]) keeps every session's event log in a SQLite table —
+//!   the log is read with SQL — so `rusqlite` and `rusqlite-isle` are ordinary
+//!   dependencies and a session is a session in every build.  They are the
+//!   same versions `mlua-batteries-sqlite` builds on (rusqlite 0.37 /
+//!   libsqlite3-sys 0.35), which is not a coincidence: `libsqlite3-sys`
+//!   declares `links = "sqlite3"`, so a build graph may hold exactly one of
+//!   it, whichever way the feature is set.
 //! - `mcp-http`: `mcp.connect_http` returns an explicit error when called.
 //!
 //! # Sandbox

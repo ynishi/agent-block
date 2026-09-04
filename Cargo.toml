@@ -44,14 +44,33 @@ async-trait  = "0.1"
 rmcp         = { version = "3.0.1", features = ["client", "transport-child-process"] }
 mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
 mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
-# `sql` / `kv` features are NOT declared here so they can be gated behind the
-# agent-block-core `sqlite` feature (they pull in rusqlite/bundled).
-mlua-batteries = { version = "0.3.1", features = ["json", "fs", "env", "path", "time", "task"] }
+# `std.sql` / `std.kv` no longer live here: as of 0.5 they are their own crate
+# (`mlua-batteries-sqlite`, below), so this dependency carries no SQLite weight
+# at all and needs no feature gating.
+mlua-batteries = { version = "0.5", features = ["json", "fs", "env", "path", "time", "task"] }
+# The `std.sql` / `std.kv` batteries, split out of mlua-batteries at 0.5. Kept
+# out of the workspace-wide default set and pulled in only under the
+# agent-block-core `sqlite` feature, which is what that feature has always
+# gated: the Lua-facing SQL surface, not SQLite itself.
+mlua-batteries-sqlite = "0.5"
+# One `block_on`, in `bridge/kv.rs`: `std.kv`'s registration is async (it
+# creates the `__kv` table through the connection thread) and bridge
+# registration runs inside the Lua Isle's synchronous closure. Already in the
+# tree transitively.
+futures-executor = "0.3"
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
 mlua-pkg     = "0.7"
-rusqlite     = { version = "0.31", features = ["bundled"] }
+# The kernel's own SQLite, taken from the same cluster mlua-batteries-sqlite
+# builds on (rusqlite-isle 0.5 → rusqlite 0.37 → libsqlite3-sys 0.35), so the
+# graph holds exactly one libsqlite3-sys however the `sqlite` feature is set.
+# `rusqlite-isle` is what the kernel's event store actually talks to — the
+# connection lives on its own thread — and plain `rusqlite` is here for the
+# types (`Connection`, `Error`, `OpenFlags`, …) that appear in the closures
+# handed to it.
+rusqlite      = { version = "0.37", features = ["bundled"] }
+rusqlite-isle = { version = "0.5", features = ["tokio"] }
 anyhow       = "1"
 # Content fingerprint for `std.fs.read_versioned` / `edit`'s optimistic
 # concurrency check. Already in the tree transitively.
