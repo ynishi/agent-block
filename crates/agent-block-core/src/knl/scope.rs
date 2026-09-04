@@ -1,26 +1,27 @@
-//! The run scope: whose run this is, and what it was allowed to spend.
+//! The scope: whose session this is, and what it was allowed to spend.
 //!
 //! A scope and a session are different things that share one lifetime.  The
-//! session is the *stream*: one append-only history, its projections, its
-//! turn numbering.  The scope is the *authority* the run holds while that
-//! stream is written — a kernel-issued identity, the principal it belongs
-//! to, and the quota an owner granted it.  Both begin when a run opens and
-//! end when it closes, which is why [`super::Session`] holds a `Scope` by
-//! value rather than pointing at one: there is no scope without the run,
-//! and no run without a scope.
+//! session is the *stream*: one append-only history and its projections.
+//! The scope is the *authority* held while that stream is written — a
+//! kernel-issued identity, the principal it belongs to, and the quota an
+//! owner granted it.  Both begin when the session opens and end when it
+//! closes, which is why [`super::Session`] holds a `Scope` by value rather
+//! than pointing at one: there is no scope without the session, and no
+//! session without a scope.
 //!
 //! Keeping the two apart is what makes the boundary readable in the log.
 //! The session id names the stream a reader reopens; a [`ScopeId`] names
 //! the authority the events were written under, and it is recorded — on
-//! `run_started`, and on every `budget_*` event the ledger is folded from —
-//! so the boundary is recoverable from the log alone.  The kernel issues
-//! it (a fresh UUID v4, like the session id) and there is no API to set
-//! one: an id a caller could choose is an authority a caller could claim.
+//! `session_opened`, and on every `budget_*` event the ledger is folded
+//! from — so the boundary is recoverable from the log alone.  The kernel
+//! issues it (a fresh UUID v4, like the session id) and there is no API to
+//! set one: an id a caller could choose is an authority a caller could
+//! claim.
 
 use super::budget::BudgetGrant;
 use super::{Budget, KnlResult};
 
-/// The identity of a run scope: a kernel-issued UUID v4 string.
+/// The identity of a scope: a kernel-issued UUID v4 string.
 ///
 /// A `String` with a name, so the field it lands in says what it is.  There
 /// is no constructor a caller can reach — [`Scope::new`] mints one, and a
@@ -32,17 +33,21 @@ fn mint_id() -> ScopeId {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// One run scope: an identity, a principal, and the quota it was granted.
+/// One scope: an identity, a principal, and the quota it was granted.
 ///
-/// Read through [`super::Session::scope`].  The counter moves only through
-/// the session's [`reserve`] / [`spend`], which record the move as an event
-/// before it happens, so the scope's balance is never ahead of the log.
+/// Read through [`super::Session::scope`].  The counter never decides
+/// anything, and it never does arithmetic of its own: a [`reserve`] and a
+/// [`spend`] alike are settled against the ledger inside the store, and the
+/// counter is then *set* from that fold ([`Scope::set_balance`]).  The
+/// balance follows the log and is never ahead of it — which is what makes it
+/// right on a stream more than one handle writes to.
 ///
 /// [`reserve`]: super::Session::reserve
 /// [`spend`]: super::Session::spend
 #[derive(Debug)]
 pub struct Scope {
-    /// Kernel-issued, recorded on `run_started` and every `budget_*` event.
+    /// Kernel-issued, recorded on `session_opened` and every `budget_*`
+    /// event.
     id: ScopeId,
     /// Whose scope this is: a real principal id, or the reserved
     /// [`super::ANON`] / [`super::SYSTEM`].  Total — never absent.
@@ -51,7 +56,7 @@ pub struct Scope {
     budget: Budget,
     /// The grant this scope opened (or resumed) with, kept for its words: a
     /// refused reservation hands the `tag` back so a caller can say which
-    /// allowance stopped it.  `None` when the run has no budget.
+    /// allowance stopped it.  `None` when the session has no budget.
     grant: Option<BudgetGrant>,
 }
 
@@ -73,9 +78,9 @@ impl Scope {
     ///
     /// `id` is `None` for a log written before the scope id was recorded,
     /// and a fresh one is issued rather than the resume failing — the same
-    /// shape of fallback as an ownerless `run_started` resuming as
+    /// shape of fallback as an ownerless `session_opened` resuming as
     /// [`super::ANON`], and for the same reason: a log that predates a field
-    /// is still a run.
+    /// is still a session.
     pub(super) fn restore(
         id: Option<ScopeId>,
         owner: String,
@@ -116,14 +121,15 @@ impl Scope {
         self.budget.exhausted()
     }
 
-    /// Take `amount` off the balance, or refuse without moving it.
-    pub(super) fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
-        self.budget.reserve(amount)
-    }
-
-    /// Settle `amount`, returning the new balance (`None` without a budget).
-    pub(super) fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
-        self.budget.spend(amount)
+    /// Take `balance` as the counter's value: the cache follows the log.
+    ///
+    /// Used after a decision taken inside the store, where the ledger has
+    /// already said what the balance is ([`super::fold_balance`]).  The
+    /// counter is a cache of the events, so it is *set* from the fold rather
+    /// than nudged by arithmetic of its own — the one direction that cannot
+    /// drift.
+    pub(super) fn set_balance(&mut self, balance: Option<i64>) {
+        self.budget = Budget::new(balance);
     }
 
     /// The owner granting again: raise the balance by `grant.amount` and
@@ -174,10 +180,12 @@ mod tests {
         assert_ne!(minted.id(), kept.id());
     }
 
-    /// The counter moves the way the budget does, and a second grant raises
-    /// it and replaces the words a refusal reports.
+    /// The counter follows the ledger: every move decided in the store sets
+    /// it ([`Scope::set_balance`]) — a reservation, a refusal and a
+    /// settlement alike — and a second grant raises it and replaces the
+    /// words a refusal reports.
     #[test]
-    fn the_scope_counter_reserves_spends_and_takes_a_second_grant() {
+    fn the_scope_counter_follows_the_fold_and_takes_a_second_grant() {
         let mut scope = Scope::new(
             "user-2".to_string(),
             Some(BudgetGrant {
@@ -186,11 +194,16 @@ mod tests {
                 desc: None,
             }),
         );
-        assert_eq!(scope.reserve(30), Ok(true));
+        // A reservation of 30 was decided and recorded in the store; the
+        // counter takes what the ledger now folds to.
+        scope.set_balance(Some(70));
         assert_eq!(scope.remaining(), Some(70));
-        assert_eq!(scope.reserve(1_000), Ok(false), "a refusal moves nothing");
+        // A refusal folds to the same balance it started from.
+        scope.set_balance(Some(70));
         assert_eq!(scope.remaining(), Some(70));
-        assert_eq!(scope.spend(70), Ok(Some(0)));
+        // And a settlement of 70 folds to nothing left.
+        scope.set_balance(Some(0));
+        assert_eq!(scope.remaining(), Some(0));
         assert!(scope.exhausted());
 
         scope

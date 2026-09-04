@@ -1,49 +1,57 @@
---- knl — the Lua kernel (POC of ctx / beat / fold / Outcome).
+--- knl — the Lua kernel (session + device / beat / fold / Outcome).
 ---
 --- What this is
 ---   The driving half of the kernel/shell split: Rust is the pure syscall
----   layer (session / append / events / view / spend / close), and this
----   module runs a beat — one model call plus the tools that call asks for —
----   over it, returning an `Outcome`. See `core-loop-design.md` (beat / ctx)
----   on top of `knl-kernel-design.md`; this file is the POC, not the full one.
+---   layer (session / append / events / view / reserve / spend / close), and
+---   this module runs a beat — one model call plus the tools that call asks
+---   for — over it, returning an `Outcome`. See `session-device-design.md`
+---   (the two-argument beat) over `knl-kernel-design.md`.
 ---
---- The ctx shape (core-loop-design.md §1/§2)
----   `knl.open{...}` returns a ctx: a single immutable handle that carries
----   both the state (the Rust session handle — History / Budget) and the
----   config (the default policy: llm, tools, filters, ...). `knl.beat(ctx)`
----   takes that one argument and reads everything from it. Per-beat policy
----   variation is NOT an override argument — derive a new ctx with
----   `ctx:with{ llm = strong }` and beat that instead. There is no loop in
----   this module: a driver composes beats on the spot, shell-style; the
----   minimal primitive is deliberate so that composition stays writable
----   inline (the old `run` is gone — a default loop belongs to a layer
----   above knl, not inside it).
+--- Two arguments, two owners (session-device-design.md §1/§4)
+---   `knl.open{ owner?, budget?, store? }` hands back the kernel's session
+---   userdata verbatim — the durable half: the fact-log and the quota, owned
+---   by the kernel, advanced only by appending. `knl.device{ llm?, tools?,
+---   tool_policy?, fold?, filters?, system?, cost? }` builds the policy half
+---   — a stateless value whose defaults are resolved once at construction
+---   and then frozen. `knl.beat(session, device)` takes both. They are not
+---   bundled into one handle because they differ in owner (kernel / caller),
+---   lifetime (durable / per-process) and mutability (append-only / frozen),
+---   and the config is consumed at construction rather than carried.
+---   Per-beat policy variation is not an override argument: derive another
+---   device with `d:with{ llm = strong }` and beat with that one.
 ---
---- Immutability (core-loop-design.md §2)
----   The config is fixed at open/with time and guarded by `__newindex`
----   (mutating a ctx raises). The state only advances by appending to the
----   fact-log through the handle — the ctx value itself never mutates.
----   `with` returns a new ctx sharing the same session; concurrent appends
----   to one session are the Rust kernel's CAS problem, not Lua's.
+--- Lifecycle belongs to the session (session-device-design.md §9-e)
+---   The canonical bracket is the callback form — the kernel opens, runs the
+---   body, and closes, so an error escaping the body still records the
+---   boundary:
 ---
---- Beat numbering (kernel-owned)
----   The ctx is the numbering authority. Appending a `model_response`
----   through `ctx:append` is what numbers it: the Rust kernel assigns the
----   `beat` (like `seq`). An append records, it does not charge. beat reads
----   the number back with `ctx:beats()` afterwards and stamps it onto the
----   tool_call / tool_result events.
+---       local result = knl.session({ owner = "u", budget = { amount = 10 } },
+---           function(s) return knl.beat(s, d) end)
+---
+---   `knl.session` resumes instead of opening when the opts name a session.
+---   `local s <close> = knl.open{...}` is the alternative and the Rust Drop
+---   backstop is the last resort; a body error always wins over a close that
+---   failed on its way out (§9-f).
+---
+--- Beats are declared, not numbered (session-device-design.md §9-a)
+---   The kernel does not count beats. `knl.beat` mints one id per beat with
+---   `knl.new_beat_id()` (time-ordered, session-free) and stamps it on every
+---   event that beat writes — request, model_response, the tool pair, and a
+---   failed call's note. The kernel stores a `beat` it is given and asks
+---   only that it be a string; grouping and ordering read it back, nothing
+---   more. `resp.beat` carries the same id out to the caller.
 ---
 --- The budget (budget-design.md §2)
----   The budget is a quota the owner granted the run, not a tally of what it
----   used. beat asks for permission BEFORE it calls — `ctx:reserve(n)`, after
----   the request is known and before anything is recorded — and a refusal is
----   a planned stop: `Ok{ budget_stopped = true, tag = <the grant's tag> }`
----   with no `request` event and no call. How much a beat asks for is beat's
----   own policy, not the kernel's: `config.cost(request)` when the caller
----   supplies one, otherwise one unit per beat. What a unit *means* is
----   whatever the owner tagged the grant with — the kernel reads the number
----   and nothing else, and token usage (`view("usage")`) is a separate
----   reading that beat never folds back into the budget.
+---   The budget is a quota the owner granted the session, not a tally of
+---   what it used. beat asks for permission BEFORE it calls —
+---   `session:reserve(n)`, after the request is known and before anything is
+---   recorded — and a refusal is a planned stop, not a failure and not a
+---   model decision: `Outcome.stopped("budget", tag)`, with no `request`
+---   event and no call. How much a beat asks for is the device's policy:
+---   `device.cost(request)`, one unit per beat by default. What a unit
+---   *means* is whatever the owner tagged the grant with — the kernel reads
+---   the number and nothing else, and token usage (`view("usage")`) is a
+---   separate reading that beat never folds back into the budget.
 ---
 --- What the POC deliberately leaves out
 ---   Real provider adapters (llm is `fn(req) -> {status, content, usage,
@@ -53,8 +61,8 @@
 
 --- The Rust syscall bridge, captured before `require("knl")` shadows the
 --- name (see the header). `nil` in a VM that has no bridge (e.g. the pure
---- lspec runner): `fold` / `Outcome` / `beat` never touch it, and `open`
---- reports its absence rather than indexing nil.
+--- lspec runner): `fold` / `Outcome` / `device` never touch it, and the
+--- entry points that do report its absence rather than indexing nil.
 local syscall = knl
 
 local lshape = require("lshape")
@@ -62,6 +70,23 @@ local T = lshape.t
 local shape = lshape.check
 
 local M = {}
+
+--- The bridge function `method` names, resolved at call time.
+---
+--- The load-time capture above is the primary source; the global is read
+--- again as a fallback so a spec that installs a fake bridge after this
+--- module loaded still reaches it. Missing either way is a loud error, not
+--- an index of nil.
+local function bridge(method)
+    local b = syscall
+    if type(b) ~= "table" or type(b[method]) ~= "function" then
+        b = rawget(_G, "knl")
+    end
+    if type(b) ~= "table" or type(b[method]) ~= "function" then
+        error("knl." .. method .. ": the knl syscall bridge is not available in this VM", 3)
+    end
+    return b[method]
+end
 
 -- ============================================================
 -- Outcome — the result type of a beat
@@ -74,12 +99,11 @@ local M = {}
 
 local Outcome = {}
 
---- The status values the kernel knows. Exactly these three, provider-neutral.
-local STATUSES = { "ok", "refused", "error" }
+--- The status values the kernel knows. Exactly these four, provider-neutral.
+local STATUSES = { "ok", "refused", "error", "stopped" }
 
---- A beat that ran (a budget stop is one too — it ran and stopped on
---- purpose). `out` is the call's return, or `{ budget_stopped = true, tag }`
---- when the reservation was refused before calling.
+--- A beat that ran: `out` is the call's return (content / usage /
+--- stop_reason, plus the `beat` id and the tool summary this layer added).
 function Outcome.ok(out)
     return { status = "ok", out = out }
 end
@@ -98,6 +122,14 @@ function Outcome.err(kind, detail)
     return { status = "error", kind = kind, detail = detail }
 end
 
+--- The beat stopped on purpose before calling: an allowance would not cover
+--- it. Not a failure (nothing broke) and not a refusal (the model was never
+--- asked) — the branch a caller's loop exits on. `tag` names the grant that
+--- stopped it, when the owner gave it one.
+function Outcome.stopped(reason, tag)
+    return { status = "stopped", reason = reason, tag = tag }
+end
+
 function Outcome.is_ok(o)
     return type(o) == "table" and o.status == "ok"
 end
@@ -110,9 +142,14 @@ function Outcome.is_error(o)
     return type(o) == "table" and o.status == "error"
 end
 
---- Match an Outcome against `arms = { ok = fn, refused = fn, error = fn }`.
+function Outcome.is_stopped(o)
+    return type(o) == "table" and o.status == "stopped"
+end
+
+--- Match an Outcome against `arms = { ok = fn, refused = fn, error = fn,
+--- stopped = fn }`.
 ---
---- Exhaustive: every one of the three arms must be present, and the actual
+--- Exhaustive: every one of the four arms must be present, and the actual
 --- status must be one the kernel knows. A missing arm is a loud error rather
 --- than a silently-dropped case (the dynamic-language stand-in for a
 --- compiler's exhaustiveness check).
@@ -183,8 +220,9 @@ end
 --- Fold an event list into a provider-neutral request.
 ---
 --- The default fold, for chat-shaped providers. Pure: it reads `events` and
---- `config` and writes nothing. Three kinds map to messages and the rest are
---- skipped (tool_call / run_* / model_call_failed / request / open kinds):
+--- the `device`'s policy fields and writes nothing. Three kinds map to
+--- messages and the rest are skipped (tool_call / session_* / budget_* /
+--- model_call_failed / request):
 ---
 ---   msg_user       -> { role = "user", content = <verbatim> }
 ---   model_response -> { role = "assistant", content = <verbatim> }
@@ -193,14 +231,14 @@ end
 ---                     tool_results batch together, which for a well-formed
 ---                     history is the same as grouping by beat)
 ---
---- `system` and `tools` are composed from the config each beat, not read
+--- `system` and `tools` are composed from the device each beat, not read
 --- from the history.
 ---
---- @param events table  array of stored events (from `ctx:events()`)
---- @param config table
+--- @param events table  array of stored events (from `session:events()`)
+--- @param device table  a knl device (any table carrying system / tools)
 --- @return table request  { system?, messages, tools? }
-function M.fold(events, config)
-    config = config or {}
+function M.fold(events, device)
+    device = device or {}
     local messages = tag_array({})
     local batch = tag_array({})
 
@@ -265,35 +303,66 @@ function M.fold(events, config)
                 is_error = (ev.ok == false) or nil,
             }
         end
-        -- everything else (tool_call / run_* / model_call_failed / request /
-        -- open kinds) is not part of a request: skip it.
+        -- everything else (tool_call / session_* / budget_* /
+        -- model_call_failed / request) is not part of a request: skip it.
     end
     close_dangling()
     flush()
 
     local request = { messages = messages }
-    if config.system ~= nil then
-        request.system = config.system
+    if device.system ~= nil then
+        request.system = device.system
     end
-    if config.tools ~= nil then
-        request.tools = wire_tools(config.tools)
+    if device.tools ~= nil then
+        request.tools = wire_tools(device.tools)
     end
     return request
 end
 
 -- ============================================================
--- shapes — the kernel's data contracts (handwritten lshape; the
--- schema-bridge SoT judgement is a separate, non-blocking ST)
+-- shapes — the public contracts of this module (handwritten lshape)
 -- ============================================================
 --
--- Only *data* gets a shape. The config is a closure bundle (llm / tools /
--- filters are functions) — not persistable, not shapeable; its checks stay
--- in `config_problem`. What crosses boundaries as data is shaped here and
--- asserted in dev mode (LSHAPE_CHECK=1), a no-op in prod — the same
--- boundary discipline as knl_adapter's `llm_result`.
+-- Every public IF is defined here and published through `M.shapes`
+-- (session-device-design.md §9-k), so a caller reads the contract as data
+-- rather than out of prose, and `M.shapes.api` (§9-m) names the shape of
+-- every export so a spec can check the registry is complete instead of a
+-- person remembering to update it.
+--
+-- The shapes are asserted at the boundaries in dev mode (LSHAPE_CHECK=1)
+-- and are a no-op in prod. That is why every construction check that must
+-- be loud — `knl.device`'s — also exists as an explicit check beside the
+-- assert: a dev-only gate would let a broken device through in prod.
+--
+-- Two limits of the DSL are worked around in the open rather than hidden:
+-- lshape has no numeric range, so `cost_result` says "number" and the
+-- whole-number >= 1 rule is checked in beat [3]; and "callable" (a
+-- function, or a table / userdata carrying `__call`) is wider than any one
+-- prim, so the shape admits the three types and `device_problem` makes the
+-- exact judgement.
+--
+-- What is deliberately NOT here: the kernel's own event vocabulary
+-- (msg_user / request / model_response / model_call_failed / tool_call /
+-- tool_result). The Rust validator is its single source of truth
+-- (session-device-design.md §11 R7); two copies of it drifted apart in
+-- three fields. What this layer adds — and therefore all it checks — is
+-- the `beat` id it stamps on the events it writes.
+
+--- A Lua function, as a shape. lshape's `prim` handler is `type(v) ==
+--- schema.prim` for any type name, but `lshape.t` exposes only the five it
+--- names, so these two are built from the same plain-data schema form
+--- (Schema-as-Data: the state is the table; the metatable carries only the
+--- `:is_optional()` / `:describe()` sugar).
+local FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
+local USERDATA = setmetatable({ kind = "prim", prim = "userdata" }, lshape.t._internal.schema_mt)
+
+--- Something a beat can call: a function, or a table / userdata carrying
+--- `__call` — a Port shim may hand back either. The exact test is
+--- `callable` below, run loudly at construction; this is its data shape.
+local CALLABLE = T.any_of({ FUNCTION, T.table, USERDATA })
 
 --- An Outcome, as data. Discriminated on `status` — exactly the kernel's
---- three, each variant carrying only its own fields.
+--- four, each variant carrying only its own fields.
 local OUTCOME = T.discriminated("status", {
     ok = T.shape({
         status = T.literal("ok"),
@@ -308,6 +377,11 @@ local OUTCOME = T.discriminated("status", {
         status = T.literal("error"),
         kind = T.one_of({ "conf", "filter", "call", "state" }),
         detail = T.any,
+    }),
+    stopped = T.shape({
+        status = T.literal("stopped"),
+        reason = T.string,
+        tag = T.string:is_optional(),
     }),
 })
 
@@ -327,70 +401,240 @@ local REQUEST = T.shape({
     tools = T.array_of(WIRE_TOOL):is_optional(),
 })
 
---- Every event minimally: a `kind` string. The vocabulary is open (run_* /
---- open kinds and caller kinds exist beyond what this module writes), so
---- the base shape is the only universal contract.
-local EVENT_BASE = T.shape({ kind = T.string })
+--- Every event, in the only terms this layer owns: a `kind` string, and —
+--- when the event is one a beat wrote — the `beat` id stamped on it, which
+--- is an opaque string and nothing more.
+---
+--- Per-kind field contracts are deliberately absent. The kernel's
+--- validator holds them (session-device-design.md §11 R7), the vocabulary
+--- is open (session_* / budget_* and a caller's own kinds exist beyond
+--- what this module writes), and a second copy here is a source of truth
+--- that can only drift.
+local EVENT_BASE = T.shape({
+    kind = T.string,
+    beat = T.string:is_optional(),
+})
 
---- Per-kind shapes for the kinds this module itself writes (plus the
---- msg_user seed). Open shapes: the kernel stamps seq / epoch_ms / beat on
---- the way in, and those ride alongside. `beat` is optional on the tool
---- pair (stamped from out.beat by execute_tools).
-local EVENT_SHAPES = {
-    msg_user = T.shape({
-        kind = T.literal("msg_user"),
-        content = T.any,
-    }),
-    request = T.shape({
-        kind = T.literal("request"),
-        request = REQUEST,
-    }),
-    model_response = T.shape({
-        kind = T.literal("model_response"),
-        content = T.any,
-        usage = T.table:is_optional(),
-        stop_reason = T.string:is_optional(),
-    }),
-    model_call_failed = T.shape({
-        kind = T.literal("model_call_failed"),
-        error = T.string,
-    }),
-    tool_call = T.shape({
-        kind = T.literal("tool_call"),
-        beat = T.number:is_optional(),
-        call_id = T.string,
-        name = T.string,
-        args = T.table,
-    }),
-    tool_result = T.shape({
-        kind = T.literal("tool_result"),
-        beat = T.number:is_optional(),
-        call_id = T.string,
-        ok = T.boolean,
-        result = T.any,
-    }),
-}
+--- One entry of a device's `tools` map: what the model may call
+--- (description / input_schema, both optional and both provider
+--- vocabulary) plus how to call it. Open: `schema` is still accepted as
+--- the legacy alias for `input_schema` by fold's wire_tools.
+local TOOL_ENTRY = T.shape({
+    description = T.string:is_optional(),
+    input_schema = T.any:is_optional(),
+    handler = FUNCTION,
+})
 
---- The contracts this module holds itself to, as data — mirrors how
---- knl_adapter exposes `llm_result` via `M.shapes`.
+--- What a `tool_policy` may decide (session-device-design.md §9-l): `nil`
+--- is "no opinion" and runs, and the two words are the whole vocabulary.
+--- Anything else is a device-contract violation, not a third meaning.
+local TOOL_POLICY_DECISION = T.one_of({ "run", "deny" }):is_optional()
+
+--- What `device.cost` must answer: a whole number >= 1, which is what
+--- makes the budget a ranking function and the run finite. lshape has no
+--- numeric range or integrality combinator, so the shape carries the type
+--- and beat [3] carries the bound — loudly, in prod as well as dev.
+local COST_RESULT = T.number:describe("a whole number >= 1 (the bound is checked in beat, not by this shape)")
+
+--- The config `knl.device` consumes. Closed: a policy typo must not
+--- quietly become a no-op, which is also why `knl.device` rejects unknown
+--- keys loudly rather than leaving it to this dev-mode assert.
+local DEVICE_CONFIG = T.shape({
+    llm = CALLABLE:is_optional(),
+    tools = T.map_of(T.string, TOOL_ENTRY):is_optional(),
+    tool_policy = FUNCTION:is_optional(),
+    fold = FUNCTION:is_optional(),
+    filters = T.array_of(FUNCTION):is_optional(),
+    system = T.any:is_optional(),
+    cost = FUNCTION:is_optional(),
+}, { open = false })
+
+--- What an owner grants a session. `amount` is a count of whatever `tag`
+--- names (the kernel reads the number and nothing else); lshape has no
+--- integer prim, so the whole-number expectation rides in the doc.
+local BUDGET_GRANT = T.shape({
+    amount = T.number:describe("a whole number of units"),
+    tag = T.string:is_optional(),
+    desc = T.string:is_optional(),
+})
+
+--- `knl.open` opts: state only. Policy has its own constructor.
+local OPEN_OPTS = T.shape({
+    owner = T.string:is_optional(),
+    budget = BUDGET_GRANT:is_optional(),
+    store = T.any:is_optional(),
+})
+
+--- `knl.resume` opts: the store and the session to reopen, plus the grant
+--- this process runs under.
+local RESUME_OPTS = T.shape({
+    store = T.any,
+    session = T.string,
+    budget = BUDGET_GRANT:is_optional(),
+})
+
+--- The token accounting an llm answer promises: three counts, always
+--- present as numbers. An adapter normalizes a provider that reported none
+--- to zeros, so this stays strict rather than admitting a missing field.
+--- Closed so a stray usage key cannot ride across the boundary.
+local USAGE = T.shape({
+    input_tokens = T.number,
+    output_tokens = T.number,
+    thinking_tokens = T.number,
+}, { open = false })
+
+--- The refusal detail an llm answer carries alongside a "refused" status.
+--- `kind` normalizes *why* the beat did not progress across providers:
+--- "model" is the model declining, "content_filter" a provider safety
+--- filter blocking it — a distinction the kernel's status cannot carry, so
+--- it rides here. Present iff status == "refused".
+local REFUSAL = T.shape({
+    kind = T.one_of({ "model", "content_filter" }),
+    detail = T.string:is_optional(),
+}, { open = false })
+
+--- What `device.llm(request)` hands back — the shape beat reads at [5],
+--- and the one an adapter's Mapper is held to on the way out (knl_adapter
+--- asserts against this very table). Closed, so a contract gap in one
+--- provider's parse cannot leak past the boundary: `content` is an array
+--- of blocks (tagged as an empty array when the model said nothing, so it
+--- crosses the JSON bridge as `[]`), `usage` is the strict count above,
+--- `stop_reason` is absent when no reason was given, and `refusal` is
+--- present exactly on "refused".
+---
+--- The third status a beat can meet — a transport / provider failure — is
+--- not a variant here: that path answers `nil, err` (or raises), which
+--- beat records as `model_call_failed` and reports as `err("call")`.
+local LLM_RESULT = T.shape({
+    content = T.array_of(T.table),
+    usage = USAGE,
+    stop_reason = T.string:is_optional(),
+    status = T.one_of({ "ok", "refused" }),
+    refusal = REFUSAL:is_optional(),
+}, { open = false })
+
+--- The contracts this module holds itself to, as data.
 M.shapes = {
     outcome = OUTCOME,
     request = REQUEST,
-    event = EVENT_BASE,
-    events = EVENT_SHAPES,
+    event_base = EVENT_BASE,
+    device_config = DEVICE_CONFIG,
+    tool_entry = TOOL_ENTRY,
+    tool_policy_decision = TOOL_POLICY_DECISION,
+    cost_result = COST_RESULT,
+    llm_result = LLM_RESULT,
+    open_opts = OPEN_OPTS,
+    resume_opts = RESUME_OPTS,
+    budget_grant = BUDGET_GRANT,
 }
 
---- Dev-mode gate for an event about to cross into the kernel: the base
---- contract always, the per-kind contract when this module knows the kind.
---- Unknown kinds pass on the base alone (open vocabulary, not a typo trap
---- this layer can judge). No-op in prod.
+--- The API registry (session-device-design.md §9-m): one entry per public
+--- export, naming the shape of what goes in and what comes out. It exists
+--- so the completeness of the contract is *checked* rather than remembered
+--- — `knl/spec/api_spec.lua` walks this module and fails on an export with
+--- no entry, an entry with no export, and a device field that
+--- `device_config` does not describe.
+---
+--- `args` is a shape, or an ordered list of shapes and descriptions for
+--- the arguments a shape cannot express (a session handle, a callback).
+--- `returns` is the same. `members` names the functions of an export that
+--- is itself a namespace (`Outcome`).
+---
+--- This registry covers the Lua module. The bridge declares its own surface
+--- through `knl.api()` (SESSION_API / MODULE_API in bridge/knl.rs), and
+--- `M.shapes.session` / `M.shapes.module` below describe that surface from
+--- this side; `tests/fixtures/knl_turn_test.lua` (inv10, runs with the
+--- bridge) checks the two against each other in both directions, so a
+--- syscall added on one side and not the other goes red.
+M.shapes.session = {
+    id = { args = "none", returns = "string (stream id)" },
+    scope_id = { args = "none", returns = "string (kernel-issued scope id)" },
+    owner = { args = "none", returns = "string (principal, or anon / system)" },
+    append = { args = { EVENT_BASE }, returns = "integer seq; refused after session_closed and for kernel-only kinds" },
+    events = { args = { "integer from?" }, returns = T.array_of(EVENT_BASE) },
+    len = { args = "none", returns = "integer" },
+    view = { args = { T.one_of({ "usage", "tail" }), "table opts?" }, returns = "table (the named fold)" },
+    reserve = { args = { "integer n >= 0" }, returns = "true | false, tag — decided inside the store" },
+    spend = { args = { "integer n >= 0" }, returns = "integer remaining | nil (no grant)" },
+    remaining = { args = "none", returns = "integer | nil (no grant)" },
+    exhausted = { args = "none", returns = "boolean" },
+    close = {
+        args = { T.string:is_optional(), T.string:is_optional() },
+        returns = "nothing; records session_closed{reason, detail?} once per stream",
+    },
+    __close = { args = { "session", "any err" }, returns = "nothing; scope_exit or error(+detail)" },
+}
+
+M.shapes.module = {
+    open = { args = OPEN_OPTS, returns = "session" },
+    resume = { args = RESUME_OPTS, returns = "session" },
+    new_beat_id = { args = "none", returns = "string" },
+    api = { args = "none", returns = "{ session = { {name, doc}... }, module = { {name, doc}... } }" },
+}
+
+M.shapes.api = {
+    open = {
+        args = OPEN_OPTS,
+        returns = "session (the kernel's userdata, unwrapped)",
+    },
+    resume = {
+        args = RESUME_OPTS,
+        returns = "session (pre-loaded with the persisted log)",
+    },
+    session = {
+        args = { "open_opts | resume_opts", "function fn(session)" },
+        returns = "whatever fn returned (the session is closed either way)",
+    },
+    device = {
+        args = DEVICE_CONFIG,
+        returns = "device (frozen; d:with derives another)",
+    },
+    beat = {
+        args = { "session", "device" },
+        returns = OUTCOME,
+    },
+    fold = {
+        args = { T.array_of(EVENT_BASE), "device (read for system / tools)" },
+        returns = REQUEST,
+    },
+    new_beat_id = {
+        args = "none",
+        returns = "string (time-ordered, session-free)",
+    },
+    Outcome = {
+        args = "none (a namespace table, not a function)",
+        returns = "the Outcome constructors, predicates and match",
+        members = {
+            ok = { args = { "table out" }, returns = OUTCOME },
+            refused = { args = { "string reason", "table detail?" }, returns = OUTCOME },
+            err = { args = { T.one_of({ "conf", "filter", "call", "state" }), "any detail" }, returns = OUTCOME },
+            stopped = { args = { "string reason", "string tag?" }, returns = OUTCOME },
+            is_ok = { args = { "any" }, returns = "boolean" },
+            is_refused = { args = { "any" }, returns = "boolean" },
+            is_error = { args = { "any" }, returns = "boolean" },
+            is_stopped = { args = { "any" }, returns = "boolean" },
+            match = {
+                args = { OUTCOME, "table arms { ok, refused, error, stopped }" },
+                returns = "whatever the taken arm returned",
+            },
+        },
+    },
+    shapes = {
+        args = "none (a data table)",
+        returns = "this registry: every shape above, plus `api`, `session` and `module`",
+    },
+}
+
+--- Dev-mode gate for an event a beat is about to write: the contract this
+--- layer owns (a `kind`, and a `beat` that is a string when present). The
+--- kernel's validator holds the per-kind contract and refuses what it does
+--- not accept — this is not a second copy of it. No-op in prod.
+---
+--- It guards only what *beat* writes. A caller's own `session:append` goes
+--- straight to the kernel validator: the session handle is the kernel's,
+--- not something this module wraps.
 local function assert_event_dev(ev)
-    shape.assert_dev(ev, EVENT_BASE, "knl_event")
-    local per_kind = type(ev) == "table" and EVENT_SHAPES[ev.kind] or nil
-    if per_kind then
-        shape.assert_dev(ev, per_kind, "knl_event:" .. tostring(ev.kind))
-    end
-    return ev
+    return shape.assert_dev(ev, EVENT_BASE, "knl_event")
 end
 
 --- Dev-mode gate for an Outcome on its way out of beat. No-op in prod.
@@ -399,34 +643,105 @@ local function emit(o)
 end
 
 -- ============================================================
--- ctx — the immutable handle (state + config)
+-- device — the resolved, frozen policy half
 -- ============================================================
 
---- The fields `with` may derive. Everything that names the session itself
---- (owner / store / session) is NOT here: that is a different session, not a
---- derivation — open or resume one instead.
-local CONFIG_KEYS = {
-    llm = true,
-    tools = true,
-    tool_policy = true,
-    fold = true,
-    filters = true,
-    system = true,
-    cost = true,
-}
+--- The fields a device carries. The config is consumed at construction, so
+--- this is both the accepted key set and the field set of the result.
+--- Everything that names the session itself (owner / store / session /
+--- budget) is state and belongs to `knl.open` / `knl.resume`.
+local DEVICE_KEYS = { "llm", "tools", "tool_policy", "fold", "filters", "system", "cost" }
 
---- Minimal config shape check. Returns an error string, or nil when the
---- config is usable. `llm` is not required here — a ctx may be opened for
---- reading/appending only; beat's gate demands it.
-local function config_problem(config)
-    if type(config) ~= "table" then
-        return "config must be a table"
+local IS_DEVICE_KEY = {}
+for _, k in ipairs(DEVICE_KEYS) do
+    IS_DEVICE_KEY[k] = true
+end
+
+--- The metatable name `beat` recognises a device by. A protected metatable
+--- (`__metatable`), so the tag cannot be forged by assignment either.
+local DEVICE_TAG = "knl.device"
+
+--- The tag on a device's frozen tools map.
+local TOOLS_TAG = "knl.device.tools"
+
+--- How much one beat asks the budget for when the device names no policy.
+---
+--- One beat, one unit: a beat is the thing being bounded, so the default
+--- makes the grant a count of beats. It must be >= 1 — that is what makes
+--- the budget a ranking function and the run finite. What the unit *means*
+--- is the owner's (`budget = { amount = N, tag = "tokens" }` counts tokens,
+--- and then a device supplies `cost` to say how many one beat may take).
+local function default_cost()
+    return 1
+end
+
+--- Whether `v` can be called like a function (a callable table / userdata
+--- counts: a Port shim may hand back either).
+local function callable(v)
+    if type(v) == "function" then
+        return true
     end
-    if config.filters ~= nil and type(config.filters) ~= "table" then
-        return "filters must be an array of functions"
+    local mt = getmetatable(v)
+    return type(mt) == "table" and mt.__call ~= nil
+end
+
+--- A read-only view over `fields`: reads pass through, `pairs` walks the
+--- underlying table, and every assignment raises — including one to a key
+--- that already exists, which a plain `__newindex` on the table itself
+--- would let through.
+local function frozen(fields, what, tag)
+    return setmetatable({}, {
+        __index = fields,
+        __newindex = function(_, k)
+            error(what .. " is frozen: '" .. tostring(k) .. "' cannot be assigned", 2)
+        end,
+        __pairs = function()
+            return next, fields, nil
+        end,
+        __len = function()
+            return #fields
+        end,
+        __metatable = tag,
+    })
+end
+
+local function shallow_copy(t)
+    local out = {}
+    for k, v in pairs(t) do
+        out[k] = v
     end
-    if config.tools ~= nil and type(config.tools) ~= "table" then
-        return "tools must be a table"
+    return out
+end
+
+local function copy_array(t)
+    local out = {}
+    for i, v in ipairs(t or {}) do
+        out[i] = v
+    end
+    return out
+end
+
+--- Minimal device config check. Returns an error string, or nil when the
+--- config is usable. `llm` is not required here — a device may be built for
+--- its tools alone; beat's gate demands one.
+---
+--- This is the loud half of the pair: `DEVICE_CONFIG` says the same thing
+--- as data and is asserted beside it, but a dev-mode assert is a no-op in
+--- prod and a device built out of a mistyped config would then fail at the
+--- first beat instead of at the line that built it. It also makes the two
+--- judgements a shape cannot: "callable" (function / `__call`), and "a map
+--- of entries, not an array of flat specs".
+local function device_problem(config)
+    if config.llm ~= nil and not callable(config.llm) then
+        return "llm must be a function (or a callable)"
+    end
+    if config.tools ~= nil then
+        if type(config.tools) ~= "table" then
+            return "tools must be a map of name -> { description?, input_schema?, handler }"
+        end
+        if config.tools[1] ~= nil then
+            return "tools must be a map (name -> entry); bind an array of specs with knl_adapter.tools first"
+        end
     end
     if config.tool_policy ~= nil and type(config.tool_policy) ~= "function" then
         return "tool_policy must be a function"
@@ -437,345 +752,472 @@ local function config_problem(config)
     if config.cost ~= nil and type(config.cost) ~= "function" then
         return "cost must be a function (fn(request) -> integer >= 1)"
     end
+    if config.filters ~= nil then
+        if type(config.filters) ~= "table" then
+            return "filters must be an array of functions"
+        end
+        for i, filter in ipairs(config.filters) do
+            if type(filter) ~= "function" then
+                return "filters[" .. i .. "] must be a function"
+            end
+        end
+    end
     return nil
 end
 
-local ctx_with -- forward declaration (referenced by make_ctx's __index)
+local device_with -- forward declaration (served by the device's __index)
 
---- Wrap a kernel session handle and a frozen config into a ctx.
+--- Build a device: the resolved, frozen policy half of a beat.
 ---
---- Reads resolve in order: `with` / internals, then config fields (the
---- memory-map read: `ctx.llm`, `ctx.system`, ... are direct), then the
---- handle's own surface (state methods — `ctx:append`, `ctx:events`,
---- `ctx:beats`, `ctx:reserve`, `ctx:view`, ... delegate to the kernel
---- handle). Writes
---- raise: the ctx is immutable, derive with `ctx:with{...}`.
-local function make_ctx(handle, config)
-    -- A ctx resolves config fields before handle methods, so a config key
-    -- named like a session method would silently replace it (`ctx:reserve`
-    -- turning into a policy function). Refuse that at construction.
+--- The config is *consumed* here — defaults are resolved once (`fold` ->
+--- `knl.fold`, `filters` -> `{}`, `cost` -> one unit per beat), types are
+--- checked once, and the result carries only resolved values. There is no
+--- `_config` to read back: what the device does is what its fields say.
+--- Unknown keys raise, because a typo in a policy field must not silently
+--- become a no-op.
+---
+--- The device is stateless: share one across sessions, and give one session
+--- several (escalation) — nothing about a beat is remembered here.
+---
+--- @param config table  { llm?, tools?, tool_policy?, fold?, filters?,
+---                        system?, cost? }
+--- @return table device  frozen, with `with` for derivation
+function M.device(config)
+    config = config or {}
+    if type(config) ~= "table" then
+        error("knl.device: config must be a table", 2)
+    end
     for k in pairs(config) do
-        if handle[k] ~= nil then
-            error("ctx config '" .. tostring(k) .. "' shadows a session method; use another key", 3)
+        if not IS_DEVICE_KEY[k] then
+            error(
+                "knl.device: unknown option '"
+                    .. tostring(k)
+                    .. "' (owner/budget/store/session are state — open or resume a session with them)",
+                2
+            )
         end
     end
-    local mt = {
+    -- Loud in prod (a construction error must not wait for the first beat)
+    -- and shaped in dev (the same contract as data, which is what
+    -- `knl.shapes.device_config` publishes).
+    local problem = device_problem(config)
+    if problem then
+        error("knl.device: " .. problem, 2)
+    end
+    shape.assert_dev(config, DEVICE_CONFIG, "knl.device config")
+
+    local fields = {
+        llm = config.llm,
+        tool_policy = config.tool_policy,
+        system = config.system,
+        fold = config.fold or M.fold,
+        cost = config.cost or default_cost,
+        -- The caller's arrays/maps are copied, so writing to them after
+        -- construction cannot reach the device (session-device-design §9-d).
+        filters = copy_array(config.filters),
+        tools = config.tools and frozen(shallow_copy(config.tools), "a device's tools map", TOOLS_TAG) or nil,
+    }
+
+    return setmetatable({}, {
         __index = function(_, k)
             if k == "with" then
-                return ctx_with
+                return device_with
             end
-            -- Internals: the spec and beat read these; not part of the
-            -- public surface.
-            if k == "_handle" then
-                return handle
-            end
-            if k == "_config" then
-                return config
-            end
-            local v = config[k]
-            if v ~= nil then
-                return v
-            end
-            -- The append boundary carries the dev-mode event contract:
-            -- every event that crosses into the kernel is asserted against
-            -- EVENT_BASE (+ the per-kind shape when known) before it goes.
-            if k == "append" then
-                local m = handle.append
-                return function(_, ev)
-                    return m(handle, assert_event_dev(ev))
-                end
-            end
-            -- State surface: delegate to the kernel handle. Methods are
-            -- re-bound so `ctx:append(...)` reaches `handle:append(...)`;
-            -- plain fields pass through as-is.
-            local m = handle[k]
-            if type(m) == "function" then
-                return function(_, ...)
-                    return m(handle, ...)
-                end
-            end
-            return m
+            return fields[k]
         end,
         __newindex = function(_, k)
-            error(
-                "ctx is immutable: derive a new one with ctx:with{ "
-                    .. tostring(k)
-                    .. " = ... }",
-                2
-            )
+            error("a device is frozen: derive a new one with d:with{ " .. tostring(k) .. " = ... }", 2)
         end,
-        __metatable = "knl.ctx",
-    }
-    return setmetatable({}, mt)
+        __pairs = function()
+            return next, fields, nil
+        end,
+        __metatable = DEVICE_TAG,
+    })
 end
 
---- Derive a new ctx from this one: same session (state), config with
---- `delta` merged over it. The original ctx is untouched and stays usable —
---- both point at the same fact-log, and the kernel's CAS guards concurrent
---- appends. Only CONFIG_KEYS may appear in the delta; `owner` / `store` /
---- `session` name a different session and are rejected loudly.
+--- Derive a new device: this one's resolved fields with `delta` over them,
+--- re-resolved through `knl.device`. The original is untouched and stays
+--- usable — a device is a value, and `with` is how a beat gets a different
+--- one (`knl.beat(s, d:with{ llm = strong })`).
 ---
---- @param ctx table  a knl ctx
---- @param delta table  config fields to override
---- @return table ctx'  a new immutable ctx
-ctx_with = function(ctx, delta)
+--- @param d table  a knl device
+--- @param delta table  device fields to override
+--- @return table device'  a new frozen device
+device_with = function(d, delta)
     if type(delta) ~= "table" then
-        error("ctx:with: delta must be a table", 2)
+        error("device:with: delta must be a table", 2)
     end
     local merged = {}
-    for k, v in pairs(ctx._config) do
-        merged[k] = v
+    for _, k in ipairs(DEVICE_KEYS) do
+        merged[k] = d[k]
     end
     for k, v in pairs(delta) do
-        if not CONFIG_KEYS[k] then
+        if not IS_DEVICE_KEY[k] then
             error(
-                "ctx:with: '"
+                "device:with: '"
                     .. tostring(k)
-                    .. "' is not a config field (owner/store/session are not "
-                    .. "derivable — open a new session instead)",
+                    .. "' is not a device field (owner/store/session name a session — open one instead)",
                 2
             )
         end
         merged[k] = v
     end
-    local problem = config_problem(merged)
-    if problem then
-        error("ctx:with: " .. problem, 2)
-    end
-    return make_ctx(ctx._handle, merged)
-end
-
---- Split open/resume opts into state opts (for the syscall) and config
---- (frozen onto the ctx). Unknown keys raise — a typo in a policy field
---- must not silently become a no-op.
-local function split_opts(opts, state_keys, who)
-    local state, config = {}, {}
-    for k, v in pairs(opts) do
-        if state_keys[k] then
-            state[k] = v
-        elseif CONFIG_KEYS[k] then
-            config[k] = v
-        else
-            error(who .. ": unknown option '" .. tostring(k) .. "'", 3)
-        end
-    end
-    local problem = config_problem(config)
-    if problem then
-        error(who .. ": " .. problem, 3)
-    end
-    return state, config
+    return M.device(merged)
 end
 
 -- ============================================================
--- open / resume — build a ctx
+-- open / resume / session — the state half
 -- ============================================================
 
 local OPEN_STATE_KEYS = { owner = true, budget = true, store = true }
 local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 
---- Open a session and return its ctx.
----
---- State opts (`owner` / `budget` / `store`) go to `knl.open` (the Rust
---- bridge — `store` absent / "mem" for the in-memory log, `{ sqlite =
---- "<path>" }` for a durable stream). Everything else is default policy,
---- frozen onto the ctx: config is fixed here, per-beat variation derives
---- with `ctx:with{...}`.
----
---- @param opts table  { owner?, budget?, store?,
----                      llm?, tools?, tool_policy?, fold?, filters?,
----                      system?, cost? }
---- @return table ctx  an immutable knl ctx
-function M.open(opts)
-    opts = opts or {}
-    if syscall == nil then
-        error("knl.open: the knl syscall bridge is not available in this VM")
+--- Reject anything that is not a state key. Policy has its own constructor
+--- now, so `knl.open{ llm = ... }` is a typo, not a shorthand.
+local function state_only(opts, allowed, who)
+    if type(opts) ~= "table" then
+        error(who .. ": opts must be a table", 3)
     end
-    local state, config = split_opts(opts, OPEN_STATE_KEYS, "knl.open")
-    local handle = syscall.open({
-        owner = state.owner,
-        budget = state.budget,
-        store = state.store,
-    })
-    return make_ctx(handle, config)
+    for k in pairs(opts) do
+        if not allowed[k] then
+            local hint = IS_DEVICE_KEY[k] and " (policy belongs to knl.device)" or ""
+            error(who .. ": unknown option '" .. tostring(k) .. "'" .. hint, 3)
+        end
+    end
 end
 
---- Resume a persisted session and return its ctx.
+--- Open a session. The kernel's userdata comes back as-is — this module
+--- wraps nothing: `s:append`, `s:events`, `s:reserve`, `s:view`, `s:close`
+--- and `<close>` are the kernel's own surface.
 ---
---- The state comes back from the store (`knl.resume` reopens the durable
---- stream and re-folds the log); the config does NOT — it is a non-
---- serializable closure bundle, so every process supplies its own default
---- policy here (core-loop-design.md §4: state is durable, config is
---- per-process).
+--- @param opts table  { owner?, budget? = { amount, tag?, desc? }, store? }
+--- @return userdata session
+function M.open(opts)
+    opts = opts or {}
+    state_only(opts, OPEN_STATE_KEYS, "knl.open")
+    shape.assert_dev(opts, OPEN_OPTS, "knl.open opts")
+    return bridge("open")({
+        owner = opts.owner,
+        budget = opts.budget,
+        store = opts.store,
+    })
+end
+
+--- Resume a persisted session. The state comes back from the store (the
+--- bridge reopens the durable stream and re-folds the log); policy does NOT
+--- — it is a non-serializable closure bundle, so every process builds its
+--- own device.
 ---
---- @param opts table  { store = { sqlite = <path> }, session = <id>, budget?,
----                      llm?, tools?, tool_policy?, fold?, filters?,
----                      system?, cost? }
---- @return table ctx  an immutable knl ctx, pre-loaded with the log
+--- @param opts table  { store = { sqlite = <path> }, session = <id>, budget? }
+--- @return userdata session  pre-loaded with the log
 function M.resume(opts)
     opts = opts or {}
-    if syscall == nil then
-        error("knl.resume: the knl syscall bridge is not available in this VM")
-    end
-    local state, config = split_opts(opts, RESUME_STATE_KEYS, "knl.resume")
-    local handle = syscall.resume({
-        store = state.store,
-        session = state.session,
-        budget = state.budget,
+    state_only(opts, RESUME_STATE_KEYS, "knl.resume")
+    shape.assert_dev(opts, RESUME_OPTS, "knl.resume opts")
+    return bridge("resume")({
+        store = opts.store,
+        session = opts.session,
+        budget = opts.budget,
     })
-    return make_ctx(handle, config)
+end
+
+--- The canonical bracket (session-device-design.md §9-e): open (or resume),
+--- run the body with the session, close it either way.
+---
+---     local out = knl.session({ owner = "u" }, function(s)
+---         return knl.beat(s, d)
+---     end)
+---
+--- Opts naming a `session` resume that stream instead of opening a new one.
+--- The body's return values are the bracket's. When the body raises, the
+--- session is closed with reason "error" first and the body's error is then
+--- re-raised unchanged: a bookkeeping failure must not replace the failure
+--- it is bookkeeping for (§9-f), so a close that itself fails on that path
+--- is dropped. On the clean path a failing close raises, since a bracket
+--- that reports success with no boundary recorded is the one outcome this
+--- exists to rule out.
+---
+--- A close that fails on the error path is not silent either: it goes to
+--- the host `log` global as a warning when the VM has one. It cannot be
+--- raised (that would replace the body's error) and it cannot be returned
+--- (this path does not return).
+---
+--- The reason vocabulary is the kernel's: "closed" here (the bridge's own
+--- DEFAULT_CLOSE_REASON), "scope_exit" / "error" from `<close>`, "dropped"
+--- from the Drop backstop. The message of a body error does not ride along
+--- — `s:close` takes a reason and nothing else — so it stays with the
+--- error that is propagating.
+---
+--- @param opts table  knl.open / knl.resume opts
+--- @param fn function  fn(session) -> ...
+--- @return ...  whatever `fn` returned
+function M.session(opts, fn)
+    if type(fn) ~= "function" then
+        error("knl.session: the second argument must be a function fn(session)", 2)
+    end
+    opts = opts or {}
+    local s
+    if opts.session ~= nil then
+        s = M.resume(opts)
+    else
+        s = M.open(opts)
+    end
+
+    local returned = table.pack(pcall(fn, s))
+    if returned[1] then
+        s:close("closed")
+        return table.unpack(returned, 2, returned.n)
+    end
+    -- The body is failing: close best-effort with the body's error as the
+    -- boundary's `detail`, then let that error through. A close that fails
+    -- here is reported, not raised and not swallowed — the body's error is
+    -- the one that propagates (§9-f, the suppressed exception of
+    -- try-with-resources).
+    local closed_ok, cerr = pcall(s.close, s, "error", tostring(returned[2]))
+    if not closed_ok then
+        local host_log = rawget(_G, "log")
+        if type(host_log) == "table" and type(host_log.warn) == "function" then
+            pcall(host_log.warn, "knl.session: close failed after body error: " .. tostring(cerr))
+        end
+    end
+    error(returned[2], 0)
+end
+
+--- Mint a beat id: a time-ordered, session-free string the caller stamps on
+--- the events of one beat (session-device-design.md §9-a). A module
+--- function, not a direct bridge call, so a spec can stand in for it.
+---
+--- @return string beat_id
+function M.new_beat_id()
+    return bridge("new_beat_id")()
 end
 
 -- ============================================================
 -- beat — one complete beat (the primitive; there is no loop here)
 -- ============================================================
 
---- Run the tool_use blocks of a response, closing every one with a
---- tool_result. What runs / is skipped is `config.tool_policy` (a
---- `fn(tc, out) -> action`), the success result is the handler's, and the
---- pair-closing record — including the machine-minimal error for an unknown
---- tool or a raising handler — is the kernel's. `out.beat` (set by beat
---- before this runs) stamps both halves of every pair.
----
---- @param ctx table  a knl ctx
---- @return table summary  one { call_id, name, ok } per tool_use
-local function execute_tools(ctx, config, out)
-    local summary = {}
-    local tools = config.tools or {}
-    local policy = config.tool_policy
+--- Whether `s` answers the part of the session surface a beat uses. A
+--- duck-type on purpose: the real handle is Rust userdata with no metatable
+--- name of its own, and a faithful Lua stand-in must be beatable too.
+local function is_session(s)
+    local t = type(s)
+    if t ~= "table" and t ~= "userdata" then
+        return false
+    end
+    local ok, append, reserve, events = pcall(function()
+        return s.append, s.reserve, s.events
+    end)
+    return ok and callable(append) and callable(reserve) and callable(events)
+end
 
+--- Append an event this beat is writing, through the dev-mode contract.
+local function record(session, ev)
+    return session:append(assert_event_dev(ev))
+end
+
+--- Ask the policy about one tool_use block (session-device-design.md §9-l).
+---
+--- The contract is `tool_policy(tool_use_block, out) -> decision, reason?`
+--- with a decision of `nil` (no opinion — run), `"run"` or `"deny"`, and
+--- nothing else: a fourth word is a device-contract violation rather than a
+--- fourth meaning this layer gets to guess at. A policy that RAISES is
+--- fail-closed — a gate written to veto tools must not fall open on its own
+--- bug — so the raise denies the call and its message becomes the reason.
+---
+--- @param policy function|nil  device.tool_policy
+--- @param block table  the tool_use block being decided
+--- @param out table  the model response it came in
+--- @return string|nil action  "run" / "deny", or nil on a violation
+--- @return string|nil reason  the denial's reason, when there is one
+--- @return string|nil problem  the contract violation, when there is one
+local function decide_tool(policy, block, out)
+    if policy == nil then
+        return "run"
+    end
+    local ok, decided, reason = pcall(policy, block, out)
+    if not ok then
+        return "deny", "policy raised: " .. tostring(decided)
+    end
+    -- The published shape is the vocabulary, checked (not asserted) so the
+    -- judgement is the same in prod as in dev: a decision outside it is a
+    -- contract violation to report, not a raise.
+    if not shape.check(decided, TOOL_POLICY_DECISION) then
+        return nil,
+            nil,
+            "tool_policy returned "
+                .. (type(decided) == "string" and string.format("%q", decided) or type(decided))
+                .. ' (a decision must be nil, "run" or "deny")'
+    end
+    -- Past the check there are three values left: nil (no opinion), "run",
+    -- and "deny".
+    if decided ~= "deny" then
+        return "run"
+    end
+    -- A reason is optional and a string; anything else is not made up into
+    -- one, it is left out.
+    return "deny", (type(reason) == "string" and reason ~= "" and reason) or nil
+end
+
+--- Run the tool_use blocks of a response, closing every one with a
+--- tool_result. What runs / is denied is `device.tool_policy`, the success
+--- result is the handler's, and the pair-closing record — including the
+--- machine-minimal error for an unknown tool, a denied call or a raising
+--- handler — is the kernel's. `beat_id` stamps both halves of every pair,
+--- so the pair reads back as part of its beat.
+---
+--- Every block is decided before any of them runs. A policy that breaks its
+--- contract therefore stops the beat with nothing dispatched and no
+--- tool_call written, rather than half a response's worth of side effects
+--- and a report that the config was wrong.
+---
+--- @param session userdata|table  a knl session
+--- @param device table  a knl device
+--- @param out table  the model response being executed
+--- @param beat_id string  the id of the beat writing these events
+--- @return table|nil summary  one { call_id, name, ok } per tool_use
+--- @return string|nil problem  a device-contract violation (nothing ran)
+local function execute_tools(session, device, out, beat_id)
+    local tools = device.tools or {}
+    local policy = device.tool_policy
+
+    -- [a] decide everything first (nothing has run, nothing is recorded)
+    local planned = {}
     for _, block in ipairs(out.content or {}) do
         if block.type == "tool_use" then
-            local call_id = tostring(block.id or "")
-            local name = tostring(block.name or "")
-            local args = block.input or {}
-
-            -- Record the call before running it: a run that dies mid-tool
-            -- leaves a history that says a call was made.
-            ctx:append({
-                kind = "tool_call",
-                beat = out.beat,
-                call_id = call_id,
-                name = name,
-                args = args,
-            })
-
-            -- Ask the policy whether to run.  A nil return is "no opinion"
-            -- (default: run) — but a policy that RAISES is fail-closed: a
-            -- gate written to veto tools must not fall open on its own bug,
-            -- so the raise denies the call and the reason lands in the
-            -- tool_result instead of vanishing.
-            local action = "run"
-            if policy then
-                local ok_p, decided = pcall(policy, block, out)
-                if not ok_p then
-                    action = "denied (policy raised: " .. tostring(decided) .. ")"
-                elseif decided ~= nil then
-                    action = decided
-                end
+            local action, reason, problem = decide_tool(policy, block, out)
+            if problem then
+                return nil, problem
             end
-
-            local ok, result
-            if action ~= "run" then
-                ok, result = false, "tool '" .. name .. "' " .. tostring(action) .. " by policy"
-            else
-                local spec = tools[name]
-                if spec == nil or spec.handler == nil then
-                    -- Unknown tool: close the pair with a machine-minimal
-                    -- error. This is the kernel's skeleton, not a policy.
-                    ok, result = false, "tool '" .. name .. "' not found"
-                else
-                    local pok, pres = pcall(spec.handler, args)
-                    if pok then
-                        ok, result = true, pres
-                    else
-                        ok, result = false, "tool '" .. name .. "' raised: " .. tostring(pres)
-                    end
-                end
-            end
-
-            -- `result` must be present for a tool_result; a handler that
-            -- answered with nil gets the empty string in the record.
-            if result == nil then
-                result = ""
-            end
-
-            ctx:append({
-                kind = "tool_result",
-                beat = out.beat,
-                call_id = call_id,
-                ok = ok,
-                result = result,
-            })
-
-            summary[#summary + 1] = { call_id = call_id, name = name, ok = ok }
+            planned[#planned + 1] = { block = block, action = action, reason = reason }
         end
+    end
+
+    -- [b] then run them, each pair recorded around its call
+    local summary = {}
+    for _, item in ipairs(planned) do
+        local block = item.block
+        local call_id = tostring(block.id or "")
+        local name = tostring(block.name or "")
+        local args = block.input or {}
+
+        -- Record the call before running it: a run that dies mid-tool
+        -- leaves a history that says a call was made.
+        record(session, {
+            kind = "tool_call",
+            beat = beat_id,
+            call_id = call_id,
+            name = name,
+            args = args,
+        })
+
+        local ok, result
+        if item.action == "deny" then
+            local why = item.reason and (": " .. item.reason) or ""
+            ok, result = false, "tool '" .. name .. "' denied by policy" .. why
+        else
+            local spec = tools[name]
+            if spec == nil or spec.handler == nil then
+                -- Unknown tool: close the pair with a machine-minimal
+                -- error. This is the kernel's skeleton, not a policy.
+                ok, result = false, "tool '" .. name .. "' not found"
+            else
+                local pok, pres = pcall(spec.handler, args)
+                if pok then
+                    ok, result = true, pres
+                else
+                    ok, result = false, "tool '" .. name .. "' raised: " .. tostring(pres)
+                end
+            end
+        end
+
+        -- `result` must be present for a tool_result; a handler that
+        -- answered with nil gets the empty string in the record.
+        if result == nil then
+            result = ""
+        end
+
+        record(session, {
+            kind = "tool_result",
+            beat = beat_id,
+            call_id = call_id,
+            ok = ok,
+            result = result,
+        })
+
+        summary[#summary + 1] = { call_id = call_id, name = name, ok = ok }
     end
 
     return summary
 end
 
---- How much one beat asks the budget for when the ctx names no policy.
+--- One complete beat: gate, name itself, fold, filter, reserve, record,
+--- call, record, run its tools. Two arguments and no bundle — the session
+--- is the kernel's state, the device is the caller's policy, and neither is
+--- mutated. Per-beat variation is the caller's: `knl.beat(s, d:with{ llm =
+--- strong })`.
 ---
---- One beat, one unit: a beat is the thing being bounded, so the default
---- makes the grant a count of beats. It must be >= 1 — that is what makes
---- the budget a ranking function and the run finite. What the unit *means*
---- is the owner's (`budget = { amount = N, tag = "tokens" }` counts tokens,
---- and then a ctx supplies `cost` to say how many one beat may take).
-local DEFAULT_COST = 1
-
---- One complete beat: gate, fold, filter, reserve, record, call, record, run
---- its tools. Single argument — everything is read off the ctx (state +
---- config), and the ctx is never mutated. Per-beat variation is the
---- caller's: `knl.beat(ctx:with{ llm = strong })`.
+--- Re-entrant and stateless: a beat is decided entirely by its two
+--- arguments, so it can be called from any driver, resumed, or interleaved.
 ---
---- Re-entrant and stateless: a beat is decided entirely by its ctx, so it
---- can be called from any driver, resumed, or interleaved (one ctx per
---- concurrent strand; one shared session is the kernel CAS's problem).
----
---- @param ctx table  a knl ctx (from knl.open / knl.resume / ctx:with)
+--- @param session userdata|table  a knl session (knl.open / knl.resume)
+--- @param device table  a knl device (knl.device / d:with)
 --- @return table outcome  an `Outcome`
-function M.beat(ctx)
+function M.beat(session, device)
     -- [0] gate ------------------------------------------------------------
-    if type(ctx) ~= "table" and type(ctx) ~= "userdata" then
-        return emit(Outcome.err("conf", "beat takes a ctx (from knl.open / knl.resume)"))
+    if not is_session(session) then
+        return emit(Outcome.err("conf", "beat takes a knl session first (from knl.open / knl.resume)"))
     end
-    local okc, config = pcall(function()
-        return ctx._config
-    end)
-    local handle = okc and ctx._handle or nil
-    if config == nil or handle == nil then
-        return emit(Outcome.err("conf", "not a knl ctx (build one with knl.open)"))
+    if getmetatable(device) ~= DEVICE_TAG then
+        return emit(Outcome.err("conf", "beat takes a knl device second (build one with knl.device)"))
     end
-    -- The llm is beat's to call, off the ctx config (open-time or with-time).
-    if config.llm == nil then
-        return emit(Outcome.err("conf", "no llm in ctx (open with llm=..., or derive ctx:with{ llm = ... })"))
+    -- The llm is beat's to call, off the device.
+    if device.llm == nil then
+        return emit(Outcome.err("conf", "no llm in the device (knl.device{ llm = ... } / d:with{ llm = ... })"))
     end
-    -- [1] request <- fold(events, config) ---------------------------------
-    local fold_fn = config.fold or M.fold
-    local folded_ok, request = pcall(fold_fn, ctx:events(), config)
+
+    -- [0.5] the beat names itself ----------------------------------------
+    -- One id per beat, minted here and stamped on every event this beat
+    -- writes. The kernel neither numbers nor requires it (§9-a).
+    local id_ok, beat_id = pcall(M.new_beat_id)
+    if not id_ok or type(beat_id) ~= "string" then
+        return emit(Outcome.err("conf", "no beat id: " .. tostring(beat_id)))
+    end
+
+    -- [1] request <- fold(events, device) ---------------------------------
+    -- Reading the log is a kernel call like any other in this function: a
+    -- store that cannot be read (a closed session, a failed query) is
+    -- `err("state")`, not a raise escaping beat's Outcome contract. It is
+    -- pcall'd separately from the fold so the two failures keep their own
+    -- kinds — the state that could not be read, or the policy that could
+    -- not fold it.
+    local read_ok, events = pcall(session.events, session)
+    if not read_ok then
+        return emit(Outcome.err("state", "events read failed: " .. tostring(events)))
+    end
+    local folded_ok, request = pcall(device.fold, events, device)
     if not folded_ok then
         return emit(Outcome.err("conf", "fold failed: " .. tostring(request)))
     end
 
     -- [2] filter chain (fn(req) -> req) -----------------------------------
-    if config.filters then
-        for i, filter in ipairs(config.filters) do
-            local filtered_ok, filtered = pcall(filter, request)
-            if not filtered_ok then
-                return emit(Outcome.err("filter", tostring(filtered)))
-            end
-            -- A filter's return replaces the request wholesale, so a filter
-            -- that mutates and forgets to return (nil) or returns a
-            -- non-table would corrupt the write-ahead record and the wire.
-            -- Loud in prod, not just under the dev assert below.
-            if type(filtered) ~= "table" then
-                return emit(Outcome.err(
+    for i, filter in ipairs(device.filters) do
+        local filtered_ok, filtered = pcall(filter, request)
+        if not filtered_ok then
+            return emit(Outcome.err("filter", tostring(filtered)))
+        end
+        -- A filter's return replaces the request wholesale, so a filter
+        -- that mutates and forgets to return (nil) or returns a
+        -- non-table would corrupt the write-ahead record and the wire.
+        -- Loud in prod, not just under the dev assert below.
+        if type(filtered) ~= "table" then
+            return emit(
+                Outcome.err(
                     "filter",
                     "filter #" .. i .. " returned " .. type(filtered) .. " (a filter must return the request table)"
-                ))
-            end
-            request = filtered
+                )
+            )
         end
+        request = filtered
     end
     -- Dev-mode contract on what actually goes to the llm — a custom fold or
     -- a filter that broke the request shape fails loud here, not in the wire.
@@ -784,31 +1226,30 @@ function M.beat(ctx)
     -- [3] reserve before anything is recorded or called -------------------
     -- The quota decides here, with the request known and nothing spent yet:
     -- a refusal leaves no `request` event, makes no call, and is a planned
-    -- stop rather than a failure (Ok, carrying the grant's tag so a caller
-    -- can name what stopped it). How much to ask for is this layer's policy
-    -- — `config.cost(request)`, or one unit per beat — and it is never
-    -- derived from token counts: the budget and the `usage` view are
-    -- separate readings (budget-design.md §4-8).
-    local amount = DEFAULT_COST
-    if config.cost then
-        local est_ok, est = pcall(config.cost, request)
-        if not est_ok then
-            return emit(Outcome.err("conf", "cost failed: " .. tostring(est)))
-        end
-        if type(est) ~= "number" or est < 1 or est % 1 ~= 0 then
-            return emit(Outcome.err("conf", "cost must return a whole number >= 1, got " .. tostring(est)))
-        end
-        amount = est
+    -- stop rather than a failure (`stopped`, carrying the grant's tag so a
+    -- caller can name what stopped it). How much to ask for is the device's
+    -- policy — `device.cost(request)` — and it is never derived from token
+    -- counts: the budget and the `usage` view are separate readings
+    -- (budget-design.md §4-8).
+    local est_ok, amount = pcall(device.cost, request)
+    if not est_ok then
+        return emit(Outcome.err("conf", "cost failed: " .. tostring(amount)))
+    end
+    -- `cost_result` carries the type; the bound and the integrality are
+    -- here, because lshape has no combinator for either. Checked rather than
+    -- asserted: this must be loud in prod too — an unbounded beat is how a
+    -- run stops being finite.
+    if not shape.check(amount, COST_RESULT) or amount < 1 or amount % 1 ~= 0 then
+        return emit(Outcome.err("conf", "cost must return a whole number >= 1, got " .. tostring(amount)))
     end
     -- The handle raises on a closed session, and beat's contract is an
-    -- Outcome, so the call is pcall'd. (`ctx:reserve` reaches the same
-    -- method: make_ctx refuses a config key that would shadow one.)
-    local res_ok, granted, tag = pcall(handle.reserve, handle, amount)
+    -- Outcome, so the call is pcall'd.
+    local res_ok, granted, tag = pcall(session.reserve, session, amount)
     if not res_ok then
         return emit(Outcome.err("state", "reserve failed: " .. tostring(granted)))
     end
     if not granted then
-        return emit(Outcome.ok({ budget_stopped = true, tag = tag }))
+        return emit(Outcome.stopped("budget", tag))
     end
 
     -- [4] record the request write-ahead (open kind "request") ------------
@@ -817,9 +1258,11 @@ function M.beat(ctx)
     -- can fail (closed session, CAS head conflict, validation) — beat's
     -- contract is an Outcome, so a state failure is Error("state"), never
     -- a raw raise.
-    local rec_ok, rec_err = pcall(function()
-        ctx:append({ kind = "request", request = request })
-    end)
+    local rec_ok, rec_err = pcall(record, session, {
+        kind = "request",
+        beat = beat_id,
+        request = request,
+    })
     if not rec_ok then
         return emit(Outcome.err("state", "request append failed: " .. tostring(rec_err)))
     end
@@ -830,7 +1273,7 @@ function M.beat(ctx)
     -- invent one (status is llm-supplied).  The call is pcall'd: an adapter
     -- that raises (instead of returning nil, err) is still a call failure,
     -- not an escape from the Outcome contract.
-    local call_ok, resp, berr = pcall(config.llm, request)
+    local call_ok, resp, berr = pcall(device.llm, request)
     if not call_ok then
         berr = "llm raised: " .. tostring(resp)
         resp = nil
@@ -840,38 +1283,57 @@ function M.beat(ctx)
     -- error / transport failure: the beat did not come off. Note it and stop.
     -- The failure note is best-effort (the state may be what failed); the
     -- call error stays the primary detail either way.
-    if resp == nil or resp.status == "error" then
-        local reason = berr or (resp and resp.detail) or "llm reported error"
-        local noted_ok, note_err = pcall(function()
-            ctx:append({ kind = "model_call_failed", error = tostring(reason) })
-        end)
+    --
+    -- Anything that is not a table is that same failure: an adapter whose
+    -- contract is `resp | nil, err` and that answered `false` / a string /
+    -- a number has not produced a response, and reading `.status` off it
+    -- would raise (or, for a string, quietly find the string library).
+    if type(resp) ~= "table" or resp.status == "error" then
+        local reason = berr
+        if reason == nil then
+            if type(resp) == "table" then
+                reason = resp.detail or "llm reported error"
+            elseif resp == nil then
+                reason = "llm reported error"
+            else
+                reason = "llm returned " .. type(resp) .. " (the contract is a table, or nil and an error)"
+            end
+        end
+        local noted_ok, note_err = pcall(record, session, {
+            kind = "model_call_failed",
+            beat = beat_id,
+            error = tostring(reason),
+        })
         if not noted_ok then
-            return emit(Outcome.err(
-                "state",
-                "call failed (" .. tostring(reason) .. ") and the failure note could not be recorded: " .. tostring(note_err)
-            ))
+            return emit(
+                Outcome.err(
+                    "state",
+                    "call failed ("
+                        .. tostring(reason)
+                        .. ") and the failure note could not be recorded: "
+                        .. tostring(note_err)
+                )
+            )
         end
         return emit(Outcome.err("call", tostring(reason)))
     end
     -- ok / refused: the model answered. Appending the model_response is
-    -- what records it and numbers it — the kernel does both in the one
-    -- append, and charges nothing (the quota was settled at [3]).
-    -- Read the kernel-assigned number back afterwards to stamp the tools.
-    -- `usage` defaults to an empty count: the llm contract leaves it
-    -- optional, but the kernel validator requires the field on a
-    -- model_response (the Lua/Rust contract meet in the middle here).
-    local resp_ok, resp_err = pcall(function()
-        ctx:append({
-            kind = "model_response",
-            content = resp.content,
-            usage = resp.usage or {},
-            stop_reason = resp.stop_reason,
-        })
-    end)
+    -- what records it, under this beat's id, and it charges nothing (the
+    -- quota was settled at [3]).  `usage` defaults to an empty count: the
+    -- llm contract leaves it optional, but the kernel validator requires
+    -- the field on a model_response (the Lua/Rust contract meet in the
+    -- middle here).
+    local resp_ok, resp_err = pcall(record, session, {
+        kind = "model_response",
+        beat = beat_id,
+        content = resp.content,
+        usage = resp.usage or {},
+        stop_reason = resp.stop_reason,
+    })
     if not resp_ok then
         return emit(Outcome.err("state", "model_response append failed: " .. tostring(resp_err)))
     end
-    resp.beat = ctx:beats()
+    resp.beat = beat_id
     -- A refusal is a recorded response the model would not build on — and
     -- the beat that produced it reserved its amount like any other.
     if resp.status == "refused" then
@@ -880,12 +1342,19 @@ function M.beat(ctx)
 
     -- [7] tool execution (skeleton) --------------------------------------
     -- execute_tools raises only on a state failure (an append that did not
-    -- land); handler/policy failures close their pair as data (ok=false).
-    local tools_ok, tools_or_err = pcall(execute_tools, ctx, config, resp)
+    -- land); handler and policy failures close their pair as data
+    -- (ok=false). A tool_policy that broke its contract is the one thing it
+    -- reports instead: a config error, returned before any tool ran or any
+    -- tool_call was written. The model_response above is already recorded
+    -- either way — the beat happened, it is the device that is wrong.
+    local tools_ok, summary, policy_problem = pcall(execute_tools, session, device, resp, beat_id)
     if not tools_ok then
-        return emit(Outcome.err("state", "tool record append failed: " .. tostring(tools_or_err)))
+        return emit(Outcome.err("state", "tool record append failed: " .. tostring(summary)))
     end
-    resp.tools = tools_or_err
+    if policy_problem then
+        return emit(Outcome.err("conf", policy_problem))
+    end
+    resp.tools = summary
 
     return emit(Outcome.ok(resp))
 end
@@ -893,6 +1362,5 @@ end
 -- Internals exposed for the spec (the fixture drives these directly).
 M._execute_tools = execute_tools
 M._wire_tools = wire_tools
-M._make_ctx = make_ctx
 
 return M

@@ -1,12 +1,13 @@
 --- knl_adapter — the Device IF backend for the Lua kernel, as a Port.
 ---
 --- The interface, not a shim of literals
----   `knl.beat` calls `ctx.llm(request)` and reads a *status string* off the
----   answer: "ok" | "refused" | "error". Turning an llm_proto answer into that
----   contract needs three provider-specific steps — build the wire, parse the
----   raw response, and classify the result — and only the last one carries a
----   provider's private vocabulary (how *this* provider says "I refused", and
----   whether the refusal was the model declining or a safety filter blocking).
+---   `knl.beat` calls `device.llm(request)` and reads a *status string* off the
+---   answer: "ok" | "refused" (a transport or provider failure is `nil, err`).
+---   Turning an llm_proto answer into that contract needs three
+---   provider-specific steps — build the wire, parse the raw response, and
+---   classify the result — and only the last one carries a provider's private
+---   vocabulary (how *this* provider says "I refused", and whether the refusal
+---   was the model declining or a safety filter blocking).
 ---
 ---   An earlier POC put that vocabulary (`stop_reason == "refusal"`) straight
 ---   into the shim as a literal. That leaks provider knowledge into the piece
@@ -34,16 +35,29 @@
 ---   whole parse result to `status`.
 ---
 --- Usage
----   local knl_adapter = require("knl_adapter")
----   local llm = knl_adapter.anthropic:open({ model = ..., max_tokens = ... })
----   local ctx = knl.open({ owner = ..., llm = llm })
----   local outcome = knl.beat(ctx)
+---   local knl = require("knl")
+---   local adapter = require("knl_adapter")
+---
+---   local device = knl.device({
+---       llm = adapter.anthropic:open({ model = ..., max_tokens = ... }),
+---       tools = adapter.tools({ ... }),        -- flat specs or ToolPorts
+---   })
+---   knl.session({ owner = ..., budget = { amount = 8, tag = "beats" } },
+---       function(s) return knl.beat(s, device) end)
+---
+---   The two halves stay apart: what this module builds is *policy* (the llm
+---   closure, the tools map) and belongs to a device; the session is state and
+---   is opened by the kernel.
 ---
 ---   `open`'s conf is forwarded to llm_proto verbatim: model / api_key /
 ---   max_tokens / thinking / tool_choice / ... are llm_proto's vocabulary and
 ---   this module does not reinterpret any of them.
 
 local proto = require("llm_proto")
+--- The kernel module, for its published contracts only (`knl.shapes`). Named
+--- `kernel` because the bare `knl` is the syscall bridge global in a full host
+--- VM, and shadowing it here would read as the wrong one.
+local kernel = require("knl")
 
 local lshape = require("lshape")
 local T = lshape.t
@@ -66,46 +80,25 @@ local DEFAULT_MAX_TOKENS = 4096
 -- Result shape — the Port's clean-data contract
 -- ============================================================
 
---- The token accounting the Port promises: three counts, always present as
---- numbers. A provider that reports no usage (nil or {}) is normalized to
---- zeros by the Mapper, so this stays strict rather than admitting a missing
---- field. Closed so a stray usage key cannot ride across the boundary.
-local USAGE = T.shape({
-    input_tokens = T.number,
-    output_tokens = T.number,
-    thinking_tokens = T.number,
-}, { open = false })
-
---- The refusal detail the Port surfaces alongside a "refused" status. `kind`
---- normalizes *why* the beat did not progress across providers: "model" is the
---- model declining, "content_filter" is a provider safety filter blocking it —
---- a distinction the kernel's 3-value status cannot carry, so it rides here.
---- `detail` is the provider's own refusal message when it gave one. Closed so a
---- stray key cannot cross the boundary. Present iff status == "refused" (the
---- Port's classify() is one method, so status and refusal cannot disagree).
-local REFUSAL = T.shape({
-    kind = T.one_of({ "model", "content_filter" }),
-    detail = T.string:is_optional(),
-}, { open = false })
-
---- What `LLMPort:open`'s closure hands back — the shape the kernel reads.
---- Closed (open=false) so a contract gap in one provider's parse cannot leak
---- past the Port boundary: `content` is an array of blocks (tagged as an empty
+--- What `LLMPort:open`'s closure hands back is the kernel's `llm_result`, not
+--- a shape of this module's own: it is the contract `knl.beat` reads at its
+--- call step, so the kernel publishes it (`knl.shapes.llm_result`,
+--- session-device-design.md §9-k) and every adapter is held to that one copy.
+--- Two definitions of the same boundary is exactly the drift §11 R7 removed on
+--- the event side.
+---
+--- It is closed, so a contract gap in one provider's parse cannot leak past
+--- the Port boundary: `content` is an array of blocks (tagged as an empty
 --- array by the Mapper when the model said nothing, so it crosses the JSON
---- bridge as `[]` and not `{}`), `usage` is the strict count above,
---- `stop_reason` is absent when no reason was given, `status` is the Port's own
---- "ok" | "refused" verdict, and `refusal` carries the normalized reason — absent
---- on "ok", present with a `kind` on "refused".
-local RESULT = T.shape({
-    content = T.array_of(T.table),
-    usage = USAGE,
-    stop_reason = T.string:is_optional(),
-    status = T.one_of({ "ok", "refused" }),
-    refusal = REFUSAL:is_optional(),
-}, { open = false })
+--- bridge as `[]` and not `{}`), `usage` is a strict three-count, `stop_reason`
+--- is absent when no reason was given, `status` is the Port's own "ok" |
+--- "refused" verdict, and `refusal` carries the normalized reason — absent on
+--- "ok", present with a `kind` on "refused".
+local RESULT = kernel.shapes.llm_result
 
 --- The contract this module holds itself to, as data — mirrors how `agent` and
---- `tool_loop` expose theirs via `M.shapes`.
+--- `tool_loop` expose theirs via `M.shapes`. Re-exported rather than
+--- redefined, so `knl_adapter.shapes.llm_result == knl.shapes.llm_result`.
 M.shapes = { llm_result = RESULT }
 
 -- ============================================================
@@ -139,8 +132,9 @@ function LLMPort.new(impl)
     return setmetatable(impl, LLMPort)
 end
 
---- Open the Port into a knl backend: the closure a knl ctx binds as
---- `conf.llm`. Shared by every Port instance — it knows no provider dialect,
+--- Open the Port into a knl backend: the closure a device carries as its
+--- `llm` (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
+--- `knl.beat` calls. Shared by every Port instance — it knows no provider dialect,
 --- it only calls `self:build` / `self:parse` / `self:classify`. There is no
 --- `== "refusal"` here and no status of its own; the one judgement it makes is
 --- delegated to `self:classify`.
@@ -194,8 +188,8 @@ function LLMPort:open(conf)
             std.task.sleep(proto.retry_delay(attempt, classified, attempt) * 1000)
         end
 
-        -- Non-200 after retries: the beat did not come off. turn maps the
-        -- (nil, err) onto Outcome.err("call", err).
+        -- Non-200 after retries: the beat did not come off. beat records the
+        -- (nil, err) as `model_call_failed` and reports Outcome.err("call").
         if resp.status ~= 200 then
             local classified = proto.classify_error(resp.status, resp.body, resp.headers)
             return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"

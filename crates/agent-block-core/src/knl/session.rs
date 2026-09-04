@@ -1,39 +1,97 @@
-//! K5 — the run scope.
+//! K5 — the session.
 //!
 //! A session binds one history, one budget and the projection caches
 //! together and is the only handle on kernel state.  All of it lives in
 //! the value: two sessions share nothing.
 //!
+//! # The lifecycle is the session's
+//!
+//! There is no "run" inside a session.  A session opens once, records, and
+//! closes once; the two events that bracket it — `session_opened` and
+//! `session_closed` — are written by the kernel on those two occasions and
+//! by nothing else.  A caller cannot hand-append either
+//! ([`super::event::is_kernel_only`]), because a stream that claims an
+//! opening it never had, or an ending it never reached, is exactly what a
+//! resume and an audit read.
+//!
+//! Beats are the layer above's, not the kernel's: the shell mints a beat id
+//! and stamps it on the facts that belong together.  The kernel neither
+//! numbers nor requires one — see [`super::event`].
+//!
 //! # The session *has a* scope
 //!
 //! A scope and a session are two things, sharing one lifetime: both begin
-//! when a run opens and end when it closes.  The session is the stream —
-//! this history, its projections, its beat numbering.  The [`Scope`] is the
-//! authority the run is written under: a kernel-issued [`ScopeId`], the
-//! `owner`, and the quota that owner granted.  The session holds it *by
-//! value*, because neither outlives the other and there is nothing to share.
+//! when the session opens and end when it closes.  The session is the
+//! stream — this history and its projections.  The [`Scope`] is the
+//! authority it is written under: a kernel-issued [`ScopeId`], the `owner`,
+//! and the quota that owner granted.  The session holds it *by value*,
+//! because neither outlives the other and there is nothing to share.
 //!
 //! A session holds only its own events, so ownership is not a per-event
 //! question: the scope carries one `owner` — a real principal id, or the
 //! reserved [`ANON`] / [`SYSTEM`] id — and it is *total* (never `Option`,
-//! never a "kernel vs caller" flag).  System-originated work is a run whose
-//! owner is [`SYSTEM`]; unspecified is [`ANON`].  The policy layer above the
-//! kernel reads [`Session::owner`] to authorize; the kernel itself does not
-//! branch on it.
+//! never a "kernel vs caller" flag).  System-originated work is a session
+//! whose owner is [`SYSTEM`]; unspecified is [`ANON`].  The policy layer
+//! above the kernel reads [`Session::owner`] to authorize; the kernel itself
+//! does not branch on it.
 //!
 //! The scope is in the log, not only in the value.  Its id is recorded on
-//! `run_started` beside the owner, and on every `budget_*` event, so the
+//! `session_opened` beside the owner, and on every `budget_*` event, so the
 //! boundary is recoverable — and unforgeable, since the kinds that carry it
 //! are the kernel's alone to write ([`super::event::is_kernel_only`]).
 //! [`Session::resume`] restores the scope from those records rather than
 //! being told what it was.
 //!
-//! # One append
+//! # One append, and it lands
 //!
 //! There is a single write path.  [`Session::append`] validates, stamps
-//! the kernel-owned `seq` / `epoch_ms`, and pushes.  When the event is a
-//! `model_response` it also *numbers* it: the kernel assigns the `beat`
-//! from its own count, overwriting any the caller supplied.
+//! the kernel-owned `seq` / `epoch_ms`, and pushes.  It adds nothing else:
+//! what an event says beyond the envelope is the caller's.
+//!
+//! An append *records a fact*, so it is never refused for what the handle
+//! last saw.  The store assigns the `seq` and the ordering, and serializes
+//! the write per stream; two handles on one stream both write and the log
+//! interleaves in arrival order.  [`Session::head`] is what this handle
+//! last saw and nothing more — a report, never a precondition.
+//!
+//! A *command with an invariant* is the other shape, and it is decided
+//! inside the store ([`EventStore::append_if`]), which folds the events it
+//! is handed and writes only if the invariant holds, all under the same
+//! serialization.  Checking a cached value out here and appending
+//! afterwards is exactly the race that would let two handles reserve the
+//! same allowance twice.  Every write the kernel makes takes that shape:
+//! [`Session::reserve`] writes only if the ledger covers what was asked,
+//! [`Session::spend`] settles against the ledger it was handed rather than
+//! against a counter, and every append at all — a caller's, the kernel's
+//! own, either of the boundaries — writes only if the stream has not
+//! already ended.
+//!
+//! # A session is disposable
+//!
+//! It opens once and closes once, and a closed stream is not reopened:
+//! [`Session::resume`] refuses a log that already carries its
+//! `session_closed`.  What comes after an ending is a new session, not a
+//! second life for the old one — otherwise "closed" would say nothing about
+//! what a reader of the log can expect after it.
+//!
+//! The ending is the stream's, not the handle's, so it holds for handles
+//! that never saw it.  `closed` here is only this session's memory of one;
+//! the fact is the `session_closed` in the log, and the decision every
+//! write is taken against reads it there.  So a second handle appends
+//! nothing after another handle's close — its write is refused, and it
+//! learns from the refusal that the session is over — and a second *close*
+//! writes nothing either, rather than a second ending.  Exactly one
+//! `session_closed` lands per stream, whichever handle gets there.
+//!
+//! # Stored shape change ⇒ upcaster
+//!
+//! Every read a session makes — the restore fold, the view folds, `events`
+//! — goes through the read-time upcaster chain
+//! ([`super::event_store::kernel_upcasters`]), so a log written under an
+//! older shape reads as the current one and the stored bytes are never
+//! rewritten.  A round that changes what is stored ships the matching
+//! `n → n+1` step in the same breath; see the [`super::event_store`] module
+//! docs.
 //!
 //! It does not charge.  An append is a record of something that happened,
 //! and the budget is a permission asked for *before* something happens —
@@ -55,16 +113,17 @@
 //! write ([`super::event::is_kernel_only`]) — [`Session::append`] refuses
 //! them from a caller, because writing one is moving the account.
 //!
-//! The kernel writes the run's own boundaries through the same append:
-//! [`Session::new`] appends `run_started` and [`Session::close`] appends
-//! `run_finished`, so a run is bracketed in the history whether or not the
-//! shell remembers to say so.  After a close, `append` / `spend` are errors
-//! while reads keep working — the record outlives the run.
+//! The kernel writes the session's own boundaries through the same append:
+//! [`Session::new`] appends `session_opened` and [`Session::close`] appends
+//! `session_closed`, so a session is bracketed in the history whether or not
+//! the shell remembers to say so.  After a close, `append` / `spend` are
+//! errors while reads keep working — the record outlives the session.
 //!
-//! The scope itself is the `closed` flag, not the `run_finished` event.
-//! An event is a record of something; what ends the run is [`close`], and
-//! a caller that appends a `run_finished` of its own has written a line
-//! in the history and changed no state.
+//! What ends a session is [`close`], and only [`close`] writes the
+//! `session_closed` that says so: the flag and the event are set on one
+//! path, so the log and the state cannot disagree — and the event is
+//! written under the decision that there is not one already, so the path
+//! being taken twice still leaves one ending.
 //!
 //! [`close`]: Session::close
 
@@ -72,19 +131,19 @@ use serde_json::{Map, Value};
 
 use super::budget::{self, fold_balance, last_grant, BudgetGrant};
 use super::event::{
-    is_kernel_only, kernel_event, kind_of, seq_of, FIELD_AMOUNT, FIELD_BEAT, FIELD_DESC,
-    FIELD_DETAIL, FIELD_KIND, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG,
-    KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT,
-    KIND_MODEL_RESPONSE, KIND_RUN_FINISHED, KIND_RUN_STARTED,
+    is_kernel_only, kernel_event, kind_of, seq_of, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL,
+    FIELD_KIND, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED,
+    KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED,
+    KIND_SESSION_OPENED,
 };
-use super::event_store::{EventStore, MemEventStore, UpcastingEventStore};
+use super::event_store::{kernel_upcasters, EventStore, MemEventStore, UpcastingEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
 use super::scope::{Scope, ScopeId};
 use super::{projection, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
 pub const DEFAULT_CLOSE_REASON: &str = "closed";
-/// Reason recorded when a run scope ended on its own: the Lua `<close>`
+/// Reason recorded when a session ended on its own: the Lua `<close>`
 /// variable holding the session went out of scope with no error.
 pub const CLOSE_REASON_SCOPE_EXIT: &str = "scope_exit";
 /// Reason recorded when a run scope ended because the block raised: the
@@ -94,16 +153,36 @@ pub const CLOSE_REASON_ERROR: &str = "error";
 /// it, so the boundary is written where the value is dropped.
 pub const CLOSE_REASON_DROPPED: &str = "dropped";
 
+/// What a write refused past the stream's ending says.
+///
+/// One sentence for every refusal — the local flag's, and the one a write
+/// comes back with when the log turns out to carry a `session_closed` this
+/// handle never saw — because from the caller's side they are the same
+/// answer: the session is over and nothing more will be recorded for it.
+const CLOSED: &str = "session is closed";
+
+/// Whether `events` already carry the stream's ending.
+///
+/// The decision under every write and the one [`Session::resume`] takes.
+/// There is no reopening kind, so a single `session_closed` anywhere in the
+/// log is final: what a reader was told was the last of it must stay the
+/// last of it, whichever handle asks afterwards.
+fn has_ended(events: &[Value]) -> bool {
+    events
+        .iter()
+        .any(|event| kind_of(event) == KIND_SESSION_CLOSED)
+}
+
 /// Reserved owner: no principal was named when the session opened.
 pub const ANON: &str = "anon";
 /// Reserved owner: the session belongs to the system itself.
 pub const SYSTEM: &str = "system";
 
-/// Payload field the kernel records on `run_started`, beside
-/// [`FIELD_SCOPE_ID`], so a later [`Session::resume`] can recover the run's
-/// scope — who it belonged to — from the log.
+/// Payload field the kernel records on `session_opened`, beside
+/// [`FIELD_SCOPE_ID`], so a later [`Session::resume`] can recover the
+/// session's scope — who it belonged to — from the log.
 ///
-/// `run_started` is an open-shape reserved kind (no required fields), so
+/// `session_opened` is an open-shape reserved kind (no required fields), so
 /// carrying this extra field needs no change to the event validator.
 const FIELD_OWNER: &str = "owner";
 
@@ -131,7 +210,7 @@ fn granted_event(grant: &BudgetGrant, scope_id: &str) -> Map<String, Value> {
 /// `amount`, written under `scope_id` and tagged with the grant's unit so
 /// the ledger reads without a join.
 ///
-/// The scope id is on every move of the balance, not only on the run's
+/// The scope id is on every move of the balance, not only on the session's
 /// opening: the ledger is the one part of the log that says what was
 /// *allowed*, so each entry names the authority it was allowed under.
 fn budget_move_event(
@@ -152,33 +231,42 @@ fn budget_move_event(
     event
 }
 
-/// One run: a stream, and the scope it is written under.
+/// What a caller should have called instead of hand-appending `kind`.
+///
+/// The refusal names the method that legitimately writes the kind, so the
+/// error is a redirection rather than a wall.
+fn kernel_only_hint(kind: &str) -> &'static str {
+    match kind {
+        KIND_SESSION_OPENED => "a session records its own opening",
+        KIND_SESSION_CLOSED => "use close",
+        _ => "use reserve / spend",
+    }
+}
+
+/// One session: a stream, and the scope it is written under.
 pub struct Session {
-    /// Run-correlation id, unique per session — the stream this session
-    /// writes.  Distinct from [`Scope::id`], which names the authority the
-    /// stream is written under.
+    /// Correlation id, unique per session — the stream this session writes.
+    /// Distinct from [`Scope::id`], which names the authority the stream is
+    /// written under.
     id: String,
-    /// The run's scope: its kernel-issued id, its owner, and the budget an
-    /// owner granted it.  Held by value — a scope and its session begin and
-    /// end together, so there is nothing to point at.
+    /// The session's scope: its kernel-issued id, its owner, and the budget
+    /// an owner granted it.  Held by value — a scope and its session begin
+    /// and end together, so there is nothing to point at.
     scope: Scope,
     /// K1 append-only history, held behind the event-store SPI so the
     /// backend can be the in-memory store or the durable SQLite one.
     store: Box<dyn EventStore>,
     /// Cached projection folds (derived, never authoritative).
     views: Views,
-    /// Model responses recorded so far: the beat number's authority.
-    beats: u64,
-    /// The stream head this session has observed and writes against.
+    /// The last `seq` this handle saw land — a report, not a precondition.
     ///
-    /// The compare-and-swap expectation for the next [`append`] — *not* a
-    /// fresh read of the store.  A single-writer session wrote every event, so
-    /// this always equals the real head and every CAS succeeds.  A second
-    /// session on the same stream keeps the head it last saw, so the moment
-    /// another writer advances the real head this one goes stale and its next
-    /// append fails loud with a head-conflict instead of duplicating a beat.
-    ///
-    /// [`append`]: Session::append
+    /// Advanced by every append this session makes, and set on resume to the
+    /// head the log carried then.  Nothing is compared against it: an append
+    /// records a fact and the store orders it, so a handle whose view is out
+    /// of date still writes, after whatever another handle wrote in the
+    /// meantime.  Read it to say "I have seen up to here" (a `from` for
+    /// [`Session::events`], say), never to decide whether a write may
+    /// happen.
     head: u64,
     /// Set by `close()`; blocks further `append` / `spend`.
     closed: bool,
@@ -186,13 +274,12 @@ pub struct Session {
 
 impl std::fmt::Debug for Session {
     /// The store is a trait object (`dyn EventStore` is not `Debug`), so it
-    /// is summarised rather than printed; the fields that identify the run
-    /// scope are shown.
+    /// is summarised rather than printed; the fields that identify the
+    /// session are shown.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.id)
             .field("scope", &self.scope)
-            .field("beats", &self.beats)
             .field("closed", &self.closed)
             .field("len", &self.store.len())
             .finish_non_exhaustive()
@@ -200,26 +287,26 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    /// Open a run for `owner` with an optional budget grant, on the
+    /// Open a session for `owner` with an optional budget grant, on the
     /// in-memory store.
     ///
     /// `owner` is total: pass a real principal id, or [`ANON`] / [`SYSTEM`]
-    /// for the reserved ones.  The `run_started` event is appended here, so
-    /// a fresh session already has one event.
+    /// for the reserved ones.  The `session_opened` event is appended here,
+    /// so a fresh session already has one event.
     pub fn new(owner: String, grant: Option<BudgetGrant>) -> KnlResult<Self> {
         Self::open_on(owner, grant, Box::new(MemEventStore::new()))
     }
 
-    /// Open a run for `owner` on a caller-chosen backend `store` (the
+    /// Open a session for `owner` on a caller-chosen backend `store` (the
     /// in-memory store, or the durable SQLite one).
     ///
     /// Like [`Session::new`] but takes the backend, so the shell decides
     /// whether the log is ephemeral or persisted.  It appends the same
-    /// `run_started` boundary, recording the run's scope on it — the
+    /// `session_opened` boundary, recording the session's scope on it — the
     /// kernel-issued [`ScopeId`] and the `owner` — so a later
     /// [`Session::resume`] can recover the scope from the log alone, and
-    /// the `grant`, so the log says what the owner allowed this run.
-    /// `run_started` is an open-shape reserved kind, so both extra fields
+    /// the `grant`, so the log says what the owner allowed.
+    /// `session_opened` is an open-shape reserved kind, so both extra fields
     /// are accepted without any change to the validator.
     pub fn open_on(
         owner: String,
@@ -227,37 +314,37 @@ impl Session {
         store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
         // Wrap the chosen backend in the read-time upcasting seam, so every one
-        // of this session's reads (view folds, `events`) passes through it by
-        // construction.  The chain is empty today (v1), making the decorator a
-        // functional no-op; a future upcaster registers at this one wrap site.
-        let store: Box<dyn EventStore> = Box::new(UpcastingEventStore::new(store, Vec::new()));
+        // of this session's reads (view folds, `events`, the decision a
+        // `reserve` takes inside the store) passes through it by construction.
+        // The chain carries the `1 → 2` step; a further shape change registers
+        // its own at that one site.
+        let store: Box<dyn EventStore> =
+            Box::new(UpcastingEventStore::new(store, kernel_upcasters()));
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             // The scope is issued here, before the first event: the
-            // `run_started` below is already written under it.
+            // `session_opened` below is already written under it.
             scope: Scope::new(owner, grant),
             store,
             views: Views::default(),
-            beats: 0,
-            // A fresh run opens on an empty stream: the first append (the
-            // `run_started` below) CASes against head 0 (expect empty) and
-            // advances the observed head to the seq it lands at.
+            // Nothing seen yet; the `session_opened` below is the first thing
+            // this handle watches land.
             head: 0,
             closed: false,
         };
-        // The same one path records `run_started` as records everything
-        // else, and it CAN fail on a durable backend (a non-empty stream
-        // fails the CAS; a busy database exhausts its retries) — a session
-        // that could not record its own opening must not exist, so the
-        // error surfaces instead of leaving a run with no `run_started`.
-        // The append advances `self.head` to the run_started's seq, so a
-        // freshly opened session observes the head right after open.
+        // The same one path records `session_opened` as records everything
+        // else, and it CAN fail on a durable backend (a busy database
+        // exhausts its retries) — a session that could not record its own
+        // opening must not exist, so the error surfaces instead of leaving a
+        // stream with no `session_opened`.  The append advances `self.head`
+        // to that event's seq, so a freshly opened session has seen the head
+        // right after open.
         //
         // The scope rides on it: the id the kernel just issued, next to the
         // owner.  Together they are the whole of what a resume needs to
         // restore the scope, so the boundary is in the log and not only in
         // this value.
-        let mut started = kernel_event(KIND_RUN_STARTED);
+        let mut started = kernel_event(KIND_SESSION_OPENED);
         started.insert(
             FIELD_OWNER.to_string(),
             Value::from(session.scope.owner().to_string()),
@@ -273,27 +360,44 @@ impl Session {
         // from, not a decoration on the run's opening.  A session that
         // could not record its own grant must not exist either — the error
         // surfaces rather than leaving a counter no event accounts for.
+        //
+        // But the opening is already in the log by then, so returning the
+        // error alone would leave a stream that opened and never ended.  The
+        // boundary is written first, best effort: a close that fails too is
+        // logged, not raised, because the error that matters to the caller is
+        // the one that stopped the open.
         if let Some(grant) = session.scope.grant().cloned() {
             let event = granted_event(&grant, session.scope.id());
-            session.append_kernel(event)?;
+            if let Err(failed) = session.append_kernel(event) {
+                if let Err(unclosed) = session.close_with(
+                    Some(CLOSE_REASON_ERROR),
+                    Some(&format!("open: budget_granted: {failed}")),
+                ) {
+                    tracing::warn!(
+                        error = %unclosed,
+                        cause = %failed,
+                        "knl: a failed open could not record session_closed; \
+                         the stream is left open"
+                    );
+                }
+                return Err(failed);
+            }
         }
         Ok(session)
     }
 
-    /// Continue an existing run by re-folding its persisted log.
+    /// Continue an existing session by re-folding its persisted log.
     ///
-    /// The `store` already holds a run's events (a reopened SQLite stream),
-    /// so resume does *not* append a new `run_started` — the run already
-    /// started.  It reads the whole log once and restores the run's state
-    /// from it:
+    /// The `store` already holds a session's events (a reopened SQLite
+    /// stream), so resume does *not* append a new `session_opened` — the
+    /// session already opened.  It reads the whole log once and restores the
+    /// state from it:
     ///
-    /// - the scope, from the first `run_started` event: its [`ScopeId`]
+    /// - the scope, from the first `session_opened` event: its [`ScopeId`]
     ///   ([`FIELD_SCOPE_ID`]) and its `owner` ([`FIELD_OWNER`]).  An older
     ///   log written before either was recorded falls back — to a fresh
     ///   kernel-issued scope id, and to [`ANON`] — rather than failing the
     ///   resume;
-    /// - the beat counter from the number of `model_response` events, so the
-    ///   kernel-owned numbering continues where it left off;
     /// - the balance, by folding the `budget_*` ledger
     ///   ([`fold_balance`]) — the counter is a cache of the log, so a
     ///   reopened stream carries on with exactly what was left, and the
@@ -302,68 +406,80 @@ impl Session {
     /// A `grant` passed here is the owner granting *again*: it is appended
     /// as a new `budget_granted` and raises the restored balance, rather
     /// than replacing it.  Omit it to continue on what is left.  Nothing is
-    /// deducted for the previous run's `model_response` usage — an append
-    /// never charged, and what was consumed is the `usage` projection's
-    /// answer, not the quota's.
+    /// deducted for the earlier `model_response` usage — an append never
+    /// charged, and what was consumed is the `usage` projection's answer,
+    /// not the quota's.
+    ///
+    /// A closed stream is not resumed.  A session is disposable: it opens
+    /// once and ends once, so a log that already carries its `session_closed`
+    /// is an ending, not a state to continue from — the caller opens a new
+    /// session instead.
     ///
     /// The projection caches start empty and re-fold lazily from the store,
     /// so a resumed session's `usage` view is correct on first read.
     pub fn resume(grant: Option<BudgetGrant>, store: Box<dyn EventStore>) -> KnlResult<Self> {
+        // The upcasting seam goes on first, so the restore below reads the
+        // same projected shape every other read of this session gets: a log
+        // written under an older shape resumes as what it means today, and the
+        // stored bytes stay as they were written.
+        let store: Box<dyn EventStore> =
+            Box::new(UpcastingEventStore::new(store, kernel_upcasters()));
+
         // Fallible read: a transient busy read or an undecodable row surfaces
         // here rather than being silently folded into a wrong resumed state.
         let log = store.read(0, usize::MAX)?;
 
         // Resuming an empty or mistyped stream is a caller error, not an
-        // anonymous zero session: a real run always opens with a `run_started`.
-        let run_started = log
+        // anonymous zero session: a real session always opens with a
+        // `session_opened`.
+        let opened = log
             .iter()
-            .find(|event| kind_of(event) == KIND_RUN_STARTED)
+            .find(|event| kind_of(event) == KIND_SESSION_OPENED)
             .ok_or_else(|| {
-                KnlError::new("resume: stream has no run to resume (no run_started event)")
+                KnlError::new("stream has no session to resume (no session_opened event)")
             })?;
 
-        // The scope rides on `run_started`; an older log written before
+        // …and an ended one is not resumed at all.  There is no reopening
+        // kind, so any `session_closed` in the stream is the session's
+        // ending: a handle that carried on past it would be appending to a
+        // log whose readers were told nothing more was coming.
+        if has_ended(&log) {
+            return Err(KnlError::new(format!(
+                "{CLOSED} (disposable; open a new session)"
+            )));
+        }
+
+        // The scope rides on `session_opened`; an older log written before
         // either field existed falls back — the owner to ANON, the scope id
         // to a fresh kernel-issued one (`Scope::restore` mints it) — but
-        // only for a real `run_started`, never for an absent one.  A run
-        // that predates a field is still a run, and refusing to resume it
-        // would lose the log rather than protect it.
-        let owner = run_started
+        // only for a real `session_opened`, never for an absent one.  A
+        // session that predates a field is still a session, and refusing to
+        // resume it would lose the log rather than protect it.
+        let owner = opened
             .get(FIELD_OWNER)
             .and_then(Value::as_str)
             .unwrap_or(ANON)
             .to_string();
-        let scope_id: Option<ScopeId> = run_started
+        let scope_id: Option<ScopeId> = opened
             .get(FIELD_SCOPE_ID)
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let beats = log
-            .iter()
-            .filter(|event| kind_of(event) == KIND_MODEL_RESPONSE)
-            .count() as u64;
-
-        // The observed head is the log's current head — the last event's seq
-        // (`read` returns events in seq order).  A resume errors above on an
-        // empty / run_started-less log, so a resumed session's head is a real
-        // event's seq; the `0` fallback is unreachable but keeps this total.
+        // What this handle has seen: the log's head at the moment it resumed
+        // — the last event's seq (`read` returns events in seq order).  A
+        // resume errors above on an empty / session_opened-less log, so this
+        // is a real event's seq; the `0` fallback is unreachable but keeps it
+        // total.
         let head = log.last().map(seq_of).unwrap_or(0);
 
-        // The restore read above used the raw backend; the session itself reads
-        // through the same upcasting seam `open_on` establishes, so a resumed
-        // run's log read, view folds and `events` all pass through it too.  The
-        // chain is empty today (v1), so this is a functional no-op.
-        let store: Box<dyn EventStore> = Box::new(UpcastingEventStore::new(store, Vec::new()));
-
         // The balance is what the ledger says, and the grant that named it
-        // comes back with it: a resumed run keeps having a budget (and a
+        // comes back with it: a resumed session keeps having a budget (and a
         // tag to report) even when the caller grants nothing new.
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             scope: Scope::restore(scope_id, owner, fold_balance(&log), last_grant(&log)),
             store,
             views: Views::default(),
-            beats,
             head,
             closed: false,
         };
@@ -372,33 +488,49 @@ impl Session {
         // any other and *adds* to what was left.  Write-ahead: the event
         // lands first, and a failed append leaves the restored balance
         // exactly as the log describes it.
+        //
+        // A caller that must vet the restored session *before* anything is
+        // written for it — the Lua bridge, which refuses a reserved owner —
+        // resumes with no grant and calls [`Session::grant_more`] once the
+        // stream has passed.
         if let Some(grant) = grant {
-            let event = granted_event(&grant, session.scope.id());
-            session.append_kernel(event)?;
-            session.scope.grant_more(grant)?;
+            session.grant_more(grant)?;
         }
         Ok(session)
     }
 
-    /// The run-correlation id.
+    /// The owner granting again: record `budget_granted` and raise the
+    /// balance by it.
+    ///
+    /// The one way the balance rises, and it is a fact in the log before it
+    /// is a number in the counter — a failed append leaves the balance
+    /// exactly as the ledger describes it.  Refused on a closed session, like
+    /// every other write: a run that has ended cannot be granted more.
+    pub fn grant_more(&mut self, grant: BudgetGrant) -> KnlResult<()> {
+        let event = granted_event(&grant, self.scope.id());
+        self.append_kernel(event)?;
+        self.scope.grant_more(grant)
+    }
+
+    /// The session-correlation id.
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// Adopt `id` as the run-correlation id.
+    /// Adopt `id` as the session-correlation id.
     ///
     /// Used only by the durable Lua bridge so a session and the SQLite
     /// stream it writes to share one id: `open_on` / `resume` mint a fresh
     /// id like `new`, and the bridge overrides it to the stream it opened,
-    /// so the id a caller resumes by *is* the stream.  `run_started` records
-    /// the scope (its id and the `owner`), never the session id, so
+    /// so the id a caller resumes by *is* the stream.  `session_opened`
+    /// records the scope (its id and the `owner`), never the session id, so
     /// overriding the id does not desync the log.
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub(crate) fn adopt_id(&mut self, id: impl Into<String>) {
         self.id = id.into();
     }
 
-    /// The scope this run is written under.
+    /// The scope this session is written under.
     ///
     /// The scope and the session are two things with one lifetime: this is
     /// the authority half — the id, the owner, the granted quota — while the
@@ -408,7 +540,7 @@ impl Session {
         &self.scope
     }
 
-    /// The scope's kernel-issued id, as recorded on `run_started` and on
+    /// The scope's kernel-issued id, as recorded on `session_opened` and on
     /// every `budget_*` event.
     ///
     /// Not the session id: [`Session::id`] names the stream, this names the
@@ -425,12 +557,10 @@ impl Session {
     /// Record an event, returning its `seq`.  The one write path.
     ///
     /// Any kind is welcome, the reserved ones included, as long as it meets
-    /// the shape its kind requires.  The kernel-owned `seq` / `epoch_ms`
-    /// are stamped here and overwrite any caller-supplied value.
-    ///
-    /// A `model_response` is numbered as it is recorded: the kernel assigns
-    /// the `beat` from its own count, overwriting whatever the caller put
-    /// there — the number is kernel-owned, like `seq`.
+    /// the shape its kind requires and is not one of the kernel's own
+    /// ([`is_kernel_only`]).  The kernel-owned `seq` / `epoch_ms` are
+    /// stamped here and overwrite any caller-supplied value; nothing else
+    /// is added, and a `beat` the caller declared is recorded as given.
     ///
     /// No append moves the budget, this one included.  What a call may
     /// consume is decided before it happens ([`Session::reserve`]) and
@@ -438,28 +568,27 @@ impl Session {
     /// call costs; the history records what happened and says nothing about
     /// what was allowed.
     ///
-    /// A `run_finished` a caller appends is a line in the history, not a
-    /// close: the run scope is the `closed` flag, and only
-    /// [`Session::close`] sets it.
+    /// The session's own boundaries are not appendable: `session_opened` and
+    /// `session_closed` are written by [`Session::open_on`] and
+    /// [`Session::close`], and a caller asking for either is refused.
     ///
-    /// One stream has one live writer: the append is a compare-and-swap on the
-    /// head *this session observed* (`self.head`), not a fresh read of the
-    /// store.  A single writer wrote every event, so its observed head always
-    /// matches the real one and every CAS succeeds — unchanged behaviour.  But
-    /// a second session on the same stream keeps the head it last saw: the
-    /// moment the first writes, the second's observed head is stale, and its
-    /// next append fails loud with a head-conflict rather than reading the
-    /// already-advanced head and silently duplicating a beat.
+    /// The append lands.  The store assigns the `seq` and serializes the
+    /// write per stream, so two handles on one stream both record and the log
+    /// interleaves in the order the writes arrived.  A stale view of the head
+    /// is not a reason to refuse a fact: [`Session::head`] is what this handle
+    /// last saw, and nothing is compared against it.
     pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
-        // The budget ledger is the kernel's to write: the balance is a fold
-        // of those events, so accepting one from a caller would be letting
-        // it grant itself the quota its owner set.  Refused before the
-        // closed check has anything to say about it — the kind is wrong
-        // whatever state the run is in.
+        // The kernel's own kinds are refused before the closed check has
+        // anything to say about it — the kind is wrong whatever state the
+        // session is in.  The balance is a fold of the `budget_*` events, so
+        // accepting one from a caller would be letting it grant itself the
+        // quota its owner set; the two `session_*` events are the lifecycle
+        // a resume and an audit read off the log.
         let kind = event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("");
         if is_kernel_only(kind) {
             return Err(KnlError::new(format!(
-                "{kind:?} is written by the kernel only (use reserve / spend)"
+                "{kind:?} is written by the kernel only ({})",
+                kernel_only_hint(kind)
             )));
         }
         self.append_kernel(event)
@@ -468,41 +597,49 @@ impl Session {
     /// [`Session::append`] without the kernel-only guard: the path the
     /// kernel's own writes take.
     ///
-    /// Same validation, same stamping, same compare-and-swap — the only
-    /// difference is that this one may write the `budget_*` kinds, which is
+    /// Same validation, same stamping, same serialized write — the only
+    /// difference is that this one may write the kernel-only kinds, which is
     /// what makes "the kernel wrote it" a property of the code path rather
     /// than of a field a caller could set.
-    fn append_kernel(&mut self, mut event: Map<String, Value>) -> KnlResult<u64> {
+    ///
+    /// The write carries one invariant, so it is decided inside the store:
+    /// the event lands only if the stream has not already ended.  The local
+    /// flag is this handle's memory of a close, which another handle's close
+    /// never reached; the ending itself is in the log, so that is where the
+    /// question is asked — under the same serialization as the write, so
+    /// nothing can slip in between the two.
+    fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
-            return Err(KnlError::new("session is closed"));
+            return Err(KnlError::new(CLOSED));
         }
 
-        let is_response =
-            event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
-        if !is_response {
-            // CAS against the head this session observed, not a fresh read: a
-            // concurrent writer that advanced the real head leaves this
-            // expectation stale, so the conflict surfaces instead of appending
-            // blind.  The observed head advances only after the write lands.
-            let committed = self.store.append_if_head(event, self.head)?;
-            self.head = committed.seq;
-            return Ok(committed.seq);
-        }
+        // `decide` may be run more than once (a retried transaction), so the
+        // event is cloned per attempt rather than moved into the decision.
+        let committed = self
+            .store
+            .append_if(&mut |events| (!has_ended(events)).then(|| event.clone()))?;
 
-        // Kernel-owned beat, assigned before the event is stored so the
-        // record carries the number the run will refer to it by.
-        let beat = self.next_beat();
-        event.insert(FIELD_BEAT.to_string(), Value::from(beat));
+        let Some(committed) = committed else {
+            // The stream carries an ending this handle had not seen.  Nothing
+            // was written, and the handle now knows what the log knew: a
+            // session is over for every handle at once.
+            self.closed = true;
+            return Err(KnlError::new(CLOSED));
+        };
 
-        // Validate + stamp + push, guarded by the observed head.  A malformed
-        // response is rejected, and an observed head another writer has moved
-        // past is a head-conflict error — either way the observed head and the
-        // beat counter are left untouched, advancing only after the append
-        // actually lands.
-        let committed = self.store.append_if_head(event, self.head)?;
+        // The store orders the write and hands back where it landed; that is
+        // the newest thing this handle has seen.
         self.head = committed.seq;
-        self.beats = beat;
         Ok(committed.seq)
+    }
+
+    /// The last `seq` this handle saw land.
+    ///
+    /// A report of what this session has written or read, not a precondition:
+    /// nothing is refused for it being out of date.  `0` before the first
+    /// event of a freshly opened session.
+    pub fn head(&self) -> u64 {
+        self.head
     }
 
     /// Events with `seq >= from`, cloned.
@@ -519,7 +656,7 @@ impl Session {
         self.store.len()
     }
 
-    /// Whether the history is empty (only before `run_started`, i.e.
+    /// Whether the history is empty (only before `session_opened`, i.e.
     /// never for a session built by [`Session::new`]).
     pub fn is_empty(&self) -> KnlResult<bool> {
         self.store.is_empty()
@@ -535,40 +672,72 @@ impl Session {
     /// Both answers are recorded: a `budget_reserved` when it was allowed,
     /// a `budget_refused` (carrying what was asked for and what there was)
     /// when it was not.  A refusal is where a run stops, which is the one
-    /// thing a log must not be silent about.  The event lands *before* the
-    /// balance moves, so an append that fails leaves the counter exactly
-    /// where the log says it is.
+    /// thing a log must not be silent about.
+    ///
+    /// This is the one *command with an invariant* the kernel has, so the
+    /// decision is taken inside the store ([`EventStore::append_if`]): the
+    /// backend hands the ledger to a fold of [`fold_balance`] and writes the
+    /// `budget_reserved` in the same serialized write, so two handles on one
+    /// stream cannot both reserve the same allowance.  The counter is then
+    /// set from that fold — the cache follows the log, never the other way
+    /// round.  A refusal needs no such guard: it is a fact about a decision
+    /// already taken, so it is an ordinary append.
     ///
     /// Always `true`, and recorded nowhere, without a budget: a run with no
     /// quota has no ledger to keep.  Closed sessions refuse, like
     /// [`Session::spend`] — a run that has ended cannot be granted more.
     pub fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
         if self.closed {
-            return Err(KnlError::new("session is closed"));
+            return Err(KnlError::new(CLOSED));
         }
         budget::check_amount(amount)?;
         // No budget, no ledger: nothing to decide and nothing to record.
         let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
             return Ok(true);
         };
+        let scope_id = self.scope.id().to_string();
 
-        let remaining = self.scope.remaining().unwrap_or(0);
-        if remaining < amount {
+        // The balance the decision saw, as the ledger read inside the store
+        // folds to.  Written by `decide`, which the backend may run more than
+        // once (a retried transaction), so the last run is the one that
+        // counts — and it is the run whose answer was committed.
+        let mut balance = 0_i64;
+        // …and whether the stream had already ended, which is the other half
+        // of the decision: a reservation past the boundary would be a write
+        // after the ending, which no invariant on the balance would catch.
+        let mut ended = false;
+        let committed = self.store.append_if(&mut |events| {
+            ended = has_ended(events);
+            balance = fold_balance(events).unwrap_or(0);
+            (!ended && balance >= amount)
+                .then(|| budget_move_event(KIND_BUDGET_RESERVED, amount, tag.as_deref(), &scope_id))
+        })?;
+
+        let Some(committed) = committed else {
+            if ended {
+                // Not a refusal — there is no run left to refuse anything
+                // for.  Nothing was written, here or below.
+                self.closed = true;
+                return Err(KnlError::new(CLOSED));
+            }
+            // Refused: nothing was written by the decision, so the refusal is
+            // recorded here as the ordinary fact it is, carrying what was
+            // asked for and what there was.
             let mut event =
-                budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref(), self.scope.id());
-            event.insert(FIELD_REMAINING.to_string(), Value::from(remaining));
+                budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref(), &scope_id);
+            event.insert(FIELD_REMAINING.to_string(), Value::from(balance));
             self.append_kernel(event)?;
+            // A refusal moves nothing, so the counter is the balance the
+            // ledger just showed.
+            self.scope.set_balance(Some(balance));
             return Ok(false);
-        }
+        };
 
-        let event = budget_move_event(
-            KIND_BUDGET_RESERVED,
-            amount,
-            tag.as_deref(),
-            self.scope.id(),
-        );
-        self.append_kernel(event)?;
-        self.scope.reserve(amount)
+        self.head = committed.seq;
+        // The reservation landed in the same write the fold was taken in, so
+        // the ledger now folds to exactly this.
+        self.scope.set_balance(Some(balance.saturating_sub(amount)));
+        Ok(true)
     }
 
     /// Settle `amount` against the budget, returning the new balance.
@@ -577,17 +746,52 @@ impl Session {
     /// cost, beyond what was reserved for it.  Recorded as `budget_spent`
     /// before the balance moves, on the same write-ahead rule — and
     /// recorded nowhere, moving nothing, when there is no budget.
+    ///
+    /// A settlement has no invariant on the balance to hold — it floors at
+    /// `0` rather than refusing — but it still *reads* one: the balance it
+    /// leaves behind is the ledger's, so the fold is taken inside the store
+    /// ([`EventStore::append_if`]), in the same serialized write as the
+    /// `budget_spent`, and the counter is set from it.  Arithmetic on the
+    /// cached counter would be right only on a stream this handle is alone
+    /// on; the fold is right on any of them.
+    ///
+    /// The decision the write is taken under is the one every write is taken
+    /// under — that the stream has not ended — so a settlement cannot land
+    /// after another handle's close.
     pub fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
         if self.closed {
-            return Err(KnlError::new("session is closed"));
+            return Err(KnlError::new(CLOSED));
         }
         budget::check_amount(amount)?;
         let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
             return Ok(None);
         };
-        let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), self.scope.id());
-        self.append_kernel(event)?;
-        self.scope.spend(amount)
+        let scope_id = self.scope.id().to_string();
+
+        // The ledger as it stood when the settlement landed, read inside the
+        // store like `reserve`'s.  `decide` can be run again on a retried
+        // transaction, so what the committed run left here is what counts.
+        let mut balance = 0_i64;
+        let mut ended = false;
+        let committed = self.store.append_if(&mut |events| {
+            ended = has_ended(events);
+            balance = fold_balance(events).unwrap_or(0);
+            (!ended)
+                .then(|| budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id))
+        })?;
+
+        let Some(committed) = committed else {
+            self.closed = true;
+            return Err(KnlError::new(CLOSED));
+        };
+        self.head = committed.seq;
+
+        // The same step [`fold_balance`] takes for a `budget_spent`, applied
+        // to the balance the fold just showed: floored at `0`, because the
+        // consumption already happened and a settlement never refuses.
+        let remaining = balance.saturating_sub(amount).max(0);
+        self.scope.set_balance(Some(remaining));
+        Ok(Some(remaining))
     }
 
     /// The grant this run opened (or resumed) with, if any.
@@ -597,25 +801,6 @@ impl Session {
     /// when the counter is built.
     pub fn grant(&self) -> Option<&BudgetGrant> {
         self.scope.grant()
-    }
-
-    /// The beat number the next recorded model response will carry.
-    ///
-    /// Also the number a *failed* call names in its `model_call_failed`
-    /// event: the failure does not consume it, so the next success takes
-    /// the same one and the successful beats stay 1, 2, 3 … without gaps.
-    ///
-    /// A counter, not a scan of the history: it advances in
-    /// [`Session::append`]'s `model_response` branch and nowhere else, so
-    /// the `beat` field of an appended event — whatever it says — cannot
-    /// renumber the run.
-    pub fn next_beat(&self) -> u64 {
-        self.beats.saturating_add(1)
-    }
-
-    /// How many model responses this session has recorded.
-    pub fn beats(&self) -> u64 {
-        self.beats
     }
 
     /// The remaining balance (`None` without a budget).
@@ -628,22 +813,22 @@ impl Session {
         self.scope.exhausted()
     }
 
-    /// Whether the run scope has ended.
+    /// Whether the session has ended.
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    /// End the run scope, recording `run_finished` with `reason`
+    /// End the session, recording `session_closed` with `reason`
     /// (defaulting to [`DEFAULT_CLOSE_REASON`]).
     ///
     /// Idempotent: closing an already closed session records nothing.
     ///
-    /// Fallible on a durable backend: the `run_finished` append CASes
-    /// against the observed head, and a concurrent writer can make that
-    /// fail.  On failure the session stays open (closed is not set), so
-    /// the caller knows the boundary was NOT recorded and can retry —
-    /// a close that reports success with no `run_finished` in the log
-    /// would silently break resume/audit reads.
+    /// Fallible on a durable backend: the `session_closed` append can fail on
+    /// a database that stays contended past its retries, or a store that is
+    /// gone.  On failure the session stays open (closed is not set), so the
+    /// caller knows the boundary was NOT recorded and can retry — a close
+    /// that reports success with no `session_closed` in the log would
+    /// silently break resume/audit reads.
     pub fn close(&mut self, reason: Option<&str>) -> KnlResult<()> {
         self.close_with(reason, None)
     }
@@ -662,7 +847,7 @@ impl Session {
         if self.closed {
             return Ok(());
         }
-        let mut event = kernel_event(KIND_RUN_FINISHED);
+        let mut event = kernel_event(KIND_SESSION_CLOSED);
         event.insert(
             FIELD_REASON.to_string(),
             Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
@@ -670,7 +855,25 @@ impl Session {
         if let Some(detail) = detail {
             event.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
         }
-        self.append(event)?;
+
+        // Ending a session is a command with an invariant like any other —
+        // that there is not an ending already — so it is decided inside the
+        // store rather than against this handle's flag.  Two handles on one
+        // stream leave one `session_closed`, not two, whichever of them
+        // closes (or is dropped) second.  The kernel's own decision path:
+        // `session_closed` is kernel-only, so the guarded `append` would
+        // refuse the very event that ends the session.
+        let committed = self
+            .store
+            .append_if(&mut |events| (!has_ended(events)).then(|| event.clone()))?;
+
+        // Whether this close wrote the boundary or found another handle's
+        // already there, the session is over — so the flag is set either way
+        // and the caller is told the ending is in the log, which it is.  Only
+        // a *failed* append leaves the session open, above.
+        if let Some(committed) = committed {
+            self.head = committed.seq;
+        }
         self.closed = true;
         Ok(())
     }
@@ -708,7 +911,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, seq_of};
+    use crate::knl::event::{kind_of, seq_of, FIELD_BEAT, KIND_MODEL_RESPONSE};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -730,7 +933,7 @@ mod tests {
 
     /// A session owned by the reserved anonymous principal.
     ///
-    /// With a budget it opens with two events, not one: `run_started` and
+    /// With a budget it opens with two events, not one: `session_opened` and
     /// the `budget_granted` that records what the owner allowed.
     fn new_session(budget: Option<i64>) -> Session {
         Session::new(ANON.to_string(), budget.map(grant)).expect("open")
@@ -761,25 +964,25 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_already_carries_run_started() {
+    fn a_new_session_already_carries_session_opened() {
         let s = new_session(None);
         assert_eq!(s.len().expect("len"), 1);
         let events = s.events(0).expect("events");
-        assert_eq!(kind_of(&events[0]), KIND_RUN_STARTED);
+        assert_eq!(kind_of(&events[0]), KIND_SESSION_OPENED);
         assert_eq!(seq_of(&events[0]), 1);
         assert!(!s.is_closed());
         assert!(!s.id().is_empty());
     }
 
-    /// The scope is issued when the run opens, and it is not the session:
-    /// two ids, both real, and neither taken from a caller.  Two runs are
-    /// two scopes.
+    /// The scope is issued when the session opens, and it is not the
+    /// session: two ids, both real, and neither taken from a caller.  Two
+    /// sessions are two scopes.
     #[test]
     fn open_issues_a_scope_id_distinct_from_the_session_id() {
         let a = new_session(None);
         let b = new_session(None);
 
-        assert!(!a.scope_id().is_empty(), "a run opens under a scope");
+        assert!(!a.scope_id().is_empty(), "a session opens under a scope");
         assert!(!a.id().is_empty());
         assert_ne!(
             a.scope_id(),
@@ -789,15 +992,15 @@ mod tests {
         assert_eq!(a.scope().id(), a.scope_id(), "the delegate reads the scope");
         assert_eq!(a.scope().owner(), a.owner(), "and so does the owner");
 
-        assert_ne!(a.scope_id(), b.scope_id(), "two runs, two scopes");
+        assert_ne!(a.scope_id(), b.scope_id(), "two sessions, two scopes");
         assert_ne!(a.id(), b.id());
     }
 
-    /// The scope is in the log, not only in the value: it rides on the run's
-    /// opening and on every entry of the ledger, so a reader can tell whose
-    /// authority each move of the balance was made under.
+    /// The scope is in the log, not only in the value: it rides on the
+    /// session's opening and on every entry of the ledger, so a reader can
+    /// tell whose authority each move of the balance was made under.
     #[test]
-    fn run_started_and_every_budget_event_carry_the_scope_id() {
+    fn session_opened_and_every_budget_event_carry_the_scope_id() {
         let mut s = new_session(Some(100));
         assert_eq!(s.reserve(30), Ok(true));
         s.spend(10).expect("spend");
@@ -806,17 +1009,17 @@ mod tests {
         let scope_id = s.scope_id().to_string();
         let events = s.events(0).expect("events");
 
-        let started = &events[0];
-        assert_eq!(kind_of(started), KIND_RUN_STARTED);
+        let opened = &events[0];
+        assert_eq!(kind_of(opened), KIND_SESSION_OPENED);
         assert_eq!(
-            started.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            opened.get(FIELD_SCOPE_ID).and_then(Value::as_str),
             Some(scope_id.as_str()),
-            "the scope rides on run_started: {started}"
+            "the scope rides on session_opened: {opened}"
         );
         assert_eq!(
-            started.get("owner").and_then(Value::as_str),
+            opened.get("owner").and_then(Value::as_str),
             Some(ANON),
-            "beside the owner: {started}"
+            "beside the owner: {opened}"
         );
 
         let moves = ledger(&s);
@@ -864,14 +1067,14 @@ mod tests {
     }
 
     #[test]
-    fn close_records_run_finished_once_with_the_given_reason() {
+    fn close_records_session_closed_once_with_the_given_reason() {
         let mut s = new_session(None);
         s.close(Some("budget_exhausted")).expect("close");
         s.close(Some("ignored")).expect("close (idempotent)");
         assert_eq!(s.len().expect("len"), 2, "close must be idempotent");
 
-        let last = s.events(2).expect("events").pop().expect("run_finished");
-        assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
+        let last = s.events(2).expect("events").pop().expect("session_closed");
+        assert_eq!(kind_of(&last), KIND_SESSION_CLOSED);
         assert_eq!(last["reason"], json!("budget_exhausted"));
         assert!(s.is_closed());
     }
@@ -880,7 +1083,7 @@ mod tests {
     fn close_without_a_reason_records_the_default() {
         let mut s = new_session(None);
         s.close(None).expect("close");
-        let last = s.events(2).expect("events").pop().expect("run_finished");
+        let last = s.events(2).expect("events").pop().expect("session_closed");
         assert_eq!(last["reason"], json!(DEFAULT_CLOSE_REASON));
     }
 
@@ -903,7 +1106,7 @@ mod tests {
         assert_eq!(
             s.len().expect("len"),
             5,
-            "run_started + budget_granted + note + budget_spent + run_finished"
+            "session_opened + budget_granted + note + budget_spent + session_closed"
         );
         assert_eq!(s.remaining(), Some(6));
         assert_eq!(folded(&s), s.remaining(), "the ledger is the balance");
@@ -924,9 +1127,9 @@ mod tests {
         assert_eq!(
             a.len().expect("len"),
             4,
-            "run_started + budget_granted + only_in_a + budget_spent"
+            "session_opened + budget_granted + only_in_a + budget_spent"
         );
-        assert_eq!(b.len().expect("len"), 2, "run_started + budget_granted");
+        assert_eq!(b.len().expect("len"), 2, "session_opened + budget_granted");
         assert_eq!(a.remaining(), Some(40));
         assert_eq!(b.remaining(), Some(100));
         // The ledgers are as separate as the histories.
@@ -950,7 +1153,7 @@ mod tests {
         assert_eq!(
             usage["at_seq"],
             json!(3),
-            "run_started + msg_user + response"
+            "session_opened + msg_user + response"
         );
 
         let tail = s
@@ -980,18 +1183,18 @@ mod tests {
         assert_eq!(events[1]["content"], json!("hi"));
     }
 
-    /// Appending a `model_response` records, numbers and counts it — and
-    /// leaves the budget alone.  What a call was allowed to cost was
+    /// Appending a `model_response` records it — verbatim, beat included —
+    /// and leaves the budget alone.  What a call was allowed to cost was
     /// decided before it happened; the record of it happening is not a
     /// second place where that is decided.
     #[test]
-    fn appending_a_model_response_numbers_and_counts_it_without_charging() {
+    fn appending_a_model_response_records_it_verbatim_without_charging() {
         let mut s = new_session(Some(100));
         let seq = s
             .append(obj(json!({
                 "kind": "model_response",
-                // A beat the caller supplied is ignored: the kernel owns it.
-                "beat": 99,
+                // The beat is the caller's word and the kernel keeps it.
+                "beat": "beat-7",
                 "content": [{ "type": "text", "text": "hi" }],
                 "usage": { "input_tokens": 20, "output_tokens": 10 }
             })))
@@ -1003,9 +1206,12 @@ mod tests {
             .pop()
             .expect("model_response");
         assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
-        assert_eq!(recorded[FIELD_BEAT], json!(1), "the kernel numbered it 1");
+        assert_eq!(
+            recorded[FIELD_BEAT],
+            json!("beat-7"),
+            "the declared beat is recorded as given"
+        );
 
-        assert_eq!(s.beats(), 1);
         assert_eq!(s.remaining(), Some(100), "an append must not charge");
         assert_eq!(
             ledger(&s).len(),
@@ -1023,8 +1229,8 @@ mod tests {
         );
     }
 
-    /// The grant is the first thing the ledger says, right after the run's
-    /// own boundary, with the owner's words on it.
+    /// The grant is the first thing the ledger says, right after the
+    /// session's own boundary, with the owner's words on it.
     #[test]
     fn opening_with_a_grant_records_it() {
         let s = Session::new(
@@ -1038,12 +1244,12 @@ mod tests {
         .expect("open");
 
         let events = s.events(0).expect("events");
-        assert_eq!(events.len(), 2, "run_started + budget_granted");
-        assert_eq!(kind_of(&events[0]), KIND_RUN_STARTED);
+        assert_eq!(events.len(), 2, "session_opened + budget_granted");
+        assert_eq!(kind_of(&events[0]), KIND_SESSION_OPENED);
         assert_eq!(
             events[0].get("budget"),
             None,
-            "the grant is its own event, not a field on run_started"
+            "the grant is its own event, not a field on session_opened"
         );
 
         let granted = &events[1];
@@ -1054,9 +1260,9 @@ mod tests {
         assert_eq!(s.remaining(), Some(500));
         assert_eq!(folded(&s), s.remaining());
 
-        // A run with no grant keeps no ledger at all.
+        // A session with no grant keeps no ledger at all.
         let bare = new_session(None);
-        assert_eq!(bare.len().expect("len"), 1, "run_started only");
+        assert_eq!(bare.len().expect("len"), 1, "session_opened only");
         assert!(ledger(&bare).is_empty());
         assert_eq!(folded(&bare), None);
     }
@@ -1155,28 +1361,57 @@ mod tests {
         assert_eq!(folded(&s), s.remaining());
     }
 
-    /// The run scope is the flag, so a `run_finished` a caller writes is a
-    /// line in the history and nothing more: the session stays open and
-    /// keeps taking writes.
+    /// The session's boundaries are the kernel's alone: a caller cannot
+    /// hand-append either one, so a stream cannot claim an opening it never
+    /// had or an ending it never reached.  The refusal leaves the session
+    /// open and the log untouched.
     #[test]
-    fn an_appended_run_finished_records_a_fact_without_ending_the_run() {
+    fn a_caller_cannot_append_the_session_boundary_kinds() {
         let mut s = new_session(Some(100));
-        s.append(obj(
-            json!({ "kind": "run_finished", "reason": "carried over" }),
-        ))
-        .expect("append");
+        for event in [
+            json!({ "kind": "session_opened" }),
+            json!({ "kind": "session_closed", "reason": "carried over" }),
+        ] {
+            let err = s.append(obj(event.clone())).expect_err("kernel-only kind");
+            assert!(
+                err.reason().contains("kernel only"),
+                "{event}: {}",
+                err.reason()
+            );
+        }
 
-        assert!(!s.is_closed(), "an event ended the run scope");
-        assert_eq!(s.append(obj(json!({ "kind": "note" }))), Ok(4));
+        assert!(!s.is_closed(), "a refused append ended the session");
+        assert_eq!(s.len().expect("len"), 2, "nothing was recorded");
+        assert_eq!(s.append(obj(json!({ "kind": "note" }))), Ok(3));
         assert_eq!(s.spend(10), Ok(Some(90)));
+    }
 
-        // Closing still writes the kernel's own boundary, and only then
-        // do writes stop.
+    /// Only `close` records `session_closed`, and it records exactly one:
+    /// the flag and the event move together, so the log and the state
+    /// cannot disagree.
+    #[test]
+    fn only_close_records_session_closed() {
+        let mut s = new_session(Some(100));
+        s.append(obj(json!({ "kind": "note" }))).expect("append");
+        assert!(
+            !s.events(0)
+                .expect("events")
+                .iter()
+                .any(|e| kind_of(e) == KIND_SESSION_CLOSED),
+            "nothing but close writes the boundary"
+        );
+
         s.close(Some("done")).expect("close");
         assert!(s.is_closed());
-        let last = s.events(0).expect("events").pop().expect("run_finished");
-        assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
-        assert_eq!(last["reason"], json!("done"));
+
+        let closed: Vec<Value> = s
+            .events(0)
+            .expect("events")
+            .into_iter()
+            .filter(|e| kind_of(e) == KIND_SESSION_CLOSED)
+            .collect();
+        assert_eq!(closed.len(), 1, "exactly one boundary: {closed:?}");
+        assert_eq!(closed[0]["reason"], json!("done"));
         assert_eq!(
             s.append(obj(json!({ "kind": "note" })))
                 .expect_err("append after close")
@@ -1185,46 +1420,66 @@ mod tests {
         );
     }
 
-    /// The record and the account are separate readings of the same run:
-    /// the response is in the history and in `usage`, and the balance is
-    /// exactly what was granted, because nobody reserved anything.
+    /// The record and the account are separate readings of the same
+    /// session: the response is in the history and in `usage`, and the
+    /// balance is exactly what was granted, because nobody reserved
+    /// anything.
     #[test]
     fn a_recorded_response_is_in_the_history_without_being_charged() {
         let mut s = new_session(Some(100));
         s.append(response(30)).expect("recorded");
 
-        assert_eq!(s.beats(), 1);
         assert_eq!(s.remaining(), Some(100));
         assert!(!s.exhausted());
 
         let recorded = s.events(3).expect("events").pop().expect("model_response");
         assert_eq!(kind_of(&recorded), "model_response");
-        assert_eq!(recorded[FIELD_BEAT], json!(1));
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
         assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["input_tokens"], 30);
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
     }
 
+    /// The beat belongs to the layer above: the kernel never mints one, so
+    /// an event that declares none carries none, and one that declares a
+    /// beat carries exactly the string it was given — on any kind, and
+    /// repeated across the facts of one beat without the kernel objecting.
     #[test]
-    fn beats_are_numbered_by_the_kernel_over_the_recorded_responses() {
+    fn beats_are_the_callers_word_and_the_kernel_adds_none() {
         let mut s = new_session(None);
-        assert_eq!(s.next_beat(), 1);
 
-        s.append(response(1)).expect("first");
-        assert_eq!(s.beats(), 1);
+        let seq = s.append(response(1)).expect("an undeclared beat");
+        let bare = s.events(seq).expect("events").pop().expect("response");
+        assert_eq!(
+            bare.get(FIELD_BEAT),
+            None,
+            "the kernel must not invent a beat: {bare}"
+        );
 
-        // An open-kind event between responses does not advance the counter.
-        s.append(obj(
-            json!({ "kind": "model_call_failed", "beat": 2, "error": "boom" }),
-        ))
-        .expect("note");
-        assert_eq!(s.beats(), 1, "a non-response must not advance the counter");
-        assert_eq!(s.next_beat(), 2);
+        for event in [
+            json!({
+                "kind": "model_response", "beat": "b-1", "content": [],
+                "usage": { "input_tokens": 1 }
+            }),
+            json!({
+                "kind": "tool_call", "beat": "b-1", "call_id": "c1",
+                "name": "sh", "args": {}
+            }),
+            json!({
+                "kind": "tool_result", "beat": "b-1", "call_id": "c1",
+                "ok": true, "result": "ok"
+            }),
+            json!({ "kind": "model_call_failed", "beat": "b-1", "error": "boom" }),
+        ] {
+            let seq = s.append(obj(event.clone())).expect("declared beat");
+            let recorded = s.events(seq).expect("events").pop().expect("recorded");
+            assert_eq!(recorded[FIELD_BEAT], json!("b-1"), "{event}");
+        }
 
-        s.append(response(1)).expect("second");
-        assert_eq!(s.beats(), 2);
-        s.append(response(1)).expect("third");
-        assert_eq!(s.beats(), 3);
+        // A non-string beat is the one thing refused, on any kind.
+        let err = s
+            .append(obj(json!({ "kind": "note", "beat": 1 })))
+            .expect_err("a numbered beat");
+        assert!(err.reason().contains("beat must be a string"), "{err}");
     }
 
     #[test]
@@ -1238,20 +1493,28 @@ mod tests {
         assert_eq!(
             s.len().expect("len"),
             3,
-            "run_started + budget_granted + run_finished only"
+            "session_opened + budget_granted + session_closed only"
         );
         assert_eq!(s.remaining(), Some(100), "nothing was consumed");
-        assert_eq!(s.beats(), 0);
     }
 
-    /// The budget stops a run *before* it spends, not after: a reservation
-    /// the balance cannot cover is refused, and the call it was for never
-    /// happens.  This replaces the old contract, where the budget was a
-    /// flag that only stood up once a recorded call had already used the
-    /// allowance up — by which time the spending was done.
+    /// The budget stops a session *before* it spends, not after: a
+    /// reservation the balance cannot cover is refused, and the call it was
+    /// for never happens.  This replaces the old contract, where the budget
+    /// was a flag that only stood up once a recorded call had already used
+    /// the allowance up — by which time the spending was done.
     #[test]
     fn the_budget_refuses_before_the_call_rather_than_flagging_after_it() {
         let mut s = new_session(Some(10));
+
+        /// How many model responses the log holds.
+        fn responses(s: &Session) -> usize {
+            s.events(0)
+                .expect("events")
+                .iter()
+                .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+                .count()
+        }
 
         // The estimate fits, so the beat proceeds and records its response.
         assert_eq!(s.reserve(10), Ok(true));
@@ -1262,14 +1525,14 @@ mod tests {
         // The next beat asks first and is turned away, so no second
         // response is recorded: the caller never made the call.
         assert_eq!(s.reserve(1), Ok(false));
-        assert_eq!(s.beats(), 1, "the refused beat made no call");
+        assert_eq!(responses(&s), 1, "the refused beat made no call");
         assert_eq!(s.remaining(), Some(0));
         assert_eq!(folded(&s), s.remaining());
 
         // The kernel still does not police it: a caller that ignores the
         // refusal can append anyway, and the history says that it did.
         s.append(response(5)).expect("recorded");
-        assert_eq!(s.beats(), 2, "stopping is the caller's decision");
+        assert_eq!(responses(&s), 2, "stopping is the caller's decision");
     }
 
     #[test]
@@ -1296,7 +1559,7 @@ mod tests {
         s.close(None).expect("close");
         let after = s.view(VIEW_USAGE, None).expect("usage after close");
 
-        // `run_finished` costs nothing, so the totals are unchanged even
+        // `session_closed` costs nothing, so the totals are unchanged even
         // though the history grew — and `at_seq` says the fold saw it.
         assert_eq!(before["input_tokens"], after["input_tokens"]);
         assert_eq!(before["model_calls"], after["model_calls"]);
@@ -1304,14 +1567,18 @@ mod tests {
         assert_eq!(after["at_seq"], json!(3));
 
         assert_eq!(s.len().expect("len"), 3);
-        assert_eq!(kind_of(&s.events(0).expect("events")[2]), KIND_RUN_FINISHED);
+        assert_eq!(
+            kind_of(&s.events(0).expect("events")[2]),
+            KIND_SESSION_CLOSED
+        );
     }
 
     /// `open_on` on a durable backend records the session's owner on the
-    /// `run_started` boundary, so resume can recover it from the log alone.
+    /// `session_opened` boundary, so resume can recover it from the log
+    /// alone.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn open_on_records_the_owner_on_run_started() {
+    fn open_on_records_the_owner_on_session_opened() {
         use crate::knl::SqliteEventStore;
 
         let store = SqliteEventStore::open_in_memory("owner-stream").expect("open");
@@ -1319,12 +1586,12 @@ mod tests {
             .expect("open");
 
         let events = s.events(0).expect("events");
-        let started = events.first().expect("run_started");
-        assert_eq!(kind_of(started), KIND_RUN_STARTED);
+        let opened = events.first().expect("session_opened");
+        assert_eq!(kind_of(opened), KIND_SESSION_OPENED);
         assert_eq!(
-            started.get("owner").and_then(Value::as_str),
+            opened.get("owner").and_then(Value::as_str),
             Some("user-7"),
-            "owner rides on run_started: {started}"
+            "owner rides on session_opened: {opened}"
         );
         assert_eq!(s.owner(), "user-7");
 
@@ -1333,12 +1600,12 @@ mod tests {
         assert_eq!(events[1]["amount"], json!(100));
     }
 
-    /// Resume re-folds a persisted SQLite stream: the beat counter, the
-    /// owner and the *balance* all come back from the log, because every
-    /// move of the balance is in it.
+    /// Resume re-folds a persisted SQLite stream: the owner and the
+    /// *balance* come back from the log, because every move of the balance
+    /// is in it.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn resume_restores_beat_owner_and_the_folded_balance() {
+    fn resume_restores_the_owner_and_the_folded_balance() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1357,23 +1624,21 @@ mod tests {
             assert_eq!(s.reserve(15), Ok(true));
             s.append(response(20)).expect("second response");
             s.spend(5).expect("the second call overran its estimate");
-            assert_eq!(s.beats(), 2);
             assert_eq!(s.remaining(), Some(50), "100 - 30 - 15 - 5");
             assert_eq!(folded(&s), s.remaining());
             s.remaining()
         }; // dropped: the connection closes, the log persists.
 
-        // Reopen the same stream and resume — no new run_started is written,
-        // and no new grant either.
+        // Reopen the same stream and resume — no new session_opened is
+        // written, and no new grant either.
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let mut resumed = Session::resume(None, Box::new(store)).expect("resume");
 
         assert_eq!(
             resumed.owner(),
             "user-42",
-            "owner restored from run_started"
+            "owner restored from session_opened"
         );
-        assert_eq!(resumed.beats(), 2, "beat counter restored");
         assert_eq!(
             resumed.remaining(),
             before_close,
@@ -1388,7 +1653,7 @@ mod tests {
         assert_eq!(
             resumed.len().expect("len"),
             8,
-            "run_started + granted + reserved + response + msg_user \
+            "session_opened + granted + reserved + response + msg_user \
              + reserved + response + spent — and nothing from resume itself"
         );
 
@@ -1397,8 +1662,8 @@ mod tests {
         assert_eq!(usage["model_calls"], json!(2));
         assert_eq!(usage["input_tokens"], json!(50));
 
-        // Numbering continues, and so does the ledger: the next reservation
-        // comes off the restored balance.
+        // The ledger continues: the next reservation comes off the restored
+        // balance, and what the resumed session records is its own.
         assert_eq!(resumed.reserve(5), Ok(true));
         let seq = resumed.append(response(5)).expect("third response");
         let recorded = resumed
@@ -1406,12 +1671,7 @@ mod tests {
             .expect("events")
             .pop()
             .expect("model_response");
-        assert_eq!(
-            recorded[FIELD_BEAT],
-            json!(3),
-            "numbering continues from the restored count"
-        );
-        assert_eq!(resumed.beats(), 3);
+        assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
         assert_eq!(resumed.remaining(), Some(45), "5 reserved off the 50");
         assert_eq!(folded(&resumed), resumed.remaining());
     }
@@ -1470,7 +1730,7 @@ mod tests {
         assert_eq!(folded(&resumed), resumed.remaining());
     }
 
-    /// An older log with no `owner` on `run_started` resumes as [`ANON`]
+    /// An older log with no `owner` on `session_opened` resumes as [`ANON`]
     /// rather than failing — the field is a later addition.
     #[cfg(feature = "sqlite")]
     #[test]
@@ -1481,24 +1741,24 @@ mod tests {
         let path = dir.path().join("events.db");
         let stream = "legacy-stream";
 
-        // Write a run_started with no owner field, as an older build would.
+        // Write a session_opened with no owner field, as an older build
+        // would.
         {
             let mut store = SqliteEventStore::open(&path, stream).expect("open");
             store
-                .append(kernel_event(KIND_RUN_STARTED))
-                .expect("run_started");
+                .append(kernel_event(KIND_SESSION_OPENED))
+                .expect("session_opened");
         }
 
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(None, Box::new(store)).expect("resume");
         assert_eq!(resumed.owner(), ANON);
-        assert_eq!(resumed.beats(), 0);
         assert_eq!(resumed.remaining(), None, "resumed without a budget cap");
     }
 
     /// Resume restores the *scope*, not just a fresh one: the id and the
-    /// owner come back off `run_started`, so the run continues under the
-    /// authority the log says it opened with, and the ledger it goes on
+    /// owner come back off `session_opened`, so the session continues under
+    /// the authority the log says it opened with, and the ledger it goes on
     /// writing names that same scope.
     #[cfg(feature = "sqlite")]
     #[test]
@@ -1522,13 +1782,13 @@ mod tests {
         assert_eq!(
             resumed.scope_id(),
             opened_scope,
-            "the scope id is restored from run_started, not re-issued"
+            "the scope id is restored from session_opened, not re-issued"
         );
         assert_eq!(resumed.owner(), "user-11");
         assert_eq!(resumed.scope().owner(), "user-11");
         assert_eq!(resumed.remaining(), Some(60), "the balance is the fold's");
 
-        // What the resumed run records goes on naming the same scope.
+        // What the resumed session records goes on naming the same scope.
         assert_eq!(resumed.reserve(10), Ok(true));
         let last = ledger(&resumed).pop().expect("budget_reserved");
         assert_eq!(kind_of(&last), KIND_BUDGET_RESERVED);
@@ -1539,10 +1799,10 @@ mod tests {
         );
     }
 
-    /// An older log with no `scope_id` on `run_started` resumes under a
+    /// An older log with no `scope_id` on `session_opened` resumes under a
     /// fresh kernel-issued one rather than failing — the field is a later
-    /// addition, exactly like `owner` above, and a run that predates it is
-    /// still a run.
+    /// addition, exactly like `owner` above, and a session that predates it
+    /// is still a session.
     #[cfg(feature = "sqlite")]
     #[test]
     fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
@@ -1552,23 +1812,23 @@ mod tests {
         let path = dir.path().join("events.db");
         let stream = "legacy-scope-stream";
 
-        // An old-style opening: a run_started carrying neither field.
+        // An old-style opening: a session_opened carrying neither field.
         {
             let mut store = SqliteEventStore::open(&path, stream).expect("open");
             store
-                .append(kernel_event(KIND_RUN_STARTED))
-                .expect("run_started");
+                .append(kernel_event(KIND_SESSION_OPENED))
+                .expect("session_opened");
         }
 
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(Some(grant(50)), Box::new(store)).expect("resume");
 
         // The fallback is visible from both sides: the log says nothing…
-        let started = resumed.events(0).expect("events").remove(0);
-        assert_eq!(kind_of(&started), KIND_RUN_STARTED);
-        assert_eq!(started.get(FIELD_SCOPE_ID), None, "{started}");
-        assert_eq!(started.get("owner"), None, "{started}");
-        // …and the resumed run has a real scope all the same.
+        let opened = resumed.events(0).expect("events").remove(0);
+        assert_eq!(kind_of(&opened), KIND_SESSION_OPENED);
+        assert_eq!(opened.get(FIELD_SCOPE_ID), None, "{opened}");
+        assert_eq!(opened.get("owner"), None, "{opened}");
+        // …and the resumed session has a real scope all the same.
         assert!(
             !resumed.scope_id().is_empty(),
             "an older log must still resume under a scope"
@@ -1590,61 +1850,100 @@ mod tests {
     #[test]
     fn resume_of_an_empty_store_is_a_caller_error_not_an_anon_session() {
         let err = Session::resume(Some(grant(100)), Box::new(MemEventStore::new()))
-            .expect_err("an empty store has no run to resume");
+            .expect_err("an empty store has no session to resume");
         assert!(
-            err.reason().contains("no run to resume"),
+            err.reason().contains("no session to resume"),
             "{}",
             err.reason()
         );
     }
 
-    /// (Fix 5) A log that has events but never opened with `run_started` is a
-    /// caller error too — the ANON fallback is only for a real run_started.
+    /// (Fix 5) A log that has events but no opening the kernel recognises —
+    /// under any shape it has ever been written in — is a caller error too:
+    /// the ANON fallback is only for a real `session_opened`.
     #[test]
-    fn resume_of_a_store_without_run_started_is_a_caller_error() {
+    fn resume_of_a_store_without_an_opening_is_a_caller_error() {
         let mut store = MemEventStore::new();
         store
             .append(obj(json!({ "kind": "note" })))
-            .expect("seed a non-run_started event");
+            .expect("seed a non-opening event");
         let err = Session::resume(None, Box::new(store))
-            .expect_err("a log with no run_started has no run to resume");
+            .expect_err("a log with no opening has no session to resume");
         assert!(
-            err.reason().contains("no run to resume"),
+            err.reason().contains("no session to resume"),
             "{}",
             err.reason()
         );
     }
 
-    /// A store that drops a competing write in between the head read and the
-    /// CAS on the first `model_response`, deterministically reproducing the
-    /// race [`Session::append`]'s compare-and-swap guards: the injected write
-    /// advances the head, so the session's CAS then holds a stale expectation.
-    struct RacyStore {
+    /// A session is disposable: once its ending is in the log, the stream is
+    /// not continued.  What comes after an ending is a new session.
+    #[test]
+    fn a_closed_stream_is_not_resumed() {
+        let mut store = MemEventStore::new();
+        store
+            .append(obj(json!({ "kind": "session_opened", "owner": "user-5" })))
+            .expect("seed the opening");
+        store
+            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
+            .expect("seed the grant");
+        store
+            .append(obj(json!({ "kind": "session_closed", "reason": "done" })))
+            .expect("seed the ending");
+
+        let err = Session::resume(None, Box::new(store))
+            .expect_err("a closed session must not be resumed");
+        assert!(
+            err.reason().contains("session is closed"),
+            "{}",
+            err.reason()
+        );
+        assert!(err.reason().contains("disposable"), "{}", err.reason());
+    }
+
+    // A v1 log — `run_started` / `run_finished`, the numbered `turn` — is
+    // seeded as real v1 rows rather than through today's store (which stamps
+    // the current version), so those two cases live with the durable tests
+    // below: `a_v1_stream_resumes_and_reads_upcasted_without_rewriting_the_bytes`
+    // and `a_v1_stream_that_finished_is_refused_as_closed`.
+
+    /// A competing writer lands an event between this session's writes, so
+    /// the head it last saw is out of date at the moment it appends.  The
+    /// append still lands — a fact is not refused for what its writer had
+    /// seen — and `head` follows the event, whatever landed in between.
+    struct BusyStore {
         inner: MemEventStore,
         injected: bool,
     }
 
-    impl EventStore for RacyStore {
+    impl EventStore for BusyStore {
         fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
             self.inner.append(event)
         }
 
-        fn append_if_head(
+        /// Every session write comes through here, so this is where the
+        /// competing writer gets in: once, just before the response this
+        /// session is about to record.  `decide` is a pure fold of the events
+        /// it is handed, so asking it what it would write costs nothing.
+        fn append_if(
             &mut self,
-            event: Map<String, Value>,
-            expected_head: u64,
-        ) -> KnlResult<crate::knl::Committed> {
-            let is_response =
-                event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
-            if is_response && !self.injected {
-                self.injected = true;
-                // A competing writer lands one event, advancing the head
-                // under us so the pending CAS is now stale.
-                self.inner
-                    .append(obj(json!({ "kind": "sneaked_in" })))
-                    .expect("injected concurrent write");
+            decide: &mut crate::knl::Decision<'_>,
+        ) -> KnlResult<Option<crate::knl::Committed>> {
+            if !self.injected {
+                let events = self.inner.read(0, usize::MAX)?;
+                let is_response = decide(&events)
+                    .as_ref()
+                    .and_then(|event| event.get(FIELD_KIND))
+                    .and_then(Value::as_str)
+                    == Some(KIND_MODEL_RESPONSE);
+                if is_response {
+                    self.injected = true;
+                    self.inner
+                        .append(obj(json!({ "kind": "sneaked_in" })))
+                        .expect("injected concurrent write");
+                }
             }
-            self.inner.append_if_head(event, expected_head)
+            self.inner.append_if(decide)
         }
 
         fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
@@ -1660,14 +1959,12 @@ mod tests {
         }
     }
 
-    /// (Fix 1) `Session::append` is a compare-and-swap on the head: a second
-    /// writer landing between the head read and the write makes the append a
-    /// stale CAS, which fails loud instead of silently duplicating a beat —
-    /// and neither the beat counter nor the budget move on the failure.
+    /// An append records a fact and the store orders it: another writer
+    /// getting there first does not turn this session's append into a
+    /// failure, it only decides where the two land.
     #[test]
-    fn append_cas_rejects_a_stale_writer_without_duplicating_a_beat() {
-        // Single-writer construction is unaffected: run_started lands as usual.
-        let store = RacyStore {
+    fn an_append_lands_after_a_competing_write_rather_than_being_refused() {
+        let store = BusyStore {
             inner: MemEventStore::new(),
             injected: false,
         };
@@ -1676,30 +1973,29 @@ mod tests {
         assert_eq!(
             s.len().expect("len"),
             2,
-            "run_started + budget_granted so far"
+            "session_opened + budget_granted so far"
         );
-        assert_eq!(s.beats(), 0);
+        assert_eq!(s.head(), 2, "the head is what this handle has seen");
 
-        // The CAS sees a head advanced by the injected competing writer.
-        let err = s
-            .append(response(10))
-            .expect_err("a stale CAS must fail loud");
-        assert!(err.reason().contains("head conflict"), "{}", err.reason());
+        // The competing write lands at seq 3, so the response lands at 4 —
+        // and it lands.
+        let seq = s.append(response(10)).expect("an append is not refused");
+        assert_eq!(seq, 4);
+        assert_eq!(s.head(), 4, "head follows the event, not the other way");
 
-        // Neither the beat counter nor the budget moved: the append did not land.
-        assert_eq!(s.beats(), 0, "a failed CAS must not advance the beat");
-        assert_eq!(s.remaining(), Some(1000), "a failed CAS must not consume");
-
-        // No model_response reached the log — no duplicate beat was written.
         let log = s.events(0).expect("events");
-        let responses = log
-            .iter()
-            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
-            .count();
+        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
         assert_eq!(
-            responses, 0,
-            "the conflicting response must not be recorded"
+            kinds,
+            [
+                KIND_SESSION_OPENED,
+                KIND_BUDGET_GRANTED,
+                "sneaked_in",
+                KIND_MODEL_RESPONSE
+            ],
+            "the log interleaves in arrival order"
         );
+        assert_eq!(s.remaining(), Some(1000), "an append still charges nothing");
     }
 
     /// (Fix 5) Resuming a nonexistent SQLite stream is a caller error, not an
@@ -1711,103 +2007,391 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
-        // A stream that was never opened as a run: its log is empty.
+        // A stream that was never opened as a session: its log is empty.
         let store = SqliteEventStore::open(&path, "ghost-stream").expect("open");
         let err = Session::resume(Some(grant(100)), Box::new(store))
-            .expect_err("an empty stream has no run to resume");
+            .expect_err("an empty stream has no session to resume");
         assert!(
-            err.reason().contains("no run to resume"),
+            err.reason().contains("no session to resume"),
             "{}",
             err.reason()
         );
     }
 
-    /// (Concurrency) The interleaved two-session scenario, with no artificial
-    /// straddle decorator: two `Session`s open on ONE durable stream, both
-    /// observing the same head `H`.  Session A appends a response, so the head
-    /// advances; Session B — whose observed head is still `H`, from *before* A's
-    /// write — appends a response and MUST get a head-conflict, write nothing,
-    /// and leave no duplicate beat in the log.
-    ///
-    /// This is the exact bug a fresh `self.store.head()` read would *not* catch:
-    /// B would read the already-advanced head, its CAS would match, and it would
-    /// silently write a second event carrying the same beat.  CASing against the
-    /// head each session *observed* is what makes B's stale write fail loud.
+    /// (Concurrency) Two `Session` handles on ONE durable stream, each with a
+    /// view of the head from before the other wrote: both append, and the log
+    /// holds both in the order they arrived.  This is the scenario that used
+    /// to be a head conflict — an append records a fact, and a fact is not
+    /// refused for what its writer had last seen.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn two_sessions_interleaving_on_one_stream_conflict_without_duplicating_a_beat() {
+    fn two_sessions_on_one_stream_both_append_and_the_log_interleaves() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "interleave-stream";
 
-        // A opens the run on the shared stream: `run_started` lands at seq 1
-        // and its `budget_granted` at seq 2, so A observes head 2 (H).
+        // A opens the session on the shared stream: `session_opened` at seq 1
+        // and its `budget_granted` at seq 2, so A has seen head 2.
         let store_a = SqliteEventStore::open(&path, stream).expect("open A");
         let mut a = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store_a))
             .expect("open A");
-        assert_eq!(a.beats(), 0);
 
-        // B resumes the SAME stream while it holds only those two, so B
-        // observes the same head 2 — genuinely from before A's write, not
-        // injected mid-call.  It resumes on the folded balance, granting
-        // nothing new (a second grant would be a second write).
+        // B resumes the SAME stream while it holds only those two, so both
+        // handles have seen exactly head 2.  (It resumes before A closes: a
+        // closed session is not resumable.)
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(b.beats(), 0);
         assert_eq!(b.remaining(), Some(1000), "B resumed on A's ledger");
+        assert_eq!((a.head(), b.head()), (2, 2), "both saw the same head");
 
-        // A appends a model_response: its observed head still matches the real
-        // one, so it lands (seq 3, beat 1) and A advances its observed head.
-        let a_seq = a.append(response(10)).expect("A appends");
-        assert_eq!(a_seq, 3);
-        assert_eq!(a.beats(), 1);
-
-        // B's observed head is still 2 — it never saw A's write — so its CAS is
-        // stale: a head-conflict, with no write, no charge, and no beat advance.
-        let err = b
-            .append(response(20))
-            .expect_err("B's stale observed head must conflict");
-        assert!(err.reason().contains("head conflict"), "{}", err.reason());
+        // A appends, so B's view is now out of date — and B appends anyway.
+        assert_eq!(a.append(response(10)).expect("A appends"), 3);
         assert_eq!(
-            b.beats(),
-            0,
-            "a conflicting append must not advance B's beat"
+            b.append(response(20)).expect("B appends too"),
+            4,
+            "B's write lands after A's, rather than being refused"
         );
-        assert_eq!(
-            b.remaining(),
-            Some(1000),
-            "a conflicting append must not consume B's budget"
-        );
+        // And A, now out of date in its turn, goes on writing.
+        assert_eq!(a.append(response(30)).expect("A appends again"), 5);
 
-        // A stale writer cannot move the ledger either: B's reservation
-        // fails on the same CAS, and its balance is untouched.
-        let err = b
-            .reserve(10)
-            .expect_err("B's stale reservation must conflict");
-        assert!(err.reason().contains("head conflict"), "{}", err.reason());
-        assert_eq!(b.remaining(), Some(1000), "a failed CAS must not deduct");
-
-        // The durable log: exactly one event past H = 2 (A's response at seq 3)
-        // and exactly one model_response, numbered beat 1 — no duplicate.
+        // The durable log holds all three, in arrival order.
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         let log = verify.read(0, usize::MAX).expect("read log");
-        let past_h: Vec<_> = log.iter().filter(|e| seq_of(e) > 2).collect();
-        assert_eq!(past_h.len(), 1, "exactly one event past H");
-        let responses: Vec<_> = log
+        let responses: Vec<u64> = log
             .iter()
             .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+            .map(seq_of)
+            .collect();
+        assert_eq!(responses, [3, 4, 5], "every append landed, in order");
+    }
+
+    /// (Concurrency) The invariant that *is* a decision: two handles on one
+    /// stream, ten granted, each asking for six.  The decision is taken inside
+    /// the store, against the ledger as it stands there, so exactly one is
+    /// allowed — and the fold says four, not minus two.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn two_sessions_cannot_both_reserve_the_same_allowance() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "reserve-race-stream";
+
+        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let mut a = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store_a))
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
+        assert_eq!(b.remaining(), Some(10), "both see the whole grant");
+        assert_eq!(a.remaining(), Some(10));
+
+        // A takes six.  B still believes it has ten — and is refused all the
+        // same, because the balance it is measured against is the one in the
+        // store, not the one it cached.
+        assert_eq!(a.reserve(6), Ok(true), "the first reservation fits");
+        assert_eq!(b.reserve(6), Ok(false), "the second does not");
+        assert_eq!(b.remaining(), Some(4), "B's counter follows the ledger");
+        assert_eq!(a.remaining(), Some(4), "and so does A's");
+
+        // The ledger is the answer: 10 granted − 6 reserved = 4, with the
+        // refusal recorded and moving nothing.
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        let log = verify.read(0, usize::MAX).expect("read log");
+        assert_eq!(fold_balance(&log), Some(4), "no allowance was taken twice");
+        let moves: Vec<&str> = log
+            .iter()
+            .map(kind_of)
+            .filter(|k| k.starts_with("budget_"))
             .collect();
         assert_eq!(
-            responses.len(),
-            1,
-            "no duplicate beat: one model_response only"
+            moves,
+            [
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_RESERVED,
+                KIND_BUDGET_REFUSED
+            ],
+            "one grant, one reservation, one refusal"
+        );
+        let refused = log.last().expect("the refusal");
+        assert_eq!(refused["amount"], json!(6));
+        assert_eq!(refused["remaining"], json!(4), "what there really was");
+    }
+
+    /// (Concurrency) The ending belongs to the stream, not to the handle that
+    /// wrote it.  Three handles, one close: the two that never saw it are
+    /// refused their next write — the ordinary append and the settlement
+    /// alike, each learning from the refusal that the session is over — and
+    /// closing them afterwards (which is what a dropped handle does) leaves
+    /// no second ending.  Exactly one `session_closed` per stream.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn two_handles_on_one_stream_leave_exactly_one_session_closed() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "close-race-stream";
+
+        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .expect("open A");
+        // Both resume while the stream is open — a closed one is not
+        // resumable — so both hold `closed = false` across A's close.
+        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
+        let store_c = SqliteEventStore::open(&path, stream).expect("open C");
+        let mut c = Session::resume(None, Box::new(store_c)).expect("resume C");
+
+        a.close(Some("done")).expect("A closes");
+        assert!(!b.is_closed(), "B's flag is its own and has not moved");
+        assert!(!c.is_closed());
+
+        // B writes anyway — and does not: the invariant is read off the log,
+        // inside the write, so the refusal is the log's answer and not B's.
+        let err = b
+            .append(obj(json!({ "kind": "note" })))
+            .expect_err("an append after another handle's close");
+        assert_eq!(err.reason(), CLOSED);
+        assert!(b.is_closed(), "the refusal told B what the log knew");
+
+        // And so does C, whose next move is a settlement.
+        let err = c
+            .spend(5)
+            .expect_err("a settlement after another handle's close");
+        assert_eq!(err.reason(), CLOSED);
+        assert!(c.is_closed());
+        let err = c
+            .reserve(5)
+            .expect_err("a reservation after another handle's close");
+        assert_eq!(err.reason(), CLOSED);
+
+        // Closing them records nothing: the ending is already in the log.
+        b.close(Some("late")).expect("B closes, idempotently");
+        c.close(Some(CLOSE_REASON_DROPPED))
+            .expect("C closes, idempotently");
+        a.close(Some("again")).expect("and so does A");
+
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        let log = verify.read(0, usize::MAX).expect("read log");
+        let endings: Vec<&Value> = log
+            .iter()
+            .filter(|event| kind_of(event) == KIND_SESSION_CLOSED)
+            .collect();
+        assert_eq!(endings.len(), 1, "exactly one ending: {endings:?}");
+        assert_eq!(
+            endings[0]["reason"],
+            json!("done"),
+            "the reason is the one the close that wrote it gave"
         );
         assert_eq!(
-            responses[0][FIELD_BEAT],
-            json!(1),
-            "the single recorded response is beat 1"
+            log.len(),
+            3,
+            "session_opened + budget_granted + session_closed, and nothing \
+             the refused writes tried to add"
         );
+        assert_eq!(fold_balance(&log), Some(100), "no refused write moved it");
+    }
+
+    /// (Concurrency) A settlement is folded from the ledger inside the store,
+    /// so it is exact on a stream two handles write to: B settles against
+    /// what the log says, not against the counter it cached before A spent.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_settlement_folds_the_ledger_rather_than_the_handles_own_counter() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "spend-race-stream";
+
+        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
+        assert_eq!((a.remaining(), b.remaining()), (Some(100), Some(100)));
+
+        assert_eq!(a.spend(30), Ok(Some(70)), "A settles 30 of the 100");
+        assert_eq!(b.remaining(), Some(100), "B's counter is out of date");
+
+        // B's own settlement measures against the ledger — 100 − 30 − 20 —
+        // rather than subtracting 20 from the 100 it remembers.
+        assert_eq!(b.spend(20), Ok(Some(50)), "both settlements are in it");
+        assert_eq!(b.remaining(), Some(50));
+
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        let log = verify.read(0, usize::MAX).expect("read log");
+        assert_eq!(fold_balance(&log), Some(50), "the counter is the fold");
+        let moves: Vec<&str> = log
+            .iter()
+            .map(kind_of)
+            .filter(|kind| kind.starts_with("budget_"))
+            .collect();
+        assert_eq!(
+            moves,
+            [KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT, KIND_BUDGET_SPENT],
+            "one grant and two settlements"
+        );
+
+        // A settlement never refuses: it floors at zero, as the fold does.
+        assert_eq!(a.spend(1_000), Ok(Some(0)));
+        assert_eq!(b.spend(1), Ok(Some(0)));
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        assert_eq!(
+            fold_balance(&verify.read(0, usize::MAX).expect("read log")),
+            Some(0),
+            "the ledger floors where the counter does"
+        );
+    }
+
+    /// A v1 stream — written under the old kind names and the numbered turn —
+    /// resumes and reads as the shape the kernel speaks today, while the
+    /// stored bytes stay exactly as they were.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_v1_stream_resumes_and_reads_upcasted_without_rewriting_the_bytes() {
+        use crate::knl::event_store::SCHEMA_VERSION_FIELD;
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "v1-stream";
+
+        // Seeded as an older build wrote it — the rows go in directly, so the
+        // payloads carry no schema version at all (which *is* version 1).
+        seed_v1_rows(
+            &path,
+            stream,
+            &[
+                json!({ "kind": "run_started", "owner": "user-1" }),
+                json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens" }),
+                json!({
+                    "kind": "model_response", "turn": 1,
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "usage": { "input_tokens": 7 }
+                }),
+                json!({ "kind": "tool_call", "turn": 1, "call_id": "c1",
+                        "name": "sh", "args": {} }),
+                json!({ "kind": "tool_result", "turn": 1, "call_id": "c1",
+                        "ok": true, "result": "ok" }),
+            ],
+        );
+
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let mut resumed = Session::resume(None, Box::new(store)).expect("resume a v1 stream");
+
+        // The opening reads under its current name, with what it carried.
+        assert_eq!(resumed.owner(), "user-1");
+        let log = resumed.events(0).expect("events");
+        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
+        assert_eq!(
+            kinds,
+            [
+                KIND_SESSION_OPENED,
+                KIND_BUDGET_GRANTED,
+                KIND_MODEL_RESPONSE,
+                "tool_call",
+                "tool_result"
+            ]
+        );
+        // The numbered turn reads as the beat, under the one name today's
+        // validator knows.
+        for event in &log[2..] {
+            assert_eq!(event[FIELD_BEAT], json!("1"), "{event}");
+            assert_eq!(event.get("turn"), None, "{event}");
+        }
+        // The ledger folds as it always did, and the usage view reads too.
+        assert_eq!(resumed.remaining(), Some(100));
+        assert_eq!(
+            resumed.view(VIEW_USAGE, None).expect("usage")["input_tokens"],
+            json!(7)
+        );
+
+        // And the stored bytes were not rewritten: read the same rows without
+        // the upcaster and they are the v1 shape still.
+        let raw = SqliteEventStore::open(&path, stream).expect("reopen raw");
+        let stored = raw.read(0, usize::MAX).expect("read raw");
+        assert_eq!(kind_of(&stored[0]), "run_started", "{}", stored[0]);
+        assert_eq!(stored[2]["turn"], json!(1), "{}", stored[2]);
+        assert_eq!(stored[2].get(FIELD_BEAT), None, "{}", stored[2]);
+        assert_eq!(
+            stored[0].get(SCHEMA_VERSION_FIELD),
+            None,
+            "an untouched v1 row carries no version field: {}",
+            stored[0]
+        );
+    }
+
+    /// The same v1 stream, ended: `run_finished` reads as the session's
+    /// closing, so the durable stream is refused like any other closed one —
+    /// the upcaster makes the old log readable, and being readable is what
+    /// lets the disposable rule see the ending in it.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_v1_stream_that_finished_is_refused_as_closed() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "v1-finished-stream";
+
+        seed_v1_rows(
+            &path,
+            stream,
+            &[
+                json!({ "kind": "run_started", "owner": "user-1" }),
+                json!({ "kind": "run_finished", "reason": "done", "detail": "the old ending" }),
+            ],
+        );
+
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let err = Session::resume(None, Box::new(store))
+            .expect_err("a finished v1 stream must not be resumed");
+        assert!(
+            err.reason().contains("session is closed"),
+            "{}",
+            err.reason()
+        );
+    }
+
+    /// Write `events` into the SQLite `events` table as an older build would
+    /// have: the payload exactly as given, with no `_schema_version` — which
+    /// is what makes it a version 1 row.
+    ///
+    /// Direct rows, not `SqliteEventStore::append`, because today's append
+    /// stamps the current version and the point of the fixture is a log that
+    /// predates it.
+    #[cfg(feature = "sqlite")]
+    fn seed_v1_rows(path: &std::path::Path, stream: &str, events: &[Value]) {
+        let conn = rusqlite::Connection::open(path).expect("open the db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events ( \
+                 stream         TEXT    NOT NULL, \
+                 seq            INTEGER NOT NULL, \
+                 epoch_ms       INTEGER NOT NULL, \
+                 kind           TEXT    NOT NULL, \
+                 schema_version INTEGER NOT NULL, \
+                 payload        TEXT    NOT NULL, \
+                 PRIMARY KEY (stream, seq) \
+             );",
+        )
+        .expect("create the events table");
+
+        for (index, event) in events.iter().enumerate() {
+            let seq = index as i64 + 1;
+            let mut row = event.clone();
+            let payload = row.as_object_mut().expect("an event is an object");
+            payload.insert("seq".to_string(), json!(seq));
+            payload.insert("epoch_ms".to_string(), json!(0));
+            conn.execute(
+                "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![stream, seq, 0_i64, kind_of(event), 1_i64, row.to_string()],
+            )
+            .expect("insert a v1 row");
+        }
     }
 }

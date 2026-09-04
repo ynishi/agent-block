@@ -436,20 +436,21 @@ end
 ---
 --- This is the whole transport in one value — wire format, retries, parse —
 --- so a caller that wants a model call holds a function rather than a
---- provider. Two of them use it:
+--- provider. Two kinds of caller use it:
 ---
----   * the kernel, when a session is opened with `backend = ...`: `s:call(req)`
----     runs it and records what it returns
----   * a loop with no session, which calls it directly
+---   * `tool_loop` and the agent block, which call it directly
+---   * `knl_adapter`, whose Port reuses the same pieces (build / parse /
+---     classify_error / retry_delay) and hands the result to a knl device as
+---     its `llm` — what `knl.beat(session, device)` then calls
 ---
---- so there is one implementation of "ask the model" and neither side carries
+--- so there is one implementation of "ask the model" and no side of it carries
 --- provider knowledge.
 ---
---- The closure answers `result | nil, err`, which is the contract `knl.call`
---- checks: `content` is an array of blocks (empty when the model sent none),
---- `usage` a table, and `stop_reason` a string when the provider named one.
---- `status` and `latency_ms` ride along for callers that want them; the
---- kernel drops anything beyond the three.
+--- The closure answers `result | nil, err`: `content` is an array of blocks
+--- (empty when the model sent none), `usage` a table, and `stop_reason` a
+--- string when the provider named one. `status` and `latency_ms` ride along
+--- for callers that want them; the kernel's own boundary shape
+--- (`knl.shapes.llm_result`) keeps only what a beat reads.
 ---
 --- @param conf table {
 ---   provider, model, api_key, api_key_env, base_url, headers, max_tokens,

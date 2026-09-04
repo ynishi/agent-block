@@ -1,10 +1,18 @@
-//! Runs the mlua-lspec fixtures in `crates/agent-block/tests/fixtures/`.
+//! Runs the repository's mlua-lspec specs: the fixtures in
+//! `crates/agent-block/tests/fixtures/`, and each block's own
+//! `crates/agent-block-core/blocks/lib/<block>/spec/`.
 //!
-//! Those fixtures are Lua unit tests for the Lua side of the runtime
-//! (`blocks/agent`, `blocks/lib/llm_proto`, `blocks/tools/compile_loop`). They
-//! were reachable only by hand, through the lua-debugger MCP, so nothing ran
-//! them on the way to a commit — which is how eight of them came to be failing
-//! against a stub that had not kept up with the `std.fs` bridge.
+//! Both are Lua unit tests for the Lua side of the runtime (`blocks/agent`,
+//! `blocks/lib/llm_proto`, `blocks/lib/knl`, `blocks/tools/compile_loop`).
+//! They were reachable only by hand, through the lua-debugger MCP, so nothing
+//! ran them on the way to a commit — which is how eight of them came to be
+//! failing against a stub that had not kept up with the `std.fs` bridge, and
+//! how four more, written beside the block they cover instead of under
+//! `tests/fixtures`, went unrun entirely.
+//!
+//! A spec beside its block is the layout this repository is moving to (the
+//! spec reads as part of the module it pins), so discovery follows it rather
+//! than asking anyone to file specs where the runner happens to look.
 //!
 //! # Why this is a separate crate, outside the workspace
 //!
@@ -29,7 +37,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Fixtures live at a fixed place relative to this crate, so the runner works
+/// Specs live at fixed places relative to this crate, so the runner works
 /// regardless of the directory it is invoked from.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -45,6 +53,31 @@ fn repo_root() -> PathBuf {
 /// enforces is a fixture waiting to be skipped silently.
 fn is_spec(source: &str) -> bool {
     source.contains("lust.")
+}
+
+/// Every directory a spec may live in: the shared fixture directory, then one
+/// `spec/` per block that has one.
+///
+/// A block without a `spec/` is skipped rather than reported: not every block
+/// has unit tests, and a missing directory there is not a broken layout. The
+/// fixture directory is not optional in the same way — if it is gone,
+/// `discover` says so loudly.
+fn spec_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.join("crates/agent-block/tests/fixtures")];
+
+    let lib = root.join("crates/agent-block-core/blocks/lib");
+    let entries = std::fs::read_dir(&lib).unwrap_or_else(|e| panic!("{}: {e}", lib.display()));
+    let mut block_specs: Vec<PathBuf> = entries
+        .filter_map(|entry| {
+            let spec = entry.expect("readable directory entry").path().join("spec");
+            spec.is_dir().then_some(spec)
+        })
+        .collect();
+    // read_dir order is the filesystem's; sort so a run is reproducible.
+    block_specs.sort();
+
+    dirs.extend(block_specs);
+    dirs
 }
 
 fn discover(dir: &Path, filter: Option<&str>) -> Vec<(PathBuf, String)> {
@@ -74,11 +107,13 @@ fn discover(dir: &Path, filter: Option<&str>) -> Vec<(PathBuf, String)> {
 
 fn main() -> ExitCode {
     let root = repo_root();
-    let fixtures = root.join("crates/agent-block/tests/fixtures");
     let blocks = root.join("crates/agent-block-core/blocks");
+    let dirs = spec_dirs(&root);
 
-    // `require("compile_loop")` / `require("llm_proto")` / `require("agent")`
-    // resolve against the three directories blocks are laid out in.
+    // `require("compile_loop")` / `require("llm_proto")` / `require("knl")` /
+    // `require("agent")` resolve against the three directories blocks are laid
+    // out in — the same paths for a fixture and for a spec sitting inside the
+    // block it covers.
     let search: Vec<String> = ["tools", "lib", ""]
         .iter()
         .map(|sub| blocks.join(sub).display().to_string())
@@ -86,12 +121,18 @@ fn main() -> ExitCode {
     let search: Vec<&str> = search.iter().map(String::as_str).collect();
 
     let filter = std::env::args().nth(1);
-    let specs = discover(&fixtures, filter.as_deref());
+    let mut specs = Vec::new();
+    for dir in &dirs {
+        specs.extend(discover(dir, filter.as_deref()));
+    }
 
     if specs.is_empty() {
         // Silence here would read as success. It means the filter matched
-        // nothing, or the fixtures moved.
-        eprintln!("no spec fixtures found under {}", fixtures.display());
+        // nothing, or the specs moved.
+        eprintln!("no specs found under any of:");
+        for dir in &dirs {
+            eprintln!("  {}", dir.display());
+        }
         if let Some(f) = filter {
             eprintln!("(filter: {f})");
         }

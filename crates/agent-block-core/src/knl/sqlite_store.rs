@@ -15,17 +15,22 @@
 //!
 //! # Concurrency
 //!
-//! `append` and `append_if_head` read-then-write, so each runs in an
-//! `IMMEDIATE` transaction: the `RESERVED` lock is taken at `BEGIN` rather
-//! than promoted from `SHARED` on the first write, which is the point
-//! `busy_timeout` actually covers — a `DEFERRED` transaction can still hit
-//! `SQLITE_BUSY` on lock *promotion* even with a timeout set. On top of the
-//! timeout, a contended `BEGIN`/insert/commit is retried a bounded number of
-//! times when SQLite reports a retryable code (`SQLITE_BUSY` / `SQLITE_LOCKED`,
-//! matched on the error code, not the message). If every attempt is still
-//! contended the write surfaces as a busy/locked [`KnlError`] rather than
-//! looping forever. The `(stream, seq)` primary key and the in-transaction
-//! head read keep the compare-and-swap correct when two writers race.
+//! `append` and `append_if` read-then-write, so each runs in an `IMMEDIATE`
+//! transaction: the `RESERVED` lock is taken at `BEGIN` rather than promoted
+//! from `SHARED` on the first write, which is the point `busy_timeout`
+//! actually covers — a `DEFERRED` transaction can still hit `SQLITE_BUSY` on
+//! lock *promotion* even with a timeout set. On top of the timeout, a
+//! contended `BEGIN`/insert/commit is retried a bounded number of times when
+//! SQLite reports a retryable code (`SQLITE_BUSY` / `SQLITE_LOCKED`, matched
+//! on the error code, not the message). If every attempt is still contended
+//! the write surfaces as a busy/locked [`KnlError`] rather than looping
+//! forever.
+//!
+//! That is what makes the SPI's promise true here: appends to one stream are
+//! *serialized* — two handles both write and the log interleaves in arrival
+//! order — and a decision taken by `append_if` runs against the stream inside
+//! the same transaction that records its answer, so no concurrent writer can
+//! slip between the two.
 //!
 //! [`MemEventStore`]: super::event_store::MemEventStore
 
@@ -35,9 +40,10 @@ use std::time::Duration;
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{Map, Value};
 
-use super::event::{stamp, validate_event, FIELD_KIND};
+use super::event::{seq_of, stamp, validate_event, FIELD_KIND};
 use super::event_store::{
-    stamp_schema_version, Committed, EventStore, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    stamp_schema_version, Committed, Decision, EventStore, CURRENT_SCHEMA_VERSION,
+    SCHEMA_VERSION_FIELD,
 };
 use super::{now_ms, KnlError, KnlResult};
 
@@ -49,7 +55,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TX_ATTEMPTS: u32 = 5;
 
 /// A single transactional attempt's failure: a retryable SQLite fault, or a
-/// terminal error (a rejected event, a head conflict, an encode failure) that
+/// terminal error (a rejected event, a corrupt row, an encode failure) that
 /// no retry can fix.
 enum TxError {
     /// A rusqlite fault; retried when its code is busy/locked.
@@ -131,15 +137,13 @@ impl EventStore for SqliteEventStore {
         run_with_retry(|| append_attempt(&mut self.conn, &self.stream, &event))
     }
 
-    fn append_if_head(
-        &mut self,
-        mut event: Map<String, Value>,
-        expected_head: u64,
-    ) -> KnlResult<Committed> {
-        stamp_schema_version(&mut event);
-        run_with_retry(|| {
-            append_if_head_attempt(&mut self.conn, &self.stream, &event, expected_head)
-        })
+    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+        // The read, the decision and the insert share one IMMEDIATE
+        // transaction, so the invariant `decide` checks holds at the instant
+        // the event lands.  A contended attempt is retried whole — `decide` is
+        // a pure fold over the events it is handed, so running it again on the
+        // freshly read stream is the correct thing to do.
+        run_with_retry(|| append_if_attempt(&mut self.conn, &self.stream, &mut *decide))
     }
 
     fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
@@ -194,9 +198,9 @@ impl EventStore for SqliteEventStore {
 /// Run one transactional `attempt`, retrying up to [`MAX_TX_ATTEMPTS`] times
 /// while SQLite reports a retryable lock code, then surfacing the busy/locked
 /// error rather than looping forever. A terminal error is returned at once.
-fn run_with_retry<F>(mut attempt: F) -> KnlResult<Committed>
+fn run_with_retry<T, F>(mut attempt: F) -> KnlResult<T>
 where
-    F: FnMut() -> Result<Committed, TxError>,
+    F: FnMut() -> Result<T, TxError>,
 {
     let mut tries = 1;
     loop {
@@ -230,38 +234,61 @@ fn append_attempt(
     Ok(Committed { seq, epoch_ms })
 }
 
-/// One `IMMEDIATE` compare-and-swap append: read the head, compare it to
-/// `expected_head`, and insert only on a match. The head read and the insert
-/// share the transaction, so the CAS holds under concurrent writers.
-fn append_if_head_attempt(
+/// One `IMMEDIATE` decide-then-append: read the stream, ask `decide` what to
+/// record, and insert its answer in the same transaction.
+///
+/// The whole stream is read to decide, which is acceptable while streams are
+/// small; the future optimisation is a snapshot plus the events after it.
+///
+/// A `None` decision commits nothing — the transaction is dropped, so the
+/// stream is exactly as it was — and reports `Ok(None)`.
+fn append_if_attempt(
     conn: &mut Connection,
     stream: &str,
-    event: &Map<String, Value>,
-    expected_head: u64,
-) -> Result<Committed, TxError> {
+    decide: &mut Decision<'_>,
+) -> Result<Option<Committed>, TxError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(TxError::Sqlite)?;
-    let actual = head_in(&tx, stream).map_err(TxError::Sqlite)?;
-    let matches = match expected_head {
-        0 => actual.is_none(),
-        expected => actual == Some(expected),
+    let events = read_in(&tx, stream)?;
+    let Some(event) = decide(&events) else {
+        // Nothing to write: the transaction is rolled back on drop.
+        return Ok(None);
     };
-    if !matches {
-        return Err(TxError::Terminal(KnlError::new(format!(
-            "head conflict: expected {expected_head}, actual {actual:?}"
-        ))));
-    }
-    // Head matched: the append can still reject a malformed event, exactly as
-    // the in-memory store's `append_if_head` does.
-    validate_event(event).map_err(TxError::Terminal)?;
-    let seq = actual.unwrap_or(0).saturating_add(1);
+    // The decision's event is validated like any other: a malformed one is
+    // refused and the transaction goes no further.
+    validate_event(&event).map_err(TxError::Terminal)?;
+    let head = events.last().map(seq_of);
+    let seq = head.unwrap_or(0).saturating_add(1);
     let epoch_ms = now_ms();
     let mut row = event.clone();
+    stamp_schema_version(&mut row);
     stamp(&mut row, seq, epoch_ms);
     insert_row(&tx, stream, seq, epoch_ms, &row)?;
     tx.commit().map_err(TxError::Sqlite)?;
-    Ok(Committed { seq, epoch_ms })
+    Ok(Some(Committed { seq, epoch_ms }))
+}
+
+/// Every event of `stream`, in `seq` order, read inside a transaction.
+///
+/// The in-transaction twin of [`EventStore::read`]: a decode failure is
+/// corruption and terminal, a fault on the read itself is retryable.
+fn read_in(conn: &Connection, stream: &str) -> Result<Vec<Value>, TxError> {
+    let mut stmt = conn
+        .prepare("SELECT payload FROM events WHERE stream = ?1 ORDER BY seq ASC")
+        .map_err(TxError::Sqlite)?;
+    let rows = stmt
+        .query_map(params![stream], |row| row.get::<_, String>(0))
+        .map_err(TxError::Sqlite)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let payload = row.map_err(TxError::Sqlite)?;
+        let value = serde_json::from_str::<Value>(&payload).map_err(|e| {
+            TxError::Terminal(KnlError::new(format!("sqlite: corrupt event payload: {e}")))
+        })?;
+        events.push(value);
+    }
+    Ok(events)
 }
 
 /// The next `seq` for `stream`: `MAX(seq) + 1`, or `1` for an empty stream.
@@ -390,35 +417,68 @@ mod tests {
         assert_eq!(store.append(ev(1)).expect("append").seq, 1);
     }
 
+    /// `append_if` decides on the stream inside its transaction: the events
+    /// it is handed are the durable ones, a `Some` lands at the next seq, and
+    /// a `None` commits nothing.
     #[test]
-    fn append_if_head_is_a_compare_and_swap() {
+    fn append_if_decides_inside_the_transaction_and_writes_only_a_some() {
         let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        store.append(ev(1)).expect("seed");
 
-        // `expected_head == 0` means "expect empty" and succeeds on a fresh
-        // store, assigning seq 1.
-        let first = store.append_if_head(ev(1), 0).expect("empty CAS");
-        assert_eq!(first.seq, 1);
+        let mut seen_kinds: Vec<String> = Vec::new();
+        let committed = store
+            .append_if(&mut |events| {
+                seen_kinds = events.iter().map(|e| kind_of(e).to_string()).collect();
+                Some(ev(2))
+            })
+            .expect("append_if");
+        assert_eq!(seen_kinds, ["e1"], "decide saw the durable stream");
+        assert_eq!(committed.map(|c| c.seq), Some(2));
 
-        // The same "expect empty" now conflicts: the head is 1, not empty.
-        let err = store.append_if_head(ev(2), 0).expect_err("no longer empty");
-        assert!(err.reason().contains("head conflict"), "{err}");
-        assert!(err.reason().contains("expected 0"), "{err}");
-        assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(
-            store.len().expect("len"),
-            1,
-            "the conflicting append did not happen"
-        );
+        let nothing = store.append_if(&mut |_| None).expect("append_if");
+        assert_eq!(nothing, None);
+        assert_eq!(store.len().expect("len"), 2, "a None commits nothing");
+        assert_eq!(store.append(ev(3)).expect("append").seq, 3);
+    }
 
-        // Matching the real head succeeds and advances it.
-        let second = store.append_if_head(ev(2), 1).expect("head matches");
-        assert_eq!(second.seq, 2);
+    /// A malformed decision is refused and leaves the stream alone.
+    #[test]
+    fn append_if_validates_the_event_the_decision_returns() {
+        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        store
+            .append_if(&mut |_| Some(obj(json!({ "text": "no kind" }))))
+            .expect_err("kind is required");
+        assert_eq!(store.len().expect("len"), 0);
+    }
 
-        // A wrong (non-zero) expectation conflicts and reports both sides.
-        let err = store.append_if_head(ev(3), 5).expect_err("stale head");
-        assert!(err.reason().contains("expected 5"), "{err}");
-        assert!(err.reason().contains("actual Some(2)"), "{err}");
-        assert_eq!(store.len().expect("len"), 2, "no append on conflict");
+    /// Two handles on one stream, one invariant: each decides inside its own
+    /// transaction, so the second sees what the first wrote and exactly one
+    /// of them may write.  This is the property a compare-and-swap against a
+    /// cached head could only detect after the fact.
+    #[test]
+    fn append_if_across_two_handles_decides_on_the_other_handles_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+
+        let mut a = SqliteEventStore::open(&path, "s").expect("open a");
+        let mut b = SqliteEventStore::open(&path, "s").expect("open b");
+
+        // "Write the marker, but only if nobody has written one yet."
+        let mut only_once_a = |events: &[Value]| {
+            (!events.iter().any(|e| kind_of(e) == "marker"))
+                .then(|| obj(json!({ "kind": "marker" })))
+        };
+        let mut only_once_b = |events: &[Value]| {
+            (!events.iter().any(|e| kind_of(e) == "marker"))
+                .then(|| obj(json!({ "kind": "marker" })))
+        };
+
+        let first = a.append_if(&mut only_once_a).expect("a decides");
+        assert_eq!(first.map(|c| c.seq), Some(1), "a wrote the marker");
+
+        let second = b.append_if(&mut only_once_b).expect("b decides");
+        assert_eq!(second, None, "b saw a's marker and wrote nothing");
+        assert_eq!(b.len().expect("len"), 1, "exactly one marker");
     }
 
     #[test]
@@ -559,34 +619,28 @@ mod tests {
         );
     }
 
-    /// (Fix 1) The CAS holds across two handles on one stream: both observe
-    /// head 1, the first CAS lands, and the second — still holding the stale
-    /// head — is rejected with no row written (no duplicate).
+    /// Two handles on one stream both write: an append records a fact, so it
+    /// is serialized and assigned the next seq rather than refused for the
+    /// head one of them last saw.
     #[test]
-    fn append_if_head_across_two_handles_rejects_the_stale_writer() {
+    fn two_handles_on_one_stream_both_append_in_arrival_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
 
         let mut a = SqliteEventStore::open(&path, "s").expect("open a");
         let mut b = SqliteEventStore::open(&path, "s").expect("open b");
 
-        a.append(ev(1)).expect("seed"); // head 1 on both handles
-        let observed = 1; // both writers observe the same head
+        a.append(ev(1)).expect("seed"); // both handles now see head 1
 
-        // A lands its CAS at head 1, advancing the head to 2.
-        assert_eq!(a.append_if_head(ev(2), observed).expect("a wins").seq, 2);
+        // A writes, then B writes — neither is refused, and the log holds
+        // them in the order they arrived.
+        assert_eq!(a.append(ev(2)).expect("a appends").seq, 2);
+        assert_eq!(b.append(ev(3)).expect("b appends").seq, 3);
 
-        // B still holds the stale head 1: its CAS is a loud conflict, no row.
-        let err = b
-            .append_if_head(ev(3), observed)
-            .expect_err("b's CAS is stale");
-        assert!(err.reason().contains("head conflict"), "{}", err.reason());
-        assert_eq!(
-            b.head().expect("head"),
-            Some(2),
-            "the stale CAS wrote nothing"
-        );
-        assert_eq!(b.read(0, usize::MAX).expect("read").len(), 2);
+        let events = b.read(0, usize::MAX).expect("read");
+        let kinds: Vec<&str> = events.iter().map(kind_of).collect();
+        assert_eq!(kinds, ["e1", "e2", "e3"]);
+        assert_eq!(b.head().expect("head"), Some(3));
     }
 
     /// (Fix 3) Under the IMMEDIATE transaction + `busy_timeout`, interleaved

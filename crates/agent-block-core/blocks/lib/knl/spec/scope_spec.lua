@@ -1,29 +1,30 @@
 -- scope_spec.lua — mlua-lspec unit tests for the session-scope model of the
--- Lua kernel (knl.open + kernel-assigned beat numbering via ctx:append).
+-- Lua kernel (knl.open + the beat ids the shell declares).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/scope_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
--- What this proves (scope-design.md rev 3 checklist, pure-VM half):
---   1 appending a model_response is counted by usage and gets a kernel beat
---     (the old usage=0 divergence, and the per-event scope stamp, are both
---     gone — the kernel numbers/counts by kind), while the balance moved
---     only where the beat reserved it.
---   2 beat numbering is kernel-owned: two successive responses are 1 then 2.
+-- What this proves (scope-design.md rev 3 + session-device-design.md §9-a,
+-- pure-VM half):
+--   1 appending a model_response is counted by usage (the old usage=0
+--     divergence, and the per-event scope stamp, are both gone — the kernel
+--     counts by kind), while the balance moved only where the beat reserved it.
+--   2 beat ids are the shell's: two successive beats carry two distinct
+--     opaque strings, and the session is never asked to number anything.
 --   3 one model response with two tool_use blocks: both tool_call/tool_result
---     pairs share the response's kernel-assigned beat.
+--     pairs carry the same declared id as the response.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
 -- a faithful Lua fake stands in below. It reproduces the facts the model
 -- rests on, mirroring crates/agent-block-core/src/bridge/knl.rs:
 --   * append overwrites the kernel-owned seq/epoch_ms and passes every other
---     field through untouched (there is no author field);
---   * appending a model_response assigns the beat (beats + 1) and advances
---     the counter — read back with s:beats() — and moves no balance;
+--     field through untouched — `beat` included (there is no author field,
+--     and no beat numbering: the kernel stores the id it is given);
 --   * reserve is the only decision point: it deducts, or refuses with the
 --     grant's tag and leaves the balance alone;
---   * view("usage") counts every model_response in the session.
+--   * view("usage") counts every model_response in the session;
+--   * new_beat_id mints a fresh, time-ordered id per call.
 -- The e2e coverage against the *real* bridge lives in
 -- crates/agent-block/tests/fixtures/knl_turn_test.lua.
 
@@ -35,6 +36,7 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local uuid_counter = 0
+local minted = 0
 
 local COUNTERS = { "input_tokens", "output_tokens", "thinking_tokens" }
 
@@ -49,7 +51,6 @@ local function fake_session(opts)
     local remaining = grant.amount
     local tag = grant.tag
     local closed = false
-    local beats = 0
 
     local function deep_copy(v)
         if type(v) ~= "table" then
@@ -73,7 +74,7 @@ local function fake_session(opts)
         return seq
     end
 
-    store({ kind = "run_started" })
+    store({ kind = "session_opened", scope_id = "scope-" .. id, owner = owner })
 
     local s = {}
 
@@ -85,23 +86,15 @@ local function fake_session(opts)
         return owner
     end
 
-    -- The one write path. A model_response is numbered and counted here,
-    -- and nothing is charged (mirrors the Rust Session::append).
+    -- The one write path. Nothing is numbered and nothing is charged here
+    -- (mirrors the Rust Session::append): a `beat` the caller declared is
+    -- stored exactly as given, and the kernel only insists it be a string.
     function s:append(event)
         assert(not closed, "knl: append: session is closed")
         assert(type(event) == "table", "knl: append: event must be a table")
         assert(type(event.kind) == "string", "knl: append: kind is required")
-        if event.kind == "model_response" then
-            beats = beats + 1
-            local rec = deep_copy(event)
-            rec.beat = beats -- kernel-owned, overwrites any caller value
-            return store(rec)
-        end
+        assert(event.beat == nil or type(event.beat) == "string", "knl: append: beat must be a string")
         return store(event)
-    end
-
-    function s:beats()
-        return beats
     end
 
     -- The decision point: allow and deduct, or refuse (naming the grant)
@@ -153,7 +146,7 @@ local function fake_session(opts)
 
     function s:close(reason)
         if not closed then
-            store({ kind = "run_finished", reason = reason or "closed" })
+            store({ kind = "session_closed", reason = reason or "closed" })
             closed = true
         end
     end
@@ -182,9 +175,15 @@ local function fake_session(opts)
     return s
 end
 
--- Global the module captures as `local syscall = knl` at load time. Both
--- names resolve to the same constructor, as the Rust bridge registers them.
-knl = { open = fake_session, session = fake_session }
+-- Global the module captures as `local syscall = knl` at load time.
+knl = {
+    open = fake_session,
+    session = fake_session,
+    new_beat_id = function()
+        minted = minted + 1
+        return string.format("beat-%06d", minted)
+    end,
+}
 
 local kernel = require("knl")
 local Outcome = kernel.Outcome
@@ -218,15 +217,15 @@ local function tool_use(id, name, input)
     return { type = "tool_use", id = id, name = name, input = input or {} }
 end
 
--- Every model_response's beat number, in seq order.
-local function response_beats(h)
-    local numbers = {}
-    for _, ev in ipairs(h:events()) do
+-- Every model_response's declared beat id, in seq order.
+local function response_beats(s)
+    local ids = {}
+    for _, ev in ipairs(s:events()) do
         if ev.kind == "model_response" then
-            numbers[#numbers + 1] = ev.beat
+            ids[#ids + 1] = ev.beat
         end
     end
-    return numbers
+    return ids
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -234,51 +233,54 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 describe("knl beat (session-scope model)", function()
-    it("counts a beat's model_response in usage and gives it a kernel number", function()
-        local h = kernel.open({
+    it("counts a beat's model_response in usage and carries the declared id", function()
+        local s = kernel.open({
             owner = "test",
             budget = { amount = 100, tag = "tokens" },
+        })
+        local d = kernel.device({
             llm = stub(response("ok", { { type = "text", text = "hello" } }, {
                 input_tokens = 10,
                 output_tokens = 3,
             })),
         })
-        expect(h:owner()).to.equal("test")
-        h:append({ kind = "msg_user", content = "hi" })
+        expect(s:owner()).to.equal("test")
+        s:append({ kind = "msg_user", content = "hi" })
 
-        local o = kernel.beat(h)
+        local o = kernel.beat(s, d)
         expect(Outcome.is_ok(o)).to.equal(true)
-        expect(o.out.beat).to.equal(1)
+        expect(type(o.out.beat)).to.equal("string")
 
-        local u = h:view("usage")
+        local u = s:view("usage")
         expect(u.model_calls).to.equal(1)
         expect(u.input_tokens).to.equal(10)
         expect(u.output_tokens).to.equal(3)
 
         -- Reserved, not charged: the beat took one unit before the call and
         -- the appends moved nothing. The usage above is the other reading.
-        expect(h:remaining()).to.equal(99)
-        expect(h:beats()).to.equal(1)
+        expect(s:remaining()).to.equal(99)
+        -- The kernel does not number beats: nothing to read back.
+        expect(s.beats).to.equal(nil)
+        expect(response_beats(s)[1]).to.equal(o.out.beat)
     end)
 
-    it("numbers successive beats 1 then 2 (kernel-owned)", function()
-        local h = kernel.open({
-            budget = { amount = 1000, tag = "tokens" },
-            llm = stub(response("ok"), response("ok")),
-        })
+    it("gives two successive beats two distinct ids (shell-declared)", function()
+        local s = kernel.open({ budget = { amount = 1000, tag = "tokens" } })
+        local d = kernel.device({ llm = stub(response("ok"), response("ok")) })
 
-        kernel.beat(h)
-        kernel.beat(h)
+        kernel.beat(s, d)
+        kernel.beat(s, d)
 
-        local numbers = response_beats(h)
-        expect(#numbers).to.equal(2)
-        expect(numbers[1]).to.equal(1)
-        expect(numbers[2]).to.equal(2)
+        local ids = response_beats(s)
+        expect(#ids).to.equal(2)
+        expect(type(ids[1])).to.equal("string")
+        expect(type(ids[2])).to.equal("string")
+        expect(ids[1] == ids[2]).to.equal(false)
     end)
 
-    it("shares one beat number across a response's tool_call/tool_result pairs", function()
-        local h = kernel.open({
-            budget = { amount = 100, tag = "tokens" },
+    it("shares one beat id across a response's tool_call/tool_result pairs", function()
+        local s = kernel.open({ budget = { amount = 100, tag = "tokens" } })
+        local d = kernel.device({
             llm = stub(response("ok", {
                 tool_use("a", "noop", {}),
                 tool_use("b", "noop", {}),
@@ -292,11 +294,12 @@ describe("knl beat (session-scope model)", function()
             },
         })
 
-        kernel.beat(h)
+        local o = kernel.beat(s, d)
+        expect(Outcome.is_ok(o)).to.equal(true)
 
         local model_beat
         local call_beats, result_beats = {}, {}
-        for _, ev in ipairs(h:events()) do
+        for _, ev in ipairs(s:events()) do
             if ev.kind == "model_response" then
                 model_beat = ev.beat
             elseif ev.kind == "tool_call" then
@@ -306,12 +309,12 @@ describe("knl beat (session-scope model)", function()
             end
         end
 
-        expect(model_beat).to.equal(1)
+        expect(model_beat).to.equal(o.out.beat)
         expect(#call_beats).to.equal(2)
         expect(#result_beats).to.equal(2)
-        expect(call_beats[1]).to.equal(1)
-        expect(call_beats[2]).to.equal(1)
-        expect(result_beats[1]).to.equal(1)
-        expect(result_beats[2]).to.equal(1)
+        expect(call_beats[1]).to.equal(model_beat)
+        expect(call_beats[2]).to.equal(model_beat)
+        expect(result_beats[1]).to.equal(model_beat)
+        expect(result_beats[2]).to.equal(model_beat)
     end)
 end)

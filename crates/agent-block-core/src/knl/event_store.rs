@@ -17,13 +17,46 @@
 //! A write returns a [`Committed`]: the `seq` and `epoch_ms` the store
 //! assigned.  A caller never has to read back to learn where its event
 //! landed, and never supplies those fields — they are the store's to give.
+//!
+//! # Appends land; decisions are taken inside the write
+//!
+//! [`EventStore::append`] records a fact, and the store — not the caller —
+//! decides where it lands.  It is *serialized per stream by the backend*
+//! (SQLite: an `IMMEDIATE` transaction with a bounded busy retry; the
+//! in-memory store: a single owner in a single process), so two handles on
+//! one stream both write and the log interleaves in arrival order.  An
+//! ordinary append is never refused for an out-of-date view of the head:
+//! that would be asking a fact to prove it knew the future.
+//!
+//! A *command* with an invariant — "reserve n only if the balance covers
+//! it" — is the other case, and it is expressed by
+//! [`EventStore::append_if`]: the backend reads the stream, calls the
+//! caller's `decide` and appends what it returns, all inside the same
+//! serialized write.  The check therefore runs against the stream as it is
+//! at that instant, not against a head someone cached earlier.
+//!
+//! # Stored shape change ⇒ upcaster, always
+//!
+//! Stored bytes are never rewritten.  Every change to the shape of a stored
+//! event ships in the same round as (a) a bump of
+//! [`CURRENT_SCHEMA_VERSION`], which every new event is stamped with, and
+//! (b) an [`Upcaster`] for the `n → n+1` step, registered in
+//! [`kernel_upcasters`] and applied at read time by
+//! [`UpcastingEventStore`].  An event with no [`SCHEMA_VERSION_FIELD`] is
+//! version 1 (the field is itself a later addition).  A round that renames a
+//! kind or a field without an upcaster is incomplete: an old log would be
+//! silently misread, which is the one failure an append-only store exists to
+//! prevent.
 
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::event::{seq_of, FIELD_EPOCH_MS};
-use super::{History, KnlError, KnlResult};
+use super::event::{
+    seq_of, FIELD_BEAT, FIELD_EPOCH_MS, FIELD_KIND, KIND_MODEL_RESPONSE, KIND_SESSION_CLOSED,
+    KIND_SESSION_OPENED, KIND_TOOL_CALL, KIND_TOOL_RESULT,
+};
+use super::{History, KnlResult};
 
 /// Reserved envelope key: the schema version an event was written under.
 ///
@@ -35,9 +68,99 @@ pub const SCHEMA_VERSION_FIELD: &str = "_schema_version";
 
 /// The schema version new events are stamped with.
 ///
-/// Starts at `1`; a future shape change bumps it and registers an
-/// [`Upcaster`] for the `n → n+1` step.
-pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+/// `2` since the round that renamed the lifecycle kinds and turned the
+/// numbered `turn` into a caller-declared [`FIELD_BEAT`]; the `1 → 2`
+/// upcaster is [`kernel_upcasters`].  A shape change bumps this and
+/// registers the next step — see the module docs.
+pub const CURRENT_SCHEMA_VERSION: u64 = 2;
+
+/// The version an event was written under: what [`SCHEMA_VERSION_FIELD`]
+/// says, or `1` when it says nothing (the field is itself a v2 addition, so
+/// an event without one predates it).
+fn version_of(event: &Value) -> u64 {
+    event
+        .get(SCHEMA_VERSION_FIELD)
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+}
+
+/// v1 kind: the session's opening, before the lifecycle was named after the
+/// session rather than a "run".
+const LEGACY_KIND_RUN_STARTED: &str = "run_started";
+/// v1 kind: the session's ending, same rename.
+const LEGACY_KIND_RUN_FINISHED: &str = "run_finished";
+/// v1 field: the kernel-numbered turn a fact belonged to, before beats
+/// became opaque caller-declared strings ([`FIELD_BEAT`]).
+const LEGACY_FIELD_TURN: &str = "turn";
+
+/// The `1 → 2` step: the lifecycle rename and the numbered turn.
+///
+/// - `run_started` → `session_opened`, `run_finished` → `session_closed`,
+///   every other field kept as written.  An absent `scope_id` stays absent:
+///   [`super::Scope::restore`] mints one rather than inventing an authority
+///   the log never recorded.
+/// - an integer `turn` on `model_response` / `tool_call` / `tool_result`
+///   becomes the string `beat` of the same digits, so a v1 log reads under
+///   the one name the kernel validates today.
+///
+/// The `budget_*` kinds need no step: no budget event was ever persisted
+/// under v1 (the pre-v2 kernel wrote none), so there is no old shape of one
+/// to read.
+struct V1ToV2;
+
+impl Upcaster for V1ToV2 {
+    fn upcast(&self, mut event: Value) -> Value {
+        if version_of(&event) >= 2 {
+            return event;
+        }
+        let Some(map) = event.as_object_mut() else {
+            return event;
+        };
+
+        let renamed = match map.get(FIELD_KIND).and_then(Value::as_str) {
+            Some(LEGACY_KIND_RUN_STARTED) => Some(KIND_SESSION_OPENED),
+            Some(LEGACY_KIND_RUN_FINISHED) => Some(KIND_SESSION_CLOSED),
+            _ => None,
+        };
+        if let Some(kind) = renamed {
+            map.insert(FIELD_KIND.to_string(), Value::from(kind));
+        }
+
+        let carries_a_beat = matches!(
+            map.get(FIELD_KIND).and_then(Value::as_str),
+            Some(KIND_MODEL_RESPONSE) | Some(KIND_TOOL_CALL) | Some(KIND_TOOL_RESULT)
+        );
+        if carries_a_beat {
+            // Only a whole number is the old numbering; anything else stays
+            // where it is rather than being guessed at.  A log that already
+            // carries a `beat` keeps it — the beat is the caller's word and
+            // an upcaster does not overrule one.
+            if let Some(turn) = map.get(LEGACY_FIELD_TURN).and_then(Value::as_i64) {
+                map.remove(LEGACY_FIELD_TURN);
+                map.entry(FIELD_BEAT.to_string())
+                    .or_insert_with(|| Value::from(turn.to_string()));
+            }
+        }
+
+        // The projection is a v2 event, so it says so: a reader that folds on
+        // the version sees the shape it actually got.
+        map.insert(
+            SCHEMA_VERSION_FIELD.to_string(),
+            Value::from(CURRENT_SCHEMA_VERSION),
+        );
+        event
+    }
+}
+
+/// The upcaster chain every session reads through, newest step last.
+///
+/// [`super::Session::open_on`] and [`super::Session::resume`] wrap their
+/// backend in an [`UpcastingEventStore`] carrying this chain, so every read a
+/// session makes — the restore fold, the view folds, `events` — sees the
+/// current shape while the stored bytes stay exactly as they were written.
+pub fn kernel_upcasters() -> Vec<Arc<dyn Upcaster>> {
+    vec![Arc::new(V1ToV2)]
+}
 
 /// Stamp [`CURRENT_SCHEMA_VERSION`] onto an event, overwriting any
 /// caller-supplied value (the version is the store's to assign, like `seq`).
@@ -76,6 +199,14 @@ pub fn apply_upcasters(chain: &[Arc<dyn Upcaster>], events: Vec<Value>) -> Vec<V
         .collect()
 }
 
+/// What a command decides, given the stream it is decided against.
+///
+/// Handed the stream's events in `seq` order and returning the event to
+/// record — or `None` to record nothing.  [`EventStore::append_if`] runs it
+/// inside the backend's serialization, which is what makes the decision and
+/// the write one step.
+pub type Decision<'a> = dyn FnMut(&[Value]) -> Option<Map<String, Value>> + 'a;
+
 /// The coordinates a store assigns to an appended event.
 ///
 /// Returned inline from every write so no follow-up read is needed to
@@ -97,18 +228,34 @@ pub trait EventStore {
     /// Validate, stamp and append an event, returning its coordinates.
     ///
     /// A rejected event leaves no trace and consumes no sequence number.
+    ///
+    /// **Serialized per stream by the backend.**  The store assigns the
+    /// `seq` and the ordering, and the append lands: two handles writing to
+    /// one stream interleave in arrival order rather than one of them being
+    /// refused for holding an out-of-date head.  SQLite takes an `IMMEDIATE`
+    /// transaction (with a bounded busy retry) around the head read and the
+    /// insert; the in-memory store is owned by one session in one process.
     fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed>;
 
-    /// Append iff the current head is `expected_head` (compare-and-swap).
+    /// Decide *inside* the store's serialization: read the stream, ask
+    /// `decide` what to write, and append its answer in the same write.
     ///
-    /// `expected_head == 0` means "expect the stream to be empty".  On a
-    /// mismatch the append does not happen and a head-conflict error is
-    /// returned carrying the expected and the actual head.
-    fn append_if_head(
-        &mut self,
-        event: Map<String, Value>,
-        expected_head: u64,
-    ) -> KnlResult<Committed>;
+    /// The form a command with an invariant takes — "reserve `n` only if the
+    /// balance covers it".  `decide` is handed the stream's events (in `seq`
+    /// order) as they are under the backend's lock, and returns the event to
+    /// record, or `None` to record nothing (`Ok(None)`, with the stream
+    /// untouched).  Because the read and the write share the transaction, the
+    /// decision cannot be raced by a concurrent writer — which a
+    /// compare-and-swap against a cached head could only detect afterwards.
+    ///
+    /// `decide` may be called more than once when a contended backend retries
+    /// its transaction, so it must be a pure function of the events it is
+    /// given.
+    ///
+    /// The whole stream is read to decide, which is fine while streams are
+    /// small; a future optimisation reads only the range a decision needs
+    /// (a snapshot plus the events after it).
+    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>>;
 
     /// Events with `seq >= from_seq`, at most `limit`, cloned in `seq`
     /// order (a paged range read).
@@ -191,22 +338,15 @@ impl EventStore for MemEventStore {
         Ok(Committed { seq, epoch_ms })
     }
 
-    fn append_if_head(
-        &mut self,
-        event: Map<String, Value>,
-        expected_head: u64,
-    ) -> KnlResult<Committed> {
-        let actual = self.head()?;
-        let matches = match expected_head {
-            0 => actual.is_none(),
-            expected => actual == Some(expected),
-        };
-        if !matches {
-            return Err(KnlError::new(format!(
-                "head conflict: expected {expected_head}, actual {actual:?}"
-            )));
+    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+        // One process, one owner: the read and the append below cannot be
+        // interleaved with another writer's, which is all the serialization
+        // this backend needs.
+        let events = self.read(0, usize::MAX)?;
+        match decide(&events) {
+            Some(event) => self.append(event).map(Some),
+            None => Ok(None),
         }
-        self.append(event)
     }
 
     fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
@@ -261,12 +401,14 @@ impl EventStore for UpcastingEventStore {
         self.inner.append(event)
     }
 
-    fn append_if_head(
-        &mut self,
-        event: Map<String, Value>,
-        expected_head: u64,
-    ) -> KnlResult<Committed> {
-        self.inner.append_if_head(event, expected_head)
+    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+        // The decision is a read, so it is upcasted like every other read: the
+        // backend hands over the stored events, the chain projects them, and
+        // `decide` sees the current shape — a v1 log decides the same way a
+        // v2 one does.
+        let chain = self.chain.clone();
+        let mut upcasted = |events: &[Value]| decide(&apply_upcasters(&chain, events.to_vec()));
+        self.inner.append_if(&mut upcasted)
     }
 
     fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
@@ -338,35 +480,40 @@ mod tests {
         assert_eq!(store.append(ev(1)).expect("append").seq, 1);
     }
 
+    /// `append_if` decides on the stream the backend hands it and writes in
+    /// the same step: a `Some` lands, a `None` writes nothing at all.
     #[test]
-    fn append_if_head_is_a_compare_and_swap() {
+    fn append_if_decides_on_the_stream_and_writes_only_a_some() {
         let mut store = MemEventStore::new();
+        store.append(ev(1)).expect("seed");
 
-        // `expected_head == 0` means "expect empty" and succeeds on a fresh
-        // store, assigning seq 1.
-        let first = store.append_if_head(ev(1), 0).expect("empty CAS");
-        assert_eq!(first.seq, 1);
+        // The decision sees the stream as it is, in seq order.
+        let mut seen = 0;
+        let committed = store
+            .append_if(&mut |events| {
+                seen = events.len();
+                Some(ev(2))
+            })
+            .expect("append_if");
+        assert_eq!(seen, 1, "decide was handed the whole stream");
+        assert_eq!(committed.map(|c| c.seq), Some(2));
 
-        // The same "expect empty" now conflicts: the head is 1, not empty.
-        let err = store.append_if_head(ev(2), 0).expect_err("no longer empty");
-        assert!(err.reason().contains("head conflict"), "{err}");
-        assert!(err.reason().contains("expected 0"), "{err}");
-        assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(
-            store.len().expect("len"),
-            1,
-            "the conflicting append did not happen"
-        );
+        // `None` is a decision too: nothing is written and no seq is burnt.
+        let nothing = store.append_if(&mut |_| None).expect("append_if");
+        assert_eq!(nothing, None);
+        assert_eq!(store.len().expect("len"), 2, "a None writes nothing");
+        assert_eq!(store.append(ev(3)).expect("append").seq, 3);
+    }
 
-        // Matching the real head succeeds and advances it.
-        let second = store.append_if_head(ev(2), 1).expect("head matches");
-        assert_eq!(second.seq, 2);
-
-        // A wrong (non-zero) expectation conflicts and reports both sides.
-        let err = store.append_if_head(ev(3), 5).expect_err("stale head");
-        assert!(err.reason().contains("expected 5"), "{err}");
-        assert!(err.reason().contains("actual Some(2)"), "{err}");
-        assert_eq!(store.len().expect("len"), 2, "no append on conflict");
+    /// The event a decision returns is validated like any other: a malformed
+    /// one is refused and the stream is untouched.
+    #[test]
+    fn append_if_validates_the_event_the_decision_returns() {
+        let mut store = MemEventStore::new();
+        store
+            .append_if(&mut |_| Some(obj(json!({ "text": "no kind" }))))
+            .expect_err("kind is required");
+        assert_eq!(store.len().expect("len"), 0);
     }
 
     #[test]
@@ -556,5 +703,101 @@ mod tests {
         );
         assert_eq!(store.head().expect("head"), Some(1));
         assert_eq!(store.len().expect("len"), 1);
+    }
+
+    /// The `1 → 2` step: the lifecycle kinds are renamed, the numbered turn
+    /// becomes the string beat, and everything else is kept as written.
+    #[test]
+    fn the_v1_to_v2_upcaster_renames_the_lifecycle_and_the_numbered_turn() {
+        let v1 = vec![
+            json!({ "kind": "run_started", "seq": 1, "owner": "user-7" }),
+            json!({
+                "kind": "model_response", "seq": 2, "turn": 1,
+                "content": [], "usage": { "input_tokens": 3 }
+            }),
+            json!({ "kind": "tool_call", "seq": 3, "turn": 1,
+                    "call_id": "c1", "name": "sh", "args": {} }),
+            json!({ "kind": "tool_result", "seq": 4, "turn": 1,
+                    "call_id": "c1", "ok": true, "result": "ok" }),
+            json!({ "kind": "run_finished", "seq": 5, "reason": "done", "detail": "all of it" }),
+        ];
+
+        let out = apply_upcasters(&kernel_upcasters(), v1);
+        let kinds: Vec<&str> = out.iter().map(kind_of).collect();
+        assert_eq!(
+            kinds,
+            [
+                "session_opened",
+                "model_response",
+                "tool_call",
+                "tool_result",
+                "session_closed"
+            ]
+        );
+
+        // The opening keeps its fields and gains no scope id it never had.
+        assert_eq!(out[0]["owner"], json!("user-7"));
+        assert_eq!(out[0].get("scope_id"), None, "{}", out[0]);
+
+        // The numbered turn is the string beat now, and the old name is gone.
+        for event in &out[1..4] {
+            assert_eq!(event[FIELD_BEAT], json!("1"), "{event}");
+            assert_eq!(event.get("turn"), None, "{event}");
+        }
+        assert_eq!(
+            out[1]["usage"],
+            json!({ "input_tokens": 3 }),
+            "payload kept"
+        );
+
+        // The ending keeps both its words.
+        assert_eq!(out[4]["reason"], json!("done"));
+        assert_eq!(out[4]["detail"], json!("all of it"));
+
+        // And the projection says which shape it is.
+        for event in &out {
+            assert_eq!(
+                event.get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
+                Some(CURRENT_SCHEMA_VERSION),
+                "{event}"
+            );
+        }
+    }
+
+    /// A v2 event passes through untouched, and a beat the caller declared is
+    /// never overruled by the old numbering.
+    #[test]
+    fn the_v1_to_v2_upcaster_leaves_current_events_alone() {
+        let current = json!({
+            "kind": "model_response", "seq": 1, "beat": "b-1",
+            "content": [], "usage": {}, SCHEMA_VERSION_FIELD: 2
+        });
+        assert_eq!(
+            apply_upcasters(&kernel_upcasters(), vec![current.clone()]),
+            vec![current]
+        );
+
+        // A v1 event that already carries a beat keeps it: the beat is the
+        // caller's word, and the upcaster only fills the gap the rename left.
+        let both = json!({
+            "kind": "tool_call", "seq": 1, "turn": 4, "beat": "b-9",
+            "call_id": "c", "name": "sh", "args": {}
+        });
+        let out = apply_upcasters(&kernel_upcasters(), vec![both]);
+        assert_eq!(out[0][FIELD_BEAT], json!("b-9"));
+        assert_eq!(out[0].get("turn"), None);
+    }
+
+    /// A stored event carries the version it was written under, and today
+    /// that is v2 — the shape the upcaster chain brings v1 logs up to.
+    #[test]
+    fn new_events_are_stamped_with_the_current_version() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+        let mut store = MemEventStore::new();
+        store.append(ev(1)).expect("append");
+        let stored = store.read(0, usize::MAX).expect("read");
+        assert_eq!(version_of(&stored[0]), CURRENT_SCHEMA_VERSION);
+        // An event with no version field is v1 by definition.
+        assert_eq!(version_of(&json!({ "kind": "note" })), 1);
     }
 }

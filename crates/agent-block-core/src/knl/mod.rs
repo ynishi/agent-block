@@ -14,26 +14,39 @@
 //!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
 //!   overwritten rather than trusted.  Reads hand back clones, so a caller
 //!   cannot reach recorded state through a returned value.
+//! - **An append lands; a command decides inside the store.**  Recording a
+//!   fact is never refused for what the writing handle last saw: the store
+//!   assigns the `seq` and serializes writes per stream, so two handles on
+//!   one stream both append and the log interleaves in arrival order.  The
+//!   one place a check belongs — "reserve `n` only if the balance covers
+//!   it" — runs inside that same serialized write
+//!   ([`EventStore::append_if`]), never against a cached balance.
+//! - **A session is disposable.**  It opens once and closes once, and
+//!   [`Session::resume`] refuses a stream whose `session_closed` is already
+//!   in the log: after an ending there is a new session, not a second life
+//!   for the old one.
+//! - **Stored shape change ⇒ upcaster.**  Stored bytes are never rewritten.
+//!   A change to the shape of a stored event ships with a bump of
+//!   [`CURRENT_SCHEMA_VERSION`] and the matching read-time [`Upcaster`]
+//!   ([`kernel_upcasters`]), which every session's reads pass through.
 //! - **A session has a scope.**  The two are different concepts sharing one
-//!   lifetime: the session is the stream (history, projections, beat
-//!   numbering), the [`Scope`] is the authority it is written under (a
-//!   kernel-issued [`ScopeId`], the owner, the granted quota).  A session
-//!   holds its scope by value, since neither outlives the other.  The scope
-//!   id is recorded on `run_started` and on every `budget_*` event, so the
-//!   boundary is recoverable from the log — and unforgeable, since those
-//!   kinds are the kernel's alone to write.  There is no per-event author:
-//!   a session holds only its own events, so ownership is the scope-level
+//!   lifetime: the session is the stream (history, projections), the
+//!   [`Scope`] is the authority it is written under (a kernel-issued
+//!   [`ScopeId`], the owner, the granted quota).  A session holds its scope
+//!   by value, since neither outlives the other.  The scope id is recorded
+//!   on `session_opened` and on every `budget_*` event, so the boundary is
+//!   recoverable from the log — and unforgeable, since those kinds are the
+//!   kernel's alone to write.  There is no per-event author: a session
+//!   holds only its own events, so ownership is the scope-level
 //!   [`Session::owner`] — a real principal id, or the reserved
 //!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
 //!   layer above the kernel.  The accounting keys on the `kind`: the
 //!   `usage` view folds over every `model_response`, because in a
-//!   session's own log a `model_response` is a call it made.  Appending
-//!   one records and numbers it; appending a `run_finished` records a line
-//!   without ending a run that only [`Session::close`] can end.
+//!   session's own log a `model_response` is a call it made.
 //! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative amounts
-//!   only, and within a run the balance can only decrease — it rises only
-//!   when an owner grants again, which a resumed run records like any
-//!   other fact.  It is a quota, not accounting: the decision is taken
+//!   only, and within a session the balance can only decrease — it rises
+//!   only when an owner grants again, which a resumed session records like
+//!   any other fact.  It is a quota, not accounting: the decision is taken
 //!   *before* the spending ([`Session::reserve`], which refuses without
 //!   deducting) and settled after ([`Session::spend`]), by the layer that
 //!   knows what a call costs.  No `append` moves it, and the `usage` view
@@ -41,14 +54,19 @@
 //! - **The balance is a fold.**  Every move is a `budget_*` event first,
 //!   written by the kernel alone ([`is_kernel_only`]), so the counter is a
 //!   cache of the log and [`fold_balance`] recovers it — which is how
-//!   [`Session::resume`] restores a reopened run's remaining balance.
-//! - **I6 run scope.**  All state lives inside a [`Session`] value — no
-//!   statics — so two sessions are fully independent, and `close` ends
-//!   the run scope (later `append` / `spend` are errors).
-//! - **Beat numbering.**  The beat a `model_response` carries is the
-//!   kernel's own count of the responses recorded, assigned on
-//!   [`Session::append`] (like `seq`), so a loop cannot restart or forge
-//!   it.
+//!   [`Session::resume`] restores a reopened session's remaining balance.
+//! - **I6 session lifecycle.**  All state lives inside a [`Session`] value
+//!   — no statics — so two sessions are fully independent.  There is no
+//!   "run" inside a session: the lifecycle is the session's own, bracketed
+//!   by the `session_opened` that [`Session::open_on`] records and the
+//!   `session_closed` that [`Session::close`] records.  Both are
+//!   kernel-only ([`is_kernel_only`]), so a caller can neither fake an
+//!   opening nor end a session by appending an event; after `close`, later
+//!   `append` / `spend` are errors.
+//! - **Beats are declared, not numbered.**  A `beat` is an opaque string
+//!   the layer above mints and stamps on the facts that belong together.
+//!   The kernel never generates one and never requires one; it only
+//!   insists that a present `beat` is a string.
 //!
 //! Projections ([`projection`]) are *derived*: folding never changes the
 //! history and a fold result is a cache, not a capture — it can always be
@@ -72,8 +90,8 @@ use std::fmt;
 pub use budget::{fold_balance, Budget, BudgetGrant};
 pub use event::{is_kernel_only, now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use event_store::{
-    apply_upcasters, Committed, EventStore, MemEventStore, Upcaster, UpcastingEventStore,
-    CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    apply_upcasters, kernel_upcasters, Committed, Decision, EventStore, MemEventStore, Upcaster,
+    UpcastingEventStore, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};

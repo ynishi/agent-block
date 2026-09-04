@@ -5,13 +5,14 @@
 --   just test-lua                          # every spec fixture
 --
 -- `llm_proto.backend` is the whole model call as one closure: build the wire
--- request, post it with the retries worth taking, parse the answer. It is what
--- a kernel session runs (`knl.session { backend = ... }` / `s:call(req)`) and
--- what a loop with no session calls directly, so both sides get the same
--- transport and neither carries provider knowledge.
+-- request, post it with the retries worth taking, parse the answer. `tool_loop`
+-- and the agent block call it directly, and `knl_adapter`'s Port reuses the
+-- same pieces behind a device's `llm`, so every side gets the same transport
+-- and none of them carries provider knowledge.
 --
 -- What is pinned here is the closure's end of that arrangement:
---   1. the result satisfies the contract `knl.call` checks
+--   1. the result satisfies the contract its callers read (content / usage /
+--      stop_reason, or nil and an error)
 --   2. the conf and the request meet on the wire, request first
 --   3. api_key / model resolution, including the failure before the request
 --   4. which failures are retried and which are answered as they are

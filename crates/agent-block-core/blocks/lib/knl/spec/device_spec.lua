@@ -1,0 +1,1090 @@
+-- device_spec.lua — mlua-lspec unit tests for the session / device split
+-- (session-device-design.md: state and policy are two arguments, not one ctx).
+--
+-- Run via:
+--   test_launch(code_file=".../knl/spec/device_spec.lua",
+--               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
+--
+-- What this proves (session-device-design.md §8, pure-VM half):
+--   1 knl.device resolves its defaults once (fold / filters / cost), checks
+--     types at construction, and rejects unknown keys loudly (no silent
+--     policy typos). knl.open takes state keys only — a policy key is an
+--     unknown option now, not a shorthand.
+--   2 a device is frozen: assignment raises, and the tools map is copied, so
+--     writing to the caller's table afterwards cannot reach the device.
+--   3 d:with derives a new device from d's resolved fields; d is untouched;
+--     a state key in the delta raises.
+--   4 knl.beat(session, device) is the whole primitive: gate, beat id, fold,
+--     filter, reserve, record, call, record, tools — and every event one beat
+--     writes carries that beat's id, a string the kernel neither mints nor
+--     numbers.
+--   5 a refused reservation is `stopped`, the fourth status: no call, no
+--     record, and the grant's tag names what stopped it.
+--   6 knl.session(opts, fn) is the bracket: it closes on the way out either
+--     way, a body error wins over the close, and a close that fails on that
+--     path is warned rather than raised or swallowed (§9-f).
+--   7 tool_policy's decision vocabulary is nil / "run" / "deny" and nothing
+--     else; a raise denies (fail-closed) and a fourth value stops the beat
+--     with err("conf") before any tool runs (§9-l).
+--   8 the shapes M.shapes publishes cover every public IF (§9-k). The
+--     kernel's per-kind event contracts are NOT among them: the Rust
+--     validator is their one source of truth, and all this layer adds is
+--     that a `beat` stamp is a string (§11 R7).
+--
+-- The Rust `knl` syscall bridge is not present in the pure lspec runner, so a
+-- faithful Lua fake stands in below (mirroring bridge/knl.rs facts: append
+-- records and charges nothing and does NOT number beats; `reserve` is the one
+-- decision point — it deducts or refuses with the grant's tag; new_beat_id
+-- mints a fresh id per call; close takes a reason and is idempotent).
+
+local describe, it, expect = lust.describe, lust.it, lust.expect
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Fake `knl` bridge (installed as a global BEFORE require("knl"), which is
+-- what the module captures as its syscall layer at load time).
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local minted = 0
+
+local function fake_session(opts)
+    opts = opts or {}
+    local grant = opts.budget or {}
+    local s = {
+        _events = {},
+        _seq = 0,
+        _remaining = grant.amount,
+        _tag = grant.tag,
+        owner = opts.owner or "anon",
+        closed = false,
+        close_reason = nil,
+    }
+    -- An append records and charges nothing. The kernel stamps seq and
+    -- leaves every other field exactly as written — `beat` included, which
+    -- is the caller's to declare and never the kernel's to assign.
+    function s:append(ev)
+        assert(not self.closed, "knl: append: session is closed")
+        assert(type(ev) == "table" and type(ev.kind) == "string", "knl: append: kind is required")
+        self._seq = self._seq + 1
+        ev.seq = self._seq
+        self._events[#self._events + 1] = ev
+        return ev.seq
+    end
+    function s:events()
+        return self._events
+    end
+    -- The quota, asked before the spending: it deducts and answers true, or
+    -- refuses with the grant's tag and leaves the balance where it was.
+    function s:reserve(n)
+        assert(not self.closed, "knl: reserve: session is closed")
+        if self._remaining == nil then
+            return true
+        end
+        if self._remaining < n then
+            return false, self._tag
+        end
+        self._remaining = self._remaining - n
+        return true
+    end
+    function s:spend(n)
+        if self._remaining == nil then
+            return nil
+        end
+        self._remaining = math.max(0, self._remaining - n)
+        return self._remaining
+    end
+    function s:exhausted()
+        return self._remaining ~= nil and self._remaining <= 0
+    end
+    function s:remaining()
+        return self._remaining
+    end
+    function s:close(reason)
+        if not self.closed then
+            self.closed = true
+            self.close_reason = reason or "closed"
+        end
+    end
+    return s
+end
+
+knl = {
+    open = function(o)
+        return fake_session(o)
+    end,
+    resume = function(o)
+        local s = fake_session(o)
+        s.resumed_from = o and o.session
+        return s
+    end,
+    -- Time-ordered and session-free, like the Rust UUID v7 mint.
+    new_beat_id = function()
+        minted = minted + 1
+        return string.format("beat-%06d", minted)
+    end,
+}
+
+local K = require("knl")
+local Outcome = K.Outcome
+
+-- A minimal happy-path llm stub: plain text answer, fixed usage.
+local function stub_llm(text)
+    return function(_request)
+        return {
+            status = "ok",
+            content = { { type = "text", text = text } },
+            usage = { input_tokens = 10, output_tokens = 5 },
+            stop_reason = "end_turn",
+        }
+    end
+end
+
+-- A stub that answers with one tool_use first, then a plain answer.
+local function llm_with_tool(name, id)
+    local sent = false
+    return function(_req)
+        if sent then
+            return {
+                status = "ok",
+                content = { { type = "text", text = "done" } },
+                usage = {},
+                stop_reason = "end_turn",
+            }
+        end
+        sent = true
+        return {
+            status = "ok",
+            content = { { type = "tool_use", id = id or "c1", name = name, input = { s = "hi" } } },
+            usage = {},
+            stop_reason = "tool_use",
+        }
+    end
+end
+
+local function echo_tools()
+    return {
+        echo = {
+            description = "echo",
+            input_schema = { type = "object" },
+            handler = function(args)
+                return args.s
+            end,
+        },
+    }
+end
+
+-- The `beat` field of every event that carries one, in seq order.
+local function stamped_beats(s)
+    local ids = {}
+    for _, ev in ipairs(s:events()) do
+        if ev.beat ~= nil then
+            ids[#ids + 1] = ev.beat
+        end
+    end
+    return ids
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("knl.device — construction and resolution", function()
+    it("resolves the defaults once (fold / filters / cost)", function()
+        local d = K.device({})
+        expect(d.fold).to.be(K.fold)
+        expect(type(d.filters)).to.be("table")
+        expect(#d.filters).to.be(0)
+        expect(type(d.cost)).to.be("function")
+        expect(d.cost({})).to.be(1)
+        -- no default is invented for the rest
+        expect(d.llm).to.be(nil)
+        expect(d.tools).to.be(nil)
+        expect(d.tool_policy).to.be(nil)
+        expect(d.system).to.be(nil)
+    end)
+
+    it("keeps the fields it was given", function()
+        local llm, fold = stub_llm("hi"), function()
+            return { messages = {} }
+        end
+        local d = K.device({ llm = llm, fold = fold, system = "be terse" })
+        expect(d.llm).to.be(llm)
+        expect(d.fold).to.be(fold)
+        expect(d.system).to.be("be terse")
+    end)
+
+    it("rejects unknown keys loudly", function()
+        expect(function()
+            K.device({ llm = stub_llm("x"), inptu = "typo" })
+        end).to.fail()
+        -- state keys are a different constructor's, not a device's
+        expect(function()
+            K.device({ owner = "u" })
+        end).to.fail()
+        expect(function()
+            K.device({ budget = { amount = 1 } })
+        end).to.fail()
+    end)
+
+    it("checks types at construction", function()
+        expect(function()
+            K.device({ filters = "not-a-table" })
+        end).to.fail()
+        expect(function()
+            K.device({ filters = { "not-a-function" } })
+        end).to.fail()
+        expect(function()
+            K.device({ tool_policy = "not-a-function" })
+        end).to.fail()
+        expect(function()
+            K.device({ cost = 3 })
+        end).to.fail()
+        expect(function()
+            K.device({ fold = "not-a-function" })
+        end).to.fail()
+        expect(function()
+            K.device({ llm = "not-callable" })
+        end).to.fail()
+    end)
+
+    it("takes tools as a map only (an array is the adapter's job)", function()
+        expect(function()
+            K.device({ tools = { { name = "flat", handler = function() end } } })
+        end).to.fail()
+        local d = K.device({ tools = echo_tools() })
+        expect(type(d.tools.echo.handler)).to.be("function")
+    end)
+end)
+
+describe("knl.device — immutability", function()
+    it("assignment raises (__newindex guard), on a set field too", function()
+        local d = K.device({ llm = stub_llm("x") })
+        expect(function()
+            d.llm = stub_llm("mutated")
+        end).to.fail()
+        expect(function()
+            d.system = "sneak"
+        end).to.fail()
+    end)
+
+    it("copies the tools map: writing to the caller's table afterwards does nothing", function()
+        local mine = echo_tools()
+        local d = K.device({ tools = mine })
+        mine.echo = nil
+        mine.added = { handler = function() end }
+        expect(d.tools.echo).to.exist()
+        expect(d.tools.added).to.be(nil)
+    end)
+
+    it("the tools map itself is frozen", function()
+        local d = K.device({ tools = echo_tools() })
+        expect(function()
+            d.tools.injected = { handler = function() end }
+        end).to.fail()
+        expect(function()
+            d.tools.echo = { handler = function() end }
+        end).to.fail()
+    end)
+
+    it("copies the filters array", function()
+        local mine = {
+            function(req)
+                return req
+            end,
+        }
+        local d = K.device({ filters = mine })
+        mine[2] = function() end
+        expect(#d.filters).to.be(1)
+    end)
+end)
+
+describe("device:with — derivation", function()
+    it("derives a new device; the original is untouched", function()
+        local weak, strong = stub_llm("weak"), stub_llm("strong")
+        local d = K.device({ llm = weak, system = "base", tools = echo_tools() })
+        local d2 = d:with({ llm = strong })
+        expect(d2.llm).to.be(strong)
+        expect(d2.system).to.be("base") -- inherited
+        expect(d2.tools.echo).to.exist() -- inherited, re-frozen
+        expect(d.llm).to.be(weak) -- original intact
+        expect(d2 == d).to.be(false)
+    end)
+
+    it("the derived device is frozen too", function()
+        local d = K.device({ llm = stub_llm("x") }):with({ system = "s" })
+        expect(function()
+            d.system = "t"
+        end).to.fail()
+    end)
+
+    it("rejects state keys and typos in the delta", function()
+        local d = K.device({ llm = stub_llm("x") })
+        expect(function()
+            d:with({ owner = "other" })
+        end).to.fail()
+        expect(function()
+            d:with({ store = { sqlite = "p" } })
+        end).to.fail()
+        expect(function()
+            d:with({ session = "s" })
+        end).to.fail()
+        expect(function()
+            d:with({ typo = 1 })
+        end).to.fail()
+    end)
+
+    it("re-checks types on the merged result", function()
+        local d = K.device({ llm = stub_llm("x") })
+        expect(function()
+            d:with({ tool_policy = "not-a-function" })
+        end).to.fail()
+    end)
+end)
+
+describe("knl.open / knl.resume — state only", function()
+    it("returns the kernel session itself (no Lua wrapper)", function()
+        local s = K.open({ owner = "spec" })
+        expect(s.owner).to.be("spec")
+        s:append({ kind = "msg_user", content = "hello" })
+        local evs = s:events()
+        expect(#evs).to.be(1)
+        expect(evs[1].seq).to.be(1) -- kernel-owned stamp
+    end)
+
+    it("refuses policy keys and typos", function()
+        expect(function()
+            K.open({ llm = stub_llm("x") })
+        end).to.fail()
+        expect(function()
+            K.open({ tools = echo_tools() })
+        end).to.fail()
+        expect(function()
+            K.open({ inptu = "typo" })
+        end).to.fail()
+    end)
+
+    it("resume takes store / session / budget", function()
+        local s = K.resume({ store = { sqlite = "p.db" }, session = "sess-1" })
+        expect(s.resumed_from).to.be("sess-1")
+        expect(function()
+            K.resume({ store = { sqlite = "p.db" }, session = "s", llm = stub_llm("x") })
+        end).to.fail()
+    end)
+end)
+
+describe("knl.beat — the primitive", function()
+    it("errors on a non-session first argument", function()
+        local o = K.beat({ nothing = true }, K.device({ llm = stub_llm("x") }))
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("conf")
+    end)
+
+    it("errors on a second argument that is not a device", function()
+        local s = K.open({})
+        expect(Outcome.is_error(K.beat(s, { llm = stub_llm("x") }))).to.be(true)
+        expect(Outcome.is_error(K.beat(s, nil))).to.be(true)
+    end)
+
+    it("errors without an llm in the device", function()
+        local o = K.beat(K.open({ owner = "spec" }), K.device({}))
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("conf")
+    end)
+
+    it("one beat: records request + model_response under one declared id", function()
+        local s = K.open({})
+        local d = K.device({ llm = stub_llm("answer") })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_ok(o)).to.be(true)
+        expect(type(o.out.beat)).to.be("string")
+
+        local evs = s:events()
+        expect(evs[1].kind).to.be("msg_user")
+        expect(evs[1].beat).to.be(nil) -- the caller's seed is not part of a beat
+        expect(evs[2].kind).to.be("request")
+        expect(evs[3].kind).to.be("model_response")
+        expect(evs[2].beat).to.be(o.out.beat)
+        expect(evs[3].beat).to.be(o.out.beat)
+    end)
+
+    it("stamps every event of one beat — model response and tool pair — with the same id", function()
+        local s = K.open({})
+        local d = K.device({ llm = llm_with_tool("echo"), tools = echo_tools() })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_ok(o)).to.be(true)
+
+        local kinds = {}
+        for _, ev in ipairs(s:events()) do
+            kinds[#kinds + 1] = ev.kind
+        end
+        expect(table.concat(kinds, ",")).to.be("msg_user,request,model_response,tool_call,tool_result")
+
+        local ids = stamped_beats(s)
+        expect(#ids).to.be(4)
+        for _, id in ipairs(ids) do
+            expect(id).to.be(o.out.beat)
+        end
+        expect(o.out.tools[1].ok).to.be(true)
+    end)
+
+    it("two beats declare two different ids (no numbering, no read-back)", function()
+        local s = K.open({})
+        local d = K.device({ llm = stub_llm("x") })
+        s:append({ kind = "msg_user", content = "q" })
+        local first = K.beat(s, d)
+        local second = K.beat(s, d)
+        expect(Outcome.is_ok(first)).to.be(true)
+        expect(Outcome.is_ok(second)).to.be(true)
+        expect(type(first.out.beat)).to.be("string")
+        expect(first.out.beat == second.out.beat).to.be(false)
+        -- the session was never asked to count anything
+        expect(s.beats).to.be(nil)
+    end)
+
+    it("stops (the fourth status) when the reservation is refused", function()
+        -- One unit granted, one unit per beat: the second beat is refused.
+        local s = K.open({ budget = { amount = 1, tag = "tokens" } })
+        local d = K.device({ llm = stub_llm("x") })
+        s:append({ kind = "msg_user", content = "q" })
+        expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
+        expect(s:remaining()).to.be(0) -- the beat reserved it; the appends did not
+
+        local before = #s:events()
+        local second = K.beat(s, d)
+        expect(Outcome.is_stopped(second)).to.be(true)
+        expect(Outcome.is_ok(second)).to.be(false)
+        expect(second.reason).to.be("budget")
+        expect(second.tag).to.be("tokens") -- which allowance stopped it
+        -- A refused beat records nothing and calls nobody.
+        expect(#s:events()).to.be(before)
+    end)
+
+    it("asks device.cost how much one beat costs", function()
+        local asked = {}
+        local s = K.open({ budget = { amount = 10, tag = "tokens" } })
+        local d = K.device({
+            llm = stub_llm("x"),
+            cost = function(request)
+                asked[#asked + 1] = #request.messages
+                return 4
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
+        expect(s:remaining()).to.be(6)
+        expect(asked[1]).to.be(1) -- the policy saw the request, not the events
+    end)
+
+    it("a cost policy that answers 0 is a conf error (no ranking function)", function()
+        local s = K.open({ budget = { amount = 10, tag = "tokens" } })
+        local d = K.device({
+            llm = stub_llm("x"),
+            cost = function()
+                return 0
+            end,
+        })
+        local o = K.beat(s, d)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("conf")
+        expect(s:remaining()).to.be(10)
+    end)
+
+    it("escalation: beat(s, d:with{llm=strong}) uses strong for that beat only", function()
+        local called = {}
+        local function tagged(tag)
+            return function(_req)
+                called[#called + 1] = tag
+                return {
+                    status = "ok",
+                    content = { { type = "text", text = tag } },
+                    usage = {},
+                    stop_reason = "end_turn",
+                }
+            end
+        end
+        local s = K.open({})
+        local d = K.device({ llm = tagged("weak") })
+        s:append({ kind = "msg_user", content = "q" })
+        K.beat(s, d)
+        K.beat(s, d:with({ llm = tagged("strong") }))
+        K.beat(s, d)
+        expect(called[1]).to.be("weak")
+        expect(called[2]).to.be("strong")
+        expect(called[3]).to.be("weak") -- the original device is untouched
+    end)
+
+    it("one device drives two sessions independently", function()
+        local d = K.device({ llm = stub_llm("shared") })
+        local a, b = K.open({}), K.open({})
+        expect(Outcome.is_ok(K.beat(a, d))).to.be(true)
+        expect(#a:events()).to.be(2)
+        expect(#b:events()).to.be(0)
+    end)
+end)
+
+describe("knl.session — the canonical bracket", function()
+    it("opens, runs the body, and closes on the way out", function()
+        local seen
+        local first, second = K.session({ owner = "spec" }, function(s)
+            seen = s
+            s:append({ kind = "msg_user", content = "q" })
+            return "one", 2
+        end)
+        expect(first).to.be("one")
+        expect(second).to.be(2)
+        expect(seen.owner).to.be("spec")
+        expect(seen.closed).to.be(true)
+        expect(seen.close_reason).to.be("closed")
+    end)
+
+    it("closes on a body error and re-raises the body's error", function()
+        local seen
+        local ok, err = pcall(K.session, { owner = "spec" }, function(s)
+            seen = s
+            error("body exploded")
+        end)
+        expect(ok).to.be(false)
+        expect(tostring(err):find("body exploded", 1, true) ~= nil).to.be(true)
+        expect(seen.closed).to.be(true)
+        expect(seen.close_reason).to.be("error")
+    end)
+
+    it("resumes instead of opening when the opts name a session", function()
+        local resumed
+        K.session({ store = { sqlite = "p.db" }, session = "sess-7" }, function(s)
+            resumed = s.resumed_from
+        end)
+        expect(resumed).to.be("sess-7")
+    end)
+
+    it("nests: the inner session is its own", function()
+        local outer_id, inner_id
+        K.session({ owner = "outer" }, function(o)
+            outer_id = o
+            K.session({ owner = "inner" }, function(i)
+                inner_id = i
+                i:append({ kind = "msg_user", content = "in" })
+            end)
+            expect(#o:events()).to.be(0)
+        end)
+        expect(outer_id == inner_id).to.be(false)
+        expect(inner_id.closed).to.be(true)
+        expect(outer_id.closed).to.be(true)
+    end)
+
+    it("beats inside the bracket, the loop written by the caller", function()
+        local s
+        local out = K.session({ owner = "spec", budget = { amount = 5, tag = "beats" } }, function(session)
+            s = session
+            local d = K.device({ llm = stub_llm("hi") })
+            session:append({ kind = "msg_user", content = "q" })
+            return K.beat(session, d)
+        end)
+        expect(Outcome.is_ok(out)).to.be(true)
+        expect(s.closed).to.be(true)
+        expect(s:remaining()).to.be(4)
+    end)
+
+    it("requires a function body", function()
+        expect(function()
+            K.session({}, "not a function")
+        end).to.fail()
+    end)
+
+    -- §9-f: the body's error is the winner. A close that fails on the way
+    -- out is bookkeeping about a failure — it must not replace it, and it
+    -- must not vanish either, so it goes to the host log when there is one.
+    it("a close that fails on the error path is warned, not raised", function()
+        local warned
+        log = {
+            warn = function(msg)
+                warned = msg
+            end,
+        }
+        local ok, err = pcall(K.session, { owner = "spec" }, function(s)
+            s.close = function()
+                error("close blew up")
+            end
+            error("body exploded")
+        end)
+        log = nil
+        expect(ok).to.be(false)
+        expect(tostring(err):find("body exploded", 1, true) ~= nil).to.be(true)
+        expect(tostring(warned):find("close failed after body error", 1, true) ~= nil).to.be(true)
+        expect(tostring(warned):find("close blew up", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("a failing close needs no log global (it never raises)", function()
+        local ok, err = pcall(K.session, { owner = "spec" }, function(s)
+            s.close = function()
+                error("close blew up")
+            end
+            error("body exploded")
+        end)
+        expect(ok).to.be(false)
+        expect(tostring(err):find("body exploded", 1, true) ~= nil).to.be(true)
+    end)
+end)
+
+describe("knl shapes — data contracts, asserted in dev mode", function()
+    local lshape = require("lshape")
+    local shape = lshape.check
+
+    -- The mode is a property of the case, not of the environment: these
+    -- specs run both under the pure lspec runner (which sets LSHAPE_CHECK=1)
+    -- and under a bare test_launch (which does not), and a case about
+    -- dev-mode behaviour has to say which one it means.
+    local function with_dev_mode(on, fn)
+        local saved = shape.is_dev_mode
+        shape.is_dev_mode = function()
+            return on
+        end
+        local ok, err = pcall(fn)
+        shape.is_dev_mode = saved
+        if not ok then
+            error(err, 0)
+        end
+    end
+
+    local function in_dev(fn)
+        return with_dev_mode(true, fn)
+    end
+
+    local function in_prod(fn)
+        return with_dev_mode(false, fn)
+    end
+
+    it("publishes a shape for every public contract", function()
+        for _, name in ipairs({
+            "outcome",
+            "request",
+            "event_base",
+            "device_config",
+            "tool_entry",
+            "tool_policy_decision",
+            "cost_result",
+            "llm_result",
+            "open_opts",
+            "resume_opts",
+            "budget_grant",
+        }) do
+            expect(K.shapes[name]).to.exist()
+        end
+    end)
+
+    it("does not redefine the kernel's per-kind event contracts (one SoT)", function()
+        -- The Rust validator owns msg_user / request / model_response /
+        -- model_call_failed / tool_call / tool_result. A second copy here
+        -- drifted from it in three fields, so there is none: what this
+        -- layer contributes is the `beat` stamp, and that is all it checks.
+        expect(K.shapes.events).to.be(nil)
+        expect(shape.check({ kind = "model_response" }, K.shapes.event_base)).to.be(true)
+        expect(shape.check({ kind = "model_response", beat = 42 }, K.shapes.event_base)).to.be(false)
+    end)
+
+    it("a beat's Outcome validates against the outcome shape", function()
+        local s = K.open({})
+        local d = K.device({ llm = stub_llm("shaped") })
+        s:append({ kind = "msg_user", content = "q" })
+        expect(shape.check(K.beat(s, d), K.shapes.outcome)).to.be(true)
+    end)
+
+    it("a stopped Outcome validates too (the fourth variant)", function()
+        local stopped = Outcome.stopped("budget", "tokens")
+        expect(shape.check(stopped, K.shapes.outcome)).to.be(true)
+        expect(shape.check(Outcome.stopped("budget"), K.shapes.outcome)).to.be(true)
+    end)
+
+    it("dev mode: the beat stamp is checked on the events beat writes", function()
+        in_dev(function()
+            local s = K.open({})
+            local d = K.device({ tools = echo_tools() })
+            local out = { content = { { type = "tool_use", id = "c1", name = "echo", input = {} } } }
+            -- a numeric beat id: `beat` is an opaque STRING, and this is
+            -- the one thing this layer adds to the kernel's own validator
+            expect(function()
+                K._execute_tools(s, d, out, 42)
+            end).to.fail()
+            -- the same call with a declared id passes
+            K._execute_tools(s, d, out, "beat-x")
+        end)
+    end)
+
+    it("dev mode: a filter that breaks the request shape fails loud", function()
+        in_dev(function()
+            local s = K.open({})
+            local d = K.device({
+                llm = stub_llm("x"),
+                filters = {
+                    function(_req)
+                        return { messages = "not-an-array" }
+                    end,
+                },
+            })
+            s:append({ kind = "msg_user", content = "q" })
+            expect(function()
+                K.beat(s, d)
+            end).to.fail()
+        end)
+    end)
+
+    it("prod mode: the same malformed stamp passes through (no-op gate)", function()
+        in_prod(function()
+            local s = K.open({})
+            local d = K.device({ tools = echo_tools() })
+            local out = { content = { { type = "tool_use", id = "c1", name = "echo", input = {} } } }
+            K._execute_tools(s, d, out, 42) -- no raise
+            expect(#s:events()).to.be(2)
+        end)
+    end)
+end)
+
+describe("Outcome — four statuses", function()
+    it("match is exhaustive over all four arms", function()
+        local arms = {
+            ok = function()
+                return "O"
+            end,
+            refused = function()
+                return "R"
+            end,
+            error = function()
+                return "E"
+            end,
+            stopped = function(o)
+                return "S:" .. o.reason
+            end,
+        }
+        expect(Outcome.match(Outcome.stopped("budget", "tokens"), arms)).to.be("S:budget")
+        expect(Outcome.match(Outcome.ok({}), arms)).to.be("O")
+        -- a missing arm is loud, and a three-armed match no longer suffices
+        expect(function()
+            Outcome.match(Outcome.ok({}), {
+                ok = arms.ok,
+                refused = arms.refused,
+                error = arms.error,
+            })
+        end).to.fail()
+    end)
+
+    it("the predicates do not overlap", function()
+        local stopped = Outcome.stopped("budget")
+        expect(Outcome.is_stopped(stopped)).to.be(true)
+        expect(Outcome.is_ok(stopped)).to.be(false)
+        expect(Outcome.is_error(stopped)).to.be(false)
+        expect(Outcome.is_refused(stopped)).to.be(false)
+        expect(Outcome.is_stopped(Outcome.ok({}))).to.be(false)
+    end)
+end)
+
+describe("beat contract hardening (review findings)", function()
+    it("a raising llm is Error('call'), not a raw raise", function()
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                error("adapter exploded")
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("call")
+        -- the failure is noted in the history, under this beat's id
+        local last = s:events()[#s:events()]
+        expect(last.kind).to.be("model_call_failed")
+        expect(type(last.beat)).to.be("string")
+    end)
+
+    it("an llm that answers a non-table is Error('call'), not a raise on resp.status", function()
+        for _, answer in ipairs({ false, "just a string", 42 }) do
+            local s = K.open({})
+            local d = K.device({
+                llm = function()
+                    return answer
+                end,
+            })
+            s:append({ kind = "msg_user", content = "q" })
+            local o = K.beat(s, d)
+            expect(Outcome.is_error(o)).to.be(true)
+            expect(o.kind).to.be("call")
+            -- and it is noted in the history under this beat's id, like any
+            -- other call failure
+            local last = s:events()[#s:events()]
+            expect(last.kind).to.be("model_call_failed")
+            expect(type(last.beat)).to.be("string")
+        end
+    end)
+
+    it("a log that cannot be read is Error('state'), not a raw raise", function()
+        local s = K.open({})
+        s.events = function()
+            error("store read failed: database is locked")
+        end
+        local o = K.beat(s, K.device({ llm = stub_llm("x") }))
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("state")
+    end)
+
+    it("an append that fails is Error('state'), not a raw raise", function()
+        local s = K.open({})
+        s.append = function()
+            error("head conflict: expected 1, actual 2")
+        end
+        local o = K.beat(s, K.device({ llm = stub_llm("x") }))
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("state")
+    end)
+
+    it("a missing usage defaults to an empty count on the record", function()
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                return {
+                    status = "ok",
+                    content = { { type = "text", text = "hi" } },
+                    stop_reason = "end_turn",
+                }
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
+        local resp
+        for _, ev in ipairs(s:events()) do
+            if ev.kind == "model_response" then
+                resp = ev
+            end
+        end
+        expect(type(resp.usage)).to.be("table")
+    end)
+
+    it("a filter returning nil is Error('filter') in prod", function()
+        local s = K.open({})
+        local d = K.device({
+            llm = stub_llm("x"),
+            filters = {
+                function(req)
+                    req.system = "mutated"
+                    -- forgets to return
+                end,
+            },
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("filter")
+        -- nothing was recorded: the corrupt request never reached append
+        expect(#s:events()).to.be(1)
+    end)
+
+    it("a refusal is recorded and carries the beat id", function()
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                return {
+                    status = "refused",
+                    content = { { type = "text", text = "no" } },
+                    usage = {},
+                    stop_reason = "refusal",
+                }
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_refused(o)).to.be(true)
+        expect(o.reason).to.be("refusal")
+        expect(type(o.detail.beat)).to.be("string")
+        local last = s:events()[#s:events()]
+        expect(last.kind).to.be("model_response")
+        expect(last.beat).to.be(o.detail.beat)
+    end)
+
+    it("a raising tool_policy denies the call (fail-closed)", function()
+        local ran = false
+        local s = K.open({})
+        local d = K.device({
+            llm = llm_with_tool("danger"),
+            tools = {
+                danger = {
+                    handler = function()
+                        ran = true
+                        return "side effect"
+                    end,
+                },
+            },
+            tool_policy = function()
+                error("policy bug")
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_ok(o)).to.be(true)
+        expect(ran).to.be(false) -- the handler never executed
+        expect(o.out.tools[1].ok).to.be(false)
+    end)
+end)
+
+-- session-device-design.md §9-l. The vocabulary is three values and no
+-- more: nil (no opinion), "run", "deny". A policy is a gate, so its own
+-- failures close (a raise denies) and its own mistakes stop the beat
+-- rather than being read as some fourth intention.
+describe("tool_policy — the decision contract", function()
+    local function danger_device(policy)
+        return K.device({
+            llm = llm_with_tool("danger"),
+            tools = {
+                danger = {
+                    handler = function()
+                        return "side effect"
+                    end,
+                },
+            },
+            tool_policy = policy,
+        })
+    end
+
+    local function beat_with(policy)
+        local ran = false
+        local s = K.open({})
+        local d = K.device({
+            llm = llm_with_tool("danger"),
+            tools = {
+                danger = {
+                    handler = function()
+                        ran = true
+                        return "side effect"
+                    end,
+                },
+            },
+            tool_policy = policy,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        return K.beat(s, d), s, ran and true or false
+    end
+
+    it('no policy, a nil decision and "run" all run the tool', function()
+        for _, policy in ipairs({
+            false, -- stands in for "no policy at all"
+            function() end,
+            function()
+                return "run"
+            end,
+        }) do
+            local o, s, ran = beat_with(policy or nil)
+            expect(Outcome.is_ok(o)).to.be(true)
+            expect(ran).to.be(true)
+            expect(o.out.tools[1].ok).to.be(true)
+            expect(s:events()[#s:events()].result).to.be("side effect")
+        end
+    end)
+
+    it('"deny" closes the pair ok=false and the handler never runs', function()
+        local o, s, ran = beat_with(function()
+            return "deny"
+        end)
+        expect(Outcome.is_ok(o)).to.be(true)
+        expect(ran).to.be(false)
+        expect(o.out.tools[1].ok).to.be(false)
+        local last = s:events()[#s:events()]
+        expect(last.kind).to.be("tool_result")
+        expect(last.ok).to.be(false)
+        expect(last.result).to.be("tool 'danger' denied by policy")
+    end)
+
+    it("a denial's reason rides in the tool_result", function()
+        local _, s = beat_with(function()
+            return "deny", "not on this scope"
+        end)
+        expect(s:events()[#s:events()].result).to.be("tool 'danger' denied by policy: not on this scope")
+    end)
+
+    it("a raising policy denies (fail-closed) and says so", function()
+        local o, s, ran = beat_with(function()
+            error("policy bug")
+        end)
+        expect(Outcome.is_ok(o)).to.be(true)
+        expect(ran).to.be(false)
+        expect(o.out.tools[1].ok).to.be(false)
+        expect(s:events()[#s:events()].result:find("policy raised", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("any other decision is Error('conf') and nothing runs", function()
+        for _, decision in ipairs({ "skip", "allow", true, 1 }) do
+            local o, s, ran = beat_with(function()
+                return decision
+            end)
+            expect(Outcome.is_error(o)).to.be(true)
+            expect(o.kind).to.be("conf")
+            expect(ran).to.be(false)
+            -- the beat itself happened: its model_response is recorded, and
+            -- no tool_call was written for a call that never ran
+            local kinds = {}
+            for _, ev in ipairs(s:events()) do
+                kinds[#kinds + 1] = ev.kind
+            end
+            expect(table.concat(kinds, ",")).to.be("msg_user,request,model_response")
+        end
+    end)
+
+    it("the device still refuses a tool_policy that is not a function", function()
+        expect(function()
+            danger_device("deny")
+        end).to.fail()
+    end)
+end)
+
+describe("fold hardening (review findings)", function()
+    it("empty messages carry the JSON-array tag across the boundary", function()
+        local req = K.fold({}, {})
+        expect(#req.messages).to.be(0)
+        expect(getmetatable(req.messages).__jsontype).to.be("array")
+    end)
+
+    it("reads system and tools off the device", function()
+        local req = K.fold({}, K.device({ system = "SYS", tools = echo_tools() }))
+        expect(req.system).to.be("SYS")
+        expect(#req.tools).to.be(1)
+        expect(req.tools[1].name).to.be("echo")
+        expect(req.tools[1].input_schema.type).to.be("object")
+    end)
+
+    it("a dangling tool_use (crash mid-tool) is closed with a synthetic error result", function()
+        local events = {
+            { kind = "msg_user", content = "go", seq = 1 },
+            {
+                kind = "model_response",
+                beat = "b1",
+                content = {
+                    { type = "text", text = "using tools" },
+                    { type = "tool_use", id = "c1", name = "t", input = {} },
+                    { type = "tool_use", id = "c2", name = "t", input = {} },
+                },
+                seq = 2,
+            },
+            -- c1 was answered before the crash; c2 was not
+            { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 3 },
+        }
+        local req = K.fold(events, {})
+        -- user "go" / assistant / user [c1 result + synthetic c2 result]
+        expect(#req.messages).to.be(3)
+        local closing = req.messages[3].content
+        expect(#closing).to.be(2)
+        expect(closing[1].tool_use_id).to.be("c1")
+        expect(closing[2].tool_use_id).to.be("c2")
+        expect(closing[2].is_error).to.be(true)
+    end)
+
+    it("an answered tool pair needs no repair (no synthetic results)", function()
+        local events = {
+            {
+                kind = "model_response",
+                beat = "b1",
+                content = { { type = "tool_use", id = "c1", name = "t", input = {} } },
+                seq = 1,
+            },
+            { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 2 },
+            { kind = "model_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 3 },
+        }
+        local req = K.fold(events, {})
+        expect(#req.messages).to.be(3)
+        expect(#req.messages[2].content).to.be(1) -- just the real result
+    end)
+end)

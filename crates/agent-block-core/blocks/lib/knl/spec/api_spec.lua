@@ -1,0 +1,254 @@
+-- api_spec.lua — the machine check that knl's public IF is fully declared
+-- (session-device-design.md §9-m, the Lua half).
+--
+-- Run via:
+--   test_launch(code_file=".../knl/spec/api_spec.lua",
+--               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
+--
+-- Why this file exists
+--   §9-k says every public IF of knl is defined as a shape and published
+--   through `knl.shapes`. A rule like that decays the moment it depends on
+--   someone remembering it: an export is added, the registry is not, and the
+--   contract quietly stops being the contract. So the completeness is
+--   checked rather than remembered — this spec walks the module itself and
+--   fails on
+--     * an export with no `knl.shapes.api` entry (the registry fell behind),
+--     * an entry with no export (the registry kept a name that is gone),
+--     * an `Outcome` function missing from / stale in that entry's members,
+--     * a device field `knl.shapes.device_config` does not describe.
+--
+--   It reads the module, never a list written next to it, so there is no
+--   third place to keep in step.
+--
+-- TODO (§9-m, the other half — a later pass): the same check across the
+-- bridge. `knl.api()` answers the bridge's own SESSION_API / MODULE_API
+-- tables, and a test that has the bridge in its VM will hold every name it
+-- declares against `knl.shapes.session` / `knl.shapes.module`, so adding a
+-- syscall on one side and not the other goes red. It cannot live here (this
+-- file runs in a VM with no bridge on purpose), and nothing here depends on
+-- it landing.
+--
+-- No fake `knl` bridge is installed on purpose: none of this touches the
+-- syscall layer, and a module that cannot be loaded and read without one
+-- would be a finding of its own.
+
+local describe, it, expect = lust.describe, lust.it, lust.expect
+
+local K = require("knl")
+local api = K.shapes.api
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Helpers
+-- ─────────────────────────────────────────────────────────────────────────────
+
+--- A schema is plain data with a `kind` (lshape's Schema-as-Data contract).
+local function is_shape(v)
+    return type(v) == "table" and rawget(v, "kind") ~= nil
+end
+
+--- What an `args` / `returns` slot may hold: a shape, a description, or an
+--- ordered list of either (for the arguments a shape cannot express — a
+--- session handle, a callback).
+local function is_declaration(v)
+    if is_shape(v) or type(v) == "string" then
+        return true
+    end
+    if type(v) ~= "table" then
+        return false
+    end
+    if #v == 0 then
+        return false
+    end
+    for _, item in ipairs(v) do
+        if not (is_shape(item) or type(item) == "string") then
+            return false
+        end
+    end
+    return true
+end
+
+--- The public names of a table: everything not marked internal with `_`.
+local function public_names(t)
+    local names = {}
+    for name in pairs(t) do
+        if type(name) == "string" and name:sub(1, 1) ~= "_" then
+            names[#names + 1] = name
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+--- Report as a sorted, comma-joined string: a failure then names what is
+--- missing instead of only saying that something is.
+local function listed(names)
+    table.sort(names)
+    return table.concat(names, ",")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("knl.shapes.api — every export is declared", function()
+    it("declares every public export of the module", function()
+        local undeclared = {}
+        for _, name in ipairs(public_names(K)) do
+            if api[name] == nil then
+                undeclared[#undeclared + 1] = name
+            end
+        end
+        expect(listed(undeclared)).to.be("")
+    end)
+
+    it("declares nothing the module does not export", function()
+        local stale = {}
+        for _, name in ipairs(public_names(api)) do
+            if K[name] == nil then
+                stale[#stale + 1] = name
+            end
+        end
+        expect(listed(stale)).to.be("")
+    end)
+
+    it("gives every entry an args and a returns declaration", function()
+        local bad = {}
+        for _, name in ipairs(public_names(api)) do
+            local entry = api[name]
+            if type(entry) ~= "table" or not is_declaration(entry.args) or not is_declaration(entry.returns) then
+                bad[#bad + 1] = name
+            end
+        end
+        expect(listed(bad)).to.be("")
+    end)
+
+    it("covers the exports the design names one by one", function()
+        -- The walk above would still pass if the module lost an export and
+        -- the registry lost it too. These are the names §9-m lists.
+        for _, name in ipairs({
+            "open",
+            "resume",
+            "session",
+            "device",
+            "beat",
+            "fold",
+            "new_beat_id",
+            "Outcome",
+            "shapes",
+        }) do
+            expect(K[name]).to.exist()
+            expect(api[name]).to.exist()
+        end
+    end)
+end)
+
+describe("knl.shapes.api.Outcome — the namespace's own members", function()
+    local members = api.Outcome.members
+
+    it("declares every function Outcome exports", function()
+        local undeclared = {}
+        for _, name in ipairs(public_names(K.Outcome)) do
+            if members[name] == nil then
+                undeclared[#undeclared + 1] = name
+            end
+        end
+        expect(listed(undeclared)).to.be("")
+    end)
+
+    it("declares nothing Outcome does not export", function()
+        local stale = {}
+        for _, name in ipairs(public_names(members)) do
+            if K.Outcome[name] == nil then
+                stale[#stale + 1] = name
+            end
+        end
+        expect(listed(stale)).to.be("")
+    end)
+
+    it("gives every member an args and a returns declaration", function()
+        local bad = {}
+        for _, name in ipairs(public_names(members)) do
+            local entry = members[name]
+            if type(entry) ~= "table" or not is_declaration(entry.args) or not is_declaration(entry.returns) then
+                bad[#bad + 1] = name
+            end
+        end
+        expect(listed(bad)).to.be("")
+    end)
+
+    it("covers the four constructors, the four predicates and match", function()
+        for _, name in ipairs({
+            "ok",
+            "refused",
+            "err",
+            "stopped",
+            "is_ok",
+            "is_refused",
+            "is_error",
+            "is_stopped",
+            "match",
+        }) do
+            expect(type(K.Outcome[name])).to.be("function")
+            expect(members[name]).to.exist()
+        end
+    end)
+end)
+
+describe("knl.shapes.device_config — every field of a device is described", function()
+    -- A device carries exactly what it was built from, resolved. Building
+    -- one with every key set is what makes the walk below see them all: a
+    -- field left nil is not a field.
+    local function full_device()
+        return K.device({
+            llm = function() end,
+            tools = {
+                echo = {
+                    description = "echo",
+                    input_schema = { type = "object" },
+                    handler = function(args)
+                        return args
+                    end,
+                },
+            },
+            tool_policy = function()
+                return "run"
+            end,
+            fold = function()
+                return { messages = {} }
+            end,
+            filters = {
+                function(req)
+                    return req
+                end,
+            },
+            system = "be terse",
+            cost = function()
+                return 1
+            end,
+        })
+    end
+
+    it("describes every field a constructed device carries", function()
+        local fields = rawget(K.shapes.device_config, "fields")
+        local undescribed = {}
+        for name in pairs(full_device()) do
+            if fields[name] == nil then
+                undescribed[#undescribed + 1] = tostring(name)
+            end
+        end
+        expect(listed(undescribed)).to.be("")
+    end)
+
+    it("describes nothing a device cannot carry", function()
+        local d = full_device()
+        local unreachable = {}
+        for name in pairs(rawget(K.shapes.device_config, "fields")) do
+            if d[name] == nil then
+                unreachable[#unreachable + 1] = name
+            end
+        end
+        expect(listed(unreachable)).to.be("")
+    end)
+
+    it("is closed, so an undeclared key cannot ride in on a config", function()
+        expect(rawget(K.shapes.device_config, "open")).to.be(false)
+    end)
+end)

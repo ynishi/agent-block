@@ -143,12 +143,13 @@ describe("tool_loop.run result contract", function()
         http_status = 200
     end)
 
-    -- `opts.session` is opt-in, and this is what "opt-in" has to mean for the
-    -- callers that pass nothing: the same keys, the same values, no field
-    -- appearing because the feature exists. The session cases themselves need
-    -- the kernel bridge, which no spec fixture has, so they run against the
-    -- real one from the Rust side (tool_loop_session).
-    it("adds nothing to the result when no session is passed", function()
+    -- The keys of a plain run, pinned. tool_loop took an `opts.session`
+    -- once, routing the call through a `s:call` the bridge never had; that
+    -- path is gone (session-device-design.md §11 R1) and running a loop over
+    -- a recorded session is `knl.beat(session, device)` now. What this case
+    -- holds is that nothing was left behind by the removal: the same keys,
+    -- the same values, no field appearing from a feature that is not there.
+    it("returns exactly the keys of a standalone run", function()
         http_status = 200
         canned_response = text_response("hello")
         local res = run({ prompt = "ask" })

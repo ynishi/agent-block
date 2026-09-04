@@ -15,7 +15,7 @@
 --     runs the bound handler and closes the pair (ok=true / raise=>ok=false).
 --
 -- A fake `knl` bridge stands in for the Rust syscall layer (same fake as
--- knl/spec/ctx_spec.lua), installed BEFORE require("knl").
+-- knl/spec/device_spec.lua), installed BEFORE require("knl").
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -23,29 +23,29 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- Fake `knl` bridge
 -- ─────────────────────────────────────────────────────────────────────────────
 
+local minted = 0
+
 local function fake_session(opts)
     opts = opts or {}
-    local s = { _events = {}, _seq = 0, _beats = 0 }
+    local s = { _events = {}, _seq = 0 }
+    -- An append records: the kernel stamps seq and stores every other field
+    -- as written, `beat` (the shell's declared id) included.
     function s:append(ev)
         self._seq = self._seq + 1
         ev.seq = self._seq
-        if ev.kind == "model_response" then
-            self._beats = self._beats + 1
-            ev.beat = self._beats
-        end
         self._events[#self._events + 1] = ev
         return ev.seq
     end
     function s:events()
         return self._events
     end
-    function s:beats()
-        return self._beats
-    end
     -- No grant here, so every reservation is allowed and nothing is
     -- recorded — the kernel's "no budget, no ledger" answer.
     function s:reserve(_n)
         return true
+    end
+    function s:spend(_n)
+        return nil
     end
     function s:remaining()
         return nil
@@ -60,6 +60,10 @@ end
 knl = {
     open = function(o)
         return fake_session(o)
+    end,
+    new_beat_id = function()
+        minted = minted + 1
+        return string.format("beat-%06d", minted)
     end,
 }
 
@@ -249,7 +253,8 @@ describe("ToolPort.mcp — the second source (fake mcp bridge)", function()
         install_fake_mcp({ { name = "bad" } }, {
             bad = { ok = true, is_error = true, content = { { type = "text", text = "boom" } } },
         })
-        local ctx = kernel.open({
+        local session = kernel.open({})
+        local device = kernel.device({
             llm = (function()
                 local sent = false
                 return function(_req)
@@ -272,8 +277,8 @@ describe("ToolPort.mcp — the second source (fake mcp bridge)", function()
             end)(),
             tools = adapter.tools(adapter.mcp_tools("srv")),
         })
-        ctx:append({ kind = "msg_user", content = "q" })
-        local o = kernel.beat(ctx)
+        session:append({ kind = "msg_user", content = "q" })
+        local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].ok).to.be(false)
     end)
@@ -304,33 +309,38 @@ describe("bound tools drive a beat (kernel contract end-to-end)", function()
     end
 
     it("a tool_use runs the bound handler and closes the pair ok=true", function()
-        local ctx = kernel.open({
+        local session = kernel.open({})
+        local device = kernel.device({
             llm = llm_with_tool("fs_read"),
             tools = adapter.tools({ flat_spec("fs_read") }),
         })
-        ctx:append({ kind = "msg_user", content = "q" })
-        local o = kernel.beat(ctx)
+        session:append({ kind = "msg_user", content = "q" })
+        local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].name).to.be("fs_read")
         expect(o.out.tools[1].ok).to.be(true)
-        local last = ctx:events()[#ctx:events()]
+        local last = session:events()[#session:events()]
         expect(last.kind).to.be("tool_result")
         expect(last.result).to.be("fs_read:9")
+        -- both halves of the pair carry the beat's declared id
+        expect(last.beat).to.be(o.out.beat)
+        expect(type(o.out.beat)).to.be("string")
     end)
 
     it("a raising invoke closes the pair ok=false (source failure vocabulary stays inside)", function()
         local boom = flat_spec("boom", function()
             error("device exploded")
         end)
-        local ctx = kernel.open({
+        local session = kernel.open({})
+        local device = kernel.device({
             llm = llm_with_tool("boom"),
             tools = adapter.tools({ boom }),
         })
-        ctx:append({ kind = "msg_user", content = "q" })
-        local o = kernel.beat(ctx)
+        session:append({ kind = "msg_user", content = "q" })
+        local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].ok).to.be(false)
-        local last = ctx:events()[#ctx:events()]
+        local last = session:events()[#session:events()]
         expect(last.kind).to.be("tool_result")
         expect(last.ok).to.be(false)
     end)

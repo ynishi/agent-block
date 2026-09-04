@@ -130,6 +130,26 @@ local knl_adapter = require("knl_adapter")
 -- verdict is whatever the test scripts, proving the shim computes no status.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+--- Run `fn` with the dev-mode gate pinned on or off.
+---
+--- Cases about the boundary assert have to state which mode they mean: this
+--- file runs under a bare test_launch (dev off) and under the lua-spec
+--- runner (LSHAPE_CHECK=1, dev on), and a scripted verdict that the
+--- llm_result shape rejects behaves differently in each. Pinning the mode
+--- is what makes the case about the shim rather than about the environment.
+local function with_dev_mode(on, fn)
+    local saved = shape.is_dev_mode
+    shape.is_dev_mode = function()
+        return on
+    end
+    local results = table.pack(pcall(fn))
+    shape.is_dev_mode = saved
+    if not results[1] then
+        error(results[2], 0)
+    end
+    return table.unpack(results, 2, results.n)
+end
+
 local function make_test_port(opts)
     local seen = {}
     local port = knl_adapter.LLMPort.new({
@@ -179,7 +199,13 @@ describe("knl_adapter Port", function()
         http_script.resp = { status = 200, body = "{}", headers = {} }
 
         local llm = port:open({ model = "test" })
-        local resp, err = llm({ messages = {} })
+        -- The scripted verdict is deliberately outside the llm_result
+        -- vocabulary — that is the point of the case — so this one is about
+        -- what the shim carries, with the boundary assert off. Case 11 is
+        -- the other half: with it on, the same result raises.
+        local resp, err = with_dev_mode(false, function()
+            return llm({ messages = {} })
+        end)
 
         expect(err).to.equal(nil)
         expect(resp.status).to.equal("SCRIPTED_VERDICT")
@@ -382,16 +408,16 @@ describe("knl_adapter Port", function()
         local llm = port:open({})
 
         -- prod (dev off): assert_dev is a no-op, the malformed result passes on
-        expect(pcall(llm, { messages = {} })).to.equal(true)
+        local passed_in_prod = with_dev_mode(false, function()
+            return (pcall(llm, { messages = {} }))
+        end)
+        expect(passed_in_prod).to.equal(true)
 
         -- dev on: the boundary catches the Mapper bug and raises
-        local saved = shape.is_dev_mode
-        shape.is_dev_mode = function()
-            return true
-        end
-        local ok = pcall(llm, { messages = {} })
-        shape.is_dev_mode = saved
-        expect(ok).to.equal(false)
+        local passed_in_dev = with_dev_mode(true, function()
+            return (pcall(llm, { messages = {} }))
+        end)
+        expect(passed_in_dev).to.equal(false)
     end)
 
     it("12: non-table content is an unreadable-response (nil, err), not a raise", function()

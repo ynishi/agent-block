@@ -3,8 +3,15 @@
 //! The counter is what makes a run stop: termination is undecidable, so
 //! the owner injects a resource that only decreases and the run ends when
 //! it runs out (`ulimit` / cgroup semantics).  The decision is taken
-//! *before* the spending, by [`Budget::reserve`] — asking whether `n` may
-//! be consumed — and [`Budget::spend`] settles afterwards.
+//! *before* the spending, by [`super::Session::reserve`] — asking whether
+//! `n` may be consumed — and [`Budget::spend`] settles afterwards.
+//!
+//! The decision is not taken here.  A reservation is a command with an
+//! invariant, so it is decided inside the store, against the ledger as it
+//! stands there ([`super::EventStore::append_if`]); this counter is the cache
+//! that follows, set from [`fold_balance`] afterwards.  A `reserve` on the
+//! counter alone would be a second place the balance is decided, and two
+//! handles on one stream could then take the same allowance twice.
 //!
 //! It is not accounting.  What a run actually consumed is the `usage`
 //! projection over the fact-log ([`super::projection`]); the two are
@@ -152,30 +159,6 @@ impl Budget {
         }
     }
 
-    /// Ask to consume `n`: `true` when it was taken, `false` when the
-    /// balance would not cover it.
-    ///
-    /// This is the decision point — the whole reason a budget exists.  A
-    /// refusal is atomic: the balance is left exactly as it was, so a
-    /// caller that stops on `false` has spent nothing on the attempt.
-    /// Without a budget every request is granted (`true`) and there is no
-    /// balance to move.
-    ///
-    /// A negative amount is an error, as it is for [`Budget::spend`]: the
-    /// counter decreases, and a "reservation" that raised the balance
-    /// would be a refund by another name.
-    pub fn reserve(&mut self, n: i64) -> KnlResult<bool> {
-        check_amount(n)?;
-        let Some(remaining) = self.remaining.as_mut() else {
-            return Ok(true);
-        };
-        if *remaining < n {
-            return Ok(false);
-        }
-        *remaining -= n;
-        Ok(true)
-    }
-
     /// Settle `amount` after the fact, returning the new balance (`None`
     /// without a budget).
     ///
@@ -274,83 +257,10 @@ mod tests {
         assert_eq!(b.remaining(), Some(0));
     }
 
-    /// The decision point: a request the balance covers is taken, and the
-    /// balance falls by exactly what was asked for.
-    #[test]
-    fn reserve_takes_what_the_balance_covers() {
-        let mut b = Budget::new(Some(100));
-        assert_eq!(b.reserve(40), Ok(true));
-        assert_eq!(b.remaining(), Some(60));
-        assert_eq!(b.reserve(60), Ok(true), "the exact balance is coverable");
-        assert_eq!(b.remaining(), Some(0));
-        assert!(b.exhausted());
-        // Zero is always coverable, even at zero.
-        assert_eq!(b.reserve(0), Ok(true));
-        assert_eq!(b.remaining(), Some(0));
-    }
-
-    /// A refusal is atomic: the balance is exactly what it was, so a
-    /// caller that stops on `false` has paid nothing for the attempt.
-    #[test]
-    fn a_refused_reserve_leaves_the_balance_untouched() {
-        let mut b = Budget::new(Some(50));
-        assert_eq!(b.reserve(51), Ok(false));
-        assert_eq!(b.remaining(), Some(50), "a refusal must not deduct");
-        assert!(!b.exhausted(), "a refusal must not exhaust the budget");
-
-        // Still spendable afterwards: the refusal changed no state at all.
-        assert_eq!(b.reserve(50), Ok(true));
-        assert_eq!(b.remaining(), Some(0));
-        assert_eq!(b.reserve(1), Ok(false));
-        assert_eq!(b.remaining(), Some(0));
-    }
-
-    /// Without a budget there is nothing to refuse: every request is
-    /// granted and no balance moves.
-    #[test]
-    fn without_a_budget_reserve_always_grants() {
-        let mut b = Budget::new(None);
-        assert_eq!(b.reserve(0), Ok(true));
-        assert_eq!(b.reserve(i64::MAX), Ok(true));
-        assert_eq!(b.remaining(), None);
-        assert!(!b.exhausted());
-    }
-
-    /// The counter only decreases: a negative reservation is rejected
-    /// rather than handing balance back, with or without a budget.
-    #[test]
-    fn a_negative_reserve_is_rejected_and_changes_nothing() {
-        let mut b = Budget::new(Some(100));
-        let err = b.reserve(-1).expect_err("negative reserve");
-        assert!(err.reason().contains("non-negative"), "{err}");
-        assert_eq!(b.remaining(), Some(100));
-
-        let mut none = Budget::new(None);
-        none.reserve(-1)
-            .expect_err("negative reserve without a budget");
-    }
-
-    /// reserve and spend move the same counter in the same direction:
-    /// across any interleaving the balance is non-increasing.
-    #[test]
-    fn reserve_and_spend_are_one_monotonic_counter() {
-        let mut b = Budget::new(Some(1000));
-        let mut prev = 1000;
-        for (i, n) in [10, 300, 0, 90].into_iter().enumerate() {
-            if i % 2 == 0 {
-                assert_eq!(b.reserve(n), Ok(true));
-            } else {
-                b.spend(n).expect("spend");
-            }
-            let now = b.remaining().expect("has a budget");
-            assert!(now <= prev, "balance rose: {prev} -> {now}");
-            prev = now;
-        }
-        assert_eq!(b.remaining(), Some(600));
-    }
-
-    /// The fold is the definition and the counter is the cache: the same
-    /// sequence of moves, applied both ways, lands on the same number.
+    /// The fold is the definition and the counter is the cache: a
+    /// reservation is decided and recorded elsewhere (inside the store), and
+    /// the counter is *set* from the fold — so the two land on the same
+    /// number after any sequence of moves.
     #[test]
     fn the_fold_of_the_ledger_is_the_balance() {
         use serde_json::json;
@@ -359,14 +269,17 @@ mod tests {
         let mut log = vec![json!({ "kind": "budget_granted", "amount": 100 })];
         assert_eq!(fold_balance(&log), b.remaining());
 
-        assert_eq!(b.reserve(30), Ok(true));
+        // A reservation of 30 was decided in the store and recorded there;
+        // the cache takes what the ledger folds to.
         log.push(json!({ "kind": "budget_reserved", "amount": 30 }));
+        b = Budget::new(fold_balance(&log));
         assert_eq!(fold_balance(&log), b.remaining(), "after a reservation");
 
         // A refusal is recorded and moves nothing.
-        assert_eq!(b.reserve(1_000), Ok(false));
         log.push(json!({ "kind": "budget_refused", "amount": 1000, "remaining": 70 }));
+        b = Budget::new(fold_balance(&log));
         assert_eq!(fold_balance(&log), b.remaining(), "after a refusal");
+        assert_eq!(b.remaining(), Some(70));
 
         b.spend(20).expect("spend");
         log.push(json!({ "kind": "budget_spent", "amount": 20 }));
@@ -395,7 +308,7 @@ mod tests {
         assert_eq!(fold_balance(&[]), None);
         assert_eq!(
             fold_balance(&[
-                json!({ "kind": "run_started" }),
+                json!({ "kind": "session_opened" }),
                 json!({ "kind": "model_response", "usage": { "input_tokens": 500 } }),
             ]),
             None,
