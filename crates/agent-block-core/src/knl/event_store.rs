@@ -35,27 +35,28 @@
 //! serialized write.  The check therefore runs against the stream as it is
 //! at that instant, not against a head someone cached earlier.
 //!
-//! # Stored shape change ⇒ upcaster, always
+//! # Stored shape change ⇒ upcaster, always — from the first release on
 //!
 //! Stored bytes are never rewritten.  Every change to the shape of a stored
 //! event ships in the same round as (a) a bump of
 //! [`CURRENT_SCHEMA_VERSION`], which every new event is stamped with, and
 //! (b) an [`Upcaster`] for the `n → n+1` step, registered in
 //! [`kernel_upcasters`] and applied at read time by
-//! [`UpcastingEventStore`].  An event with no [`SCHEMA_VERSION_FIELD`] is
-//! version 1 (the field is itself a later addition).  A round that renames a
-//! kind or a field without an upcaster is incomplete: an old log would be
-//! silently misread, which is the one failure an append-only store exists to
-//! prevent.
+//! [`UpcastingEventStore`].  A round that renames a kind or a field without
+//! an upcaster is incomplete: an old log would be silently misread, which is
+//! the one failure an append-only store exists to prevent.
+//!
+//! That obligation starts at the first release.  Until then the stored shape
+//! is still being settled, there is no log anyone has to keep, and a rename
+//! is a rename — so [`kernel_upcasters`] returns an empty chain and
+//! [`CURRENT_SCHEMA_VERSION`] stays at `1`.  The seam is built and tested all
+//! the same, so the first step that is owed has one site to be registered at.
 
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::event::{
-    seq_of, FIELD_BEAT, FIELD_EPOCH_MS, FIELD_KIND, KIND_MODEL_RESPONSE, KIND_SESSION_CLOSED,
-    KIND_SESSION_OPENED, KIND_TOOL_CALL, KIND_TOOL_RESULT,
-};
+use super::event::{seq_of, FIELD_EPOCH_MS};
 use super::{History, KnlResult};
 
 /// Reserved envelope key: the schema version an event was written under.
@@ -68,89 +69,11 @@ pub const SCHEMA_VERSION_FIELD: &str = "_schema_version";
 
 /// The schema version new events are stamped with.
 ///
-/// `2` since the round that renamed the lifecycle kinds and turned the
-/// numbered `turn` into a caller-declared [`FIELD_BEAT`]; the `1 → 2`
-/// upcaster is [`kernel_upcasters`].  A shape change bumps this and
-/// registers the next step — see the module docs.
-pub const CURRENT_SCHEMA_VERSION: u64 = 2;
-
-/// The version an event was written under: what [`SCHEMA_VERSION_FIELD`]
-/// says, or `1` when it says nothing (the field is itself a v2 addition, so
-/// an event without one predates it).
-fn version_of(event: &Value) -> u64 {
-    event
-        .get(SCHEMA_VERSION_FIELD)
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-}
-
-/// v1 kind: the session's opening, before the lifecycle was named after the
-/// session rather than a "run".
-const LEGACY_KIND_RUN_STARTED: &str = "run_started";
-/// v1 kind: the session's ending, same rename.
-const LEGACY_KIND_RUN_FINISHED: &str = "run_finished";
-/// v1 field: the kernel-numbered turn a fact belonged to, before beats
-/// became opaque caller-declared strings ([`FIELD_BEAT`]).
-const LEGACY_FIELD_TURN: &str = "turn";
-
-/// The `1 → 2` step: the lifecycle rename and the numbered turn.
-///
-/// - `run_started` → `session_opened`, `run_finished` → `session_closed`,
-///   every other field kept as written.  An absent `scope_id` stays absent:
-///   [`super::Scope::restore`] mints one rather than inventing an authority
-///   the log never recorded.
-/// - an integer `turn` on `model_response` / `tool_call` / `tool_result`
-///   becomes the string `beat` of the same digits, so a v1 log reads under
-///   the one name the kernel validates today.
-///
-/// The `budget_*` kinds need no step: no budget event was ever persisted
-/// under v1 (the pre-v2 kernel wrote none), so there is no old shape of one
-/// to read.
-struct V1ToV2;
-
-impl Upcaster for V1ToV2 {
-    fn upcast(&self, mut event: Value) -> Value {
-        if version_of(&event) >= 2 {
-            return event;
-        }
-        let Some(map) = event.as_object_mut() else {
-            return event;
-        };
-
-        let renamed = match map.get(FIELD_KIND).and_then(Value::as_str) {
-            Some(LEGACY_KIND_RUN_STARTED) => Some(KIND_SESSION_OPENED),
-            Some(LEGACY_KIND_RUN_FINISHED) => Some(KIND_SESSION_CLOSED),
-            _ => None,
-        };
-        if let Some(kind) = renamed {
-            map.insert(FIELD_KIND.to_string(), Value::from(kind));
-        }
-
-        let carries_a_beat = matches!(
-            map.get(FIELD_KIND).and_then(Value::as_str),
-            Some(KIND_MODEL_RESPONSE) | Some(KIND_TOOL_CALL) | Some(KIND_TOOL_RESULT)
-        );
-        if carries_a_beat {
-            // Only a whole number is the old numbering; anything else stays
-            // where it is rather than being guessed at.  A log that already
-            // carries a `beat` keeps it — the beat is the caller's word and
-            // an upcaster does not overrule one.
-            if let Some(turn) = map.get(LEGACY_FIELD_TURN).and_then(Value::as_i64) {
-                map.remove(LEGACY_FIELD_TURN);
-                map.entry(FIELD_BEAT.to_string())
-                    .or_insert_with(|| Value::from(turn.to_string()));
-            }
-        }
-
-        // The projection is a v2 event, so it says so: a reader that folds on
-        // the version sees the shape it actually got.
-        map.insert(
-            SCHEMA_VERSION_FIELD.to_string(),
-            Value::from(CURRENT_SCHEMA_VERSION),
-        );
-        event
-    }
-}
+/// `1`: the stored shape has never been released, so nothing has been
+/// written under an older one and there is no step to take.  A shape change
+/// *after* the first release bumps this and registers the matching
+/// [`Upcaster`] — see the module docs.
+pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 
 /// The upcaster chain every session reads through, newest step last.
 ///
@@ -158,8 +81,13 @@ impl Upcaster for V1ToV2 {
 /// backend in an [`UpcastingEventStore`] carrying this chain, so every read a
 /// session makes — the restore fold, the view folds, `events` — sees the
 /// current shape while the stored bytes stay exactly as they were written.
+///
+/// Empty until the first release: there is no released shape to read yet, so
+/// there is no step owed.  This is the one site a step is registered at, and
+/// the seam around it is exercised by the tests below with a chain of their
+/// own.
 pub fn kernel_upcasters() -> Vec<Arc<dyn Upcaster>> {
-    vec![Arc::new(V1ToV2)]
+    Vec::new()
 }
 
 /// Stamp [`CURRENT_SCHEMA_VERSION`] onto an event, overwriting any
@@ -705,99 +633,86 @@ mod tests {
         assert_eq!(store.len().expect("len"), 1);
     }
 
-    /// The `1 → 2` step: the lifecycle kinds are renamed, the numbered turn
-    /// becomes the string beat, and everything else is kept as written.
-    #[test]
-    fn the_v1_to_v2_upcaster_renames_the_lifecycle_and_the_numbered_turn() {
-        let v1 = vec![
-            json!({ "kind": "run_started", "seq": 1, "owner": "user-7" }),
-            json!({
-                "kind": "model_response", "seq": 2, "turn": 1,
-                "content": [], "usage": { "input_tokens": 3 }
-            }),
-            json!({ "kind": "tool_call", "seq": 3, "turn": 1,
-                    "call_id": "c1", "name": "sh", "args": {} }),
-            json!({ "kind": "tool_result", "seq": 4, "turn": 1,
-                    "call_id": "c1", "ok": true, "result": "ok" }),
-            json!({ "kind": "run_finished", "seq": 5, "reason": "done", "detail": "all of it" }),
-        ];
+    /// A test-local `1 → 2` step, standing in for a real one: it renames a
+    /// kind and marks the projection with the version it produced.  The
+    /// kernel chain is empty until the first release, so the mechanism is
+    /// exercised with a chain the tests own.
+    struct RenameOldKind;
 
-        let out = apply_upcasters(&kernel_upcasters(), v1);
-        let kinds: Vec<&str> = out.iter().map(kind_of).collect();
-        assert_eq!(
-            kinds,
-            [
-                "session_opened",
-                "model_response",
-                "tool_call",
-                "tool_result",
-                "session_closed"
-            ]
-        );
-
-        // The opening keeps its fields and gains no scope id it never had.
-        assert_eq!(out[0]["owner"], json!("user-7"));
-        assert_eq!(out[0].get("scope_id"), None, "{}", out[0]);
-
-        // The numbered turn is the string beat now, and the old name is gone.
-        for event in &out[1..4] {
-            assert_eq!(event[FIELD_BEAT], json!("1"), "{event}");
-            assert_eq!(event.get("turn"), None, "{event}");
-        }
-        assert_eq!(
-            out[1]["usage"],
-            json!({ "input_tokens": 3 }),
-            "payload kept"
-        );
-
-        // The ending keeps both its words.
-        assert_eq!(out[4]["reason"], json!("done"));
-        assert_eq!(out[4]["detail"], json!("all of it"));
-
-        // And the projection says which shape it is.
-        for event in &out {
-            assert_eq!(
-                event.get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
-                Some(CURRENT_SCHEMA_VERSION),
-                "{event}"
-            );
+    impl Upcaster for RenameOldKind {
+        fn upcast(&self, mut event: Value) -> Value {
+            // Already at the newer shape — or not an object at all — so
+            // there is nothing to do.  An upcaster is infallible: an event
+            // it does not recognise comes back exactly as it went in.
+            let version = event
+                .get(SCHEMA_VERSION_FIELD)
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            if version >= 2 {
+                return event;
+            }
+            let Some(map) = event.as_object_mut() else {
+                return event;
+            };
+            if map.get(FIELD_KIND).and_then(Value::as_str) == Some("old_kind") {
+                map.insert(FIELD_KIND.to_string(), Value::from("new_kind"));
+            }
+            map.insert(SCHEMA_VERSION_FIELD.to_string(), Value::from(2_u64));
+            event
         }
     }
 
-    /// A v2 event passes through untouched, and a beat the caller declared is
-    /// never overruled by the old numbering.
+    /// The chain a session reads through is empty until the first release,
+    /// so a stored event reads back exactly as it was written.
     #[test]
-    fn the_v1_to_v2_upcaster_leaves_current_events_alone() {
-        let current = json!({
-            "kind": "model_response", "seq": 1, "beat": "b-1",
-            "content": [], "usage": {}, SCHEMA_VERSION_FIELD: 2
-        });
-        assert_eq!(
-            apply_upcasters(&kernel_upcasters(), vec![current.clone()]),
-            vec![current]
+    fn the_kernel_chain_is_empty_and_the_current_version_is_one() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+        assert!(
+            kernel_upcasters().is_empty(),
+            "no shape has been released, so no step is owed"
         );
 
-        // A v1 event that already carries a beat keeps it: the beat is the
-        // caller's word, and the upcaster only fills the gap the rename left.
-        let both = json!({
-            "kind": "tool_call", "seq": 1, "turn": 4, "beat": "b-9",
-            "call_id": "c", "name": "sh", "args": {}
-        });
-        let out = apply_upcasters(&kernel_upcasters(), vec![both]);
-        assert_eq!(out[0][FIELD_BEAT], json!("b-9"));
-        assert_eq!(out[0].get("turn"), None);
+        let stored = json!({ "kind": "note", "seq": 1, SCHEMA_VERSION_FIELD: 1 });
+        assert_eq!(
+            apply_upcasters(&kernel_upcasters(), vec![stored.clone()]),
+            vec![stored],
+            "an empty chain reads the log back verbatim"
+        );
     }
 
-    /// A stored event carries the version it was written under, and today
-    /// that is v2 — the shape the upcaster chain brings v1 logs up to.
+    /// A stored event carries the version it was written under.
     #[test]
     fn new_events_are_stamped_with_the_current_version() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
         let mut store = MemEventStore::new();
         store.append(ev(1)).expect("append");
         let stored = store.read(0, usize::MAX).expect("read");
-        assert_eq!(version_of(&stored[0]), CURRENT_SCHEMA_VERSION);
-        // An event with no version field is v1 by definition.
-        assert_eq!(version_of(&json!({ "kind": "note" })), 1);
+        assert_eq!(
+            stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
+            Some(CURRENT_SCHEMA_VERSION),
+            "{}",
+            stored[0]
+        );
+    }
+
+    /// An upcaster is total: an event already at the version it produces, and
+    /// a value it does not recognise at all, both come back unchanged rather
+    /// than failing or being guessed at.
+    #[test]
+    fn an_upcaster_leaves_a_current_or_unrecognised_event_unchanged() {
+        let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameOldKind)];
+
+        // Already at the newer shape: untouched, kind included.
+        let current = json!({ "kind": "old_kind", "seq": 1, SCHEMA_VERSION_FIELD: 2 });
+        assert_eq!(
+            apply_upcasters(&chain, vec![current.clone()]),
+            vec![current],
+            "an event at the version the step produces is not stepped again"
+        );
+
+        // Not an object, and not a kind the step knows: neither panics, and
+        // neither is invented into something else.
+        let out = apply_upcasters(&chain, vec![json!(42), json!({ "kind": "note", "seq": 1 })]);
+        assert_eq!(out[0], json!(42), "a non-object passes straight through");
+        assert_eq!(kind_of(&out[1]), "note", "an unknown kind keeps its name");
     }
 }

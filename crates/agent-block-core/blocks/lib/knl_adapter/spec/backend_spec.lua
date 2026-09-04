@@ -319,7 +319,7 @@ describe("knl_adapter Port", function()
 
     it("7: empty content is normalized to a tagged JSON array (the #2 bug fixed)", function()
         -- The openai refusal case parses to content = {} (empty). Untagged, the
-        -- host bridge reads it as an empty MAPPING; the kernel's model_response
+        -- host bridge reads it as an empty MAPPING; the kernel's llm_response
         -- requires an empty ARRAY. The Mapper tags it so it crosses as [].
         local port = make_test_port({
             wire = { url = "http://example", headers = {}, body = {} },

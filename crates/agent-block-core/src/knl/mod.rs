@@ -1,4 +1,4 @@
-//! `knl` — kernel core (K1 History / K4 Budget / K5 Session).
+//! `knl` — kernel core (K1 History / K4 Budget ledger / K5 Session).
 //!
 //! Pure Rust: nothing here knows about Lua.  Events are plain
 //! `serde_json` objects, so the Lua ⇄ JSON conversion — and the
@@ -25,10 +25,13 @@
 //!   [`Session::resume`] refuses a stream whose `session_closed` is already
 //!   in the log: after an ending there is a new session, not a second life
 //!   for the old one.
-//! - **Stored shape change ⇒ upcaster.**  Stored bytes are never rewritten.
-//!   A change to the shape of a stored event ships with a bump of
-//!   [`CURRENT_SCHEMA_VERSION`] and the matching read-time [`Upcaster`]
-//!   ([`kernel_upcasters`]), which every session's reads pass through.
+//! - **Stored shape change ⇒ upcaster, from the first release on.**  Stored
+//!   bytes are never rewritten.  A change to the shape of a stored event
+//!   ships with a bump of [`CURRENT_SCHEMA_VERSION`] and the matching
+//!   read-time [`Upcaster`] ([`kernel_upcasters`]), which every session's
+//!   reads pass through.  Nothing has been released yet, so the chain is
+//!   empty and the version is `1`: the seam is in place and tested, and the
+//!   first step that is owed has one site to be registered at.
 //! - **A session has a scope.**  The two are different concepts sharing one
 //!   lifetime: the session is the stream (history, projections), the
 //!   [`Scope`] is the authority it is written under (a kernel-issued
@@ -41,9 +44,9 @@
 //!   [`Session::owner`] — a real principal id, or the reserved
 //!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
 //!   layer above the kernel.  The accounting keys on the `kind`: the
-//!   `usage` view folds over every `model_response`, because in a
-//!   session's own log a `model_response` is a call it made.
-//! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative amounts
+//!   `usage` view folds over every `llm_response`, because in a session's
+//!   own log an `llm_response` is a call it made.
+//! - **I3 budget monotonicity.**  The ledger accepts non-negative amounts
 //!   only, and within a session the balance can only decrease — it rises
 //!   only when an owner grants again, which a resumed session records like
 //!   any other fact.  It is a quota, not accounting: the decision is taken
@@ -51,18 +54,23 @@
 //!   deducting) and settled after ([`Session::spend`]), by the layer that
 //!   knows what a call costs.  No `append` moves it, and the `usage` view
 //!   is the independent reading of what was consumed.
-//! - **The balance is a fold.**  Every move is a `budget_*` event first,
-//!   written by the kernel alone ([`is_kernel_only`]), so the counter is a
-//!   cache of the log and [`fold_balance`] recovers it — which is how
-//!   [`Session::resume`] restores a reopened session's remaining balance.
+//! - **The balance is a fold, and only a fold.**  Every move is a `budget_*`
+//!   event first, written by the kernel alone ([`is_kernel_only`]), and
+//!   [`fold_balance`] over those events *is* the balance — there is no
+//!   counter beside them.  [`Session::remaining`] reads it back off the
+//!   stream (cached against the store's head, refolded when the head moves),
+//!   so two handles on one stream cannot hold two different answers.
 //! - **I6 session lifecycle.**  All state lives inside a [`Session`] value
 //!   — no statics — so two sessions are fully independent.  There is no
 //!   "run" inside a session: the lifecycle is the session's own, bracketed
 //!   by the `session_opened` that [`Session::open_on`] records and the
 //!   `session_closed` that [`Session::close`] records.  Both are
 //!   kernel-only ([`is_kernel_only`]), so a caller can neither fake an
-//!   opening nor end a session by appending an event; after `close`, later
-//!   `append` / `spend` are errors.
+//!   opening nor end a session by appending an event.  Closed is the
+//!   handle's state, not the stream's: a handle that closed refuses its own
+//!   later `append` / `spend`, while the log itself never refuses a write
+//!   (a write arriving after another handle's ending lands, as evidence),
+//!   and `resume` is the only reader of `session_closed`.
 //! - **Beats are declared, not numbered.**  A `beat` is an opaque string
 //!   the layer above mints and stamps on the facts that belong together.
 //!   The kernel never generates one and never requires one; it only
@@ -87,7 +95,7 @@ pub mod sqlite_store;
 
 use std::fmt;
 
-pub use budget::{fold_balance, Budget, BudgetGrant};
+pub use budget::{fold_balance, BudgetGrant};
 pub use event::{is_kernel_only, now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use event_store::{
     apply_upcasters, kernel_upcasters, Committed, Decision, EventStore, MemEventStore, Upcaster,

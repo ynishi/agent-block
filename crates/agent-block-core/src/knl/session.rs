@@ -51,19 +51,20 @@
 //! An append *records a fact*, so it is never refused for what the handle
 //! last saw.  The store assigns the `seq` and the ordering, and serializes
 //! the write per stream; two handles on one stream both write and the log
-//! interleaves in arrival order.  [`Session::head`] is what this handle
-//! last saw and nothing more — a report, never a precondition.
+//! interleaves in arrival order.  No handle keeps a head of its own to be
+//! measured against — the store's head is read when something needs it.
 //!
 //! A *command with an invariant* is the other shape, and it is decided
 //! inside the store ([`EventStore::append_if`]), which folds the events it
 //! is handed and writes only if the invariant holds, all under the same
 //! serialization.  Checking a cached value out here and appending
 //! afterwards is exactly the race that would let two handles reserve the
-//! same allowance twice.  The kernel has two of them, and the invariant is
-//! the ledger both times: [`Session::reserve`] writes only if the balance
-//! covers what was asked, and [`Session::spend`] settles against the ledger
-//! it was handed rather than against a counter.  Neither asks whether the
-//! session ended — see below.
+//! same allowance twice.  The kernel has exactly one:
+//! [`Session::reserve`] writes only if the ledger covers what was asked.
+//! [`Session::spend`] is not one of them — a settlement has nothing to
+//! decide, so it is a plain append, and the balance it reports is read back
+//! off the ledger afterwards.  Neither asks whether the session ended — see
+//! below.
 //!
 //! # The log never refuses a write
 //!
@@ -92,40 +93,44 @@
 //!
 //! # Stored shape change ⇒ upcaster
 //!
-//! Every read a session makes — the restore fold, the view folds, `events`
-//! — goes through the read-time upcaster chain
+//! Every read a session makes — the restore fold, the view folds, `events`,
+//! the balance fold — goes through the read-time upcaster chain
 //! ([`super::event_store::kernel_upcasters`]), so a log written under an
 //! older shape reads as the current one and the stored bytes are never
-//! rewritten.  A round that changes what is stored ships the matching
-//! `n → n+1` step in the same breath; see the [`super::event_store`] module
-//! docs.
+//! rewritten.  The chain is empty until the first release, because there is
+//! no released shape to read yet; from then on, a round that changes what is
+//! stored ships the matching `n → n+1` step in the same breath.  See the
+//! [`super::event_store`] module docs.
 //!
-//! It does not charge.  An append is a record of something that happened,
+//! An append does not charge.  It is a record of something that happened,
 //! and the budget is a permission asked for *before* something happens —
 //! [`Session::reserve`], which the layer that knows what a call costs
 //! calls, then settles with [`Session::spend`].  Folding the two together
 //! is what turned the budget into a flag that only stands up once the
-//! allowance is already gone; the counter and the `usage` projection are
+//! allowance is already gone; the balance and the `usage` projection are
 //! independent readings and neither is the other's ledger.
 //!
-//! # The budget is in the log
+//! # The budget is in the log, and nowhere else
 //!
-//! Every move of the balance is an event first — `budget_granted` when an
-//! owner allows, `budget_reserved` / `budget_refused` at the decision
-//! point, `budget_spent` at the settlement — written through the same
-//! append, before the counter moves.  So the balance is not session-local
-//! state that dies with the process: [`Session::resume`] recovers it by
-//! folding the ledger, and any reader can check the counter against
-//! [`super::budget::fold_balance`].  Those kinds are the kernel's alone to
-//! write ([`super::event::is_kernel_only`]) — [`Session::append`] refuses
-//! them from a caller, because writing one is moving the account.
+//! Every move of the balance is an event — `budget_granted` when an owner
+//! allows, `budget_reserved` / `budget_refused` at the decision point,
+//! `budget_spent` at the settlement — written through the same append.  The
+//! balance is not session-local state that dies with the process, and it is
+//! not a number kept beside the log either: it *is*
+//! [`super::budget::fold_balance`] over the stream, which is why
+//! [`Session::remaining`] is right on a stream more than one handle writes
+//! to.  Reading it is cheap because the fold is cached against the store's
+//! head and retaken only when the head has moved; nothing but that fold ever
+//! sets it.  Those kinds are the kernel's alone to write
+//! ([`super::event::is_kernel_only`]) — [`Session::append`] refuses them
+//! from a caller, because writing one is moving the account.
 //!
 //! The kernel writes the session's own boundaries through the same append:
 //! [`Session::new`] appends `session_opened` and [`Session::close`] appends
 //! `session_closed`, so a session is bracketed in the history whether or not
 //! the shell remembers to say so.  After a close, *this handle's* `append` /
 //! `reserve` / `spend` are errors while reads keep working — the record
-//! outlives the session.
+//! outlives the session, and another handle's writes go on landing in it.
 //!
 //! What ends a session is [`close`], and only [`close`] writes the
 //! `session_closed` that says so: the flag and the event are set on one
@@ -134,6 +139,8 @@
 //! second time.
 //!
 //! [`close`]: Session::close
+
+use std::cell::Cell;
 
 use serde_json::{Map, Value};
 
@@ -267,16 +274,19 @@ pub struct Session {
     store: Box<dyn EventStore>,
     /// Cached projection folds (derived, never authoritative).
     views: Views,
-    /// The last `seq` this handle saw land — a report, not a precondition.
+    /// The last balance fold, and the store head it was taken at.
     ///
-    /// Advanced by every append this session makes, and set on resume to the
-    /// head the log carried then.  Nothing is compared against it: an append
-    /// records a fact and the store orders it, so a handle whose view is out
-    /// of date still writes, after whatever another handle wrote in the
-    /// meantime.  Read it to say "I have seen up to here" (a `from` for
-    /// [`Session::events`], say), never to decide whether a write may
-    /// happen.
-    head: u64,
+    /// Not a counter: nothing adds to it or subtracts from it.  A read of
+    /// the balance compares the store's head against the `seq` recorded here
+    /// and, if the log has moved on, refolds [`fold_balance`] over the
+    /// stream and replaces both halves.  So the answer is the ledger's on a
+    /// stream two handles write to, and costs one head read on a stream that
+    /// has not moved.
+    ///
+    /// A [`Cell`] because reading a balance is a read: [`Session::remaining`]
+    /// takes `&self`, and the cache it refreshes is derived state, not a
+    /// change to the session.
+    balance: Cell<(u64, Option<i64>)>,
     /// Set by `close()`; blocks this handle's further `append` / `reserve` /
     /// `spend` / `close`.
     ///
@@ -328,10 +338,10 @@ impl Session {
         store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
         // Wrap the chosen backend in the read-time upcasting seam, so every one
-        // of this session's reads (view folds, `events`, the decision a
-        // `reserve` takes inside the store) passes through it by construction.
-        // The chain carries the `1 → 2` step; a further shape change registers
-        // its own at that one site.
+        // of this session's reads (view folds, `events`, the balance fold, the
+        // decision a `reserve` takes inside the store) passes through it by
+        // construction.  The chain is empty until the first release; a shape
+        // change after it registers its step at that one site.
         let store: Box<dyn EventStore> =
             Box::new(UpcastingEventStore::new(store, kernel_upcasters()));
         let mut session = Self {
@@ -341,18 +351,17 @@ impl Session {
             scope: Scope::new(owner, grant),
             store,
             views: Views::default(),
-            // Nothing seen yet; the `session_opened` below is the first thing
-            // this handle watches land.
-            head: 0,
+            // Nothing folded yet, over a stream with nothing in it: the first
+            // read of the balance sees the head move and folds the ledger the
+            // two appends below are about to write.
+            balance: Cell::new((0, None)),
             closed: false,
         };
         // The same one path records `session_opened` as records everything
         // else, and it CAN fail on a durable backend (a busy database
         // exhausts its retries) — a session that could not record its own
         // opening must not exist, so the error surfaces instead of leaving a
-        // stream with no `session_opened`.  The append advances `self.head`
-        // to that event's seq, so a freshly opened session has seen the head
-        // right after open.
+        // stream with no `session_opened`.
         //
         // The scope rides on it: the id the kernel just issued, next to the
         // owner.  Together they are the whole of what a resume needs to
@@ -412,15 +421,15 @@ impl Session {
     ///   log written before either was recorded falls back — to a fresh
     ///   kernel-issued scope id, and to [`ANON`] — rather than failing the
     ///   resume;
-    /// - the balance, by folding the `budget_*` ledger
-    ///   ([`fold_balance`]) — the counter is a cache of the log, so a
-    ///   reopened stream carries on with exactly what was left, and the
-    ///   grant's words come back with it.
+    /// - the grant, from the last `budget_granted` the log carries, so a
+    ///   reopened stream goes on keeping a ledger and a refusal still has a
+    ///   `tag` to report.  The balance itself needs no restoring: it is
+    ///   [`fold_balance`] over the stream, and the stream is right there.
     ///
     /// A `grant` passed here is the owner granting *again*: it is appended
     /// as a new `budget_granted` and raises the restored balance, rather
     /// than replacing it.  Omit it to continue on what is left.  Nothing is
-    /// deducted for the earlier `model_response` usage — an append never
+    /// deducted for the earlier `llm_response` usage — an append never
     /// charged, and what was consumed is the `usage` projection's answer,
     /// not the quota's.
     ///
@@ -479,22 +488,23 @@ impl Session {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // What this handle has seen: the log's head at the moment it resumed
-        // — the last event's seq (`read` returns events in seq order).  A
-        // resume errors above on an empty / session_opened-less log, so this
-        // is a real event's seq; the `0` fallback is unreachable but keeps it
-        // total.
+        // The log was read once already, so seed the balance cache from it
+        // rather than folding the same events again on the first read: the
+        // head it was taken at is the last event's seq (`read` returns events
+        // in seq order).  A resume errors above on an empty /
+        // session_opened-less log, so this is a real event's seq; the `0`
+        // fallback is unreachable but keeps it total.
         let head = log.last().map(seq_of).unwrap_or(0);
 
-        // The balance is what the ledger says, and the grant that named it
-        // comes back with it: a resumed session keeps having a budget (and a
-        // tag to report) even when the caller grants nothing new.
+        // The grant comes back off the log: a resumed session keeps having a
+        // budget (and a tag to report) even when the caller grants nothing
+        // new.  What is left of it is the fold, seeded just below.
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
-            scope: Scope::restore(scope_id, owner, fold_balance(&log), last_grant(&log)),
+            scope: Scope::restore(scope_id, owner, last_grant(&log)),
             store,
             views: Views::default(),
-            head,
+            balance: Cell::new((head, fold_balance(&log))),
             closed: false,
         };
 
@@ -630,20 +640,9 @@ impl Session {
             return Err(KnlError::new(CLOSED));
         }
 
-        // The store orders the write and hands back where it landed; that is
-        // the newest thing this handle has seen.
+        // The store orders the write and hands back where it landed.
         let committed = self.store.append(event)?;
-        self.head = committed.seq;
         Ok(committed.seq)
-    }
-
-    /// The last `seq` this handle saw land.
-    ///
-    /// A report of what this session has written or read, not a precondition:
-    /// nothing is refused for it being out of date.  `0` before the first
-    /// event of a freshly opened session.
-    pub fn head(&self) -> u64 {
-        self.head
     }
 
     /// Events with `seq >= from`, cloned.
@@ -682,9 +681,10 @@ impl Session {
     /// decision is taken inside the store ([`EventStore::append_if`]): the
     /// backend hands the ledger to a fold of [`fold_balance`] and writes the
     /// `budget_reserved` in the same serialized write, so two handles on one
-    /// stream cannot both reserve the same allowance.  The counter is then
-    /// set from that fold — the cache follows the log, never the other way
-    /// round.  A refusal needs no such guard: it is a fact about a decision
+    /// stream cannot both reserve the same allowance.  Nothing is set
+    /// afterwards: the write moved the store's head, so the next read of
+    /// [`Session::remaining`] refolds the ledger the reservation is now part
+    /// of.  A refusal needs no such guard: it is a fact about a decision
     /// already taken, so it is an ordinary append.
     ///
     /// Always `true`, and recorded nowhere, without a budget: a run with no
@@ -717,46 +717,38 @@ impl Session {
                 .then(|| budget_move_event(KIND_BUDGET_RESERVED, amount, tag.as_deref(), &scope_id))
         })?;
 
-        let Some(committed) = committed else {
+        if committed.is_none() {
             // Refused: nothing was written by the decision, so the refusal is
             // recorded here as the ordinary fact it is, carrying what was
-            // asked for and what there was.
+            // asked for and what there was.  It moves no balance, and a later
+            // read folds the ledger including it and finds the same number.
             let mut event =
                 budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref(), &scope_id);
             event.insert(FIELD_REMAINING.to_string(), Value::from(balance));
             self.append_kernel(event)?;
-            // A refusal moves nothing, so the counter is the balance the
-            // ledger just showed.
-            self.scope.set_balance(Some(balance));
             return Ok(false);
-        };
-
-        self.head = committed.seq;
-        // The reservation landed in the same write the fold was taken in, so
-        // the ledger now folds to exactly this.
-        self.scope.set_balance(Some(balance.saturating_sub(amount)));
+        }
         Ok(true)
     }
 
     /// Settle `amount` against the budget, returning the new balance.
     ///
     /// The after-the-fact half of [`Session::reserve`]: what a call really
-    /// cost, beyond what was reserved for it.  Recorded as `budget_spent`
-    /// before the balance moves, on the same write-ahead rule — and
-    /// recorded nowhere, moving nothing, when there is no budget.
+    /// cost, beyond what was reserved for it.  It is recorded as a
+    /// `budget_spent`, which is the whole of the move — and recorded
+    /// nowhere, moving nothing, when there is no budget.
     ///
-    /// A settlement has no invariant on the balance to hold — it floors at
-    /// `0` rather than refusing — but it still *reads* one: the balance it
-    /// leaves behind is the ledger's, so the fold is taken inside the store
-    /// ([`EventStore::append_if`]), in the same serialized write as the
-    /// `budget_spent`, and the counter is set from it.  Arithmetic on the
-    /// cached counter would be right only on a stream this handle is alone
-    /// on; the fold is right on any of them.
+    /// A settlement has no invariant to hold — it floors at `0` rather than
+    /// refusing — so it is a plain serialized [`Session::append`], not a
+    /// command: there is nothing to decide inside the store.  What it hands
+    /// back is the balance read through [`Session::remaining`] *after* the
+    /// event landed, which is [`fold_balance`] over the whole ledger — so the
+    /// answer is exact even when another handle settled in between, where
+    /// arithmetic on a number this handle was holding would not be.
     ///
-    /// It always writes: the fold is there for the balance it leaves behind,
-    /// not for a decision to refuse.  A handle that has closed refuses
-    /// before the store is reached; another handle's close does not, and a
-    /// settlement landing after one is recorded as what it is.
+    /// It always writes.  A handle that has closed refuses before the store
+    /// is reached; another handle's close does not, and a settlement landing
+    /// after one is recorded as what it is.
     pub fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
         if self.closed {
             return Err(KnlError::new(CLOSED));
@@ -767,54 +759,78 @@ impl Session {
         };
         let scope_id = self.scope.id().to_string();
 
-        // The ledger as it stood when the settlement landed, read inside the
-        // store like `reserve`'s.  `decide` can be run again on a retried
-        // transaction, so what the committed run left here is what counts.
-        let mut balance = 0_i64;
-        let committed = self.store.append_if(&mut |events| {
-            balance = fold_balance(events).unwrap_or(0);
-            Some(budget_move_event(
-                KIND_BUDGET_SPENT,
-                amount,
-                tag.as_deref(),
-                &scope_id,
-            ))
-        })?;
+        let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id);
+        self.append_kernel(event)?;
 
-        let Some(committed) = committed else {
-            // The decision always hands back an event, so there is nothing
-            // here for a store to decline: a `None` would be a backend
-            // dropping a write it was given.  Surfaced rather than folded
-            // into a balance no event accounts for.
-            return Err(KnlError::new("budget_spent was not recorded"));
-        };
-        self.head = committed.seq;
-
-        // The same step [`fold_balance`] takes for a `budget_spent`, applied
-        // to the balance the fold just showed: floored at `0`, because the
-        // consumption already happened and a settlement never refuses.
-        let remaining = balance.saturating_sub(amount).max(0);
-        self.scope.set_balance(Some(remaining));
-        Ok(Some(remaining))
+        // Read back, do not compute: the settlement is in the log now, and
+        // so is everything anyone else wrote before it.
+        Ok(self.remaining())
     }
 
     /// The grant this run opened (or resumed) with, if any.
     ///
     /// Read for its words — the `tag` a caller reports when a reservation
-    /// is refused.  The kernel itself reads only `amount`, and only once,
-    /// when the counter is built.
+    /// is refused — and for its presence, which is what says this session
+    /// keeps a ledger at all.  The amount on it is the *last* grant, not
+    /// what is left: that is [`Session::remaining`].
     pub fn grant(&self) -> Option<&BudgetGrant> {
         self.scope.grant()
     }
 
     /// The remaining balance (`None` without a budget).
+    ///
+    /// The ledger's answer, not a counter's: [`fold_balance`] over the
+    /// stream, so a handle that has written nothing still sees what another
+    /// handle spent.  The fold is cached against the store's head and retaken
+    /// only when the head has moved, so a read on a quiet stream costs one
+    /// head query.
+    ///
+    /// A store that cannot be read serves the last fold and says so in a
+    /// warning: the balance is a report, and a transient busy read is not a
+    /// reason to claim there is no budget.  The two writes that turn on the
+    /// balance — [`Session::reserve`] and [`Session::grant_more`] — are
+    /// fallible and surface such a failure themselves.
     pub fn remaining(&self) -> Option<i64> {
-        self.scope.remaining()
+        let (folded_head_seq, cached) = self.balance.get();
+
+        let head = match self.store.head() {
+            Ok(head) => head.unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "knl: the stream head could not be read; \
+                     the balance is served from the last fold"
+                );
+                return cached;
+            }
+        };
+        // The log has not moved since the fold, so neither has the balance.
+        if head <= folded_head_seq {
+            return cached;
+        }
+
+        match self.store.read(0, usize::MAX) {
+            Ok(events) => {
+                let balance = fold_balance(&events);
+                self.balance.set((head, balance));
+                balance
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "knl: the ledger could not be read; \
+                     the balance is served from the last fold"
+                );
+                cached
+            }
+        }
     }
 
-    /// Whether the budget is used up.
+    /// Whether the budget is used up (never true without a budget).
+    ///
+    /// The same fold [`Session::remaining`] reads, asked as a question.
     pub fn exhausted(&self) -> bool {
-        self.scope.exhausted()
+        matches!(self.remaining(), Some(remaining) if remaining <= 0)
     }
 
     /// Whether the session has ended.
@@ -912,7 +928,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, seq_of, FIELD_BEAT, KIND_MODEL_RESPONSE};
+    use crate::knl::event::{kind_of, seq_of, FIELD_BEAT, KIND_LLM_RESPONSE};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -954,10 +970,10 @@ mod tests {
             .collect()
     }
 
-    /// A `model_response` event charging `tokens`, as the kernel accepts it.
+    /// An `llm_response` event charging `tokens`, as the kernel accepts it.
     fn response(tokens: i64) -> Map<String, Value> {
         obj(json!({
-            "kind": "model_response",
+            "kind": "llm_response",
             "content": [{ "type": "text", "text": "ok" }],
             "usage": { "input_tokens": tokens },
             "stop_reason": "end_turn"
@@ -1184,16 +1200,16 @@ mod tests {
         assert_eq!(events[1]["content"], json!("hi"));
     }
 
-    /// Appending a `model_response` records it — verbatim, beat included —
+    /// Appending an `llm_response` records it — verbatim, beat included —
     /// and leaves the budget alone.  What a call was allowed to cost was
     /// decided before it happened; the record of it happening is not a
     /// second place where that is decided.
     #[test]
-    fn appending_a_model_response_records_it_verbatim_without_charging() {
+    fn appending_an_llm_response_records_it_verbatim_without_charging() {
         let mut s = new_session(Some(100));
         let seq = s
             .append(obj(json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 // The beat is the caller's word and the kernel keeps it.
                 "beat": "beat-7",
                 "content": [{ "type": "text", "text": "hi" }],
@@ -1201,12 +1217,8 @@ mod tests {
             })))
             .expect("append");
 
-        let recorded = s
-            .events(seq)
-            .expect("events")
-            .pop()
-            .expect("model_response");
-        assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
+        let recorded = s.events(seq).expect("events").pop().expect("llm_response");
+        assert_eq!(kind_of(&recorded), KIND_LLM_RESPONSE);
         assert_eq!(
             recorded[FIELD_BEAT],
             json!("beat-7"),
@@ -1307,10 +1319,10 @@ mod tests {
         assert_eq!(folded(&s), Some(0));
     }
 
-    /// The settlement is recorded like everything else, and the counter and
-    /// the fold agree after any sequence of moves.
+    /// The settlement is recorded like everything else, and what the session
+    /// reports is the fold of the ledger after any sequence of moves.
     #[test]
-    fn the_counter_is_a_fold_of_the_ledger_after_any_sequence() {
+    fn the_balance_is_the_fold_after_any_sequence_of_moves() {
         let mut s = new_session(Some(1000));
         assert_eq!(s.reserve(200), Ok(true));
         s.append(response(40)).expect("recorded");
@@ -1433,8 +1445,8 @@ mod tests {
         assert_eq!(s.remaining(), Some(100));
         assert!(!s.exhausted());
 
-        let recorded = s.events(3).expect("events").pop().expect("model_response");
-        assert_eq!(kind_of(&recorded), "model_response");
+        let recorded = s.events(3).expect("events").pop().expect("llm_response");
+        assert_eq!(kind_of(&recorded), "llm_response");
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
         assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["input_tokens"], 30);
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
@@ -1458,7 +1470,7 @@ mod tests {
 
         for event in [
             json!({
-                "kind": "model_response", "beat": "b-1", "content": [],
+                "kind": "llm_response", "beat": "b-1", "content": [],
                 "usage": { "input_tokens": 1 }
             }),
             json!({
@@ -1469,7 +1481,7 @@ mod tests {
                 "kind": "tool_result", "beat": "b-1", "call_id": "c1",
                 "ok": true, "result": "ok"
             }),
-            json!({ "kind": "model_call_failed", "beat": "b-1", "error": "boom" }),
+            json!({ "kind": "llm_call_failed", "beat": "b-1", "error": "boom" }),
         ] {
             let seq = s.append(obj(event.clone())).expect("declared beat");
             let recorded = s.events(seq).expect("events").pop().expect("recorded");
@@ -1513,7 +1525,7 @@ mod tests {
             s.events(0)
                 .expect("events")
                 .iter()
-                .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+                .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
                 .count()
         }
 
@@ -1671,8 +1683,8 @@ mod tests {
             .events(seq)
             .expect("events")
             .pop()
-            .expect("model_response");
-        assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
+            .expect("llm_response");
+        assert_eq!(kind_of(&recorded), KIND_LLM_RESPONSE);
         assert_eq!(resumed.remaining(), Some(45), "5 reserved off the 50");
         assert_eq!(folded(&resumed), resumed.remaining());
     }
@@ -1902,16 +1914,11 @@ mod tests {
         assert!(err.reason().contains("disposable"), "{}", err.reason());
     }
 
-    // A v1 log — `run_started` / `run_finished`, the numbered `turn` — is
-    // seeded as real v1 rows rather than through today's store (which stamps
-    // the current version), so those two cases live with the durable tests
-    // below: `a_v1_stream_resumes_and_reads_upcasted_without_rewriting_the_bytes`
-    // and `a_v1_stream_that_finished_is_refused_as_closed`.
-
     /// A competing writer lands an event between this session's writes, so
-    /// the head it last saw is out of date at the moment it appends.  The
-    /// append still lands — a fact is not refused for what its writer had
-    /// seen — and `head` follows the event, whatever landed in between.
+    /// the log has moved on at the moment this one appends.  The append still
+    /// lands — a fact is not refused for what its writer had seen — and the
+    /// `seq` it comes back with is where it really landed, after whatever got
+    /// in first.
     struct BusyStore {
         inner: MemEventStore,
         injected: bool,
@@ -1923,7 +1930,7 @@ mod tests {
         /// session is about to record.
         fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
             if !self.injected
-                && event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE)
+                && event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_LLM_RESPONSE)
             {
                 self.injected = true;
                 self.inner
@@ -1969,13 +1976,12 @@ mod tests {
             2,
             "session_opened + budget_granted so far"
         );
-        assert_eq!(s.head(), 2, "the head is what this handle has seen");
 
         // The competing write lands at seq 3, so the response lands at 4 —
         // and it lands.
         let seq = s.append(response(10)).expect("an append is not refused");
-        assert_eq!(seq, 4);
-        assert_eq!(s.head(), 4, "head follows the event, not the other way");
+        assert_eq!(seq, 4, "the seq is where the event really landed");
+        assert_eq!(s.len().expect("len"), 4, "both writes are in the log");
 
         let log = s.events(0).expect("events");
         let kinds: Vec<&str> = log.iter().map(kind_of).collect();
@@ -1985,7 +1991,7 @@ mod tests {
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
                 "sneaked_in",
-                KIND_MODEL_RESPONSE
+                KIND_LLM_RESPONSE
             ],
             "the log interleaves in arrival order"
         );
@@ -2038,7 +2044,11 @@ mod tests {
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
         assert_eq!(b.remaining(), Some(1000), "B resumed on A's ledger");
-        assert_eq!((a.head(), b.head()), (2, 2), "both saw the same head");
+        assert_eq!(
+            (a.len().expect("len"), b.len().expect("len")),
+            (2, 2),
+            "both see the same two events"
+        );
 
         // A appends, so B's view is now out of date — and B appends anyway.
         assert_eq!(a.append(response(10)).expect("A appends"), 3);
@@ -2055,7 +2065,7 @@ mod tests {
         let log = verify.read(0, usize::MAX).expect("read log");
         let responses: Vec<u64> = log
             .iter()
-            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+            .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
             .map(seq_of)
             .collect();
         assert_eq!(responses, [3, 4, 5], "every append landed, in order");
@@ -2087,8 +2097,8 @@ mod tests {
         // store, not the one it cached.
         assert_eq!(a.reserve(6), Ok(true), "the first reservation fits");
         assert_eq!(b.reserve(6), Ok(false), "the second does not");
-        assert_eq!(b.remaining(), Some(4), "B's counter follows the ledger");
-        assert_eq!(a.remaining(), Some(4), "and so does A's");
+        assert_eq!(b.remaining(), Some(4), "B's balance is the ledger's");
+        assert_eq!(a.remaining(), Some(4), "and so is A's");
 
         // The ledger is the answer: 10 granted − 6 reserved = 4, with the
         // refusal recorded and moving nothing.
@@ -2195,12 +2205,12 @@ mod tests {
         );
     }
 
-    /// (Concurrency) A settlement is folded from the ledger inside the store,
-    /// so it is exact on a stream two handles write to: B settles against
-    /// what the log says, not against the counter it cached before A spent.
+    /// (Concurrency) A settlement reads its answer back off the ledger, so it
+    /// is exact on a stream two handles write to: B settles against what the
+    /// log says, not against a number it was holding before A spent.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_settlement_folds_the_ledger_rather_than_the_handles_own_counter() {
+    fn a_settlement_reads_its_answer_back_off_the_ledger() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2215,16 +2225,20 @@ mod tests {
         assert_eq!((a.remaining(), b.remaining()), (Some(100), Some(100)));
 
         assert_eq!(a.spend(30), Ok(Some(70)), "A settles 30 of the 100");
-        assert_eq!(b.remaining(), Some(100), "B's counter is out of date");
+        assert_eq!(
+            b.remaining(),
+            Some(70),
+            "B wrote nothing and still reads A's settlement off the ledger"
+        );
 
         // B's own settlement measures against the ledger — 100 − 30 − 20 —
-        // rather than subtracting 20 from the 100 it remembers.
+        // rather than subtracting 20 from a number it was holding.
         assert_eq!(b.spend(20), Ok(Some(50)), "both settlements are in it");
         assert_eq!(b.remaining(), Some(50));
 
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         let log = verify.read(0, usize::MAX).expect("read log");
-        assert_eq!(fold_balance(&log), Some(50), "the counter is the fold");
+        assert_eq!(fold_balance(&log), Some(50), "the balance is the fold");
         let moves: Vec<&str> = log
             .iter()
             .map(kind_of)
@@ -2243,155 +2257,222 @@ mod tests {
         assert_eq!(
             fold_balance(&verify.read(0, usize::MAX).expect("read log")),
             Some(0),
-            "the ledger floors where the counter does"
+            "the ledger floors at zero rather than going into debt"
         );
     }
 
-    /// A v1 stream — written under the old kind names and the numbered turn —
-    /// resumes and reads as the shape the kernel speaks today, while the
-    /// stored bytes stay exactly as they were.
+    /// (Concurrency) The balance is the ledger and nothing else, so a handle
+    /// that has written nothing at all still reports what the other one
+    /// spent: `B` never calls a write in this test, and every answer it gives
+    /// comes from folding the stream it shares with `A`.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_v1_stream_resumes_and_reads_upcasted_without_rewriting_the_bytes() {
-        use crate::knl::event_store::SCHEMA_VERSION_FIELD;
+    fn a_handle_that_wrote_nothing_reports_what_the_other_spent() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
-        let stream = "v1-stream";
+        let stream = "shared-balance-stream";
 
-        // Seeded as an older build wrote it — the rows go in directly, so the
-        // payloads carry no schema version at all (which *is* version 1).
-        seed_v1_rows(
-            &path,
-            stream,
-            &[
-                json!({ "kind": "run_started", "owner": "user-1" }),
-                json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens" }),
-                json!({
-                    "kind": "model_response", "turn": 1,
-                    "content": [{ "type": "text", "text": "ok" }],
-                    "usage": { "input_tokens": 7 }
-                }),
-                json!({ "kind": "tool_call", "turn": 1, "call_id": "c1",
-                        "name": "sh", "args": {} }),
-                json!({ "kind": "tool_result", "turn": 1, "call_id": "c1",
-                        "ok": true, "result": "ok" }),
-            ],
+        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        // Not `mut`: reading a balance is a read, and B does nothing else.
+        let b = Session::resume(None, Box::new(store_b)).expect("resume B");
+        assert_eq!(b.remaining(), Some(100), "both start on the same ledger");
+
+        assert_eq!(a.spend(30), Ok(Some(70)), "A settles 30");
+        assert_eq!(
+            b.remaining(),
+            Some(70),
+            "B sees the settlement it did not make"
         );
 
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let mut resumed = Session::resume(None, Box::new(store)).expect("resume a v1 stream");
+        assert_eq!(a.reserve(20), Ok(true), "A reserves 20");
+        assert_eq!(b.remaining(), Some(50), "and the reservation too");
+        assert!(!b.exhausted());
 
-        // The opening reads under its current name, with what it carried.
-        assert_eq!(resumed.owner(), "user-1");
+        // Reading twice over a stream that has not moved repeats the fold's
+        // answer rather than drifting from it.
+        assert_eq!(b.remaining(), Some(50), "a second read is the same read");
+
+        assert_eq!(a.spend(1_000), Ok(Some(0)), "A overspends");
+        assert_eq!(b.remaining(), Some(0), "the floor is the ledger's");
+        assert!(b.exhausted());
+
+        // And the log is the whole of the story: nothing B holds was needed.
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        assert_eq!(
+            fold_balance(&verify.read(0, usize::MAX).expect("read log")),
+            b.remaining()
+        );
+    }
+
+    /// A test-local `1 → 2` step, standing in for a real one: it renames the
+    /// two kinds a hypothetical earlier shape used and marks what it
+    /// produced.  The kernel chain is empty until the first release, so the
+    /// seam is exercised with a chain the test owns — wrapped round the
+    /// backend before the session is handed it, so the session's own (empty)
+    /// wrap sits outside it as an identity.
+    #[cfg(feature = "sqlite")]
+    struct RenameLegacyKinds;
+
+    #[cfg(feature = "sqlite")]
+    impl crate::knl::Upcaster for RenameLegacyKinds {
+        fn upcast(&self, mut event: Value) -> Value {
+            use crate::knl::SCHEMA_VERSION_FIELD;
+
+            // Already at the shape this step produces, or not an object at
+            // all: unchanged.  An upcaster is total and infallible.
+            let version = event
+                .get(SCHEMA_VERSION_FIELD)
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            if version >= 2 {
+                return event;
+            }
+            let Some(map) = event.as_object_mut() else {
+                return event;
+            };
+            let renamed = match map.get(FIELD_KIND).and_then(Value::as_str) {
+                Some("legacy_opened") => Some(KIND_SESSION_OPENED),
+                Some("legacy_response") => Some(KIND_LLM_RESPONSE),
+                _ => None,
+            };
+            if let Some(kind) = renamed {
+                map.insert(FIELD_KIND.to_string(), Value::from(kind));
+            }
+            map.insert(SCHEMA_VERSION_FIELD.to_string(), Value::from(2_u64));
+            event
+        }
+    }
+
+    /// (Upcasting seam) Every read a session makes goes through the chain
+    /// wrapped round its backend — the restore fold a resume takes, `events`,
+    /// the `usage` view and the balance fold alike — while the rows on disk
+    /// keep the shape they were written in.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_session_reads_every_path_through_the_upcaster_seam() {
+        use crate::knl::{
+            SqliteEventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+        };
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "seam-stream";
+
+        // Seeded under the older kind names, through the store itself: the
+        // rows are ordinary appends, so they carry the version they were
+        // written under.
+        {
+            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            let mut opened = kernel_event("legacy_opened");
+            opened.insert(FIELD_OWNER.to_string(), Value::from("user-3"));
+            opened.insert(
+                FIELD_SCOPE_ID.to_string(),
+                Value::from("scope-from-the-log"),
+            );
+            store.append(opened).expect("the opening");
+            store
+                .append(obj(
+                    json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens" }),
+                ))
+                .expect("the grant");
+            store
+                .append(obj(json!({
+                    "kind": "legacy_response", "beat": "b-1",
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "usage": { "input_tokens": 7 }
+                })))
+                .expect("the response");
+        }
+
+        let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
+        let seamed = UpcastingEventStore::new(
+            Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
+            chain,
+        );
+        let mut resumed = Session::resume(None, Box::new(seamed)).expect("resume through the seam");
+
+        // The restore read went through the chain: the opening was only a
+        // `session_opened` after the step, and the scope came off it.
+        assert_eq!(resumed.owner(), "user-3", "the owner the step revealed");
+        assert_eq!(resumed.scope_id(), "scope-from-the-log");
+        assert_eq!(
+            resumed.grant().and_then(|g| g.tag.as_deref()),
+            Some("tokens"),
+            "and the grant with it"
+        );
+
+        // …and so do `events`, the view fold and the balance fold.
         let log = resumed.events(0).expect("events");
         let kinds: Vec<&str> = log.iter().map(kind_of).collect();
         assert_eq!(
             kinds,
-            [
-                KIND_SESSION_OPENED,
-                KIND_BUDGET_GRANTED,
-                KIND_MODEL_RESPONSE,
-                "tool_call",
-                "tool_result"
-            ]
+            [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, KIND_LLM_RESPONSE],
+            "every read is projected"
         );
-        // The numbered turn reads as the beat, under the one name today's
-        // validator knows.
-        for event in &log[2..] {
-            assert_eq!(event[FIELD_BEAT], json!("1"), "{event}");
-            assert_eq!(event.get("turn"), None, "{event}");
-        }
-        // The ledger folds as it always did, and the usage view reads too.
-        assert_eq!(resumed.remaining(), Some(100));
+        let usage = resumed.view(VIEW_USAGE, None).expect("usage");
         assert_eq!(
-            resumed.view(VIEW_USAGE, None).expect("usage")["input_tokens"],
-            json!(7)
+            usage["model_calls"],
+            json!(1),
+            "the view folded the projected kind: {usage}"
         );
+        assert_eq!(usage["input_tokens"], json!(7));
+        assert_eq!(resumed.remaining(), Some(100), "the balance folds too");
 
-        // And the stored bytes were not rewritten: read the same rows without
-        // the upcaster and they are the v1 shape still.
+        // The stored rows were not rewritten: read them without the seam and
+        // the old names are still there, under the version they were written
+        // with.
         let raw = SqliteEventStore::open(&path, stream).expect("reopen raw");
         let stored = raw.read(0, usize::MAX).expect("read raw");
-        assert_eq!(kind_of(&stored[0]), "run_started", "{}", stored[0]);
-        assert_eq!(stored[2]["turn"], json!(1), "{}", stored[2]);
-        assert_eq!(stored[2].get(FIELD_BEAT), None, "{}", stored[2]);
+        assert_eq!(kind_of(&stored[0]), "legacy_opened", "{}", stored[0]);
+        assert_eq!(kind_of(&stored[2]), "legacy_response", "{}", stored[2]);
         assert_eq!(
-            stored[0].get(SCHEMA_VERSION_FIELD),
-            None,
-            "an untouched v1 row carries no version field: {}",
+            stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
+            Some(CURRENT_SCHEMA_VERSION),
+            "an untouched row keeps the version it was written under: {}",
             stored[0]
         );
     }
 
-    /// The same v1 stream, ended: `run_finished` reads as the session's
-    /// closing, so the durable stream is refused like any other closed one —
-    /// the upcaster makes the old log readable, and being readable is what
-    /// lets the disposable rule see the ending in it.
+    /// (Upcasting seam) A stream whose ending is only visible *after* the
+    /// step is still an ending: the disposable rule reads the projected log,
+    /// not the stored one.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_v1_stream_that_finished_is_refused_as_closed() {
-        use crate::knl::SqliteEventStore;
+    fn a_closed_stream_seen_through_the_seam_is_still_refused() {
+        use crate::knl::{SqliteEventStore, Upcaster};
+        use std::sync::Arc;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
-        let stream = "v1-finished-stream";
+        let stream = "seam-closed-stream";
 
-        seed_v1_rows(
-            &path,
-            stream,
-            &[
-                json!({ "kind": "run_started", "owner": "user-1" }),
-                json!({ "kind": "run_finished", "reason": "done", "detail": "the old ending" }),
-            ],
+        {
+            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            store
+                .append(kernel_event("legacy_opened"))
+                .expect("the opening");
+            store
+                .append(obj(json!({ "kind": "session_closed", "reason": "done" })))
+                .expect("the ending");
+        }
+
+        let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
+        let seamed = UpcastingEventStore::new(
+            Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
+            chain,
         );
-
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let err = Session::resume(None, Box::new(store))
-            .expect_err("a finished v1 stream must not be resumed");
+        let err = Session::resume(None, Box::new(seamed))
+            .expect_err("a stream that ended must not be resumed");
         assert!(
             err.reason().contains("session is closed"),
             "{}",
             err.reason()
         );
-    }
-
-    /// Write `events` into the SQLite `events` table as an older build would
-    /// have: the payload exactly as given, with no `_schema_version` — which
-    /// is what makes it a version 1 row.
-    ///
-    /// Direct rows, not `SqliteEventStore::append`, because today's append
-    /// stamps the current version and the point of the fixture is a log that
-    /// predates it.
-    #[cfg(feature = "sqlite")]
-    fn seed_v1_rows(path: &std::path::Path, stream: &str, events: &[Value]) {
-        let conn = rusqlite::Connection::open(path).expect("open the db");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events ( \
-                 stream         TEXT    NOT NULL, \
-                 seq            INTEGER NOT NULL, \
-                 epoch_ms       INTEGER NOT NULL, \
-                 kind           TEXT    NOT NULL, \
-                 schema_version INTEGER NOT NULL, \
-                 payload        TEXT    NOT NULL, \
-                 PRIMARY KEY (stream, seq) \
-             );",
-        )
-        .expect("create the events table");
-
-        for (index, event) in events.iter().enumerate() {
-            let seq = index as i64 + 1;
-            let mut row = event.clone();
-            let payload = row.as_object_mut().expect("an event is an object");
-            payload.insert("seq".to_string(), json!(seq));
-            payload.insert("epoch_ms".to_string(), json!(0));
-            conn.execute(
-                "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![stream, seq, 0_i64, kind_of(event), 1_i64, row.to_string()],
-            )
-            .expect("insert a v1 row");
-        }
     }
 }

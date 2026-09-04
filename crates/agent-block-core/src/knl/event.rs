@@ -22,14 +22,14 @@
 //!
 //! Because a session's log is exactly the calls it made, the accounting
 //! keys on the `kind` alone: [`super::projection::UsageFold`] counts every
-//! `model_response` in the session.  A `model_response` in the history is
-//! one this run made.
+//! `llm_response` in the session.  An `llm_response` in the history is one
+//! this run made.
 //!
 //! # Two layers of `kind`
 //!
 //! - **Reserved kinds** (the table below) describe a Turn's observable
 //!   facts.  Their required fields are checked here, so a malformed
-//!   `model_response` cannot enter the history.
+//!   `llm_response` cannot enter the history.
 //! - **Open kinds** — everything else.  Only `kind: string` is checked.
 //!   Caller-domain events (decision / note / carry …) live here and their
 //!   shape is the shell's business, which is why the kind vocabulary is
@@ -40,7 +40,7 @@
 //! | `session_opened`  | — (appended by the kernel when a session opens)       |
 //! | `session_closed`  | `reason: string` (appended by the kernel on close)   |
 //! | `msg_user`        | `content: string \| array`                           |
-//! | `model_response`  | `content: array`, `usage: table`                     |
+//! | `llm_response`    | `content: array`, `usage: table`                     |
 //! | `tool_call`       | `call_id: string`, `name: string`, `args: table`     |
 //! | `tool_result`     | `call_id: string`, `ok: boolean`, `result` (any)     |
 //! | `budget_granted`  | `amount: integer` (`tag` / `desc` optional)          |
@@ -107,8 +107,8 @@ pub const KIND_SESSION_OPENED: &str = "session_opened";
 pub const KIND_SESSION_CLOSED: &str = "session_closed";
 /// Reserved kind: a user message.
 pub const KIND_MSG_USER: &str = "msg_user";
-/// Reserved kind: a model response (verbatim blocks + usage).
-pub const KIND_MODEL_RESPONSE: &str = "model_response";
+/// Reserved kind: a provider response (verbatim blocks + usage).
+pub const KIND_LLM_RESPONSE: &str = "llm_response";
 /// Reserved kind: a tool invocation.
 pub const KIND_TOOL_CALL: &str = "tool_call";
 /// Reserved kind: a tool result (failures are events too).
@@ -135,9 +135,9 @@ pub const FIELD_DETAIL: &str = "detail";
 /// time-ordered one).  The kernel never requires it and never generates it;
 /// it only insists that a present `beat` is a string — see the module docs.
 pub const FIELD_BEAT: &str = "beat";
-/// Payload field of `msg_user` / `model_response`.
+/// Payload field of `msg_user` / `llm_response`.
 pub const FIELD_CONTENT: &str = "content";
-/// Payload field of `model_response`.
+/// Payload field of `llm_response`.
 pub const FIELD_USAGE: &str = "usage";
 /// Payload field of `tool_call` / `tool_result`.
 pub const FIELD_CALL_ID: &str = "call_id";
@@ -219,11 +219,11 @@ impl Shape {
 const SESSION_CLOSED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
 /// Required fields of `msg_user`.
 const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
-/// Required fields of `model_response`.
+/// Required fields of `llm_response`.
 ///
 /// `beat` is not among them: beats are declared by the layer above, and no
 /// kind requires one — see the module docs.
-const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] =
+const LLM_RESPONSE_FIELDS: &[(&str, Shape)] =
     &[(FIELD_CONTENT, Shape::Array), (FIELD_USAGE, Shape::Object)];
 /// Required fields of `tool_call`.
 ///
@@ -259,7 +259,7 @@ fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
         KIND_SESSION_OPENED => Some(SESSION_OPENED_FIELDS),
         KIND_SESSION_CLOSED => Some(SESSION_CLOSED_FIELDS),
         KIND_MSG_USER => Some(MSG_USER_FIELDS),
-        KIND_MODEL_RESPONSE => Some(MODEL_RESPONSE_FIELDS),
+        KIND_LLM_RESPONSE => Some(LLM_RESPONSE_FIELDS),
         KIND_TOOL_CALL => Some(TOOL_CALL_FIELDS),
         KIND_TOOL_RESULT => Some(TOOL_RESULT_FIELDS),
         KIND_BUDGET_GRANTED => Some(BUDGET_GRANTED_FIELDS),
@@ -452,16 +452,16 @@ mod tests {
             json!({ "kind": "session_closed", "reason": "closed" }),
             json!({ "kind": "msg_user", "content": "hi" }),
             json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "hi" }] }),
-            // A model_response with no beat is valid: beats are declared by
+            // An llm_response with no beat is valid: beats are declared by
             // the layer above, and no kind requires one.
             json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 3 }
             }),
             // …and one that declares a beat is valid too.
             json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 "beat": "0199e0f0-0000-7000-8000-000000000001",
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 3 }
@@ -507,7 +507,7 @@ mod tests {
         assert!(err.reason().contains("reason"), "{err}");
 
         let err = validate_event(&obj(json!({
-            "kind": "model_response",
+            "kind": "llm_response",
             "content": []
         })))
         .expect_err("usage is required");
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn no_kind_requires_a_beat() {
         for event in [
-            json!({ "kind": "model_response", "content": [], "usage": {} }),
+            json!({ "kind": "llm_response", "content": [], "usage": {} }),
             json!({ "kind": "tool_call", "call_id": "c", "name": "sh", "args": {} }),
             json!({ "kind": "tool_result", "call_id": "c", "ok": true, "result": 1 }),
             json!({ "kind": "note" }),
@@ -544,7 +544,7 @@ mod tests {
     fn a_declared_beat_must_be_a_string_on_any_kind() {
         for event in [
             json!({ "kind": "note", "beat": "b1" }),
-            json!({ "kind": "model_response", "beat": "b1", "content": [], "usage": {} }),
+            json!({ "kind": "llm_response", "beat": "b1", "content": [], "usage": {} }),
             json!({ "kind": "tool_call", "beat": "b1", "call_id": "c", "name": "sh", "args": {} }),
         ] {
             validate_event(&obj(event.clone()))
@@ -553,7 +553,7 @@ mod tests {
 
         for event in [
             json!({ "kind": "note", "beat": 1 }),
-            json!({ "kind": "model_response", "beat": 1, "content": [], "usage": {} }),
+            json!({ "kind": "llm_response", "beat": 1, "content": [], "usage": {} }),
             json!({ "kind": "tool_call", "beat": [], "call_id": "c", "name": "sh", "args": {} }),
         ] {
             let err =
@@ -573,7 +573,7 @@ mod tests {
         assert!(err.reason().contains("number"), "{err}");
 
         let err = validate_event(&obj(json!({
-            "kind": "model_response",
+            "kind": "llm_response",
             "content": "not blocks",
             "usage": {}
         })))
@@ -637,7 +637,7 @@ mod tests {
             "session_opened",
             "session_closed",
             "msg_user",
-            "model_response",
+            "llm_response",
             "tool_call",
             "tool_result",
             "budget_granted",
@@ -652,8 +652,11 @@ mod tests {
             "decision",
             "carry",
             "user_msg",
-            "run_started",
-            "run_finished",
+            // The two open kinds the shell writes around a call, and the name
+            // the response kind used to have — none of them reserved.
+            "llm_request",
+            "llm_call_failed",
+            "model_response",
             "session_open",
             "",
         ] {
@@ -679,7 +682,7 @@ mod tests {
         }
         for kind in [
             "msg_user",
-            "model_response",
+            "llm_response",
             "tool_call",
             "tool_result",
             "note",
@@ -717,7 +720,7 @@ mod tests {
         assert!(err.reason().contains("whole number"), "{err}");
     }
 
-    /// Validation is about shape only.  A `model_response` is as acceptable
+    /// Validation is about shape only.  An `llm_response` is as acceptable
     /// from a caller as from the kernel, because a hand-written one moves no
     /// state — a session holds only its own events, so the usage fold has
     /// nothing foreign to count.  The kernel-only kinds pass here too: their
@@ -730,7 +733,7 @@ mod tests {
             json!({ "kind": "session_closed", "reason": "carried over" }),
             json!({ "kind": "budget_granted", "amount": 1_000_000 }),
             json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 "content": [{ "type": "text", "text": "said last time" }],
                 "usage": { "input_tokens": 9_000 }
             }),

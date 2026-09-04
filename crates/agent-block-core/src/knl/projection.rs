@@ -34,8 +34,8 @@
 //!
 //! # What `usage` counts
 //!
-//! [`UsageFold`] adds up every `model_response` in the session.  A session
-//! holds only its own events, so a `model_response` in it is a call this
+//! [`UsageFold`] adds up every `llm_response` in the session.  A session
+//! holds only its own events, so an `llm_response` in it is a call this
 //! run made — there is nothing foreign to exclude, and no author to key
 //! on.  Those are exactly the responses the budget was charged for, so the
 //! view and the balance are two readings of one set of facts rather than
@@ -53,7 +53,7 @@
 
 use serde_json::{Map, Value};
 
-use super::event::{kind_of, seq_of, FIELD_USAGE, KIND_MODEL_RESPONSE};
+use super::event::{kind_of, seq_of, FIELD_USAGE, KIND_LLM_RESPONSE};
 use super::{KnlError, KnlResult};
 
 /// View name: usage totals.
@@ -73,7 +73,7 @@ pub const DEFAULT_TAIL_N: usize = 20;
 /// and what its `usage` view reports are then the same arithmetic over the
 /// same fields, rather than two definitions that can drift apart.
 pub(super) const USAGE_COUNTERS: [&str; 3] = ["input_tokens", "output_tokens", "thinking_tokens"];
-/// Usage field: number of `model_response` events folded.
+/// Usage field: number of `llm_response` events folded.
 const FIELD_MODEL_CALLS: &str = "model_calls";
 /// Usage field: `seq` of the last event the totals include.
 const FIELD_AT_SEQ: &str = "at_seq";
@@ -81,7 +81,7 @@ const FIELD_AT_SEQ: &str = "at_seq";
 /// Incremental fold of the `usage` view.
 ///
 /// Keyed on the `kind` alone: a session holds only its own events, so every
-/// `model_response` in it is a call this run made and was charged for.
+/// `llm_response` in it is a call this run made and was charged for.
 /// There is no foreign response to filter out — that was the point of
 /// dropping the per-event author.
 #[derive(Debug, Clone, Default)]
@@ -90,7 +90,7 @@ pub struct UsageFold {
     folded_seq: u64,
     /// Running totals, in the order of [`USAGE_COUNTERS`].
     totals: [i64; 3],
-    /// Number of `model_response` events folded.
+    /// Number of `llm_response` events folded.
     model_calls: u64,
 }
 
@@ -109,7 +109,7 @@ impl UsageFold {
             if seq_of(event) <= self.folded_seq {
                 continue;
             }
-            if kind_of(event) == KIND_MODEL_RESPONSE {
+            if kind_of(event) == KIND_LLM_RESPONSE {
                 self.model_calls = self.model_calls.saturating_add(1);
                 let usage = event.get(FIELD_USAGE);
                 for (slot, counter) in self.totals.iter_mut().zip(USAGE_COUNTERS) {
@@ -251,7 +251,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 "beat": "b1",
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 10, "output_tokens": 3 }
@@ -291,7 +291,7 @@ mod tests {
             [
                 "session_opened",
                 "msg_user",
-                "model_response",
+                "llm_response",
                 "tool_call",
                 "tool_result",
                 "note"
@@ -321,7 +321,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response", "beat": "b1",
+                "kind": "llm_response", "beat": "b1",
                 "content": [{ "type": "text", "text": "said last time" }],
                 "usage": { "input_tokens": 9_000 }
             }),
@@ -330,7 +330,7 @@ mod tests {
 
         let events = h.since(0);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(kind_of(&events[0]), KIND_MODEL_RESPONSE);
+        assert_eq!(kind_of(&events[0]), KIND_LLM_RESPONSE);
         assert_eq!(
             events[0][FIELD_CONTENT],
             json!([{ "type": "text", "text": "said last time" }])
@@ -338,23 +338,23 @@ mod tests {
         assert_eq!(kind_of(&events[1]), "msg_user");
     }
 
-    /// `usage` counts every `model_response` in the session — there is no
+    /// `usage` counts every `llm_response` in the session — there is no
     /// foreign response to exclude, because a session holds only its own
     /// events.
     #[test]
-    fn usage_counts_every_model_response() {
+    fn usage_counts_every_llm_response() {
         let mut h = History::new();
         append(
             &mut h,
             json!({
-                "kind": "model_response", "beat": "b1", "content": [],
+                "kind": "llm_response", "beat": "b1", "content": [],
                 "usage": { "input_tokens": 4, "output_tokens": 2 }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "model_response", "beat": "b2", "content": [],
+                "kind": "llm_response", "beat": "b2", "content": [],
                 "usage": { "input_tokens": 5, "thinking_tokens": 7 }
             }),
         );
@@ -371,12 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_sums_model_responses_and_counts_the_calls() {
+    fn usage_sums_llm_responses_and_counts_the_calls() {
         let mut h = mixed_history();
         append(
             &mut h,
             json!({
-                "kind": "model_response",
+                "kind": "llm_response",
                 "beat": "b2",
                 "content": [],
                 "usage": { "input_tokens": 5, "thinking_tokens": 7 }
@@ -434,7 +434,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response", "beat": "b1", "content": [],
+                "kind": "llm_response", "beat": "b1", "content": [],
                 "usage": { "input_tokens": 4 }
             }),
         );
@@ -456,7 +456,7 @@ mod tests {
             json!({ "kind": "msg_user", "content": "one" }),
             json!({ "kind": "note", "text": "ignored" }),
             json!({
-                "kind": "model_response", "beat": "b1", "content": [],
+                "kind": "llm_response", "beat": "b1", "content": [],
                 "usage": { "input_tokens": 4, "output_tokens": 2 }
             }),
             json!({
@@ -469,11 +469,11 @@ mod tests {
             }),
             json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
             json!({
-                "kind": "model_response", "beat": "b2", "content": [],
+                "kind": "llm_response", "beat": "b2", "content": [],
                 "usage": { "input_tokens": 9_000 }
             }),
             json!({
-                "kind": "model_response", "beat": "b3", "content": [],
+                "kind": "llm_response", "beat": "b3", "content": [],
                 "usage": { "input_tokens": 6, "thinking_tokens": 1 }
             }),
         ];
@@ -493,7 +493,7 @@ mod tests {
         // than double-folding.
         assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
 
-        // Every model_response counts now: three calls, and the 9000-token
+        // Every llm_response counts now: three calls, and the 9000-token
         // one is summed in with the rest.
         assert_eq!(
             usage_cached(&mut views, &h),
@@ -509,7 +509,7 @@ mod tests {
         let responses = h
             .since(0)
             .iter()
-            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+            .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
             .count();
         assert_eq!(responses, 3, "{:?}", h.since(0));
     }

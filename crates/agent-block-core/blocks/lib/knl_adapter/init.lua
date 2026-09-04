@@ -189,7 +189,7 @@ function LLMPort:open(conf)
         end
 
         -- Non-200 after retries: the beat did not come off. beat records the
-        -- (nil, err) as `model_call_failed` and reports Outcome.err("call").
+        -- (nil, err) as `llm_call_failed` and reports Outcome.err("call").
         if resp.status ~= 200 then
             local classified = proto.classify_error(resp.status, resp.body, resp.headers)
             return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"

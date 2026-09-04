@@ -21,8 +21,10 @@
 --   5 a refused reservation is `stopped`, the fourth status: no call, no
 --     record, and the grant's tag names what stopped it.
 --   6 knl.session(opts, fn) is the bracket: it closes on the way out either
---     way, a body error wins over the close, and a close that fails on that
---     path is warned rather than raised or swallowed (§9-f).
+--     way — "scope_exit" on a clean exit (the one word for leaving a scope,
+--     whichever form wrote it) and "error" on a failing one — a body error
+--     wins over the close, and a close that fails on that path is warned
+--     rather than raised or swallowed (§9-f).
 --   7 tool_policy's decision vocabulary is nil / "run" / "deny" and nothing
 --     else; a raise denies (fail-closed) and a fourth value stops the beat
 --     with err("conf") before any tool runs (§9-l).
@@ -388,7 +390,7 @@ describe("knl.beat — the primitive", function()
         expect(o.kind).to.be("conf")
     end)
 
-    it("one beat: records request + model_response under one declared id", function()
+    it("one beat: records llm_request + llm_response under one declared id", function()
         local s = K.open({})
         local d = K.device({ llm = stub_llm("answer") })
         s:append({ kind = "msg_user", content = "q" })
@@ -399,8 +401,8 @@ describe("knl.beat — the primitive", function()
         local evs = s:events()
         expect(evs[1].kind).to.be("msg_user")
         expect(evs[1].beat).to.be(nil) -- the caller's seed is not part of a beat
-        expect(evs[2].kind).to.be("request")
-        expect(evs[3].kind).to.be("model_response")
+        expect(evs[2].kind).to.be("llm_request")
+        expect(evs[3].kind).to.be("llm_response")
         expect(evs[2].beat).to.be(o.out.beat)
         expect(evs[3].beat).to.be(o.out.beat)
     end)
@@ -416,7 +418,7 @@ describe("knl.beat — the primitive", function()
         for _, ev in ipairs(s:events()) do
             kinds[#kinds + 1] = ev.kind
         end
-        expect(table.concat(kinds, ",")).to.be("msg_user,request,model_response,tool_call,tool_result")
+        expect(table.concat(kinds, ",")).to.be("msg_user,llm_request,llm_response,tool_call,tool_result")
 
         local ids = stamped_beats(s)
         expect(#ids).to.be(4)
@@ -522,7 +524,7 @@ describe("knl.beat — the primitive", function()
 end)
 
 describe("knl.session — the canonical bracket", function()
-    it("opens, runs the body, and closes on the way out", function()
+    it("opens, runs the body, and closes with scope_exit on the way out", function()
         local seen
         local first, second = K.session({ owner = "spec" }, function(s)
             seen = s
@@ -533,7 +535,7 @@ describe("knl.session — the canonical bracket", function()
         expect(second).to.be(2)
         expect(seen.owner).to.be("spec")
         expect(seen.closed).to.be(true)
-        expect(seen.close_reason).to.be("closed")
+        expect(seen.close_reason).to.be("scope_exit")
     end)
 
     it("closes on a body error and re-raises the body's error", function()
@@ -672,13 +674,13 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
     end)
 
     it("does not redefine the kernel's per-kind event contracts (one SoT)", function()
-        -- The Rust validator owns msg_user / request / model_response /
-        -- model_call_failed / tool_call / tool_result. A second copy here
+        -- The Rust validator owns msg_user / llm_request / llm_response /
+        -- llm_call_failed / tool_call / tool_result. A second copy here
         -- drifted from it in three fields, so there is none: what this
         -- layer contributes is the `beat` stamp, and that is all it checks.
         expect(K.shapes.events).to.be(nil)
-        expect(shape.check({ kind = "model_response" }, K.shapes.event_base)).to.be(true)
-        expect(shape.check({ kind = "model_response", beat = 42 }, K.shapes.event_base)).to.be(false)
+        expect(shape.check({ kind = "llm_response" }, K.shapes.event_base)).to.be(true)
+        expect(shape.check({ kind = "llm_response", beat = 42 }, K.shapes.event_base)).to.be(false)
     end)
 
     it("a beat's Outcome validates against the outcome shape", function()
@@ -790,7 +792,7 @@ describe("beat contract hardening (review findings)", function()
         expect(o.kind).to.be("call")
         -- the failure is noted in the history, under this beat's id
         local last = s:events()[#s:events()]
-        expect(last.kind).to.be("model_call_failed")
+        expect(last.kind).to.be("llm_call_failed")
         expect(type(last.beat)).to.be("string")
     end)
 
@@ -809,7 +811,7 @@ describe("beat contract hardening (review findings)", function()
             -- and it is noted in the history under this beat's id, like any
             -- other call failure
             local last = s:events()[#s:events()]
-            expect(last.kind).to.be("model_call_failed")
+            expect(last.kind).to.be("llm_call_failed")
             expect(type(last.beat)).to.be("string")
         end
     end)
@@ -849,7 +851,7 @@ describe("beat contract hardening (review findings)", function()
         expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
         local resp
         for _, ev in ipairs(s:events()) do
-            if ev.kind == "model_response" then
+            if ev.kind == "llm_response" then
                 resp = ev
             end
         end
@@ -893,7 +895,7 @@ describe("beat contract hardening (review findings)", function()
         expect(o.reason).to.be("refusal")
         expect(type(o.detail.beat)).to.be("string")
         local last = s:events()[#s:events()]
-        expect(last.kind).to.be("model_response")
+        expect(last.kind).to.be("llm_response")
         expect(last.beat).to.be(o.detail.beat)
     end)
 
@@ -1014,13 +1016,13 @@ describe("tool_policy — the decision contract", function()
             expect(Outcome.is_error(o)).to.be(true)
             expect(o.kind).to.be("conf")
             expect(ran).to.be(false)
-            -- the beat itself happened: its model_response is recorded, and
+            -- the beat itself happened: its llm_response is recorded, and
             -- no tool_call was written for a call that never ran
             local kinds = {}
             for _, ev in ipairs(s:events()) do
                 kinds[#kinds + 1] = ev.kind
             end
-            expect(table.concat(kinds, ",")).to.be("msg_user,request,model_response")
+            expect(table.concat(kinds, ",")).to.be("msg_user,llm_request,llm_response")
         end
     end)
 
@@ -1050,7 +1052,7 @@ describe("fold hardening (review findings)", function()
         local events = {
             { kind = "msg_user", content = "go", seq = 1 },
             {
-                kind = "model_response",
+                kind = "llm_response",
                 beat = "b1",
                 content = {
                     { type = "text", text = "using tools" },
@@ -1075,13 +1077,13 @@ describe("fold hardening (review findings)", function()
     it("an answered tool pair needs no repair (no synthetic results)", function()
         local events = {
             {
-                kind = "model_response",
+                kind = "llm_response",
                 beat = "b1",
                 content = { { type = "tool_use", id = "c1", name = "t", input = {} } },
                 seq = 1,
             },
             { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 2 },
-            { kind = "model_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 3 },
+            { kind = "llm_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 3 },
         }
         local req = K.fold(events, {})
         expect(#req.messages).to.be(3)

@@ -36,8 +36,8 @@
 --- Beats are declared, not numbered (session-device-design.md §9-a)
 ---   The kernel does not count beats. `knl.beat` mints one id per beat with
 ---   `knl.new_beat_id()` (time-ordered, session-free) and stamps it on every
----   event that beat writes — request, model_response, the tool pair, and a
----   failed call's note. The kernel stores a `beat` it is given and asks
+---   event that beat writes — llm_request, llm_response, the tool pair, and
+---   a failed call's note. The kernel stores a `beat` it is given and asks
 ---   only that it be a string; grouping and ordering read it back, nothing
 ---   more. `resp.beat` carries the same id out to the caller.
 ---
@@ -46,7 +46,7 @@
 ---   what it used. beat asks for permission BEFORE it calls —
 ---   `session:reserve(n)`, after the request is known and before anything is
 ---   recorded — and a refusal is a planned stop, not a failure and not a
----   model decision: `Outcome.stopped("budget", tag)`, with no `request`
+---   model decision: `Outcome.stopped("budget", tag)`, with no `llm_request`
 ---   event and no call. How much a beat asks for is the device's policy:
 ---   `device.cost(request)`, one unit per beat by default. What a unit
 ---   *means* is whatever the owner tagged the grant with — the kernel reads
@@ -177,7 +177,7 @@ M.Outcome = Outcome
 
 --- The JSON-array tag the bridge's converter honours (`lua_to_json` reads
 --- `__jsontype = "array"`).  Every array fold builds is tagged, so the empty
---- case crosses the boundary — into the durable `request` event and onto
+--- case crosses the boundary — into the durable `llm_request` event and onto
 --- the provider wire — as `[]`, not `{}` (the empty-array boundary class
 --- this repo has prior fixes for).
 local ARRAY_TAG = { __jsontype = "array" }
@@ -222,14 +222,14 @@ end
 --- The default fold, for chat-shaped providers. Pure: it reads `events` and
 --- the `device`'s policy fields and writes nothing. Three kinds map to
 --- messages and the rest are skipped (tool_call / session_* / budget_* /
---- model_call_failed / request):
+--- llm_call_failed / llm_request):
 ---
----   msg_user       -> { role = "user", content = <verbatim> }
----   model_response -> { role = "assistant", content = <verbatim> }
----   tool_result    -> collected, in seq order, into the user message that
----                     follows the assistant turn they answer (consecutive
----                     tool_results batch together, which for a well-formed
----                     history is the same as grouping by beat)
+---   msg_user     -> { role = "user", content = <verbatim> }
+---   llm_response -> { role = "assistant", content = <verbatim> }
+---   tool_result  -> collected, in seq order, into the user message that
+---                   follows the assistant turn they answer (consecutive
+---                   tool_results batch together, which for a well-formed
+---                   history is the same as grouping by beat)
 ---
 --- `system` and `tools` are composed from the device each beat, not read
 --- from the history.
@@ -245,7 +245,7 @@ function M.fold(events, device)
     -- The tool_use ids of the most recent assistant message, in block
     -- order, and which of them a recorded tool_result has answered.  A
     -- history can legitimately end (or be interrupted) between the
-    -- model_response append and the tool results — the state a crash
+    -- llm_response append and the tool results — the state a crash
     -- mid-tool leaves behind — and the provider rejects an assistant
     -- message whose tool_use ids have no answering tool_result.  fold
     -- repairs that read-side: any id still unanswered when the next
@@ -281,7 +281,7 @@ function M.fold(events, device)
             close_dangling()
             flush()
             messages[#messages + 1] = { role = "user", content = ev.content }
-        elseif kind == "model_response" then
+        elseif kind == "llm_response" then
             close_dangling()
             flush()
             messages[#messages + 1] = { role = "assistant", content = ev.content }
@@ -304,7 +304,7 @@ function M.fold(events, device)
             }
         end
         -- everything else (tool_call / session_* / budget_* /
-        -- model_call_failed / request) is not part of a request: skip it.
+        -- llm_call_failed / llm_request) is not part of a request: skip it.
     end
     close_dangling()
     flush()
@@ -342,7 +342,7 @@ end
 -- exact judgement.
 --
 -- What is deliberately NOT here: the kernel's own event vocabulary
--- (msg_user / request / model_response / model_call_failed / tool_call /
+-- (msg_user / llm_request / llm_response / llm_call_failed / tool_call /
 -- tool_result). The Rust validator is its single source of truth
 -- (session-device-design.md §11 R7); two copies of it drifted apart in
 -- three fields. What this layer adds — and therefore all it checks — is
@@ -504,7 +504,7 @@ local REFUSAL = T.shape({
 ---
 --- The third status a beat can meet — a transport / provider failure — is
 --- not a variant here: that path answers `nil, err` (or raises), which
---- beat records as `model_call_failed` and reports as `err("call")`.
+--- beat records as `llm_call_failed` and reports as `err("call")`.
 local LLM_RESULT = T.shape({
     content = T.array_of(T.table),
     usage = USAGE,
@@ -942,9 +942,12 @@ end
 --- raised (that would replace the body's error) and it cannot be returned
 --- (this path does not return).
 ---
---- The reason vocabulary is the kernel's: "closed" here (the bridge's own
---- DEFAULT_CLOSE_REASON), "scope_exit" / "error" from `<close>`, "dropped"
---- from the Drop backstop. The message of a body error does not ride along
+--- The reason vocabulary is the kernel's, and a normal exit has one word in
+--- it: "scope_exit" — what this bracket closes with and what `<close>`
+--- records, because leaving the scope is the same event whichever form
+--- wrote it. "error" is the failing path (here and in `<close>`), "dropped"
+--- the Drop backstop, and "closed" stays the bridge's DEFAULT_CLOSE_REASON
+--- for a bare `s:close()`. The message of a body error does not ride along
 --- — `s:close` takes a reason and nothing else — so it stays with the
 --- error that is propagating.
 ---
@@ -965,7 +968,7 @@ function M.session(opts, fn)
 
     local returned = table.pack(pcall(fn, s))
     if returned[1] then
-        s:close("closed")
+        s:close("scope_exit")
         return table.unpack(returned, 2, returned.n)
     end
     -- The body is failing: close best-effort with the body's error as the
@@ -1225,7 +1228,7 @@ function M.beat(session, device)
 
     -- [3] reserve before anything is recorded or called -------------------
     -- The quota decides here, with the request known and nothing spent yet:
-    -- a refusal leaves no `request` event, makes no call, and is a planned
+    -- a refusal leaves no `llm_request` event, makes no call, and is a planned
     -- stop rather than a failure (`stopped`, carrying the grant's tag so a
     -- caller can name what stopped it). How much to ask for is the device's
     -- policy — `device.cost(request)` — and it is never derived from token
@@ -1252,19 +1255,19 @@ function M.beat(session, device)
         return emit(Outcome.stopped("budget", tag))
     end
 
-    -- [4] record the request write-ahead (open kind "request") ------------
+    -- [4] record the request write-ahead (open kind "llm_request") --------
     -- The request as actually sent is a fact in the history before the call,
-    -- so a call that then fails leaves the request event behind.  An append
+    -- so a call that then fails leaves the llm_request event behind.  An append
     -- can fail (closed session, CAS head conflict, validation) — beat's
     -- contract is an Outcome, so a state failure is Error("state"), never
     -- a raw raise.
     local rec_ok, rec_err = pcall(record, session, {
-        kind = "request",
+        kind = "llm_request",
         beat = beat_id,
         request = request,
     })
     if not rec_ok then
-        return emit(Outcome.err("state", "request append failed: " .. tostring(rec_err)))
+        return emit(Outcome.err("state", "llm_request append failed: " .. tostring(rec_err)))
     end
 
     -- [5] beat calls the llm directly ------------------------------------
@@ -1300,7 +1303,7 @@ function M.beat(session, device)
             end
         end
         local noted_ok, note_err = pcall(record, session, {
-            kind = "model_call_failed",
+            kind = "llm_call_failed",
             beat = beat_id,
             error = tostring(reason),
         })
@@ -1317,21 +1320,21 @@ function M.beat(session, device)
         end
         return emit(Outcome.err("call", tostring(reason)))
     end
-    -- ok / refused: the model answered. Appending the model_response is
+    -- ok / refused: the model answered. Appending the llm_response is
     -- what records it, under this beat's id, and it charges nothing (the
     -- quota was settled at [3]).  `usage` defaults to an empty count: the
     -- llm contract leaves it optional, but the kernel validator requires
-    -- the field on a model_response (the Lua/Rust contract meet in the
+    -- the field on an llm_response (the Lua/Rust contract meet in the
     -- middle here).
     local resp_ok, resp_err = pcall(record, session, {
-        kind = "model_response",
+        kind = "llm_response",
         beat = beat_id,
         content = resp.content,
         usage = resp.usage or {},
         stop_reason = resp.stop_reason,
     })
     if not resp_ok then
-        return emit(Outcome.err("state", "model_response append failed: " .. tostring(resp_err)))
+        return emit(Outcome.err("state", "llm_response append failed: " .. tostring(resp_err)))
     end
     resp.beat = beat_id
     -- A refusal is a recorded response the model would not build on — and
@@ -1345,7 +1348,7 @@ function M.beat(session, device)
     -- land); handler and policy failures close their pair as data
     -- (ok=false). A tool_policy that broke its contract is the one thing it
     -- reports instead: a config error, returned before any tool ran or any
-    -- tool_call was written. The model_response above is already recorded
+    -- tool_call was written. The llm_response above is already recorded
     -- either way — the beat happened, it is the device that is wrong.
     local tools_ok, summary, policy_problem = pcall(execute_tools, session, device, resp, beat_id)
     if not tools_ok then

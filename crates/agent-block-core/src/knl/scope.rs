@@ -18,8 +18,8 @@
 //! set one: an id a caller could choose is an authority a caller could
 //! claim.
 
-use super::budget::BudgetGrant;
-use super::{Budget, KnlResult};
+use super::budget::{check_amount, BudgetGrant};
+use super::KnlResult;
 
 /// The identity of a scope: a kernel-issued UUID v4 string.
 ///
@@ -33,17 +33,17 @@ fn mint_id() -> ScopeId {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// One scope: an identity, a principal, and the quota it was granted.
+/// One scope: an identity, a principal, and the grant it was opened under.
 ///
-/// Read through [`super::Session::scope`].  The counter never decides
-/// anything, and it never does arithmetic of its own: a [`reserve`] and a
-/// [`spend`] alike are settled against the ledger inside the store, and the
-/// counter is then *set* from that fold ([`Scope::set_balance`]).  The
-/// balance follows the log and is never ahead of it — which is what makes it
-/// right on a stream more than one handle writes to.
+/// Read through [`super::Session::scope`].  It holds no balance: the balance
+/// is [`super::fold_balance`] over the ledger, decided inside the store for a
+/// [`reserve`] and read back from the log for everything else
+/// ([`super::Session::remaining`]).  A number kept here would be a second
+/// answer to that question, and the wrong one on a stream more than one
+/// handle writes to.  What the scope keeps of the grant is its *words* — the
+/// `tag` a refusal reports, the `desc` an audit reads.
 ///
 /// [`reserve`]: super::Session::reserve
-/// [`spend`]: super::Session::spend
 #[derive(Debug)]
 pub struct Scope {
     /// Kernel-issued, recorded on `session_opened` and every `budget_*`
@@ -52,11 +52,10 @@ pub struct Scope {
     /// Whose scope this is: a real principal id, or the reserved
     /// [`super::ANON`] / [`super::SYSTEM`].  Total — never absent.
     owner: String,
-    /// K4 budget counter: a cache of the `budget_*` ledger.
-    budget: Budget,
     /// The grant this scope opened (or resumed) with, kept for its words: a
     /// refused reservation hands the `tag` back so a caller can say which
-    /// allowance stopped it.  `None` when the session has no budget.
+    /// allowance stopped it, and its presence is what says this session keeps
+    /// a ledger at all.  `None` when the session has no budget.
     grant: Option<BudgetGrant>,
 }
 
@@ -67,30 +66,25 @@ impl Scope {
         Self {
             id: mint_id(),
             owner,
-            budget: Budget::new(grant.as_ref().map(|g| g.amount)),
             grant,
         }
     }
 
     /// Restore the scope a log records: `id` and `owner` as they were
-    /// written, `balance` as the ledger folds to, `grant` as the last
-    /// `budget_granted` said.
+    /// written, `grant` as the last `budget_granted` said.
+    ///
+    /// No balance is handed over, because none is held: what is left is
+    /// [`super::fold_balance`] over the ledger, read when it is asked for.
     ///
     /// `id` is `None` for a log written before the scope id was recorded,
     /// and a fresh one is issued rather than the resume failing — the same
     /// shape of fallback as an ownerless `session_opened` resuming as
     /// [`super::ANON`], and for the same reason: a log that predates a field
     /// is still a session.
-    pub(super) fn restore(
-        id: Option<ScopeId>,
-        owner: String,
-        balance: Option<i64>,
-        grant: Option<BudgetGrant>,
-    ) -> Self {
+    pub(super) fn restore(id: Option<ScopeId>, owner: String, grant: Option<BudgetGrant>) -> Self {
         Self {
             id: id.unwrap_or_else(mint_id),
             owner,
-            budget: Budget::new(balance),
             grant,
         }
     }
@@ -111,31 +105,14 @@ impl Scope {
         self.grant.as_ref()
     }
 
-    /// The remaining balance (`None` without a budget).
-    pub fn remaining(&self) -> Option<i64> {
-        self.budget.remaining()
-    }
-
-    /// Whether the budget is used up (never true without a budget).
-    pub fn exhausted(&self) -> bool {
-        self.budget.exhausted()
-    }
-
-    /// Take `balance` as the counter's value: the cache follows the log.
+    /// The owner granting again: take the new grant's words as the scope's.
     ///
-    /// Used after a decision taken inside the store, where the ledger has
-    /// already said what the balance is ([`super::fold_balance`]).  The
-    /// counter is a cache of the events, so it is *set* from the fold rather
-    /// than nudged by arithmetic of its own — the one direction that cannot
-    /// drift.
-    pub(super) fn set_balance(&mut self, balance: Option<i64>) {
-        self.budget = Budget::new(balance);
-    }
-
-    /// The owner granting again: raise the balance by `grant.amount` and
-    /// take its words as the scope's.
+    /// The balance it raises is the ledger's business — the
+    /// `budget_granted` event is already in the log by the time this runs
+    /// ([`super::Session::grant_more`]) — so all that is left here is the
+    /// amount check and the words a later refusal will report.
     pub(super) fn grant_more(&mut self, grant: BudgetGrant) -> KnlResult<()> {
-        self.budget.grant(grant.amount)?;
+        check_amount(grant.amount)?;
         self.grant = Some(grant);
         Ok(())
     }
@@ -155,7 +132,7 @@ mod tests {
         assert!(!a.id().is_empty());
         assert_ne!(a.id(), b.id(), "scope ids must be unique");
         assert_eq!(a.owner(), ANON);
-        assert_eq!(a.remaining(), None, "no grant, no balance");
+        assert_eq!(a.grant(), None, "no grant, no ledger");
     }
 
     /// A restored scope keeps the id the log recorded; a log with none gets
@@ -165,14 +142,17 @@ mod tests {
         let kept = Scope::restore(
             Some("scope-from-the-log".to_string()),
             "user-1".to_string(),
-            Some(40),
             Some(BudgetGrant::new(100)),
         );
         assert_eq!(kept.id(), "scope-from-the-log");
         assert_eq!(kept.owner(), "user-1");
-        assert_eq!(kept.remaining(), Some(40), "the balance is the fold's");
+        assert_eq!(
+            kept.grant().map(|g| g.amount),
+            Some(100),
+            "the grant the log recorded comes back"
+        );
 
-        let minted = Scope::restore(None, ANON.to_string(), None, None);
+        let minted = Scope::restore(None, ANON.to_string(), None);
         assert!(
             !minted.id().is_empty(),
             "an older log still resumes under a scope id"
@@ -180,12 +160,11 @@ mod tests {
         assert_ne!(minted.id(), kept.id());
     }
 
-    /// The counter follows the ledger: every move decided in the store sets
-    /// it ([`Scope::set_balance`]) — a reservation, a refusal and a
-    /// settlement alike — and a second grant raises it and replaces the
-    /// words a refusal reports.
+    /// A second grant replaces the words a refusal reports, and refuses a
+    /// negative amount.  It moves no balance here: the balance is the
+    /// ledger's, and the `budget_granted` event is what raised it.
     #[test]
-    fn the_scope_counter_follows_the_fold_and_takes_a_second_grant() {
+    fn a_second_grant_replaces_the_words_and_refuses_a_negative_amount() {
         let mut scope = Scope::new(
             "user-2".to_string(),
             Some(BudgetGrant {
@@ -194,17 +173,7 @@ mod tests {
                 desc: None,
             }),
         );
-        // A reservation of 30 was decided and recorded in the store; the
-        // counter takes what the ledger now folds to.
-        scope.set_balance(Some(70));
-        assert_eq!(scope.remaining(), Some(70));
-        // A refusal folds to the same balance it started from.
-        scope.set_balance(Some(70));
-        assert_eq!(scope.remaining(), Some(70));
-        // And a settlement of 70 folds to nothing left.
-        scope.set_balance(Some(0));
-        assert_eq!(scope.remaining(), Some(0));
-        assert!(scope.exhausted());
+        assert_eq!(scope.grant().and_then(|g| g.tag.as_deref()), Some("tokens"));
 
         scope
             .grant_more(BudgetGrant {
@@ -213,8 +182,17 @@ mod tests {
                 desc: None,
             })
             .expect("a second grant");
-        assert_eq!(scope.remaining(), Some(5));
-        assert!(!scope.exhausted());
         assert_eq!(scope.grant().and_then(|g| g.tag.as_deref()), Some("calls"));
+        assert_eq!(scope.grant().map(|g| g.amount), Some(5));
+
+        let err = scope
+            .grant_more(BudgetGrant::new(-1))
+            .expect_err("a negative grant");
+        assert!(err.reason().contains("non-negative"), "{err}");
+        assert_eq!(
+            scope.grant().and_then(|g| g.tag.as_deref()),
+            Some("calls"),
+            "a refused grant leaves the words as they were"
+        );
     }
 }

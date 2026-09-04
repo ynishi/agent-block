@@ -10,10 +10,10 @@
 -- session/device surface (session-device-design.md: beat takes the state and
 -- the policy as two arguments, and the loop is written by the caller):
 --   inv1 Outcome 4 values + predicates + match loud fail
---   inv2 the beat runs (write-ahead: reservation, then the request event,
---        then the model_response)
+--   inv2 the beat runs (write-ahead: reservation, then the llm_request
+--        event, then the llm_response)
 --   inv3 the tool pair (known tool runs; unknown tool closes ok=false)
---   inv4 the request event is in the store and readable via events()
+--   inv4 the llm_request event is in the store and readable via events()
 --   inv5 budget stop (a refused reservation is `stopped`, made no call, and
 --        a caller loop exits on it)
 --   inv6 loop composition (a self-written while-beat loop settles on a
@@ -177,14 +177,14 @@ do
         { kind = "session_opened", seq = 1 },
         { kind = "msg_user", content = "hi", seq = 2 },
         {
-            kind = "model_response",
+            kind = "llm_response",
             beat = "b1",
             content = { { type = "text", text = "a" }, tool_use("c1", "t", {}) },
             seq = 3,
         },
         { kind = "tool_call", beat = "b1", call_id = "c1", seq = 4 },
         { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 5 },
-        { kind = "model_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 6 },
+        { kind = "llm_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 6 },
         { kind = "note", seq = 7 },
     }
     local req = kernel.fold(events, {})
@@ -203,7 +203,7 @@ do
 
     -- a non-string tool_result is JSON-encoded
     local encoded = kernel.fold({
-        { kind = "model_response", beat = "b1", content = {}, seq = 1 },
+        { kind = "llm_response", beat = "b1", content = {}, seq = 1 },
         { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = { x = 1 }, seq = 2 },
     }, {})
     assert(type(encoded.messages[2].content[1].content) == "string", "non-string result must be encoded")
@@ -224,7 +224,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv2 + inv4 — the beat reserves, then records write-ahead; the request
+-- inv2 + inv4 — the beat reserves, then records write-ahead; the llm_request
 -- event is readable
 -- ---------------------------------------------------------------------------
 
@@ -237,18 +237,21 @@ do
 
     -- the session records its own opening, the grant opens the ledger, the
     -- beat reserves before it calls, and the request is recorded before the
-    -- model_response (write-ahead)
-    assert(kinds_of(s) == "session_opened,budget_granted,msg_user,budget_reserved,request,model_response", kinds_of(s))
+    -- llm_response (write-ahead)
+    assert(
+        kinds_of(s) == "session_opened,budget_granted,msg_user,budget_reserved,llm_request,llm_response",
+        kinds_of(s)
+    )
 
     -- inv4: the request that was sent is in the store, readable via events()
-    local req_ev = first_of(s, "request")
+    local req_ev = first_of(s, "llm_request")
     assert(req_ev ~= nil and req_ev.request ~= nil)
     assert(#req_ev.request.messages == 1 and req_ev.request.messages[1].content == "hi")
 
     -- The beat named itself and stamped what it wrote: the id is an opaque
     -- string, the same one on the request and on the response, and the
     -- caller's own seed carries none.
-    local resp = first_of(s, "model_response")
+    local resp = first_of(s, "llm_response")
     assert(type(o.out.beat) == "string", "beat id: " .. tostring(o.out.beat))
     assert(resp ~= nil and resp.beat == o.out.beat, "response beat: " .. tostring(resp and resp.beat))
     assert(req_ev.beat == o.out.beat, "request beat: " .. tostring(req_ev.beat))
@@ -288,7 +291,7 @@ do
     assert(Outcome.is_ok(o))
     assert(#ran == 1 and ran[1] == "x", "handler did not run")
     assert(
-        kinds_of(s) == "session_opened,budget_granted,budget_reserved,request,model_response,tool_call,tool_result",
+        kinds_of(s) == "session_opened,budget_granted,budget_reserved,llm_request,llm_response,tool_call,tool_result",
         kinds_of(s)
     )
 
@@ -344,18 +347,18 @@ do
     local before = sr:remaining()
     local orf = kernel.beat(sr, dr)
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
-    assert(first_of(sr, "model_response") ~= nil, "a refusal is still a recorded response")
+    assert(first_of(sr, "llm_response") ~= nil, "a refusal is still a recorded response")
     -- A refusing beat reserved like any other: the allowance went before the
     -- call, and the recorded response added nothing on top of it.
     assert(sr:remaining() == before - 1, "refused beat balance: " .. tostring(sr:remaining()))
 
-    -- error: the beat did not come off — no model_response, a model_call_failed
+    -- error: the beat did not come off — no llm_response, a llm_call_failed
     local se = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
     local de = kernel.device({ llm = stub({ status = "error", detail = "boom", content = {}, usage = {} }) })
     local oe = kernel.beat(se, de)
     assert(Outcome.is_error(oe) and oe.kind == "call", "error status must map to Error(call)")
-    assert(first_of(se, "model_response") == nil, "an errored call must record no response")
-    local failed = first_of(se, "model_call_failed")
+    assert(first_of(se, "llm_response") == nil, "an errored call must record no response")
+    local failed = first_of(se, "llm_call_failed")
     assert(failed ~= nil, "an errored call is noted as a failed call")
     assert(type(failed.beat) == "string", "the note belongs to the beat that made the call")
 
@@ -387,7 +390,7 @@ do
     assert(Outcome.is_stopped(o), "a refused beat must be Stopped")
     assert(o.reason == "budget", "the stop names its cause: " .. tostring(o.reason))
     assert(o.tag == "tokens", "the refusal names its grant: " .. tostring(o.tag))
-    assert(first_of(s, "request") == nil, "no call is made once the budget is gone")
+    assert(first_of(s, "llm_request") == nil, "no call is made once the budget is gone")
 
     -- the reservation policy is the caller's: one that asks for the whole
     -- grant leaves nothing for a second beat.
@@ -400,7 +403,7 @@ do
     })
     assert(Outcome.is_ok(kernel.beat(sp, dp)) and sp:remaining() == 0)
     assert(Outcome.is_stopped(kernel.beat(sp, dp)))
-    assert(count_of(sp, "model_response") == 1, "the refused beat made no call")
+    assert(count_of(sp, "llm_response") == 1, "the refused beat made no call")
 
     -- loop-level: one unit granted, one unit per beat, and the first answer
     -- asks for a tool — so the second beat is refused and the caller's own
@@ -429,7 +432,7 @@ do
         end
     end
     assert(Outcome.is_stopped(last) and last.reason == "budget")
-    assert(count_of(sl, "model_response") == 1, "the second beat must not have called the model")
+    assert(count_of(sl, "llm_response") == 1, "the second beat must not have called the model")
 
     mark("inv5_budget_stop")
 end
@@ -459,11 +462,17 @@ do
             end
         end
         assert(calls == 1)
-        assert(count_of(s, "model_response") == 1)
+        assert(count_of(s, "llm_response") == 1)
         return s
     end)
     assert(count_of(settled, "session_closed") == 1, "the bracket must lay down the session_closed record")
-    assert(first_of(settled, "session_closed").reason == "closed")
+    -- One word for a normal scope exit: the bracket closes with the same
+    -- reason `<close>` records, because leaving the scope is the same event
+    -- whichever form wrote it.
+    assert(
+        first_of(settled, "session_closed").reason == "scope_exit",
+        "close reason: " .. tostring(first_of(settled, "session_closed").reason)
+    )
 
     -- bounded: the model never stops asking for a tool, so the caller's own
     -- cap — a local of the loop that uses it — stops it
@@ -491,7 +500,7 @@ do
             break
         end
     end
-    assert(count_of(sb, "model_response") == 3, "the caller cap must bound the number of calls")
+    assert(count_of(sb, "llm_response") == 3, "the caller cap must bound the number of calls")
     -- three beats, three ids, and every tool pair grouped under its own
     assert(#distinct_beats(sb) == 3, "three beats declared " .. #distinct_beats(sb) .. " ids")
 
@@ -532,7 +541,7 @@ do
     assert(Outcome.is_ok(kernel.beat(s, d:with({ llm = strong }))))
     assert(Outcome.is_ok(kernel.beat(s, d)))
     assert(weak_called == 2 and strong_called == 1, weak_called .. "/" .. strong_called)
-    assert(count_of(s, "model_response") == 3, "all beats must land in the one session")
+    assert(count_of(s, "llm_response") == 3, "all beats must land in the one session")
     assert(#distinct_beats(s) == 3, "three beats declared " .. #distinct_beats(s) .. " ids")
 
     mark("inv9_device_with")

@@ -7,7 +7,7 @@
 --
 -- What this proves (scope-design.md rev 3 + session-device-design.md §9-a,
 -- pure-VM half):
---   1 appending a model_response is counted by usage (the old usage=0
+--   1 appending an llm_response is counted by usage (the old usage=0
 --     divergence, and the per-event scope stamp, are both gone — the kernel
 --     counts by kind), while the balance moved only where the beat reserved it.
 --   2 beat ids are the shell's: two successive beats carry two distinct
@@ -23,7 +23,7 @@
 --     and no beat numbering: the kernel stores the id it is given);
 --   * reserve is the only decision point: it deducts, or refuses with the
 --     grant's tag and leaves the balance alone;
---   * view("usage") counts every model_response in the session;
+--   * view("usage") counts every llm_response in the session;
 --   * new_beat_id mints a fresh, time-ordered id per call.
 -- The e2e coverage against the *real* bridge lives in
 -- crates/agent-block/tests/fixtures/knl_turn_test.lua.
@@ -151,13 +151,13 @@ local function fake_session(opts)
         end
     end
 
-    -- Usage counts every model_response in the session (kind-keyed, no
+    -- Usage counts every llm_response in the session (kind-keyed, no
     -- author) — the Rust view("usage") under the new model.
     function s:view(name)
         assert(name == "usage", "knl: view: unknown view")
         local u = { input_tokens = 0, output_tokens = 0, thinking_tokens = 0, model_calls = 0 }
         for _, e in ipairs(events) do
-            if e.kind == "model_response" then
+            if e.kind == "llm_response" then
                 u.model_calls = u.model_calls + 1
                 if type(e.usage) == "table" then
                     for _, counter in ipairs(COUNTERS) do
@@ -217,11 +217,11 @@ local function tool_use(id, name, input)
     return { type = "tool_use", id = id, name = name, input = input or {} }
 end
 
--- Every model_response's declared beat id, in seq order.
+-- Every llm_response's declared beat id, in seq order.
 local function response_beats(s)
     local ids = {}
     for _, ev in ipairs(s:events()) do
-        if ev.kind == "model_response" then
+        if ev.kind == "llm_response" then
             ids[#ids + 1] = ev.beat
         end
     end
@@ -233,7 +233,7 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 describe("knl beat (session-scope model)", function()
-    it("counts a beat's model_response in usage and carries the declared id", function()
+    it("counts a beat's llm_response in usage and carries the declared id", function()
         local s = kernel.open({
             owner = "test",
             budget = { amount = 100, tag = "tokens" },
@@ -300,7 +300,7 @@ describe("knl beat (session-scope model)", function()
         local model_beat
         local call_beats, result_beats = {}, {}
         for _, ev in ipairs(s:events()) do
-            if ev.kind == "model_response" then
+            if ev.kind == "llm_response" then
                 model_beat = ev.beat
             elseif ev.kind == "tool_call" then
                 call_beats[#call_beats + 1] = ev.beat

@@ -31,9 +31,9 @@
 //!   scope id is recorded on `session_opened` and on every `budget_*` event,
 //!   so the boundary is readable — and unforgeable — from the log alone.
 //!   There is no per-event author: a session holds only its own events, so
-//!   `view("usage")` keys on the `kind` and counts every `model_response`.
+//!   `view("usage")` keys on the `kind` and counts every `llm_response`.
 //! - **Beats are yours.**  `knl.new_beat_id()` mints a time-ordered id; you
-//!   stamp it on the `model_response`, `tool_call` and `tool_result` events
+//!   stamp it on the `llm_response`, `tool_call` and `tool_result` events
 //!   that belong to one beat.  The kernel does not number beats, does not
 //!   require the field, and asks only that a `beat` you do write is a
 //!   string.
@@ -44,15 +44,14 @@
 //!   settles afterwards.  Both take non-negative whole amounts and the
 //!   balance can only decrease; there is no API to raise or reset it, and
 //!   no `append` moves it.  What a session actually consumed is
-//!   `view("usage")`, which is independent of the counter.
+//!   `view("usage")`, which is independent of the balance.
 //! - **I6 session lifecycle.**  All state lives inside the userdata — no
 //!   module-level statics, no Lua globals — so two sessions are fully
 //!   independent.  There is no "run" inside a session: `knl.open()` records
 //!   `session_opened` and the grant, so the log says what was allowed, and
-//!   the session ends with `session_closed`, after which `append` /
-//!   `reserve` / `spend` are errors while reads keep working.  Both events
-//!   are the kernel's alone — appending either by hand is an error — so the
-//!   lifecycle in the log is the lifecycle that happened.  Three paths reach
+//!   `close` records `session_closed`.  Both events are the kernel's alone —
+//!   appending either by hand is an error — so the lifecycle in the log is
+//!   the lifecycle that happened.  Three paths reach
 //!   the closing boundary and the log never loses it: `close(reason?)` said
 //!   explicitly; a `local s <close> = knl.open{...}` scope ending, which
 //!   records `scope_exit` — or `error` with the message in `detail` when the
@@ -60,10 +59,19 @@
 //!   closed.  Whichever runs first wins and the rest are no-ops, because
 //!   `close` is idempotent — so an explicit reason is never overwritten by
 //!   the scope or the collector that follows it.
+//! - **Closed is the handle's, not the stream's.**  `closed` is a flag on
+//!   *this* userdata: after it, this handle's `append` / `reserve` / `spend`
+//!   are errors while its reads keep working.  The log turns nothing away.
+//!   A write from another handle that never saw the ending is recorded after
+//!   the `session_closed`, because that is what happened and it is exactly
+//!   what an audit is reading for; two handles that both close leave two
+//!   endings, not one.  One reader consults `session_closed` at all —
+//!   `knl.resume`, which refuses a stream whose ending is already in the log,
+//!   because a session is disposable.
 //! - **K2 model call.**  There is no composite call and the session keeps
 //!   no backend of its own.  The driver reserves what it estimates the
-//!   call will cost, calls the backend itself, appends the
-//!   `model_response`, and settles the difference with `spend`.
+//!   call will cost, calls the backend itself, appends the `llm_response`,
+//!   and settles the difference with `spend`.
 //!
 //! ```lua
 //! local s = knl.open({
@@ -76,7 +84,7 @@
 //! local beat = knl.new_beat_id()
 //! local ok, tag = s:reserve(est)
 //! if not ok then return { budget_stopped = true, tag = tag } end
-//! s:append({ kind = "model_response", beat = beat, content = blocks, usage = u })
+//! s:append({ kind = "llm_response", beat = beat, content = blocks, usage = u })
 //! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
 //! local usage  = s:view("usage")         -- token totals + `at_seq`
@@ -1658,7 +1666,7 @@ mod tests {
             assert(folded(s) == s:remaining())
 
             s:reserve(120)
-            s:append({ kind = "model_response",
+            s:append({ kind = "llm_response",
                        content = { { type = "text", text = "hi" } },
                        usage = { input_tokens = 100, output_tokens = 50 } })
             s:spend(30)          -- the call overran its estimate
@@ -1753,7 +1761,7 @@ mod tests {
             assert(s.new_beat_id == nil, "the beat id is not the session's to mint")
 
             -- And it is what the kernel accepts as a beat.
-            s:append({ kind = "model_response", beat = a,
+            s:append({ kind = "llm_response", beat = a,
                        content = { { type = "text", text = "ok" } },
                        usage = { input_tokens = 1 } })
             assert(s:events()[2].beat == a, "the minted beat is recorded verbatim")
@@ -2002,12 +2010,12 @@ mod tests {
             local s = knl.open({{ store = {{ sqlite = path }}, owner = "durable-user",
                                   budget = {{ amount = 100, tag = "tokens" }} }})
             s:reserve(30)
-            s:append({{ kind = "model_response",
+            s:append({{ kind = "llm_response",
                         content = {{ {{ type = "text", text = "a" }} }},
                         usage = {{ input_tokens = 30 }} }})
             s:append({{ kind = "msg_user", content = "more" }})
             s:reserve(15)
-            s:append({{ kind = "model_response",
+            s:append({{ kind = "llm_response",
                         content = {{ {{ type = "text", text = "b" }} }},
                         usage = {{ input_tokens = 20 }} }})
             s:spend(5)  -- the second call overran its estimate
@@ -2032,7 +2040,7 @@ mod tests {
 
             -- The record and the ledger continue on the resumed session.
             r:reserve(5)
-            r:append({{ kind = "model_response", beat = knl.new_beat_id(),
+            r:append({{ kind = "llm_response", beat = knl.new_beat_id(),
                         content = {{ {{ type = "text", text = "c" }} }},
                         usage = {{ input_tokens = 5 }} }})
             local u2 = r:view("usage")
