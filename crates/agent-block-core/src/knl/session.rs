@@ -59,29 +59,36 @@
 //! is handed and writes only if the invariant holds, all under the same
 //! serialization.  Checking a cached value out here and appending
 //! afterwards is exactly the race that would let two handles reserve the
-//! same allowance twice.  Every write the kernel makes takes that shape:
-//! [`Session::reserve`] writes only if the ledger covers what was asked,
-//! [`Session::spend`] settles against the ledger it was handed rather than
-//! against a counter, and every append at all — a caller's, the kernel's
-//! own, either of the boundaries — writes only if the stream has not
-//! already ended.
+//! same allowance twice.  The kernel has two of them, and the invariant is
+//! the ledger both times: [`Session::reserve`] writes only if the balance
+//! covers what was asked, and [`Session::spend`] settles against the ledger
+//! it was handed rather than against a counter.  Neither asks whether the
+//! session ended — see below.
+//!
+//! # The log never refuses a write
+//!
+//! `closed` is the *handle's* state, not the stream's.  A handle that has
+//! closed will not operate again — [`Session::append`], [`Session::reserve`],
+//! [`Session::spend`] and [`Session::close`] all read that one local flag —
+//! but the log itself turns nothing away.  A write that arrives after a
+//! `session_closed`, from another handle that never saw the ending, is
+//! recorded like any other, because it *is* a fact: something wrote to a
+//! stream that had ended, which is exactly what an audit is there to find.
+//! Refusing it would delete the evidence of the bug that produced it.
+//!
+//! So two handles closing leave two `session_closed` events, not one, and
+//! that is the truthful record.  The store's job is to serialize appends and
+//! land them; deciding what a stream *ought* to have looked like is a
+//! reader's.
 //!
 //! # A session is disposable
 //!
-//! It opens once and closes once, and a closed stream is not reopened:
-//! [`Session::resume`] refuses a log that already carries its
-//! `session_closed`.  What comes after an ending is a new session, not a
-//! second life for the old one — otherwise "closed" would say nothing about
-//! what a reader of the log can expect after it.
-//!
-//! The ending is the stream's, not the handle's, so it holds for handles
-//! that never saw it.  `closed` here is only this session's memory of one;
-//! the fact is the `session_closed` in the log, and the decision every
-//! write is taken against reads it there.  So a second handle appends
-//! nothing after another handle's close — its write is refused, and it
-//! learns from the refusal that the session is over — and a second *close*
-//! writes nothing either, rather than a second ending.  Exactly one
-//! `session_closed` lands per stream, whichever handle gets there.
+//! Nothing else looks at `session_closed`: [`Session::resume`] is its one
+//! reader.  A stream whose log already carries an ending is not continued —
+//! what comes after an ending is a new session, not a second life for the
+//! old one, or "closed" would say nothing about what a reader of the log can
+//! expect after it.  That is where a closed stream refuses; the writes do
+//! not.
 //!
 //! # Stored shape change ⇒ upcaster
 //!
@@ -116,14 +123,15 @@
 //! The kernel writes the session's own boundaries through the same append:
 //! [`Session::new`] appends `session_opened` and [`Session::close`] appends
 //! `session_closed`, so a session is bracketed in the history whether or not
-//! the shell remembers to say so.  After a close, `append` / `spend` are
-//! errors while reads keep working — the record outlives the session.
+//! the shell remembers to say so.  After a close, *this handle's* `append` /
+//! `reserve` / `spend` are errors while reads keep working — the record
+//! outlives the session.
 //!
 //! What ends a session is [`close`], and only [`close`] writes the
 //! `session_closed` that says so: the flag and the event are set on one
-//! path, so the log and the state cannot disagree — and the event is
-//! written under the decision that there is not one already, so the path
-//! being taken twice still leaves one ending.
+//! path, so a handle's state and what it wrote cannot disagree.  Taking that
+//! path twice on one handle writes once, because the flag is already set the
+//! second time.
 //!
 //! [`close`]: Session::close
 
@@ -153,20 +161,21 @@ pub const CLOSE_REASON_ERROR: &str = "error";
 /// it, so the boundary is written where the value is dropped.
 pub const CLOSE_REASON_DROPPED: &str = "dropped";
 
-/// What a write refused past the stream's ending says.
+/// What a closed handle says when it is asked to write.
 ///
-/// One sentence for every refusal — the local flag's, and the one a write
-/// comes back with when the log turns out to carry a `session_closed` this
-/// handle never saw — because from the caller's side they are the same
-/// answer: the session is over and nothing more will be recorded for it.
+/// One sentence for both places it comes from — a handle that has closed,
+/// and a [`Session::resume`] of a stream whose log already ended — because
+/// from the caller's side they are the same answer: this session is over,
+/// go and open another.
 const CLOSED: &str = "session is closed";
 
 /// Whether `events` already carry the stream's ending.
 ///
-/// The decision under every write and the one [`Session::resume`] takes.
-/// There is no reopening kind, so a single `session_closed` anywhere in the
-/// log is final: what a reader was told was the last of it must stay the
-/// last of it, whichever handle asks afterwards.
+/// Read in exactly one place, [`Session::resume`], because a session is
+/// disposable: there is no reopening kind, so a single `session_closed`
+/// anywhere in the log means the stream is not a state to continue from.
+/// No *write* asks this — a write records what happened, and something
+/// writing after an ending is the fact an audit most wants recorded.
 fn has_ended(events: &[Value]) -> bool {
     events
         .iter()
@@ -268,7 +277,12 @@ pub struct Session {
     /// [`Session::events`], say), never to decide whether a write may
     /// happen.
     head: u64,
-    /// Set by `close()`; blocks further `append` / `spend`.
+    /// Set by `close()`; blocks this handle's further `append` / `reserve` /
+    /// `spend` / `close`.
+    ///
+    /// The handle's state, not the stream's: another handle on the same
+    /// stream keeps its own flag and goes on writing, and the log records
+    /// what it writes.  Nothing consults the log to set this.
     closed: bool,
 }
 
@@ -577,6 +591,10 @@ impl Session {
     /// interleaves in the order the writes arrived.  A stale view of the head
     /// is not a reason to refuse a fact: [`Session::head`] is what this handle
     /// last saw, and nothing is compared against it.
+    ///
+    /// The one refusal is this handle having closed.  Another handle's close
+    /// is not: it set *that* handle's flag, and a write landing after the
+    /// `session_closed` it wrote is recorded, because that is what happened.
     pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         // The kernel's own kinds are refused before the closed check has
         // anything to say about it — the kind is wrong whatever state the
@@ -602,33 +620,19 @@ impl Session {
     /// what makes "the kernel wrote it" a property of the code path rather
     /// than of a field a caller could set.
     ///
-    /// The write carries one invariant, so it is decided inside the store:
-    /// the event lands only if the stream has not already ended.  The local
-    /// flag is this handle's memory of a close, which another handle's close
-    /// never reached; the ending itself is in the log, so that is where the
-    /// question is asked — under the same serialization as the write, so
-    /// nothing can slip in between the two.
+    /// A plain append, with no invariant to decide: the only refusal is the
+    /// handle's own `closed` flag, checked here before the store is touched.
+    /// The store is not asked whether the stream has ended, because a write
+    /// arriving after an ending is a fact — evidence of a bug or a misuse —
+    /// and dropping it would hide the one thing an audit is reading for.
     fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
             return Err(KnlError::new(CLOSED));
         }
 
-        // `decide` may be run more than once (a retried transaction), so the
-        // event is cloned per attempt rather than moved into the decision.
-        let committed = self
-            .store
-            .append_if(&mut |events| (!has_ended(events)).then(|| event.clone()))?;
-
-        let Some(committed) = committed else {
-            // The stream carries an ending this handle had not seen.  Nothing
-            // was written, and the handle now knows what the log knew: a
-            // session is over for every handle at once.
-            self.closed = true;
-            return Err(KnlError::new(CLOSED));
-        };
-
         // The store orders the write and hands back where it landed; that is
         // the newest thing this handle has seen.
+        let committed = self.store.append(event)?;
         self.head = committed.seq;
         Ok(committed.seq)
     }
@@ -684,8 +688,9 @@ impl Session {
     /// already taken, so it is an ordinary append.
     ///
     /// Always `true`, and recorded nowhere, without a budget: a run with no
-    /// quota has no ledger to keep.  Closed sessions refuse, like
-    /// [`Session::spend`] — a run that has ended cannot be granted more.
+    /// quota has no ledger to keep.  A handle that has closed refuses, like
+    /// [`Session::spend`]; another handle's close is nothing to this one —
+    /// the balance is the whole of the invariant.
     pub fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
         if self.closed {
             return Err(KnlError::new(CLOSED));
@@ -702,24 +707,17 @@ impl Session {
         // once (a retried transaction), so the last run is the one that
         // counts — and it is the run whose answer was committed.
         let mut balance = 0_i64;
-        // …and whether the stream had already ended, which is the other half
-        // of the decision: a reservation past the boundary would be a write
-        // after the ending, which no invariant on the balance would catch.
-        let mut ended = false;
+        // The whole of the decision: does the ledger cover what was asked.
+        // Whether the stream carries an ending is not part of it — a
+        // reservation past the boundary is a fact about a run that overran
+        // its own close, and the log is where facts go.
         let committed = self.store.append_if(&mut |events| {
-            ended = has_ended(events);
             balance = fold_balance(events).unwrap_or(0);
-            (!ended && balance >= amount)
+            (balance >= amount)
                 .then(|| budget_move_event(KIND_BUDGET_RESERVED, amount, tag.as_deref(), &scope_id))
         })?;
 
         let Some(committed) = committed else {
-            if ended {
-                // Not a refusal — there is no run left to refuse anything
-                // for.  Nothing was written, here or below.
-                self.closed = true;
-                return Err(KnlError::new(CLOSED));
-            }
             // Refused: nothing was written by the decision, so the refusal is
             // recorded here as the ordinary fact it is, carrying what was
             // asked for and what there was.
@@ -755,9 +753,10 @@ impl Session {
     /// cached counter would be right only on a stream this handle is alone
     /// on; the fold is right on any of them.
     ///
-    /// The decision the write is taken under is the one every write is taken
-    /// under — that the stream has not ended — so a settlement cannot land
-    /// after another handle's close.
+    /// It always writes: the fold is there for the balance it leaves behind,
+    /// not for a decision to refuse.  A handle that has closed refuses
+    /// before the store is reached; another handle's close does not, and a
+    /// settlement landing after one is recorded as what it is.
     pub fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
         if self.closed {
             return Err(KnlError::new(CLOSED));
@@ -772,17 +771,22 @@ impl Session {
         // store like `reserve`'s.  `decide` can be run again on a retried
         // transaction, so what the committed run left here is what counts.
         let mut balance = 0_i64;
-        let mut ended = false;
         let committed = self.store.append_if(&mut |events| {
-            ended = has_ended(events);
             balance = fold_balance(events).unwrap_or(0);
-            (!ended)
-                .then(|| budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id))
+            Some(budget_move_event(
+                KIND_BUDGET_SPENT,
+                amount,
+                tag.as_deref(),
+                &scope_id,
+            ))
         })?;
 
         let Some(committed) = committed else {
-            self.closed = true;
-            return Err(KnlError::new(CLOSED));
+            // The decision always hands back an event, so there is nothing
+            // here for a store to decline: a `None` would be a backend
+            // dropping a write it was given.  Surfaced rather than folded
+            // into a balance no event accounts for.
+            return Err(KnlError::new("budget_spent was not recorded"));
         };
         self.head = committed.seq;
 
@@ -821,7 +825,10 @@ impl Session {
     /// End the session, recording `session_closed` with `reason`
     /// (defaulting to [`DEFAULT_CLOSE_REASON`]).
     ///
-    /// Idempotent: closing an already closed session records nothing.
+    /// Idempotent *per handle*: closing a session this handle already closed
+    /// records nothing.  Another handle closing the same stream is a second
+    /// ending in the log — the truthful record of two handles both believing
+    /// they owned the session, and the shape an audit needs to see.
     ///
     /// Fallible on a durable backend: the `session_closed` append can fail on
     /// a database that stays contended past its retries, or a store that is
@@ -856,24 +863,18 @@ impl Session {
             event.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
         }
 
-        // Ending a session is a command with an invariant like any other —
-        // that there is not an ending already — so it is decided inside the
-        // store rather than against this handle's flag.  Two handles on one
-        // stream leave one `session_closed`, not two, whichever of them
-        // closes (or is dropped) second.  The kernel's own decision path:
-        // `session_closed` is kernel-only, so the guarded `append` would
-        // refuse the very event that ends the session.
-        let committed = self
-            .store
-            .append_if(&mut |events| (!has_ended(events)).then(|| event.clone()))?;
-
-        // Whether this close wrote the boundary or found another handle's
-        // already there, the session is over — so the flag is set either way
-        // and the caller is told the ending is in the log, which it is.  Only
-        // a *failed* append leaves the session open, above.
-        if let Some(committed) = committed {
-            self.head = committed.seq;
-        }
+        // A plain append, taken through the kernel's own path because
+        // `session_closed` is kernel-only and the guarded `append` would
+        // refuse the very event that ends the session.  The store is not
+        // asked whether an ending is there already: two handles closing one
+        // stream write two `session_closed` events, which is what happened
+        // and therefore what the log says.
+        //
+        // The flag moves only after the boundary landed, so a failed append
+        // leaves this handle open and the caller free to retry — a close that
+        // reported success with nothing in the log would break every later
+        // read of it.
+        self.append_kernel(event)?;
         self.closed = true;
         Ok(())
     }
@@ -1917,32 +1918,25 @@ mod tests {
     }
 
     impl EventStore for BusyStore {
+        /// A session's appends come through here, so this is where the
+        /// competing writer gets in: once, just before the response this
+        /// session is about to record.
         fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            if !self.injected
+                && event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE)
+            {
+                self.injected = true;
+                self.inner
+                    .append(obj(json!({ "kind": "sneaked_in" })))
+                    .expect("injected concurrent write");
+            }
             self.inner.append(event)
         }
 
-        /// Every session write comes through here, so this is where the
-        /// competing writer gets in: once, just before the response this
-        /// session is about to record.  `decide` is a pure fold of the events
-        /// it is handed, so asking it what it would write costs nothing.
         fn append_if(
             &mut self,
             decide: &mut crate::knl::Decision<'_>,
         ) -> KnlResult<Option<crate::knl::Committed>> {
-            if !self.injected {
-                let events = self.inner.read(0, usize::MAX)?;
-                let is_response = decide(&events)
-                    .as_ref()
-                    .and_then(|event| event.get(FIELD_KIND))
-                    .and_then(Value::as_str)
-                    == Some(KIND_MODEL_RESPONSE);
-                if is_response {
-                    self.injected = true;
-                    self.inner
-                        .append(obj(json!({ "kind": "sneaked_in" })))
-                        .expect("injected concurrent write");
-                }
-            }
             self.inner.append_if(decide)
         }
 
@@ -2120,15 +2114,15 @@ mod tests {
         assert_eq!(refused["remaining"], json!(4), "what there really was");
     }
 
-    /// (Concurrency) The ending belongs to the stream, not to the handle that
-    /// wrote it.  Three handles, one close: the two that never saw it are
-    /// refused their next write — the ordinary append and the settlement
-    /// alike, each learning from the refusal that the session is over — and
-    /// closing them afterwards (which is what a dropped handle does) leaves
-    /// no second ending.  Exactly one `session_closed` per stream.
+    /// (Concurrency) "Closed" is the handle's, and the log records what
+    /// arrives after it.  Three handles, one close: the two that never saw it
+    /// go on writing, and their writes land *after* the `session_closed` —
+    /// which is the fact an audit is reading for, and would be gone if the
+    /// store had refused them.  A second handle closing writes a second
+    /// ending, because that is what happened.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn two_handles_on_one_stream_leave_exactly_one_session_closed() {
+    fn a_close_is_the_handles_and_the_log_records_what_arrives_after_it() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2146,53 +2140,59 @@ mod tests {
         let mut c = Session::resume(None, Box::new(store_c)).expect("resume C");
 
         a.close(Some("done")).expect("A closes");
+        assert!(a.is_closed());
         assert!(!b.is_closed(), "B's flag is its own and has not moved");
         assert!(!c.is_closed());
 
-        // B writes anyway — and does not: the invariant is read off the log,
-        // inside the write, so the refusal is the log's answer and not B's.
-        let err = b
-            .append(obj(json!({ "kind": "note" })))
-            .expect_err("an append after another handle's close");
-        assert_eq!(err.reason(), CLOSED);
-        assert!(b.is_closed(), "the refusal told B what the log knew");
+        // B writes, and the write lands: the store serializes appends, it does
+        // not adjudicate them.
+        assert_eq!(
+            b.append(obj(json!({ "kind": "note" }))),
+            Ok(4),
+            "an append after another handle's close is recorded"
+        );
+        assert!(!b.is_closed(), "landing a write closed nothing");
 
-        // And so does C, whose next move is a settlement.
-        let err = c
-            .spend(5)
-            .expect_err("a settlement after another handle's close");
-        assert_eq!(err.reason(), CLOSED);
-        assert!(c.is_closed());
-        let err = c
-            .reserve(5)
-            .expect_err("a reservation after another handle's close");
-        assert_eq!(err.reason(), CLOSED);
+        // C's budget moves are decided on the balance alone — 100 granted,
+        // nothing spent, so both go through.
+        assert_eq!(c.reserve(5), Ok(true), "the ledger covers it");
+        assert_eq!(c.spend(10), Ok(Some(85)), "100 − 5 − 10, folded in the tx");
+        assert!(!c.is_closed());
 
-        // Closing them records nothing: the ending is already in the log.
-        b.close(Some("late")).expect("B closes, idempotently");
-        c.close(Some(CLOSE_REASON_DROPPED))
-            .expect("C closes, idempotently");
-        a.close(Some("again")).expect("and so does A");
+        // B closing writes a *second* ending; A closing again writes nothing,
+        // because A's own flag is set.
+        b.close(Some("late")).expect("B closes");
+        a.close(Some("again")).expect("A is idempotent per handle");
 
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         let log = verify.read(0, usize::MAX).expect("read log");
+        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
+        assert_eq!(
+            kinds,
+            [
+                KIND_SESSION_OPENED,
+                KIND_BUDGET_GRANTED,
+                KIND_SESSION_CLOSED,
+                "note",
+                KIND_BUDGET_RESERVED,
+                KIND_BUDGET_SPENT,
+                KIND_SESSION_CLOSED,
+            ],
+            "everything that happened, in the order it arrived"
+        );
+
         let endings: Vec<&Value> = log
             .iter()
             .filter(|event| kind_of(event) == KIND_SESSION_CLOSED)
             .collect();
-        assert_eq!(endings.len(), 1, "exactly one ending: {endings:?}");
+        assert_eq!(endings.len(), 2, "two handles closed, two endings recorded");
+        assert_eq!(endings[0]["reason"], json!("done"));
+        assert_eq!(endings[1]["reason"], json!("late"));
         assert_eq!(
-            endings[0]["reason"],
-            json!("done"),
-            "the reason is the one the close that wrote it gave"
+            fold_balance(&log),
+            Some(85),
+            "the ledger is what the moves that landed add up to"
         );
-        assert_eq!(
-            log.len(),
-            3,
-            "session_opened + budget_granted + session_closed, and nothing \
-             the refused writes tried to add"
-        );
-        assert_eq!(fold_balance(&log), Some(100), "no refused write moved it");
     }
 
     /// (Concurrency) A settlement is folded from the ledger inside the store,
