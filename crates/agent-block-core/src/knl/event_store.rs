@@ -112,7 +112,12 @@ pub trait EventStore {
 
     /// Events with `seq >= from_seq`, at most `limit`, cloned in `seq`
     /// order (a paged range read).
-    fn read(&self, from_seq: u64, limit: usize) -> Vec<Value>;
+    ///
+    /// Fallible: a durable backend can hit a transient busy read or a row it
+    /// cannot decode, and those must surface rather than be silently dropped
+    /// (a dropped row would let [`super::Session::resume`] re-fold a truncated
+    /// log into the wrong state). The in-memory backend never errors.
+    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>>;
 
     /// The current head: the highest `seq`, or `None` for an empty stream.
     fn head(&self) -> Option<u64>;
@@ -199,10 +204,12 @@ impl EventStore for MemEventStore {
         self.append(event)
     }
 
-    fn read(&self, from_seq: u64, limit: usize) -> Vec<Value> {
+    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+        // The in-memory history is infallible; the `Ok` is the SPI's shape,
+        // not a failure the mem backend can actually produce.
         let mut events = self.history.since(from_seq);
         events.truncate(limit);
-        events
+        Ok(events)
     }
 
     fn head(&self) -> Option<u64> {
@@ -251,7 +258,7 @@ mod tests {
         assert!(!store.is_empty());
 
         // The stamped epoch is what is stored.
-        let stored = store.read(0, usize::MAX);
+        let stored = store.read(0, usize::MAX).expect("read");
         let stored_epoch = stored[0]
             .get(FIELD_EPOCH_MS)
             .and_then(Value::as_u64)
@@ -308,18 +315,18 @@ mod tests {
         }
 
         // from_seq filters, limit caps.
-        assert_eq!(store.read(0, usize::MAX).len(), 5);
-        assert_eq!(store.read(1, usize::MAX).len(), 5);
-        assert_eq!(store.read(3, usize::MAX).len(), 3);
-        assert_eq!(store.read(6, usize::MAX).len(), 0);
+        assert_eq!(store.read(0, usize::MAX).expect("read").len(), 5);
+        assert_eq!(store.read(1, usize::MAX).expect("read").len(), 5);
+        assert_eq!(store.read(3, usize::MAX).expect("read").len(), 3);
+        assert_eq!(store.read(6, usize::MAX).expect("read").len(), 0);
 
-        let page = store.read(2, 2);
+        let page = store.read(2, 2).expect("read");
         assert_eq!(page.len(), 2);
         assert_eq!(kind_of(&page[0]), "e2");
         assert_eq!(kind_of(&page[1]), "e3");
 
         // A zero limit returns nothing even when events match.
-        assert!(store.read(0, 0).is_empty());
+        assert!(store.read(0, 0).expect("read").is_empty());
     }
 
     #[test]
@@ -351,16 +358,16 @@ mod tests {
     fn reads_are_copies_so_the_store_cannot_be_reached_through_them() {
         let mut store = MemEventStore::new();
         store.append(ev(1)).expect("append");
-        let mut copy = store.read(0, usize::MAX);
+        let mut copy = store.read(0, usize::MAX).expect("read");
         copy[0][FIELD_KIND] = Value::String("TAMPERED".into());
-        assert_eq!(kind_of(&store.read(0, usize::MAX)[0]), "e1");
+        assert_eq!(kind_of(&store.read(0, usize::MAX).expect("read")[0]), "e1");
     }
 
     #[test]
     fn append_stamps_the_current_schema_version() {
         let mut store = MemEventStore::new();
         store.append(ev(1)).expect("append");
-        let stored = store.read(0, usize::MAX);
+        let stored = store.read(0, usize::MAX).expect("read");
         assert_eq!(
             stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
             Some(CURRENT_SCHEMA_VERSION),

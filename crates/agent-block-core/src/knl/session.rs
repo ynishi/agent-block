@@ -42,8 +42,8 @@ use serde_json::{Map, Value};
 
 use super::call::charge_of;
 use super::event::{
-    kernel_event, kind_of, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE, KIND_MODEL_RESPONSE,
-    KIND_RUN_FINISHED, KIND_RUN_STARTED,
+    kernel_event, kind_of, seq_of, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE,
+    KIND_MODEL_RESPONSE, KIND_RUN_FINISHED, KIND_RUN_STARTED,
 };
 use super::event_store::{EventStore, MemEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
@@ -80,6 +80,17 @@ pub struct Session {
     views: Views,
     /// Model responses recorded so far: the turn number's authority.
     turns: u64,
+    /// The stream head this session has observed and writes against.
+    ///
+    /// The compare-and-swap expectation for the next [`append`] — *not* a
+    /// fresh read of the store.  A single-writer session wrote every event, so
+    /// this always equals the real head and every CAS succeeds.  A second
+    /// session on the same stream keeps the head it last saw, so the moment
+    /// another writer advances the real head this one goes stale and its next
+    /// append fails loud with a head-conflict instead of duplicating a turn.
+    ///
+    /// [`append`]: Session::append
+    head: u64,
     /// Set by `close()`; blocks further `append` / `spend`.
     closed: bool,
 }
@@ -128,11 +139,17 @@ impl Session {
             budget: Budget::new(budget_tokens),
             views: Views::default(),
             turns: 0,
+            // A fresh run opens on an empty stream: the first append (the
+            // `run_started` below) CASes against head 0 (expect empty) and
+            // advances the observed head to the seq it lands at.
+            head: 0,
             closed: false,
         };
         // `run_started` is well-formed and the session is open, so this
         // append cannot fail; the same one path records it as records
         // everything else.  The owner rides along so resume can recover it.
+        // The append advances `self.head` to the run_started's seq, so a
+        // freshly opened session observes the head right after open.
         let mut started = kernel_event(KIND_RUN_STARTED);
         started.insert(FIELD_OWNER.to_string(), Value::from(session.owner.clone()));
         let _ = session.append(started);
@@ -159,12 +176,25 @@ impl Session {
     /// The projection caches start empty and re-fold lazily from the store,
     /// so a resumed session's `usage` view is correct on first read.
     pub fn resume(budget_tokens: Option<i64>, store: Box<dyn EventStore>) -> KnlResult<Self> {
-        let log = store.read(0, usize::MAX);
+        // Fallible read: a transient busy read or an undecodable row surfaces
+        // here rather than being silently folded into a wrong resumed state.
+        let log = store.read(0, usize::MAX)?;
 
-        let owner = log
+        // Resuming an empty or mistyped stream is a caller error, not an
+        // anonymous zero session: a real run always opens with a `run_started`.
+        let run_started = log
             .iter()
             .find(|event| kind_of(event) == KIND_RUN_STARTED)
-            .and_then(|event| event.get(FIELD_OWNER).and_then(Value::as_str))
+            .ok_or_else(|| {
+                KnlError::new("resume: stream has no run to resume (no run_started event)")
+            })?;
+
+        // The owner rides on `run_started`; an older log written before the
+        // field existed falls back to ANON — but only for a real `run_started`,
+        // never for an absent one.
+        let owner = run_started
+            .get(FIELD_OWNER)
+            .and_then(Value::as_str)
             .unwrap_or(ANON)
             .to_string();
 
@@ -189,6 +219,12 @@ impl Session {
         let mut budget = Budget::new(budget_tokens);
         let _ = budget.spend(spent);
 
+        // The observed head is the log's current head — the last event's seq
+        // (`read` returns events in seq order).  A resume errors above on an
+        // empty / run_started-less log, so a resumed session's head is a real
+        // event's seq; the `0` fallback is unreachable but keeps this total.
+        let head = log.last().map(seq_of).unwrap_or(0);
+
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             owner,
@@ -196,6 +232,7 @@ impl Session {
             budget,
             views: Views::default(),
             turns,
+            head,
             closed: false,
         })
     }
@@ -242,6 +279,15 @@ impl Session {
     /// A `run_finished` a caller appends is a line in the history, not a
     /// close: the run scope is the `closed` flag, and only
     /// [`Session::close`] sets it.
+    ///
+    /// One stream has one live writer: the append is a compare-and-swap on the
+    /// head *this session observed* (`self.head`), not a fresh read of the
+    /// store.  A single writer wrote every event, so its observed head always
+    /// matches the real one and every CAS succeeds — unchanged behaviour.  But
+    /// a second session on the same stream keeps the head it last saw: the
+    /// moment the first writes, the second's observed head is stale, and its
+    /// next append fails loud with a head-conflict rather than reading the
+    /// already-advanced head and silently duplicating a turn.
     pub fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
             return Err(KnlError::new("session is closed"));
@@ -250,7 +296,13 @@ impl Session {
         let is_response =
             event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
         if !is_response {
-            return self.store.append(event).map(|committed| committed.seq);
+            // CAS against the head this session observed, not a fresh read: a
+            // concurrent writer that advanced the real head leaves this
+            // expectation stale, so the conflict surfaces instead of appending
+            // blind.  The observed head advances only after the write lands.
+            let committed = self.store.append_if_head(event, self.head)?;
+            self.head = committed.seq;
+            return Ok(committed.seq);
         }
 
         // Kernel-owned turn, assigned before the event is stored so the
@@ -262,16 +314,24 @@ impl Session {
             .and_then(Value::as_object)
             .map_or(0, charge_of);
 
-        // Validate + stamp + push.  A malformed response is rejected here,
-        // before the turn counter advances or the budget is touched.
-        let seq = self.store.append(event)?.seq;
+        // Validate + stamp + push, guarded by the observed head.  A malformed
+        // response is rejected, and an observed head another writer has moved
+        // past is a head-conflict error — either way the observed head, the
+        // turn counter and the budget are left untouched, advancing only after
+        // the append actually lands.
+        let committed = self.store.append_if_head(event, self.head)?;
+        self.head = committed.seq;
         self.turns = turn;
         let _ = self.budget.spend(charge);
-        Ok(seq)
+        Ok(committed.seq)
     }
 
     /// Events with `seq >= from`, cloned.
-    pub fn events(&self, from: u64) -> Vec<Value> {
+    ///
+    /// Fallible: a durable backend can hit a transient busy read or a row it
+    /// cannot decode, which surfaces here rather than being dropped silently.
+    /// The in-memory backend is always `Ok`.
+    pub fn events(&self, from: u64) -> KnlResult<Vec<Value>> {
         self.store.read(from, usize::MAX)
     }
 
@@ -364,12 +424,12 @@ impl Session {
                 // events and Session works against the `EventStore` trait
                 // alone — no reach into a concrete `History`.
                 let from = self.views.usage_folded_seq().saturating_add(1);
-                let fresh = self.store.read(from, usize::MAX);
+                let fresh = self.store.read(from, usize::MAX)?;
                 Ok(self.views.usage(&fresh))
             }
             VIEW_TAIL => {
                 let n = tail_count(opts)?;
-                let events = self.store.read(0, usize::MAX);
+                let events = self.store.read(0, usize::MAX)?;
                 Ok(projection::tail_of(&events, n))
             }
             other => Err(KnlError::new(format!("unknown view {other:?}"))),
@@ -410,7 +470,7 @@ mod tests {
     fn a_new_session_already_carries_run_started() {
         let s = new_session(None);
         assert_eq!(s.len(), 1);
-        let events = s.events(0);
+        let events = s.events(0).expect("events");
         assert_eq!(kind_of(&events[0]), KIND_RUN_STARTED);
         assert_eq!(seq_of(&events[0]), 1);
         assert!(!s.is_closed());
@@ -434,7 +494,7 @@ mod tests {
         s.close(Some("ignored"));
         assert_eq!(s.len(), 2, "close must be idempotent");
 
-        let last = s.events(2).pop().expect("run_finished");
+        let last = s.events(2).expect("events").pop().expect("run_finished");
         assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
         assert_eq!(last["reason"], json!("budget_exhausted"));
         assert!(s.is_closed());
@@ -444,7 +504,7 @@ mod tests {
     fn close_without_a_reason_records_the_default() {
         let mut s = new_session(None);
         s.close(None);
-        let last = s.events(2).pop().expect("run_finished");
+        let last = s.events(2).expect("events").pop().expect("run_finished");
         assert_eq!(last["reason"], json!(DEFAULT_CLOSE_REASON));
     }
 
@@ -465,7 +525,7 @@ mod tests {
         assert_eq!(s.len(), 3, "run_started + note + run_finished");
         assert_eq!(s.remaining(), Some(6));
         assert!(!s.exhausted());
-        assert_eq!(kind_of(&s.events(0)[1]), "note");
+        assert_eq!(kind_of(&s.events(0).expect("events")[1]), "note");
     }
 
     #[test]
@@ -525,7 +585,7 @@ mod tests {
         let err = s.view("dialogue", None).expect_err("dialogue was served");
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
-        let events = s.events(0);
+        let events = s.events(0).expect("events");
         assert_eq!(kind_of(&events[1]), "msg_user");
         assert_eq!(events[1]["content"], json!("hi"));
     }
@@ -547,7 +607,7 @@ mod tests {
             })))
             .expect("append");
 
-        let recorded = s.events(seq).pop().expect("model_response");
+        let recorded = s.events(seq).expect("events").pop().expect("model_response");
         assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
         assert_eq!(recorded[FIELD_TURN], json!(1), "the kernel numbered it 1");
 
@@ -578,7 +638,7 @@ mod tests {
         // do writes stop.
         s.close(Some("done"));
         assert!(s.is_closed());
-        let last = s.events(0).pop().expect("run_finished");
+        let last = s.events(0).expect("events").pop().expect("run_finished");
         assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
         assert_eq!(last["reason"], json!("done"));
         assert_eq!(
@@ -598,7 +658,7 @@ mod tests {
         assert_eq!(s.remaining(), Some(70));
         assert!(!s.exhausted());
 
-        let recorded = s.events(2).pop().expect("model_response");
+        let recorded = s.events(2).expect("events").pop().expect("model_response");
         assert_eq!(kind_of(&recorded), "model_response");
         assert_eq!(recorded[FIELD_TURN], json!(1));
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
@@ -678,7 +738,7 @@ mod tests {
         assert_eq!(after["at_seq"], json!(3));
 
         assert_eq!(s.len(), 3);
-        assert_eq!(kind_of(&s.events(0)[2]), KIND_RUN_FINISHED);
+        assert_eq!(kind_of(&s.events(0).expect("events")[2]), KIND_RUN_FINISHED);
     }
 
     /// `open_on` on a durable backend records the session's owner on the
@@ -691,7 +751,7 @@ mod tests {
         let store = SqliteEventStore::open_in_memory("owner-stream").expect("open");
         let s = Session::open_on("user-7".to_string(), Some(100), Box::new(store));
 
-        let started = s.events(0);
+        let started = s.events(0).expect("events");
         let started = started.first().expect("run_started");
         assert_eq!(kind_of(started), KIND_RUN_STARTED);
         assert_eq!(
@@ -747,7 +807,7 @@ mod tests {
 
         // Numbering and accounting continue: the next response is turn 3.
         let seq = resumed.append(response(5)).expect("third response");
-        let recorded = resumed.events(seq).pop().expect("model_response");
+        let recorded = resumed.events(seq).expect("events").pop().expect("model_response");
         assert_eq!(
             recorded[FIELD_TURN],
             json!(3),
@@ -781,5 +841,196 @@ mod tests {
         assert_eq!(resumed.owner(), ANON);
         assert_eq!(resumed.turns(), 0);
         assert_eq!(resumed.remaining(), None, "resumed without a budget cap");
+    }
+
+    /// (Fix 5) Resuming an empty log is a caller error — a mistyped or
+    /// nonexistent stream must not fold into an anonymous zero session.
+    #[test]
+    fn resume_of_an_empty_store_is_a_caller_error_not_an_anon_session() {
+        let err = Session::resume(Some(100), Box::new(MemEventStore::new()))
+            .expect_err("an empty store has no run to resume");
+        assert!(err.reason().contains("no run to resume"), "{}", err.reason());
+    }
+
+    /// (Fix 5) A log that has events but never opened with `run_started` is a
+    /// caller error too — the ANON fallback is only for a real run_started.
+    #[test]
+    fn resume_of_a_store_without_run_started_is_a_caller_error() {
+        let mut store = MemEventStore::new();
+        store
+            .append(obj(json!({ "kind": "note" })))
+            .expect("seed a non-run_started event");
+        let err = Session::resume(None, Box::new(store))
+            .expect_err("a log with no run_started has no run to resume");
+        assert!(err.reason().contains("no run to resume"), "{}", err.reason());
+    }
+
+    /// A store that drops a competing write in between the head read and the
+    /// CAS on the first `model_response`, deterministically reproducing the
+    /// race [`Session::append`]'s compare-and-swap guards: the injected write
+    /// advances the head, so the session's CAS then holds a stale expectation.
+    struct RacyStore {
+        inner: MemEventStore,
+        injected: bool,
+    }
+
+    impl EventStore for RacyStore {
+        fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            self.inner.append(event)
+        }
+
+        fn append_if_head(
+            &mut self,
+            event: Map<String, Value>,
+            expected_head: u64,
+        ) -> KnlResult<crate::knl::Committed> {
+            let is_response =
+                event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
+            if is_response && !self.injected {
+                self.injected = true;
+                // A competing writer lands one event, advancing the head
+                // under us so the pending CAS is now stale.
+                self.inner
+                    .append(obj(json!({ "kind": "sneaked_in" })))
+                    .expect("injected concurrent write");
+            }
+            self.inner.append_if_head(event, expected_head)
+        }
+
+        fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+            self.inner.read(from_seq, limit)
+        }
+
+        fn head(&self) -> Option<u64> {
+            self.inner.head()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    /// (Fix 1) `Session::append` is a compare-and-swap on the head: a second
+    /// writer landing between the head read and the write makes the append a
+    /// stale CAS, which fails loud instead of silently duplicating a turn —
+    /// and neither the turn counter nor the budget move on the failure.
+    #[test]
+    fn append_cas_rejects_a_stale_writer_without_duplicating_a_turn() {
+        // Single-writer construction is unaffected: run_started lands as usual.
+        let store = RacyStore {
+            inner: MemEventStore::new(),
+            injected: false,
+        };
+        let mut s = Session::open_on("user".to_string(), Some(1000), Box::new(store));
+        assert_eq!(s.len(), 1, "only run_started so far");
+        assert_eq!(s.turns(), 0);
+
+        // The CAS sees a head advanced by the injected competing writer.
+        let err = s
+            .append(response(10))
+            .expect_err("a stale CAS must fail loud");
+        assert!(err.reason().contains("head conflict"), "{}", err.reason());
+
+        // Neither the turn counter nor the budget moved: the append did not land.
+        assert_eq!(s.turns(), 0, "a failed CAS must not advance the turn");
+        assert_eq!(s.remaining(), Some(1000), "a failed CAS must not charge");
+
+        // No model_response reached the log — no duplicate turn was written.
+        let log = s.events(0).expect("events");
+        let responses = log
+            .iter()
+            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+            .count();
+        assert_eq!(responses, 0, "the conflicting response must not be recorded");
+    }
+
+    /// (Fix 5) Resuming a nonexistent SQLite stream is a caller error, not an
+    /// anonymous empty session.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_of_a_nonexistent_sqlite_stream_is_a_caller_error() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        // A stream that was never opened as a run: its log is empty.
+        let store = SqliteEventStore::open(&path, "ghost-stream").expect("open");
+        let err = Session::resume(Some(100), Box::new(store))
+            .expect_err("an empty stream has no run to resume");
+        assert!(err.reason().contains("no run to resume"), "{}", err.reason());
+    }
+
+    /// (Concurrency) The interleaved two-session scenario, with no artificial
+    /// straddle decorator: two `Session`s open on ONE durable stream, both
+    /// observing the same head `H`.  Session A appends a response, so the head
+    /// advances; Session B — whose observed head is still `H`, from *before* A's
+    /// write — appends a response and MUST get a head-conflict, write nothing,
+    /// and leave no duplicate turn in the log.
+    ///
+    /// This is the exact bug a fresh `self.store.head()` read would *not* catch:
+    /// B would read the already-advanced head, its CAS would match, and it would
+    /// silently write a second event carrying the same turn.  CASing against the
+    /// head each session *observed* is what makes B's stale write fail loud.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn two_sessions_interleaving_on_one_stream_conflict_without_duplicating_a_turn() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "interleave-stream";
+
+        // A opens the run on the shared stream: `run_started` lands at seq 1,
+        // so A observes head 1 (H).
+        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let mut a = Session::open_on("user".to_string(), Some(1000), Box::new(store_a));
+        assert_eq!(a.turns(), 0);
+
+        // B resumes the SAME stream while it holds only `run_started`, so B
+        // observes the same head 1 — genuinely from before A's write, not
+        // injected mid-call.
+        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        let mut b = Session::resume(Some(1000), Box::new(store_b)).expect("resume B");
+        assert_eq!(b.turns(), 0);
+
+        // A appends a model_response: its observed head still matches the real
+        // one, so it lands (seq 2, turn 1) and A advances its observed head.
+        let a_seq = a.append(response(10)).expect("A appends");
+        assert_eq!(a_seq, 2);
+        assert_eq!(a.turns(), 1);
+
+        // B's observed head is still 1 — it never saw A's write — so its CAS is
+        // stale: a head-conflict, with no write, no charge, and no turn advance.
+        let err = b
+            .append(response(20))
+            .expect_err("B's stale observed head must conflict");
+        assert!(err.reason().contains("head conflict"), "{}", err.reason());
+        assert_eq!(b.turns(), 0, "a conflicting append must not advance B's turn");
+        assert_eq!(
+            b.remaining(),
+            Some(1000),
+            "a conflicting append must not charge B"
+        );
+
+        // The durable log: exactly one event past H = 1 (A's response at seq 2)
+        // and exactly one model_response, numbered turn 1 — no duplicate.
+        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        let log = verify.read(0, usize::MAX).expect("read log");
+        let past_h: Vec<_> = log.iter().filter(|e| seq_of(e) > 1).collect();
+        assert_eq!(past_h.len(), 1, "exactly one event past H");
+        let responses: Vec<_> = log
+            .iter()
+            .filter(|e| kind_of(e) == KIND_MODEL_RESPONSE)
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "no duplicate turn: one model_response only"
+        );
+        assert_eq!(
+            responses[0][FIELD_TURN],
+            json!(1),
+            "the single recorded response is turn 1"
+        );
     }
 }

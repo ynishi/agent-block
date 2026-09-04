@@ -207,7 +207,11 @@ impl LuaUserData for Session {
         // K1: the returned tables are freshly built from the stored JSON
         // on every call, so mutating them cannot reach kernel state.
         methods.add_method("events", |lua, this, from: Option<u64>| {
-            let selected = this.state.borrow().events(from.unwrap_or(0));
+            let selected = this
+                .state
+                .borrow()
+                .events(from.unwrap_or(0))
+                .map_err(|e| err("events", e))?;
             // The borrow is released above: json_to_lua re-enters Lua.
             json_to_lua(lua, Value::Array(selected))
         });
