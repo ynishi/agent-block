@@ -45,7 +45,7 @@ use super::event::{
     kernel_event, kind_of, seq_of, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE,
     KIND_MODEL_RESPONSE, KIND_RUN_FINISHED, KIND_RUN_STARTED,
 };
-use super::event_store::{EventStore, MemEventStore};
+use super::event_store::{EventStore, MemEventStore, UpcastingEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
 use super::{projection, Budget, KnlError, KnlResult};
 
@@ -132,6 +132,11 @@ impl Session {
     /// alone.  `run_started` is an open-shape reserved kind, so the extra
     /// `owner` field is accepted without any change to the validator.
     pub fn open_on(owner: String, budget_tokens: Option<i64>, store: Box<dyn EventStore>) -> Self {
+        // Wrap the chosen backend in the read-time upcasting seam, so every one
+        // of this session's reads (view folds, `events`) passes through it by
+        // construction.  The chain is empty today (v1), making the decorator a
+        // functional no-op; a future upcaster registers at this one wrap site.
+        let store: Box<dyn EventStore> = Box::new(UpcastingEventStore::new(store, Vec::new()));
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             owner,
@@ -224,6 +229,12 @@ impl Session {
         // empty / run_started-less log, so a resumed session's head is a real
         // event's seq; the `0` fallback is unreachable but keeps this total.
         let head = log.last().map(seq_of).unwrap_or(0);
+
+        // The restore read above used the raw backend; the session itself reads
+        // through the same upcasting seam `open_on` establishes, so a resumed
+        // run's log read, view folds and `events` all pass through it too.  The
+        // chain is empty today (v1), so this is a functional no-op.
+        let store: Box<dyn EventStore> = Box::new(UpcastingEventStore::new(store, Vec::new()));
 
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),

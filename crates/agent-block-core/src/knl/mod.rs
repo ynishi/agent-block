@@ -58,8 +58,8 @@ pub use budget::Budget;
 pub use call::charge_of;
 pub use event::{now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use event_store::{
-    apply_upcasters, Committed, EventStore, MemEventStore, Upcaster, CURRENT_SCHEMA_VERSION,
-    SCHEMA_VERSION_FIELD,
+    apply_upcasters, Committed, EventStore, MemEventStore, UpcastingEventStore, Upcaster,
+    CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};

@@ -350,7 +350,18 @@ fn parse_owner(opts: Option<&LuaTable>) -> LuaResult<String> {
     let value: LuaValue = opts.get("owner")?;
     match value {
         LuaValue::Nil => Ok(knl::ANON.to_string()),
-        LuaValue::String(owner) => Ok(owner.to_str()?.to_string()),
+        LuaValue::String(owner) => {
+            let owner = owner.to_str()?.to_string();
+            // The reserved ids are the kernel's own namespace: an untrusted Lua
+            // caller must not claim ANON or SYSTEM, or it could impersonate a
+            // reserved principal on `run_started`.  Compared against the consts,
+            // not literal strings, so the guard tracks the kernel's definition.
+            // Unspecified owner still defaults to the kernel-assigned ANON above.
+            if owner == knl::ANON || owner == knl::SYSTEM {
+                return Err(err("open", format!("owner {owner:?} is reserved")));
+            }
+            Ok(owner)
+        }
         other => Err(err(
             "session",
             format!("owner must be a string, got {}", other.type_name()),
@@ -1167,6 +1178,38 @@ mod tests {
         let msg = expect_err(&lua, r#"knl.open({ store = { redis = "x" } })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("sqlite"), "{msg}");
+    }
+
+    /// (Fix 6) The reserved owner ids are the kernel's own namespace: an
+    /// untrusted Lua caller cannot claim "system" or "anon" (a spoofing hole
+    /// for the future permission layer), each rejected as a `knl: open:` error.
+    /// An unspecified owner still defaults to the kernel-assigned "anon", and a
+    /// real principal id is accepted verbatim.
+    #[test]
+    fn open_rejects_reserved_owner_ids_from_the_caller() {
+        let lua = vm();
+
+        let msg = expect_err(&lua, r#"knl.open({ owner = "system" })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains("system"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.open({ owner = "anon" })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains("anon"), "{msg}");
+
+        lua.load(
+            r#"
+            -- Unspecified owner is the kernel-assigned reserved anon.
+            assert(knl.open():owner() == "anon", "default owner must be anon")
+            assert(knl.open({}):owner() == "anon", "empty opts default owner must be anon")
+            -- A real principal id is accepted verbatim.
+            assert(knl.open({ owner = "alice" }):owner() == "alice", "owner not carried")
+        "#,
+        )
+        .exec()
+        .expect("reserved-owner chunk");
     }
 
     /// (durable) `knl.open({ store = { sqlite = path } })` writes to a

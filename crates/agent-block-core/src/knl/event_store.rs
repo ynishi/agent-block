@@ -223,6 +223,63 @@ impl EventStore for MemEventStore {
     }
 }
 
+/// An [`EventStore`] decorator that upcasts on read.
+///
+/// Wraps any backend and a `chain` of [`Upcaster`]s.  Reads fold the chain
+/// over the events before returning them (read-time projection); every write
+/// passes straight through, so the stored bytes are never rewritten — the same
+/// old-log-stays-readable discipline [`Upcaster`] describes, established once
+/// here as the single seam a future upcaster registers into.
+///
+/// An empty chain is a functional no-op, which is the state today: v1 has no
+/// upcaster, so the decorator changes nothing, but a later shape change
+/// registers its `n → n+1` step here and every read path picks it up.
+pub struct UpcastingEventStore {
+    /// The wrapped backend that actually holds the events.
+    inner: Box<dyn EventStore>,
+    /// The read-time upcaster chain, applied front to back on every read.
+    chain: Vec<Arc<dyn Upcaster>>,
+}
+
+impl UpcastingEventStore {
+    /// Wrap `inner` so its reads are upcasted through `chain`.
+    ///
+    /// An empty `chain` makes this an identity decorator over `inner`.
+    pub fn new(inner: Box<dyn EventStore>, chain: Vec<Arc<dyn Upcaster>>) -> Self {
+        Self { inner, chain }
+    }
+}
+
+impl EventStore for UpcastingEventStore {
+    fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed> {
+        // Write path untouched: upcasting is read-time only.
+        self.inner.append(event)
+    }
+
+    fn append_if_head(
+        &mut self,
+        event: Map<String, Value>,
+        expected_head: u64,
+    ) -> KnlResult<Committed> {
+        self.inner.append_if_head(event, expected_head)
+    }
+
+    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+        // The single read-time application point: read from the backend, then
+        // fold the chain over the events before handing them back.
+        let events = self.inner.read(from_seq, limit)?;
+        Ok(apply_upcasters(&self.chain, events))
+    }
+
+    fn head(&self) -> Option<u64> {
+        self.inner.head()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +470,85 @@ mod tests {
         );
         assert_eq!(out[0]["trace"], json!(["first", "second"]));
         assert_eq!(out[1]["trace"], json!(["first", "second"]));
+    }
+
+    /// (Fix 4) `UpcastingEventStore` projects the chain on read while leaving
+    /// the write path untouched: an appended event is stored raw, and the
+    /// marker only appears in the read projection — it never accumulates, so
+    /// the stored bytes carry no upcaster field.
+    #[test]
+    fn upcasting_store_projects_on_read_and_leaves_writes_untouched() {
+        use std::sync::Arc;
+
+        // Pushes a marker onto a `trace` array, so a value upcasted twice would
+        // show two entries — this distinguishes a read-time projection from a
+        // stored rewrite.
+        struct Mark;
+        impl Upcaster for Mark {
+            fn upcast(&self, mut event: Value) -> Value {
+                let map = event.as_object_mut().expect("event is an object");
+                map.entry("trace")
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .expect("trace is an array")
+                    .push(Value::from("mark"));
+                event
+            }
+        }
+
+        let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(Mark)];
+        let mut store = UpcastingEventStore::new(Box::new(MemEventStore::new()), chain);
+
+        // Write path passes through: coordinates and counters are the backend's.
+        let a = store.append(ev(1)).expect("append e1");
+        assert_eq!(a.seq, 1);
+        assert_eq!(store.head(), Some(1));
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
+
+        // read projects the marker on.
+        let first = store.read(0, usize::MAX).expect("read");
+        assert_eq!(first[0]["trace"], json!(["mark"]), "read applies the chain");
+
+        // A second read is consistent — the marker does not accumulate, proving
+        // the append stored no marker (the write path is not upcasted).
+        let second = store.read(0, usize::MAX).expect("read again");
+        assert_eq!(
+            second[0]["trace"],
+            json!(["mark"]),
+            "stored bytes carry no marker; read adds exactly one"
+        );
+
+        // A freshly appended event reads back consistently under the same chain,
+        // and head / len stay in step with the backend.
+        let b = store.append(ev(2)).expect("append e2");
+        assert_eq!(b.seq, 2);
+        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.len(), 2);
+        let both = store.read(0, usize::MAX).expect("read both");
+        assert_eq!(both.len(), 2);
+        assert_eq!(kind_of(&both[1]), "e2");
+        assert_eq!(both[1]["trace"], json!(["mark"]));
+    }
+
+    /// (Fix 4) An empty chain makes the decorator an identity over its backend:
+    /// reads return the events unchanged, with no upcaster-added field, and the
+    /// coordinates track the backend exactly.
+    #[test]
+    fn upcasting_store_with_an_empty_chain_returns_events_unchanged() {
+        let mut store = UpcastingEventStore::new(Box::new(MemEventStore::new()), Vec::new());
+        assert!(store.is_empty());
+
+        store.append(ev(1)).expect("append");
+        let read = store.read(0, usize::MAX).expect("read");
+        assert_eq!(read.len(), 1);
+        assert_eq!(kind_of(&read[0]), "e1", "the event passes through unchanged");
+        assert!(
+            read[0].get("trace").is_none(),
+            "an empty chain adds nothing: {}",
+            read[0]
+        );
+        assert_eq!(store.head(), Some(1));
+        assert_eq!(store.len(), 1);
     }
 }
