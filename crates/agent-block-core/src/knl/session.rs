@@ -157,10 +157,10 @@ use serde_json::{Map, Value};
 
 use super::budget::{self, fold_balance, last_grant, BudgetGrant};
 use super::event::{
-    is_kernel_only, kernel_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL, FIELD_KIND,
-    FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED,
-    KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED,
-    KIND_SESSION_OPENED,
+    data_field, is_kernel_only, kernel_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL,
+    FIELD_KIND, FIELD_OWNER, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG,
+    KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT,
+    KIND_SESSION_CLOSED, KIND_SESSION_OPENED,
 };
 use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore};
 use super::projection::{tail_count, VIEW_TAIL};
@@ -210,32 +210,27 @@ pub const ANON: &str = "anon";
 /// Reserved owner: the session belongs to the system itself.
 pub const SYSTEM: &str = "system";
 
-/// Payload field the kernel records on `session_opened`, beside
-/// [`FIELD_SCOPE_ID`], so a later [`Session::resume`] can recover the
-/// session's scope — who it belonged to — from the log.
-///
-/// `session_opened` is an open-shape reserved kind (no required fields), so
-/// carrying this extra field needs no change to the event validator.
-const FIELD_OWNER: &str = "owner";
-
 /// A `budget_granted` event for `grant`, written under `scope_id`.
 ///
 /// Only what the owner said is written — an absent `tag` is an absent
 /// field, not a null — so the record carries the grant and nothing more.
+/// The fields are the kind's own, so they go under `data`
+/// ([`super::event`]); the envelope carries the log's vocabulary and not the
+/// ledger's.
 fn granted_event(grant: &BudgetGrant, scope_id: &str) -> Map<String, Value> {
-    let mut event = kernel_event(KIND_BUDGET_GRANTED);
-    event.insert(
+    let mut data = Map::new();
+    data.insert(
         FIELD_SCOPE_ID.to_string(),
         Value::from(scope_id.to_string()),
     );
-    event.insert(FIELD_AMOUNT.to_string(), Value::from(grant.amount));
+    data.insert(FIELD_AMOUNT.to_string(), Value::from(grant.amount));
     if let Some(tag) = grant.tag.as_ref() {
-        event.insert(FIELD_TAG.to_string(), Value::from(tag.clone()));
+        data.insert(FIELD_TAG.to_string(), Value::from(tag.clone()));
     }
     if let Some(desc) = grant.desc.as_ref() {
-        event.insert(FIELD_DESC.to_string(), Value::from(desc.clone()));
+        data.insert(FIELD_DESC.to_string(), Value::from(desc.clone()));
     }
-    event
+    kernel_event(KIND_BUDGET_GRANTED, data)
 }
 
 /// A `budget_reserved` / `budget_spent` / `budget_refused` event for
@@ -251,16 +246,38 @@ fn budget_move_event(
     tag: Option<&str>,
     scope_id: &str,
 ) -> Map<String, Value> {
-    let mut event = kernel_event(kind);
-    event.insert(
+    kernel_event(kind, budget_move_data(amount, tag, scope_id))
+}
+
+/// The `data` every `budget_*` entry carries: the scope it was allowed
+/// under, how much, and the grant's unit if it named one.
+fn budget_move_data(amount: i64, tag: Option<&str>, scope_id: &str) -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert(
         FIELD_SCOPE_ID.to_string(),
         Value::from(scope_id.to_string()),
     );
-    event.insert(FIELD_AMOUNT.to_string(), Value::from(amount));
+    data.insert(FIELD_AMOUNT.to_string(), Value::from(amount));
     if let Some(tag) = tag {
-        event.insert(FIELD_TAG.to_string(), Value::from(tag.to_string()));
+        data.insert(FIELD_TAG.to_string(), Value::from(tag.to_string()));
     }
-    event
+    data
+}
+
+/// A `budget_refused` event: a move that did not happen, carrying what was
+/// asked for *and* the balance it was measured against.
+///
+/// The pair is what makes a refusal readable without folding the ledger, so
+/// `remaining` is built into the entry rather than added to it afterwards.
+fn refused_event(
+    amount: i64,
+    remaining: i64,
+    tag: Option<&str>,
+    scope_id: &str,
+) -> Map<String, Value> {
+    let mut data = budget_move_data(amount, tag, scope_id);
+    data.insert(FIELD_REMAINING.to_string(), Value::from(remaining));
+    kernel_event(KIND_BUDGET_REFUSED, data)
 }
 
 /// What a caller should have called instead of hand-appending `kind`.
@@ -397,16 +414,18 @@ impl Session {
         // The scope rides on the opening: the id the kernel just issued, next
         // to the owner.  Together they are the whole of what a resume needs to
         // restore the scope, so the boundary is in the log and not only in
-        // this value.
-        let mut started = kernel_event(KIND_SESSION_OPENED);
-        started.insert(
+        // this value — and they are the kind's own fields, so they go under
+        // `data` where the validator requires them.
+        let mut opened = Map::new();
+        opened.insert(
             FIELD_OWNER.to_string(),
             Value::from(session.scope.owner().to_string()),
         );
-        started.insert(
+        opened.insert(
             FIELD_SCOPE_ID.to_string(),
             Value::from(session.scope.id().to_string()),
         );
+        let started = kernel_event(KIND_SESSION_OPENED, opened);
 
         // The grant is its own fact, right after the boundary: what the
         // owner allowed is the first entry of the ledger the balance folds
@@ -510,19 +529,18 @@ impl Session {
             )));
         }
 
-        // The scope rides on `session_opened`; an older log written before
-        // either field existed falls back — the owner to ANON, the scope id
-        // to a fresh kernel-issued one (`Scope::restore` mints it) — but
-        // only for a real `session_opened`, never for an absent one.  A
-        // session that predates a field is still a session, and refusing to
-        // resume it would lose the log rather than protect it.
-        let owner = opened
-            .get(FIELD_OWNER)
+        // The scope rides on the `data` of `session_opened`, where the
+        // validator requires both halves of it.  The fallbacks — the owner to
+        // ANON, the scope id to a fresh kernel-issued one (`Scope::restore`
+        // mints it) — are for a stream an upcaster could not bring all the
+        // way: a session that arrives here missing a field is still a
+        // session, and refusing to resume it would lose the log rather than
+        // protect it.
+        let owner = data_field(opened, FIELD_OWNER)
             .and_then(Value::as_str)
             .unwrap_or(ANON)
             .to_string();
-        let scope_id: Option<ScopeId> = opened
-            .get(FIELD_SCOPE_ID)
+        let scope_id: Option<ScopeId> = data_field(opened, FIELD_SCOPE_ID)
             .and_then(Value::as_str)
             .map(str::to_string);
 
@@ -771,9 +789,7 @@ impl Session {
             // recorded here as the ordinary fact it is, carrying what was
             // asked for and what there was.  It moves no balance, and a later
             // read folds the ledger including it and finds the same number.
-            let mut event =
-                budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref(), &scope_id);
-            event.insert(FIELD_REMAINING.to_string(), Value::from(balance));
+            let event = refused_event(amount, balance, tag.as_deref(), &scope_id);
             self.append_kernel(event)?;
             return Ok(false);
         }
@@ -911,14 +927,15 @@ impl Session {
         if self.closed {
             return Ok(());
         }
-        let mut event = kernel_event(KIND_SESSION_CLOSED);
-        event.insert(
+        let mut data = Map::new();
+        data.insert(
             FIELD_REASON.to_string(),
             Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
         );
         if let Some(detail) = detail {
-            event.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
+            data.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
         }
+        let event = kernel_event(KIND_SESSION_CLOSED, data);
 
         // A plain append, taken through the kernel's own path because
         // `session_closed` is kernel-only and the guarded `append` would
@@ -991,7 +1008,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, FIELD_BEAT, KIND_LLM_RESPONSE};
+    use crate::knl::event::{kind_of, FIELD_BEAT, FIELD_DATA};
     // The `Vec`-backed test store: the SPI, the seam and the folds are worth
     // exercising without a database underneath, and the failure injection
     // below is easier to build on a `Vec` than on a connection.
@@ -1066,14 +1083,24 @@ mod tests {
             .collect()
     }
 
-    /// An `llm_response` event charging `tokens`, as the kernel accepts it.
+    /// An `llm_response` event charging `tokens`.
+    ///
+    /// A kind of the shell's, so its shape is the shell's too: the kernel
+    /// takes the envelope and keeps whatever is under `data` verbatim.
     fn response(tokens: i64) -> Map<String, Value> {
         obj(json!({
             "kind": "llm_response",
-            "content": [{ "type": "text", "text": "ok" }],
-            "usage": { "input_tokens": tokens },
-            "stop_reason": "end_turn"
+            "data": {
+                "content": [{ "type": "text", "text": "ok" }],
+                "usage": { "input_tokens": tokens },
+                "stop_reason": "end_turn"
+            }
         }))
+    }
+
+    /// A `data` field of a recorded event, for the assertions below.
+    fn field<'a>(event: &'a Current, name: &str) -> &'a Value {
+        data_field(event, name).unwrap_or_else(|| panic!("data.{name} is missing: {event}"))
     }
 
     #[test]
@@ -1125,12 +1152,12 @@ mod tests {
         let opened = &events[0];
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
-            opened.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            field(opened, FIELD_SCOPE_ID).as_str(),
             Some(scope_id.as_str()),
             "the scope rides on session_opened: {opened}"
         );
         assert_eq!(
-            opened.get("owner").and_then(Value::as_str),
+            field(opened, FIELD_OWNER).as_str(),
             Some(ANON),
             "beside the owner: {opened}"
         );
@@ -1148,7 +1175,7 @@ mod tests {
         );
         for event in &moves {
             assert_eq!(
-                event.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+                field(event, FIELD_SCOPE_ID).as_str(),
                 Some(scope_id.as_str()),
                 "a ledger entry must name the scope it was allowed under: {event}"
             );
@@ -1158,7 +1185,8 @@ mod tests {
         // kernel's, on the kinds only the kernel writes.
         s.append(obj(json!({ "kind": "note" }))).expect("append");
         let note = s.events(0).expect("events").pop().expect("note");
-        assert_eq!(note.get(FIELD_SCOPE_ID), None, "{note}");
+        assert_eq!(data_field(&note, FIELD_SCOPE_ID), None, "{note}");
+        assert_eq!(note[FIELD_DATA], json!({}), "and no data of its own");
     }
 
     #[test]
@@ -1187,7 +1215,7 @@ mod tests {
 
         let last = s.events(2).expect("events").pop().expect("session_closed");
         assert_eq!(last.kind(), KIND_SESSION_CLOSED);
-        assert_eq!(last["reason"], json!("budget_exhausted"));
+        assert_eq!(*field(&last, FIELD_REASON), json!("budget_exhausted"));
         assert!(s.is_closed());
     }
 
@@ -1196,7 +1224,7 @@ mod tests {
         let mut s = new_session(None);
         s.close(None).expect("close");
         let last = s.events(2).expect("events").pop().expect("session_closed");
-        assert_eq!(last["reason"], json!(DEFAULT_CLOSE_REASON));
+        assert_eq!(*field(&last, FIELD_REASON), json!(DEFAULT_CLOSE_REASON));
     }
 
     #[test]
@@ -1255,8 +1283,10 @@ mod tests {
     #[test]
     fn view_serves_the_one_named_projection_and_rejects_anything_else() {
         let mut s = new_session(None);
-        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
-            .expect("append");
+        s.append(obj(
+            json!({ "kind": "msg_user", "data": { "content": "hi" } }),
+        ))
+        .expect("append");
         s.append(response(9)).expect("recorded");
 
         let tail = s
@@ -1283,7 +1313,7 @@ mod tests {
 
         // What it needs is in the log, verbatim, for a reader to sum.
         let recorded = s.events(2).expect("events").pop().expect("llm_response");
-        assert_eq!(recorded["usage"], json!({ "input_tokens": 9 }));
+        assert_eq!(*field(&recorded, "usage"), json!({ "input_tokens": 9 }));
     }
 
     /// The conversation is not one of the names: how a record becomes a
@@ -1293,15 +1323,17 @@ mod tests {
     #[test]
     fn the_conversation_is_not_a_named_view() {
         let mut s = new_session(None);
-        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
-            .expect("append");
+        s.append(obj(
+            json!({ "kind": "msg_user", "data": { "content": "hi" } }),
+        ))
+        .expect("append");
 
         let err = s.view("dialogue", None).expect_err("dialogue was served");
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
         let events = s.events(0).expect("events");
         assert_eq!(events[1].kind(), "msg_user");
-        assert_eq!(events[1]["content"], json!("hi"));
+        assert_eq!(*field(&events[1], "content"), json!("hi"));
     }
 
     /// Appending an `llm_response` records it — verbatim, beat included —
@@ -1316,13 +1348,15 @@ mod tests {
                 "kind": "llm_response",
                 // The beat is the caller's word and the kernel keeps it.
                 "beat": "beat-7",
-                "content": [{ "type": "text", "text": "hi" }],
-                "usage": { "input_tokens": 20, "output_tokens": 10 }
+                "data": {
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "usage": { "input_tokens": 20, "output_tokens": 10 }
+                }
             })))
             .expect("append");
 
         let recorded = s.events(seq).expect("events").pop().expect("llm_response");
-        assert_eq!(recorded.kind(), KIND_LLM_RESPONSE);
+        assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(
             recorded[FIELD_BEAT],
             json!("beat-7"),
@@ -1336,7 +1370,7 @@ mod tests {
             "only the opening grant is in the ledger"
         );
         assert_eq!(
-            recorded["usage"],
+            *field(&recorded, "usage"),
             json!({ "input_tokens": 20, "output_tokens": 10 }),
             "the counts are stored as they came: {recorded}"
         );
@@ -1365,16 +1399,16 @@ mod tests {
         assert_eq!(events.len(), 2, "session_opened + budget_granted");
         assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(
-            events[0].get("budget"),
+            data_field(&events[0], "budget"),
             None,
             "the grant is its own event, not a field on session_opened"
         );
 
         let granted = &events[1];
         assert_eq!(granted.kind(), KIND_BUDGET_GRANTED);
-        assert_eq!(granted["amount"], json!(500));
-        assert_eq!(granted["tag"], json!("tokens"));
-        assert_eq!(granted["desc"], json!("one nightly run"));
+        assert_eq!(*field(granted, FIELD_AMOUNT), json!(500));
+        assert_eq!(*field(granted, FIELD_TAG), json!("tokens"));
+        assert_eq!(*field(granted, FIELD_DESC), json!("one nightly run"));
         assert_eq!(remaining(&s), Some(500));
         assert_eq!(folded(&s), remaining(&s));
 
@@ -1395,8 +1429,8 @@ mod tests {
         let moves = ledger(&s);
         assert_eq!(moves.len(), 2, "the grant and the reservation");
         assert_eq!(moves[1].kind(), KIND_BUDGET_RESERVED);
-        assert_eq!(moves[1]["amount"], json!(30));
-        assert_eq!(moves[1]["tag"], json!("tokens"));
+        assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(30));
+        assert_eq!(*field(&moves[1], FIELD_TAG), json!("tokens"));
         assert_eq!(remaining(&s), Some(70));
         assert_eq!(folded(&s), remaining(&s), "the ledger is the balance");
     }
@@ -1411,9 +1445,13 @@ mod tests {
         let moves = ledger(&s);
         assert_eq!(moves.len(), 2, "the grant and the refusal");
         assert_eq!(moves[1].kind(), KIND_BUDGET_REFUSED);
-        assert_eq!(moves[1]["amount"], json!(11));
-        assert_eq!(moves[1]["remaining"], json!(10), "what there was");
-        assert_eq!(moves[1]["tag"], json!("tokens"));
+        assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(11));
+        assert_eq!(
+            *field(&moves[1], FIELD_REMAINING),
+            json!(10),
+            "what there was"
+        );
+        assert_eq!(*field(&moves[1], FIELD_TAG), json!("tokens"));
         assert_eq!(remaining(&s), Some(10), "a refusal must not deduct");
         assert!(!exhausted(&s));
         assert_eq!(folded(&s), remaining(&s));
@@ -1460,10 +1498,10 @@ mod tests {
     fn a_caller_cannot_append_the_budget_kinds() {
         let mut s = new_session(Some(10));
         for event in [
-            json!({ "kind": "budget_granted", "amount": 1_000_000 }),
-            json!({ "kind": "budget_reserved", "amount": 5 }),
-            json!({ "kind": "budget_refused", "amount": 5, "remaining": 0 }),
-            json!({ "kind": "budget_spent", "amount": 5 }),
+            json!({ "kind": "budget_granted", "data": { "amount": 1_000_000 } }),
+            json!({ "kind": "budget_reserved", "data": { "amount": 5 } }),
+            json!({ "kind": "budget_refused", "data": { "amount": 5, "remaining": 0 } }),
+            json!({ "kind": "budget_spent", "data": { "amount": 5 } }),
         ] {
             let err = s.append(obj(event.clone())).expect_err("kernel-only kind");
             assert!(
@@ -1486,8 +1524,8 @@ mod tests {
     fn a_caller_cannot_append_the_session_boundary_kinds() {
         let mut s = new_session(Some(100));
         for event in [
-            json!({ "kind": "session_opened" }),
-            json!({ "kind": "session_closed", "reason": "carried over" }),
+            json!({ "kind": "session_opened", "data": { "scope_id": "s", "owner": "me" } }),
+            json!({ "kind": "session_closed", "data": { "reason": "carried over" } }),
         ] {
             let err = s.append(obj(event.clone())).expect_err("kernel-only kind");
             assert!(
@@ -1529,7 +1567,7 @@ mod tests {
             .filter(|e| e.kind() == KIND_SESSION_CLOSED)
             .collect();
         assert_eq!(closed.len(), 1, "exactly one boundary: {closed:?}");
-        assert_eq!(closed[0]["reason"], json!("done"));
+        assert_eq!(*field(&closed[0], FIELD_REASON), json!("done"));
         assert_eq!(
             s.append(obj(json!({ "kind": "note" })))
                 .expect_err("append after close")
@@ -1552,8 +1590,8 @@ mod tests {
 
         let recorded = s.events(3).expect("events").pop().expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
-        assert_eq!(recorded["stop_reason"], json!("end_turn"));
-        assert_eq!(recorded["usage"]["input_tokens"], json!(30));
+        assert_eq!(*field(&recorded, "stop_reason"), json!("end_turn"));
+        assert_eq!(field(&recorded, "usage")["input_tokens"], json!(30));
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
     }
 
@@ -1575,18 +1613,18 @@ mod tests {
 
         for event in [
             json!({
-                "kind": "llm_response", "beat": "b-1", "content": [],
-                "usage": { "input_tokens": 1 }
+                "kind": "llm_response", "beat": "b-1",
+                "data": { "content": [], "usage": { "input_tokens": 1 } }
             }),
             json!({
-                "kind": "tool_call", "beat": "b-1", "call_id": "c1",
-                "name": "sh", "args": {}
+                "kind": "tool_call", "beat": "b-1",
+                "data": { "call_id": "c1", "name": "sh", "args": {} }
             }),
             json!({
-                "kind": "tool_result", "beat": "b-1", "call_id": "c1",
-                "ok": true, "result": "ok"
+                "kind": "tool_result", "beat": "b-1",
+                "data": { "call_id": "c1", "ok": true, "result": "ok" }
             }),
-            json!({ "kind": "llm_call_failed", "beat": "b-1", "error": "boom" }),
+            json!({ "kind": "llm_call_failed", "beat": "b-1", "data": { "error": "boom" } }),
         ] {
             let seq = s.append(obj(event.clone())).expect("declared beat");
             let recorded = s.events(seq).expect("events").pop().expect("recorded");
@@ -1630,7 +1668,7 @@ mod tests {
             s.events(0)
                 .expect("events")
                 .iter()
-                .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+                .filter(|e| e.kind() == "llm_response")
                 .count()
         }
 
@@ -1711,7 +1749,7 @@ mod tests {
         let opened = events.first().expect("session_opened");
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
-            opened.get("owner").and_then(Value::as_str),
+            field(opened, FIELD_OWNER).as_str(),
             Some("user-7"),
             "owner rides on session_opened: {opened}"
         );
@@ -1719,7 +1757,7 @@ mod tests {
 
         // The grant is durable too, as its own event.
         assert_eq!(events[1].kind(), KIND_BUDGET_GRANTED);
-        assert_eq!(events[1]["amount"], json!(100));
+        assert_eq!(*field(&events[1], FIELD_AMOUNT), json!(100));
     }
 
     /// Resume re-folds a persisted SQLite stream: the owner and the
@@ -1740,8 +1778,10 @@ mod tests {
                 .expect("open");
             assert_eq!(s.reserve(30), Ok(true));
             s.append(response(30)).expect("first response");
-            s.append(obj(json!({ "kind": "msg_user", "content": "more" })))
-                .expect("msg_user");
+            s.append(obj(
+                json!({ "kind": "msg_user", "data": { "content": "more" } }),
+            ))
+            .expect("msg_user");
             assert_eq!(s.reserve(15), Ok(true));
             s.append(response(20)).expect("second response");
             s.spend(5).expect("the second call overran its estimate");
@@ -1785,11 +1825,11 @@ mod tests {
             .events(0)
             .expect("events")
             .into_iter()
-            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+            .filter(|e| e.kind() == "llm_response")
             .collect();
         assert_eq!(responses.len(), 2, "{responses:?}");
-        assert_eq!(responses[0]["usage"]["input_tokens"], json!(30));
-        assert_eq!(responses[1]["usage"]["input_tokens"], json!(20));
+        assert_eq!(field(&responses[0], "usage")["input_tokens"], json!(30));
+        assert_eq!(field(&responses[1], "usage")["input_tokens"], json!(20));
 
         // The ledger continues: the next reservation comes off the restored
         // balance, and what the resumed session records is its own.
@@ -1800,7 +1840,7 @@ mod tests {
             .expect("events")
             .pop()
             .expect("llm_response");
-        assert_eq!(recorded.kind(), KIND_LLM_RESPONSE);
+        assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(remaining(&resumed), Some(45), "5 reserved off the 50");
         assert_eq!(folded(&resumed), remaining(&resumed));
     }
@@ -1847,8 +1887,8 @@ mod tests {
             ],
             "the second grant is a recorded fact"
         );
-        assert_eq!(moves[2]["amount"], json!(50));
-        assert_eq!(moves[2]["desc"], json!("a little more"));
+        assert_eq!(*field(&moves[2], FIELD_AMOUNT), json!(50));
+        assert_eq!(*field(&moves[2], FIELD_DESC), json!("a little more"));
 
         // And the resumed run spends against the raised balance.
         assert_eq!(resumed.reserve(70), Ok(true));
@@ -1857,8 +1897,31 @@ mod tests {
         assert_eq!(folded(&resumed), remaining(&resumed));
     }
 
-    /// An older log with no `owner` on `session_opened` resumes as [`ANON`]
-    /// rather than failing — the field is a later addition.
+    /// Seed `stream` with a `session_opened` whose `data` is empty.
+    ///
+    /// The validator requires the scope on that kind, so this cannot be
+    /// written through the store: the row goes in behind it, which is what a
+    /// stream an upcaster could not bring all the way would look like.  The
+    /// resume fallbacks below are for exactly that, and this is the only way
+    /// to reach them.
+    fn seed_an_opening_with_no_scope(path: &std::path::Path, stream: &str) {
+        use crate::knl::SqliteEventStore;
+
+        // Open once so the table is there, then write past the validator.
+        drop(SqliteEventStore::open(path, stream).expect("open"));
+        let conn = rusqlite::Connection::open(path).expect("open the database directly");
+        conn.execute(
+            "INSERT INTO events \
+             (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+             VALUES (?1, 1, 0, ?2, 1, NULL, '{}', '{}')",
+            rusqlite::params![stream, KIND_SESSION_OPENED],
+        )
+        .expect("seed the opening");
+    }
+
+    /// A log whose `session_opened` carries no `owner` resumes as [`ANON`]
+    /// rather than failing: a stream that arrives missing the field is still
+    /// a session, and refusing it would lose the log rather than protect it.
     #[test]
     fn resume_falls_back_to_anon_when_the_log_has_no_owner() {
         use crate::knl::SqliteEventStore;
@@ -1866,15 +1929,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "legacy-stream";
-
-        // Write a session_opened with no owner field, as an older build
-        // would.
-        {
-            let mut store = SqliteEventStore::open(&path, stream).expect("open");
-            store
-                .append(kernel_event(KIND_SESSION_OPENED))
-                .expect("session_opened");
-        }
+        seed_an_opening_with_no_scope(&path, stream);
 
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(None, Box::new(store)).expect("resume");
@@ -1918,16 +1973,15 @@ mod tests {
         let last = ledger(&resumed).pop().expect("budget_reserved");
         assert_eq!(last.kind(), KIND_BUDGET_RESERVED);
         assert_eq!(
-            last.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            field(&last, FIELD_SCOPE_ID).as_str(),
             Some(opened_scope.as_str()),
             "{last}"
         );
     }
 
-    /// An older log with no `scope_id` on `session_opened` resumes under a
-    /// fresh kernel-issued one rather than failing — the field is a later
-    /// addition, exactly like `owner` above, and a session that predates it
-    /// is still a session.
+    /// A log whose `session_opened` carries no `scope_id` resumes under a
+    /// fresh kernel-issued one rather than failing — the sibling of the
+    /// `owner` fallback above, and for the same reason.
     #[test]
     fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
         use crate::knl::SqliteEventStore;
@@ -1935,14 +1989,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "legacy-scope-stream";
-
-        // An old-style opening: a session_opened carrying neither field.
-        {
-            let mut store = SqliteEventStore::open(&path, stream).expect("open");
-            store
-                .append(kernel_event(KIND_SESSION_OPENED))
-                .expect("session_opened");
-        }
+        seed_an_opening_with_no_scope(&path, stream);
 
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(Some(grant(50)), Box::new(store)).expect("resume");
@@ -1950,8 +1997,8 @@ mod tests {
         // The fallback is visible from both sides: the log says nothing…
         let opened = resumed.events(0).expect("events").remove(0);
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
-        assert_eq!(opened.get(FIELD_SCOPE_ID), None, "{opened}");
-        assert_eq!(opened.get("owner"), None, "{opened}");
+        assert_eq!(data_field(&opened, FIELD_SCOPE_ID), None, "{opened}");
+        assert_eq!(data_field(&opened, FIELD_OWNER), None, "{opened}");
         // …and the resumed session has a real scope all the same.
         assert!(
             !resumed.scope_id().is_empty(),
@@ -1963,7 +2010,7 @@ mod tests {
         let granted = ledger(&resumed).pop().expect("budget_granted");
         assert_eq!(granted.kind(), KIND_BUDGET_GRANTED);
         assert_eq!(
-            granted.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            field(&granted, FIELD_SCOPE_ID).as_str(),
             Some(resumed.scope_id()),
             "{granted}"
         );
@@ -2006,13 +2053,20 @@ mod tests {
     fn a_closed_stream_is_not_resumed() {
         let mut store = MemEventStore::new();
         store
-            .append(obj(json!({ "kind": "session_opened", "owner": "user-5" })))
+            .append(obj(json!({
+                "kind": "session_opened",
+                "data": { "scope_id": "scope-5", "owner": "user-5" }
+            })))
             .expect("seed the opening");
         store
-            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
+            .append(obj(
+                json!({ "kind": "budget_granted", "data": { "amount": 100 } }),
+            ))
             .expect("seed the grant");
         store
-            .append(obj(json!({ "kind": "session_closed", "reason": "done" })))
+            .append(obj(
+                json!({ "kind": "session_closed", "data": { "reason": "done" } }),
+            ))
             .expect("seed the ending");
 
         let err = Session::resume(None, Box::new(store))
@@ -2041,7 +2095,7 @@ mod tests {
         /// session is about to record.
         fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
             if !self.injected
-                && event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_LLM_RESPONSE)
+                && event.get(FIELD_KIND).and_then(Value::as_str) == Some("llm_response")
             {
                 self.injected = true;
                 self.inner
@@ -2107,7 +2161,7 @@ mod tests {
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
                 "sneaked_in",
-                KIND_LLM_RESPONSE
+                "llm_response"
             ],
             "the log interleaves in arrival order"
         );
@@ -2250,7 +2304,7 @@ mod tests {
         let log = as_current(verify.read(0, usize::MAX).expect("read log"));
         let responses: Vec<u64> = log
             .iter()
-            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+            .filter(|e| e.kind() == "llm_response")
             .map(Current::seq)
             .collect();
         assert_eq!(responses, [3, 4, 5], "every append landed, in order");
@@ -2303,8 +2357,12 @@ mod tests {
             "one grant, one reservation, one refusal"
         );
         let refused = log.last().expect("the refusal");
-        assert_eq!(refused["amount"], json!(6));
-        assert_eq!(refused["remaining"], json!(4), "what there really was");
+        assert_eq!(*field(refused, FIELD_AMOUNT), json!(6));
+        assert_eq!(
+            *field(refused, FIELD_REMAINING),
+            json!(4),
+            "what there really was"
+        );
     }
 
     /// (Concurrency) "Closed" is the handle's, and the log records what
@@ -2378,8 +2436,8 @@ mod tests {
             .filter(|event| event.kind() == KIND_SESSION_CLOSED)
             .collect();
         assert_eq!(endings.len(), 2, "two handles closed, two endings recorded");
-        assert_eq!(endings[0]["reason"], json!("done"));
-        assert_eq!(endings[1]["reason"], json!("late"));
+        assert_eq!(*field(endings[0], FIELD_REASON), json!("done"));
+        assert_eq!(*field(endings[1], FIELD_REASON), json!("late"));
         assert_eq!(
             fold_balance(&log),
             Some(85),
@@ -2512,7 +2570,7 @@ mod tests {
             };
             let renamed = match map.get(FIELD_KIND).and_then(Value::as_str) {
                 Some("legacy_opened") => Some(KIND_SESSION_OPENED),
-                Some("legacy_response") => Some(KIND_LLM_RESPONSE),
+                Some("legacy_response") => Some("llm_response"),
                 _ => None,
             };
             if let Some(kind) = renamed {
@@ -2542,23 +2600,25 @@ mod tests {
         // written under.
         {
             let mut store = SqliteEventStore::open(&path, stream).expect("open");
-            let mut opened = kernel_event("legacy_opened");
-            opened.insert(FIELD_OWNER.to_string(), Value::from("user-3"));
-            opened.insert(
-                FIELD_SCOPE_ID.to_string(),
-                Value::from("scope-from-the-log"),
-            );
-            store.append(opened).expect("the opening");
             store
-                .append(obj(
-                    json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens" }),
-                ))
+                .append(obj(json!({
+                    "kind": "legacy_opened",
+                    "data": { "owner": "user-3", "scope_id": "scope-from-the-log" }
+                })))
+                .expect("the opening");
+            store
+                .append(obj(json!({
+                    "kind": "budget_granted",
+                    "data": { "amount": 100, "tag": "tokens" }
+                })))
                 .expect("the grant");
             store
                 .append(obj(json!({
                     "kind": "legacy_response", "beat": "b-1",
-                    "content": [{ "type": "text", "text": "ok" }],
-                    "usage": { "input_tokens": 7 }
+                    "data": {
+                        "content": [{ "type": "text", "text": "ok" }],
+                        "usage": { "input_tokens": 7 }
+                    }
                 })))
                 .expect("the response");
         }
@@ -2587,7 +2647,7 @@ mod tests {
         let log = resumed.events(0).expect("events");
         assert_eq!(
             kinds(&log),
-            [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, KIND_LLM_RESPONSE],
+            [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, "llm_response"],
             "every read is projected"
         );
         let tail = resumed
@@ -2596,10 +2656,10 @@ mod tests {
         let last = &tail.as_array().expect("array")[0];
         assert_eq!(
             kind_of(last),
-            KIND_LLM_RESPONSE,
+            "llm_response",
             "the view read the projected kind: {last}"
         );
-        assert_eq!(last["usage"]["input_tokens"], json!(7));
+        assert_eq!(last[FIELD_DATA]["usage"]["input_tokens"], json!(7));
         assert_eq!(remaining(&resumed), Some(100), "the balance folds too");
 
         // The stored rows were not rewritten: read them without the seam and
@@ -2642,10 +2702,15 @@ mod tests {
         {
             let mut store = SqliteEventStore::open(&path, stream).expect("open");
             store
-                .append(kernel_event("legacy_opened"))
+                .append(obj(json!({
+                    "kind": "legacy_opened",
+                    "data": { "owner": "user-3", "scope_id": "scope-from-the-log" }
+                })))
                 .expect("the opening");
             store
-                .append(obj(json!({ "kind": "session_closed", "reason": "done" })))
+                .append(obj(json!({
+                    "kind": "session_closed", "data": { "reason": "done" }
+                })))
                 .expect("the ending");
         }
 
@@ -2674,7 +2739,7 @@ mod tests {
     fn an_in_memory_stream_is_resumable_while_it_is_open() {
         let mut s = new_session(Some(100));
         assert_eq!(s.reserve(30), Ok(true));
-        s.append(obj(json!({ "kind": "note", "text": "hi" })))
+        s.append(obj(json!({ "kind": "note", "data": { "text": "hi" } })))
             .expect("append");
 
         // The session id *is* the stream, so it is what a resume names.
@@ -2707,8 +2772,10 @@ mod tests {
     #[test]
     fn a_session_reads_its_own_log_with_sql() {
         let mut s = new_session(None);
-        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
-            .expect("append");
+        s.append(obj(
+            json!({ "kind": "msg_user", "data": { "content": "hi" } }),
+        ))
+        .expect("append");
         s.append(response(9)).expect("recorded");
 
         let found = s
@@ -2724,7 +2791,7 @@ mod tests {
             .iter()
             .map(|row| row["kind"].as_str().expect("a kind"))
             .collect();
-        assert_eq!(kinds, [KIND_SESSION_OPENED, "msg_user", KIND_LLM_RESPONSE]);
+        assert_eq!(kinds, [KIND_SESSION_OPENED, "msg_user", "llm_response"]);
 
         // A fold the kernel does not name — how many events of each kind —
         // is a query rather than a view it had to be taught.

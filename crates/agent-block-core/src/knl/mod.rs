@@ -79,12 +79,52 @@
 //!   The kernel never generates one and never requires one; it only
 //!   insists that a present `beat` is a string.
 //!
+//! - **The stored shape is envelope + meta + data.**  An event is an
+//!   envelope ([`FIELD_KIND`], an optional `beat`, the kernel's `seq` /
+//!   `epoch_ms` / `_schema_version`), a shallow `meta`, and a `data` object
+//!   that holds the kind's own content.  Nothing else may sit at the top
+//!   level — see the section below.
+//!
 //! - **One backend, and the log is a table.**  A session's events live in
 //!   SQLite whether the session is durable (a file) or ephemeral (an
 //!   in-memory database) — [`SqliteEventStore`], the only [`EventStore`] the
 //!   product has.  That is not an implementation detail: the read side below
 //!   is SQL, and a log that could not be queried would be a second, lesser
 //!   kind of session.  The `Vec`-backed store is `#[cfg(test)]`.
+//!
+//! # Stored shape
+//!
+//! An event has three levels, and they are separated so that a reader can
+//! tell which of them it is reading:
+//!
+//! ```text
+//! envelope   kind, beat, seq, epoch_ms, _schema_version   ← columns; never renamed
+//! meta       { label = "a", attempt = 2 }                 ← shallow by rule: scalars only
+//! data       { content = { … }, usage = { … } }           ← the kind's own, any depth
+//! ```
+//!
+//! - The **envelope** is the stable contract.  Its keys are the columns of
+//!   the `events` table ([`events_schema`]), and they do not get renamed: a
+//!   view built on them is unaffected by any kind changing shape.
+//! - **`meta`** holds scalars — a string, a number or a boolean — and
+//!   nesting is refused.  That is what makes it readable without knowing the
+//!   kind: a label to group by, a flag to filter on.
+//! - **`data`** is the only place structured JSON lives, and its shape
+//!   belongs to whoever writes the kind.  The kernel checks the `data` of the
+//!   six kinds it writes itself ([`is_kernel_only`]) and of no others; the
+//!   kinds a turn is made of are the Lua kernel's, declared where they are
+//!   written.
+//!
+//! The rule that follows, and the reason for the split: **a SQL view that
+//! reads a `data` path is updated in the same round as the kind whose shape
+//! it reads.**  When everything sat at one level, a change to what one kind
+//! recorded broke a `json_extract` path with nothing to say which change had
+//! done it.  Structured JSON is unavoidable in an event log; confining it to
+//! one key is what makes its evolution reviewable.
+//!
+//! `_schema_version` is the whole *object's*, not `data`'s: the upcaster seam
+//! ([`Upcaster`], [`Current`]) applies to the event as it was stored, and
+//! `data` is simply where the changes it will have to absorb happen.
 //!
 //! # A view is derived, and the views are spread across two halves
 //!
@@ -142,7 +182,6 @@ pub use event_store::{
     EventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
-pub use projection::Views;
 pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
 pub use scope::{Scope, ScopeId};
 pub use session::{

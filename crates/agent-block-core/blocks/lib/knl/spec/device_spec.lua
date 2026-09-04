@@ -28,10 +28,12 @@
 --   7 tool_policy's decision vocabulary is nil / "run" / "deny" and nothing
 --     else; a raise denies (fail-closed) and a fourth value stops the beat
 --     with err("conf") before any tool runs (§9-l).
---   8 the shapes M.shapes publishes cover every public IF (§9-k). The
---     kernel's per-kind event contracts are NOT among them: the Rust
---     validator is their one source of truth, and all this layer adds is
---     that a `beat` stamp is a string (§11 R7).
+--   8 the shapes M.shapes publishes cover every public IF (§9-k) — the
+--     `data` shape of every kind a beat writes among them (view-design.md
+--     §6 item 2: the kernel validates the envelope and its own kinds, the
+--     writer owns the rest), plus the two envelope rules this layer mirrors
+--     so they fail at the append instead of at the syscall (`beat` is a
+--     string, `meta` is shallow).
 --   9 a syscall failure is reported as the kernel's own reading of it
 --     (`Outcome.err("state").detail` = { kind?, method?, retryable,
 --     message }, §9-r) rather than as a sentence, and beat never acts on
@@ -432,7 +434,7 @@ describe("knl.open / knl.resume — state only", function()
     it("returns the kernel session itself (no Lua wrapper)", function()
         local s = K.open({ owner = "spec" })
         expect(s:owner()).to.be("spec")
-        s:append({ kind = "msg_user", content = "hello" })
+        s:append({ kind = "msg_user", data = { content = "hello" } })
         local evs = s:events()
         expect(#evs).to.be(1)
         expect(evs[1].seq).to.be(1) -- kernel-owned stamp
@@ -481,7 +483,7 @@ describe("knl.beat — the primitive", function()
     it("one beat: records llm_request + llm_response under one declared id", function()
         local s = K.open({})
         local d = K.device({ llm = stub_llm("answer") })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(type(o.out.beat)).to.be("string")
@@ -498,7 +500,7 @@ describe("knl.beat — the primitive", function()
     it("stamps every event of one beat — model response and tool pair — with the same id", function()
         local s = K.open({})
         local d = K.device({ llm = llm_with_tool("echo"), tools = echo_tools() })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_ok(o)).to.be(true)
 
@@ -519,7 +521,7 @@ describe("knl.beat — the primitive", function()
     it("two beats declare two different ids (no numbering, no read-back)", function()
         local s = K.open({})
         local d = K.device({ llm = stub_llm("x") })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local first = K.beat(s, d)
         local second = K.beat(s, d)
         expect(Outcome.is_ok(first)).to.be(true)
@@ -534,7 +536,7 @@ describe("knl.beat — the primitive", function()
         -- One unit granted, one unit per beat: the second beat is refused.
         local s = K.open({ budget = { amount = 1, tag = "beats" } })
         local d = K.device({ llm = stub_llm("x") })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
         expect(s:remaining()).to.be(0) -- the beat reserved it; the appends did not
 
@@ -558,7 +560,7 @@ describe("knl.beat — the primitive", function()
                 return 4
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
         expect(s:remaining()).to.be(6)
         expect(asked[1]).to.be(1) -- the policy saw the request, not the events
@@ -593,7 +595,7 @@ describe("knl.beat — the primitive", function()
         end
         local s = K.open({})
         local d = K.device({ llm = tagged("weak") })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         K.beat(s, d)
         K.beat(s, d:with({ llm = tagged("strong") }))
         K.beat(s, d)
@@ -616,7 +618,7 @@ describe("knl.session — the canonical bracket", function()
         local seen
         local first, second = K.session({ owner = "spec" }, function(s)
             seen = s
-            s:append({ kind = "msg_user", content = "q" })
+            s:append({ kind = "msg_user", data = { content = "q" } })
             return "one", 2
         end)
         expect(first).to.be("one")
@@ -652,7 +654,7 @@ describe("knl.session — the canonical bracket", function()
             outer_id = o
             K.session({ owner = "inner" }, function(i)
                 inner_id = i
-                i:append({ kind = "msg_user", content = "in" })
+                i:append({ kind = "msg_user", data = { content = "in" } })
             end)
             expect(#o:events()).to.be(0)
         end)
@@ -666,7 +668,7 @@ describe("knl.session — the canonical bracket", function()
         local out = K.session({ owner = "spec", budget = { amount = 5, tag = "beats" } }, function(session)
             s = session
             local d = K.device({ llm = stub_llm("hi") })
-            session:append({ kind = "msg_user", content = "q" })
+            session:append({ kind = "msg_user", data = { content = "q" } })
             return K.beat(session, d)
         end)
         expect(Outcome.is_ok(out)).to.be(true)
@@ -787,6 +789,8 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             "outcome",
             "request",
             "event_base",
+            "event_meta",
+            "events",
             "device_config",
             "tool_entry",
             "tool_policy_decision",
@@ -858,20 +862,45 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
         end)
     end)
 
-    it("does not redefine the kernel's per-kind event contracts (one SoT)", function()
-        -- The Rust validator owns msg_user / llm_request / llm_response /
-        -- llm_call_failed / tool_call / tool_result. A second copy here
-        -- drifted from it in three fields, so there is none: what this
-        -- layer contributes is the `beat` stamp, and that is all it checks.
-        expect(K.shapes.events).to.be(nil)
+    it("owns the `data` shape of every kind it writes (one SoT, on this side)", function()
+        -- The kernel validates the envelope and the `data` of its OWN kinds
+        -- (session_* / budget_*) and stopped judging these, so there is one
+        -- declaration of them and it is here.
+        for _, kind in ipairs({
+            "msg_user",
+            "llm_request",
+            "llm_response",
+            "llm_call_failed",
+            "tool_call",
+            "tool_result",
+        }) do
+            expect(K.shapes.events[kind]).to.exist()
+        end
+        -- and each is closed: a stray key inside `data` is a column a view
+        -- would eventually select, so it fails where it was written
+        expect(shape.check({ call_id = "c1", ok = true, result = "R" }, K.shapes.events.tool_result)).to.be(true)
+        expect(shape.check({ call_id = "c1", ok = true, result = "R", extra = 1 }, K.shapes.events.tool_result)).to.be(
+            false
+        )
+        expect(shape.check({ call_id = "c1", ok = "yes", result = "R" }, K.shapes.events.tool_result)).to.be(false)
+    end)
+
+    it("holds the envelope to the rules this layer mirrors", function()
+        -- `beat` is an opaque string, `meta` is SHALLOW (labels, not a
+        -- second `data`), and the kernel refuses the same two at the
+        -- syscall — this is the copy that fails at the line that wrote it.
         expect(shape.check({ kind = "llm_response" }, K.shapes.event_base)).to.be(true)
         expect(shape.check({ kind = "llm_response", beat = 42 }, K.shapes.event_base)).to.be(false)
+        expect(shape.check({ kind = "msg_user", meta = { label = "seed", n = 1, on = true } }, K.shapes.event_base)).to.be(
+            true
+        )
+        expect(shape.check({ kind = "msg_user", meta = { label = { deep = 1 } } }, K.shapes.event_base)).to.be(false)
     end)
 
     it("a beat's Outcome validates against the outcome shape", function()
         local s = K.open({})
         local d = K.device({ llm = stub_llm("shaped") })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         expect(shape.check(K.beat(s, d), K.shapes.outcome)).to.be(true)
     end)
 
@@ -907,7 +936,7 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
                     end,
                 },
             })
-            s:append({ kind = "msg_user", content = "q" })
+            s:append({ kind = "msg_user", data = { content = "q" } })
             expect(function()
                 K.beat(s, d)
             end).to.fail()
@@ -971,7 +1000,7 @@ describe("beat contract hardening (review findings)", function()
                 error("adapter exploded")
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("call")
@@ -989,7 +1018,7 @@ describe("beat contract hardening (review findings)", function()
                     return answer
                 end,
             })
-            s:append({ kind = "msg_user", content = "q" })
+            s:append({ kind = "msg_user", data = { content = "q" } })
             local o = K.beat(s, d)
             expect(Outcome.is_error(o)).to.be(true)
             expect(o.kind).to.be("call")
@@ -1067,7 +1096,7 @@ describe("beat contract hardening (review findings)", function()
                 return nil, "network down"
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("state") -- the winner: the record that did not land
@@ -1091,7 +1120,7 @@ describe("beat contract hardening (review findings)", function()
                 }
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("call")
@@ -1115,7 +1144,7 @@ describe("beat contract hardening (review findings)", function()
                 end,
             },
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("filter")
@@ -1140,7 +1169,7 @@ describe("beat contract hardening (review findings)", function()
                 }
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_refused(o)).to.be(true)
         expect(o.reason).to.be("content_filter")
@@ -1166,7 +1195,7 @@ describe("beat contract hardening (review findings)", function()
                 }
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("call")
@@ -1192,7 +1221,7 @@ describe("beat contract hardening (review findings)", function()
                 error("policy bug")
             end,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         local o = K.beat(s, d)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(ran).to.be(false) -- the handler never executed
@@ -1234,7 +1263,7 @@ describe("tool_policy — the decision contract", function()
             },
             tool_policy = policy,
         })
-        s:append({ kind = "msg_user", content = "q" })
+        s:append({ kind = "msg_user", data = { content = "q" } })
         return K.beat(s, d), s, ran and true or false
     end
 
@@ -1250,7 +1279,7 @@ describe("tool_policy — the decision contract", function()
             expect(Outcome.is_ok(o)).to.be(true)
             expect(ran).to.be(true)
             expect(o.out.tools[1].ok).to.be(true)
-            expect(s:events()[#s:events()].result).to.be("side effect")
+            expect(s:events()[#s:events()].data.result).to.be("side effect")
         end
     end)
 
@@ -1263,15 +1292,15 @@ describe("tool_policy — the decision contract", function()
         expect(o.out.tools[1].ok).to.be(false)
         local last = s:events()[#s:events()]
         expect(last.kind).to.be("tool_result")
-        expect(last.ok).to.be(false)
-        expect(last.result).to.be("tool 'danger' denied by policy")
+        expect(last.data.ok).to.be(false)
+        expect(last.data.result).to.be("tool 'danger' denied by policy")
     end)
 
     it("a denial's reason rides in the tool_result", function()
         local _, s = beat_with(function()
             return "deny", "not on this scope"
         end)
-        expect(s:events()[#s:events()].result).to.be("tool 'danger' denied by policy: not on this scope")
+        expect(s:events()[#s:events()].data.result).to.be("tool 'danger' denied by policy: not on this scope")
     end)
 
     it("a raising policy denies (fail-closed) and says so", function()
@@ -1281,7 +1310,7 @@ describe("tool_policy — the decision contract", function()
         expect(Outcome.is_ok(o)).to.be(true)
         expect(ran).to.be(false)
         expect(o.out.tools[1].ok).to.be(false)
-        expect(s:events()[#s:events()].result:find("policy raised", 1, true) ~= nil).to.be(true)
+        expect(s:events()[#s:events()].data.result:find("policy raised", 1, true) ~= nil).to.be(true)
     end)
 
     it("any other decision is Error('conf') and nothing runs", function()
@@ -1326,19 +1355,22 @@ describe("fold hardening (review findings)", function()
 
     it("a dangling tool_use (crash mid-tool) is closed with a synthetic error result", function()
         local events = {
-            { kind = "msg_user", content = "go", seq = 1 },
+            { kind = "msg_user", data = { content = "go" }, seq = 1 },
             {
                 kind = "llm_response",
                 beat = "b1",
-                content = {
-                    { type = "text", text = "using tools" },
-                    { type = "tool_use", id = "c1", name = "t", input = {} },
-                    { type = "tool_use", id = "c2", name = "t", input = {} },
+                data = {
+                    content = {
+                        { type = "text", text = "using tools" },
+                        { type = "tool_use", id = "c1", name = "t", input = {} },
+                        { type = "tool_use", id = "c2", name = "t", input = {} },
+                    },
+                    usage = {},
                 },
                 seq = 2,
             },
             -- c1 was answered before the crash; c2 was not
-            { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 3 },
+            { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 3 },
         }
         local req = K.fold(events, {})
         -- user "go" / assistant / user [c1 result + synthetic c2 result]
@@ -1355,11 +1387,16 @@ describe("fold hardening (review findings)", function()
             {
                 kind = "llm_response",
                 beat = "b1",
-                content = { { type = "tool_use", id = "c1", name = "t", input = {} } },
+                data = { content = { { type = "tool_use", id = "c1", name = "t", input = {} } }, usage = {} },
                 seq = 1,
             },
-            { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 2 },
-            { kind = "llm_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 3 },
+            { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 2 },
+            {
+                kind = "llm_response",
+                beat = "b2",
+                data = { content = { { type = "text", text = "done" } }, usage = {} },
+                seq = 3,
+            },
         }
         local req = K.fold(events, {})
         expect(#req.messages).to.be(3)

@@ -24,10 +24,10 @@
 //! policy and stays out.  The conversation rendered for a provider is the
 //! case in point — which role each kind maps to, whether a system message
 //! belongs in it, where to cut it off are all the shell's decisions — and so
-//! is the token account, which reads the `llm_response` payload the kernel
-//! has no opinion about.  Both are written on the Lua side: over the
-//! incremental event read (`events(from)`), or as a query view in SQL over
-//! the published schema (`session:query`, `knl.views.usage`).
+//! is the token account, which reads the `data` of an `llm_response`, a
+//! shape the kernel has no opinion about.  Both are written on the Lua side:
+//! over the incremental event read (`events(from)`), or as a query view in
+//! SQL over the published schema (`session:query`, `knl.views.usage`).
 
 use serde_json::{Map, Value};
 
@@ -41,31 +41,6 @@ pub const VIEW_TAIL: &str = "tail";
 pub const OPT_N: &str = "n";
 /// How many events `tail` returns when `n` is not given.
 pub const DEFAULT_TAIL_N: usize = 20;
-
-/// A stored number as a whole one (`0` when absent or not numeric).
-///
-/// The reading the ledger fold takes its amounts through
-/// ([`super::budget::fold_balance`]): a payload field is whatever was
-/// written, and a fold over the log must total what is there rather than
-/// stop at what is not.
-pub(super) fn whole(value: &Value) -> i64 {
-    value
-        .as_i64()
-        .or_else(|| value.as_f64().map(|f| f.trunc() as i64))
-        .unwrap_or(0)
-}
-
-/// Where a session's cached folds would live.
-///
-/// Empty, and that is the state of the vocabulary rather than an oversight:
-/// the kernel's read primitives are `events(from)` and `tail(n)`, and
-/// neither accumulates anything — `tail` reads the end of the log, so there
-/// is nothing to carry between calls, and a session holds no cache of one.
-/// The type keeps the contract for a fold the kernel might name again: a
-/// cached value an equivalent from-scratch recomputation must agree with, at
-/// every step.
-#[derive(Debug, Clone, Default)]
-pub struct Views;
 
 /// The `tail` view: the last `n` of `events`, verbatim.
 ///
@@ -105,9 +80,7 @@ pub fn tail_count(opts: Option<&Map<String, Value>>) -> KnlResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{
-        kind_of, FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT, KIND_LLM_RESPONSE,
-    };
+    use crate::knl::event::{data_field, kind_of, FIELD_DATA};
     use crate::knl::History;
     use serde_json::json;
 
@@ -140,37 +113,48 @@ mod tests {
             .unwrap_or_else(|e| panic!("append {event}: {e}"));
     }
 
-    /// A history covering every reserved kind plus an open one.
+    /// A history covering a whole beat, plus a kind of the shell's own.
     fn mixed_history() -> History {
         let mut h = History::new();
-        append(&mut h, json!({ "kind": "session_opened" }));
-        append(&mut h, json!({ "kind": "msg_user", "content": "hi" }));
+        append(
+            &mut h,
+            json!({
+                "kind": "session_opened",
+                "data": { "scope_id": "scope-1", "owner": "anon" }
+            }),
+        );
+        append(
+            &mut h,
+            json!({ "kind": "msg_user", "data": { "content": "hi" } }),
+        );
         append(
             &mut h,
             json!({
                 "kind": "llm_response",
                 "beat": "b1",
-                "content": [{ "type": "text", "text": "ok" }],
-                "usage": { "input_tokens": 10, "output_tokens": 3 }
+                "data": {
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "usage": { "input_tokens": 10, "output_tokens": 3 }
+                }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "tool_call", "beat": "b1", "call_id": "c1",
-                "name": "sh", "args": { "cmd": "ls" }
+                "kind": "tool_call", "beat": "b1",
+                "data": { "call_id": "c1", "name": "sh", "args": { "cmd": "ls" } }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "tool_result", "beat": "b1", "call_id": "c1",
-                "ok": false, "result": "boom"
+                "kind": "tool_result", "beat": "b1",
+                "data": { "call_id": "c1", "ok": false, "result": "boom" }
             }),
         );
         append(
             &mut h,
-            json!({ "kind": "note", "text": "no part of a request" }),
+            json!({ "kind": "note", "data": { "text": "no part of a request" } }),
         );
         h
     }
@@ -195,18 +179,22 @@ mod tests {
             ]
         );
 
-        assert_eq!(events[1][FIELD_CONTENT], json!("hi"));
+        // Each kind's own fields are under `data`, verbatim — the kernel
+        // stores what was written and reads none of it.
+        assert_eq!(events[1][FIELD_DATA], json!({ "content": "hi" }));
         assert_eq!(
-            events[2][FIELD_CONTENT],
-            json!([{ "type": "text", "text": "ok" }])
+            data_field(&events[2], "content"),
+            Some(&json!([{ "type": "text", "text": "ok" }]))
         );
-        assert_eq!(events[4][FIELD_CALL_ID], json!("c1"));
-        assert_eq!(events[4][FIELD_OK], json!(false));
-        assert_eq!(events[4][FIELD_RESULT], json!("boom"));
+        assert_eq!(
+            events[4][FIELD_DATA],
+            json!({ "call_id": "c1", "ok": false, "result": "boom" })
+        );
 
         // The envelope stays on: an event read hands back the record, not
         // a row shaped for a particular reader.
         assert!(events[1].get("seq").is_some(), "{}", events[1]);
+        assert_eq!(events[3]["beat"], json!("b1"), "{}", events[3]);
     }
 
     /// A conversation the caller carried in is material like any other:
@@ -219,37 +207,42 @@ mod tests {
             &mut h,
             json!({
                 "kind": "llm_response", "beat": "b1",
-                "content": [{ "type": "text", "text": "said last time" }],
-                "usage": { "input_tokens": 9_000 }
+                "data": {
+                    "content": [{ "type": "text", "text": "said last time" }],
+                    "usage": { "input_tokens": 9_000 }
+                }
             }),
         );
-        append(&mut h, json!({ "kind": "msg_user", "content": "and now?" }));
+        append(
+            &mut h,
+            json!({ "kind": "msg_user", "data": { "content": "and now?" } }),
+        );
 
         let events = since(&h, 0);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].kind(), KIND_LLM_RESPONSE);
+        assert_eq!(events[0].kind(), "llm_response");
         assert_eq!(
-            events[0][FIELD_CONTENT],
-            json!([{ "type": "text", "text": "said last time" }])
+            data_field(&events[0], "content"),
+            Some(&json!([{ "type": "text", "text": "said last time" }]))
         );
         assert_eq!(events[1].kind(), "msg_user");
     }
 
     /// The token account is not one of the names any more: it reads the
-    /// `llm_response` payload, which is the shell's vocabulary, so it is a
-    /// query view in Lua (`knl.views.usage`) over the published schema.
+    /// `data` of an `llm_response`, which is the shell's vocabulary, so it is
+    /// a query view in Lua (`knl.views.usage`) over the published schema.
     /// What the kernel still hands it is the record, in `seq` order.
     #[test]
-    fn the_token_account_is_read_from_the_payload_the_kernel_stores_verbatim() {
+    fn the_token_account_is_read_from_the_data_the_kernel_stores_verbatim() {
         let events = since(&mixed_history(), 0);
         let responses: Vec<&Current> = events
             .iter()
-            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+            .filter(|e| e.kind() == "llm_response")
             .collect();
         assert_eq!(responses.len(), 1, "{events:?}");
         assert_eq!(
-            responses[0]["usage"],
-            json!({ "input_tokens": 10, "output_tokens": 3 }),
+            data_field(responses[0], "usage"),
+            Some(&json!({ "input_tokens": 10, "output_tokens": 3 })),
             "the counts are stored as the provider reported them"
         );
     }

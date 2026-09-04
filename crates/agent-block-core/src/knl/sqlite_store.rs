@@ -30,13 +30,35 @@
 //! Within it, a stream is a stream: [`super::Session::resume`] reopens one by
 //! name exactly as it reopens a file.
 //!
-//! # Reads are indexed by kind
+//! # The stored shape is columns, and one of them is the kind's own
+//!
+//! The event's envelope is columns — `stream` / `seq` / `epoch_ms` / `kind` /
+//! `schema_version` / `beat` — and the two objects it carries are one column
+//! each: `meta`, a shallow table of scalars, and `data`, the kind's own
+//! content at any depth ([`super::event`]).  A read rebuilds exactly the
+//! object that was written, so a caller sees no difference between this and a
+//! log kept in memory.
+//!
+//! The whole event used to go into a single `payload` column, which put an
+//! envelope key and a kind's own field at the same level for anything reading
+//! the log with SQL: a `json_extract` could not say which of the two it was
+//! reaching into, and a kind changing shape broke a view with nothing to
+//! point at.  Now the columns *are* the contract — a view over them is
+//! unaffected by any kind — and the paths that need watching are all inside
+//! `data`.
+//!
+//! # Reads are indexed by kind, and by beat
 //!
 //! The table carries a `(stream, kind, seq)` index beside its `(stream, seq)`
 //! primary key, so a kind-filtered read ([`EventStore::read_kinds`], and the
 //! decision input of [`EventStore::append_if`]) costs the size of the *fold*
 //! rather than the size of the stream: folding the balance reads the
 //! `budget_*` events, not every fact the session ever recorded.
+//!
+//! `beat` has a column and a `(stream, beat, seq)` index of its own, because
+//! it is the one correlation the log itself is grouped by: the events of one
+//! beat are a range of that index rather than a scan with a `json_extract`
+//! in the predicate.
 //!
 //! # The read side is a second connection, and it cannot write
 //!
@@ -85,7 +107,10 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, TransactionBehavior};
 use serde_json::{Map, Value};
 
-use super::event::{stamp, validate_event, FIELD_KIND};
+use super::event::{
+    stamp, validate_event, FIELD_BEAT, FIELD_DATA, FIELD_EPOCH_MS, FIELD_KIND, FIELD_META,
+    FIELD_SEQ,
+};
 use super::event_store::{
     stamp_schema_version, Committed, Decision, EventStore, CURRENT_SCHEMA_VERSION,
     SCHEMA_VERSION_FIELD,
@@ -100,24 +125,34 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// ([`events_schema`]).
 pub const EVENTS_TABLE: &str = "events";
 
-/// The DDL for [`EVENTS_TABLE`] and its by-kind index.
+/// The DDL for [`EVENTS_TABLE`] and its two indexes.
 ///
-/// `IF NOT EXISTS` on both, so opening a fresh database and reopening one an
-/// earlier build wrote take the same path.  The `(stream, kind, seq)` index is
-/// what makes a kind-filtered read cost the size of the fold rather than the
-/// size of the stream, and it keeps the rows in `seq` order within a kind, so
-/// the read needs no sort.
+/// `IF NOT EXISTS` throughout, so opening a fresh database and reopening one
+/// an earlier build wrote take the same path.  The `(stream, kind, seq)`
+/// index is what makes a kind-filtered read cost the size of the fold rather
+/// than the size of the stream, and it keeps the rows in `seq` order within a
+/// kind, so the read needs no sort; `(stream, beat, seq)` does the same for
+/// the events of one beat.
+///
+/// `beat` is the one nullable column: it is the caller's to declare and most
+/// events do not belong to a beat.  `meta` and `data` are `NOT NULL` because
+/// they are filled in with `{}` on the way in ([`stamp`]), so a reader never
+/// has to tell an empty object from a missing one.
 const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS events ( \
          stream         TEXT    NOT NULL, \
          seq            INTEGER NOT NULL, \
          epoch_ms       INTEGER NOT NULL, \
          kind           TEXT    NOT NULL, \
          schema_version INTEGER NOT NULL, \
-         payload        TEXT    NOT NULL, \
+         beat           TEXT    NULL, \
+         meta           TEXT    NOT NULL, \
+         data           TEXT    NOT NULL, \
          PRIMARY KEY (stream, seq) \
      ); \
      CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
-         ON events (stream, kind, seq);";
+         ON events (stream, kind, seq); \
+     CREATE INDEX IF NOT EXISTS events_stream_beat_seq \
+         ON events (stream, beat, seq);";
 
 /// One column of [`EVENTS_TABLE`], as SQLite itself reports it.
 ///
@@ -375,17 +410,14 @@ impl EventStore for SqliteEventStore {
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
         let (sql, args) = read_query(&self.stream, kinds, from_seq, capped);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args.iter()), |row| row.get::<_, String>(0))?;
-        // A read that cannot prepare/query is a fault, and a row whose payload
-        // does not decode is corruption — both surface as an error rather than
-        // being silently dropped, so a caller (resume) never re-folds a
-        // truncated log into the wrong state.
+        let rows = stmt.query_map(params_from_iter(args.iter()), read_row)?;
+        // A read that cannot prepare/query is a fault, and a row whose stored
+        // objects do not decode is corruption — both surface as an error
+        // rather than being silently dropped, so a caller (resume) never
+        // re-folds a truncated log into the wrong state.
         let mut events = Vec::new();
         for row in rows {
-            let payload = row?;
-            let value = serde_json::from_str::<Value>(&payload)
-                .map_err(|e| KnlError::Corruption(format!("sqlite: corrupt event payload: {e}")))?;
-            events.push(value);
+            events.push(event_of(row?)?);
         }
         Ok(events)
     }
@@ -812,7 +844,89 @@ fn append_if_attempt(
     Ok(Some(Committed { seq, epoch_ms }))
 }
 
-/// The `SELECT payload` statement for a read, with its bound arguments.
+/// The columns a read selects, in the order [`read_row`] takes them.
+const READ_COLUMNS: &str = "seq, epoch_ms, kind, schema_version, beat, meta, data";
+
+/// One stored row, as its columns come back from SQLite.
+///
+/// The raw values, before the two JSON columns are decoded: reading and
+/// decoding are separate so a fault on the read (retryable) and a value that
+/// will not decode (corruption) stay two different answers.
+struct StoredRow {
+    /// The store-assigned sequence number.
+    seq: i64,
+    /// The wall-clock append time the store stamped.
+    epoch_ms: i64,
+    /// The event's kind.
+    kind: String,
+    /// The shape the event was written under.
+    schema_version: i64,
+    /// The beat the caller declared, if it declared one.
+    beat: Option<String>,
+    /// The shallow `meta` object, as stored text.
+    meta: String,
+    /// The kind's own `data` object, as stored text.
+    data: String,
+}
+
+/// Take one row's columns, in [`READ_COLUMNS`] order.
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
+    Ok(StoredRow {
+        seq: row.get(0)?,
+        epoch_ms: row.get(1)?,
+        kind: row.get(2)?,
+        schema_version: row.get(3)?,
+        beat: row.get(4)?,
+        meta: row.get(5)?,
+        data: row.get(6)?,
+    })
+}
+
+/// Rebuild the event object a row was written from.
+///
+/// The inverse of [`insert_row`], and exactly that: the same keys in the same
+/// envelope, so a caller reading a durable log sees what it wrote.  An absent
+/// `beat` is an absent key rather than a null — the kernel's rule is that a
+/// beat is a string when it is there at all.
+fn event_of(row: StoredRow) -> KnlResult<Value> {
+    let meta = decode_object(&row.meta, FIELD_META)?;
+    let data = decode_object(&row.data, FIELD_DATA)?;
+
+    let mut event = Map::new();
+    event.insert(FIELD_KIND.to_string(), Value::from(row.kind));
+    if let Some(beat) = row.beat {
+        event.insert(FIELD_BEAT.to_string(), Value::from(beat));
+    }
+    event.insert(FIELD_META.to_string(), meta);
+    event.insert(FIELD_DATA.to_string(), data);
+    event.insert(FIELD_SEQ.to_string(), Value::from(row.seq as u64));
+    event.insert(FIELD_EPOCH_MS.to_string(), Value::from(row.epoch_ms as u64));
+    event.insert(
+        SCHEMA_VERSION_FIELD.to_string(),
+        Value::from(row.schema_version as u64),
+    );
+    Ok(Value::Object(event))
+}
+
+/// Decode a stored JSON column, which must be an object.
+///
+/// Corruption rather than storage: the IO worked and the bytes came back, so
+/// what is wrong is the data, and no retry changes it.  A value that is not
+/// an object is the same fault as one that will not parse — the store's own
+/// writes are objects, so a scalar here came from the bytes.
+fn decode_object(text: &str, column: &str) -> KnlResult<Value> {
+    let value = serde_json::from_str::<Value>(text)
+        .map_err(|e| KnlError::Corruption(format!("sqlite: corrupt event {column}: {e}")))?;
+    if !value.is_object() {
+        return Err(KnlError::Corruption(format!(
+            "sqlite: corrupt event {column}: stored as {}, not a table",
+            super::event::json_type_name(&value)
+        )));
+    }
+    Ok(value)
+}
+
+/// The read statement for a stream, with its bound arguments.
 ///
 /// One builder for both read paths — the plain one and the in-transaction
 /// twin — so a filtered read and the input a decision is shown select the
@@ -824,7 +938,7 @@ fn read_query(
     from_seq: u64,
     limit: i64,
 ) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from("SELECT payload FROM events WHERE stream = ? AND seq >= ?");
+    let mut sql = format!("SELECT {READ_COLUMNS} FROM events WHERE stream = ? AND seq >= ?");
     let mut args = vec![
         SqlValue::Text(stream.to_string()),
         SqlValue::Integer(from_seq as i64),
@@ -852,17 +966,12 @@ fn read_in(conn: &Connection, stream: &str, kinds: Option<&[&str]>) -> Result<Ve
     let (sql, args) = read_query(stream, kinds, 0, i64::MAX);
     let mut stmt = conn.prepare(&sql).map_err(TxError::Sqlite)?;
     let rows = stmt
-        .query_map(params_from_iter(args.iter()), |row| row.get::<_, String>(0))
+        .query_map(params_from_iter(args.iter()), read_row)
         .map_err(TxError::Sqlite)?;
     let mut events = Vec::new();
     for row in rows {
-        let payload = row.map_err(TxError::Sqlite)?;
-        let value = serde_json::from_str::<Value>(&payload).map_err(|e| {
-            TxError::Terminal(KnlError::Corruption(format!(
-                "sqlite: corrupt event payload: {e}"
-            )))
-        })?;
-        events.push(value);
+        let row = row.map_err(TxError::Sqlite)?;
+        events.push(event_of(row).map_err(TxError::Terminal)?);
     }
     Ok(events)
 }
@@ -891,9 +1000,11 @@ fn head_in(conn: &Connection, stream: &str) -> Result<Option<u64>, rusqlite::Err
     Ok(max.map(|n| n as u64))
 }
 
-/// Insert the fully-stamped event; `payload` is the whole event object, so a
-/// read reconstructs the exact same `Value` the in-memory store returns. An
-/// encode failure is terminal; a contended insert is retryable.
+/// Insert the fully-stamped event, one column per envelope key and one each
+/// for the two objects it carries, so a read rebuilds the exact same `Value`
+/// the caller wrote ([`event_of`]).
+///
+/// An encode failure is terminal; a contended insert is retryable.
 fn insert_row(
     conn: &Connection,
     stream: &str,
@@ -906,25 +1017,49 @@ fn insert_row(
         .get(SCHEMA_VERSION_FIELD)
         .and_then(Value::as_u64)
         .unwrap_or(CURRENT_SCHEMA_VERSION);
-    // An event that will not encode never reaches the disk, so this is the
-    // store failing to do the work rather than data that came back wrong —
-    // `Storage`, not `Corruption`.
-    let payload = serde_json::to_string(&Value::Object(event.clone()))
-        .map_err(|e| TxError::Terminal(KnlError::Storage(format!("sqlite: encode event: {e}"))))?;
+    // The beat is the caller's and most events have none: an undeclared one
+    // is a NULL in its column, which is what the read gives back as an
+    // absent key.
+    let beat = event.get(FIELD_BEAT).and_then(Value::as_str);
+    let meta = encode_object(event.get(FIELD_META), FIELD_META)?;
+    let data = encode_object(event.get(FIELD_DATA), FIELD_DATA)?;
     conn.execute(
-        "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             stream,
             seq as i64,
             epoch_ms as i64,
             kind,
             schema_version as i64,
-            payload
+            beat,
+            meta,
+            data
         ],
     )
     .map_err(TxError::Sqlite)?;
     Ok(())
+}
+
+/// Encode `meta` / `data` for its column: the object as text, `{}` when the
+/// event carries none.
+///
+/// Both are filled in on the way through [`stamp`], so the default is a
+/// belt-and-braces answer rather than the usual path — and it is the empty
+/// object either way, which is what makes the column `NOT NULL`.
+///
+/// An event that will not encode never reaches the disk, so a failure here is
+/// the store failing to do the work rather than data that came back wrong —
+/// `Storage`, not `Corruption`.
+fn encode_object(value: Option<&Value>, column: &str) -> Result<String, TxError> {
+    let Some(value) = value else {
+        return Ok("{}".to_string());
+    };
+    serde_json::to_string(value).map_err(|e| {
+        TxError::Terminal(KnlError::Storage(format!(
+            "sqlite: encode event {column}: {e}"
+        )))
+    })
 }
 
 /// Classify a rusqlite error into the kernel's vocabulary.
@@ -964,9 +1099,14 @@ mod tests {
         }
     }
 
-    /// An open-kind event named `e{i}`.
+    /// An event of a caller's own kind, named `e{i}`.
     fn ev(i: usize) -> Map<String, Value> {
         obj(json!({ "kind": format!("e{i}") }))
+    }
+
+    /// A `budget_*` event of `amount`, as the kernel writes one.
+    fn budget(kind: &str, amount: i64) -> Map<String, Value> {
+        obj(json!({ "kind": kind, "data": { "amount": amount } }))
     }
 
     /// A store on an in-memory database of its very own.
@@ -1083,13 +1223,9 @@ mod tests {
     #[test]
     fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
         let mut store = mem_store();
-        store
-            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
-            .expect("grant");
+        store.append(budget("budget_granted", 100)).expect("grant");
         store.append(ev(1)).expect("noise");
-        store
-            .append(obj(json!({ "kind": "budget_spent", "amount": 10 })))
-            .expect("spend");
+        store.append(budget("budget_spent", 10)).expect("spend");
         store.append(ev(2)).expect("more noise");
 
         let ledger = store
@@ -1135,9 +1271,7 @@ mod tests {
     #[test]
     fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
         let mut store = mem_store();
-        store
-            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
-            .expect("grant");
+        store.append(budget("budget_granted", 100)).expect("grant");
         store.append(ev(1)).expect("noise");
         store.append(ev(2)).expect("more noise");
 
@@ -1145,7 +1279,7 @@ mod tests {
         let committed = store
             .append_if(Some(&["budget_granted"]), &mut |events| {
                 seen = events.iter().map(|e| kind_of(e).to_string()).collect();
-                Some(obj(json!({ "kind": "budget_spent", "amount": 10 })))
+                Some(budget("budget_spent", 10))
             })
             .expect("append_if");
         assert_eq!(seen, ["budget_granted"], "only the kinds asked for");
@@ -1225,19 +1359,88 @@ mod tests {
         assert_eq!(store.head().expect("head"), Some(2));
     }
 
+    /// A read rebuilds the object that was written: the envelope out of its
+    /// columns, `meta` and `data` out of theirs, and the beat back as an
+    /// absent key when there was none.
     #[test]
-    fn read_reconstructs_the_stored_envelope_including_the_schema_version() {
+    fn read_reconstructs_the_written_event_out_of_its_columns() {
         let mut store = mem_store();
         store
-            .append(obj(json!({ "kind": "note", "text": "hi" })))
+            .append(obj(json!({
+                "kind": "note",
+                "beat": "b1",
+                "meta": { "label": "a", "attempt": 2, "retried": true },
+                "data": { "text": "hi", "nested": { "deep": [1, 2] } }
+            })))
             .expect("append");
+        store
+            .append(obj(json!({ "kind": "note" })))
+            .expect("append a bare one");
+
         let stored = store.read(0, usize::MAX).expect("read");
         assert_eq!(kind_of(&stored[0]), "note");
-        assert_eq!(stored[0]["text"], json!("hi"));
+        assert_eq!(stored[0]["beat"], json!("b1"));
+        assert_eq!(
+            stored[0]["meta"],
+            json!({ "label": "a", "attempt": 2, "retried": true })
+        );
+        assert_eq!(
+            stored[0]["data"],
+            json!({ "text": "hi", "nested": { "deep": [1, 2] } }),
+            "data comes back at any depth"
+        );
         assert_eq!(seq_of(&stored[0]), 1);
+        assert!(stored[0].get("epoch_ms").is_some(), "{}", stored[0]);
         assert_eq!(
             stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
             Some(CURRENT_SCHEMA_VERSION)
+        );
+
+        // An event with nothing declared: no beat key at all, and the two
+        // objects empty rather than missing.
+        assert_eq!(stored[1].get("beat"), None, "{}", stored[1]);
+        assert_eq!(stored[1]["meta"], json!({}));
+        assert_eq!(stored[1]["data"], json!({}));
+    }
+
+    /// The beat lands in its own column — a plain `SELECT beat` sees it —
+    /// and the index that makes a by-beat read a range is on the table.
+    #[test]
+    fn the_beat_is_a_column_of_its_own_with_an_index() {
+        let mut store = mem_store();
+        store
+            .append(obj(json!({ "kind": "e1", "beat": "b1" })))
+            .expect("append");
+        store.append(ev(2)).expect("append with no beat");
+
+        let rows = ask(
+            &store,
+            "SELECT seq, beat FROM events WHERE stream = $stream ORDER BY seq",
+        )
+        .expect("query");
+        assert_eq!(rows.rows[0]["beat"], Value::from("b1"));
+        assert!(
+            !rows.rows[1].contains_key("beat"),
+            "an undeclared beat is NULL: {:?}",
+            rows.rows[1]
+        );
+
+        // Grouping a run by beat is a range of an index, not a scan.
+        let indexes = store
+            .conn
+            .prepare("PRAGMA index_list(events)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>("name"))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("index_list");
+        assert!(
+            indexes.iter().any(|name| name == "events_stream_beat_seq"),
+            "the (stream, beat, seq) index must exist: {indexes:?}"
+        );
+        assert!(
+            indexes.iter().any(|name| name == "events_stream_kind_seq"),
+            "…beside the by-kind one: {indexes:?}"
         );
     }
 
@@ -1249,7 +1452,9 @@ mod tests {
         {
             let mut store = SqliteEventStore::open(&path, "s").expect("open");
             store
-                .append(obj(json!({ "kind": "note", "text": "durable" })))
+                .append(obj(
+                    json!({ "kind": "note", "data": { "text": "durable" } }),
+                ))
                 .expect("append note");
             store.append(ev(2)).expect("append e2");
         } // the store — and its connection — is dropped here.
@@ -1260,7 +1465,7 @@ mod tests {
         let events = store.read(0, usize::MAX).expect("read");
         assert_eq!(events.len(), 2);
         assert_eq!(kind_of(&events[0]), "note");
-        assert_eq!(events[0]["text"], json!("durable"));
+        assert_eq!(events[0]["data"], json!({ "text": "durable" }));
         assert_eq!(seq_of(&events[0]), 1);
         assert_eq!(
             events[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
@@ -1297,37 +1502,56 @@ mod tests {
         assert_eq!(b_kinds, ["only_b1", "only_b2"]);
     }
 
-    /// (Fix 2) A row whose payload is not valid JSON is corruption: `read`
-    /// surfaces it as an error rather than silently dropping the row (which
-    /// would let a resume re-fold a truncated log into the wrong state).
+    /// (Fix 2) A row whose stored objects will not decode is corruption:
+    /// `read` surfaces it as an error rather than silently dropping the row
+    /// (which would let a resume re-fold a truncated log into the wrong
+    /// state).  Both JSON columns are checked, and a scalar where an object
+    /// was written is the same fault as text that will not parse.
     #[test]
-    fn read_errors_on_a_corrupt_payload_row_instead_of_dropping_it() {
-        let mut store = mem_store();
-        store.append(ev(1)).expect("append");
+    fn read_errors_on_a_corrupt_row_instead_of_dropping_it() {
+        for (seq, meta, data, column) in [
+            (2_i64, "{}", "{not valid json", "data"),
+            (3_i64, "not valid json either", "{}", "meta"),
+            (4_i64, "{}", "7", "data"),
+        ] {
+            let mut store = mem_store();
+            store.append(ev(1)).expect("append");
 
-        // Sneak in a row whose payload cannot decode — a corrupt log entry.
-        let stream = store.stream.clone();
-        store
-            .conn
-            .execute(
-                "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![stream, 2_i64, 0_i64, "note", 1_i64, "{not valid json"],
-            )
-            .expect("insert corrupt row");
+            // Sneak in a row the store itself could not have written.
+            let stream = store.stream.clone();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events \
+                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        stream,
+                        seq,
+                        0_i64,
+                        "note",
+                        1_i64,
+                        None::<String>,
+                        meta,
+                        data
+                    ],
+                )
+                .expect("insert corrupt row");
 
-        let err = store
-            .read(0, usize::MAX)
-            .expect_err("a corrupt payload must surface, not be dropped");
-        assert!(
-            err.reason().contains("corrupt event payload"),
-            "{}",
-            err.reason()
-        );
-        // Corruption, not storage: the IO worked and the bytes came back, so
-        // what is wrong is the data — no retry and no reconnect changes it.
-        assert_eq!(err.kind(), KnlError::CORRUPTION);
-        assert!(!err.is_retryable());
+            let err = store
+                .read(0, usize::MAX)
+                .expect_err("a corrupt row must surface, not be dropped");
+            assert!(
+                err.reason().contains(&format!("corrupt event {column}")),
+                "{}",
+                err.reason()
+            );
+            // Corruption, not storage: the IO worked and the bytes came back,
+            // so what is wrong is the data — no retry and no reconnect
+            // changes it.
+            assert_eq!(err.kind(), KnlError::CORRUPTION);
+            assert!(!err.is_retryable());
+        }
     }
 
     /// The backend's error language is translated in exactly one place, and
@@ -1662,8 +1886,9 @@ mod tests {
 
         let err = reader
             .execute(
-                "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
-                 VALUES ('x', 1, 0, 'note', 1, '{}')",
+                "INSERT INTO events \
+                 (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+                 VALUES ('x', 1, 0, 'note', 1, NULL, '{}', '{}')",
                 [],
             )
             .expect_err("the reader must not be able to write");
@@ -1754,7 +1979,9 @@ mod tests {
                 "epoch_ms",
                 "kind",
                 "schema_version",
-                "payload"
+                "beat",
+                "meta",
+                "data"
             ]
         );
 
@@ -1768,7 +1995,7 @@ mod tests {
         let declared: Vec<&str> = columns.iter().map(|c| c.declared_type.as_str()).collect();
         assert_eq!(
             declared,
-            ["TEXT", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT"]
+            ["TEXT", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT"]
         );
 
         // And a query may name every one of them.

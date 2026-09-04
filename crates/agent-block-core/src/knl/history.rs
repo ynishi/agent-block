@@ -126,13 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn append_stamps_the_envelope_and_keeps_the_payload() {
+    fn append_stamps_the_envelope_and_keeps_the_data() {
         let mut h = History::new();
-        h.append(obj(json!({ "kind": "note", "text": "hi", "seq": 999 })))
-            .expect("append");
+        h.append(obj(json!({
+            "kind": "note", "data": { "text": "hi" }, "seq": 999
+        })))
+        .expect("append");
         let event = &h.events()[0];
         assert_eq!(event.get(FIELD_KIND).and_then(Value::as_str), Some("note"));
-        assert_eq!(event.get("text").and_then(Value::as_str), Some("hi"));
+        assert_eq!(event["data"], json!({ "text": "hi" }));
         assert_eq!(event.get(FIELD_SEQ).and_then(Value::as_u64), Some(1));
         assert!(event.get(FIELD_EPOCH_MS).and_then(Value::as_u64).is_some());
     }

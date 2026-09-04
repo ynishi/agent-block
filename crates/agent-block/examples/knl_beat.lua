@@ -78,9 +78,15 @@ kernel.session({
     -- usage is the separate `knl.views.usage` reading printed below.
     budget = { amount = 8, tag = "beats", desc = "one unit per beat" },
 }, function(s)
+    -- The seed is an event like any other: the envelope is `{ kind, beat?,
+    -- meta?, data? }` and what the kind is about goes under `data`
+    -- (view-design.md §6 item 2). `meta` is the shallow-label half — string
+    -- / number / boolean values only — and it is what a view can read
+    -- without being tied to any kind's shape.
     s:append({
         kind = "msg_user",
-        content = "What is 20250904 + 42? Use the add tool, then answer with just the number.",
+        meta = { label = "seed" },
+        data = { content = "What is 20250904 + 42? Use the add tool, then answer with just the number." },
     })
 
     local beats = 0

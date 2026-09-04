@@ -29,6 +29,16 @@
 //! userdata returned by `knl.open(opts?)`, so the invariants are enforced
 //! by the shape of the API rather than by convention:
 //!
+//! - **An event is envelope + meta + data.**  What you append is
+//!   `{ kind = …, beat? = …, meta? = { … }, data? = { … } }` and nothing
+//!   else: a top-level key outside that set is refused, because a kind's own
+//!   fields belong under `data`.  `meta` is shallow — string, number or
+//!   boolean values — so a reader can group or filter on it without knowing
+//!   the kind; `data` is yours, at any depth, and the shape under it is
+//!   declared where the kind is written (`knl.shapes`).  The kernel checks
+//!   the `data` of its own six kinds (`session_*` / `budget_*`) and of no
+//!   others.  Both come back the way they went in, `data` defaulting to an
+//!   empty table when you write none.
 //! - **I1 append-only.**  There is deliberately no `update`, `delete` or
 //!   `replace`.  `events()` / `view()` hand back freshly built tables, so
 //!   a caller that mutates a returned value cannot reach recorded state.
@@ -94,13 +104,14 @@
 //!     owner  = "user-42",              -- default: the reserved "anon"
 //!     budget = { amount = 10000, tag = "tokens" },
 //! })
-//! s:append({ kind = "msg_user", content = "hi" })
+//! s:append({ kind = "msg_user", data = { content = "hi" } })
 //! -- Drive the beat yourself: name it, ask for the estimate first, call
 //! -- the backend, append the response, then settle what it really cost.
 //! local beat = knl.new_beat_id()
 //! local ok, tag = s:reserve(est)
 //! if not ok then return { budget_stopped = true, tag = tag } end
-//! s:append({ kind = "llm_response", beat = beat, content = blocks, usage = u })
+//! s:append({ kind = "llm_response", beat = beat,
+//!            data = { content = blocks, usage = u } })
 //! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
@@ -173,12 +184,14 @@ pub const SESSION_API: &[(&str, &str)] = &[
     ),
     (
         "append",
-        "append(event) -> seq — record a fact; kernel-only kinds are refused, the budget does not move \
-         [raises: validation, closed, busy, storage]",
+        "append(event) -> seq — record a fact: { kind, beat?, meta? (shallow), data? }; a key \
+         outside that envelope, a kernel-only kind and a nested meta are refused, and the budget \
+         does not move [raises: validation, closed, busy, storage]",
     ),
     (
         "events",
-        "events(from?) -> array — the record from `from` on, as fresh tables \
+        "events(from?) -> array — the record from `from` on, as fresh tables in the shape it was \
+         written in (kind / beat / meta / data, plus the kernel's stamps) \
          [raises: busy, storage, corruption]",
     ),
     (
@@ -474,9 +487,11 @@ impl LuaUserData for Session {
         // s:append(event) -> seq
         //
         // K1: the only way to add to the history, and there is no way to
-        // change what is already in it.  The event is recorded as written,
-        // `beat` included — the kernel adds `seq` / `epoch_ms` and nothing
-        // else.  No append touches the budget — that is `reserve` before the
+        // change what is already in it.  The event is the envelope
+        // (`kind` / `beat?` / `meta?` / `data?`) and nothing beside it; what
+        // is under `data` is recorded as written, `beat` included, and the
+        // kernel adds `seq` / `epoch_ms` and an empty `data` when there was
+        // none.  No append touches the budget — that is `reserve` before the
         // call and `spend` after it — and the two `session_*` kinds are
         // refused here, since only `knl.open` / `close` write those.
         methods.add_method("append", |lua, this, event: LuaValue| {
@@ -1412,8 +1427,8 @@ mod tests {
             r#"
             local s = knl.open()
             assert(s:len() == 1, "a fresh session holds session_opened")
-            local a = s:append({ kind = "user_msg", text = "hi" })
-            local b = s:append({ kind = "note", name = "sh" })
+            local a = s:append({ kind = "user_msg", data = { text = "hi" } })
+            local b = s:append({ kind = "note", data = { name = "sh" } })
             assert(a == 2, "first caller seq: " .. tostring(a))
             assert(b == 3, "second caller seq: " .. tostring(b))
             assert(s:len() == 3, "len: " .. tostring(s:len()))
@@ -1422,11 +1437,17 @@ mod tests {
             assert(#evs == 3, "events len: " .. tostring(#evs))
             assert(evs[1].kind == "session_opened")
             assert(evs[2].kind == "user_msg")
-            assert(evs[2].text == "hi")
+            assert(evs[2].data.text == "hi")
             assert(evs[2].seq == 2)
             assert(type(evs[2].epoch_ms) == "number", "epoch_ms must be a number")
             assert(evs[3].kind == "note")
             assert(evs[3].seq == 3)
+
+            -- The envelope is closed: a kind's own field at the top level is
+            -- refused, with the place it belongs in the message.
+            local err = failure(function() s:append({ kind = "note", text = "hi" }) end)
+            assert(err.kind == "validation", "kind: " .. tostring(err.kind))
+            assert(err.message:find("under data"), "message: " .. err.message)
         "#,
         )
         .exec()
@@ -1461,21 +1482,24 @@ mod tests {
         lua.load(
             r#"
             local s = knl.open()
-            s:append({ kind = "user_msg", text = "hi", meta = { tag = "a" } })
+            s:append({ kind = "user_msg", meta = { tag = "a" },
+                       data = { text = "hi", blocks = { { type = "text" } } } })
 
             local evs = s:events()
             evs[2].kind = "TAMPERED"
-            evs[2].text = nil
-            evs[2].extra = "injected"
+            evs[2].data.text = nil
+            evs[2].data.extra = "injected"
             evs[2].meta.tag = "b"
+            evs[2].data.blocks[1].type = "tampered"
             table.insert(evs, { kind = "ghost" })
 
             local again = s:events()
             assert(#again == 2, "history length changed: " .. tostring(#again))
             assert(again[2].kind == "user_msg", "kind changed: " .. tostring(again[2].kind))
-            assert(again[2].text == "hi", "text changed")
-            assert(again[2].extra == nil, "field injected into history")
-            assert(again[2].meta.tag == "a", "nested table changed")
+            assert(again[2].data.text == "hi", "data changed")
+            assert(again[2].data.extra == nil, "field injected into history")
+            assert(again[2].meta.tag == "a", "meta changed")
+            assert(again[2].data.blocks[1].type == "text", "nested table changed")
         "#,
         )
         .exec()
@@ -1676,11 +1700,12 @@ mod tests {
             assert(s:remaining() == 42, "remaining: " .. tostring(s:remaining()))
             local granted = s:events()[2]
             assert(granted.kind == "budget_granted", "kind: " .. tostring(granted.kind))
-            assert(granted.amount == 42 and granted.tag == "tokens")
-            assert(granted.desc == "one nightly run", "desc: " .. tostring(granted.desc))
+            assert(granted.data.amount == 42 and granted.data.tag == "tokens")
+            assert(granted.data.desc == "one nightly run",
+                   "desc: " .. tostring(granted.data.desc))
 
             local bare = knl.open({ budget = { amount = 7 } })
-            local g2 = bare:events()[2]
+            local g2 = bare:events()[2].data
             assert(g2.amount == 7 and g2.tag == nil and g2.desc == nil,
                    "a grant with no words must invent none")
         "#,
@@ -1836,7 +1861,7 @@ mod tests {
             local evs = s:events()
             assert(#evs == 2, "close must record session_closed")
             assert(evs[2].kind == "session_closed")
-            assert(evs[2].reason == "budget_exhausted")
+            assert(evs[2].data.reason == "budget_exhausted")
 
             s:close("ignored")
             assert(s:len() == 2, "close is idempotent")
@@ -1844,7 +1869,7 @@ mod tests {
             -- Without a reason the kernel records its default.
             local d = knl.open()
             d:close()
-            assert(d:events()[2].reason == "closed", "default reason")
+            assert(d:events()[2].data.reason == "closed", "default reason")
         "#,
         )
         .exec()
@@ -1855,58 +1880,69 @@ mod tests {
         assert!(msg.contains("reason must be a string"), "{msg}");
     }
 
-    /// The reserved kinds the shell writes are checked by the kernel; the
-    /// required fields are named in an attributed error and nothing is
-    /// recorded.
+    /// The kernel checks the *envelope* of every event — the closed set of
+    /// top-level keys, a string beat, a shallow meta, a table data — and the
+    /// shape of a kind's own `data` is the writer's business, not its.
     #[test]
-    fn reserved_kinds_are_validated_with_attributed_errors() {
+    fn the_envelope_is_validated_and_a_kinds_own_data_is_not() {
         let lua = vm();
 
-        let msg = expect_err(&lua, r#"knl.open():append({ kind = "msg_user" })"#);
+        // A kind's own field at the top level: refused, and the message says
+        // where it goes.
+        let msg = expect_err(
+            &lua,
+            r#"knl.open():append({ kind = "msg_user", content = "hi" })"#,
+        );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("msg_user"), "{msg}");
         assert!(msg.contains("content"), "{msg}");
+        assert!(msg.contains("under data"), "{msg}");
 
+        // `meta` is shallow: nesting belongs under `data`.
         let msg = expect_err(
             &lua,
-            r#"knl.open():append({ kind = "tool_result", beat = "b1", call_id = "c", ok = "yes", result = 1 })"#,
+            r#"knl.open():append({ kind = "note", meta = { deep = { a = 1 } } })"#,
         );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("a boolean"), "{msg}");
+        assert!(msg.contains("meta is shallow"), "{msg}");
 
-        let msg = expect_err(
-            &lua,
-            r#"knl.open():append({ kind = "tool_call", beat = "b1", call_id = "c1", args = {} })"#,
-        );
-        assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("name"), "{msg}");
+        let msg = expect_err(&lua, r#"knl.open():append({ kind = "note", data = 7 })"#);
+        assert!(msg.contains("data must be a table"), "{msg}");
 
         lua.load(
             r#"
             local s = knl.open()
-            pcall(function() s:append({ kind = "msg_user" }) end)
-            assert(s:len() == 1, "a rejected reserved event was recorded")
+            pcall(function() s:append({ kind = "note", text = "hi" }) end)
+            assert(s:len() == 1, "a rejected event was recorded")
 
-            -- The documented shapes are accepted, with a beat and without.
+            -- The kinds of a turn are the Lua kernel's, shape and all: the
+            -- Rust side takes whatever `data` says, at any depth.
             local beat = knl.new_beat_id()
-            s:append({ kind = "msg_user", content = "hi" })
-            s:append({ kind = "tool_call", beat = beat, call_id = "c1",
-                       name = "sh", args = { cmd = "ls" } })
-            s:append({ kind = "tool_result", beat = beat, call_id = "c1",
-                       ok = false, result = "boom" })
-            s:append({ kind = "tool_call", call_id = "c2",
-                       name = "sh", args = { cmd = "ls" } })
+            s:append({ kind = "msg_user", data = { content = "hi" } })
+            s:append({ kind = "tool_call", beat = beat,
+                       data = { call_id = "c1", name = "sh", args = { cmd = "ls" } } })
+            s:append({ kind = "tool_result", beat = beat,
+                       data = { call_id = "c1", ok = false, result = "boom" } })
+            -- …including an empty one.
+            s:append({ kind = "tool_call" })
             assert(s:len() == 5)
             assert(s:events()[3].beat == beat, "the declared beat is recorded")
             assert(s:events()[5].beat == nil, "an undeclared beat stays absent")
+            assert(s:events()[3].data.args.cmd == "ls", "data comes back at any depth")
+            assert(next(s:events()[5].data) == nil, "an absent data reads as empty")
 
-            -- A numbered beat is the one thing refused, on any kind.
+            -- meta takes scalars, and comes back as it was written.
+            s:append({ kind = "note", meta = { label = "a", attempt = 2, retried = true } })
+            local m = s:events()[6].meta
+            assert(m.label == "a" and m.attempt == 2 and m.retried == true,
+                   "meta round-trips")
+
+            -- A numbered beat is refused, on any kind.
             local ok = pcall(function() s:append({ kind = "note", beat = 1 }) end)
             assert(not ok, "a numeric beat was accepted")
         "#,
         )
         .exec()
-        .expect("reserved kind chunk");
+        .expect("envelope chunk");
     }
 
     /// The budget ledger is the kernel's: Lua can read those events but not
@@ -1921,7 +1957,7 @@ mod tests {
             &lua,
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
-            s:append({ kind = "budget_reserved", amount = 5 })
+            s:append({ kind = "budget_reserved", data = { amount = 5 } })
         "#,
         );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
@@ -1932,10 +1968,10 @@ mod tests {
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             for _, ev in ipairs({
-                { kind = "budget_granted", amount = 1000000 },
-                { kind = "budget_reserved", amount = 5 },
-                { kind = "budget_refused", amount = 5, remaining = 0 },
-                { kind = "budget_spent", amount = 5 },
+                { kind = "budget_granted", data = { amount = 1000000 } },
+                { kind = "budget_reserved", data = { amount = 5 } },
+                { kind = "budget_refused", data = { amount = 5, remaining = 0 } },
+                { kind = "budget_spent", data = { amount = 5 } },
             }) do
                 local ok = pcall(function() s:append(ev) end)
                 assert(not ok, "a caller wrote " .. ev.kind)
@@ -1948,7 +1984,7 @@ mod tests {
             -- like everything else.
             s:reserve(4)
             local evs = s:events()
-            assert(evs[3].kind == "budget_reserved" and evs[3].amount == 4,
+            assert(evs[3].kind == "budget_reserved" and evs[3].data.amount == 4,
                    "the kernel's own reservation is readable")
         "#,
         )
@@ -1979,10 +2015,10 @@ mod tests {
 
             -- Both answers are in the log, with what was asked for.
             local evs = s:events()
-            assert(evs[3].kind == "budget_reserved" and evs[3].amount == 30)
-            assert(evs[3].tag == "beats")
-            assert(evs[4].kind == "budget_refused" and evs[4].amount == 1000)
-            assert(evs[4].remaining == 70, "the refusal records what there was")
+            assert(evs[3].kind == "budget_reserved" and evs[3].data.amount == 30)
+            assert(evs[3].data.tag == "beats")
+            assert(evs[4].kind == "budget_refused" and evs[4].data.amount == 1000)
+            assert(evs[4].data.remaining == 70, "the refusal records what there was")
 
             -- Exactly the balance is coverable, and zero always is.
             assert(s:reserve(70) == true)
@@ -2029,9 +2065,9 @@ mod tests {
                 local balance = nil
                 for _, ev in ipairs(s:events()) do
                     if ev.kind == "budget_granted" then
-                        balance = (balance or 0) + ev.amount
+                        balance = (balance or 0) + ev.data.amount
                     elseif ev.kind == "budget_reserved" or ev.kind == "budget_spent" then
-                        balance = math.max(0, balance - ev.amount)
+                        balance = math.max(0, balance - ev.data.amount)
                     end
                 end
                 return balance
@@ -2042,8 +2078,8 @@ mod tests {
 
             s:reserve(120)
             s:append({ kind = "llm_response",
-                       content = { { type = "text", text = "hi" } },
-                       usage = { input_tokens = 100, output_tokens = 50 } })
+                       data = { content = { { type = "text", text = "hi" } },
+                                usage = { input_tokens = 100, output_tokens = 50 } } })
             s:spend(30)          -- the call overran its estimate
             s:reserve(10000)     -- refused, and moves nothing
             s:spend(0)
@@ -2056,7 +2092,7 @@ mod tests {
             -- the response, for a query view to sum.
             local r = s:events()[4]  -- opened, granted, reserved, the response
             assert(r.kind == "llm_response", "kind: " .. tostring(r.kind))
-            assert(r.usage.input_tokens == 100 and r.usage.output_tokens == 50)
+            assert(r.data.usage.input_tokens == 100 and r.data.usage.output_tokens == 50)
         "#,
         )
         .exec()
@@ -2075,7 +2111,7 @@ mod tests {
             &lua,
             r#"
             local s = knl.open()
-            s:append({ kind = "session_closed", reason = "carried over" })
+            s:append({ kind = "session_closed", data = { reason = "carried over" } })
         "#,
         );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
@@ -2086,8 +2122,8 @@ mod tests {
             r#"
             local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             for _, ev in ipairs({
-                { kind = "session_opened" },
-                { kind = "session_closed", reason = "carried over" },
+                { kind = "session_opened", data = { scope_id = "s", owner = "me" } },
+                { kind = "session_closed", data = { reason = "carried over" } },
             }) do
                 local ok = pcall(function() s:append(ev) end)
                 assert(not ok, "a caller wrote " .. ev.kind)
@@ -2105,7 +2141,8 @@ mod tests {
                    "session_opened,budget_granted,note,budget_spent,session_closed",
                    "recorded: " .. kinds_of(s))
             local evs = s:events()
-            assert(evs[5].reason == "done", "reason: " .. tostring(evs[5].reason))
+            assert(evs[5].data.reason == "done",
+                   "reason: " .. tostring(evs[5].data.reason))
 
             local ok = pcall(function() s:append({ kind = "note" }) end)
             assert(not ok, "a closed session took a write")
@@ -2140,8 +2177,8 @@ mod tests {
 
             -- And it is what the kernel accepts as a beat.
             s:append({ kind = "llm_response", beat = a,
-                       content = { { type = "text", text = "ok" } },
-                       usage = { input_tokens = 1 } })
+                       data = { content = { { type = "text", text = "ok" } },
+                                usage = { input_tokens = 1 } } })
             assert(s:events()[2].beat == a, "the minted beat is recorded verbatim")
         "#,
         )
@@ -2187,8 +2224,8 @@ mod tests {
         assert!(msg.contains(r#"unknown view "dialog""#), "{msg}");
 
         // The token account is one of the names the kernel does not have:
-        // it reads the `llm_response` payload, so it is a query view in Lua
-        // (`knl.views.usage`) over the published schema.
+        // it reads the `data` of an `llm_response`, so it is a query view in
+        // Lua (`knl.views.usage`) over the published schema.
         let msg = expect_err(&lua, r#"knl.open():view("usage")"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains(r#"unknown view "usage""#), "{msg}");
@@ -2210,17 +2247,17 @@ mod tests {
         lua.load(
             r#"
             local s = knl.open()
-            s:append({ kind = "msg_user", content = "hi" })
+            s:append({ kind = "msg_user", data = { content = "hi" } })
 
             local t = s:view("tail", { n = 1 })
             t[1].kind = "TAMPERED"
-            t[1].content = nil
+            t[1].data.content = nil
             table.insert(t, { kind = "ghost" })
 
             local again = s:view("tail", { n = 1 })
             assert(#again == 1, "tail length changed: " .. tostring(#again))
             assert(again[1].kind == "msg_user", "kind changed: " .. tostring(again[1].kind))
-            assert(again[1].content == "hi", "content changed")
+            assert(again[1].data.content == "hi", "content changed")
 
             -- …and the history itself is untouched by any of it.
             assert(s:len() == 2, "len: " .. tostring(s:len()))
@@ -2308,12 +2345,13 @@ mod tests {
             local seen = 0
             for _, e in ipairs(s:events()) do
                 if e.kind == "session_opened" then
-                    assert(e.scope_id == scope, "session_opened scope_id: " .. tostring(e.scope_id))
-                    assert(e.owner == "alice", "the owner rides beside it")
+                    assert(e.data.scope_id == scope,
+                           "session_opened scope_id: " .. tostring(e.data.scope_id))
+                    assert(e.data.owner == "alice", "the owner rides beside it")
                     seen = seen + 1
                 elseif e.kind:sub(1, 7) == "budget_" then
-                    assert(e.scope_id == scope,
-                           e.kind .. " scope_id: " .. tostring(e.scope_id))
+                    assert(e.data.scope_id == scope,
+                           e.kind .. " scope_id: " .. tostring(e.data.scope_id))
                     seen = seen + 1
                 end
             end
@@ -2324,7 +2362,8 @@ mod tests {
             -- kinds only the kernel writes.
             s:append({ kind = "note" })
             local evs = s:events()
-            assert(evs[#evs].scope_id == nil, "a caller's event must not carry a scope id")
+            assert(evs[#evs].data.scope_id == nil,
+                   "a caller's event must not carry a scope id")
 
             assert(knl.open({ owner = "bob" }):scope_id() ~= scope,
                    "two runs must be two scopes")
@@ -2364,7 +2403,8 @@ mod tests {
             local evs = r:events()
             local last = evs[#evs]
             assert(last.kind == "budget_reserved", "last kind: " .. tostring(last.kind))
-            assert(last.scope_id == scope, "continued scope_id: " .. tostring(last.scope_id))
+            assert(last.data.scope_id == scope,
+                   "continued scope_id: " .. tostring(last.data.scope_id))
         "#
         ))
         .exec()
@@ -2400,13 +2440,13 @@ mod tests {
                                   budget = {{ amount = 100, tag = "beats" }} }})
             s:reserve(30)
             s:append({{ kind = "llm_response",
-                        content = {{ {{ type = "text", text = "a" }} }},
-                        usage = {{ input_tokens = 30 }} }})
-            s:append({{ kind = "msg_user", content = "more" }})
+                        data = {{ content = {{ {{ type = "text", text = "a" }} }},
+                                  usage = {{ input_tokens = 30 }} }} }})
+            s:append({{ kind = "msg_user", data = {{ content = "more" }} }})
             s:reserve(15)
             s:append({{ kind = "llm_response",
-                        content = {{ {{ type = "text", text = "b" }} }},
-                        usage = {{ input_tokens = 20 }} }})
+                        data = {{ content = {{ {{ type = "text", text = "b" }} }},
+                                  usage = {{ input_tokens = 20 }} }} }})
             s:spend(5)  -- the second call overran its estimate
             assert(s:remaining() == 50, "open remaining: " .. tostring(s:remaining()))
             local id = s:id()
@@ -2423,7 +2463,8 @@ mod tests {
             -- where a query view reads them.
             local rs = responses(r)
             assert(#rs == 2, "resumed responses: " .. tostring(#rs))
-            assert(rs[1].usage.input_tokens == 30 and rs[2].usage.input_tokens == 20,
+            assert(rs[1].data.usage.input_tokens == 30
+                       and rs[2].data.usage.input_tokens == 20,
                    "the counts came back with the record")
 
             -- The grant's words came back too: a refusal still names it.
@@ -2433,8 +2474,8 @@ mod tests {
             -- The record and the ledger continue on the resumed session.
             r:reserve(5)
             r:append({{ kind = "llm_response", beat = knl.new_beat_id(),
-                        content = {{ {{ type = "text", text = "c" }} }},
-                        usage = {{ input_tokens = 5 }} }})
+                        data = {{ content = {{ {{ type = "text", text = "c" }} }},
+                                  usage = {{ input_tokens = 5 }} }} }})
             assert(#responses(r) == 3, "continued responses: " .. tostring(#responses(r)))
             assert(r:remaining() == 45, "continued remaining: " .. tostring(r:remaining()))
 
@@ -2446,7 +2487,7 @@ mod tests {
             local evs = g:events()
             local last = evs[#evs]
             assert(last.kind == "budget_granted", "last event: " .. tostring(last.kind))
-            assert(last.amount == 100 and last.desc == "a second grant")
+            assert(last.data.amount == 100 and last.data.desc == "a second grant")
         "#
         ))
         .exec()
@@ -2519,7 +2560,7 @@ mod tests {
             local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "beats" } })
             local id = s:id()
             s:reserve(30)
-            s:append({ kind = "note", text = "in memory" })
+            s:append({ kind = "note", data = { text = "in memory" } })
 
             -- The writer is still alive, so the database is still there.
             local r = knl.resume({ store = "mem", session = id })
@@ -2590,8 +2631,12 @@ mod tests {
         let log = persisted(&path, &id);
         let last = log.last().expect("the stream is not empty");
         assert_eq!(last["kind"], Value::from("session_closed"), "{last}");
-        assert_eq!(last["reason"], Value::from("scope_exit"), "{last}");
-        assert_eq!(last.get("detail"), None, "a clean exit has nothing to say");
+        assert_eq!(last["data"]["reason"], Value::from("scope_exit"), "{last}");
+        assert_eq!(
+            last["data"].get("detail"),
+            None,
+            "a clean exit has nothing to say"
+        );
         assert_eq!(log.len(), 3, "session_opened + note + session_closed");
     }
 
@@ -2622,8 +2667,8 @@ mod tests {
         let log = persisted(&path, &id);
         let last = log.last().expect("the stream is not empty");
         assert_eq!(last["kind"], Value::from("session_closed"), "{last}");
-        assert_eq!(last["reason"], Value::from("error"), "{last}");
-        let detail = last["detail"].as_str().expect("detail text");
+        assert_eq!(last["data"]["reason"], Value::from("error"), "{last}");
+        let detail = last["data"]["detail"].as_str().expect("detail text");
         assert!(detail.contains("boom"), "detail: {detail}");
     }
 
@@ -2894,9 +2939,9 @@ mod tests {
         let log = persisted(&path, &id);
         let last = log.last().expect("the stream is not empty");
         assert_eq!(last["kind"], Value::from("session_closed"), "{last}");
-        assert_eq!(last["reason"], Value::from("error"), "{last}");
+        assert_eq!(last["data"]["reason"], Value::from("error"), "{last}");
         assert_eq!(
-            last["detail"],
+            last["data"]["detail"],
             Value::from("the body raised: boom"),
             "{last}"
         );
@@ -2908,13 +2953,13 @@ mod tests {
             r#"
             local a = knl.open({ owner = "t" })
             a:close("done")
-            local last = a:events()[a:len()]
+            local last = a:events()[a:len()].data
             assert(last.reason == "done", "reason: " .. tostring(last.reason))
             assert(last.detail == nil, "a close with no detail must record none")
 
             local b = knl.open({ owner = "t" })
             b:close()
-            local closed = b:events()[b:len()]
+            local closed = b:events()[b:len()].data
             assert(closed.reason == "closed", "default reason: " .. tostring(closed.reason))
             assert(closed.detail == nil)
         "#,
@@ -2938,7 +2983,7 @@ mod tests {
             r#"
             local s = knl.open({ owner = "t" })
             s:close("error", string.rep("x", 500))
-            local last = s:events()[s:len()]
+            local last = s:events()[s:len()].data
             assert(#last.detail == 203, "detail length: " .. tostring(#last.detail))
             assert(last.detail:sub(-3) == "...", "a cut detail says it was cut")
         "#,
@@ -3267,7 +3312,7 @@ mod tests {
             .filter(|e| e["kind"] == "session_closed")
             .collect();
         assert_eq!(finished.len(), 1, "exactly one boundary: {log:?}");
-        assert_eq!(finished[0]["reason"], Value::from("done"));
+        assert_eq!(finished[0]["data"]["reason"], Value::from("done"));
     }
 
     /// (I6) The backstop: a handle that goes out of scope with no `<close>`
@@ -3305,7 +3350,7 @@ mod tests {
             Value::from("session_closed"),
             "the collector left the session open: {log:?}"
         );
-        assert_eq!(last["reason"], Value::from("dropped"), "{last}");
+        assert_eq!(last["data"]["reason"], Value::from("dropped"), "{last}");
     }
 
     // -- reading the log with SQL ------------------------------------------
@@ -3319,8 +3364,8 @@ mod tests {
         lua.load(
             r#"
             local s = knl.open({ owner = "q" })
-            s:append({ kind = "msg_user", content = "hi" })
-            s:append({ kind = "note", text = "a note" })
+            s:append({ kind = "msg_user", beat = "b1", data = { content = "hi" } })
+            s:append({ kind = "note", meta = { label = "a" }, data = { text = "a note" } })
 
             local rows, truncated = s:query(
                 "SELECT seq, kind FROM events WHERE stream = $stream ORDER BY seq")
@@ -3336,6 +3381,23 @@ mod tests {
                 SELECT kind, COUNT(*) AS n FROM events
                 WHERE stream = $stream GROUP BY kind ORDER BY kind]])
             assert(#counted == 3, "kinds: " .. tostring(#counted))
+
+            -- The envelope is columns, so grouping a run by beat is a
+            -- GROUP BY rather than a json path…
+            local beats = s:query([[
+                SELECT beat, COUNT(*) AS n FROM events
+                WHERE stream = $stream AND beat IS NOT NULL GROUP BY beat]])
+            assert(#beats == 1 and beats[1].beat == "b1" and beats[1].n == 1,
+                   "beat is a column of its own")
+
+            -- …while a kind's own shape is read out of `data`, and `meta`
+            -- can be read without knowing the kind at all.
+            local read = s:query([[
+                SELECT json_extract(data, '$.content') AS content,
+                       json_extract(meta, '$.label') AS label
+                FROM events WHERE stream = $stream AND kind = 'msg_user']])
+            assert(read[1].content == "hi", "data path: " .. tostring(read[1].content))
+            assert(read[1].label == nil, "this one carried no meta")
 
             -- Values are bound: positionally…
             local one = s:query("SELECT kind FROM events WHERE kind = ?", { "note" })
@@ -3516,7 +3578,7 @@ mod tests {
                 if column.pk then table.insert(keyed, column.name) end
             end
             assert(table.concat(names, ",")
-                   == "stream,seq,epoch_ms,kind,schema_version,payload",
+                   == "stream,seq,epoch_ms,kind,schema_version,beat,meta,data",
                    "columns: " .. table.concat(names, ","))
             assert(table.concat(keyed, ",") == "stream,seq",
                    "primary key: " .. table.concat(keyed, ","))
@@ -3528,7 +3590,9 @@ mod tests {
             assert(#rows == 1, "the opening event: " .. tostring(#rows))
             assert(rows[1].kind == "session_opened")
             assert(rows[1].schema_version == 1, "the stored version is a column")
-            assert(type(rows[1].payload) == "string", "the payload stays a string")
+            assert(rows[1].beat == nil, "an undeclared beat is NULL")
+            assert(type(rows[1].meta) == "string", "meta stays the stored text")
+            assert(type(rows[1].data) == "string", "and so does data")
         "#,
         )
         .exec()

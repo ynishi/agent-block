@@ -778,7 +778,9 @@ mod tests {
     fn append_if_shows_the_decision_only_the_kinds_it_asked_for() {
         let mut store = MemEventStore::new();
         store
-            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .append(obj(
+                json!({ "kind": KIND_BUDGET_GRANTED, "data": { "amount": 100 } }),
+            ))
             .expect("the grant");
         store.append(ev(1)).expect("noise");
         store.append(ev(2)).expect("more noise");
@@ -789,7 +791,9 @@ mod tests {
                 Some(&[KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]),
                 &mut |events| {
                     seen = events.iter().map(|e| kind_of(e).to_string()).collect();
-                    Some(obj(json!({ "kind": KIND_BUDGET_SPENT, "amount": 10 })))
+                    Some(obj(
+                        json!({ "kind": KIND_BUDGET_SPENT, "data": { "amount": 10 } }),
+                    ))
                 },
             )
             .expect("append_if");
@@ -845,11 +849,15 @@ mod tests {
     fn read_kinds_selects_by_kind_and_still_pages() {
         let mut store = MemEventStore::new();
         store
-            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .append(obj(
+                json!({ "kind": KIND_BUDGET_GRANTED, "data": { "amount": 100 } }),
+            ))
             .expect("grant");
         store.append(ev(1)).expect("noise");
         store
-            .append(obj(json!({ "kind": KIND_BUDGET_SPENT, "amount": 10 })))
+            .append(obj(
+                json!({ "kind": KIND_BUDGET_SPENT, "data": { "amount": 10 } }),
+            ))
             .expect("spend");
         store.append(ev(2)).expect("more noise");
 
@@ -1133,10 +1141,14 @@ mod tests {
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameSpent)];
         let mut store = CurrentStore::new(Box::new(MemEventStore::new()), chain);
         store
-            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .append(obj(
+                json!({ "kind": KIND_BUDGET_GRANTED, "data": { "amount": 100 } }),
+            ))
             .expect("the grant");
         store
-            .append(obj(json!({ "kind": "old_spent", "amount": 10 })))
+            .append(obj(
+                json!({ "kind": "old_spent", "data": { "amount": 10 } }),
+            ))
             .expect("a settlement under the older name");
 
         // Asked for by the name it is stored under, it comes back projected.

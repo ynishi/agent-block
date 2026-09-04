@@ -33,12 +33,23 @@
 use serde_json::Value;
 
 use super::event::{
-    FIELD_AMOUNT, FIELD_DESC, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED,
+    data_field, FIELD_AMOUNT, FIELD_DESC, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED,
     KIND_BUDGET_SPENT,
 };
 use super::event_store::Current;
-use super::projection::whole;
 use super::{KnlError, KnlResult};
+
+/// A stored number as a whole one (`0` when absent or not numeric).
+///
+/// The reading the ledger fold takes its amounts through: a `data` field is
+/// whatever was written, and a fold over the log must total what is there
+/// rather than stop at what is not.
+fn whole(value: &Value) -> i64 {
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|f| f.trunc() as i64))
+        .unwrap_or(0)
+}
 
 /// Reject an amount the counter cannot take.
 ///
@@ -72,10 +83,14 @@ pub(super) fn check_amount(amount: i64) -> KnlResult<()> {
 /// A caller may hand it the whole stream or only the `budget_*` kinds
 /// ([`super::EventStore::read_kinds`]); the arithmetic is the same, because
 /// every other kind moves nothing.
+///
+/// The amounts are read from the event's `data`, where a kind's own fields
+/// live ([`super::event`]) — the envelope carries the log's vocabulary, not
+/// the ledger's.
 pub fn fold_balance(events: &[Current]) -> Option<i64> {
     let mut balance: Option<i64> = None;
     for event in events {
-        let amount = event.get(FIELD_AMOUNT).map_or(0, whole).max(0);
+        let amount = data_field(event, FIELD_AMOUNT).map_or(0, whole).max(0);
         match event.kind() {
             KIND_BUDGET_GRANTED => {
                 balance = Some(balance.unwrap_or(0).saturating_add(amount));
@@ -101,15 +116,17 @@ pub fn last_grant(events: &[Current]) -> Option<BudgetGrant> {
         .rev()
         .find(|event| event.kind() == KIND_BUDGET_GRANTED)
         .map(|event| BudgetGrant {
-            amount: event.get(FIELD_AMOUNT).map_or(0, whole).max(0),
+            amount: data_field(event, FIELD_AMOUNT).map_or(0, whole).max(0),
             tag: string_field(event, FIELD_TAG),
             desc: string_field(event, FIELD_DESC),
         })
 }
 
-/// An optional string payload field of a stored event.
+/// An optional string `data` field of a stored event.
 fn string_field(event: &Current, field: &str) -> Option<String> {
-    event.get(field).and_then(Value::as_str).map(str::to_string)
+    data_field(event, field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// What an owner grants a scope: an amount, and the words for what it is.
@@ -172,34 +189,56 @@ mod tests {
     fn the_fold_of_the_ledger_is_the_balance() {
         use serde_json::json;
 
-        let mut ledger = log(vec![json!({ "kind": "budget_granted", "amount": 100 })]);
+        let mut ledger = log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 100 } }),
+        ]);
         assert_eq!(fold_balance(&ledger), Some(100));
 
         // A reservation of 30 was decided in the store and recorded there.
         ledger.extend(log(vec![
-            json!({ "kind": "budget_reserved", "amount": 30 }),
+            json!({ "kind": "budget_reserved", "data": { "amount": 30 } }),
         ]));
         assert_eq!(fold_balance(&ledger), Some(70), "after a reservation");
 
         // A refusal is recorded and moves nothing.
         ledger.extend(log(vec![
-            json!({ "kind": "budget_refused", "amount": 1000, "remaining": 70 }),
+            json!({ "kind": "budget_refused", "data": { "amount": 1000, "remaining": 70 } }),
         ]));
         assert_eq!(fold_balance(&ledger), Some(70), "after a refusal");
 
-        ledger.extend(log(vec![json!({ "kind": "budget_spent", "amount": 20 })]));
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_spent", "data": { "amount": 20 } }),
+        ]));
         assert_eq!(fold_balance(&ledger), Some(50), "after a settlement");
 
         // Overspending floors at zero rather than going into debt, and a
         // huge amount cannot wrap it…
         ledger.extend(log(vec![
-            json!({ "kind": "budget_spent", "amount": i64::MAX }),
+            json!({ "kind": "budget_spent", "data": { "amount": i64::MAX } }),
         ]));
         assert_eq!(fold_balance(&ledger), Some(0), "at the floor");
 
         // …so a later grant starts from zero, not from a forgiven debt.
-        ledger.extend(log(vec![json!({ "kind": "budget_granted", "amount": 10 })]));
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 10 } }),
+        ]));
         assert_eq!(fold_balance(&ledger), Some(10), "after a re-grant");
+    }
+
+    /// The amounts are read from `data` and nowhere else: a number left at
+    /// the top level is not a ledger entry, which is what stops the envelope
+    /// and a kind's own fields from being read as one namespace.
+    #[test]
+    fn an_amount_outside_data_is_not_folded() {
+        use serde_json::json;
+
+        assert_eq!(
+            fold_balance(&log(vec![
+                json!({ "kind": "budget_granted", "amount": 100 })
+            ])),
+            Some(0),
+            "a grant whose amount is not under data grants nothing"
+        );
     }
 
     /// No grant in the log is no budget — which is not a balance of zero:
@@ -211,14 +250,16 @@ mod tests {
         assert_eq!(fold_balance(&[]), None);
         assert_eq!(
             fold_balance(&log(vec![
-                json!({ "kind": "session_opened" }),
-                json!({ "kind": "llm_response", "usage": { "input_tokens": 500 } }),
+                json!({ "kind": "session_opened", "data": { "scope_id": "s", "owner": "anon" } }),
+                json!({ "kind": "llm_response", "data": { "usage": { "input_tokens": 500 } } }),
             ])),
             None,
             "a provider response is not a budget move"
         );
         assert_eq!(
-            fold_balance(&log(vec![json!({ "kind": "budget_granted", "amount": 0 })])),
+            fold_balance(&log(vec![
+                json!({ "kind": "budget_granted", "data": { "amount": 0 } }),
+            ])),
             Some(0),
             "a grant of zero is a budget, and an empty one"
         );
@@ -233,9 +274,15 @@ mod tests {
         assert_eq!(last_grant(&[]), None);
 
         let ledger = log(vec![
-            json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens", "desc": "first" }),
-            json!({ "kind": "budget_reserved", "amount": 10 }),
-            json!({ "kind": "budget_granted", "amount": 50, "tag": "tokens", "desc": "second" }),
+            json!({
+                "kind": "budget_granted",
+                "data": { "amount": 100, "tag": "tokens", "desc": "first" }
+            }),
+            json!({ "kind": "budget_reserved", "data": { "amount": 10 } }),
+            json!({
+                "kind": "budget_granted",
+                "data": { "amount": 50, "tag": "tokens", "desc": "second" }
+            }),
         ]);
         let grant = last_grant(&ledger).expect("a grant was recorded");
         assert_eq!(grant.amount, 50, "the latest grant, not the first");
@@ -243,8 +290,10 @@ mod tests {
         assert_eq!(grant.desc.as_deref(), Some("second"));
 
         // A grant with no words comes back with none invented.
-        let bare = last_grant(&log(vec![json!({ "kind": "budget_granted", "amount": 7 })]))
-            .expect("a grant was recorded");
+        let bare = last_grant(&log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 7 } }),
+        ]))
+        .expect("a grant was recorded");
         assert_eq!(bare, BudgetGrant::new(7));
     }
 

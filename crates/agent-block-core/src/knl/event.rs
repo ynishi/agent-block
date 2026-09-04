@@ -1,13 +1,65 @@
-//! Event envelope and the two-layer `kind` vocabulary.
+//! The event envelope, and the kernel's own `kind` vocabulary.
 //!
-//! # Envelope
+//! # The stored shape is envelope + meta + data
 //!
-//! Every stored event is a JSON object carrying the kernel-owned fields
-//! [`FIELD_SEQ`] (`u64`, starts at 1, strictly increasing) and
-//! [`FIELD_EPOCH_MS`] (`u64`, wall clock at append time), plus the
-//! caller-owned [`FIELD_KIND`] (string) and an arbitrary payload.  The two
-//! kernel-owned fields are stamped by [`stamp`] and overwrite any
-//! caller-supplied field of the same name.
+//! An event is a JSON object with four caller-facing keys and three the
+//! kernel stamps, **and no others**:
+//!
+//! | key                     | written by | what it is                                                            |
+//! |-------------------------|------------|-----------------------------------------------------------------------|
+//! | [`FIELD_KIND`]          | the caller | required, a string: what happened                                      |
+//! | [`FIELD_BEAT`]          | the caller | optional, a string: the beat this fact belongs to                      |
+//! | [`FIELD_META`]          | the caller | optional, a **shallow** object: string / number / boolean values only   |
+//! | [`FIELD_DATA`]          | the caller | optional (default `{}`), an object: the kind's own content, any depth   |
+//! | [`FIELD_SEQ`]           | the kernel | `u64`, starts at 1, strictly increasing                                |
+//! | [`FIELD_EPOCH_MS`]      | the kernel | `u64`, wall clock at append time                                       |
+//! | `_schema_version`       | the kernel | the shape the event was written under                                  |
+//!
+//! A top-level key that is none of those is refused
+//! ([`KnlError::Validation`]).  That is the whole point of the split: an
+//! event used to be one flat object, so an envelope key and a kind's own
+//! field sat at the same level and a reader — a SQL view most of all — could
+//! not tell which of them it was reading.  A change to what one kind records
+//! then broke a `json_extract` path silently, because nothing said where a
+//! kind's shape ended and the log's did.
+//!
+//! So the three levels are separated by rule:
+//!
+//! - the **envelope** is the stable contract.  Its keys are never renamed;
+//!   they are columns of the log's table ([`super::sqlite_store`]) and a view
+//!   built on them is not affected by any kind changing shape.
+//! - **`meta`** is shallow *by rule* — its values are scalars — so it can be
+//!   read without knowing the kind.  It is the place for a correlation value,
+//!   a label, a flag: anything a reader groups or filters by.  A nested value
+//!   there is refused, and the refusal says where it goes instead.
+//! - **`data`** is the one place structured JSON lives, and its shape belongs
+//!   to whoever writes the kind.  A view that reads a `data` path is updated
+//!   in the same round as the kind whose shape it reads — which is a rule a
+//!   reader can actually follow, because the paths that need watching are all
+//!   under one key.
+//!
+//! # Who owns which shape
+//!
+//! The kernel validates the envelope for every event, and the `data` of its
+//! own six kinds — the ones [`is_kernel_only`] names, which are the only ones
+//! it writes:
+//!
+//! | kernel kind       | required `data`                                | optional `data`   |
+//! |-------------------|------------------------------------------------|-------------------|
+//! | `session_opened`  | `scope_id: string`, `owner: string`            | —                 |
+//! | `session_closed`  | `reason: string`                               | `detail`          |
+//! | `budget_granted`  | `amount: integer`                              | `tag`, `desc`     |
+//! | `budget_reserved` | `amount: integer`                              | `tag`             |
+//! | `budget_refused`  | `amount: integer`, `remaining: integer`        | `tag`             |
+//! | `budget_spent`    | `amount: integer`                              | `tag`             |
+//!
+//! Every other kind passes with its envelope checked and its `data` untouched.
+//! That includes the kinds a turn is made of — `msg_user`, `llm_request`,
+//! `llm_response`, `llm_call_failed`, `tool_call`, `tool_result` — which the
+//! Lua kernel writes and therefore owns: their shapes are declared over there
+//! (`knl.shapes`), where the code that writes them is.  The kernel used to
+//! hold a second copy of those requirements, which made it the one place a
+//! shell could not change its own event without a Rust round.
 //!
 //! # No per-event author
 //!
@@ -24,48 +76,9 @@
 //! what it consumed keys on the `kind` alone: an `llm_response` in the
 //! history is one this run made, so a reader summing the counts has nothing
 //! foreign to exclude and no author to key on.  That reader is not the
-//! kernel.  The totals are a query view over the recorded payloads
+//! kernel.  The totals are a query view over the recorded `data`
 //! (`knl.views.usage`, SQL over the published schema); what the kernel does
-//! is keep the payload verbatim and hold the shape below.
-//!
-//! # Two layers of `kind`
-//!
-//! - **Reserved kinds** (the table below) describe a Turn's observable
-//!   facts.  Their required fields are checked here, so a malformed
-//!   `llm_response` cannot enter the history.
-//! - **Open kinds** — everything else.  Only `kind: string` is checked.
-//!   Caller-domain events (decision / note / carry …) live here and their
-//!   shape is the shell's business, which is why the kind vocabulary is
-//!   deliberately *not* closed in Rust.
-//!
-//! | reserved kind     | required fields                                      |
-//! |-------------------|------------------------------------------------------|
-//! | `session_opened`  | — (appended by the kernel when a session opens)       |
-//! | `session_closed`  | `reason: string` (appended by the kernel on close)   |
-//! | `msg_user`        | `content: string \| array`                           |
-//! | `llm_response`    | `content: array`, `usage: table`                     |
-//! | `tool_call`       | `call_id: string`, `name: string`, `args: table`     |
-//! | `tool_result`     | `call_id: string`, `ok: boolean`, `result` (any)     |
-//! | `budget_granted`  | `amount: integer` (`tag` / `desc` optional)          |
-//! | `budget_reserved` | `amount: integer` (`tag` optional)                   |
-//! | `budget_refused`  | `amount: integer`, `remaining: integer` (`tag` optional) |
-//! | `budget_spent`    | `amount: integer` (`tag` optional)                   |
-//!
-//! `llm_response` keeps its required fields although nothing in the kernel
-//! reads them any more: a reserved kind's shape is a *contract*, not a
-//! fold's input.  The layer above keeps no second copy of it on purpose (a
-//! copy drifted, so the Lua device checks the `beat` stamp and nothing
-//! else); the provider adapter normalises an empty answer to an empty
-//! *array* because this check is what says `content` is one; and the token
-//! account reads `usage` back out of the log.  Dropping the check would not
-//! remove it, it would move it into every reader.
-//!
-//! The kernel writes two more fields onto some of those, neither of them
-//! required: `owner` and [`FIELD_SCOPE_ID`] on `session_opened`, and
-//! [`FIELD_SCOPE_ID`] on each `budget_*` event.  They record the scope the
-//! session was written under ([`super::Scope`]) so it can be recovered from
-//! the log alone; leaving them out of the required set is what lets a log
-//! written before they existed still validate and still resume.
+//! is keep the `data` verbatim.
 //!
 //! # Kernel-only kinds
 //!
@@ -91,10 +104,15 @@
 //!
 //! [`FIELD_BEAT`] is an opaque, caller-declared string — the id of the beat
 //! a fact belongs to, minted by the layer above (`knl.new_beat_id()` on the
-//! Lua side).  The kernel neither requires nor generates it: no reserved
-//! kind lists it among its required fields, and no append stamps it.  It is
-//! validated in one respect only, and on every kind: when present it must be
-//! a string, so a stream cannot mix a number and a string under one name.
+//! Lua side).  The kernel neither requires it nor generates it: no kind lists
+//! it among its required fields, and no append stamps it.  It is validated in
+//! one respect only, and on every kind: when present it must be a string, so
+//! a stream cannot mix a number and a string under one name.
+//!
+//! It is an envelope key rather than a `meta` entry because it is the one
+//! correlation the log itself is indexed by — it has a column and an index of
+//! its own ([`super::sqlite_store`]), so grouping a run by beat is a plain
+//! `GROUP BY` and not a `json_extract`.
 //!
 //! The literal request/response bytes are not stored: they are derivable
 //! from these facts by a projection, and byte-level fidelity is the dump
@@ -104,27 +122,54 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
+use super::event_store::SCHEMA_VERSION_FIELD;
 use super::{KnlError, KnlResult};
 
 /// Kernel-owned event field: strictly increasing sequence number.
 pub const FIELD_SEQ: &str = "seq";
 /// Kernel-owned event field: wall-clock append time in milliseconds.
 pub const FIELD_EPOCH_MS: &str = "epoch_ms";
-/// Caller-owned event field that every event must carry.
+/// Caller-owned envelope key that every event must carry.
 pub const FIELD_KIND: &str = "kind";
+/// Caller-owned envelope key: which beat the fact belongs to.
+///
+/// An opaque string the caller declares (`knl.new_beat_id()` mints a
+/// time-ordered one).  The kernel never requires it and never generates it;
+/// it only insists that a present `beat` is a string — see the module docs.
+pub const FIELD_BEAT: &str = "beat";
+/// Caller-owned envelope key: a shallow object of scalars.
+///
+/// Values are a string, a number or a boolean; a nested object or array is
+/// refused, because the point of `meta` is that it can be read without
+/// knowing the kind.  Structure goes under [`FIELD_DATA`].
+pub const FIELD_META: &str = "meta";
+/// Caller-owned envelope key: the kind's own content, at any depth.
+///
+/// Defaults to `{}` when the caller writes none, so every stored event has
+/// one.  The shape under here belongs to whoever writes the kind — the
+/// kernel checks only its own six ([`is_kernel_only`]).
+pub const FIELD_DATA: &str = "data";
+
+/// Every key an event may carry at the top level.
+///
+/// The closed list the stray-key check reads.  Four are the caller's
+/// ([`FIELD_KIND`] / [`FIELD_BEAT`] / [`FIELD_META`] / [`FIELD_DATA`]) and
+/// three are stamped by the kernel; anything else is a kind's own field that
+/// belongs under `data`.
+pub const ENVELOPE_FIELDS: &[&str] = &[
+    FIELD_KIND,
+    FIELD_BEAT,
+    FIELD_META,
+    FIELD_DATA,
+    FIELD_SEQ,
+    FIELD_EPOCH_MS,
+    SCHEMA_VERSION_FIELD,
+];
 
 /// Kernel-only kind: the session opened (appended by the kernel).
 pub const KIND_SESSION_OPENED: &str = "session_opened";
 /// Kernel-only kind: the session ended (appended by the kernel on close).
 pub const KIND_SESSION_CLOSED: &str = "session_closed";
-/// Reserved kind: a user message.
-pub const KIND_MSG_USER: &str = "msg_user";
-/// Reserved kind: a provider response (verbatim blocks + usage).
-pub const KIND_LLM_RESPONSE: &str = "llm_response";
-/// Reserved kind: a tool invocation.
-pub const KIND_TOOL_CALL: &str = "tool_call";
-/// Reserved kind: a tool result (failures are events too).
-pub const KIND_TOOL_RESULT: &str = "tool_result";
 /// Kernel-only kind: an owner granted the run a quota.
 pub const KIND_BUDGET_GRANTED: &str = "budget_granted";
 /// Kernel-only kind: a reservation was allowed, and the balance fell by it.
@@ -150,69 +195,47 @@ pub const BUDGET_KINDS: &[&str] = &[
     KIND_BUDGET_SPENT,
 ];
 
-/// Payload field of `session_closed`.
+/// `data` field of `session_closed`.
 pub const FIELD_REASON: &str = "reason";
-/// Optional payload field of `session_closed`: free text about the close
+/// Optional `data` field of `session_closed`: free text about the close
 /// that wrote it — the message of the error that ended a scope, say.  It is
 /// kept out of [`FIELD_REASON`] on purpose: the reason is a small vocabulary
 /// a reader can fold on, and an error message is not part of it.
 pub const FIELD_DETAIL: &str = "detail";
-/// Optional payload field of any event: which beat the fact belongs to.
-///
-/// An opaque string the caller declares (`knl.new_beat_id()` mints a
-/// time-ordered one).  The kernel never requires it and never generates it;
-/// it only insists that a present `beat` is a string — see the module docs.
-pub const FIELD_BEAT: &str = "beat";
-/// Payload field of `msg_user` / `llm_response`.
-pub const FIELD_CONTENT: &str = "content";
-/// Payload field of `llm_response`.
-pub const FIELD_USAGE: &str = "usage";
-/// Payload field of `tool_call` / `tool_result`.
-pub const FIELD_CALL_ID: &str = "call_id";
-/// Payload field of `tool_result`.
-pub const FIELD_OK: &str = "ok";
-/// Payload field of `tool_result`.
-pub const FIELD_RESULT: &str = "result";
-/// Payload field of every `budget_*` kind: how much, in the grant's unit.
+/// `data` field of every `budget_*` kind: how much, in the grant's unit.
 pub const FIELD_AMOUNT: &str = "amount";
-/// Payload field of `budget_*`: the grant's unit / identity, if it named
+/// `data` field of `budget_*`: the grant's unit / identity, if it named
 /// one.  Optional and kernel-uninterpreted — it rides along so a log can
 /// be read without asking the shell what the numbers counted.
 pub const FIELD_TAG: &str = "tag";
-/// Payload field of `budget_granted`: the owner's free-text note.
+/// `data` field of `budget_granted`: the owner's free-text note.
 pub const FIELD_DESC: &str = "desc";
-/// Payload field of `budget_refused`: the balance at the moment of the
+/// `data` field of `budget_refused`: the balance at the moment of the
 /// refusal, which the refusal did not change.
 pub const FIELD_REMAINING: &str = "remaining";
-/// Payload field of `session_opened` and of every `budget_*` kind: the
+/// `data` field of `session_opened`: the principal the session's scope
+/// belongs to (a real id, or the reserved [`super::ANON`] /
+/// [`super::SYSTEM`]).
+///
+/// Recorded so a later [`super::Session::resume`] can restore the scope from
+/// the log alone rather than being told what it was.
+pub const FIELD_OWNER: &str = "owner";
+/// `data` field of `session_opened` and of every `budget_*` kind: the
 /// kernel-issued id of the scope the event was written under
 /// ([`super::Scope`]).
 ///
 /// It rides on the events that define the boundary — the session's opening
 /// and every move of its balance — so a reader can tell whose authority a
-/// ledger entry was written with from the log alone, and a resume can
-/// restore the scope without being told.  Both kinds are open-shaped as far
-/// as this field is concerned (nothing below requires it), so a log written
-/// before it existed still validates and still resumes.
+/// ledger entry was written with from the log alone.
 pub const FIELD_SCOPE_ID: &str = "scope_id";
 
-/// Expected JSON shape of a required field on a reserved kind.
+/// Expected JSON shape of a required `data` field on a kernel kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
     /// A JSON string.
     Str,
     /// A whole number.
     Integer,
-    /// A JSON boolean.
-    Bool,
-    /// A JSON array.
-    Array,
-    /// A JSON object (a Lua table with string keys).
-    Object,
-    /// A JSON string or array.
-    StringOrArray,
-    /// Any value: the field must be present, its shape is the caller's.
-    Any,
 }
 
 impl Shape {
@@ -221,11 +244,6 @@ impl Shape {
         match self {
             Shape::Str => "a string",
             Shape::Integer => "a whole number",
-            Shape::Bool => "a boolean",
-            Shape::Array => "an array",
-            Shape::Object => "a table",
-            Shape::StringOrArray => "a string or an array",
-            Shape::Any => "present",
         }
     }
 
@@ -234,72 +252,53 @@ impl Shape {
         match self {
             Shape::Str => value.is_string(),
             Shape::Integer => is_whole_number(value),
-            Shape::Bool => value.is_boolean(),
-            Shape::Array => value.is_array(),
-            Shape::Object => value.is_object(),
-            Shape::StringOrArray => value.is_string() || value.is_array(),
-            Shape::Any => true,
         }
     }
 }
 
-/// Required fields of `session_closed`.
-const SESSION_CLOSED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
-/// Required fields of `msg_user`.
-const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
-/// Required fields of `llm_response`.
+/// Required `data` of `session_opened`: the scope the session opened under.
 ///
-/// `beat` is not among them: beats are declared by the layer above, and no
-/// kind requires one — see the module docs.
-const LLM_RESPONSE_FIELDS: &[(&str, Shape)] =
-    &[(FIELD_CONTENT, Shape::Array), (FIELD_USAGE, Shape::Object)];
-/// Required fields of `tool_call`.
-///
-/// `beat` is not among them either: the kernel does not know beats, so it
-/// cannot insist a tool call name one.
-const TOOL_CALL_FIELDS: &[(&str, Shape)] = &[
-    (FIELD_CALL_ID, Shape::Str),
-    ("name", Shape::Str),
-    ("args", Shape::Object),
-];
-/// Required fields of `tool_result`.
-const TOOL_RESULT_FIELDS: &[(&str, Shape)] = &[
-    (FIELD_CALL_ID, Shape::Str),
-    (FIELD_OK, Shape::Bool),
-    (FIELD_RESULT, Shape::Any),
-];
-/// Required fields of `session_opened` (none — the kernel appends it).
-const SESSION_OPENED_FIELDS: &[(&str, Shape)] = &[];
-/// Required fields of `budget_granted` (`tag` / `desc` are optional).
-const BUDGET_GRANTED_FIELDS: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
-/// Required fields of `budget_reserved` / `budget_spent` (`tag` optional).
-const BUDGET_MOVE_FIELDS: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
-/// Required fields of `budget_refused`: what was asked for, and what there
+/// Both are the kernel's own writes, and both are what a resume reads back to
+/// restore the scope — so a `session_opened` without them is an opening that
+/// cannot be resumed, and it is refused here rather than discovered there.
+const SESSION_OPENED_DATA: &[(&str, Shape)] =
+    &[(FIELD_SCOPE_ID, Shape::Str), (FIELD_OWNER, Shape::Str)];
+/// Required `data` of `session_closed` (`detail` is optional).
+const SESSION_CLOSED_DATA: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
+/// Required `data` of `budget_granted` (`tag` / `desc` are optional).
+const BUDGET_GRANTED_DATA: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
+/// Required `data` of `budget_reserved` / `budget_spent` (`tag` optional).
+const BUDGET_MOVE_DATA: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
+/// Required `data` of `budget_refused`: what was asked for, and what there
 /// was — the pair that makes the refusal readable without a fold.
-const BUDGET_REFUSED_FIELDS: &[(&str, Shape)] = &[
+const BUDGET_REFUSED_DATA: &[(&str, Shape)] = &[
     (FIELD_AMOUNT, Shape::Integer),
     (FIELD_REMAINING, Shape::Integer),
 ];
 
-/// The required fields of a reserved kind, or `None` for an open kind.
-fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
+/// The required `data` fields of a kernel kind, or `None` for every other
+/// kind — whose `data` shape belongs to whoever writes it.
+fn required_data(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
     match kind {
-        KIND_SESSION_OPENED => Some(SESSION_OPENED_FIELDS),
-        KIND_SESSION_CLOSED => Some(SESSION_CLOSED_FIELDS),
-        KIND_MSG_USER => Some(MSG_USER_FIELDS),
-        KIND_LLM_RESPONSE => Some(LLM_RESPONSE_FIELDS),
-        KIND_TOOL_CALL => Some(TOOL_CALL_FIELDS),
-        KIND_TOOL_RESULT => Some(TOOL_RESULT_FIELDS),
-        KIND_BUDGET_GRANTED => Some(BUDGET_GRANTED_FIELDS),
-        KIND_BUDGET_RESERVED | KIND_BUDGET_SPENT => Some(BUDGET_MOVE_FIELDS),
-        KIND_BUDGET_REFUSED => Some(BUDGET_REFUSED_FIELDS),
+        KIND_SESSION_OPENED => Some(SESSION_OPENED_DATA),
+        KIND_SESSION_CLOSED => Some(SESSION_CLOSED_DATA),
+        KIND_BUDGET_GRANTED => Some(BUDGET_GRANTED_DATA),
+        KIND_BUDGET_RESERVED | KIND_BUDGET_SPENT => Some(BUDGET_MOVE_DATA),
+        KIND_BUDGET_REFUSED => Some(BUDGET_REFUSED_DATA),
         _ => None,
     }
 }
 
-/// Whether `kind` is part of the reserved (kernel-checked) vocabulary.
+/// Whether the kernel checks this kind's `data`.
+///
+/// Exactly the six kinds of [`is_kernel_only`], and that is not a
+/// coincidence: the kernel holds the shape of what it writes itself, and of
+/// nothing else.  The two predicates answer different questions — "is this
+/// shape mine to check" and "is this kind mine to write" — and today they
+/// have the same answer for every kind, which is what "the writer owns the
+/// shape" means when it is followed all the way through.
 pub fn is_reserved(kind: &str) -> bool {
-    required_fields(kind).is_some()
+    required_data(kind).is_some()
 }
 
 /// Whether `kind` is one only the kernel may write.
@@ -344,12 +343,24 @@ pub fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// A field of a stored event's `data`, or `None` when either is absent.
+///
+/// The one reading of the split every fold in the kernel goes through, so
+/// "the kind's own fields live under `data`" is written once rather than
+/// spelled out at each call site.
+pub fn data_field<'a>(event: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
+    event.get(FIELD_DATA)?.as_object()?.get(name)
+}
+
 /// Validate an event before it enters the history.
 ///
-/// `kind` must be a string for every event, and a `beat` — on any kind, if
-/// the caller declared one — must be a string too.  For a reserved kind the
-/// required fields of the table above are checked as well; an open kind
-/// passes through otherwise untouched.
+/// Two checks, in this order:
+///
+/// 1. **the envelope**, on every kind — `kind` is a string, a present `beat`
+///    is a string, a present `meta` is an object of scalars, a present `data`
+///    is an object, and there is no other top-level key;
+/// 2. **the `data` of a kernel kind** — the table in the module docs.  Every
+///    other kind's `data` is its writer's, and passes through untouched.
 pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
     let kind = match obj.get(FIELD_KIND) {
         Some(Value::String(kind)) => kind.as_str(),
@@ -366,10 +377,23 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
         }
     };
 
+    // The envelope is a closed set of keys.  A field that is none of them is
+    // a kind's own, and a kind's own fields live under `data` — where a
+    // reader can tell them apart from the log's own vocabulary, and where a
+    // change to them cannot be mistaken for a change to the envelope.
+    for key in obj.keys() {
+        if !ENVELOPE_FIELDS.contains(&key.as_str()) {
+            return Err(KnlError::Validation(format!(
+                "{key:?} is not part of the envelope (kind / beat / meta / data); a kind's own \
+                 fields go under data"
+            )));
+        }
+    }
+
     // The beat is the caller's to declare and never the kernel's to mint,
     // but it is one name across the whole stream: a present `beat` is a
-    // string on every kind, reserved or open, so a reader never has to ask
-    // whether this one is a number.
+    // string on every kind, so a reader never has to ask whether this one is
+    // a number.
     match obj.get(FIELD_BEAT) {
         None => {}
         Some(Value::String(_)) => {}
@@ -381,22 +405,63 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
         }
     }
 
-    // Open kind: the shell owns the shape, so there is nothing to check.
-    let Some(fields) = required_fields(kind) else {
+    // `meta` is shallow by rule, which is what lets a reader group or filter
+    // on it without knowing the kind.  Nesting is refused rather than
+    // flattened, and the refusal says where the nested value belongs.
+    match obj.get(FIELD_META) {
+        None => {}
+        Some(Value::Object(meta)) => {
+            for (name, value) in meta {
+                if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+                    return Err(KnlError::Validation(format!(
+                        "meta is shallow: {name:?} must be a string, a number or a boolean, got \
+                         {} (nest it under data)",
+                        json_type_name(value)
+                    )));
+                }
+            }
+        }
+        Some(other) => {
+            return Err(KnlError::Validation(format!(
+                "meta must be a table, got {}",
+                json_type_name(other)
+            )));
+        }
+    }
+
+    let data = match obj.get(FIELD_DATA) {
+        None => None,
+        Some(Value::Object(data)) => Some(data),
+        Some(other) => {
+            return Err(KnlError::Validation(format!(
+                "data must be a table, got {}",
+                json_type_name(other)
+            )));
+        }
+    };
+
+    // Not a kernel kind: its `data` belongs to whoever writes it, so there is
+    // nothing here to check.
+    let Some(fields) = required_data(kind) else {
         return Ok(());
     };
 
+    // An absent `data` is the empty one — it defaults to `{}` on the way in
+    // ([`stamp`]) — so a kernel kind that needs a field reports the field it
+    // is missing rather than the `data` it has none of.
+    let empty = Map::new();
+    let data = data.unwrap_or(&empty);
     for (name, shape) in fields {
-        match obj.get(*name) {
+        match data.get(*name) {
             None => {
                 return Err(KnlError::Validation(format!(
-                    "reserved kind {kind:?} requires {name:?} ({})",
+                    "kernel kind {kind:?} requires data.{name} ({})",
                     shape.name()
                 )));
             }
             Some(value) if !shape.accepts(value) => {
                 return Err(KnlError::Validation(format!(
-                    "reserved kind {kind:?}: {name:?} must be {}, got {}",
+                    "kernel kind {kind:?}: data.{name} must be {}, got {}",
                     shape.name(),
                     json_type_name(value)
                 )));
@@ -407,13 +472,27 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
     Ok(())
 }
 
-/// Stamp the kernel-owned envelope fields, overwriting caller values.
+/// Stamp the kernel-owned envelope fields and fill the envelope's defaults.
 ///
-/// `seq` and `epoch_ms` are the kernel's to assign, so a payload that
-/// carries either gets the kernel's value instead.
+/// `seq` and `epoch_ms` are the kernel's to assign, so an event that carries
+/// either gets the kernel's value instead.  `meta` and `data` are filled in
+/// with `{}` when the caller wrote none, so every *stored* event carries the
+/// whole envelope: a reader never has to ask whether the key it wants is
+/// missing because nothing was written or because the writer left it out.
+///
+/// Called on every write path, right before the event is recorded, which is
+/// what makes the default a property of the stored shape rather than of one
+/// backend.
 pub fn stamp(obj: &mut Map<String, Value>, seq: u64, epoch_ms: u64) {
     obj.insert(FIELD_SEQ.to_string(), Value::from(seq));
     obj.insert(FIELD_EPOCH_MS.to_string(), Value::from(epoch_ms));
+    obj.entry(FIELD_META).or_insert_with(empty_object);
+    obj.entry(FIELD_DATA).or_insert_with(empty_object);
+}
+
+/// An empty JSON object — the default of `meta` and of `data`.
+fn empty_object() -> Value {
+    Value::Object(Map::new())
 }
 
 /// The `seq` of a stored event (`0` when absent, which cannot happen for
@@ -427,10 +506,15 @@ pub fn kind_of(event: &Value) -> &str {
     event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("")
 }
 
-/// Build an event with `kind` set, for the kernel's own reserved writes.
-pub fn kernel_event(kind: &str) -> Map<String, Value> {
+/// Build a kernel-written event: its `kind`, and the `data` it records.
+///
+/// The kernel's own writes go through this one constructor, so a kernel kind
+/// cannot be built with its fields left at the top level — the split is in
+/// the shape of the call rather than in what each site remembered to do.
+pub fn kernel_event(kind: &str, data: Map<String, Value>) -> Map<String, Value> {
     let mut obj = Map::new();
     obj.insert(FIELD_KIND.to_string(), Value::String(kind.to_string()));
+    obj.insert(FIELD_DATA.to_string(), Value::Object(data));
     obj
 }
 
@@ -459,7 +543,8 @@ mod tests {
 
     #[test]
     fn kind_must_be_present_and_a_string() {
-        let err = validate_event(&obj(json!({ "text": "hi" }))).expect_err("missing kind");
+        let err =
+            validate_event(&obj(json!({ "data": { "text": "hi" } }))).expect_err("missing kind");
         assert!(err.reason().contains("kind is required"), "{err}");
 
         let err = validate_event(&obj(json!({ "kind": 42 }))).expect_err("numeric kind");
@@ -467,92 +552,177 @@ mod tests {
         assert!(err.reason().contains("number"), "{err}");
     }
 
+    /// The envelope is a closed set of keys.  A kind's own field at the top
+    /// level is the mistake the split exists to stop, so it is refused with
+    /// the place it belongs in the message.
     #[test]
-    fn open_kinds_pass_through_unchecked() {
-        // Any payload at all, including none.
-        validate_event(&obj(json!({ "kind": "decision" }))).expect("bare open kind");
-        validate_event(&obj(json!({ "kind": "note", "any": { "nested": [1, 2] } })))
-            .expect("open kind with payload");
-        // Near-misses of the reserved vocabulary are open kinds too.
-        validate_event(&obj(json!({ "kind": "user_msg" }))).expect("user_msg is not reserved");
+    fn a_key_outside_the_envelope_is_refused() {
+        let err = validate_event(&obj(json!({ "kind": "msg_user", "content": "hi" })))
+            .expect_err("a stray top-level key");
+        assert!(err.reason().contains("\"content\""), "{err}");
+        assert!(err.reason().contains("under data"), "{err}");
+
+        // Every envelope key is accepted together, the kernel's stamps
+        // included: those are reserved, not stray.
+        validate_event(&obj(json!({
+            "kind": "note",
+            "beat": "b1",
+            "meta": { "tag": "a" },
+            "data": { "text": "hi" },
+            "seq": 1,
+            "epoch_ms": 0,
+            "_schema_version": 1
+        })))
+        .expect("the whole envelope");
     }
 
+    /// `meta` is shallow so a reader can use it without knowing the kind:
+    /// scalars in, nesting out, and the refusal names `data`.
     #[test]
-    fn reserved_kinds_accept_their_documented_shape() {
+    fn meta_takes_scalars_and_refuses_nesting() {
+        validate_event(&obj(json!({
+            "kind": "note",
+            "meta": { "label": "a", "attempt": 2, "retried": true }
+        })))
+        .expect("a shallow meta");
+        validate_event(&obj(json!({ "kind": "note", "meta": {} }))).expect("an empty meta");
+
+        for nested in [json!({ "deep": { "a": 1 } }), json!({ "deep": [1, 2] })] {
+            let err = validate_event(&obj(json!({ "kind": "note", "meta": nested })))
+                .expect_err("a nested meta value");
+            assert!(err.reason().contains("meta is shallow"), "{err}");
+            assert!(err.reason().contains("under data"), "{err}");
+        }
+
+        // A null is not one of the three scalars either: an absent key says
+        // "nothing here" already.
+        let err = validate_event(&obj(json!({ "kind": "note", "meta": { "x": null } })))
+            .expect_err("a null meta value");
+        assert!(err.reason().contains("meta is shallow"), "{err}");
+
+        let err = validate_event(&obj(json!({ "kind": "note", "meta": "a" })))
+            .expect_err("meta must be a table");
+        assert!(err.reason().contains("meta must be a table"), "{err}");
+    }
+
+    /// `data` is an object at any depth, and it is optional on the way in.
+    #[test]
+    fn data_is_an_object_of_any_depth_and_may_be_left_out() {
+        validate_event(&obj(json!({ "kind": "note" }))).expect("no data at all");
+        validate_event(&obj(json!({ "kind": "note", "data": {} }))).expect("empty data");
+        validate_event(&obj(json!({
+            "kind": "llm_response",
+            "data": { "content": [{ "type": "text", "text": "ok" }], "usage": { "in": 3 } }
+        })))
+        .expect("nested data");
+
+        let err = validate_event(&obj(json!({ "kind": "note", "data": [1, 2] })))
+            .expect_err("data must be a table");
+        assert!(err.reason().contains("data must be a table"), "{err}");
+    }
+
+    /// An event written without `data` is stored with an empty one, so a
+    /// reader never meets the key missing.
+    #[test]
+    fn a_stored_event_always_carries_meta_and_data() {
+        let mut event = obj(json!({ "kind": "note" }));
+        stamp(&mut event, 1, 0);
+        assert_eq!(event[FIELD_DATA], json!({}));
+        assert_eq!(event[FIELD_META], json!({}));
+
+        // What the caller did write is left exactly as it was.
+        let mut written = obj(json!({
+            "kind": "note", "meta": { "label": "a" }, "data": { "text": "hi" }
+        }));
+        stamp(&mut written, 2, 0);
+        assert_eq!(written[FIELD_META], json!({ "label": "a" }));
+        assert_eq!(written[FIELD_DATA], json!({ "text": "hi" }));
+    }
+
+    /// A kind the kernel does not write passes with its `data` untouched —
+    /// including the kinds a turn is made of, whose shapes the Lua kernel
+    /// owns now.
+    #[test]
+    fn the_data_of_a_callers_kind_is_not_the_kernels_business() {
         for event in [
-            json!({ "kind": "session_opened" }),
-            json!({ "kind": "session_closed", "reason": "closed" }),
-            json!({ "kind": "msg_user", "content": "hi" }),
-            json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "hi" }] }),
-            // An llm_response with no beat is valid: beats are declared by
-            // the layer above, and no kind requires one.
-            json!({
-                "kind": "llm_response",
-                "content": [{ "type": "text", "text": "ok" }],
-                "usage": { "input_tokens": 3 }
-            }),
-            // …and one that declares a beat is valid too.
-            json!({
-                "kind": "llm_response",
-                "beat": "0199e0f0-0000-7000-8000-000000000001",
-                "content": [{ "type": "text", "text": "ok" }],
-                "usage": { "input_tokens": 3 }
-            }),
-            json!({
-                "kind": "tool_call",
-                "beat": "b1",
-                "call_id": "c1",
-                "name": "sh",
-                "args": { "cmd": "ls" }
-            }),
-            // …and a tool_call with no beat at all: the kernel does not know
-            // beats, so it cannot require one.
-            json!({
-                "kind": "tool_call",
-                "call_id": "c1",
-                "name": "sh",
-                "args": { "cmd": "ls" }
-            }),
-            json!({
-                "kind": "tool_result",
-                "beat": "b1",
-                "call_id": "c1",
-                "ok": false,
-                "result": null
-            }),
-            json!({
-                "kind": "tool_result",
-                "call_id": "c1",
-                "ok": false,
-                "result": null
-            }),
+            json!({ "kind": "decision" }),
+            json!({ "kind": "note", "data": { "any": { "nested": [1, 2] } } }),
+            // The turn's kinds: no required field, whatever the shell writes.
+            json!({ "kind": "msg_user", "data": { "content": "hi" } }),
+            json!({ "kind": "msg_user", "data": {} }),
+            json!({ "kind": "llm_request", "data": { "model": "m", "messages": [] } }),
+            json!({ "kind": "llm_response", "data": { "anything": true } }),
+            json!({ "kind": "llm_call_failed", "data": { "error": "boom" } }),
+            json!({ "kind": "tool_call", "data": { "name": "sh" } }),
+            json!({ "kind": "tool_result", "data": { "ok": false } }),
         ] {
             validate_event(&obj(event.clone())).unwrap_or_else(|e| panic!("{event}: {e}"));
         }
     }
 
     #[test]
-    fn reserved_kinds_reject_a_missing_required_field() {
-        let err = validate_event(&obj(json!({ "kind": "session_closed" })))
+    fn kernel_kinds_accept_their_documented_data() {
+        for event in [
+            json!({ "kind": "session_opened", "data": { "scope_id": "s1", "owner": "anon" } }),
+            json!({ "kind": "session_closed", "data": { "reason": "closed" } }),
+            json!({ "kind": "session_closed", "data": { "reason": "error", "detail": "boom" } }),
+            json!({ "kind": "budget_granted", "data": { "amount": 100 } }),
+            json!({
+                "kind": "budget_granted",
+                "data": { "amount": 100, "tag": "tokens", "desc": "one run" }
+            }),
+            json!({ "kind": "budget_reserved", "data": { "amount": 12, "tag": "tokens" } }),
+            json!({ "kind": "budget_spent", "data": { "amount": 3 } }),
+            json!({ "kind": "budget_refused", "data": { "amount": 40, "remaining": 7 } }),
+        ] {
+            validate_event(&obj(event.clone())).unwrap_or_else(|e| panic!("{event}: {e}"));
+        }
+    }
+
+    #[test]
+    fn kernel_kinds_reject_a_missing_data_field() {
+        let err = validate_event(&obj(json!({ "kind": "session_closed", "data": {} })))
             .expect_err("reason is required");
         assert!(err.reason().contains("session_closed"), "{err}");
         assert!(err.reason().contains("reason"), "{err}");
 
-        let err = validate_event(&obj(json!({
-            "kind": "llm_response",
-            "content": []
-        })))
-        .expect_err("usage is required");
-        assert!(err.reason().contains("usage"), "{err}");
+        // …and an absent `data` reports the field, not the absence.
+        let err =
+            validate_event(&obj(json!({ "kind": "session_closed" }))).expect_err("no data at all");
+        assert!(err.reason().contains("reason"), "{err}");
 
         let err = validate_event(&obj(json!({
-            "kind": "tool_call",
-            "beat": "b1",
-            "call_id": "c1",
-            "args": {}
+            "kind": "session_opened", "data": { "scope_id": "s1" }
         })))
-        .expect_err("name is required");
-        assert!(err.reason().contains("name"), "{err}");
+        .expect_err("owner is required");
+        assert!(err.reason().contains("owner"), "{err}");
+
+        let err = validate_event(&obj(json!({ "kind": "budget_reserved", "data": {} })))
+            .expect_err("amount is required");
+        assert!(err.reason().contains("amount"), "{err}");
+
+        // A refusal without the balance it refused against is half a fact.
+        let err = validate_event(&obj(json!({
+            "kind": "budget_refused", "data": { "amount": 5 }
+        })))
+        .expect_err("remaining is required");
+        assert!(err.reason().contains("remaining"), "{err}");
+    }
+
+    #[test]
+    fn kernel_kinds_reject_a_mistyped_data_field() {
+        let err = validate_event(&obj(json!({
+            "kind": "session_closed", "data": { "reason": 7 }
+        })))
+        .expect_err("reason must be a string");
+        assert!(err.reason().contains("must be a string"), "{err}");
+        assert!(err.reason().contains("number"), "{err}");
+
+        let err = validate_event(&obj(json!({
+            "kind": "budget_spent", "data": { "amount": "lots" }
+        })))
+        .expect_err("amount must be a number");
+        assert!(err.reason().contains("whole number"), "{err}");
     }
 
     /// The beat is the caller's word: never required, on any kind, and the
@@ -560,9 +730,9 @@ mod tests {
     #[test]
     fn no_kind_requires_a_beat() {
         for event in [
-            json!({ "kind": "llm_response", "content": [], "usage": {} }),
-            json!({ "kind": "tool_call", "call_id": "c", "name": "sh", "args": {} }),
-            json!({ "kind": "tool_result", "call_id": "c", "ok": true, "result": 1 }),
+            json!({ "kind": "llm_response", "data": { "content": [] } }),
+            json!({ "kind": "tool_call", "data": { "name": "sh" } }),
+            json!({ "kind": "budget_spent", "data": { "amount": 1 } }),
             json!({ "kind": "note" }),
         ] {
             validate_event(&obj(event.clone()))
@@ -570,14 +740,14 @@ mod tests {
         }
     }
 
-    /// A declared beat is a string on every kind — reserved or open — so a
-    /// reader never has to ask whether this one is a number.
+    /// A declared beat is a string on every kind — the kernel's own or a
+    /// caller's — so a reader never has to ask whether this one is a number.
     #[test]
     fn a_declared_beat_must_be_a_string_on_any_kind() {
         for event in [
             json!({ "kind": "note", "beat": "b1" }),
-            json!({ "kind": "llm_response", "beat": "b1", "content": [], "usage": {} }),
-            json!({ "kind": "tool_call", "beat": "b1", "call_id": "c", "name": "sh", "args": {} }),
+            json!({ "kind": "llm_response", "beat": "b1", "data": { "content": [] } }),
+            json!({ "kind": "budget_spent", "beat": "b1", "data": { "amount": 1 } }),
         ] {
             validate_event(&obj(event.clone()))
                 .unwrap_or_else(|e| panic!("{event}: a string beat must be accepted: {e}"));
@@ -585,8 +755,8 @@ mod tests {
 
         for event in [
             json!({ "kind": "note", "beat": 1 }),
-            json!({ "kind": "llm_response", "beat": 1, "content": [], "usage": {} }),
-            json!({ "kind": "tool_call", "beat": [], "call_id": "c", "name": "sh", "args": {} }),
+            json!({ "kind": "llm_response", "beat": 1, "data": {} }),
+            json!({ "kind": "tool_call", "beat": [], "data": {} }),
         ] {
             let err =
                 validate_event(&obj(event.clone())).expect_err("a non-string beat must be refused");
@@ -598,55 +768,18 @@ mod tests {
     }
 
     #[test]
-    fn reserved_kinds_reject_a_mistyped_required_field() {
-        let err = validate_event(&obj(json!({ "kind": "session_closed", "reason": 7 })))
-            .expect_err("reason must be a string");
-        assert!(err.reason().contains("must be a string"), "{err}");
-        assert!(err.reason().contains("number"), "{err}");
-
-        let err = validate_event(&obj(json!({
-            "kind": "llm_response",
-            "content": "not blocks",
-            "usage": {}
-        })))
-        .expect_err("content must be an array");
-        assert!(err.reason().contains("an array"), "{err}");
-
-        let err = validate_event(&obj(json!({
-            "kind": "tool_result",
-            "beat": "b1",
-            "call_id": "c1",
-            "ok": "yes",
-            "result": 1
-        })))
-        .expect_err("ok must be a boolean");
-        assert!(err.reason().contains("a boolean"), "{err}");
-    }
-
-    #[test]
-    fn tool_result_requires_result_to_be_present_but_not_of_any_shape() {
-        // Present-but-null is accepted; absent is not.
-        validate_event(&obj(json!({
-            "kind": "tool_result", "beat": "b1", "call_id": "c", "ok": true, "result": null
-        })))
-        .expect("null result is present");
-
-        let err = validate_event(&obj(json!({
-            "kind": "tool_result", "beat": "b1", "call_id": "c", "ok": true
-        })))
-        .expect_err("result is required");
-        assert!(err.reason().contains("result"), "{err}");
-    }
-
-    #[test]
     fn whole_floats_count_as_integers() {
         // Lua numbers arrive as floats when they are written `1.0`.  A
         // budget amount is a caller-supplied integer.
-        validate_event(&obj(json!({ "kind": "budget_granted", "amount": 1.0 })))
-            .expect("1.0 is a whole number");
+        validate_event(&obj(
+            json!({ "kind": "budget_granted", "data": { "amount": 1.0 } }),
+        ))
+        .expect("1.0 is a whole number");
 
-        let err = validate_event(&obj(json!({ "kind": "budget_granted", "amount": 1.5 })))
-            .expect_err("1.5 is not whole");
+        let err = validate_event(&obj(
+            json!({ "kind": "budget_granted", "data": { "amount": 1.5 } }),
+        ))
+        .expect_err("1.5 is not whole");
         assert!(err.reason().contains("whole number"), "{err}");
     }
 
@@ -663,44 +796,28 @@ mod tests {
         );
     }
 
+    /// A kernel write is built with its fields under `data` by construction:
+    /// there is no way to reach the constructor and leave them at the top.
     #[test]
-    fn reserved_vocabulary_is_exactly_the_ten_kinds() {
-        for kind in [
-            "session_opened",
-            "session_closed",
-            "msg_user",
-            "llm_response",
-            "tool_call",
-            "tool_result",
-            "budget_granted",
-            "budget_reserved",
-            "budget_refused",
-            "budget_spent",
-        ] {
-            assert!(is_reserved(kind), "{kind} must be reserved");
-        }
-        for kind in [
-            "note",
-            "decision",
-            "carry",
-            "user_msg",
-            // The two open kinds the shell writes around a call, and the name
-            // the response kind used to have — none of them reserved.
-            "llm_request",
-            "llm_call_failed",
-            "model_response",
-            "session_open",
-            "",
-        ] {
-            assert!(!is_reserved(kind), "{kind} must be open");
-        }
+    fn a_kernel_event_carries_its_fields_under_data() {
+        let mut data = Map::new();
+        data.insert(FIELD_REASON.to_string(), Value::from("closed"));
+        let event = kernel_event(KIND_SESSION_CLOSED, data);
+
+        assert_eq!(event[FIELD_KIND], json!("session_closed"));
+        assert_eq!(event[FIELD_DATA], json!({ "reason": "closed" }));
+        validate_event(&event).expect("what the kernel builds, the kernel accepts");
+        assert_eq!(
+            data_field(&event, FIELD_REASON).and_then(Value::as_str),
+            Some("closed")
+        );
+        assert_eq!(data_field(&event, "nothing"), None);
     }
 
-    /// The ledger and the session's own boundaries are the kernel's alone:
-    /// writing one of these kinds is moving the account or claiming a
-    /// lifecycle the stream did not have, so no other kind joins them.
+    /// The kernel checks the shape of what it writes itself, and of nothing
+    /// else: the two lists coincide, kind for kind.
     #[test]
-    fn the_ledger_and_the_session_boundaries_are_kernel_only() {
+    fn the_shapes_the_kernel_checks_are_the_kinds_it_writes() {
         for kind in [
             "session_opened",
             "session_closed",
@@ -710,65 +827,38 @@ mod tests {
             "budget_spent",
         ] {
             assert!(is_kernel_only(kind), "{kind} must be kernel-only");
-            assert!(is_reserved(kind), "a kernel-only kind is reserved too");
+            assert!(is_reserved(kind), "{kind}'s data shape is the kernel's");
         }
         for kind in [
+            // The turn's kinds are the Lua kernel's now, shape and all.
             "msg_user",
+            "llm_request",
             "llm_response",
+            "llm_call_failed",
             "tool_call",
             "tool_result",
+            // …as is every other kind a shell invents.
             "note",
+            "decision",
+            "carry",
             "budget",
             "session",
             "",
         ] {
             assert!(!is_kernel_only(kind), "{kind} must not be kernel-only");
+            assert!(!is_reserved(kind), "{kind}'s data shape is its writer's");
         }
     }
 
-    #[test]
-    fn budget_kinds_require_their_amounts() {
-        for event in [
-            json!({ "kind": "budget_granted", "amount": 100 }),
-            json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens", "desc": "one run" }),
-            json!({ "kind": "budget_reserved", "amount": 12, "tag": "tokens" }),
-            json!({ "kind": "budget_spent", "amount": 3 }),
-            json!({ "kind": "budget_refused", "amount": 40, "remaining": 7 }),
-        ] {
-            validate_event(&obj(event.clone())).unwrap_or_else(|e| panic!("{event}: {e}"));
-        }
-
-        let err = validate_event(&obj(json!({ "kind": "budget_reserved" })))
-            .expect_err("amount is required");
-        assert!(err.reason().contains("amount"), "{err}");
-
-        // A refusal without the balance it refused against is half a fact.
-        let err = validate_event(&obj(json!({ "kind": "budget_refused", "amount": 5 })))
-            .expect_err("remaining is required");
-        assert!(err.reason().contains("remaining"), "{err}");
-
-        let err = validate_event(&obj(json!({ "kind": "budget_spent", "amount": "lots" })))
-            .expect_err("amount must be a number");
-        assert!(err.reason().contains("whole number"), "{err}");
-    }
-
-    /// Validation is about shape only.  An `llm_response` is as acceptable
-    /// from a caller as from the kernel, because a hand-written one moves no
-    /// state — a session holds only its own events, so a reader counting
-    /// them has nothing foreign to exclude.  The kernel-only kinds pass here too: their
-    /// shape is fine, it is the authorship that is not, and that is stopped
-    /// by [`is_kernel_only`] on the append path rather than here.
+    /// Validation is about shape only.  The kernel-only kinds pass here:
+    /// their shape is fine, it is the authorship that is not, and that is
+    /// stopped by [`is_kernel_only`] on the append path rather than here.
     #[test]
     fn shape_validation_says_nothing_about_who_may_write_a_kind() {
         for event in [
-            json!({ "kind": "session_opened" }),
-            json!({ "kind": "session_closed", "reason": "carried over" }),
-            json!({ "kind": "budget_granted", "amount": 1_000_000 }),
-            json!({
-                "kind": "llm_response",
-                "content": [{ "type": "text", "text": "said last time" }],
-                "usage": { "input_tokens": 9_000 }
-            }),
+            json!({ "kind": "session_opened", "data": { "scope_id": "s", "owner": "anon" } }),
+            json!({ "kind": "session_closed", "data": { "reason": "carried over" } }),
+            json!({ "kind": "budget_granted", "data": { "amount": 1_000_000 } }),
         ] {
             validate_event(&obj(event.clone())).unwrap_or_else(|e| panic!("{event}: {e}"));
         }

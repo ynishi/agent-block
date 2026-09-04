@@ -31,6 +31,10 @@
 --        wrote (token usage among them — it is a query view, not a kernel
 --        built-in), a write is refused as "validation", and one statement
 --        reads across a named set of sessions
+--  inv12 the stored shape (view-design.md §6 item 2): the envelope is closed
+--        (a stray top-level key is refused as "validation"), `meta` is
+--        shallow (a nested one is refused the same way), and a label given
+--        in `meta` comes back verbatim
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately (design §0.5).
@@ -184,18 +188,25 @@ end
 -- ---------------------------------------------------------------------------
 
 do
+    -- The stored shape: one envelope (kind / beat / meta / data) with the
+    -- kind's own content under `data` (view-design.md §6 item 2).
     local events = {
         { kind = "session_opened", seq = 1 },
-        { kind = "msg_user", content = "hi", seq = 2 },
+        { kind = "msg_user", data = { content = "hi" }, seq = 2 },
         {
             kind = "llm_response",
             beat = "b1",
-            content = { { type = "text", text = "a" }, tool_use("c1", "t", {}) },
+            data = { content = { { type = "text", text = "a" }, tool_use("c1", "t", {}) }, usage = {} },
             seq = 3,
         },
-        { kind = "tool_call", beat = "b1", call_id = "c1", seq = 4 },
-        { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = "R", seq = 5 },
-        { kind = "llm_response", beat = "b2", content = { { type = "text", text = "done" } }, seq = 6 },
+        { kind = "tool_call", beat = "b1", data = { call_id = "c1", name = "t", args = {} }, seq = 4 },
+        { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 5 },
+        {
+            kind = "llm_response",
+            beat = "b2",
+            data = { content = { { type = "text", text = "done" } }, usage = {} },
+            seq = 6,
+        },
         { kind = "note", seq = 7 },
     }
     local req = kernel.fold(events, {})
@@ -214,8 +225,8 @@ do
 
     -- a non-string tool_result is JSON-encoded
     local encoded = kernel.fold({
-        { kind = "llm_response", beat = "b1", content = {}, seq = 1 },
-        { kind = "tool_result", beat = "b1", call_id = "c1", ok = true, result = { x = 1 }, seq = 2 },
+        { kind = "llm_response", beat = "b1", data = { content = {}, usage = {} }, seq = 1 },
+        { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = { x = 1 } }, seq = 2 },
     }, {})
     assert(type(encoded.messages[2].content[1].content) == "string", "non-string result must be encoded")
 
@@ -250,7 +261,7 @@ end
 do
     local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d = kernel.device({ llm = stub(response("ok", { { type = "text", text = "hello" } })) })
-    s:append({ kind = "msg_user", content = "hi" })
+    s:append({ kind = "msg_user", data = { content = "hi" } })
     local o = kernel.beat(s, d)
     assert(Outcome.is_ok(o))
 
@@ -264,8 +275,8 @@ do
 
     -- inv4: the request that was sent is in the store, readable via events()
     local req_ev = first_of(s, "llm_request")
-    assert(req_ev ~= nil and req_ev.request ~= nil)
-    assert(#req_ev.request.messages == 1 and req_ev.request.messages[1].content == "hi")
+    assert(req_ev ~= nil and req_ev.data ~= nil and req_ev.data.request ~= nil)
+    assert(#req_ev.data.request.messages == 1 and req_ev.data.request.messages[1].content == "hi")
 
     -- The beat named itself and stamped what it wrote: the id is an opaque
     -- string, the same one on the request and on the response, and the
@@ -343,7 +354,7 @@ do
     )
 
     local tr = first_of(s, "tool_result")
-    assert(tr.ok == true and tr.result == "echoed:x" and tr.call_id == "c1")
+    assert(tr.data.ok == true and tr.data.result == "echoed:x" and tr.data.call_id == "c1")
     assert(#o.out.tools == 1 and o.out.tools[1].ok == true and o.out.tools[1].name == "echo")
     -- one beat, one id: the pair belongs to the response that asked for it
     assert(#distinct_beats(s) == 1 and distinct_beats(s)[1] == o.out.beat)
@@ -358,8 +369,8 @@ do
     local o2 = kernel.beat(s2, d2)
     assert(Outcome.is_ok(o2))
     local tr2 = first_of(s2, "tool_result")
-    assert(tr2 ~= nil and tr2.ok == false, "unknown tool must close the pair with ok=false")
-    assert(tostring(tr2.result):find("not found", 1, true) ~= nil, tostring(tr2.result))
+    assert(tr2 ~= nil and tr2.data.ok == false, "unknown tool must close the pair with ok=false")
+    assert(tostring(tr2.data.result):find("not found", 1, true) ~= nil, tostring(tr2.data.result))
 
     -- a handler that raises also closes the pair ok=false
     local s3 = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
@@ -374,7 +385,7 @@ do
     local o3 = kernel.beat(s3, d3)
     assert(Outcome.is_ok(o3))
     local tr3 = first_of(s3, "tool_result")
-    assert(tr3.ok == false and tostring(tr3.result):find("raised", 1, true) ~= nil, tostring(tr3.result))
+    assert(tr3.data.ok == false and tostring(tr3.data.result):find("raised", 1, true) ~= nil, tostring(tr3.data.result))
 
     mark("inv3_tool_pair")
 end
@@ -480,7 +491,7 @@ do
             end,
         } },
     })
-    sl:append({ kind = "msg_user", content = "go" })
+    sl:append({ kind = "msg_user", data = { content = "go" } })
     local last
     while true do
         last = kernel.beat(sl, dl)
@@ -512,7 +523,7 @@ do
     -- boundary lands in the log as session_closed.
     local settled = kernel.session({ owner = "test", budget = { amount = 1000, tag = "beats" } }, function(s)
         local d = kernel.device({ llm = stub(response("ok", { { type = "text", text = "done" } })) })
-        s:append({ kind = "msg_user", content = "hi" })
+        s:append({ kind = "msg_user", data = { content = "hi" } })
         local calls = 0
         while calls < MAX_BEATS do
             local o = kernel.beat(s, d)
@@ -531,8 +542,8 @@ do
     -- reason `<close>` records, because leaving the scope is the same event
     -- whichever form wrote it.
     assert(
-        first_of(settled, "session_closed").reason == "scope_exit",
-        "close reason: " .. tostring(first_of(settled, "session_closed").reason)
+        first_of(settled, "session_closed").data.reason == "scope_exit",
+        "close reason: " .. tostring(first_of(settled, "session_closed").data.reason)
     )
 
     -- bounded: the model never stops asking for a tool, so the caller's own
@@ -551,7 +562,7 @@ do
             end,
         } },
     })
-    sb:append({ kind = "msg_user", content = "loop" })
+    sb:append({ kind = "msg_user", data = { content = "loop" } })
     local n = 0
     while n < CAP do
         local o = kernel.beat(sb, db)
@@ -585,7 +596,7 @@ do
 
     local s = kernel.open({ owner = "test", budget = { amount = 1000, tag = "beats" } })
     local d = kernel.device({ llm = weak })
-    s:append({ kind = "msg_user", content = "q" })
+    s:append({ kind = "msg_user", data = { content = "q" } })
 
     -- mutating the device raises (it is a frozen value)
     local mutated = pcall(function()
@@ -662,7 +673,7 @@ do
     -- reads exactly what it read before.
     local ended = kernel.open({ owner = "test" })
     ended:close("done")
-    local wrote, raised = pcall(ended.append, ended, { kind = "msg_user", content = "after" })
+    local wrote, raised = pcall(ended.append, ended, { kind = "msg_user", data = { content = "after" } })
     assert(not wrote, "an append after close must raise")
     local read = knl.error(raised)
     assert(read.kind == "closed", "kind: " .. tostring(read.kind))
@@ -679,9 +690,12 @@ do
     end)
     assert(not ok and tostring(err):find("boom-detail", 1, true), "body error must propagate")
     local last = s_ref:events()[#s_ref:events()]
-    assert(last.kind == "session_closed" and last.reason == "error", "close reason: " .. tostring(last.reason))
     assert(
-        type(last.detail) == "string" and last.detail:find("boom-detail", 1, true),
+        last.kind == "session_closed" and last.data.reason == "error",
+        "close reason: " .. tostring(last.data.reason)
+    )
+    assert(
+        type(last.data.detail) == "string" and last.data.detail:find("boom-detail", 1, true),
         "detail must carry the body error"
     )
 
@@ -740,7 +754,7 @@ do
             },
         },
     })
-    s:append({ kind = "msg_user", content = "hi" })
+    s:append({ kind = "msg_user", data = { content = "hi" } })
     local beat_out = kernel.beat(s, d)
     assert(Outcome.is_ok(beat_out))
 
@@ -821,6 +835,54 @@ do
     assert(shell_kinds.timeout, "the shell must declare the timeout class")
 
     mark("inv11_sql_views")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv12 — the stored shape (view-design.md §6 item 2): the envelope is
+-- closed, `meta` is shallow, and a label given rides through verbatim
+-- ---------------------------------------------------------------------------
+
+do
+    local s = kernel.open({ owner = "test" })
+
+    -- (a) `{ kind, beat?, meta?, data? }` and nothing else. The old form —
+    -- a kind's own fields sitting at the top level — is not stored under a
+    -- different name, it is refused: the caller's argument did not hold up,
+    -- which is the "validation" class.
+    local stray, stray_raise = pcall(s.append, s, { kind = "msg_user", content = "x" })
+    assert(not stray, "a stray top-level key must not be stored")
+    assert(
+        knl.error(stray_raise).kind == "validation",
+        "a stray top-level key is a validation failure; kind: " .. tostring(knl.error(stray_raise).kind)
+    )
+
+    -- (b) `meta` is labels, not a second `data`. A nested value would make
+    -- it structure that a view could read and a schema change could break,
+    -- which is exactly what `data` exists to hold instead.
+    local nested, nested_raise = pcall(s.append, s, {
+        kind = "msg_user",
+        meta = { label = { deep = true } },
+        data = { content = "x" },
+    })
+    assert(not nested, "a nested meta must not be stored")
+    assert(
+        knl.error(nested_raise).kind == "validation",
+        "a nested meta is a validation failure; kind: " .. tostring(knl.error(nested_raise).kind)
+    )
+
+    -- (c) and a label that IS shallow comes back as it went in — the half of
+    -- the envelope a view can read without ever being broken by a change to
+    -- what a kind carries.
+    s:append({ kind = "msg_user", meta = { label = "seed" }, data = { content = "x" } })
+    local seeded = first_of(s, "msg_user")
+    assert(seeded ~= nil, "the well-formed seed was not stored")
+    assert(type(seeded.meta) == "table", "meta: " .. tostring(seeded.meta))
+    assert(seeded.meta.label == "seed", "meta.label: " .. tostring(seeded.meta.label))
+    assert(seeded.data.content == "x", "data.content: " .. tostring(seeded.data.content))
+
+    s:close("done")
+
+    mark("inv12_stored_shape")
 end
 
 print("[KNL] all_ok")

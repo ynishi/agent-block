@@ -550,15 +550,88 @@ describe("knl.shapes.schema — the read schema is published as data", function(
         expect(listed(pk)).to.be("seq,stream")
     end)
 
-    it("carries the payload column a view reads the event out of", function()
+    it("carries the envelope as columns and the structure in one of them", function()
         local names = {}
         for _, column in ipairs(schema.columns) do
             names[column.name] = true
         end
-        -- `kind` is the indexed column a kind-filtered view uses;
-        -- `payload` is where everything else (a `beat` included) is.
-        expect(names.kind).to.be(true)
-        expect(names.payload).to.be(true)
+        -- The envelope is the row (view-design.md §6 item 2): `kind` is the
+        -- indexed column a kind-filtered view uses, `beat` is the
+        -- correlation key `knl.views.beats` groups on without a JSON path,
+        -- `meta` holds the shallow labels — and `data` is the one column a
+        -- view has to reach into, which is what ties such a view to the
+        -- shape of the kind it reads.
+        for _, name in ipairs({ "kind", "beat", "meta", "data" }) do
+            expect(names[name]).to.be(true)
+        end
+        -- and the whole-object column they replaced is gone
+        expect(names.payload).to.be(nil)
+    end)
+end)
+
+describe("knl.shapes.events — the `data` shape of every kind this layer writes", function()
+    -- The kernel validates the envelope and the `data` of its OWN kinds
+    -- (session_* / budget_*) and nothing else, so these are the only
+    -- declaration there is of what a beat writes. Same completeness rule as
+    -- the registries above: checked, not remembered.
+    local events = K.shapes.events
+
+    -- The vocabulary a beat writes, plus the seed form a caller writes
+    -- (`msg_user`). The kernel's own kinds are deliberately absent.
+    local WRITTEN = {
+        "msg_user",
+        "llm_request",
+        "llm_response",
+        "llm_call_failed",
+        "tool_call",
+        "tool_result",
+    }
+
+    it("declares each kind a beat writes, plus the seed a caller writes", function()
+        local missing = {}
+        for _, kind in ipairs(WRITTEN) do
+            if not is_shape(events[kind]) then
+                missing[#missing + 1] = kind
+            end
+        end
+        expect(listed(missing)).to.be("")
+    end)
+
+    it("declares nothing else (the vocabulary here is what this layer writes)", function()
+        local known = {}
+        for _, kind in ipairs(WRITTEN) do
+            known[kind] = true
+        end
+        local extra = {}
+        for name in pairs(events) do
+            if not known[name] then
+                extra[#extra + 1] = tostring(name)
+            end
+        end
+        expect(listed(extra)).to.be("")
+    end)
+
+    it("closes every one of them", function()
+        -- A key that arrived by accident is a `data` path somebody will
+        -- eventually select; a closed shape is what makes it a failure at
+        -- the append instead of a column in a view.
+        local left_open = {}
+        for name, declared in pairs(events) do
+            if rawget(declared, "open") ~= false then
+                left_open[#left_open + 1] = tostring(name)
+            end
+        end
+        expect(listed(left_open)).to.be("")
+    end)
+
+    it("holds the envelope's own rules apart from them", function()
+        -- `event_base` is the envelope (kind / beat / meta / data) and
+        -- `event_meta` is the shallow-label rule inside it. Neither is a
+        -- per-kind contract, and neither moves when a kind's shape does.
+        expect(is_shape(K.shapes.event_base)).to.be(true)
+        expect(is_shape(K.shapes.event_meta)).to.be(true)
+        expect(check.check({ label = "seed", n = 1, on = true }, K.shapes.event_meta)).to.be(true)
+        expect(check.check({ label = { deep = 1 } }, K.shapes.event_meta)).to.be(false)
     end)
 end)
 

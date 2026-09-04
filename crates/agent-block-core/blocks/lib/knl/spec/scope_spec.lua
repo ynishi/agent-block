@@ -77,7 +77,9 @@ local function fake_session(opts)
         return seq
     end
 
-    store({ kind = "session_opened", scope_id = "scope-" .. id, owner = owner })
+    -- The kernel's own kinds go in the same envelope as everybody's: what
+    -- the kind is about lives under `data` (view-design.md §6 item 2).
+    store({ kind = "session_opened", data = { scope_id = "scope-" .. id, owner = owner } })
 
     local s = {}
 
@@ -158,7 +160,7 @@ local function fake_session(opts)
 
     function s:close(reason)
         if not closed then
-            store({ kind = "session_closed", reason = reason or "closed" })
+            store({ kind = "session_closed", data = { reason = reason or "closed" } })
             closed = true
         end
     end
@@ -252,7 +254,7 @@ describe("knl beat (session-scope model)", function()
             })),
         })
         expect(s:owner()).to.equal("test")
-        s:append({ kind = "msg_user", content = "hi" })
+        s:append({ kind = "msg_user", data = { content = "hi" } })
 
         local o = kernel.beat(s, d)
         expect(Outcome.is_ok(o)).to.equal(true)
@@ -266,8 +268,8 @@ describe("knl beat (session-scope model)", function()
                 recorded = ev
             end
         end
-        expect(recorded.usage.input_tokens).to.equal(10)
-        expect(recorded.usage.output_tokens).to.equal(3)
+        expect(recorded.data.usage.input_tokens).to.equal(10)
+        expect(recorded.data.usage.output_tokens).to.equal(3)
 
         -- And reading them is a query, not a kernel view: `knl.views.usage`
         -- runs one SELECT over the llm_response records, naming the streams

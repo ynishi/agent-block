@@ -295,7 +295,7 @@ describe("ToolPort.mcp — the second source (fake mcp bridge)", function()
             end)(),
             tools = adapter.tools(adapter.mcp_tools("srv")),
         })
-        session:append({ kind = "msg_user", content = "q" })
+        session:append({ kind = "msg_user", data = { content = "q" } })
         local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].ok).to.be(false)
@@ -332,14 +332,14 @@ describe("bound tools drive a beat (kernel contract end-to-end)", function()
             llm = llm_with_tool("fs_read"),
             tools = adapter.tools({ flat_spec("fs_read") }),
         })
-        session:append({ kind = "msg_user", content = "q" })
+        session:append({ kind = "msg_user", data = { content = "q" } })
         local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].name).to.be("fs_read")
         expect(o.out.tools[1].ok).to.be(true)
         local last = session:events()[#session:events()]
         expect(last.kind).to.be("tool_result")
-        expect(last.result).to.be("fs_read:9")
+        expect(last.data.result).to.be("fs_read:9")
         -- both halves of the pair carry the beat's declared id
         expect(last.beat).to.be(o.out.beat)
         expect(type(o.out.beat)).to.be("string")
@@ -354,12 +354,12 @@ describe("bound tools drive a beat (kernel contract end-to-end)", function()
             llm = llm_with_tool("boom"),
             tools = adapter.tools({ boom }),
         })
-        session:append({ kind = "msg_user", content = "q" })
+        session:append({ kind = "msg_user", data = { content = "q" } })
         local o = kernel.beat(session, device)
         expect(Outcome.is_ok(o)).to.be(true)
         expect(o.out.tools[1].ok).to.be(false)
         local last = session:events()[#session:events()]
         expect(last.kind).to.be("tool_result")
-        expect(last.ok).to.be(false)
+        expect(last.data.ok).to.be(false)
     end)
 end)
