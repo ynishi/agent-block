@@ -13,7 +13,7 @@
 ---   fd-like handle onto History / Budget — travels in `conf.ctx`, so a
 ---   driver is free to build its own loop by carrying `conf` (ctx included)
 ---   between beats. turn does NOT use the composite `session:call`; it calls
----   `conf.backend(request)` itself and lays down the record (`ctx:append`),
+---   `conf.llm(request)` itself and lays down the record (`ctx:append`),
 ---   the charge (`ctx:spend`) and the turn number in that order — turn owns
 ---   the beat, no syscall bundles the steps for it.
 ---
@@ -25,11 +25,11 @@
 ---   tool_result events. There is no Lua-side counting or scope stamping.
 ---
 --- What the POC deliberately leaves out
----   Real provider adapters (backend is a stub `fn(req) -> {status, content,
+---   Real provider adapters (llm is a stub `fn(req) -> {status, content,
 ---   usage, stop_reason}` passed via conf), the full fold vocabulary, and
 ---   realistic tool / filter / backend-selection policies. The skeleton
 ---   carries only the invariants: Outcome's three values, a Turn that folds
----   events into a request, records it write-ahead, calls the backend
+---   events into a request, records it write-ahead, calls the llm
 ---   directly, records + charges the response itself, and closes every
 ---   tool_use with a tool_result; and a run driver that cannot loop forever.
 
@@ -231,7 +231,7 @@ end
 --- for a durable stream. The returned handle is the ctx itself — the only
 --- capability needed to write to the session.
 ---
---- @param opts table  { owner?, budget?, backend?, store? }
+--- @param opts table  { owner?, budget?, store? }
 --- @return userdata ctx  a `knl.open` session handle
 function M.open(opts)
     opts = opts or {}
@@ -241,7 +241,6 @@ function M.open(opts)
     return syscall.open({
         owner = opts.owner,
         budget = opts.budget,
-        backend = opts.backend,
         store = opts.store,
     })
 end
@@ -373,14 +372,14 @@ local function execute_tools(ctx, conf, out)
 end
 
 --- One complete beat: gate, fold, filter, record, call, record + charge, run
---- its tools (§2, B-plan). turn calls the backend itself and lays down the
+--- its tools (§2, B-plan). turn calls the llm itself and lays down the
 --- record / charge / turn number — no `session:call` bundles the steps.
 ---
 --- Re-entrant and stateless: it is decided entirely by `conf` (the ctx
 --- handle included), so it can be called from any driver, resumed, or
 --- interleaved. The state handle is `conf.ctx`; turn never opens it.
 ---
---- @param conf table  { ctx = <knl.open handle>, backend, fold?, filters?,
+--- @param conf table  { ctx = <knl.open handle>, llm, fold?, filters?,
 ---                      tools?, tool_policy?, system? }
 --- @return table outcome  an `Outcome` (§8)
 function M.turn(conf)
@@ -395,10 +394,10 @@ function M.turn(conf)
     if ctx == nil then
         return Outcome.err("conf", "no ctx (pass conf.ctx, a knl.open handle)")
     end
-    -- The backend is turn's to call now, so it must be in conf. There is no
+    -- The llm is turn's to call now, so it must be in conf. There is no
     -- session-bound fallback here — that path belonged to `session:call`.
-    if conf.backend == nil then
-        return Outcome.err("conf", "no backend (pass conf.backend)")
+    if conf.llm == nil then
+        return Outcome.err("conf", "no llm (pass conf.llm)")
     end
     -- Budget stop is a planned stop, not a failure: Ok before the call.
     if ctx:exhausted() then
@@ -428,16 +427,16 @@ function M.turn(conf)
     -- so a call that then fails leaves the request event behind (§6).
     ctx:append({ kind = "request", request = request })
 
-    -- [4] turn calls the backend directly ---------------------------------
+    -- [4] turn calls the llm directly ------------------------------------
     -- resp = { status = "ok"|"refused"|"error", content, usage, stop_reason }.
     -- The status is the adapter's judgement; turn reads it, it does not
-    -- invent one (§8, status is backend-supplied).
-    local resp, berr = conf.backend(request)
+    -- invent one (§8, status is llm-supplied).
+    local resp, berr = conf.llm(request)
 
     -- [5] status branch — turn lays down the record and the charge ---------
     -- error / transport failure: the beat did not come off. Note it and stop.
     if resp == nil or resp.status == "error" then
-        local reason = berr or (resp and resp.detail) or "backend reported error"
+        local reason = berr or (resp and resp.detail) or "llm reported error"
         ctx:append({ kind = "model_call_failed", error = tostring(reason) })
         return Outcome.err("call", tostring(reason))
     end
@@ -486,7 +485,7 @@ end
 ---   max_turns (optional) cap on the number of model calls this run makes
 ---   ctx       (optional) a ctx handle to continue (not closed by run);
 ---             `session` is accepted as an alias for a brought-in handle
----   backend   (optional) POC stub fn(req) -> { status, content, usage, stop_reason }
+---   llm       (optional) POC stub fn(req) -> { status, content, usage, stop_reason }
 ---   store     (optional) backend for an opened ctx: absent/"mem" or { sqlite = <path> }
 ---   input     (optional) first user message, appended before the first beat
 ---   system / tools / filters / tool_policy / fold — passed to each turn
@@ -532,7 +531,6 @@ function M.run(conf)
         end
         local opened_ok, opened = pcall(M.open, {
             budget = conf.budget,
-            backend = conf.backend,
             store = conf.store,
         })
         if not opened_ok then

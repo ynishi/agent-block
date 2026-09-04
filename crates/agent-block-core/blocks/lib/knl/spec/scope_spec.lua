@@ -243,7 +243,7 @@ describe("knl turn (session-scope model)", function()
 
         local o = kernel.turn({
             ctx = h,
-            backend = stub(response("ok", { { type = "text", text = "hello" } }, {
+            llm = stub(response("ok", { { type = "text", text = "hello" } }, {
                 input_tokens = 10,
                 output_tokens = 3,
             })),
@@ -264,8 +264,8 @@ describe("knl turn (session-scope model)", function()
     it("numbers successive turns 1 then 2 (kernel-owned)", function()
         local h = kernel.open({ budget = { tokens = 1000 } })
 
-        kernel.turn({ ctx = h, backend = stub(response("ok")) })
-        kernel.turn({ ctx = h, backend = stub(response("ok")) })
+        kernel.turn({ ctx = h, llm = stub(response("ok")) })
+        kernel.turn({ ctx = h, llm = stub(response("ok")) })
 
         local turns = response_turns(h)
         expect(#turns).to.equal(2)
@@ -278,7 +278,7 @@ describe("knl turn (session-scope model)", function()
 
         kernel.turn({
             ctx = h,
-            backend = stub(response("ok", {
+            llm = stub(response("ok", {
                 tool_use("a", "noop", {}),
                 tool_use("b", "noop", {}),
             })),

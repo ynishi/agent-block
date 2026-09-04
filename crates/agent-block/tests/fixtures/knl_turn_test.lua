@@ -186,7 +186,7 @@ end
 do
     local s = knl.open({ owner = "test", budget = { tokens = 100 } })
     s:append({ kind = "msg_user", content = "hi" })
-    local o = kernel.turn({ ctx = s, backend = stub(response("ok", { { type = "text", text = "hello" } })) })
+    local o = kernel.turn({ ctx = s, llm = stub(response("ok", { { type = "text", text = "hello" } })) })
     assert(Outcome.is_ok(o))
 
     -- request is recorded before the model_response (write-ahead, §2 [3][4])
@@ -220,7 +220,7 @@ do
     local s = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o = kernel.turn({
         ctx = s,
-        backend = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
+        llm = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
         tools = {
             echo = {
                 description = "e",
@@ -244,7 +244,7 @@ do
     local s2 = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o2 = kernel.turn({
         ctx = s2,
-        backend = stub(response("ok", { tool_use("c9", "ghost", {}) })),
+        llm = stub(response("ok", { tool_use("c9", "ghost", {}) })),
         tools = {},
     })
     assert(Outcome.is_ok(o2))
@@ -256,7 +256,7 @@ do
     local s3 = knl.open({ owner = "test", budget = { tokens = 100 } })
     local o3 = kernel.turn({
         ctx = s3,
-        backend = stub(response("ok", { tool_use("c3", "boom", {}) })),
+        llm = stub(response("ok", { tool_use("c3", "boom", {}) })),
         tools = { boom = {
             handler = function()
                 error("kaboom")
@@ -277,12 +277,12 @@ end
 do
     -- ok
     local so = knl.open({ owner = "test", budget = { tokens = 100 } })
-    assert(Outcome.is_ok(kernel.turn({ ctx = so, backend = stub(response("ok")) })))
+    assert(Outcome.is_ok(kernel.turn({ ctx = so, llm = stub(response("ok")) })))
 
     -- refused: the model answered (recorded + charged) but refused to proceed
     local sr = knl.open({ owner = "test", budget = { tokens = 100 } })
     local before = sr:remaining()
-    local orf = kernel.turn({ ctx = sr, backend = stub(response("refused", { { type = "text", text = "no" } })) })
+    local orf = kernel.turn({ ctx = sr, llm = stub(response("refused", { { type = "text", text = "no" } })) })
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
     assert(first_of(sr, "model_response") ~= nil, "a refusal is still a recorded response")
     assert(sr:remaining() < before, "a refusal still costs its tokens")
@@ -291,7 +291,7 @@ do
     local se = knl.open({ owner = "test", budget = { tokens = 100 } })
     local oe = kernel.turn({
         ctx = se,
-        backend = stub({ status = "error", detail = "boom", content = {}, usage = {} }),
+        llm = stub({ status = "error", detail = "boom", content = {}, usage = {} }),
     })
     assert(Outcome.is_error(oe) and oe.kind == "call", "error status must map to Error(call)")
     assert(first_of(se, "model_response") == nil, "an errored call must record no response")
@@ -301,7 +301,7 @@ do
     local st = knl.open({ owner = "test", budget = { tokens = 100 } })
     local ot = kernel.turn({
         ctx = st,
-        backend = function()
+        llm = function()
             return nil, "network down"
         end,
     })
@@ -319,7 +319,7 @@ do
     local s = knl.open({ owner = "test", budget = { tokens = 10 } })
     s:spend(10)
     assert(s:exhausted())
-    local o = kernel.turn({ ctx = s, backend = stub(response("ok")) })
+    local o = kernel.turn({ ctx = s, llm = stub(response("ok")) })
     assert(Outcome.is_ok(o) and o.out.budget_stopped == true, "exhausted turn must be Ok(budget_stopped)")
     assert(first_of(s, "request") == nil, "no call is made once the budget is gone")
 
@@ -328,7 +328,7 @@ do
     local orun, srun = kernel.run({
         budget = { tokens = 10 },
         input = "go",
-        backend = stub(
+        llm = stub(
             response("ok", { tool_use("c1", "noop", {}) }, { input_tokens = 100 }),
             response("ok", { { type = "text", text = "unreached" } })
         ),
@@ -349,7 +349,7 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-    local o = kernel.run({ backend = stub(response("ok")) })
+    local o = kernel.run({ llm = stub(response("ok")) })
     assert(Outcome.is_error(o) and o.kind == "conf", "run with no bound must be Error(conf)")
     mark("inv6_infinite_prevention")
 end
@@ -363,7 +363,7 @@ do
     local o, s = kernel.run({
         max_turns = 5,
         input = "hi",
-        backend = stub(response("ok", { { type = "text", text = "done" } })),
+        llm = stub(response("ok", { { type = "text", text = "done" } })),
     })
     assert(Outcome.is_ok(o) and not o.out.budget_stopped)
     assert(count_of(s, "model_response") == 1)
@@ -374,7 +374,7 @@ do
     local o2, s2 = kernel.run({
         max_turns = 3,
         input = "loop",
-        backend = stub(
+        llm = stub(
             response("ok", { tool_use("a", "noop", {}) }),
             response("ok", { tool_use("b", "noop", {}) }),
             response("ok", { tool_use("c", "noop", {}) })
