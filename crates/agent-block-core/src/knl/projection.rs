@@ -8,6 +8,13 @@
 //! of the history, and the cached value is always reproducible by
 //! [`usage_of`] from scratch.
 //!
+//! The folds consume an event *slice* (`&[Value]`), not a `History`, so the
+//! same arithmetic serves the in-memory store and the durable one: the
+//! caller reads the range it wants from an [`EventStore`](super::EventStore)
+//! and hands the events over.  For the incremental cache the caller reads
+//! only what is new (`read(folded_seq + 1, ..)`); for a from-scratch
+//! reference it reads the whole log.
+//!
 //! The vocabulary is closed on purpose — named folds live here rather
 //! than being handed to a caller-supplied callback, so the kernel never
 //! calls back into the shell while it holds kernel state — and it is
@@ -47,7 +54,7 @@
 use serde_json::{Map, Value};
 
 use super::event::{kind_of, seq_of, FIELD_USAGE, KIND_MODEL_RESPONSE};
-use super::{History, KnlError, KnlResult};
+use super::{KnlError, KnlResult};
 
 /// View name: usage totals.
 pub const VIEW_USAGE: &str = "usage";
@@ -88,9 +95,20 @@ pub struct UsageFold {
 }
 
 impl UsageFold {
-    /// Fold every event newer than the last fold.
-    pub fn advance(&mut self, history: &History) {
-        for event in history.slice_after(self.folded_seq) {
+    /// Fold the events given that are newer than the last fold.
+    ///
+    /// The events are a slice read from an
+    /// [`EventStore`](super::EventStore), each still carrying its `seq`, so
+    /// the same fold serves the in-memory and the durable backend.  An event
+    /// at or before [`folded_seq`](Self::folded_seq) is skipped, so handing
+    /// a range that overlaps what was already folded does not double-count —
+    /// reading twice without an append repeats the value rather than
+    /// doubling it.
+    pub fn advance(&mut self, events: &[Value]) {
+        for event in events {
+            if seq_of(event) <= self.folded_seq {
+                continue;
+            }
             if kind_of(event) == KIND_MODEL_RESPONSE {
                 self.model_calls = self.model_calls.saturating_add(1);
                 let usage = event.get(FIELD_USAGE);
@@ -141,23 +159,37 @@ pub struct Views {
 }
 
 impl Views {
-    /// The `usage` view, folding only what is new.
-    pub fn usage(&mut self, history: &History) -> Value {
-        self.usage.advance(history);
+    /// The `usage` view, folding only the events it has not seen.
+    ///
+    /// `new_events` are the events past
+    /// [`usage_folded_seq`](Self::usage_folded_seq) — the caller reads them
+    /// with `read(usage_folded_seq + 1, ..)`, so the fold is amortised in
+    /// the number of new events, not the size of the history.  Passing a
+    /// wider range is safe too: the fold skips anything it has already seen.
+    pub fn usage(&mut self, new_events: &[Value]) -> Value {
+        self.usage.advance(new_events);
         self.usage.value()
+    }
+
+    /// The `seq` the `usage` fold has reached: the point a caller reads on
+    /// from to hand [`usage`](Self::usage) only what is new.
+    pub fn usage_folded_seq(&self) -> u64 {
+        self.usage.folded_seq()
     }
 }
 
-/// The `usage` view computed from scratch (the cache's reference).
-pub fn usage_of(history: &History) -> Value {
+/// The `usage` view computed from scratch over `events` (the cache's
+/// reference): a fresh fold folds them all, in `seq` order.
+pub fn usage_of(events: &[Value]) -> Value {
     let mut fold = UsageFold::default();
-    fold.advance(history);
+    fold.advance(events);
     fold.value()
 }
 
-/// The `tail` view: the last `n` events, verbatim.
-pub fn tail_of(history: &History, n: usize) -> Value {
-    Value::Array(history.tail(n))
+/// The `tail` view: the last `n` of `events`, verbatim.
+pub fn tail_of(events: &[Value], n: usize) -> Value {
+    let start = events.len().saturating_sub(n);
+    Value::Array(events[start..].to_vec())
 }
 
 /// Read `opts.n` for the `tail` view, defaulting to [`DEFAULT_TAIL_N`].
@@ -184,6 +216,7 @@ pub fn tail_count(opts: Option<&Map<String, Value>>) -> KnlResult<usize> {
 mod tests {
     use super::*;
     use crate::knl::event::{FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT};
+    use crate::knl::History;
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -201,6 +234,13 @@ mod tests {
         history
             .append(obj(value))
             .unwrap_or_else(|e| panic!("append {event}: {e}"));
+    }
+
+    /// Read the `usage` view the way a session does: fold only the events
+    /// past what the cache has already seen (`read(folded_seq + 1, ..)`).
+    fn usage_cached(views: &mut Views, h: &History) -> Value {
+        let from = views.usage_folded_seq().saturating_add(1);
+        views.usage(&h.since(from))
     }
 
     /// A history covering every reserved kind plus an open one.
@@ -319,7 +359,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            usage_of(&h),
+            usage_of(&h.since(0)),
             json!({
                 "input_tokens": 9,
                 "output_tokens": 2,
@@ -343,7 +383,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            usage_of(&h),
+            usage_of(&h.since(0)),
             json!({
                 "input_tokens": 15,
                 "output_tokens": 3,
@@ -354,13 +394,13 @@ mod tests {
         );
     }
 
-    /// An empty history has folded nothing, and says so: `at_seq` is `0`,
+    /// An empty slice has folded nothing, and says so: `at_seq` is `0`,
     /// which is the one position `events(from)` can be asked to start
     /// before.
     #[test]
     fn usage_of_an_empty_history_is_all_zero() {
         assert_eq!(
-            usage_of(&History::new()),
+            usage_of(&[]),
             json!({
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -378,14 +418,14 @@ mod tests {
     fn at_seq_advances_with_the_history_not_with_the_totals() {
         let mut h = History::new();
         let mut views = Views::default();
-        assert_eq!(views.usage(&h)["at_seq"], json!(0));
+        assert_eq!(usage_cached(&mut views, &h)["at_seq"], json!(0));
 
         append(
             &mut h,
             json!({ "kind": "note", "text": "counts for nothing" }),
         );
         append(&mut h, json!({ "kind": "msg_user", "content": "hi" }));
-        let usage = views.usage(&h);
+        let usage = usage_cached(&mut views, &h);
         assert_eq!(usage["at_seq"], json!(2), "{usage}");
         assert_eq!(usage["model_calls"], json!(0), "{usage}");
 
@@ -400,7 +440,7 @@ mod tests {
         );
         let rest = h.since(at_seq + 1);
         assert_eq!(rest.len(), 1, "{rest:?}");
-        assert_eq!(views.usage(&h)["at_seq"], json!(3));
+        assert_eq!(usage_cached(&mut views, &h)["at_seq"], json!(3));
     }
 
     #[test]
@@ -409,7 +449,7 @@ mod tests {
         let mut views = Views::default();
 
         // Reading before anything is appended must not poison the cache.
-        assert_eq!(views.usage(&h), usage_of(&h));
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
 
         let script = [
             json!({ "kind": "run_started" }),
@@ -442,17 +482,21 @@ mod tests {
             append(&mut h, event);
             // Read after every append: the incremental result must equal
             // the from-scratch one at each step, not only at the end.
-            assert_eq!(views.usage(&h), usage_of(&h), "step {i}");
+            assert_eq!(
+                usage_cached(&mut views, &h),
+                usage_of(&h.since(0)),
+                "step {i}"
+            );
         }
 
         // Reading twice without an append repeats the same value rather
         // than double-folding.
-        assert_eq!(views.usage(&h), usage_of(&h));
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
 
         // Every model_response counts now: three calls, and the 9000-token
         // one is summed in with the rest.
         assert_eq!(
-            views.usage(&h),
+            usage_cached(&mut views, &h),
             json!({
                 "input_tokens": 9_010,
                 "output_tokens": 2,
@@ -480,22 +524,23 @@ mod tests {
                 json!({ "kind": "msg_user", "content": format!("m{i}") }),
             );
         }
-        assert_eq!(views.usage(&h), usage_of(&h));
-        assert_eq!(views.usage.folded_seq(), 10);
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
+        assert_eq!(views.usage_folded_seq(), 10);
     }
 
     #[test]
     fn tail_returns_the_last_n_events_verbatim() {
         let h = mixed_history();
-        let tail = tail_of(&h, 2);
+        let events = h.since(0);
+        let tail = tail_of(&events, 2);
         let tail = tail.as_array().expect("array");
         assert_eq!(tail.len(), 2);
         assert_eq!(kind_of(&tail[0]), "tool_result");
         assert_eq!(kind_of(&tail[1]), "note");
         assert!(tail[1].get("seq").is_some(), "tail keeps the envelope");
 
-        assert_eq!(tail_of(&h, 99).as_array().map(Vec::len), Some(h.len()));
-        assert_eq!(tail_of(&h, 0).as_array().map(Vec::len), Some(0));
+        assert_eq!(tail_of(&events, 99).as_array().map(Vec::len), Some(h.len()));
+        assert_eq!(tail_of(&events, 0).as_array().map(Vec::len), Some(0));
     }
 
     #[test]

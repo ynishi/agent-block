@@ -65,8 +65,17 @@
 //! history off — is the shell's policy, so it is written in Lua over
 //! `events(from)` rather than named as a view here.
 //!
-//! Scope: in-memory only.  Effect execution, the Lua-side projection seam
-//! and persistence are separate steps of the kernel/shell base design.
+//! Storage backend.  `knl.open` takes an optional `store`: absent or
+//! `"mem"` keeps the in-memory log (the default), while
+//! `{ sqlite = "<path>" }` opens a durable, per-session SQLite stream (only
+//! in a build with the `sqlite` feature).  `knl.resume({ store = { sqlite =
+//! "<path>" }, session = "<id>", budget? })` reopens a persisted stream and
+//! re-folds it, so a resumed session takes new turns whose numbering and
+//! accounting continue from the recorded state — it behaves exactly like a
+//! fresh session, only pre-loaded.
+//!
+//! Scope: effect execution and the Lua-side projection seam are separate
+//! steps of the kernel/shell base design.
 
 use std::cell::RefCell;
 
@@ -85,11 +94,17 @@ struct Session {
 }
 
 impl Session {
-    /// Open a run for `owner` with an optional token budget.
-    fn new(owner: String, budget_tokens: Option<i64>) -> Self {
+    /// Wrap a kernel session as the Lua userdata.
+    fn from_state(state: knl::Session) -> Self {
         Self {
-            state: RefCell::new(knl::Session::new(owner, budget_tokens)),
+            state: RefCell::new(state),
         }
+    }
+
+    /// Open a run for `owner` with an optional token budget, on the
+    /// in-memory store.
+    fn new(owner: String, budget_tokens: Option<i64>) -> Self {
+        Self::from_state(knl::Session::new(owner, budget_tokens))
     }
 }
 
@@ -339,10 +354,110 @@ fn parse_owner(opts: Option<&LuaTable>) -> LuaResult<String> {
     }
 }
 
+/// The storage backend `opts.store` asks for.
+enum StoreSpec {
+    /// The in-memory store (the default): absent or `"mem"`.
+    Mem,
+    /// A durable SQLite stream at the given path.
+    Sqlite(String),
+}
+
+/// Read `opts.store`: absent / `"mem"` → in-memory, `{ sqlite = "<path>" }`
+/// → durable.  `method` names the caller (`open` / `resume`) for attribution.
+fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
+    let Some(opts) = opts else {
+        return Ok(StoreSpec::Mem);
+    };
+    let store: LuaValue = opts.get("store")?;
+    match store {
+        LuaValue::Nil => Ok(StoreSpec::Mem),
+        LuaValue::String(name) => {
+            let name = name.to_str()?.to_string();
+            if name == "mem" {
+                Ok(StoreSpec::Mem)
+            } else {
+                Err(err(
+                    method,
+                    format!(r#"unknown store {name:?} (expected "mem" or {{ sqlite = <path> }})"#),
+                ))
+            }
+        }
+        LuaValue::Table(table) => {
+            let sqlite: LuaValue = table.get("sqlite")?;
+            match sqlite {
+                LuaValue::String(path) => Ok(StoreSpec::Sqlite(path.to_str()?.to_string())),
+                LuaValue::Nil => Err(err(
+                    method,
+                    "store table must carry a sqlite = <path> field",
+                )),
+                other => Err(err(
+                    method,
+                    format!("store.sqlite must be a string path, got {}", other.type_name()),
+                )),
+            }
+        }
+        other => Err(err(
+            method,
+            format!(
+                r#"store must be "mem" or a table {{ sqlite = <path> }}, got {}"#,
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// Open a NEW durable session on the SQLite stream at `path`.
+///
+/// The stream id is minted here and adopted as the session's own id, so the
+/// id `knl.open` reports (`s:id()`) is exactly the stream a later
+/// `knl.resume` reopens — the durable identity is one string, not two.
+#[cfg(feature = "sqlite")]
+fn open_sqlite(owner: String, budget_tokens: Option<i64>, path: &str) -> LuaResult<Session> {
+    let stream = uuid::Uuid::new_v4().to_string();
+    let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone())
+        .map_err(|e| err("open", e))?;
+    let mut state = knl::Session::open_on(owner, budget_tokens, Box::new(store));
+    state.adopt_id(stream);
+    Ok(Session::from_state(state))
+}
+
+/// Without the `sqlite` feature a durable store cannot be built, so the
+/// request is a clear error rather than a silent fall back to memory.
+#[cfg(not(feature = "sqlite"))]
+fn open_sqlite(_owner: String, _budget_tokens: Option<i64>, _path: &str) -> LuaResult<Session> {
+    Err(err(
+        "open",
+        "a sqlite store needs the 'sqlite' feature, which this build does not have",
+    ))
+}
+
+/// Reopen the durable SQLite stream `session_id` at `path` and resume it.
+///
+/// `Session::resume` re-folds the persisted log; the reopened stream's id is
+/// adopted so `s:id()` matches the stream the caller named.
+#[cfg(feature = "sqlite")]
+fn resume_sqlite(budget_tokens: Option<i64>, path: &str, session_id: String) -> LuaResult<Session> {
+    let store = knl::SqliteEventStore::open(std::path::Path::new(path), session_id.clone())
+        .map_err(|e| err("resume", e))?;
+    let mut state = knl::Session::resume(budget_tokens, Box::new(store)).map_err(|e| err("resume", e))?;
+    state.adopt_id(session_id);
+    Ok(Session::from_state(state))
+}
+
+/// Without the `sqlite` feature there is no durable stream to resume.
+#[cfg(not(feature = "sqlite"))]
+fn resume_sqlite(_budget_tokens: Option<i64>, _path: &str, _session_id: String) -> LuaResult<Session> {
+    Err(err(
+        "resume",
+        "a sqlite store needs the 'sqlite' feature, which this build does not have",
+    ))
+}
+
 /// Build a session userdata from `opts` — the body of `knl.open`.
 ///
-/// `opts.owner` is the principal (default the reserved anonymous id) and
-/// `opts.budget` the token budget.
+/// `opts.owner` is the principal (default the reserved anonymous id),
+/// `opts.budget` the token budget, and `opts.store` the backend (in-memory
+/// by default, or `{ sqlite = "<path>" }` for a durable stream).
 fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
         LuaValue::Nil => None,
@@ -356,18 +471,78 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     };
     let owner = parse_owner(opts.as_ref())?;
     let budget_tokens = parse_budget(opts.as_ref())?;
-    lua.create_userdata(Session::new(owner, budget_tokens))
+    let session = match parse_store("open", opts.as_ref())? {
+        StoreSpec::Mem => Session::new(owner, budget_tokens),
+        StoreSpec::Sqlite(path) => open_sqlite(owner, budget_tokens, &path)?,
+    };
+    lua.create_userdata(session)
+}
+
+/// Resume a persisted session — the body of `knl.resume`.
+///
+/// Requires `opts.store = { sqlite = "<path>" }` and `opts.session =
+/// "<stream id>"`; `opts.budget` is an optional fresh cap on the resumed
+/// run.  The returned userdata is the same one `knl.open` returns, only
+/// pre-loaded with the recorded turn count and spent budget.
+fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
+    let opts = match opts {
+        LuaValue::Table(t) => t,
+        LuaValue::Nil => {
+            return Err(err(
+                "resume",
+                "opts must be a table with store and session",
+            ));
+        }
+        other => {
+            return Err(err(
+                "resume",
+                format!("opts must be a table, got {}", other.type_name()),
+            ));
+        }
+    };
+    let budget_tokens = parse_budget(Some(&opts))?;
+    let path = match parse_store("resume", Some(&opts))? {
+        StoreSpec::Sqlite(path) => path,
+        StoreSpec::Mem => {
+            return Err(err(
+                "resume",
+                "resume needs a sqlite store (store = { sqlite = <path> })",
+            ));
+        }
+    };
+    let session: LuaValue = opts.get("session")?;
+    let session_id = match session {
+        LuaValue::String(id) => id.to_str()?.to_string(),
+        LuaValue::Nil => {
+            return Err(err(
+                "resume",
+                "session is required (the stream id to reopen)",
+            ));
+        }
+        other => {
+            return Err(err(
+                "resume",
+                format!("session must be a string, got {}", other.type_name()),
+            ));
+        }
+    };
+    let state = resume_sqlite(budget_tokens, &path, session_id)?;
+    lua.create_userdata(state)
 }
 
 /// Register the `knl` global.  No [`crate::host::HostContext`] is needed —
 /// this layer keeps all state inside the session userdata.
 ///
-/// `knl.open(opts?)` is the constructor (owner-aware).
+/// `knl.open(opts?)` is the constructor (owner- and store-aware);
+/// `knl.resume(opts)` reopens a persisted SQLite session.
 pub fn register(lua: &Lua) -> LuaResult<()> {
     let knl_tbl = lua.create_table()?;
 
     // knl.open(opts?) -> Session userdata
     knl_tbl.set("open", lua.create_function(open_session)?)?;
+
+    // knl.resume(opts) -> Session userdata (durable stream re-folded)
+    knl_tbl.set("resume", lua.create_function(resume_session)?)?;
 
     lua.globals().set("knl", knl_tbl)?;
     Ok(())
@@ -963,5 +1138,101 @@ mod tests {
         )
         .exec()
         .expect("view copy chunk");
+    }
+
+    /// `store = "mem"` is the in-memory default spelled out; an unknown
+    /// store string is a `knl: open:` error.
+    #[test]
+    fn store_mem_is_the_default_and_unknown_stores_are_rejected() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ store = "mem", owner = "x", budget = { tokens = 10 } })
+            assert(s:len() == 1, "mem store opens like the default")
+            assert(s:owner() == "x")
+            assert(s:append({ kind = "note" }) == 2)
+        "#,
+        )
+        .exec()
+        .expect("mem store chunk");
+
+        let msg = expect_err(&lua, r#"knl.open({ store = "postgres" })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("unknown store"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.open({ store = { redis = "x" } })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("sqlite"), "{msg}");
+    }
+
+    /// (durable) `knl.open({ store = { sqlite = path } })` writes to a
+    /// persisted stream, and `knl.resume` reopens it and re-folds the
+    /// record: owner, turn count, spent budget and the usage view all come
+    /// back, and new turns number and charge on from there.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn open_and_resume_a_durable_sqlite_session() {
+        let lua = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path = path.to_str().expect("utf-8 path");
+
+        lua.load(format!(
+            r#"
+            local path = "{path}"
+            local s = knl.open({{ store = {{ sqlite = path }},
+                                  owner = "durable-user", budget = {{ tokens = 100 }} }})
+            s:append({{ kind = "model_response",
+                        content = {{ {{ type = "text", text = "a" }} }},
+                        usage = {{ input_tokens = 30 }} }})
+            s:append({{ kind = "msg_user", content = "more" }})
+            s:append({{ kind = "model_response",
+                        content = {{ {{ type = "text", text = "b" }} }},
+                        usage = {{ input_tokens = 20 }} }})
+            assert(s:turns() == 2, "open turns: " .. tostring(s:turns()))
+            assert(s:remaining() == 50, "open remaining: " .. tostring(s:remaining()))
+            local id = s:id()
+            s:close()
+
+            -- Reopen the same stream and continue where it left off.
+            local r = knl.resume({{ store = {{ sqlite = path }},
+                                    session = id, budget = {{ tokens = 100 }} }})
+            assert(r:owner() == "durable-user", "resumed owner: " .. tostring(r:owner()))
+            assert(r:turns() == 2, "resumed turns: " .. tostring(r:turns()))
+            assert(r:remaining() == 50, "resumed remaining: " .. tostring(r:remaining()))
+            assert(r:id() == id, "resumed id is the stream it reopened")
+            local u = r:view("usage")
+            assert(u.model_calls == 2, "resumed usage model_calls: " .. tostring(u.model_calls))
+            assert(u.input_tokens == 50, "resumed usage input_tokens: " .. tostring(u.input_tokens))
+
+            -- Numbering and accounting continue on the resumed session.
+            r:append({{ kind = "model_response",
+                        content = {{ {{ type = "text", text = "c" }} }},
+                        usage = {{ input_tokens = 5 }} }})
+            assert(r:turns() == 3, "continued turns: " .. tostring(r:turns()))
+            assert(r:remaining() == 45, "continued remaining: " .. tostring(r:remaining()))
+        "#
+        ))
+        .exec()
+        .expect("durable open/resume chunk");
+    }
+
+    /// (attribution) resume needs a sqlite store and a session id; each
+    /// missing piece is a `knl: resume:` error.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_requires_a_sqlite_store_and_a_session_id() {
+        let lua = vm();
+
+        let msg = expect_err(&lua, r#"knl.resume()"#);
+        assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
+
+        let msg = expect_err(&lua, r#"knl.resume({ session = "s1" })"#);
+        assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
+        assert!(msg.contains("sqlite"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
+        assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
+        assert!(msg.contains("session is required"), "{msg}");
     }
 }

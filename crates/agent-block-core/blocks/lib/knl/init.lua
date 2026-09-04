@@ -226,10 +226,12 @@ end
 ---
 --- A thin pass-through to `knl.open` (the Rust bridge): `owner` is the
 --- principal (the bridge defaults it to the reserved "anon" when absent),
---- `budget` / `backend` are forwarded as-is. The returned handle is the ctx
---- itself — the only capability needed to write to the session.
+--- `budget` / `backend` / `store` are forwarded as-is. `store` chooses the
+--- backend — absent / "mem" for the in-memory log, `{ sqlite = "<path>" }`
+--- for a durable stream. The returned handle is the ctx itself — the only
+--- capability needed to write to the session.
 ---
---- @param opts table  { owner?, budget?, backend? }
+--- @param opts table  { owner?, budget?, backend?, store? }
 --- @return userdata ctx  a `knl.open` session handle
 function M.open(opts)
     opts = opts or {}
@@ -240,6 +242,29 @@ function M.open(opts)
         owner = opts.owner,
         budget = opts.budget,
         backend = opts.backend,
+        store = opts.store,
+    })
+end
+
+--- Resume a persisted session and return its ctx handle.
+---
+--- A thin pass-through to `knl.resume` (the Rust bridge): it reopens the
+--- durable stream named by `opts.session` under `opts.store = { sqlite =
+--- "<path>" }`, re-folds the recorded log, and returns a ctx that continues
+--- turning where the run left off (`opts.budget` is an optional fresh cap).
+--- The handle behaves exactly like a `knl.open` one, only pre-loaded.
+---
+--- @param opts table  { store = { sqlite = <path> }, session = <id>, budget? }
+--- @return userdata ctx  a resumed session handle
+function M.resume(opts)
+    opts = opts or {}
+    if syscall == nil then
+        error("knl.resume: the knl syscall bridge is not available in this VM")
+    end
+    return syscall.resume({
+        store = opts.store,
+        session = opts.session,
+        budget = opts.budget,
     })
 end
 
@@ -462,6 +487,7 @@ end
 ---   ctx       (optional) a ctx handle to continue (not closed by run);
 ---             `session` is accepted as an alias for a brought-in handle
 ---   backend   (optional) POC stub fn(req) -> { status, content, usage, stop_reason }
+---   store     (optional) backend for an opened ctx: absent/"mem" or { sqlite = <path> }
 ---   input     (optional) first user message, appended before the first beat
 ---   system / tools / filters / tool_policy / fold — passed to each turn
 --- }
@@ -507,6 +533,7 @@ function M.run(conf)
         local opened_ok, opened = pcall(M.open, {
             budget = conf.budget,
             backend = conf.backend,
+            store = conf.store,
         })
         if not opened_ok then
             return Outcome.err("conf", "ctx open failed: " .. tostring(opened)), nil

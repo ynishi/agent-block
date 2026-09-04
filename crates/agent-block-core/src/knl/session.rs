@@ -42,11 +42,12 @@ use serde_json::{Map, Value};
 
 use super::call::charge_of;
 use super::event::{
-    kernel_event, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE, KIND_MODEL_RESPONSE,
+    kernel_event, kind_of, FIELD_KIND, FIELD_REASON, FIELD_TURN, FIELD_USAGE, KIND_MODEL_RESPONSE,
     KIND_RUN_FINISHED, KIND_RUN_STARTED,
 };
+use super::event_store::{EventStore, MemEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
-use super::{projection, Budget, History, KnlError, KnlResult};
+use super::{projection, Budget, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
 pub const DEFAULT_CLOSE_REASON: &str = "closed";
@@ -56,16 +57,23 @@ pub const ANON: &str = "anon";
 /// Reserved owner: the session belongs to the system itself.
 pub const SYSTEM: &str = "system";
 
+/// Payload field the kernel records on `run_started` so a later
+/// [`Session::resume`] can recover the session's `owner` from the log.
+///
+/// `run_started` is an open-shape reserved kind (no required fields), so
+/// carrying this extra field needs no change to the event validator.
+const FIELD_OWNER: &str = "owner";
+
 /// One run scope.
-#[derive(Debug)]
 pub struct Session {
     /// Run-correlation id, unique per session.
     id: String,
     /// Whose scope this is: a real principal id, or [`ANON`] / [`SYSTEM`].
     /// Total — never absent, read by the policy layer above the kernel.
     owner: String,
-    /// K1 append-only history.
-    history: History,
+    /// K1 append-only history, held behind the event-store SPI so the
+    /// backend can be the in-memory store or the durable SQLite one.
+    store: Box<dyn EventStore>,
     /// K4 budget counter.
     budget: Budget,
     /// Cached projection folds (derived, never authoritative).
@@ -76,17 +84,47 @@ pub struct Session {
     closed: bool,
 }
 
+impl std::fmt::Debug for Session {
+    /// The store is a trait object (`dyn EventStore` is not `Debug`), so it
+    /// is summarised rather than printed; the fields that identify the run
+    /// scope are shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("owner", &self.owner)
+            .field("budget", &self.budget)
+            .field("turns", &self.turns)
+            .field("closed", &self.closed)
+            .field("len", &self.store.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Session {
-    /// Open a run for `owner` with an optional token budget.
+    /// Open a run for `owner` with an optional token budget, on the
+    /// in-memory store.
     ///
     /// `owner` is total: pass a real principal id, or [`ANON`] / [`SYSTEM`]
     /// for the reserved ones.  The `run_started` event is appended here, so
     /// a fresh session already has one event.
     pub fn new(owner: String, budget_tokens: Option<i64>) -> Self {
+        Self::open_on(owner, budget_tokens, Box::new(MemEventStore::new()))
+    }
+
+    /// Open a run for `owner` on a caller-chosen backend `store` (the
+    /// in-memory store, or the durable SQLite one).
+    ///
+    /// Like [`Session::new`] but takes the backend, so the shell decides
+    /// whether the log is ephemeral or persisted.  It appends the same
+    /// `run_started` boundary, recording the session's `owner` on it so a
+    /// later [`Session::resume`] can recover the principal from the log
+    /// alone.  `run_started` is an open-shape reserved kind, so the extra
+    /// `owner` field is accepted without any change to the validator.
+    pub fn open_on(owner: String, budget_tokens: Option<i64>, store: Box<dyn EventStore>) -> Self {
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             owner,
-            history: History::new(),
+            store,
             budget: Budget::new(budget_tokens),
             views: Views::default(),
             turns: 0,
@@ -94,14 +132,89 @@ impl Session {
         };
         // `run_started` is well-formed and the session is open, so this
         // append cannot fail; the same one path records it as records
-        // everything else.
-        let _ = session.append(kernel_event(KIND_RUN_STARTED));
+        // everything else.  The owner rides along so resume can recover it.
+        let mut started = kernel_event(KIND_RUN_STARTED);
+        started.insert(FIELD_OWNER.to_string(), Value::from(session.owner.clone()));
+        let _ = session.append(started);
         session
+    }
+
+    /// Continue an existing run by re-folding its persisted log.
+    ///
+    /// The `store` already holds a run's events (a reopened SQLite stream),
+    /// so resume does *not* append a new `run_started` — the run already
+    /// started.  It reads the whole log once and restores the run's state
+    /// from it:
+    ///
+    /// - `owner` from the first `run_started` event's [`FIELD_OWNER`] field,
+    ///   falling back to [`ANON`] for an older log written before it was
+    ///   recorded;
+    /// - the turn counter from the number of `model_response` events, so the
+    ///   kernel-owned numbering continues where it left off;
+    /// - the budget: `budget_tokens` is a fresh policy input (the cap on the
+    ///   resumed run), and the already-spent total is the summed
+    ///   [`charge_of`] over the recorded responses, spent once here so
+    ///   [`Session::remaining`] reflects what the run has used.
+    ///
+    /// The projection caches start empty and re-fold lazily from the store,
+    /// so a resumed session's `usage` view is correct on first read.
+    pub fn resume(budget_tokens: Option<i64>, store: Box<dyn EventStore>) -> KnlResult<Self> {
+        let log = store.read(0, usize::MAX);
+
+        let owner = log
+            .iter()
+            .find(|event| kind_of(event) == KIND_RUN_STARTED)
+            .and_then(|event| event.get(FIELD_OWNER).and_then(Value::as_str))
+            .unwrap_or(ANON)
+            .to_string();
+
+        let turns = log
+            .iter()
+            .filter(|event| kind_of(event) == KIND_MODEL_RESPONSE)
+            .count() as u64;
+
+        let spent: i64 = log
+            .iter()
+            .filter(|event| kind_of(event) == KIND_MODEL_RESPONSE)
+            .map(|event| {
+                event
+                    .get(FIELD_USAGE)
+                    .and_then(Value::as_object)
+                    .map_or(0, charge_of)
+            })
+            .sum();
+
+        // The budget spends monotonically, so the restored total is spent
+        // once here; `remaining()` then reflects the run's prior usage.
+        let mut budget = Budget::new(budget_tokens);
+        let _ = budget.spend(spent);
+
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner,
+            store,
+            budget,
+            views: Views::default(),
+            turns,
+            closed: false,
+        })
     }
 
     /// The run-correlation id.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Adopt `id` as the run-correlation id.
+    ///
+    /// Used only by the durable Lua bridge so a session and the SQLite
+    /// stream it writes to share one id: `open_on` / `resume` mint a fresh
+    /// id like `new`, and the bridge overrides it to the stream it opened,
+    /// so the id a caller resumes by *is* the stream.  `run_started` records
+    /// the `owner`, not the id, so overriding the id does not desync the log.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn adopt_id(&mut self, id: impl Into<String>) {
+        self.id = id.into();
     }
 
     /// Whose scope this is (a principal id, or [`ANON`] / [`SYSTEM`]).
@@ -137,7 +250,7 @@ impl Session {
         let is_response =
             event.get(FIELD_KIND).and_then(Value::as_str) == Some(KIND_MODEL_RESPONSE);
         if !is_response {
-            return self.history.append(event);
+            return self.store.append(event).map(|committed| committed.seq);
         }
 
         // Kernel-owned turn, assigned before the event is stored so the
@@ -151,7 +264,7 @@ impl Session {
 
         // Validate + stamp + push.  A malformed response is rejected here,
         // before the turn counter advances or the budget is touched.
-        let seq = self.history.append(event)?;
+        let seq = self.store.append(event)?.seq;
         self.turns = turn;
         let _ = self.budget.spend(charge);
         Ok(seq)
@@ -159,18 +272,18 @@ impl Session {
 
     /// Events with `seq >= from`, cloned.
     pub fn events(&self, from: u64) -> Vec<Value> {
-        self.history.since(from)
+        self.store.read(from, usize::MAX)
     }
 
     /// Number of recorded events.
     pub fn len(&self) -> usize {
-        self.history.len()
+        self.store.len()
     }
 
     /// Whether the history is empty (only before `run_started`, i.e.
     /// never for a session built by [`Session::new`]).
     pub fn is_empty(&self) -> bool {
-        self.history.is_empty()
+        self.store.is_empty()
     }
 
     /// Deduct `amount` from the budget, returning the new balance.
@@ -245,8 +358,20 @@ impl Session {
     /// the shell side rather than named here.
     pub fn view(&mut self, name: &str, opts: Option<&Map<String, Value>>) -> KnlResult<Value> {
         match name {
-            VIEW_USAGE => Ok(self.views.usage(&self.history)),
-            VIEW_TAIL => Ok(projection::tail_of(&self.history, tail_count(opts)?)),
+            VIEW_USAGE => {
+                // Fold only what the cache has not seen: read on from the
+                // position it folded to, so the view is amortised in new
+                // events and Session works against the `EventStore` trait
+                // alone — no reach into a concrete `History`.
+                let from = self.views.usage_folded_seq().saturating_add(1);
+                let fresh = self.store.read(from, usize::MAX);
+                Ok(self.views.usage(&fresh))
+            }
+            VIEW_TAIL => {
+                let n = tail_count(opts)?;
+                let events = self.store.read(0, usize::MAX);
+                Ok(projection::tail_of(&events, n))
+            }
             other => Err(KnlError::new(format!("unknown view {other:?}"))),
         }
     }
@@ -554,5 +679,107 @@ mod tests {
 
         assert_eq!(s.len(), 3);
         assert_eq!(kind_of(&s.events(0)[2]), KIND_RUN_FINISHED);
+    }
+
+    /// `open_on` on a durable backend records the session's owner on the
+    /// `run_started` boundary, so resume can recover it from the log alone.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn open_on_records_the_owner_on_run_started() {
+        use crate::knl::SqliteEventStore;
+
+        let store = SqliteEventStore::open_in_memory("owner-stream").expect("open");
+        let s = Session::open_on("user-7".to_string(), Some(100), Box::new(store));
+
+        let started = s.events(0);
+        let started = started.first().expect("run_started");
+        assert_eq!(kind_of(started), KIND_RUN_STARTED);
+        assert_eq!(
+            started.get("owner").and_then(Value::as_str),
+            Some("user-7"),
+            "owner rides on run_started: {started}"
+        );
+        assert_eq!(s.owner(), "user-7");
+    }
+
+    /// Resume re-folds a persisted SQLite stream: the turn counter, the
+    /// spent budget and the owner all come back from the log, and new turns
+    /// number and charge on from the restored state.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_restores_turn_owner_and_spent_budget_from_the_log() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "resume-stream";
+
+        // A durable session: two charged responses and a user message.
+        {
+            let store = SqliteEventStore::open(&path, stream).expect("open");
+            let mut s = Session::open_on("user-42".to_string(), Some(100), Box::new(store));
+            s.append(response(30)).expect("first response");
+            s.append(obj(json!({ "kind": "msg_user", "content": "more" })))
+                .expect("msg_user");
+            s.append(response(20)).expect("second response");
+            assert_eq!(s.turns(), 2);
+            assert_eq!(s.remaining(), Some(50));
+        } // dropped: the connection closes, the log persists.
+
+        // Reopen the same stream and resume — no new run_started is written.
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let mut resumed = Session::resume(Some(100), Box::new(store)).expect("resume");
+
+        assert_eq!(resumed.owner(), "user-42", "owner restored from run_started");
+        assert_eq!(resumed.turns(), 2, "turn counter restored");
+        assert_eq!(
+            resumed.remaining(),
+            Some(50),
+            "spent budget restored (30 + 20 charged)"
+        );
+        // Resume appended nothing: the log is exactly what was persisted.
+        assert_eq!(resumed.len(), 4, "run_started + response + msg_user + response");
+
+        // The usage view re-folds correctly from the reopened store.
+        let usage = resumed.view(VIEW_USAGE, None).expect("usage");
+        assert_eq!(usage["model_calls"], json!(2));
+        assert_eq!(usage["input_tokens"], json!(50));
+
+        // Numbering and accounting continue: the next response is turn 3.
+        let seq = resumed.append(response(5)).expect("third response");
+        let recorded = resumed.events(seq).pop().expect("model_response");
+        assert_eq!(
+            recorded[FIELD_TURN],
+            json!(3),
+            "numbering continues from the restored count"
+        );
+        assert_eq!(resumed.turns(), 3);
+        assert_eq!(resumed.remaining(), Some(45), "5 more charged");
+    }
+
+    /// An older log with no `owner` on `run_started` resumes as [`ANON`]
+    /// rather than failing — the field is a later addition.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_falls_back_to_anon_when_the_log_has_no_owner() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "legacy-stream";
+
+        // Write a run_started with no owner field, as an older build would.
+        {
+            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            store
+                .append(kernel_event(KIND_RUN_STARTED))
+                .expect("run_started");
+        }
+
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let resumed = Session::resume(None, Box::new(store)).expect("resume");
+        assert_eq!(resumed.owner(), ANON);
+        assert_eq!(resumed.turns(), 0);
+        assert_eq!(resumed.remaining(), None, "resumed without a budget cap");
     }
 }
