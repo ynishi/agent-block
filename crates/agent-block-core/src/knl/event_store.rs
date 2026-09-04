@@ -83,8 +83,14 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::event::{kind_of, seq_of, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
-use super::{History, KnlError, KnlResult};
+use super::event::{FIELD_KIND, FIELD_SEQ};
+// Only the `Vec`-backed test store below reads these — the durable backend
+// stamps and selects in SQL.
+#[cfg(test)]
+use super::event::{kind_of, seq_of, validate_event, FIELD_EPOCH_MS};
+#[cfg(test)]
+use super::History;
+use super::{KnlError, KnlResult};
 
 /// Reserved envelope key: the schema version an event was written under.
 ///
@@ -398,20 +404,52 @@ pub trait EventStore {
     fn is_empty(&self) -> KnlResult<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// Answer a caller's own SQL over the log ([`super::query`]).
+    ///
+    /// The read side of a store that keeps its events in a table it can be
+    /// asked about — which the product backend is, in both its file and its
+    /// in-memory form.  The `plan` has already been validated (one statement,
+    /// and it reads) and carries what the reserved parameters bind to; a
+    /// backend answers it on a connection that cannot write.
+    ///
+    /// The default refuses, because a store that is not a database has no
+    /// answer to give: the request is well-formed and this backend cannot
+    /// serve it, which is what [`KnlError::Unsupported`] says.  Only the test
+    /// doubles take it.
+    ///
+    /// **Queries read the stored shape, not the upcasted one.**  Every other
+    /// read a session makes goes through the upcaster seam
+    /// ([`CurrentStore`]); SQL runs against the bytes as they were written,
+    /// because the chain is Rust and the query is SQLite's.  A caller reading
+    /// across a schema change is reading the versions it finds — which is why
+    /// `schema_version` is a column.
+    fn query(&self, plan: &super::query::QueryPlan) -> KnlResult<super::query::QueryRows> {
+        let _ = plan;
+        Err(KnlError::Unsupported(
+            "this store keeps no queryable table".to_string(),
+        ))
+    }
 }
 
-/// In-memory [`EventStore`]: the existing [`History`] behind the SPI.
+/// A [`Vec`]-backed [`EventStore`] — **tests only**.
 ///
-/// Storage is a [`History`], so the in-memory behaviour — seq assignment,
-/// validation on append, `since`-style reads — is exactly today's, and the
-/// inner history is available to the projection folds that still fold over
-/// a `&History`.
+/// The product has one backend: a session's log is a SQLite table whether it
+/// is a file or an in-memory database ([`super::SqliteEventStore`]), because a
+/// log that cannot be queried cannot serve the view layer that reads it with
+/// SQL.  This one stays because the SPI, the upcasting seam and the folds are
+/// worth exercising without a database underneath, and because the failure
+/// injection the bridge's lifecycle tests need is easier to build on a
+/// [`Vec`] than on a connection.  It is `#[cfg(test)]` so it cannot become a
+/// second production backend by accident.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct MemEventStore {
     /// The append-only history that holds the events.
     history: History,
 }
 
+#[cfg(test)]
 impl MemEventStore {
     /// A fresh, empty in-memory store.
     pub fn new() -> Self {
@@ -427,6 +465,7 @@ impl MemEventStore {
     }
 }
 
+#[cfg(test)]
 impl Default for MemEventStore {
     /// The same fresh store as [`MemEventStore::new`] — note this is *not*
     /// `History::default()`, whose `next_seq` would start at `0`.
@@ -435,6 +474,7 @@ impl Default for MemEventStore {
     }
 }
 
+#[cfg(test)]
 impl EventStore for MemEventStore {
     fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<Committed> {
         // Stamp the schema version before the history validates and stamps
@@ -629,6 +669,16 @@ impl CurrentStore {
     /// Whether the backend holds nothing yet.
     pub fn is_empty(&self) -> KnlResult<bool> {
         self.inner.is_empty()
+    }
+
+    /// Answer a caller's SQL ([`EventStore::query`]).
+    ///
+    /// Straight through, and deliberately *not* upcasted: the chain is a Rust
+    /// transform over whole events and a query selects columns, so there is
+    /// nothing here to project.  A query reads the stored shape, which is why
+    /// the version each row was written under is a column of the table.
+    pub fn query(&self, plan: &super::query::QueryPlan) -> KnlResult<super::query::QueryRows> {
+        self.inner.query(plan)
     }
 }
 
@@ -919,6 +969,27 @@ mod tests {
             "a stored event carries the version it was written under: {}",
             stored[0]
         );
+    }
+
+    /// A store that is not a database says so, rather than answering a query
+    /// with an empty result — which would read as "there is nothing there".
+    /// The product backend is SQLite in every build; this is the answer the
+    /// `Vec`-backed test store gives.
+    #[test]
+    fn a_store_with_no_table_refuses_a_query() {
+        use crate::knl::query::{plan, QueryOpts, QueryParams};
+
+        let store = MemEventStore::new();
+        let asked = plan(
+            "SELECT 1",
+            QueryParams::None,
+            &QueryOpts::default(),
+            "a-stream",
+        )
+        .expect("a plan");
+        let err = store.query(&asked).expect_err("there is no table to query");
+        assert_eq!(err.kind(), KnlError::UNSUPPORTED, "{err}");
+        assert!(!err.is_retryable(), "asking again changes nothing: {err}");
     }
 
     #[test]

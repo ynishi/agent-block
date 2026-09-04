@@ -59,10 +59,13 @@ local M = {}
 -- tool set from the registry and MCP, the token budget, and the dump.
 local tool_loop = require("tool_loop")
 
--- The run path reaches llm_proto's wire format through tool_loop; what this
--- module calls directly is the MCP vocabulary it shares with knl_adapter
--- (`mcp_tool_decl` / `mcp_result_text`).
+-- The run path reaches llm_proto's wire format through tool_loop; this
+-- module only reaches for llm_proto directly to re-export an adapter below.
 local proto = require("llm_proto")
+
+-- MCP's tool vocabulary — the `<server>__<tool>` namespace and the content
+-- block extraction — shared with knl_adapter's ToolPort.
+local mcp_tools = require("mcp_tools")
 
 -- Re-exported through `M._test_helpers` only.
 local proto_openai = proto.adapter("openai")
@@ -629,9 +632,9 @@ local function connect_mcp_servers(servers, opts)
         local tools = list_result.tools or {}
         for _, t in ipairs(tools) do
             -- The `<server>__<tool>` namespace and the camelCase inputSchema
-            -- conversion are llm_proto's, shared with knl_adapter's ToolPort:
+            -- conversion are mcp_tools', shared with knl_adapter's ToolPort:
             -- one tool must not get two names depending on which loop bound it.
-            local decl = proto.mcp_tool_decl(name, t)
+            local decl = mcp_tools.tool_decl(name, t)
             mcp_tool_map[decl.name] = {
                 server = name,
                 tool = t.name,
@@ -929,8 +932,8 @@ local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
 
         -- Extract content from the MCP result. The rendering (single text
         -- block verbatim / none the empty string / anything else JSON) is
-        -- llm_proto's, shared with knl_adapter's ToolPort.
-        return proto.mcp_result_text(call_result.content), is_error
+        -- mcp_tools', shared with knl_adapter's ToolPort.
+        return mcp_tools.result_text(call_result.content), is_error
     end
 
     -- 2. extra_tools direct fallback (registry-independent; honours crux dispatch_tool wiring gap constraint)

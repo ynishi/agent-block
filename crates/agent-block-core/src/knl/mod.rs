@@ -79,40 +79,54 @@
 //!   The kernel never generates one and never requires one; it only
 //!   insists that a present `beat` is a string.
 //!
+//! - **One backend, and the log is a table.**  A session's events live in
+//!   SQLite whether the session is durable (a file) or ephemeral (an
+//!   in-memory database) — [`SqliteEventStore`], the only [`EventStore`] the
+//!   product has.  That is not an implementation detail: the read side below
+//!   is SQL, and a log that could not be queried would be a second, lesser
+//!   kind of session.  The `Vec`-backed store is `#[cfg(test)]`.
+//!
 //! Projections ([`projection`]) are *derived*: folding never changes the
 //! history and a fold result is a cache, not a capture — it can always be
 //! recomputed from the events.  The kernel names only the folds whose
-//! consumer is fixed in its own terms (`usage`, `tail`); one whose shape
-//! is a caller's decision is built on the shell side from
-//! [`Session::events`].
+//! consumer is fixed in its own terms (`usage`, `tail`); one whose shape is
+//! a caller's decision is either built on the shell side from
+//! [`Session::events`], or read straight off the log with SQL
+//! ([`Session::query`], [`query`]) — one statement, and it reads, on a
+//! connection that cannot write.  The columns it may name are published
+//! ([`events_schema`]), which is what makes that a contract rather than a
+//! leak: the table is the read interface, and changing it is a change to the
+//! interface.
 
 pub mod budget;
 pub mod event;
 pub mod event_store;
 pub mod history;
 pub mod projection;
+pub mod query;
 pub mod scope;
 pub mod session;
-#[cfg(feature = "sqlite")]
 pub mod sqlite_store;
 
 pub use budget::{fold_balance, BudgetGrant};
 pub use event::{
     is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
 };
+#[cfg(test)]
+pub use event_store::MemEventStore;
 pub use event_store::{
     apply_upcasters, kernel_upcasters, Committed, Current, CurrentDecision, CurrentStore, Decision,
-    EventStore, MemEventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    EventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};
+pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
 pub use scope::{Scope, ScopeId};
 pub use session::{
     Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
     DEFAULT_CLOSE_REASON, SYSTEM,
 };
-#[cfg(feature = "sqlite")]
-pub use sqlite_store::SqliteEventStore;
+pub use sqlite_store::{events_schema, SchemaColumn, SqliteEventStore, EVENTS_TABLE};
 
 /// What went wrong in the kernel core, classified.
 ///
@@ -160,11 +174,16 @@ pub enum KnlError {
     /// amount, an unknown view or a malformed option.  Nothing was written.
     #[error("validation: {0}")]
     Validation(String),
-    /// The request is well-formed but this build or this backend cannot
-    /// serve it — resuming an in-memory store, or a durable store in a build
-    /// without the `sqlite` feature.
+    /// The request is well-formed but this backend cannot serve it — a query
+    /// put to a store that keeps no queryable table.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A read ran past the time it was given and was cut short.  Distinct
+    /// from [`KnlError::Busy`] on purpose: nothing was contended, the work
+    /// itself was too slow, so making the same call again buys nothing —
+    /// what changes the answer is a narrower query or a longer deadline.
+    #[error("timeout: {0}")]
+    Timeout(String),
 }
 
 impl KnlError {
@@ -180,6 +199,8 @@ impl KnlError {
     pub const VALIDATION: &'static str = "validation";
     /// The stable name of the [`KnlError::Unsupported`] class.
     pub const UNSUPPORTED: &'static str = "unsupported";
+    /// The stable name of the [`KnlError::Timeout`] class.
+    pub const TIMEOUT: &'static str = "timeout";
 
     /// Every class a kernel failure can have, in one closed list.
     ///
@@ -194,6 +215,7 @@ impl KnlError {
         Self::CLOSED,
         Self::VALIDATION,
         Self::UNSUPPORTED,
+        Self::TIMEOUT,
     ];
 
     /// This failure's class, as one of [`KnlError::KINDS`].
@@ -205,6 +227,7 @@ impl KnlError {
             Self::Closed(_) => Self::CLOSED,
             Self::Validation(_) => Self::VALIDATION,
             Self::Unsupported(_) => Self::UNSUPPORTED,
+            Self::Timeout(_) => Self::TIMEOUT,
         }
     }
 
@@ -238,7 +261,8 @@ impl KnlError {
             | Self::Corruption(reason)
             | Self::Closed(reason)
             | Self::Validation(reason)
-            | Self::Unsupported(reason) => reason,
+            | Self::Unsupported(reason)
+            | Self::Timeout(reason) => reason,
         }
     }
 }
@@ -259,7 +283,8 @@ mod tests {
             KnlError::Corruption("not json".to_string()),
             KnlError::Closed("session is closed".to_string()),
             KnlError::Validation("kind is required".to_string()),
-            KnlError::Unsupported("no sqlite feature".to_string()),
+            KnlError::Unsupported("this store keeps no queryable table".to_string()),
+            KnlError::Timeout("query interrupted".to_string()),
         ]
     }
 
@@ -276,7 +301,8 @@ mod tests {
                 "corruption",
                 "closed",
                 "validation",
-                "unsupported"
+                "unsupported",
+                "timeout"
             ]
         );
         assert_eq!(

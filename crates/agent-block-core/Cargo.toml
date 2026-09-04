@@ -14,9 +14,17 @@ default = ["mesh", "sqlite", "mcp-http"]
 # `mesh` — agent-to-agent mesh (`mesh.*` Lua bridge, relay connect, Ed25519
 # identity). Pulls in agent-mesh-core / agent-mesh-sdk.
 mesh = ["dep:agent-mesh-core", "dep:agent-mesh-sdk"]
-# `sqlite` — SQLite-backed `sql.*` / `kv.*` / `ts.*` Lua bridges. Pulls in
-# rusqlite (bundled) and the mlua-batteries sql/kv batteries.
-sqlite = ["dep:rusqlite", "mlua-batteries/sql", "mlua-batteries/kv"]
+# `sqlite` — SQLite-backed `sql.*` / `kv.*` / `ts.*` Lua bridges. Pulls in the
+# mlua-batteries sql/kv batteries.
+#
+# It no longer gates rusqlite itself: the kernel (`knl`) keeps every session's
+# event log in a SQLite table — a file for a durable session, an in-memory
+# database for an ephemeral one — because the log is read with SQL
+# (`session:query`), and a build where that was optional would be a build with
+# a second, lesser kind of session. So rusqlite is an ordinary dependency
+# below, and this feature is what it always was for the *batteries*: the
+# `sql.*` / `kv.*` / `ts.*` Lua surface.
+sqlite = ["mlua-batteries/sql", "mlua-batteries/kv"]
 # `mcp-http` — Streamable HTTP / SSE MCP transport (`mcp.connect_http`).
 # Forwards to agent-block-mcp's `mcp-http` feature (stdio transport is always on).
 mcp-http = ["agent-block-mcp/mcp-http"]
@@ -37,7 +45,9 @@ agent-mesh-sdk = { workspace = true, optional = true }
 llm-extract.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-rusqlite = { workspace = true, optional = true }
+# Not optional: the kernel's event store is a SQLite table in every build
+# (see the `sqlite` feature note above).
+rusqlite = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true

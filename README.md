@@ -17,6 +17,20 @@ Think of it like Envoy for agents: the process itself is simple, but the communi
 - **Runtime owns the protocol** — Mesh, MCP, and HTTP are provided by the runtime. Lua code never deals with connection management or wire formats
 - **Lua for logic, Rust for plumbing** — Domain logic in Lua. VM, networking, and protocol handling in Rust
 
+### Design documentation lives in the code
+
+Settled design is written into the code's own documentation and nowhere else:
+Rust crate and module docs (`//!`) plus item docs, and the `---` module headers of
+the embedded Lua libraries. There is no separate design document tree — a document
+beside the code drifts and goes unread, a module doc is compiled, linted and read
+with the code it describes.
+
+The entry points for the kernel are the module docs of
+`crates/agent-block-core/src/knl/mod.rs` (the kernel's invariants),
+`crates/agent-block-core/src/bridge/knl.rs` (the syscall surface Lua sees) and
+`crates/agent-block-core/blocks/lib/knl/init.lua` (the Lua kernel: session, device,
+beat, Outcome, shapes). `cargo doc --open` renders the Rust side.
+
 ## Architecture
 
 The repository is a Cargo workspace with 4 crates (strict one-way

@@ -1,4 +1,4 @@
--- knl_turn_test.lua — the POC spec for the Lua kernel (knl.beat / session /
+-- knl_beat_test.lua — the POC spec for the Lua kernel (knl.beat / session /
 -- device / fold / Outcome). Runs in the full host, because the kernel drives
 -- the real Rust `knl` syscall bridge (session / append / events / reserve /
 -- spend / close / new_beat_id), which the pure lspec runner does not have.
@@ -19,12 +19,17 @@
 --   inv6 loop composition (a self-written while-beat loop settles on a
 --        plain answer and is bounded by the caller's own cap)
 --   inv7 fold's three-kind mapping + tool_result attribution
---   inv8 status comes from the backend (ok / refused / error round-trips)
+--   inv8 status comes from the llm (ok / refused round-trip, and a call that
+--        did not come off is Error("call") — there is no third status)
 --   inv9 the device is frozen, with-derivation swaps policy for one beat,
 --        and every event of one beat carries the id that beat declared
 --  inv10 the bridge's declared surface and the Lua registry agree in both
 --        directions (§9-m) — methods, module functions and the error
 --        vocabulary — and a real raise reads back classified (§9-r)
+--  inv11 the SQL read (view-design.md): the published read schema matches the
+--        shell's declaration, the three predefined views answer what the beat
+--        wrote, a write is refused as "validation", and one statement reads
+--        across a named set of sessions
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately (design §0.5).
@@ -35,8 +40,8 @@ local Outcome = kernel.Outcome
 -- helpers
 -- ---------------------------------------------------------------------------
 
--- A backend stub that hands back queued responses. A queued function is
--- called with the request instead (a case makes the backend fail that way).
+-- An llm stub that hands back queued answers. A queued function is called
+-- with the request instead (a case makes the call fail that way).
 local function stub(...)
     local queue = { ... }
     return function(req)
@@ -49,14 +54,16 @@ local function stub(...)
     end
 end
 
--- A backend response: `{ status, content, usage, stop_reason }`, the shape the
--- POC stub returns and the kernel reads the status off.
-local function response(status, blocks, usage, stop_reason)
+-- An `llm_result`: `{ status, content, usage, stop_reason, refusal? }` — the
+-- shape the POC stub returns and the kernel reads the status off. A refusal
+-- carries the class that refused, because that is what beat reports.
+local function response(status, blocks, usage, stop_reason, refusal)
     return {
         status = status,
         content = blocks or { { type = "text", text = "ok" } },
         usage = usage or { input_tokens = 5, output_tokens = 2 },
         stop_reason = stop_reason,
+        refusal = refusal or (status == "refused" and { kind = "model" } or nil),
     }
 end
 
@@ -108,7 +115,7 @@ local function distinct_beats(s)
 end
 
 -- Whether an Ok outcome's response asks for at least one tool (loop helper —
--- run is gone from the module, so the fixture composes its own).
+-- there is no loop in the module, so the fixture composes its own).
 local function has_tool_use(out)
     for _, block in ipairs(out.content or {}) do
         if block.type == "tool_use" then
@@ -130,13 +137,13 @@ do
     local ok = Outcome.ok({ beat = "b-1" })
     local refused = Outcome.refused("no", { beat = "b-1" })
     local err = Outcome.err("call", "boom")
-    local stopped = Outcome.stopped("budget", "tokens")
+    local stopped = Outcome.stopped("budget", "beats")
 
     -- plain-data status tags, no metatable (survives the JSON boundary)
     assert(ok.status == "ok" and getmetatable(ok) == nil)
     assert(refused.status == "refused" and refused.reason == "no")
     assert(err.status == "error" and err.kind == "call" and err.detail == "boom")
-    assert(stopped.status == "stopped" and stopped.reason == "budget" and stopped.tag == "tokens")
+    assert(stopped.status == "stopped" and stopped.reason == "budget" and stopped.tag == "beats")
 
     assert(Outcome.is_ok(ok) and not Outcome.is_ok(refused) and not Outcome.is_ok(err))
     assert(Outcome.is_refused(refused) and not Outcome.is_refused(ok))
@@ -194,7 +201,7 @@ do
 
     -- user "hi" / assistant / user [tool_result] / assistant "done":
     -- session_opened, tool_call, note are skipped; the tool_result lands in
-    -- the user turn right after the assistant it answers.
+    -- the user message right after the assistant it answers.
     assert(#req.messages == 4, "fold produced " .. #req.messages .. " messages")
     assert(req.messages[1].role == "user" and req.messages[1].content == "hi")
     assert(req.messages[2].role == "assistant")
@@ -240,7 +247,7 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
+    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d = kernel.device({ llm = stub(response("ok", { { type = "text", text = "hello" } })) })
     s:append({ kind = "msg_user", content = "hi" })
     local o = kernel.beat(s, d)
@@ -269,8 +276,8 @@ do
     assert(first_of(s, "msg_user").beat == nil, "the caller's seed is not part of a beat")
     assert(s:view("usage").model_calls == 1, "usage did not count the response")
     -- The balance moved once, where the beat reserved it (one unit by
-    -- default) — the appends themselves charge nothing, and the 7 tokens the
-    -- usage view counted are a separate reading.
+    -- default) — the appends themselves do not move the budget, and the 7
+    -- tokens the usage view counted are a separate reading.
     assert(s:remaining() == 99, "reserved balance: " .. tostring(s:remaining()))
 
     mark("inv2_writeahead")
@@ -284,7 +291,7 @@ end
 
 do
     local ran = {}
-    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
+    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d = kernel.device({
         llm = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
         tools = {
@@ -314,7 +321,7 @@ do
     assert(first_of(s, "tool_call").beat == o.out.beat and tr.beat == o.out.beat)
 
     -- unknown tool: the pair is still closed, ok=false, machine-minimal error
-    local s2 = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
+    local s2 = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d2 = kernel.device({
         llm = stub(response("ok", { tool_use("c9", "ghost", {}) })),
         tools = {},
@@ -326,7 +333,7 @@ do
     assert(tostring(tr2.result):find("not found", 1, true) ~= nil, tostring(tr2.result))
 
     -- a handler that raises also closes the pair ok=false
-    local s3 = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
+    local s3 = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d3 = kernel.device({
         llm = stub(response("ok", { tool_use("c3", "boom", {}) })),
         tools = { boom = {
@@ -344,46 +351,59 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv8 — status comes from the backend (kernel loads it, does not invent it)
+-- inv8 — status comes from the llm (the kernel loads it, does not invent it),
+-- and there are only two: a call that did not come off is Error("call")
 -- ---------------------------------------------------------------------------
 
 do
     -- ok
-    local so = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
+    local so = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     assert(Outcome.is_ok(kernel.beat(so, kernel.device({ llm = stub(response("ok")) }))))
 
-    -- refused: the model answered (recorded) but refused to proceed
-    local sr = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
-    local dr = kernel.device({ llm = stub(response("refused", { { type = "text", text = "no" } })) })
+    -- refused: the model answered (recorded) but refused to proceed, and the
+    -- reason beat reports is the class the adapter classified it as
+    local sr = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    local dr = kernel.device({
+        llm = stub(response("refused", { { type = "text", text = "no" } }, nil, "refusal", { kind = "model" })),
+    })
     local before = sr:remaining()
     local orf = kernel.beat(sr, dr)
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
+    assert(orf.reason == "model", "the refusal names its class: " .. tostring(orf.reason))
     assert(first_of(sr, "llm_response") ~= nil, "a refusal is still a recorded response")
     -- A refusing beat reserved like any other: the allowance went before the
     -- call, and the recorded response added nothing on top of it.
     assert(sr:remaining() == before - 1, "refused beat balance: " .. tostring(sr:remaining()))
 
-    -- error: the beat did not come off — no llm_response, a llm_call_failed
-    local se = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
-    local de = kernel.device({ llm = stub({ status = "error", detail = "boom", content = {}, usage = {} }) })
-    local oe = kernel.beat(se, de)
-    assert(Outcome.is_error(oe) and oe.kind == "call", "error status must map to Error(call)")
-    assert(first_of(se, "llm_response") == nil, "an errored call must record no response")
-    local failed = first_of(se, "llm_call_failed")
-    assert(failed ~= nil, "an errored call is noted as a failed call")
-    assert(type(failed.beat) == "string", "the note belongs to the beat that made the call")
-
-    -- a transport failure (nil, err) is also Error(call)
-    local st = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" } })
-    local dt = kernel.device({
+    -- a failed call: the beat did not come off — no llm_response, a
+    -- llm_call_failed. There is no "error" status to return; the contract is
+    -- a result, or nil and an error.
+    local se = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    local de = kernel.device({
         llm = function()
-            return nil, "network down"
+            return nil, "the provider said no"
         end,
     })
-    local ot = kernel.beat(st, dt)
-    assert(Outcome.is_error(ot) and ot.kind == "call")
+    local oe = kernel.beat(se, de)
+    assert(Outcome.is_error(oe) and oe.kind == "call", "a failed call must map to Error(call)")
+    assert(first_of(se, "llm_response") == nil, "a failed call must record no response")
+    local failed = first_of(se, "llm_call_failed")
+    assert(failed ~= nil, "a failed call is noted as a failed call")
+    assert(type(failed.beat) == "string", "the note belongs to the beat that made the call")
 
-    mark("inv8_status_from_backend")
+    -- and an answer that is not an llm_result at all is the same ending: a
+    -- third status is a broken adapter, not a branch the kernel reads.
+    local sx = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    local dx = kernel.device({
+        llm = function()
+            return { status = "error", content = {}, usage = {} }
+        end,
+    })
+    local ox = kernel.beat(sx, dx)
+    assert(Outcome.is_error(ox) and ox.kind == "call", "an unknown status must map to Error(call)")
+    assert(first_of(sx, "llm_call_failed") ~= nil, "the broken contract is noted as a failed call")
+
+    mark("inv8_status_from_llm")
 end
 
 -- ---------------------------------------------------------------------------
@@ -393,19 +413,19 @@ end
 
 do
     -- beat-level: nothing left to reserve, so the beat stops before calling
-    local s = kernel.open({ owner = "test", budget = { amount = 10, tag = "tokens" } })
+    local s = kernel.open({ owner = "test", budget = { amount = 10, tag = "beats" } })
     local d = kernel.device({ llm = stub(response("ok")) })
     s:spend(10)
     assert(s:exhausted())
     local o = kernel.beat(s, d)
     assert(Outcome.is_stopped(o), "a refused beat must be Stopped")
     assert(o.reason == "budget", "the stop names its cause: " .. tostring(o.reason))
-    assert(o.tag == "tokens", "the refusal names its grant: " .. tostring(o.tag))
+    assert(o.tag == "beats", "the refusal names its grant: " .. tostring(o.tag))
     assert(first_of(s, "llm_request") == nil, "no call is made once the budget is gone")
 
     -- the reservation policy is the caller's: one that asks for the whole
     -- grant leaves nothing for a second beat.
-    local sp = kernel.open({ owner = "test", budget = { amount = 10, tag = "tokens" } })
+    local sp = kernel.open({ owner = "test", budget = { amount = 10, tag = "beats" } })
     local dp = kernel.device({
         cost = function()
             return 10
@@ -419,7 +439,7 @@ do
     -- loop-level: one unit granted, one unit per beat, and the first answer
     -- asks for a tool — so the second beat is refused and the caller's own
     -- loop halts on it.
-    local sl = kernel.open({ owner = "test", budget = { amount = 1, tag = "tokens" } })
+    local sl = kernel.open({ owner = "test", budget = { amount = 1, tag = "beats" } })
     local dl = kernel.device({
         llm = stub(
             response("ok", { tool_use("c1", "noop", {}) }, { input_tokens = 100 }),
@@ -453,14 +473,15 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-    -- The cap is the loop's own local: knl has no max_turns config, because
-    -- the loop is written here and the stopping guarantee is the budget's.
+    -- The cap is the loop's own local: knl has no beat cap of its own,
+    -- because the loop is written here and the stopping guarantee is the
+    -- budget's.
     local MAX_BEATS = 5
 
     -- settles: no tool_use, so the loop stops after one beat. The bracket is
     -- the canonical lifecycle: knl.session closes on the way out, and the
     -- boundary lands in the log as session_closed.
-    local settled = kernel.session({ owner = "test", budget = { amount = 1000, tag = "tokens" } }, function(s)
+    local settled = kernel.session({ owner = "test", budget = { amount = 1000, tag = "beats" } }, function(s)
         local d = kernel.device({ llm = stub(response("ok", { { type = "text", text = "done" } })) })
         s:append({ kind = "msg_user", content = "hi" })
         local calls = 0
@@ -488,7 +509,7 @@ do
     -- bounded: the model never stops asking for a tool, so the caller's own
     -- cap — a local of the loop that uses it — stops it
     local CAP = 3
-    local sb = kernel.open({ owner = "test", budget = { amount = 1000, tag = "tokens" } })
+    local sb = kernel.open({ owner = "test", budget = { amount = 1000, tag = "beats" } })
     local db = kernel.device({
         llm = stub(
             response("ok", { tool_use("a", "noop", {}) }),
@@ -533,7 +554,7 @@ do
         return response("ok", { { type = "text", text = "strong" } })
     end
 
-    local s = kernel.open({ owner = "test", budget = { amount = 1000, tag = "tokens" } })
+    local s = kernel.open({ owner = "test", budget = { amount = 1000, tag = "beats" } })
     local d = kernel.device({ llm = weak })
     s:append({ kind = "msg_user", content = "q" })
 
@@ -636,6 +657,140 @@ do
     )
 
     mark("inv10_api_registry")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv11 — the SQL read (view-design.md): the published schema, the three
+-- predefined views over a real store, the refusal of anything that is not a
+-- read, and one statement spanning a set of sessions
+-- ---------------------------------------------------------------------------
+
+do
+    -- (a) one schema, declared on both sides. The kernel publishes the
+    -- columns a caller writes SQL against (`knl.api().schema`) and the shell
+    -- declares the same table as data (`knl.shapes.schema`); a column added
+    -- to one and not the other goes red here, in both directions — the same
+    -- arrangement inv10 has for the syscall registries.
+    local published_schema = knl.api().schema
+    assert(type(published_schema) == "table", "the kernel publishes no read schema")
+    assert(
+        published_schema.table == kernel.shapes.schema.table,
+        "table name: " .. tostring(published_schema.table) .. " / " .. tostring(kernel.shapes.schema.table)
+    )
+
+    -- name -> pk, so the comparison is about the columns and their keys and
+    -- not about the order they happen to be listed in.
+    local function pk_by_name(columns)
+        local out = {}
+        for _, column in ipairs(columns) do
+            out[column.name] = (column.pk == true)
+        end
+        return out
+    end
+    local published_cols = pk_by_name(published_schema.columns)
+    local declared_cols = pk_by_name(kernel.shapes.schema.columns)
+    for name, pk in pairs(published_cols) do
+        assert(declared_cols[name] ~= nil, "the kernel publishes a column the shell does not declare: " .. name)
+        assert(declared_cols[name] == pk, "pk flag differs for column " .. name)
+    end
+    for name in pairs(declared_cols) do
+        assert(published_cols[name] ~= nil, "the shell declares a column the kernel does not publish: " .. name)
+    end
+
+    -- (b) the three views over a session that ran one beat with a tool call
+    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    local d = kernel.device({
+        llm = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
+        tools = {
+            echo = {
+                description = "e",
+                handler = function(args)
+                    return "echoed:" .. tostring(args.v)
+                end,
+            },
+        },
+    })
+    s:append({ kind = "msg_user", content = "hi" })
+    local beat_out = kernel.beat(s, d)
+    assert(Outcome.is_ok(beat_out))
+
+    -- beats: one row for the one beat, holding both halves of the call it
+    -- made. The seed message carries no beat and is not part of any.
+    local beat_rows = kernel.views.beats(s)
+    assert(#beat_rows == 1, "one beat, " .. #beat_rows .. " rows")
+    assert(beat_rows[1].beat == beat_out.out.beat, "the row names the beat: " .. tostring(beat_rows[1].beat))
+    local kinds = tostring(beat_rows[1].kinds)
+    assert(kinds:find("llm_request", 1, true) ~= nil, "kinds: " .. kinds)
+    assert(kinds:find("llm_response", 1, true) ~= nil, "kinds: " .. kinds)
+    assert(beat_rows[1].seq_from <= beat_rows[1].seq_to, "seq range: " .. kinds)
+
+    -- tool_pairs: the call and the result that answered it, joined on the
+    -- call id, with `ok` read back as a boolean (SQLite has no such type)
+    local pair_rows = kernel.views.tool_pairs(s)
+    assert(#pair_rows == 1, "one answered call, " .. #pair_rows .. " rows")
+    assert(pair_rows[1].call_id == "c1", "call_id: " .. tostring(pair_rows[1].call_id))
+    assert(pair_rows[1].name == "echo", "name: " .. tostring(pair_rows[1].name))
+    assert(pair_rows[1].ok == true, "ok: " .. tostring(pair_rows[1].ok))
+    assert(pair_rows[1].beat == beat_out.out.beat, "the pair belongs to its beat")
+
+    -- ledger: the grant that opened the account, then the reservation the
+    -- beat made before it called — in seq order, with the grant's own tag
+    local ledger_rows = kernel.views.ledger(s)
+    assert(#ledger_rows == 2, "grant + reservation, got " .. #ledger_rows)
+    assert(ledger_rows[1].kind == "budget_granted", "first: " .. tostring(ledger_rows[1].kind))
+    assert(ledger_rows[2].kind == "budget_reserved", "second: " .. tostring(ledger_rows[2].kind))
+    assert(ledger_rows[1].amount == 100, "granted: " .. tostring(ledger_rows[1].amount))
+    assert(ledger_rows[2].amount == 1, "reserved: " .. tostring(ledger_rows[2].amount))
+    assert(ledger_rows[1].tag == "beats", "tag: " .. tostring(ledger_rows[1].tag))
+
+    -- (c) a query reads. A write does not reach the store through it, and
+    -- the refusal is the caller's class: the argument did not hold up.
+    local wrote, raised = pcall(s.query, s, "INSERT INTO events (stream, seq) VALUES ('x', 1)")
+    assert(not wrote, "a write must not go through query")
+    local refusal = knl.error(raised)
+    assert(refusal.kind == "validation", "kind: " .. tostring(refusal.kind))
+
+    -- (d) one statement, a set of sessions. Two sessions on one file store,
+    -- and the same view reads across both when the caller names them —
+    -- which is what `opts.sessions` is for (a session tree, or sessions
+    -- that were split and are being read back together).
+    local path = os.tmpname()
+    local store = { sqlite = path }
+    local sa = kernel.open({ owner = "test", budget = { amount = 10, tag = "beats" }, store = store })
+    local sb = kernel.open({ owner = "test", budget = { amount = 10, tag = "beats" }, store = store })
+    assert(sa:id() ~= sb:id(), "two opens on one store are two streams")
+    assert(Outcome.is_ok(kernel.beat(sa, kernel.device({ llm = stub(response("ok")) }))))
+    assert(Outcome.is_ok(kernel.beat(sb, kernel.device({ llm = stub(response("ok")) }))))
+
+    local own = kernel.views.beats(sa)
+    assert(#own == 1, "the default set is the session's own stream: " .. #own)
+    local both = kernel.views.beats(sa, { sessions = { sa:id(), sb:id() } })
+    assert(#both == 2, "a named set reads both streams: " .. #both)
+    local seen = {}
+    for _, row in ipairs(both) do
+        seen[row.beat] = true
+    end
+    assert(seen[own[1].beat], "the set includes the session's own beat")
+
+    sa:close("done")
+    sb:close("done")
+    os.remove(path)
+
+    -- (e) the read's own failure class is in the one vocabulary both sides
+    -- publish (inv10 holds the whole list in both directions; this is the
+    -- class this round added).
+    local api_kinds = {}
+    for _, kind in ipairs(knl.api().errors) do
+        api_kinds[kind] = true
+    end
+    local shell_kinds = {}
+    for _, kind in ipairs(kernel.shapes.error_kinds) do
+        shell_kinds[kind] = true
+    end
+    assert(api_kinds.timeout, "the kernel must publish the timeout class")
+    assert(shell_kinds.timeout, "the shell must declare the timeout class")
+
+    mark("inv11_sql_views")
 end
 
 print("[KNL] all_ok")

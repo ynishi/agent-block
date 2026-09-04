@@ -1,5 +1,5 @@
 -- device_spec.lua — mlua-lspec unit tests for the session / device split
--- (session-device-design.md: state and policy are two arguments, not one ctx).
+-- (session-device-design.md: state and policy are two arguments, not one bundle).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/device_spec.lua",
@@ -40,9 +40,9 @@
 --     message, plus a traceback in dev mode only.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so a
--- faithful Lua fake stands in below (mirroring bridge/knl.rs facts: append
--- records and charges nothing and does NOT number beats; `reserve` is the one
--- decision point — it deducts or refuses with the grant's tag; new_beat_id
+-- faithful Lua fake stands in below (mirroring bridge/knl.rs facts: an append
+-- records, the budget does not move, and beats are NOT numbered; `reserve` is
+-- the one decision point — it deducts or refuses with the grant's tag; new_beat_id
 -- mints a fresh id per call; close takes a reason and is idempotent; and
 -- `knl.error` reads an attributed raise — `knl: <method>: <kind>: <message>`
 -- — back into a table, since a Rust callback cannot raise one).
@@ -55,21 +55,42 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local minted = 0
+local opened = 0
 
 local function fake_session(opts)
     opts = opts or {}
     local grant = opts.budget or {}
+    opened = opened + 1
+    local id = string.format("sess-%06d", opened)
     local s = {
         _events = {},
+        -- One entry per `query` call: { sql, params, opts }.
+        _queries = {},
+        -- What every `query` answers, until a case puts rows here.
+        _query_rows = {},
         _seq = 0,
         _remaining = grant.amount,
         _tag = grant.tag,
-        owner = opts.owner or "anon",
+        _owner = opts.owner or "anon",
         closed = false,
         close_reason = nil,
     }
-    -- An append records and charges nothing. The kernel stamps seq and
-    -- leaves every other field exactly as written — `beat` included, which
+    -- Identity, as the bridge answers it: three methods, not three fields.
+    -- The fake carries the WHOLE session surface because `knl.beat` asks for
+    -- the whole surface before it will treat a value as a session — a fake
+    -- that answered only what a beat calls would be a stand-in for something
+    -- the kernel does not hand out.
+    function s:id()
+        return id
+    end
+    function s:scope_id()
+        return "scope-" .. id
+    end
+    function s:owner()
+        return self._owner
+    end
+    -- An append records and the budget does not move. The kernel stamps seq
+    -- and leaves every other field exactly as written — `beat` included, which
     -- is the caller's to declare and never the kernel's to assign.
     function s:append(ev)
         assert(not self.closed, "knl: append: session is closed")
@@ -81,6 +102,20 @@ local function fake_session(opts)
     end
     function s:events()
         return self._events
+    end
+    -- The SQL read (view-design.md §2). No SQLite stands behind this: the
+    -- fake records the call and answers whatever the case queued, which is
+    -- what makes a view's CONTRACT testable here — that it runs one
+    -- statement, that the statement names `$sessions`, that the caller's
+    -- opts reach the read unaltered, and how the rows are read back. What
+    -- the SQL actually selects is a question only a database can answer, and
+    -- it is asked where there is one (tests/fixtures/knl_beat_test.lua,
+    -- inv11).
+    function s:query(sql, params, opts)
+        assert(not self.closed, "knl: query: session is closed")
+        assert(type(sql) == "string", "knl: query: sql must be a string")
+        self._queries[#self._queries + 1] = { sql = sql, params = params, opts = opts }
+        return self._query_rows, false
     end
     -- The quota, asked before the spending: it deducts and answers true, or
     -- refuses with the grant's tag and leaves the balance where it was.
@@ -123,7 +158,7 @@ end
 -- on purpose: this table stands in for the bridge, and a stand-in that
 -- borrowed the module's own list could not catch the module reading it
 -- wrong. The two are held against each other where a real bridge exists
--- (tests/fixtures/knl_turn_test.lua, inv10).
+-- (tests/fixtures/knl_beat_test.lua, inv10).
 local FAKE_ERROR_KINDS = {
     busy = true,
     storage = true,
@@ -396,7 +431,7 @@ end)
 describe("knl.open / knl.resume — state only", function()
     it("returns the kernel session itself (no Lua wrapper)", function()
         local s = K.open({ owner = "spec" })
-        expect(s.owner).to.be("spec")
+        expect(s:owner()).to.be("spec")
         s:append({ kind = "msg_user", content = "hello" })
         local evs = s:events()
         expect(#evs).to.be(1)
@@ -497,7 +532,7 @@ describe("knl.beat — the primitive", function()
 
     it("stops (the fourth status) when the reservation is refused", function()
         -- One unit granted, one unit per beat: the second beat is refused.
-        local s = K.open({ budget = { amount = 1, tag = "tokens" } })
+        local s = K.open({ budget = { amount = 1, tag = "beats" } })
         local d = K.device({ llm = stub_llm("x") })
         s:append({ kind = "msg_user", content = "q" })
         expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
@@ -508,14 +543,14 @@ describe("knl.beat — the primitive", function()
         expect(Outcome.is_stopped(second)).to.be(true)
         expect(Outcome.is_ok(second)).to.be(false)
         expect(second.reason).to.be("budget")
-        expect(second.tag).to.be("tokens") -- which allowance stopped it
+        expect(second.tag).to.be("beats") -- which allowance stopped it
         -- A refused beat records nothing and calls nobody.
         expect(#s:events()).to.be(before)
     end)
 
     it("asks device.cost how much one beat costs", function()
         local asked = {}
-        local s = K.open({ budget = { amount = 10, tag = "tokens" } })
+        local s = K.open({ budget = { amount = 10, tag = "beats" } })
         local d = K.device({
             llm = stub_llm("x"),
             cost = function(request)
@@ -530,7 +565,7 @@ describe("knl.beat — the primitive", function()
     end)
 
     it("a cost policy that answers 0 is a conf error (no ranking function)", function()
-        local s = K.open({ budget = { amount = 10, tag = "tokens" } })
+        local s = K.open({ budget = { amount = 10, tag = "beats" } })
         local d = K.device({
             llm = stub_llm("x"),
             cost = function()
@@ -586,7 +621,7 @@ describe("knl.session — the canonical bracket", function()
         end)
         expect(first).to.be("one")
         expect(second).to.be(2)
-        expect(seen.owner).to.be("spec")
+        expect(seen:owner()).to.be("spec")
         expect(seen.closed).to.be(true)
         expect(seen.close_reason).to.be("scope_exit")
     end)
@@ -757,6 +792,8 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             "tool_policy_decision",
             "cost_result",
             "llm_result",
+            "llm_usage",
+            "tool_use_block",
             "open_opts",
             "resume_opts",
             "budget_grant",
@@ -1009,7 +1046,7 @@ describe("beat contract hardening (review findings)", function()
     it("an append that fails is Error('state'), not a raw raise", function()
         local s = K.open({})
         s.append = function()
-            error("head conflict: expected 1, actual 2")
+            error("knl: append: storage: the store is down")
         end
         local o = K.beat(s, K.device({ llm = stub_llm("x") }))
         expect(Outcome.is_error(o)).to.be(true)
@@ -1039,7 +1076,11 @@ describe("beat contract hardening (review findings)", function()
         expect(o.detail.cause:find("network down", 1, true) ~= nil).to.be(true) -- the suppressed one
     end)
 
-    it("a missing usage defaults to an empty count on the record", function()
+    it("an answer with no usage is Error('call') — the llm broke llm_result", function()
+        -- `llm_result` promises three counts, and the adapter's Mapper is
+        -- what normalizes a provider that reported none into zeros. So an
+        -- answer that arrives here without a usage is a broken adapter, and
+        -- beat says so instead of writing a count nobody reported.
         local s = K.open({})
         local d = K.device({
             llm = function()
@@ -1051,14 +1092,16 @@ describe("beat contract hardening (review findings)", function()
             end,
         })
         s:append({ kind = "msg_user", content = "q" })
-        expect(Outcome.is_ok(K.beat(s, d))).to.be(true)
-        local resp
+        local o = K.beat(s, d)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("call")
+        expect(tostring(o.detail):find("usage", 1, true) ~= nil).to.be(true)
+        -- nothing was recorded as a response; the failure is the note
+        local last = s:events()[#s:events()]
+        expect(last.kind).to.be("llm_call_failed")
         for _, ev in ipairs(s:events()) do
-            if ev.kind == "llm_response" then
-                resp = ev
-            end
+            expect(ev.kind == "llm_response").to.be(false)
         end
-        expect(type(resp.usage)).to.be("table")
     end)
 
     it("a filter returning nil is Error('filter') in prod", function()
@@ -1080,7 +1123,38 @@ describe("beat contract hardening (review findings)", function()
         expect(#s:events()).to.be(1)
     end)
 
-    it("a refusal is recorded and carries the beat id", function()
+    it("a refusal is recorded and reported as the adapter classified it", function()
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                return {
+                    status = "refused",
+                    content = { { type = "text", text = "no" } },
+                    usage = {},
+                    -- The provider's own word for the moment…
+                    stop_reason = "refusal",
+                    -- …and the adapter's classification of it, which is what
+                    -- beat reports. A filter block would be the same status
+                    -- with a different kind.
+                    refusal = { kind = "content_filter" },
+                }
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_refused(o)).to.be(true)
+        expect(o.reason).to.be("content_filter")
+        expect(type(o.detail.beat)).to.be("string")
+        local last = s:events()[#s:events()]
+        expect(last.kind).to.be("llm_response")
+        expect(last.beat).to.be(o.detail.beat)
+    end)
+
+    it("a refusal with no refusal.kind is Error('call') — the llm broke llm_result", function()
+        -- What refused is the adapter's judgement to make. A refusal that
+        -- named nothing leaves beat with no reason to report, and inventing
+        -- one ("refused", or the provider's stop_reason) would be beat
+        -- answering a question it was never told the answer to.
         local s = K.open({})
         local d = K.device({
             llm = function()
@@ -1094,12 +1168,11 @@ describe("beat contract hardening (review findings)", function()
         })
         s:append({ kind = "msg_user", content = "q" })
         local o = K.beat(s, d)
-        expect(Outcome.is_refused(o)).to.be(true)
-        expect(o.reason).to.be("refusal")
-        expect(type(o.detail.beat)).to.be("string")
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("call")
+        expect(tostring(o.detail):find("refusal", 1, true) ~= nil).to.be(true)
         local last = s:events()[#s:events()]
-        expect(last.kind).to.be("llm_response")
-        expect(last.beat).to.be(o.detail.beat)
+        expect(last.kind).to.be("llm_call_failed")
     end)
 
     it("a raising tool_policy denies the call (fail-closed)", function()
@@ -1291,5 +1364,101 @@ describe("fold hardening (review findings)", function()
         local req = K.fold(events, {})
         expect(#req.messages).to.be(3)
         expect(#req.messages[2].content).to.be(1) -- just the real result
+    end)
+end)
+
+describe("knl.views — the predefined reads (view-design.md §2)", function()
+    -- No SQLite here on purpose. What a statement SELECTS is a question for
+    -- a database and is asked where there is one (knl_beat_test.lua inv11);
+    -- what is asked here is the part that is this layer's own: that a view
+    -- is one query, that it reads the set the caller named, that it binds
+    -- rather than splices, and how it reads the rows back.
+    local VIEW_NAMES = { "beats", "tool_pairs", "ledger" }
+
+    local function last_query(s)
+        return s._queries[#s._queries]
+    end
+
+    it("runs exactly one query per call", function()
+        for _, name in ipairs(VIEW_NAMES) do
+            local s = K.open({})
+            K.views[name](s)
+            expect(#s._queries).to.be(1)
+        end
+    end)
+
+    it("reads: every statement is a SELECT", function()
+        for _, name in ipairs(VIEW_NAMES) do
+            local s = K.open({})
+            K.views[name](s)
+            expect(last_query(s).sql:match("^%s*SELECT") ~= nil).to.be(true)
+        end
+    end)
+
+    it("names the streams with $sessions, so a set is read by the same SQL", function()
+        -- The token is what the kernel expands into bound placeholders. A
+        -- view that filtered on `$stream` alone could not span a set at
+        -- all, and one that wrote ids into its text would not be binding.
+        for _, name in ipairs(VIEW_NAMES) do
+            local s = K.open({})
+            K.views[name](s)
+            expect(last_query(s).sql:find("$sessions", 1, true) ~= nil).to.be(true)
+        end
+    end)
+
+    it("binds nothing of its own (no view takes parameters)", function()
+        for _, name in ipairs(VIEW_NAMES) do
+            local s = K.open({})
+            K.views[name](s)
+            expect(last_query(s).params == nil).to.be(true)
+        end
+    end)
+
+    it("passes the caller's opts through to the query untouched", function()
+        local opts = { sessions = { "sess-a", "sess-b" }, timeout_ms = 250, limit = 10 }
+        for _, name in ipairs(VIEW_NAMES) do
+            local s = K.open({})
+            K.views[name](s, opts)
+            local passed = last_query(s).opts
+            expect(passed).to.be(opts)
+            expect(passed.sessions[1]).to.be("sess-a")
+            expect(passed.sessions[2]).to.be("sess-b")
+        end
+    end)
+
+    it("hands back the rows and the truncation flag the query answered", function()
+        local s = K.open({})
+        s._query_rows = { { beat = "b-1", seq_from = 3, seq_to = 6, kinds = "llm_request,llm_response" } }
+        local rows, truncated = K.views.beats(s)
+        expect(#rows).to.be(1)
+        expect(rows[1].beat).to.be("b-1")
+        expect(rows[1].kinds).to.be("llm_request,llm_response")
+        expect(truncated).to.be(false)
+    end)
+
+    it("reads tool_pairs' `ok` back as a boolean (SQLite has none)", function()
+        local s = K.open({})
+        s._query_rows = {
+            { beat = "b-1", call_id = "c1", name = "echo", ok = 1 },
+            { beat = "b-1", call_id = "c2", name = "ghost", ok = 0 },
+        }
+        local rows = K.views.tool_pairs(s)
+        expect(rows[1].ok).to.be(true)
+        expect(rows[2].ok).to.be(false)
+        -- and the row the query answered is not written to on the way
+        expect(s._query_rows[1].ok).to.be(1)
+    end)
+
+    it("declares every view it exports, and exports every view it declares", function()
+        -- The same completeness rule as the module registry, on the views:
+        -- one table stands behind `knl.shapes.views` and the `views` entry
+        -- of `knl.shapes.api`, so a view added to one is added to both.
+        for name in pairs(K.views) do
+            expect(K.shapes.views[name]).to.exist()
+        end
+        for name in pairs(K.shapes.views) do
+            expect(type(K.views[name])).to.be("function")
+        end
+        expect(K.shapes.api.views.members).to.be(K.shapes.views)
     end)
 end)

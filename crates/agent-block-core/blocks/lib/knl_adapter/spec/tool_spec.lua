@@ -8,7 +8,8 @@
 -- What this proves:
 --   1 ToolPort.new validates the 2-method contract (declare / invoke).
 --   2 ToolPort.lua wraps a flat spec (the std.fs.tool_specs shape) as a
---     pass-through Port; `schema` is accepted as the legacy alias.
+--     pass-through Port; the schema field is `input_schema` and a spec that
+--     spells it `schema` is a construction error.
 --   3 knl_adapter.tools binds a flat-spec array into knl's tools map;
 --     duplicate names are a loud error; entries carry no source literal.
 --   4 end-to-end over the kernel: a beat whose model answers with tool_use
@@ -24,10 +25,25 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local minted = 0
+local opened = 0
 
 local function fake_session(opts)
     opts = opts or {}
-    local s = { _events = {}, _seq = 0 }
+    opened = opened + 1
+    local id = string.format("sess-%06d", opened)
+    local s = { _events = {}, _seq = 0, _owner = opts.owner or "anon" }
+    -- Identity: the three readings the kernel answers. They are here because
+    -- `knl.beat` asks a value for the whole session surface before it treats
+    -- it as a session — a fake that answered less would not be one.
+    function s:id()
+        return id
+    end
+    function s:scope_id()
+        return "scope-" .. id
+    end
+    function s:owner()
+        return self._owner
+    end
     -- An append records: the kernel stamps seq and stores every other field
     -- as written, `beat` (the shell's declared id) included.
     function s:append(ev)
@@ -117,15 +133,18 @@ describe("ToolPort.lua — flat spec pass-through", function()
         expect(p:invoke({ x = 1 })).to.be("echo:1")
     end)
 
-    it("accepts `schema` as the legacy alias for input_schema", function()
-        local p = ToolPort.lua({
-            name = "old",
-            schema = { type = "object" },
-            handler = function()
-                return "r"
-            end,
-        })
-        expect(p:declare().input_schema.type).to.be("object")
+    it("rejects a spec that spells the schema field `schema`", function()
+        -- Not a second accepted spelling: reading one name and declaring
+        -- the other is how a tool reaches a provider with no schema at all.
+        expect(function()
+            ToolPort.lua({
+                name = "old",
+                schema = { type = "object" },
+                handler = function()
+                    return "r"
+                end,
+            })
+        end).to.fail()
     end)
 
     it("rejects a spec without name or handler", function()

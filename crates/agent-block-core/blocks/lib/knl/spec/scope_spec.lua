@@ -26,7 +26,7 @@
 --   * view("usage") counts every llm_response in the session;
 --   * new_beat_id mints a fresh, time-ordered id per call.
 -- The e2e coverage against the *real* bridge lives in
--- crates/agent-block/tests/fixtures/knl_turn_test.lua.
+-- crates/agent-block/tests/fixtures/knl_beat_test.lua.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -78,17 +78,24 @@ local function fake_session(opts)
 
     local s = {}
 
+    -- Identity: the three readings the kernel answers. The fake carries the
+    -- whole session surface because `knl.beat` asks for the whole surface
+    -- before it treats a value as a session.
     function s:id()
         return id
+    end
+
+    function s:scope_id()
+        return "scope-" .. id
     end
 
     function s:owner()
         return owner
     end
 
-    -- The one write path. Nothing is numbered and nothing is charged here
-    -- (mirrors the Rust Session::append): a `beat` the caller declared is
-    -- stored exactly as given, and the kernel only insists it be a string.
+    -- The one write path. Nothing is numbered here and the budget does not
+    -- move (mirrors the Rust Session::append): a `beat` the caller declared
+    -- is stored exactly as given, and the kernel only insists it be a string.
     function s:append(event)
         assert(not closed, "knl: append: session is closed")
         assert(type(event) == "table", "knl: append: event must be a table")
@@ -177,10 +184,11 @@ local function fake_session(opts)
     return s
 end
 
--- Global the module captures as `local syscall = knl` at load time.
+-- Global the module captures as `local syscall = knl` at load time. The
+-- bridge publishes `open` / `resume` / `new_beat_id` / `error` / `api` and
+-- no `session`: the bracket is the Lua module's, built on `open`.
 knl = {
     open = fake_session,
-    session = fake_session,
     new_beat_id = function()
         minted = minted + 1
         return string.format("beat-%06d", minted)
@@ -191,7 +199,7 @@ local kernel = require("knl")
 local Outcome = kernel.Outcome
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Backend / event helpers
+-- llm / event helpers
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local function stub(...)
@@ -238,7 +246,7 @@ describe("knl beat (session-scope model)", function()
     it("counts a beat's llm_response in usage and carries the declared id", function()
         local s = kernel.open({
             owner = "test",
-            budget = { amount = 100, tag = "tokens" },
+            budget = { amount = 100, tag = "beats" },
         })
         local d = kernel.device({
             llm = stub(response("ok", { { type = "text", text = "hello" } }, {
@@ -258,8 +266,9 @@ describe("knl beat (session-scope model)", function()
         expect(u.input_tokens).to.equal(10)
         expect(u.output_tokens).to.equal(3)
 
-        -- Reserved, not charged: the beat took one unit before the call and
-        -- the appends moved nothing. The usage above is the other reading.
+        -- Reserved, and only there: the beat took one unit before the call
+        -- and the appends did not move the budget. The usage above is the
+        -- other reading.
         expect(s:remaining()).to.equal(99)
         -- The kernel does not number beats: nothing to read back.
         expect(s.beats).to.equal(nil)
@@ -267,7 +276,7 @@ describe("knl beat (session-scope model)", function()
     end)
 
     it("gives two successive beats two distinct ids (shell-declared)", function()
-        local s = kernel.open({ budget = { amount = 1000, tag = "tokens" } })
+        local s = kernel.open({ budget = { amount = 1000, tag = "beats" } })
         local d = kernel.device({ llm = stub(response("ok"), response("ok")) })
 
         kernel.beat(s, d)
@@ -281,7 +290,7 @@ describe("knl beat (session-scope model)", function()
     end)
 
     it("shares one beat id across a response's tool_call/tool_result pairs", function()
-        local s = kernel.open({ budget = { amount = 100, tag = "tokens" } })
+        local s = kernel.open({ budget = { amount = 100, tag = "beats" } })
         local d = kernel.device({
             llm = stub(response("ok", {
                 tool_use("a", "noop", {}),

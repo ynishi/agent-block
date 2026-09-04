@@ -161,9 +161,11 @@ use super::event::{
     KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED,
     KIND_SESSION_OPENED,
 };
-use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore, MemEventStore};
+use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
+use super::query::{self, QueryOpts, QueryParams, QueryRows};
 use super::scope::{Scope, ScopeId};
+use super::sqlite_store::SqliteEventStore;
 use super::{projection, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
@@ -328,14 +330,30 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    /// Open a session for `owner` with an optional budget grant, on the
+    /// Open a session for `owner` with an optional budget grant, on an
     /// in-memory store.
     ///
     /// `owner` is total: pass a real principal id, or [`ANON`] / [`SYSTEM`]
     /// for the reserved ones.  The `session_opened` event is appended here,
     /// so a fresh session already has one event.
+    ///
+    /// "In-memory" is an in-memory *database*, not a different kind of store:
+    /// the same SQLite backend a durable session uses, on a database that is
+    /// reclaimed when this session lets go of it
+    /// ([`SqliteEventStore::open_memory`]).  There is one backend, because
+    /// the log is read with SQL and a log that cannot be queried would be a
+    /// second, lesser kind of session.
+    ///
+    /// The stream is minted here and adopted as the session's id, so
+    /// [`Session::id`] names the stream this session writes — the same
+    /// identity a durable session has, and what `$stream` binds to in a
+    /// [`Session::query`].
     pub fn new(owner: String, grant: Option<BudgetGrant>) -> KnlResult<Self> {
-        Self::open_on(owner, grant, Box::new(MemEventStore::new()))
+        let stream = uuid::Uuid::new_v4().to_string();
+        let store = SqliteEventStore::open_memory(stream.clone())?;
+        let mut session = Self::open_on(owner, grant, Box::new(store))?;
+        session.adopt_id(stream);
+        Ok(session)
     }
 
     /// Open a session for `owner` on a caller-chosen backend `store` (the
@@ -566,13 +584,13 @@ impl Session {
 
     /// Adopt `id` as the session-correlation id.
     ///
-    /// Used only by the durable Lua bridge so a session and the SQLite
-    /// stream it writes to share one id: `open_on` / `resume` mint a fresh
-    /// id like `new`, and the bridge overrides it to the stream it opened,
-    /// so the id a caller resumes by *is* the stream.  `session_opened`
-    /// records the scope (its id and the `owner`), never the session id, so
-    /// overriding the id does not desync the log.
-    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    /// Used so a session and the SQLite stream it writes to share one id:
+    /// `open_on` / `resume` mint a fresh id, and the caller that opened the
+    /// stream overrides it to that stream, so the id a caller resumes by *is*
+    /// the stream — and so `$stream` in a [`Session::query`] means this
+    /// session's own rows.  `session_opened` records the scope (its id and
+    /// the `owner`), never the session id, so overriding the id does not
+    /// desync the log.
     pub(crate) fn adopt_id(&mut self, id: impl Into<String>) {
         self.id = id.into();
     }
@@ -948,12 +966,41 @@ impl Session {
             other => Err(KnlError::Validation(format!("unknown view {other:?}"))),
         }
     }
+
+    /// Read the log with SQL.
+    ///
+    /// The other half of [`Session::view`], and the reason that list of names
+    /// can stay short: a fold whose shape is the caller's — beats grouped,
+    /// tool calls paired against their results, a ledger — is a `SELECT`
+    /// against the table the log lives in, not a name the kernel had to be
+    /// taught.  What the kernel keeps is the boundary around it
+    /// ([`super::query`]): one statement, and it reads; a connection that
+    /// cannot write; values bound rather than pasted; a deadline; a row cap.
+    ///
+    /// Two names are reserved.  `$stream` is this session's own stream, and
+    /// `$sessions` is the set in `opts.sessions` — the session's own stream
+    /// when that is omitted — expanded to one bound placeholder per id, so
+    /// reading across a tree of sessions is one statement rather than a loop
+    /// of them.  The kernel does not judge the set: which streams a caller
+    /// may read is a question about who the caller is, and that lives above
+    /// the kernel.
+    ///
+    /// Reads keep working after this handle closed, like every other read
+    /// here: the record outlives the session.
+    pub fn query(&self, sql: &str, params: QueryParams, opts: &QueryOpts) -> KnlResult<QueryRows> {
+        let plan = query::plan(sql, params, opts, &self.id)?;
+        self.store.query(&plan)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::knl::event::{kind_of, FIELD_BEAT, KIND_LLM_RESPONSE};
+    // The `Vec`-backed test store: the SPI, the seam and the folds are worth
+    // exercising without a database underneath, and the failure injection
+    // below is easier to build on a `Vec` than on a connection.
+    use crate::knl::event_store::MemEventStore;
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -1639,12 +1686,11 @@ mod tests {
     /// `open_on` on a durable backend records the session's owner on the
     /// `session_opened` boundary, so resume can recover it from the log
     /// alone.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn open_on_records_the_owner_on_session_opened() {
         use crate::knl::SqliteEventStore;
 
-        let store = SqliteEventStore::open_in_memory("owner-stream").expect("open");
+        let store = SqliteEventStore::open_memory("owner-stream").expect("open");
         let s = Session::open_on("user-7".to_string(), Some(grant(100)), Box::new(store))
             .expect("open");
 
@@ -1666,7 +1712,6 @@ mod tests {
     /// Resume re-folds a persisted SQLite stream: the owner and the
     /// *balance* come back from the log, because every move of the balance
     /// is in it.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_restores_the_owner_and_the_folded_balance() {
         use crate::knl::SqliteEventStore;
@@ -1741,7 +1786,6 @@ mod tests {
 
     /// A `grant` on resume is the owner allowing *more*: it is recorded and
     /// added to what the log left, rather than replacing it.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_with_a_grant_records_it_and_raises_the_balance() {
         use crate::knl::SqliteEventStore;
@@ -1794,7 +1838,6 @@ mod tests {
 
     /// An older log with no `owner` on `session_opened` resumes as [`ANON`]
     /// rather than failing — the field is a later addition.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_falls_back_to_anon_when_the_log_has_no_owner() {
         use crate::knl::SqliteEventStore;
@@ -1822,7 +1865,6 @@ mod tests {
     /// owner come back off `session_opened`, so the session continues under
     /// the authority the log says it opened with, and the ledger it goes on
     /// writing names that same scope.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_restores_the_scope_id_and_owner_from_the_log() {
         use crate::knl::SqliteEventStore;
@@ -1865,7 +1907,6 @@ mod tests {
     /// fresh kernel-issued one rather than failing — the field is a later
     /// addition, exactly like `owner` above, and a session that predates it
     /// is still a session.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
         use crate::knl::SqliteEventStore;
@@ -2125,7 +2166,6 @@ mod tests {
 
     /// (Fix 5) Resuming a nonexistent SQLite stream is a caller error, not an
     /// anonymous empty session.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_of_a_nonexistent_sqlite_stream_is_a_caller_error() {
         use crate::knl::SqliteEventStore;
@@ -2148,7 +2188,6 @@ mod tests {
     /// holds both in the order they arrived.  This is the scenario that used
     /// to be a head conflict — an append records a fact, and a fact is not
     /// refused for what its writer had last seen.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn two_sessions_on_one_stream_both_append_and_the_log_interleaves() {
         use crate::knl::SqliteEventStore;
@@ -2200,7 +2239,6 @@ mod tests {
     /// stream, ten granted, each asking for six.  The decision is taken inside
     /// the store, against the ledger as it stands there, so exactly one is
     /// allowed — and the fold says four, not minus two.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn two_sessions_cannot_both_reserve_the_same_allowance() {
         use crate::knl::SqliteEventStore;
@@ -2254,7 +2292,6 @@ mod tests {
     /// which is the fact an audit is reading for, and would be gone if the
     /// store had refused them.  A second handle closing writes a second
     /// ending, because that is what happened.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_close_is_the_handles_and_the_log_records_what_arrives_after_it() {
         use crate::knl::SqliteEventStore;
@@ -2333,7 +2370,6 @@ mod tests {
     /// balance afterwards is the ledger's, so it is exact on a stream two
     /// handles write to — B reads what the log says, not a number it was
     /// holding before A spent.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_settlement_records_the_move_and_the_balance_is_the_ledgers() {
         use crate::knl::SqliteEventStore;
@@ -2392,7 +2428,6 @@ mod tests {
     /// that has written nothing at all still reports what the other one
     /// spent: `B` never calls a write in this test, and every answer it gives
     /// comes from folding the stream it shares with `A`.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_handle_that_wrote_nothing_reports_what_the_other_spent() {
         use crate::knl::SqliteEventStore;
@@ -2445,10 +2480,8 @@ mod tests {
     /// rows were written under — and a `Current` is asserted to be at it, so
     /// a fixture that stamped `2` would be claiming a version the kernel does
     /// not have.
-    #[cfg(feature = "sqlite")]
     struct RenameLegacyKinds;
 
-    #[cfg(feature = "sqlite")]
     impl crate::knl::Upcaster for RenameLegacyKinds {
         fn upcast(&self, mut event: Value) -> Value {
             // Not an object at all: unchanged.  An upcaster is total and
@@ -2472,7 +2505,6 @@ mod tests {
     /// wrapped round its backend — the restore fold a resume takes, `events`,
     /// the `usage` view and the balance fold alike — while the rows on disk
     /// keep the shape they were written in.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_session_reads_every_path_through_the_upcaster_seam() {
         use crate::knl::{
@@ -2574,7 +2606,6 @@ mod tests {
     /// (Upcasting seam) A stream whose ending is only visible *after* the
     /// step is still an ending: the disposable rule reads the projected log,
     /// not the stored one.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_closed_stream_seen_through_the_seam_is_still_refused() {
         use crate::knl::{SqliteEventStore, Upcaster};
@@ -2606,5 +2637,106 @@ mod tests {
             "{}",
             err.reason()
         );
+    }
+
+    // -- the in-memory database, and reading the log with SQL ---------------
+
+    /// An in-memory session is a session, not a lesser one: it is a stream in
+    /// a real database, so a second handle on its name finds the same log and
+    /// resuming it restores the state.  What it cannot do is outlive the
+    /// process — the database is reclaimed when the last handle on it goes —
+    /// and nothing here pretends otherwise.
+    #[test]
+    fn an_in_memory_stream_is_resumable_while_it_is_open() {
+        let mut s = new_session(Some(100));
+        assert_eq!(s.reserve(30), Ok(true));
+        s.append(obj(json!({ "kind": "note", "text": "hi" })))
+            .expect("append");
+
+        // The session id *is* the stream, so it is what a resume names.
+        let store = SqliteEventStore::open_memory(s.id()).expect("reopen the stream");
+        let resumed = Session::resume(None, Box::new(store)).expect("resume");
+        assert_eq!(resumed.owner(), ANON);
+        assert_eq!(remaining(&resumed), Some(70), "the ledger came back");
+        assert_eq!(
+            kinds(&resumed.events(0).expect("events")),
+            vec![
+                KIND_SESSION_OPENED,
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_RESERVED,
+                "note"
+            ]
+        );
+
+        // Two sessions are two databases: neither name is the other's.
+        let other = new_session(Some(100));
+        assert_ne!(other.id(), s.id());
+        assert_eq!(
+            other.len().expect("len"),
+            2,
+            "opened + granted, and no note"
+        );
+    }
+
+    /// A session reads its own log with SQL, and `$stream` is what makes
+    /// "its own" true without the caller having to know its id.
+    #[test]
+    fn a_session_reads_its_own_log_with_sql() {
+        let mut s = new_session(None);
+        s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
+            .expect("append");
+        s.append(response(9)).expect("recorded");
+
+        let found = s
+            .query(
+                "SELECT kind, seq FROM events WHERE stream = $stream ORDER BY seq",
+                QueryParams::None,
+                &QueryOpts::default(),
+            )
+            .expect("query");
+        assert!(!found.truncated);
+        let kinds: Vec<&str> = found
+            .rows
+            .iter()
+            .map(|row| row["kind"].as_str().expect("a kind"))
+            .collect();
+        assert_eq!(kinds, [KIND_SESSION_OPENED, "msg_user", KIND_LLM_RESPONSE]);
+
+        // A fold the kernel does not name — how many events of each kind —
+        // is a query rather than a view it had to be taught.
+        let counted = s
+            .query(
+                "SELECT kind, COUNT(*) AS n FROM events WHERE stream = $stream \
+                 GROUP BY kind ORDER BY kind",
+                QueryParams::None,
+                &QueryOpts::default(),
+            )
+            .expect("query");
+        assert_eq!(counted.rows.len(), 3);
+
+        // Another session's stream is not this one's, even in the same
+        // process: the set a query reads is the set it named.
+        let mut other = new_session(None);
+        other
+            .append(obj(json!({ "kind": "only_theirs" })))
+            .expect("append");
+        let mine = s
+            .query(
+                "SELECT kind FROM events WHERE stream IN $sessions",
+                QueryParams::None,
+                &QueryOpts::default(),
+            )
+            .expect("query");
+        assert!(
+            !mine.rows.iter().any(|row| row["kind"] == "only_theirs"),
+            "{:?}",
+            mine.rows
+        );
+
+        // Reads keep working after the handle closed, like every other read.
+        s.close(None).expect("close");
+        assert!(s
+            .query("SELECT 1 AS one", QueryParams::None, &QueryOpts::default())
+            .is_ok());
     }
 }

@@ -107,20 +107,32 @@
 //! s:close("done")
 //! ```
 //!
-//! Three read faces and no more: the events, the account, the last of the
-//! record.  Turning events into a request for a provider — which role a
+//! Three named read faces and no more: the events, the account, the last of
+//! the record.  Turning events into a request for a provider — which role a
 //! kind takes, whether a system message goes in front, where to cut the
 //! history off — is the shell's policy, so it is written in Lua over
 //! `events(from)` rather than named as a view here.
 //!
-//! Storage backend.  `knl.open` takes an optional `store`: absent or
-//! `"mem"` keeps the in-memory log (the default), while
-//! `{ sqlite = "<path>" }` opens a durable, per-session SQLite stream (only
-//! in a build with the `sqlite` feature).  `knl.resume({ store = { sqlite =
-//! "<path>" }, session = "<id>", budget? })` reopens a persisted stream and
-//! re-folds it, so a resumed session's accounting continues from the
-//! recorded state — it behaves exactly like a fresh session, only
-//! pre-loaded.
+//! The fourth face is not a name but a language: `s:query(sql, params?,
+//! opts?)` reads the log with one `SELECT` / `WITH` over the table the events
+//! live in, whose columns `knl.api().schema` publishes.  That is what keeps
+//! the list of names short — a fold the kernel has no opinion about is a
+//! query, not a name it had to be taught.  `$stream` binds to this session
+//! and `$sessions` to the set in `opts.sessions`, so reading across a tree of
+//! sessions is one statement.  Values are bound, never pasted; the connection
+//! it runs on cannot write; and it returns `rows, truncated`, so a page can
+//! be told from a complete answer.
+//!
+//! Storage backend.  `knl.open` takes an optional `store`: absent or `"mem"`
+//! is an in-memory SQLite database that lives as long as the session does,
+//! while `{ sqlite = "<path>" }` is a durable, per-session stream in a file.
+//! One backend, two kinds of database — the log is a table either way, which
+//! is what `s:query` reads.  `knl.resume({ store = …, session = "<id>",
+//! budget? })` reopens a stream and re-folds it, so a resumed session's
+//! accounting continues from the recorded state — it behaves exactly like a
+//! fresh session, only pre-loaded.  A file survives the process; an in-memory
+//! database does not, so resuming one is only possible while another handle
+//! still holds it open.
 //!
 //! Scope: effect execution and the Lua-side projection seam are separate
 //! steps of the kernel/shell base design.
@@ -176,6 +188,12 @@ pub const SESSION_API: &[(&str, &str)] = &[
          [raises: validation, busy, storage, corruption]",
     ),
     (
+        "query",
+        "query(sql, params?, opts?) -> rows, truncated — read the log with one SELECT / WITH; \
+         $stream is this session, $sessions is opts.sessions (default { this session }) \
+         [raises: validation, busy, storage, corruption, timeout]",
+    ),
+    (
         "reserve",
         "reserve(n) -> true | false, tag — refuse if remaining < n, atomic, both answers recorded \
          [raises: validation, closed, busy, storage, corruption]",
@@ -214,13 +232,13 @@ pub const SESSION_API: &[(&str, &str)] = &[
 pub const MODULE_API: &[(&str, &str)] = &[
     (
         "open",
-        "open(opts?) -> session — owner? / budget? / store? (\"mem\" or { sqlite = path }) \
-         [raises: validation, unsupported, busy, storage]",
+        "open(opts?) -> session — owner? / budget? / store? (\"mem\" for an in-memory database, \
+         or { sqlite = path }) [raises: validation, busy, storage]",
     ),
     (
         "resume",
-        "resume(opts) -> session — reopen a persisted stream; a closed session is not resumable \
-         [raises: validation, closed, unsupported, busy, storage, corruption]",
+        "resume(opts) -> session — reopen a stream and re-fold it; a closed session is not \
+         resumable [raises: validation, closed, busy, storage, corruption]",
     ),
     (
         "new_beat_id",
@@ -233,8 +251,8 @@ pub const MODULE_API: &[(&str, &str)] = &[
     ),
     (
         "api",
-        "api() -> { session = { { name, doc } }, module = { { name, doc } }, errors = { kind } } — \
-         the declared surface",
+        "api() -> { session = …, module = …, errors = { kind }, schema = { table, columns } } — \
+         the declared surface, and the columns a query may name",
     ),
 ];
 
@@ -527,6 +545,44 @@ impl LuaUserData for Session {
             json_to_lua(lua, value)
         });
 
+        // s:query(sql, params?, opts?) -> rows, truncated
+        //
+        // The log read with SQL.  `view` names the folds whose consumer is
+        // the kernel's own; everything else — beats grouped, tool calls
+        // paired with their results, a ledger — is a SELECT over the table
+        // the events live in, whose columns `knl.api().schema` publishes.
+        //
+        // What the kernel keeps around it: one statement and it reads, a
+        // connection that cannot write, values bound rather than pasted, a
+        // deadline, a row cap.  The second return says whether the cap cut
+        // anything off, so a caller can tell a complete answer from a page.
+        methods.add_method(
+            "query",
+            |lua, this, (sql, params, opts): (LuaValue, LuaValue, LuaValue)| {
+                let LuaValue::String(sql) = sql else {
+                    return Err(err(
+                        "query",
+                        format!("sql must be a string, got {}", sql.type_name()),
+                    ));
+                };
+                let sql = sql.to_str()?.to_string();
+                // Both conversions happen before the session is borrowed:
+                // walking a Lua table can re-enter Lua.
+                let params = query_params(lua, params)?;
+                let opts = query_opts(lua, opts)?;
+
+                let found = this
+                    .state
+                    .borrow()
+                    .query(&sql, params, &opts)
+                    .map_err(|e| knl_err("query", &e))?;
+                let rows: Vec<Value> = found.rows.into_iter().map(Value::Object).collect();
+                // The borrow is released above: json_to_lua re-enters Lua.
+                let rows = json_to_lua(lua, Value::Array(rows))?;
+                Ok((rows, found.truncated))
+            },
+        );
+
         // s:reserve(n) -> true | false, tag
         //
         // K4, the decision point: ask before spending.  `true` means the
@@ -804,6 +860,138 @@ fn parse_owner(opts: Option<&LuaTable>) -> LuaResult<String> {
     }
 }
 
+/// The fields a `query` opts table may carry.  Anything else is a typo, and
+/// a misspelt `limit` or `timeout_ms` that reads as "no cap" / "no deadline"
+/// is exactly what those two exist to prevent.
+const QUERY_OPT_FIELDS: [&str; 3] = ["sessions", "timeout_ms", "limit"];
+
+/// Read the `params` argument of `s:query`.
+///
+/// A list is the values for the `?` parameters, in order; a table with names
+/// is the values for `:name` / `@name` / `$name`.  An absent or empty table
+/// is neither: the statement is expected to have no parameters of its own.
+///
+/// Converted before the session is borrowed — walking a Lua table can call
+/// back into Lua.
+fn query_params(lua: &Lua, params: LuaValue) -> LuaResult<knl::QueryParams> {
+    match params {
+        LuaValue::Nil => Ok(knl::QueryParams::None),
+        table @ LuaValue::Table(_) => match lua_to_json(lua, table).map_err(|e| err("query", e))? {
+            Value::Array(values) => Ok(knl::QueryParams::Positional(values)),
+            Value::Object(named) if named.is_empty() => Ok(knl::QueryParams::None),
+            Value::Object(named) => Ok(knl::QueryParams::Named(named)),
+            _ => Err(err("query", "params must be a table")),
+        },
+        other => Err(err(
+            "query",
+            format!(
+                "params must be a list or a table of names, got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// Read the `opts` argument of `s:query`: `{ sessions?, timeout_ms?, limit? }`.
+fn query_opts(lua: &Lua, opts: LuaValue) -> LuaResult<knl::QueryOpts> {
+    let opts = match opts {
+        LuaValue::Nil => return Ok(knl::QueryOpts::default()),
+        LuaValue::Table(table) => table,
+        other => {
+            return Err(err(
+                "query",
+                format!("opts must be a table, got {}", other.type_name()),
+            ));
+        }
+    };
+
+    for pair in opts.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let LuaValue::String(name) = &key else {
+            return Err(err(
+                "query",
+                format!("opts fields must be named, got a {}", key.type_name()),
+            ));
+        };
+        let name = name.to_str()?.to_string();
+        if !QUERY_OPT_FIELDS.contains(&name.as_str()) {
+            return Err(err(
+                "query",
+                format!("unknown query option {name:?} (expected sessions / timeout_ms / limit)"),
+            ));
+        }
+    }
+
+    let sessions = match opts.get::<LuaValue>("sessions")? {
+        LuaValue::Nil => None,
+        table @ LuaValue::Table(_) => {
+            match lua_to_json(lua, table).map_err(|e| err("query", e))? {
+                Value::Array(ids) => Some(
+                    ids.into_iter()
+                        .map(|id| match id {
+                            Value::String(id) => Ok(id),
+                            other => Err(err(
+                                "query",
+                                format!("opts.sessions must be a list of session ids, got {other}"),
+                            )),
+                        })
+                        .collect::<LuaResult<Vec<String>>>()?,
+                ),
+                // An empty table is an empty set, which the kernel refuses
+                // with its own words rather than being read as "all of them".
+                Value::Object(named) if named.is_empty() => Some(Vec::new()),
+                _ => {
+                    return Err(err("query", "opts.sessions must be a list of session ids"));
+                }
+            }
+        }
+        other => {
+            return Err(err(
+                "query",
+                format!(
+                    "opts.sessions must be a list of session ids, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+
+    let timeout_ms = match opts.get::<LuaValue>("timeout_ms")? {
+        LuaValue::Nil => knl::DEFAULT_TIMEOUT_MS,
+        value => as_whole_non_negative(&value)
+            .map(|n| n as u64)
+            .ok_or_else(|| {
+                err(
+                    "query",
+                    format!(
+                        "opts.timeout_ms must be a non-negative whole number, got {}",
+                        lua_value_for_msg(&value)
+                    ),
+                )
+            })?,
+    };
+    let limit = match opts.get::<LuaValue>("limit")? {
+        LuaValue::Nil => knl::DEFAULT_LIMIT,
+        value => as_whole_non_negative(&value)
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                err(
+                    "query",
+                    format!(
+                        "opts.limit must be a non-negative whole number, got {}",
+                        lua_value_for_msg(&value)
+                    ),
+                )
+            })?,
+    };
+
+    Ok(knl::QueryOpts {
+        sessions,
+        timeout_ms,
+        limit,
+    })
+}
+
 /// The storage backend `opts.store` asks for.
 enum StoreSpec {
     /// The in-memory store (the default): absent or `"mem"`.
@@ -864,7 +1052,6 @@ fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
 /// The stream id is minted here and adopted as the session's own id, so the
 /// id `knl.open` reports (`s:id()`) is exactly the stream a later
 /// `knl.resume` reopens — the durable identity is one string, not two.
-#[cfg(feature = "sqlite")]
 fn open_sqlite(owner: String, grant: Option<knl::BudgetGrant>, path: &str) -> LuaResult<Session> {
     let stream = uuid::Uuid::new_v4().to_string();
     let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone())
@@ -875,35 +1062,17 @@ fn open_sqlite(owner: String, grant: Option<knl::BudgetGrant>, path: &str) -> Lu
     Ok(Session::from_state(state))
 }
 
-/// Without the `sqlite` feature a durable store cannot be built, so the
-/// request is a clear error rather than a silent fall back to memory.
-#[cfg(not(feature = "sqlite"))]
-fn open_sqlite(
-    _owner: String,
-    _grant: Option<knl::BudgetGrant>,
-    _path: &str,
-) -> LuaResult<Session> {
-    // Not the caller's arguments: the request is well-formed and this build
-    // simply cannot serve it.
-    Err(err_of(
-        "open",
-        knl::KnlError::UNSUPPORTED,
-        "a sqlite store needs the 'sqlite' feature, which this build does not have",
-    ))
-}
-
-/// Reopen the durable SQLite stream `session_id` at `path` and resume it.
+/// Reopen the stream `session_id` and resume it.
 ///
-/// `Session::resume` re-folds the persisted log; the reopened stream's id is
-/// adopted so `s:id()` matches the stream the caller named.
-#[cfg(feature = "sqlite")]
-fn resume_sqlite(
+/// `store` is the backend the stream lives in — a file, or the in-memory
+/// database of that name while some handle still holds it open.
+/// `Session::resume` re-folds the log; the reopened stream's id is adopted so
+/// `s:id()` matches the stream the caller named.
+fn resume_on(
     grant: Option<knl::BudgetGrant>,
-    path: &str,
+    store: knl::SqliteEventStore,
     session_id: String,
 ) -> LuaResult<Session> {
-    let store = knl::SqliteEventStore::open(std::path::Path::new(path), session_id.clone())
-        .map_err(|e| knl_err("resume", &e))?;
     // Resumed with no grant, so nothing has been written yet when the check
     // below runs: a refused resume must leave the stream exactly as it found
     // it, and a `budget_granted` recorded before the refusal would be the
@@ -928,20 +1097,6 @@ fn resume_sqlite(
     }
     state.adopt_id(session_id);
     Ok(Session::from_state(state))
-}
-
-/// Without the `sqlite` feature there is no durable stream to resume.
-#[cfg(not(feature = "sqlite"))]
-fn resume_sqlite(
-    _grant: Option<knl::BudgetGrant>,
-    _path: &str,
-    _session_id: String,
-) -> LuaResult<Session> {
-    Err(err_of(
-        "resume",
-        knl::KnlError::UNSUPPORTED,
-        "a sqlite store needs the 'sqlite' feature, which this build does not have",
-    ))
 }
 
 /// Build a session userdata from `opts` — the body of `knl.open`.
@@ -992,19 +1147,7 @@ fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
         }
     };
     let grant = parse_budget(Some(&opts))?;
-    let path = match parse_store("resume", Some(&opts))? {
-        StoreSpec::Sqlite(path) => path,
-        StoreSpec::Mem => {
-            // Well-formed, and impossible: an in-memory log has nothing to
-            // reopen, so this is a backend that cannot serve the request
-            // rather than an argument that failed a check.
-            return Err(err_of(
-                "resume",
-                knl::KnlError::UNSUPPORTED,
-                "resume needs a sqlite store (store = { sqlite = <path> })",
-            ));
-        }
-    };
+    let store = parse_store("resume", Some(&opts))?;
     let session: LuaValue = opts.get("session")?;
     let session_id = match session {
         LuaValue::String(id) => id.to_str()?.to_string(),
@@ -1021,7 +1164,19 @@ fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
             ));
         }
     };
-    let state = resume_sqlite(grant, &path, session_id)?;
+    let store = match store {
+        StoreSpec::Sqlite(path) => {
+            knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone())
+        }
+        // An in-memory stream is reopenable too, for as long as it exists:
+        // the database is named after the stream, so a second handle on a
+        // live one finds the same log.  It cannot outlive the process, and it
+        // does not pretend to — a name nobody is holding open resumes as an
+        // empty stream, which is refused for having no session in it.
+        StoreSpec::Mem => knl::SqliteEventStore::open_memory(session_id.clone()),
+    }
+    .map_err(|e| knl_err("resume", &e))?;
+    let state = resume_on(grant, store, session_id)?;
     lua.create_userdata(state)
 }
 
@@ -1110,10 +1265,11 @@ fn new_beat_id(_: &Lua, _: ()) -> LuaResult<String> {
 
 /// The declared surface as a Lua table — the body of `knl.api()`.
 ///
-/// `{ session = { { name = …, doc = … }, … }, module = { … }, errors = { … } }`,
-/// built from [`SESSION_API`], [`MODULE_API`] and [`knl::KnlError::KINDS`], so
-/// a caller reads what the kernel offers from the same tables the reflection
-/// test holds the registration to.
+/// `{ session = { { name = …, doc = … }, … }, module = { … }, errors = { … },
+/// schema = { table = …, columns = { { name, type, pk }, … } } }`, built from
+/// [`SESSION_API`], [`MODULE_API`], [`knl::KnlError::KINDS`] and the events
+/// table itself, so a caller reads what the kernel offers from the same
+/// tables the reflection test holds the registration to.
 ///
 /// `errors` is the closed list of classes `knl.error(e).kind` can report.  It
 /// is published for the same reason the two method lists are: the shell keeps
@@ -1141,6 +1297,28 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
         errors.set(index + 1, *kind)?;
     }
     out.set("errors", errors)?;
+
+    // The read contract: the table a query names and the columns it has.
+    // Read off SQLite itself (`PRAGMA table_info`) rather than written out
+    // here, so the published schema is the schema — a caller's SQL is written
+    // against columns that exist, and the shell's own declaration of them can
+    // be checked instead of trusted.
+    let schema = lua.create_table()?;
+    schema.set("table", knl::EVENTS_TABLE)?;
+    let columns = lua.create_table()?;
+    for (index, column) in knl::events_schema()
+        .map_err(|e| knl_err("api", &e))?
+        .into_iter()
+        .enumerate()
+    {
+        let entry = lua.create_table()?;
+        entry.set("name", column.name)?;
+        entry.set("type", column.declared_type)?;
+        entry.set("pk", column.pk)?;
+        columns.set(index + 1, entry)?;
+    }
+    schema.set("columns", columns)?;
+    out.set("schema", schema)?;
     Ok(out)
 }
 
@@ -2150,7 +2328,6 @@ mod tests {
     /// (scope, durable) The scope outlives the process: a reopened stream
     /// resumes under the id its `session_opened` recorded — not a fresh one —
     /// and the ledger it goes on writing names that same scope.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_resumed_session_keeps_the_scope_id_the_log_recorded() {
         let lua = vm();
@@ -2191,7 +2368,6 @@ mod tests {
     /// usage view all come back, and the resumed session carries on from
     /// there.  A `budget` on resume is the owner granting again: recorded,
     /// and added to what was left.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn open_and_resume_a_durable_sqlite_session() {
         let lua = vm();
@@ -2261,7 +2437,6 @@ mod tests {
     /// open: a stream the host opened as SYSTEM cannot be reopened from
     /// Lua, or an untrusted caller could write into the reserved namespace
     /// through the resume side door.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_rejects_a_reserved_system_owned_stream() {
         let lua = vm();
@@ -2290,23 +2465,61 @@ mod tests {
         );
     }
 
-    /// (attribution) resume needs a sqlite store and a session id; each
-    /// missing piece is a `knl: resume:` error.
-    #[cfg(feature = "sqlite")]
+    /// (attribution) resume needs a session id, and a stream that is one:
+    /// each missing piece is a `knl: resume:` error.
     #[test]
-    fn resume_requires_a_sqlite_store_and_a_session_id() {
+    fn resume_requires_a_session_id_and_a_stream_that_holds_a_session() {
         let lua = vm();
 
         let msg = expect_err(&lua, r#"knl.resume()"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
 
-        let msg = expect_err(&lua, r#"knl.resume({ session = "s1" })"#);
-        assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
-        assert!(msg.contains("sqlite"), "{msg}");
-
         let msg = expect_err(&lua, r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
         assert!(msg.contains("session is required"), "{msg}");
+
+        // A name nobody is holding open is an empty stream, not a session:
+        // an in-memory database exists only while a handle does, so resuming
+        // one that has gone is refused for having no opening in it — the same
+        // answer a fresh file gives.
+        let msg = expect_err(&lua, r#"knl.resume({ session = "never-opened" })"#);
+        assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
+        assert!(msg.contains("no session to resume"), "{msg}");
+    }
+
+    /// (mem) An in-memory session is a session: it is resumable while it is
+    /// alive, by the id it reports, and the resumed handle reads the same log
+    /// and continues the same ledger.  What it cannot do is outlive the
+    /// process, and nothing here pretends otherwise.
+    #[test]
+    fn an_in_memory_stream_is_resumable_while_it_is_open() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "tokens" } })
+            local id = s:id()
+            s:reserve(30)
+            s:append({ kind = "note", text = "in memory" })
+
+            -- The writer is still alive, so the database is still there.
+            local r = knl.resume({ store = "mem", session = id })
+            assert(r:id() == id, "resumed id: " .. tostring(r:id()))
+            assert(r:owner() == "mem-user", "resumed owner: " .. tostring(r:owner()))
+            assert(r:remaining() == 70, "resumed remaining: " .. tostring(r:remaining()))
+            assert(r:len() == 4, "session_opened + granted + reserved + note")
+
+            -- An absent store means the same thing on resume as it does on
+            -- open: the in-memory database.
+            local r2 = knl.resume({ session = id })
+            assert(r2:remaining() == 70, "resumed again: " .. tostring(r2:remaining()))
+
+            -- And the resumed handle writes into the same log.
+            r:spend(20)
+            assert(s:remaining() == 50, "the writer sees it: " .. tostring(s:remaining()))
+        "#,
+        )
+        .exec()
+        .expect("in-memory resume chunk");
     }
 
     // -- session lifecycle: `<close>` and the drop backstop ----------------
@@ -2316,7 +2529,6 @@ mod tests {
     // whether the record landed, and only the durable log answers that.
 
     /// The persisted events of `stream`, read through a fresh connection.
-    #[cfg(feature = "sqlite")]
     fn persisted(path: &std::path::Path, stream: &str) -> Vec<Value> {
         use crate::knl::EventStore;
 
@@ -2328,7 +2540,6 @@ mod tests {
     ///
     /// The VM is dropped before the caller reads the stream, so anything the
     /// collector still owed has been paid by the time the log is inspected.
-    #[cfg(feature = "sqlite")]
     fn stream_id_from(chunk: String) -> String {
         let lua = vm();
         lua.load(chunk).eval::<String>().expect("close scope chunk")
@@ -2337,7 +2548,6 @@ mod tests {
     /// (I6) A `<close>` scope that ends cleanly records the session's
     /// boundary with `scope_exit`: the shell no longer has to remember to
     /// close.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_close_scope_records_the_boundary_on_the_way_out() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2369,7 +2579,6 @@ mod tests {
     /// reason and the message as `detail` — so the log says the session
     /// ended badly without the reason vocabulary growing a member per
     /// failure.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_close_scope_that_raises_records_the_error_and_its_message() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2644,7 +2853,6 @@ mod tests {
     /// `detail` — which is what lets a Lua-side bracket record the message of
     /// the error its body raised.  `close(reason)` and `close()` are
     /// unchanged.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn close_records_an_optional_detail_beside_the_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2722,7 +2930,6 @@ mod tests {
     /// (disposable) A closed stream is not reopened.  The session ended; what
     /// comes after an ending is a new session, and `knl.resume` says so
     /// instead of handing back a handle onto a finished log.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn resume_refuses_a_closed_stream() {
         let lua = vm();
@@ -2749,7 +2956,6 @@ mod tests {
     /// (F3) A resume that is refused writes nothing.  The reserved-owner
     /// check runs before any append, so a caller cannot leave a
     /// `budget_granted` in a stream it was not allowed to reopen.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_refused_resume_records_no_grant() {
         let lua = vm();
@@ -3017,7 +3223,6 @@ mod tests {
     /// (I6) An explicit `close` wins: the scope exit that follows it is a
     /// no-op, so the reason in the log is the caller's and there is exactly
     /// one boundary.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn an_explicit_close_wins_over_the_scope_exit() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3050,7 +3255,6 @@ mod tests {
     /// reclaims it.  A session that ends by being forgotten is still an
     /// ended session, and a reader of the stream must not see it as open
     /// forever.
-    #[cfg(feature = "sqlite")]
     #[test]
     fn a_collected_handle_records_the_boundary_as_dropped() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3082,5 +3286,232 @@ mod tests {
             "the collector left the session open: {log:?}"
         );
         assert_eq!(last["reason"], Value::from("dropped"), "{last}");
+    }
+
+    // -- reading the log with SQL ------------------------------------------
+
+    /// The fourth read face: one `SELECT` over the table the events live in.
+    /// `$stream` is this session without the caller naming it, values are
+    /// bound, and the second return says whether the cap cut anything off.
+    #[test]
+    fn query_reads_the_log_with_sql() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "q" })
+            s:append({ kind = "msg_user", content = "hi" })
+            s:append({ kind = "note", text = "a note" })
+
+            local rows, truncated = s:query(
+                "SELECT seq, kind FROM events WHERE stream = $stream ORDER BY seq")
+            assert(#rows == 3, "rows: " .. tostring(#rows))
+            assert(truncated == false, "nothing was cut off")
+            assert(rows[1].kind == "session_opened", "first: " .. tostring(rows[1].kind))
+            assert(rows[2].kind == "msg_user" and rows[2].seq == 2)
+            assert(rows[3].kind == "note")
+
+            -- A fold the kernel does not name is a query, not a view it had
+            -- to be taught.
+            local counted = s:query([[
+                SELECT kind, COUNT(*) AS n FROM events
+                WHERE stream = $stream GROUP BY kind ORDER BY kind]])
+            assert(#counted == 3, "kinds: " .. tostring(#counted))
+
+            -- Values are bound: positionally…
+            local one = s:query("SELECT kind FROM events WHERE kind = ?", { "note" })
+            assert(#one == 1 and one[1].kind == "note", "positional bind")
+            -- …and by name, with the prefix character left to SQLite.
+            local named = s:query("SELECT kind FROM events WHERE kind = :kind",
+                                  { kind = "msg_user" })
+            assert(#named == 1 and named[1].kind == "msg_user", "named bind")
+
+            -- A quote in a value is a character, not the end of a string, and
+            -- a value that would be SQL if it were pasted in matches nothing.
+            s:append({ kind = "it's odd" })
+            local quoted = s:query("SELECT kind FROM events WHERE kind = ?", { "it's odd" })
+            assert(#quoted == 1, "a quote in a bound value: " .. tostring(#quoted))
+            local injected = s:query("SELECT kind FROM events WHERE kind = ?",
+                                     { "x' OR 1=1 --" })
+            assert(#injected == 0, "a bound value is never SQL: " .. tostring(#injected))
+
+            -- The SQLite types come back as themselves, and a NULL column is
+            -- absent rather than present-and-null, so it reads as nil.
+            local typed = s:query(
+                "SELECT 1 AS whole, 1.5 AS fraction, 'text' AS words, NULL AS absent")
+            assert(typed[1].whole == 1 and typed[1].fraction == 1.5)
+            assert(typed[1].words == "text")
+            assert(typed[1].absent == nil, "a NULL column reads as nil")
+
+            -- Reads keep working after the handle closed.
+            s:close()
+            assert(#s:query("SELECT 1 AS one") == 1, "a closed handle still reads")
+        "#,
+        )
+        .exec()
+        .expect("query chunk");
+    }
+
+    /// `$sessions` reads across the set it was given: two streams in one
+    /// database, one statement.  This is what a session tree reads with.
+    #[test]
+    fn query_reads_across_the_session_set() {
+        let lua = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path = path.to_str().expect("utf-8 path");
+
+        lua.load(format!(
+            r#"
+            local path = "{path}"
+            local a = knl.open({{ store = {{ sqlite = path }}, owner = "a" }})
+            local b = knl.open({{ store = {{ sqlite = path }}, owner = "b" }})
+            a:append({{ kind = "from_a" }})
+            b:append({{ kind = "from_b" }})
+
+            local sql = "SELECT stream, kind FROM events WHERE stream IN $sessions \
+                         AND kind LIKE 'from_%' ORDER BY kind"
+
+            -- Both streams, one statement.
+            local both = a:query(sql, nil, {{ sessions = {{ a:id(), b:id() }} }})
+            assert(#both == 2, "both streams: " .. tostring(#both))
+            assert(both[1].kind == "from_a" and both[2].kind == "from_b")
+
+            -- Left out, the set is the asking session's own stream.
+            local mine = a:query(sql)
+            assert(#mine == 1 and mine[1].kind == "from_a", "own stream only")
+
+            -- An empty set is a mistake, not "all of them".
+            local e = failure(function() a:query(sql, nil, {{ sessions = {{}} }}) end)
+            assert(e.kind == "validation", "kind: " .. tostring(e.kind))
+            assert(e.method == "query", "method: " .. tostring(e.method))
+        "#
+        ))
+        .exec()
+        .expect("session set chunk");
+    }
+
+    /// A query reads.  Anything that writes, and anything that is two
+    /// statements, is refused as the caller's mistake — before the connection
+    /// is reached, and on a connection that could not do it anyway.
+    #[test]
+    fn query_refuses_everything_that_is_not_one_read() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "q" })
+            s:append({ kind = "note" })
+
+            for _, sql in ipairs({
+                "INSERT INTO events (stream) VALUES ('x')",
+                "UPDATE events SET kind = 'x'",
+                "DELETE FROM events",
+                "DROP TABLE events",
+                "PRAGMA table_info(events)",
+                "ATTACH DATABASE '/tmp/other.db' AS other",
+                "SELECT 1; DROP TABLE events",
+            }) do
+                local e = failure(function() s:query(sql) end)
+                assert(e.kind == "validation", sql .. " -> " .. tostring(e.kind))
+                assert(e.method == "query", sql .. " -> " .. tostring(e.method))
+            end
+
+            -- The log is exactly as it was.
+            assert(s:len() == 2, "len after the refusals: " .. tostring(s:len()))
+
+            -- And the arguments are checked too: a misspelt option is an
+            -- error rather than a limit nobody applied.
+            local e = failure(function() s:query("SELECT 1", nil, { rows = 10 }) end)
+            assert(e.kind == "validation", "kind: " .. tostring(e.kind))
+            local m = failure(function() s:query(42) end)
+            assert(m.message:find("sql must be a string", 1, true), m.message)
+        "#,
+        )
+        .exec()
+        .expect("refusal chunk");
+    }
+
+    /// The row cap is reported, so a page can be told from a whole answer.
+    #[test]
+    fn query_caps_the_rows_and_says_when_it_cut() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "q" })
+            for i = 1, 5 do s:append({ kind = "e" .. i }) end
+
+            local rows, truncated = s:query(
+                "SELECT kind FROM events ORDER BY seq", nil, { limit = 2 })
+            assert(#rows == 2, "capped rows: " .. tostring(#rows))
+            assert(truncated == true, "the cap cut rows off")
+
+            local all, whole = s:query("SELECT kind FROM events ORDER BY seq", nil, { limit = 6 })
+            assert(#all == 6 and whole == false, "nothing was cut off")
+        "#,
+        )
+        .exec()
+        .expect("limit chunk");
+    }
+
+    /// A query that will not finish is cut short and says so in its own
+    /// class — "ask again" would be the wrong advice for a slow read.
+    #[test]
+    fn query_that_runs_too_long_reports_a_timeout() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "q" })
+            local e = failure(function()
+                s:query([[WITH RECURSIVE forever(x) AS (
+                              SELECT 1 UNION ALL SELECT x + 1 FROM forever)
+                          SELECT COUNT(*) FROM forever]], nil, { timeout_ms = 50 })
+            end)
+            assert(e.kind == "timeout", "kind: " .. tostring(e.kind))
+            assert(e.method == "query", "method: " .. tostring(e.method))
+            assert(e.retryable == false, "a slow query is not a retry")
+
+            -- The session is fine afterwards: a statement ended, not the
+            -- reader.
+            assert(#s:query("SELECT 1 AS one") == 1)
+        "#,
+        )
+        .exec()
+        .expect("timeout chunk");
+    }
+
+    /// `knl.api().schema` is the read contract: the table a query names, and
+    /// its columns as SQLite reports them — including which two are the key.
+    #[test]
+    fn api_publishes_the_events_schema() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local schema = knl.api().schema
+            assert(schema.table == "events", "table: " .. tostring(schema.table))
+
+            local names, keyed = {}, {}
+            for _, column in ipairs(schema.columns) do
+                assert(type(column.name) == "string" and #column.name > 0)
+                assert(type(column.type) == "string" and #column.type > 0)
+                table.insert(names, column.name)
+                if column.pk then table.insert(keyed, column.name) end
+            end
+            assert(table.concat(names, ",")
+                   == "stream,seq,epoch_ms,kind,schema_version,payload",
+                   "columns: " .. table.concat(names, ","))
+            assert(table.concat(keyed, ",") == "stream,seq",
+                   "primary key: " .. table.concat(keyed, ","))
+
+            -- Every published column is one a query may actually name.
+            local s = knl.open({ owner = "q" })
+            local rows = s:query("SELECT " .. table.concat(names, ", ") ..
+                                 " FROM " .. schema.table .. " WHERE stream = $stream")
+            assert(#rows == 1, "the opening event: " .. tostring(#rows))
+            assert(rows[1].kind == "session_opened")
+            assert(rows[1].schema_version == 1, "the stored version is a column")
+            assert(type(rows[1].payload) == "string", "the payload stays a string")
+        "#,
+        )
+        .exec()
+        .expect("schema chunk");
     }
 }

@@ -1,9 +1,9 @@
--- backend_spec.lua — mlua-lspec unit tests for knl_adapter's Port form: the
+-- llm_port_spec.lua — mlua-lspec unit tests for knl_adapter's LLM Port: the
 -- LLMPort interface, its shared shim (LLMPort:open), and the concrete anthropic
 -- and openai providers' refusal vocabularies (classify -> { status, refusal? }).
 --
 -- Run via:
---   test_launch(code_file=".../knl_adapter/spec/backend_spec.lua",
+--   test_launch(code_file=".../knl_adapter/spec/llm_port_spec.lua",
 --               search_paths=[".../blocks/lib"])  -- so require resolves
 --
 -- Everything is tested with no network and no real provider:
@@ -37,9 +37,9 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Fakes, installed BEFORE require("knl_adapter"). The fake llm_proto only needs
--- what the module touches at load (adapter) and what the shim's retry loop
--- reuses (classify_error / retry_delay). The real provider dialect is never
--- exercised: the shim is driven by a TEST port with scripted methods.
+-- what the module touches at load (adapter) and what the Mapper reuses
+-- (response_blocks), plus the transport seam. The real provider dialect is
+-- never exercised: the shim is driven by a TEST port with scripted methods.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- proto_script drives what the fake proto.adapter's build/parse return. The
@@ -88,7 +88,7 @@ local fake_proto = {
     -- table as a JSON array (metatable { __jsontype = "array" }) and passes a
     -- non-empty one through. The fake mirrors that so the boundary tag can be
     -- asserted with no real llm_proto.
-    _response_blocks = function(content)
+    response_blocks = function(content)
         if type(content) == "table" and #content == 0 then
             return setmetatable({}, { __jsontype = "array" })
         end
@@ -333,6 +333,7 @@ describe("knl_adapter Port", function()
             wire = { url = "http://example", headers = {}, body = {} },
             result = { content = {}, usage = { input_tokens = 1, output_tokens = 0 }, stop_reason = "refusal" },
             verdict = "refused",
+            refusal = { kind = "model" },
         })
         http_script.resp = { status = 200, body = "{}", headers = {} }
 
@@ -356,7 +357,7 @@ describe("knl_adapter Port", function()
         http_script.resp = { status = 200, body = "{}", headers = {} }
         local resp_nil = port_nil:open({})({ messages = {} })
         expect(resp_nil.usage).to.equal({ input_tokens = 0, output_tokens = 0, thinking_tokens = 0 })
-        expect(shape.check(resp_nil.usage, knl_adapter.shapes.llm_result.fields.usage)).to.equal(true)
+        expect(shape.check(resp_nil.usage, knl_adapter.shapes.llm_usage)).to.equal(true)
 
         -- usage = {}
         local port_empty = make_test_port({
@@ -403,6 +404,34 @@ describe("knl_adapter Port", function()
         expect((shape.check(bad, knl_adapter.shapes.llm_result))).to.equal(false)
     end)
 
+    it("10b: a refusal without a refusal.kind is not an llm_result", function()
+        -- The status discriminates: the refused variant REQUIRES the kind,
+        -- because that is what a beat reports the refusal as. An optional
+        -- field would have said only "sometimes".
+        local without = {
+            content = setmetatable({}, { __jsontype = "array" }),
+            usage = { input_tokens = 0, output_tokens = 0, thinking_tokens = 0 },
+            status = "refused",
+        }
+        expect((shape.check(without, knl_adapter.shapes.llm_result))).to.equal(false)
+        without.refusal = { kind = "model" }
+        expect(shape.check(without, knl_adapter.shapes.llm_result)).to.equal(true)
+        -- and a kind outside the two the kernel knows is not one
+        without.refusal = { kind = "vibes" }
+        expect((shape.check(without, knl_adapter.shapes.llm_result))).to.equal(false)
+    end)
+
+    it("10c: an ok result carrying a refusal is not an llm_result either", function()
+        -- Present exactly on a refusal, in both directions.
+        local ok_with_refusal = {
+            content = setmetatable({}, { __jsontype = "array" }),
+            usage = { input_tokens = 0, output_tokens = 0, thinking_tokens = 0 },
+            status = "ok",
+            refusal = { kind = "model" },
+        }
+        expect((shape.check(ok_with_refusal, knl_adapter.shapes.llm_result))).to.equal(false)
+    end)
+
     it("11: the boundary assert_dev raises in dev mode on a Mapper violation", function()
         -- A port whose status() yields a value outside {ok, refused} makes the
         -- Mapper build a result the RESULT shape rejects — a Mapper bug. In dev
@@ -426,6 +455,43 @@ describe("knl_adapter Port", function()
             return (pcall(llm, { messages = {} }))
         end)
         expect(passed_in_dev).to.equal(false)
+    end)
+
+    it("11b: dev mode also holds a tool_use block to naming its call", function()
+        -- The kernel reads `id` and `name` straight off a tool_use block, so
+        -- a block that named neither is caught here rather than becoming a
+        -- tool_result about a tool called "".
+        local port = make_test_port({
+            wire = { url = "http://example", headers = {}, body = {} },
+            result = {
+                content = { { type = "tool_use", input = {} } },
+                usage = {},
+                stop_reason = "tool_use",
+            },
+            verdict = "ok",
+        })
+        http_script.resp = { status = 200, body = "{}", headers = {} }
+        local llm = port:open({})
+
+        local passed_in_dev = with_dev_mode(true, function()
+            return (pcall(llm, { messages = {} }))
+        end)
+        expect(passed_in_dev).to.equal(false)
+
+        -- a named one passes the same gate
+        local named = make_test_port({
+            wire = { url = "http://example", headers = {}, body = {} },
+            result = {
+                content = { { type = "tool_use", id = "c1", name = "echo", input = {} } },
+                usage = {},
+                stop_reason = "tool_use",
+            },
+            verdict = "ok",
+        })
+        local passed_named = with_dev_mode(true, function()
+            return (pcall(named:open({}), { messages = {} }))
+        end)
+        expect(passed_named).to.equal(true)
     end)
 
     it("12: non-table content is an unreadable-response (nil, err), not a raise", function()

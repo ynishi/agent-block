@@ -82,6 +82,10 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "lshape.luacats",
         include_str!("../blocks/lib/lshape/luacats.lua"),
     ),
+    (
+        "mcp_tools",
+        include_str!("../blocks/lib/mcp_tools/init.lua"),
+    ),
     ("knl", include_str!("../blocks/lib/knl/init.lua")),
     (
         "knl_adapter",

@@ -212,7 +212,8 @@ describe("knl.shapes.api — every export is declared", function()
 
     it("covers the exports the design names one by one", function()
         -- The walk above would still pass if the module lost an export and
-        -- the registry lost it too. These are the names §9-m lists.
+        -- the registry lost it too. These are the names §9-m lists, plus
+        -- the views view-design.md §3 decision 8 adds.
         for _, name in ipairs({
             "open",
             "resume",
@@ -222,6 +223,7 @@ describe("knl.shapes.api — every export is declared", function()
             "fold",
             "new_beat_id",
             "Outcome",
+            "views",
             "shapes",
         }) do
             expect(K[name]).to.exist()
@@ -395,7 +397,7 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
         -- enumerates the classes. A list retyped beside the shape is the
         -- second source of truth §9-m exists to rule out — and the third
         -- (the kernel's own `KnlError::KINDS`) is held against this one
-        -- where a bridge exists (knl_turn_test.lua, inv10).
+        -- where a bridge exists (knl_beat_test.lua, inv10).
         local declared = K.shapes.error_kinds
         expect(type(declared)).to.be("table")
         expect(#declared > 0).to.be(true)
@@ -412,6 +414,21 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
             declared[kind] = true
         end
         expect(declared.busy).to.be(true)
+    end)
+
+    it("names the class a read that ran too long comes back as", function()
+        -- The read side has a failure of its own (view-design.md §3
+        -- decision 2): a query past its deadline is interrupted, and the
+        -- class it raises is in the same closed list as every other.
+        local declared = {}
+        for _, kind in ipairs(K.shapes.error_kinds) do
+            declared[kind] = true
+        end
+        expect(declared.timeout).to.be(true)
+        -- and it validates as a reading, like any other class
+        expect(check.check({ kind = "timeout", method = "query", retryable = false, message = "…" }, K.shapes.error)).to.be(
+            true
+        )
     end)
 
     it("declares knl.error in the bridge registry, like every other syscall", function()
@@ -437,6 +454,128 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
             end
         end
         expect(listed(bad)).to.be("")
+    end)
+end)
+
+describe("knl.views — every predefined view is declared (view-design.md §3-8)", function()
+    -- The same rule as the module registry, on the read side: a view is a
+    -- named function that runs one SELECT, and the name has to be declared
+    -- or the contract is only what someone remembered to write down.
+    local views = K.shapes.views
+
+    it("declares every view the module exports", function()
+        local undeclared = {}
+        for _, name in ipairs(public_names(K.views)) do
+            if views[name] == nil then
+                undeclared[#undeclared + 1] = name
+            end
+        end
+        expect(listed(undeclared)).to.be("")
+    end)
+
+    it("declares nothing the module does not export", function()
+        local stale = {}
+        for _, name in ipairs(public_names(views)) do
+            if type(K.views[name]) ~= "function" then
+                stale[#stale + 1] = name
+            end
+        end
+        expect(listed(stale)).to.be("")
+    end)
+
+    it("gives every view an executable args list and a returns declaration", function()
+        local bad = {}
+        for _, name in ipairs(public_names(views)) do
+            local entry = views[name]
+            if type(entry) ~= "table" or not is_arg_list(entry.args) or not is_declaration(entry.returns) then
+                bad[#bad + 1] = name
+            end
+        end
+        expect(listed(bad)).to.be("")
+    end)
+
+    it("is the same table the api registry walks (one declaration, two names)", function()
+        -- `knl.shapes.views` and `knl.shapes.api.views.members` are one
+        -- table. Two would be two places to add a view to, and one of them
+        -- would eventually be missed.
+        expect(K.shapes.api.views.members).to.be(views)
+    end)
+
+    it("covers the three the design names", function()
+        for _, name in ipairs({ "beats", "tool_pairs", "ledger" }) do
+            expect(type(K.views[name])).to.be("function")
+            expect(views[name]).to.exist()
+        end
+    end)
+end)
+
+describe("knl.shapes.schema — the read schema is published as data", function()
+    -- The columns a caller writes SQL against (view-design.md §3 decision
+    -- 4). It is checked for being well formed here, and held against the
+    -- kernel's own declaration where a bridge exists (knl_beat_test.lua,
+    -- inv11) — the same two-sided arrangement as the syscall registries.
+    local schema = K.shapes.schema
+
+    it("names the table and lists its columns", function()
+        expect(type(schema)).to.be("table")
+        expect(schema.table).to.be("events")
+        expect(type(schema.columns)).to.be("table")
+        expect(#schema.columns > 0).to.be(true)
+    end)
+
+    it("gives every column a name, a type and a pk flag", function()
+        local bad = {}
+        for i, column in ipairs(schema.columns) do
+            if
+                type(column) ~= "table"
+                or type(column.name) ~= "string"
+                or type(column.type) ~= "string"
+                or type(column.pk) ~= "boolean"
+            then
+                bad[#bad + 1] = "column[" .. i .. "]"
+            end
+        end
+        expect(listed(bad)).to.be("")
+    end)
+
+    it("declares the primary key the store's rows are ordered by", function()
+        local pk = {}
+        for _, column in ipairs(schema.columns) do
+            if column.pk then
+                pk[#pk + 1] = column.name
+            end
+        end
+        expect(listed(pk)).to.be("seq,stream")
+    end)
+
+    it("carries the payload column a view reads the event out of", function()
+        local names = {}
+        for _, column in ipairs(schema.columns) do
+            names[column.name] = true
+        end
+        -- `kind` is the indexed column a kind-filtered view uses;
+        -- `payload` is where everything else (a `beat` included) is.
+        expect(names.kind).to.be(true)
+        expect(names.payload).to.be(true)
+    end)
+end)
+
+describe("knl.shapes.query_opts — what a read may ask for beyond the SQL", function()
+    it("is a closed shape (an unknown option must not quietly do nothing)", function()
+        expect(is_shape(K.shapes.query_opts)).to.be(true)
+        expect(rawget(K.shapes.query_opts, "open")).to.be(false)
+    end)
+
+    it("accepts a set of sessions, a timeout and a limit, all optional", function()
+        expect(check.check({}, K.shapes.query_opts)).to.be(true)
+        expect(check.check({ sessions = { "a", "b" }, timeout_ms = 250, limit = 10 }, K.shapes.query_opts)).to.be(true)
+        expect(check.check({ sessions = { 1 } }, K.shapes.query_opts)).to.be(false)
+        expect(check.check({ nonsense = true }, K.shapes.query_opts)).to.be(false)
+    end)
+
+    it("is the shape session:query's third argument is declared with", function()
+        expect(K.shapes.session.query).to.exist()
+        expect(K.shapes.session.query.args[3]).to.be(K.shapes.query_opts)
     end)
 end)
 

@@ -244,17 +244,17 @@ describe("what the backend returns", function()
 
     it("passes the model's blocks through untouched", function()
         local blocks = { { type = "thinking", thinking = "..." }, { type = "text", text = "hi" } }
-        expect(proto._response_blocks(blocks)).to.equal(blocks)
+        expect(proto.response_blocks(blocks)).to.equal(blocks)
 
         -- No blocks: an empty array, said in the one way an empty Lua table
         -- can say it.
-        local empty = proto._response_blocks({})
+        local empty = proto.response_blocks({})
         expect(#empty).to.equal(0)
         expect(getmetatable(empty).__jsontype).to.equal("array")
 
         -- Not blocks at all: handed on as it came, for the kernel to refuse.
         for _, odd in ipairs({ "not a table", 42 }) do
-            expect(proto._response_blocks(odd)).to.equal(odd)
+            expect(proto.response_blocks(odd)).to.equal(odd)
         end
     end)
 

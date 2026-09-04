@@ -14,7 +14,8 @@
 --
 -- Expected: the model calls the `add` tool once, the pair lands in the
 -- history under that beat's id, and the final beat settles on a plain
--- answer. The script prints `[E2E] all_ok` at the end.
+-- answer. The run is then read back with `knl.views.beats` — one SELECT over
+-- the log, one row per beat. The script prints `[E2E] all_ok` at the end.
 
 local kernel = require("knl")
 local adapter = require("knl_adapter")
@@ -52,7 +53,7 @@ local device = kernel.device({
     system = "You are a terse assistant. Use the add tool for any arithmetic.",
 })
 
--- The loop's own cap: knl has no max_turns config — the loop lives inside
+-- The loop's own cap: knl has no beat cap of its own — the loop lives inside
 -- the bracket, and the stopping guarantee is the budget the owner granted.
 -- It is the tighter of the two bounds below, so this run ends on the model
 -- rather than on the quota; a run that did hit the grant would come back
@@ -128,15 +129,15 @@ kernel.session({
         end,
     })
 
-    -- One id per beat, declared by the shell: group the record by it.
-    local seen, ids = {}, {}
+    -- One id per beat, declared by the shell — and the grouping is a read,
+    -- not a loop written here: `knl.views.beats` runs one SELECT over the
+    -- log and answers a row per beat (view-design.md §2). A consumer's own
+    -- view is a function of exactly this form.
+    local grouped = kernel.views.beats(s)
+
     local kinds = {}
     for _, ev in ipairs(s:events()) do
         kinds[#kinds + 1] = ev.kind
-        if ev.beat ~= nil and not seen[ev.beat] then
-            seen[ev.beat] = true
-            ids[#ids + 1] = ev.beat
-        end
     end
 
     local usage = s:view("usage")
@@ -144,7 +145,7 @@ kernel.session({
         string.format(
             "[E2E] beats=%d declared=%d usage: calls=%s in=%s out=%s remaining=%s",
             beats,
-            #ids,
+            #grouped,
             tostring(usage.model_calls),
             tostring(usage.input_tokens),
             tostring(usage.output_tokens),
@@ -152,7 +153,18 @@ kernel.session({
         )
     )
     print("[E2E] history: " .. table.concat(kinds, ","))
-    print("[E2E] last beat: " .. tostring(ids[#ids]))
+    for i, row in ipairs(grouped) do
+        print(
+            string.format(
+                "[E2E] beat %d: %s seq %s..%s kinds=%s",
+                i,
+                tostring(row.beat),
+                tostring(row.seq_from),
+                tostring(row.seq_to),
+                tostring(row.kinds)
+            )
+        )
+    end
 end)
 
 print("[E2E] all_ok")

@@ -41,6 +41,17 @@
 ---   only that it be a string; grouping and ordering read it back, nothing
 ---   more. `resp.beat` carries the same id out to the caller.
 ---
+--- Reading the log back (view-design.md)
+---   The log is a SQLite table whose columns the kernel publishes
+---   (`knl.shapes.schema`), and a caller reads it by writing SQL:
+---   `session:query(sql, params?, opts?)` binds values, refuses anything
+---   that is not one SELECT / WITH, and resolves `$stream` (this session)
+---   and `$sessions` (`opts.sessions`, the set to read across). A "view" is
+---   nothing more than a named function that runs one of those statements —
+---   `knl.views.beats` / `tool_pairs` / `ledger` are the three the kernel
+---   ships, and a consumer writes its own in exactly the same form. The
+---   kernel's built-in `events` / `usage` / `tail` are unaffected.
+---
 --- The budget (budget-design.md §2)
 ---   The budget is a quota the owner granted the session, not a tally of
 ---   what it used. beat asks for permission BEFORE it calls —
@@ -161,8 +172,8 @@ end
 
 --- The beat did not come off: the mechanism failed. `kind` is one of the
 --- kernel's own failure points — "conf", "filter", "call" or "state" (a
---- record that could not be laid down: closed session, CAS head conflict,
---- event validation).
+--- record that could not be laid down: closed session, a store that would
+--- not take the write, event validation).
 ---
 --- Two vocabularies meet on this value and they answer different questions.
 --- `kind` here names the STAGE of the beat that failed. What the failure
@@ -280,7 +291,7 @@ end
 ---   msg_user     -> { role = "user", content = <verbatim> }
 ---   llm_response -> { role = "assistant", content = <verbatim> }
 ---   tool_result  -> collected, in seq order, into the user message that
----                   follows the assistant turn they answer (consecutive
+---                   follows the assistant message they answer (consecutive
 ---                   tool_results batch together, which for a well-formed
 ---                   history is the same as grouping by beat)
 ---
@@ -290,7 +301,7 @@ end
 --- What "provider-neutral" names here
 ---   Neutral is a choice of shape, not the absence of one: the request and
 ---   response this fold speaks ARE the Anthropic content-block shape. An
----   assistant turn is an array of blocks, a `tool_use` block carries a call
+---   assistant message is an array of blocks, a `tool_use` block carries a call
 ---   and a `tool_result` block answers it by `tool_use_id`. `close_dangling`
 ---   below depends on exactly that — it pairs the `tool_use` ids of an
 ---   assistant message against the results that answered them, a repair no
@@ -428,9 +439,9 @@ local CALLABLE = T.any_of({ FUNCTION, T.table, USERDATA })
 
 --- A session handle, as a shape: the kernel's own userdata, or the faithful
 --- Lua stand-in a spec drives a beat with. Which methods it must answer is
---- `is_session`'s duck-type (append / reserve / events) and no schema can ask
---- a userdata that — so this says the two types the handle can have, and the
---- entry point that receives one still makes the real judgement.
+--- `is_session`'s duck-type (the whole declared surface) and no schema can
+--- ask a userdata that — so this says the two types the handle can have, and
+--- the entry point that receives one still makes the real judgement.
 local SESSION_HANDLE = T.any_of({ T.table, USERDATA })
 
 --- The STAGE of a beat an `error` Outcome names (see `Outcome.err`). One
@@ -571,35 +582,72 @@ local REFUSAL = T.shape({
     detail = T.string:is_optional(),
 }, { open = false })
 
+--- What a `tool_use` block inside a response names: the id the tool_result
+--- will answer, and the tool to run. beat reads both straight off the block
+--- — an unnamed call is the llm breaking this contract, not a hole for the
+--- kernel to fill with an empty string.
+---
+--- Open, and about `tool_use` alone: what else a block may carry (`input`,
+--- and whatever a provider adds) is the provider's vocabulary, and this
+--- layer has no business closing it.
+local TOOL_USE_BLOCK = T.shape({
+    type = T.literal("tool_use"),
+    id = T.string,
+    name = T.string,
+})
+
 --- What `device.llm(request)` hands back — the shape beat reads at [5],
 --- and the one an adapter's Mapper is held to on the way out (knl_adapter
---- asserts against this very table). Closed, so a contract gap in one
---- provider's parse cannot leak past the boundary: `content` is an array
---- of blocks (tagged as an empty array when the model said nothing, so it
---- crosses the JSON bridge as `[]`), `usage` is the strict count above,
---- `stop_reason` is absent when no reason was given, and `refusal` is
---- present exactly on "refused".
+--- asserts against this very table). Two statuses and no more: a transport
+--- or provider failure is not a variant here, because that path answers
+--- `nil, err` (or raises), which beat records as `llm_call_failed` and
+--- reports as `err("call")`.
 ---
---- The third status a beat can meet — a transport / provider failure — is
---- not a variant here: that path answers `nil, err` (or raises), which
---- beat records as `llm_call_failed` and reports as `err("call")`.
-local LLM_RESULT = T.shape({
-    content = T.array_of(T.table),
-    usage = USAGE,
-    stop_reason = T.string:is_optional(),
-    status = T.one_of({ "ok", "refused" }),
-    refusal = REFUSAL:is_optional(),
-}, { open = false })
+--- Discriminated on `status` rather than one shape with an optional
+--- `refusal`, because "present exactly on a refusal" is the contract and an
+--- optional field says only "sometimes". A refusal that named no `kind`
+--- would leave beat with nothing to report the refusal AS.
+---
+--- Both variants are closed, so a contract gap in one provider's parse
+--- cannot leak past the boundary: `content` is an array of blocks (tagged
+--- as an empty array when the model said nothing, so it crosses the JSON
+--- bridge as `[]`), `usage` is the strict count above, and `stop_reason` is
+--- absent when no reason was given.
+---
+--- The per-block rule above rides beside this shape rather than inside it:
+--- it applies to one `type` of block and lshape has no combinator for
+--- "strict for this variant, open for the rest" that would not also close
+--- the block vocabulary.
+local LLM_RESULT = T.discriminated("status", {
+    ok = T.shape({
+        status = T.literal("ok"),
+        content = T.array_of(T.table),
+        usage = USAGE,
+        stop_reason = T.string:is_optional(),
+    }, { open = false }),
+    refused = T.shape({
+        status = T.literal("refused"),
+        content = T.array_of(T.table),
+        usage = USAGE,
+        stop_reason = T.string:is_optional(),
+        refusal = REFUSAL,
+    }, { open = false }),
+})
 
 --- Every class a kernel failure can have, in one closed list — the Lua
 --- side of the Rust `KnlError::KINDS` (session-device-design.md §9-r).
 ---
 --- One constant, used by the shape below and by the check that holds this
 --- declaration against the bridge's own (`knl.api().errors`, compared in
---- `tests/fixtures/knl_turn_test.lua` inv10, the test that has a bridge).
+--- `tests/fixtures/knl_beat_test.lua` inv10, the test that has a bridge).
 --- Retyping the list beside the shape would make a second place to keep in
 --- step, which is the thing §9-m exists to rule out.
-local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported" }
+---
+--- `timeout` is the read side's own class (view-design.md §3 decision 2): a
+--- `session:query` that ran past its deadline was interrupted, and it is not
+--- retryable — the same statement over the same data would run just as long.
+--- `busy` remains the one class the kernel calls worth asking about again.
+local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported", "timeout" }
 
 --- A raised kernel failure, read back as data (`knl.error(e)`, §9-r).
 ---
@@ -625,10 +673,70 @@ local ERROR = T.shape({
     cause = T.string:is_optional(),
 })
 
+--- What a caller asks for beyond the SQL itself (view-design.md §2).
+---
+--- `sessions` is the set `$sessions` expands to — the streams this read
+--- spans, which is how one statement reads a session tree or a set of
+--- sessions that were split and are being read back together. Omitted, it is
+--- the session's own stream and nothing else. The kernel expands the token
+--- into one bound placeholder per id and binds them; whether the caller may
+--- read those streams is not the kernel's judgement (decision 3: identity
+--- lives outside the kernel).
+---
+--- `timeout_ms` and `limit` are whole numbers with kernel defaults (5000 ms,
+--- 1000 rows). lshape has no integer prim, so the whole-number expectation
+--- rides in this doc, like `budget_grant`'s `amount`.
+---
+--- Closed: an option the kernel does not know must not quietly do nothing.
+local QUERY_OPTS = T.shape({
+    sessions = T.array_of(T.string):is_optional(),
+    timeout_ms = T.number:is_optional(),
+    limit = T.number:is_optional(),
+}, { open = false })
+
+--- The read schema, as data: the kernel's table and its columns, published
+--- as the contract a caller writes SQL against (view-design.md §3 decision
+--- 4, persistence-design.md §3.2).
+---
+--- This is plain data rather than an lshape schema on purpose — it describes
+--- a SQL table, not a Lua value, and what it is FOR is to be compared:
+--- `knl.api().schema` answers the same declaration from the kernel's side
+--- and `tests/fixtures/knl_beat_test.lua` (inv11) holds the two against each
+--- other, exactly as inv10 does for the syscall registries. Adding a column
+--- is compatible; renaming or dropping one is a breaking change on the same
+--- footing as changing a stored event's shape.
+---
+--- The event itself is the whole JSON object under `payload` — every field a
+--- caller wrote, `beat` included — so a view reaches one with
+--- `json_extract(payload, '$.beat')`. `kind` is the one payload field that is
+--- also a column (it is what the store indexes on), and reading it from the
+--- column rather than out of the JSON is what makes a kind-filtered view cost
+--- the size of the filter.
+---
+--- The column is `payload`, which is what the table declares and therefore
+--- what the kernel publishes — it reads its own answer back with `PRAGMA
+--- table_info` [実測: sqlite_store.rs `SqliteEventStore::schema`], so the name
+--- here is the table's, not a doc's. (persistence-design.md §3.2 writes it as
+--- `payload_json` in prose; the implementation never used that spelling, and
+--- the table is the contract.)
+local EVENTS_SCHEMA = {
+    table = "events",
+    columns = {
+        { name = "stream", type = "TEXT", pk = true },
+        { name = "seq", type = "INTEGER", pk = true },
+        { name = "epoch_ms", type = "INTEGER", pk = false },
+        { name = "kind", type = "TEXT", pk = false },
+        { name = "schema_version", type = "INTEGER", pk = false },
+        { name = "payload", type = "TEXT", pk = false },
+    },
+}
+
 --- The contracts this module holds itself to, as data.
 M.shapes = {
     outcome = OUTCOME,
     error = ERROR,
+    query_opts = QUERY_OPTS,
+    schema = EVENTS_SCHEMA,
     -- The vocabulary as a list, next to the shape that closes on it: a
     -- caller enumerating the classes reads the same constant the shape does.
     error_kinds = ERROR_KINDS,
@@ -639,6 +747,8 @@ M.shapes = {
     tool_policy_decision = TOOL_POLICY_DECISION,
     cost_result = COST_RESULT,
     llm_result = LLM_RESULT,
+    llm_usage = USAGE,
+    tool_use_block = TOOL_USE_BLOCK,
     open_opts = OPEN_OPTS,
     resume_opts = RESUME_OPTS,
     budget_grant = BUDGET_GRANT,
@@ -675,7 +785,7 @@ M.shapes = {
 --- This registry covers the Lua module. The bridge declares its own surface
 --- through `knl.api()` (SESSION_API / MODULE_API in bridge/knl.rs), and
 --- `M.shapes.session` / `M.shapes.module` below describe that surface from
---- this side; `tests/fixtures/knl_turn_test.lua` (inv10, runs with the
+--- this side; `tests/fixtures/knl_beat_test.lua` (inv10, runs with the
 --- bridge) checks the two against each other in both directions, so a
 --- syscall added on one side and not the other goes red.
 M.shapes.session = {
@@ -686,6 +796,15 @@ M.shapes.session = {
     events = { args = { "integer from?" }, returns = T.array_of(EVENT_BASE) },
     len = { args = "none", returns = "integer" },
     view = { args = { T.one_of({ "usage", "tail" }), "table opts?" }, returns = "table (the named fold)" },
+    -- The SQL read (view-design.md §2). The statement is the caller's and
+    -- the kernel touches two things in it: it refuses anything that is not
+    -- one SELECT / WITH, and it expands `$sessions` into one bound
+    -- placeholder per id. Values are bound, never interpolated — `$stream`
+    -- is the session's own id, `?` / `:name` are the caller's own.
+    query = {
+        args = { "string sql (one SELECT / WITH; anything else raises validation)", "table params?", QUERY_OPTS },
+        returns = "rows, truncated — { { col = value }, ... } and whether the row limit cut them off",
+    },
     reserve = { args = { "integer n >= 0" }, returns = "true | false, tag — decided inside the store" },
     -- The write is the whole result: spend records the deduction and
     -- answers nothing. What is left is a separate reading (`remaining`), so
@@ -718,6 +837,37 @@ M.shapes.module = {
 local function arg_of(schema, desc)
     return { shape = schema, desc = desc }
 end
+
+--- The arguments every predefined view takes: the session whose store is
+--- read, and the query options (the set of streams above all) passed
+--- straight through to `session:query`.
+local function view_args()
+    return { arg_of(SESSION_HANDLE, "session"), arg_of(QUERY_OPTS, "opts?") }
+end
+
+--- The predefined views, declared (view-design.md §3 decision 8).
+---
+--- One table, published twice: as `knl.shapes.views` (the registry a caller
+--- reads) and as the `members` of the `views` entry below (what the dev-mode
+--- gate walks and what `api_spec` holds `knl.views` against). Two names for
+--- one table rather than two tables, so a view cannot be declared in one
+--- place and missed in the other.
+local VIEWS = {
+    beats = {
+        args = view_args(),
+        returns = "{ { beat, seq_from, seq_to, kinds }, ... }, truncated — one row per beat, in first-seq order",
+    },
+    tool_pairs = {
+        args = view_args(),
+        returns = "{ { beat, call_id, name, ok }, ... }, truncated — one row per answered tool call",
+    },
+    ledger = {
+        args = view_args(),
+        returns = "{ { seq, kind, amount, tag }, ... }, truncated — the budget_* events in seq order",
+    },
+}
+
+M.shapes.views = VIEWS
 
 M.shapes.api = {
     open = {
@@ -779,9 +929,17 @@ M.shapes.api = {
             },
         },
     },
+    views = {
+        -- A namespace table like `Outcome`: nothing to hold here, and the
+        -- members are the views themselves — which is what the gate wraps
+        -- and what `api_spec` walks.
+        args = {},
+        returns = "the predefined views: fn(session, opts?) -> rows",
+        members = VIEWS,
+    },
     shapes = {
         args = {},
-        returns = "this registry: every shape above, plus `api`, `session` and `module`",
+        returns = "this registry: every shape above, plus `api`, `session`, `module` and `views`",
     },
 }
 
@@ -1257,23 +1415,90 @@ end
 -- beat — one complete beat (the primitive; there is no loop here)
 -- ============================================================
 
---- Whether `s` answers the part of the session surface a beat uses. A
---- duck-type on purpose: the real handle is Rust userdata with no metatable
---- name of its own, and a faithful Lua stand-in must be beatable too.
+--- The session surface, as names: every method `knl.shapes.session`
+--- declares that a caller can reach (`__close` is the metamethod, reached by
+--- the language and not by a call).
+local SESSION_METHODS = {
+    "id",
+    "scope_id",
+    "owner",
+    "append",
+    "events",
+    "reserve",
+    "spend",
+    "remaining",
+    "exhausted",
+    "close",
+}
+
+--- Whether `s` is a session handle.
+---
+--- Duck-typing is not a preference here, it is the only test available: the
+--- real handle is Rust userdata whose metatable mlua protects, so
+--- `getmetatable` answers a boolean rather than the table, and there is no
+--- name to compare against from Lua. What is left is to ask the value what
+--- it can do.
+---
+--- So it is asked for the WHOLE declared surface, not the three methods a
+--- beat happens to call. A stand-in that answers `append` / `reserve` /
+--- `events` and nothing else is not a session — it is a table that would
+--- pass the gate and then fail somewhere further in, on a `remaining()` or
+--- a `close()` a caller had every right to make. Widening the check is what
+--- keeps a spec's fake honest to the surface it stands in for.
 local function is_session(s)
     local t = type(s)
     if t ~= "table" and t ~= "userdata" then
         return false
     end
-    local ok, append, reserve, events = pcall(function()
-        return s.append, s.reserve, s.events
-    end)
-    return ok and callable(append) and callable(reserve) and callable(events)
+    for _, method in ipairs(SESSION_METHODS) do
+        local ok, value = pcall(function()
+            return s[method]
+        end)
+        if not ok or not callable(value) then
+            return false
+        end
+    end
+    return true
 end
 
 --- Append an event this beat is writing, through the dev-mode contract.
 local function record(session, ev)
     return session:append(assert_event_dev(ev))
+end
+
+--- What is wrong with an llm's answer, or nil when nothing is.
+---
+--- `device.llm` promises one of two things: an `llm_result` (`knl.shapes`),
+--- or `nil` and an error. The result has exactly two statuses, a `usage` the
+--- adapter has already normalized into three counts, and — on a refusal —
+--- the `refusal.kind` that says what refused. An answer that keeps none of
+--- that is a broken adapter, and beat ends the beat the way any other failed
+--- call ends rather than filling the gaps in: a defaulted usage would put a
+--- count nobody reported into the history, and a refusal reported as
+--- "refused" would be beat naming a reason it was never given.
+---
+--- @param resp any  whatever `device.llm` answered
+--- @return string|nil  the violation, or nil when the answer is well formed
+local function llm_contract_violation(resp)
+    if type(resp) ~= "table" then
+        if resp == nil then
+            return "llm answered neither a result nor an error"
+        end
+        return "llm returned " .. type(resp) .. " (the contract is a table, or nil and an error)"
+    end
+    if resp.status ~= "ok" and resp.status ~= "refused" then
+        return "llm answered status " .. tostring(resp.status) .. ' (llm_result is "ok" or "refused")'
+    end
+    if type(resp.usage) ~= "table" then
+        return "llm answered a " .. type(resp.usage) .. " usage (llm_result promises the three counts)"
+    end
+    if resp.status == "refused" and type(resp.refusal) ~= "table" then
+        return "llm refused without a refusal (llm_result promises refusal.kind on a refusal)"
+    end
+    if resp.status == "refused" and type(resp.refusal.kind) ~= "string" then
+        return "llm refused without a refusal.kind (llm_result promises the class that refused)"
+    end
+    return nil
 end
 
 --- Ask the policy about one tool_use block (session-device-design.md §9-l).
@@ -1365,8 +1590,13 @@ local function execute_tools(session, device, out, beat_id)
     local summary = {}
     for _, item in ipairs(planned) do
         local block = item.block
-        local call_id = tostring(block.id or "")
-        local name = tostring(block.name or "")
+        -- Read, not repaired. A `tool_use` block names its call id and its
+        -- tool (`knl.shapes.tool_use_block`); a block that named neither is
+        -- the llm breaking that contract, and standing an empty string in
+        -- for the missing name would turn it into a tool_result about a
+        -- tool called "" — a fabricated fact in a durable record.
+        local call_id = block.id
+        local name = block.name
         local args = block.input or {}
 
         -- Record the call before running it: a run that dies mid-tool
@@ -1399,8 +1629,11 @@ local function execute_tools(session, device, out, beat_id)
             end
         end
 
-        -- `result` must be present for a tool_result; a handler that
-        -- answered with nil gets the empty string in the record.
+        -- The empty result, defined: a tool_result carries a `result`, and a
+        -- handler that answered nothing answered the empty string. This is
+        -- the rule, not a stand-in for a missing value — "the tool ran and
+        -- produced no output" is a real outcome, and it is what a later fold
+        -- sends back to the model.
         if result == nil then
             result = ""
         end
@@ -1538,7 +1771,7 @@ function M.beat(session, device)
     -- [4] record the request write-ahead (open kind "llm_request") --------
     -- The request as actually sent is a fact in the history before the call,
     -- so a call that then fails leaves the llm_request event behind.  An append
-    -- can fail (closed session, CAS head conflict, validation) — beat's
+    -- can fail (closed session, an unavailable store, validation) — beat's
     -- contract is an Outcome, so a state failure is Error("state"), never
     -- a raw raise.
     local rec_ok, rec_err = pcall(record, session, {
@@ -1551,12 +1784,12 @@ function M.beat(session, device)
     end
 
     -- [5] beat calls the llm directly ------------------------------------
-    -- resp = { status = "ok"|"refused"|"error", content, usage, stop_reason }.
-    -- The status is the adapter's judgement; beat reads it, it does not
-    -- invent one (status is llm-supplied).  The call is caught: an adapter
-    -- that raises (instead of returning nil, err) is still a call failure,
-    -- not an escape from the Outcome contract — and it is the caller's own
-    -- code, so the raise is traced (dev mode).
+    -- resp = an `llm_result`: { status = "ok"|"refused", content, usage,
+    -- stop_reason?, refusal? }.  The status is the adapter's judgement; beat
+    -- reads it, it does not invent one (status is llm-supplied).  The call is
+    -- caught: an adapter that raises (instead of returning nil, err) is still
+    -- a call failure, not an escape from the Outcome contract — and it is the
+    -- caller's own code, so the raise is traced (dev mode).
     local call_ok, resp, berr = xpcall(device.llm, traced, request)
     local raised
     if not call_ok then
@@ -1565,26 +1798,24 @@ function M.beat(session, device)
         resp = nil
     end
 
-    -- [6] status branch — beat lays down the record -----------------------
-    -- error / transport failure: the beat did not come off. Note it and stop.
-    -- The failure note is best-effort (the state may be what failed); the
-    -- call error stays the primary detail either way.
+    -- [6] the answer, held to its contract --------------------------------
+    -- One ending for every way the call did not come off: a transport or
+    -- provider failure (`nil, err` — its own message is the reason), a raise,
+    -- or an answer that is not an `llm_result`. Note it and stop.  The
+    -- failure note is best-effort (the state may be what failed); the call
+    -- error stays the primary detail either way.
     --
-    -- Anything that is not a table is that same failure: an adapter whose
-    -- contract is `resp | nil, err` and that answered `false` / a string /
-    -- a number has not produced a response, and reading `.status` off it
-    -- would raise (or, for a string, quietly find the string library).
-    if type(resp) ~= "table" or resp.status == "error" then
-        local reason = berr
-        if reason == nil then
-            if type(resp) == "table" then
-                reason = resp.detail or "llm reported error"
-            elseif resp == nil then
-                reason = "llm reported error"
-            else
-                reason = "llm returned " .. type(resp) .. " (the contract is a table, or nil and an error)"
-            end
-        end
+    -- The contract is judged rather than worked around. There is no third
+    -- status to read (`llm_result` has two, and a failure is `nil, err`), no
+    -- usage to default and no refusal reason to invent: an adapter that broke
+    -- its promise has produced no response, and this is where that is said.
+    local reason
+    if type(resp) ~= "table" then
+        reason = berr or llm_contract_violation(resp)
+    else
+        reason = llm_contract_violation(resp)
+    end
+    if reason ~= nil then
         local noted_ok, note_err = pcall(record, session, {
             kind = "llm_call_failed",
             beat = beat_id,
@@ -1604,17 +1835,16 @@ function M.beat(session, device)
         end
         return emit(Outcome.err("call", raised_detail(tostring(reason), raised)))
     end
-    -- ok / refused: the model answered. Appending the llm_response is
-    -- what records it, under this beat's id, and it charges nothing (the
-    -- quota was settled at [3]).  `usage` defaults to an empty count: the
-    -- llm contract leaves it optional, but the kernel validator requires
-    -- the field on an llm_response (the Lua/Rust contract meet in the
-    -- middle here).
+    -- ok / refused: the model answered. Appending the llm_response is what
+    -- records it, under this beat's id, and the budget does not move (the
+    -- quota was settled at [3]).  The counts go in as they came: the adapter
+    -- normalized them to three numbers on its way out, so there is nothing
+    -- here to default and nothing to invent.
     local resp_ok, resp_err = pcall(record, session, {
         kind = "llm_response",
         beat = beat_id,
         content = resp.content,
-        usage = resp.usage or {},
+        usage = resp.usage,
         stop_reason = resp.stop_reason,
     })
     if not resp_ok then
@@ -1622,9 +1852,13 @@ function M.beat(session, device)
     end
     resp.beat = beat_id
     -- A refusal is a recorded response the model would not build on — and
-    -- the beat that produced it reserved its amount like any other.
+    -- the beat that produced it reserved its amount like any other. What
+    -- refused is the adapter's classification (`refusal.kind`: the model
+    -- itself, or a provider's filter), which is the one place that judgement
+    -- is made; `stop_reason` is the provider's own word for the same moment
+    -- and beat does not translate one into the other.
     if resp.status == "refused" then
-        return emit(Outcome.refused(resp.stop_reason or "refused", resp))
+        return emit(Outcome.refused(resp.refusal.kind, resp))
     end
 
     -- [7] tool execution (skeleton) --------------------------------------
@@ -1649,9 +1883,182 @@ function M.beat(session, device)
     return emit(Outcome.ok(resp))
 end
 
--- Internals exposed for the spec (the fixture drives these directly).
+-- An internal exposed for the spec, which drives it directly.
 M._execute_tools = execute_tools
-M._wire_tools = wire_tools
+
+-- ============================================================
+-- views — the predefined reads (view-design.md §2)
+-- ============================================================
+--
+-- A view is a named function that runs one SELECT. That is the whole of the
+-- mechanism: no builder, no query object, no registration hook. The kernel
+-- publishes the table (`knl.shapes.schema`) and a caller writes SQL against
+-- it, and these three are the ones the kernel ships because they read what
+-- the kernel itself wrote — the beat grouping it stamps, the tool pairs it
+-- closes, the ledger it keeps. A consumer's own view is a function of
+-- exactly this form in exactly this way (`local function tool_error_rate(s)
+-- return s:query([[...]]) end`); nothing here is privileged.
+--
+-- They do not duplicate the built-in views. `events` / `usage` / `tail` stay
+-- the kernel's own (d3-input rev 2), and `usage` in particular is not
+-- rewritten as SQL here.
+--
+-- Two rules hold for every statement below and for a consumer's own:
+--
+--   * the streams being read are named by `$sessions`, never spliced in.
+--     The kernel expands the token into one bound placeholder per id, so an
+--     id is a value like any other and `opts.sessions` reads a set of
+--     sessions with the same SQL that reads one;
+--   * no value is concatenated into the text. What is written into these
+--     statements is column names, the kernel's own kind vocabulary, and
+--     nothing that came from a caller.
+--
+-- `beat` is not a column. It is a field of the stored event, which lives
+-- whole in the `payload` column, so every view reaches it with
+-- `json_extract(payload, '$.beat')` [実測: sqlite_store.rs `insert_row`
+-- writes the entire event object into the payload column; event.rs
+-- `FIELD_BEAT` is a top-level field of that object].
+
+--- One row per beat: where it starts, where it ends, and what it wrote.
+---
+--- `kinds` is the beat's events in `seq` order, comma-joined. The order
+--- comes from the ordered subquery rather than from `group_concat(kind ORDER
+--- BY seq)`: the aggregate's own ORDER BY needs SQLite 3.44, and SQLite may
+--- not flatten a subquery with an ORDER BY into an aggregating outer query,
+--- so the rows reach the aggregate in the order the subquery put them.
+---
+--- Events with no `beat` — the session's own boundaries, the ledger, a
+--- caller's seed message — are not part of any beat and are left out.
+local BEATS_SQL = [[
+SELECT beat,
+       MIN(seq)           AS seq_from,
+       MAX(seq)           AS seq_to,
+       group_concat(kind) AS kinds
+  FROM (SELECT json_extract(payload, '$.beat') AS beat,
+               stream,
+               seq,
+               kind
+          FROM events
+         WHERE stream IN $sessions
+           AND json_extract(payload, '$.beat') IS NOT NULL
+         ORDER BY stream, seq)
+ GROUP BY beat
+ ORDER BY seq_from, beat
+]]
+
+--- The tool pairs: a `tool_call` and the `tool_result` that answered it,
+--- joined on the call id within one stream.
+---
+--- A call id is unique to the stream that minted it, so the join carries
+--- `r.stream = c.stream` — without it a set of sessions read together could
+--- pair one session's call with another's result.
+---
+--- A call with no result is not a pair and does not appear. That is the
+--- point of the view: what it lists is the calls that were answered, and a
+--- call left open by a run that died mid-tool is visible as its absence
+--- (`beats` still shows the `tool_call` in its `kinds`).
+local TOOL_PAIRS_SQL = [[
+SELECT json_extract(c.payload, '$.beat')    AS beat,
+       json_extract(c.payload, '$.call_id') AS call_id,
+       json_extract(c.payload, '$.name')    AS name,
+       json_extract(r.payload, '$.ok')      AS ok
+  FROM events AS c
+  JOIN events AS r
+    ON r.stream = c.stream
+   AND r.kind = 'tool_result'
+   AND json_extract(r.payload, '$.call_id') = json_extract(c.payload, '$.call_id')
+ WHERE c.stream IN $sessions
+   AND c.kind = 'tool_call'
+ ORDER BY c.stream, c.seq
+]]
+
+--- The budget ledger: every `budget_*` event in order, with the amount and
+--- the grant's tag read out of the payload.
+---
+--- The four kinds are named rather than matched with a `LIKE 'budget_%'`:
+--- they are the closed vocabulary the balance is a fold of (event.rs), and
+--- `kind` is an indexed column, so naming them keeps the read the size of
+--- the ledger rather than the size of the stream.
+local LEDGER_SQL = [[
+SELECT seq,
+       kind,
+       json_extract(payload, '$.amount') AS amount,
+       json_extract(payload, '$.tag')    AS tag
+  FROM events
+ WHERE stream IN $sessions
+   AND kind IN ('budget_granted', 'budget_reserved', 'budget_refused', 'budget_spent')
+ ORDER BY stream, seq
+]]
+
+--- Run one view's statement over `session`.
+---
+--- The options are the caller's, passed through untouched: `sessions` is
+--- what makes a view span a set of streams, and `timeout_ms` / `limit` are
+--- the same knobs any other read has. No view takes parameters of its own —
+--- the only values any of them binds are the stream ids the kernel resolves
+--- from `$sessions`.
+---
+--- `truncated` is handed back beside the rows rather than dropped: a view
+--- that had more rows than the limit allowed has said so, and swallowing
+--- that would leave a caller to guess from a suspiciously round count.
+local function read_view(session, sql, opts)
+    return session:query(sql, nil, opts)
+end
+
+--- Whether a stored `ok` is true.
+---
+--- SQLite has no boolean: `json_extract` answers 1 / 0 for a JSON true /
+--- false, and that is what crosses the bridge. The view declares an `ok`, so
+--- the reading back into a boolean happens here — once, in the layer that
+--- promised it — rather than in every caller.
+local function truthy(value)
+    return value == true or value == 1
+end
+
+M.views = {}
+
+--- One row per beat: `{ beat, seq_from, seq_to, kinds }`.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` to span a set of streams)
+--- @return table rows
+--- @return boolean truncated
+function M.views.beats(session, opts)
+    return read_view(session, BEATS_SQL, opts)
+end
+
+--- One row per answered tool call: `{ beat, call_id, name, ok }`.
+---
+--- The rows are rebuilt rather than edited in place, so reading a view never
+--- writes to a table the caller can still be holding.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` to span a set of streams)
+--- @return table rows
+--- @return boolean truncated
+function M.views.tool_pairs(session, opts)
+    local rows, truncated = read_view(session, TOOL_PAIRS_SQL, opts)
+    local out = {}
+    for i, row in ipairs(rows) do
+        out[i] = {
+            beat = row.beat,
+            call_id = row.call_id,
+            name = row.name,
+            ok = truthy(row.ok),
+        }
+    end
+    return out, truncated
+end
+
+--- The budget ledger: `{ seq, kind, amount, tag }` in seq order.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` to span a set of streams)
+--- @return table rows
+--- @return boolean truncated
+function M.views.ledger(session, opts)
+    return read_view(session, LEDGER_SQL, opts)
+end
 
 -- ============================================================
 -- The registry, executed (session-device-design.md §9-m)

@@ -1,4 +1,5 @@
---- knl_adapter — the Device IF backend for the Lua kernel, as a Port.
+--- knl_adapter — what a device carries, as Ports: the `llm` closure and the
+--- tools map `knl.device` is built with.
 ---
 --- The interface, not a shim of literals
 ---   `knl.beat` calls `device.llm(request)` and reads a *status string* off the
@@ -57,6 +58,11 @@
 ---   this module does not reinterpret any of them.
 
 local proto = require("llm_proto")
+--- MCP's tool vocabulary (the `<server>__<tool>` namespace, the content
+--- block extraction), shared with the block that binds the same servers
+--- through its own loop. A namespace that differed between the two would
+--- give one tool two names.
+local mcp_tools = require("mcp_tools")
 --- The kernel module, for its published contracts only (`knl.shapes`). Named
 --- `kernel` because the bare `knl` is the syscall bridge global in a full host
 --- VM, and shadowing it here would read as the wrong one.
@@ -67,9 +73,6 @@ local T = lshape.t
 local shape = lshape.check
 
 local M = {}
-
---- Output cap when neither the request nor the conf names one.
-local DEFAULT_MAX_TOKENS = 4096
 
 -- ============================================================
 -- Result shape — the Port's clean-data contract
@@ -91,10 +94,18 @@ local DEFAULT_MAX_TOKENS = 4096
 --- "ok", present with a `kind` on "refused".
 local RESULT = kernel.shapes.llm_result
 
---- The contract this module holds itself to, as data — mirrors how `agent` and
---- `tool_loop` expose theirs via `M.shapes`. Re-exported rather than
---- redefined, so `knl_adapter.shapes.llm_result == knl.shapes.llm_result`.
-M.shapes = { llm_result = RESULT }
+--- The contract this module holds itself to, as data. Re-exported rather
+--- than redefined, so `knl_adapter.shapes.llm_result == knl.shapes.llm_result`.
+--- `llm_usage` rides along because the Mapper's normalization (a provider
+--- that named no counts becomes zeros) is held to it directly, and the
+--- discriminated `llm_result` keeps its fields per variant.
+M.shapes = { llm_result = RESULT, llm_usage = kernel.shapes.llm_usage }
+
+--- What a `tool_use` block inside a result must name (`knl.shapes`'s own —
+--- see the Mapper's boundary check below for why it is asserted beside the
+--- result rather than inside it).
+local TOOL_USE_BLOCK = kernel.shapes.tool_use_block
+M.shapes.tool_use_block = TOOL_USE_BLOCK
 
 -- ============================================================
 -- LLMPort — the provider Port (interface)
@@ -127,8 +138,8 @@ function LLMPort.new(impl)
     return setmetatable(impl, LLMPort)
 end
 
---- Open the Port into a knl backend: the closure a device carries as its
---- `llm` (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
+--- Open the Port into the closure a device carries as its `llm`
+--- (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
 --- `knl.beat` calls. Shared by every Port instance — it knows no provider dialect,
 --- it only calls `self:build` / `self:parse` / `self:classify`. There is no
 --- `== "refusal"` here and no status of its own; the one judgement it makes is
@@ -203,7 +214,7 @@ function LLMPort:open(conf)
             -- as `[]`, not `{}`; a non-empty content passes through untouched.
             -- llm_proto owns the tag — the Mapper reuses its export rather than
             -- reimplementing the metatable.
-            content = proto._response_blocks(result.content),
+            content = proto.response_blocks(result.content),
             -- A provider that named no counts (nil or {}) becomes zeros, so the
             -- strict USAGE shape holds without inventing a `{}`.
             usage = {
@@ -222,7 +233,20 @@ function LLMPort:open(conf)
         -- Validate at the boundary. A violation here is a Mapper bug, so it
         -- raises in dev (LSHAPE_CHECK=1) and is a no-op in prod. Provider /
         -- transport failures never reach this line — they returned (nil, err).
-        return shape.assert_dev(mapped, RESULT, "llm_result")
+        shape.assert_dev(mapped, RESULT, "llm_result")
+        -- The per-block half of the same contract: a `tool_use` block names
+        -- the call it is making, and the kernel reads that id and name
+        -- straight off it. It is a second assert rather than a field of
+        -- RESULT because the rule is conditional on the block's `type` and
+        -- lshape has no combinator for "this variant is strict, the rest are
+        -- open" — a discriminated union would have to close the block
+        -- vocabulary, which is the provider's and not the kernel's.
+        for _, block in ipairs(mapped.content) do
+            if type(block) == "table" and block.type == "tool_use" then
+                shape.assert_dev(block, TOOL_USE_BLOCK, "llm_result content tool_use")
+            end
+        end
+        return mapped
     end
 end
 
@@ -250,7 +274,6 @@ local function anthropic_build(_, request, conf)
     for key, value in pairs(request or {}) do
         spec[key] = value
     end
-    spec.max_tokens = (request and request.max_tokens) or (conf and conf.max_tokens) or DEFAULT_MAX_TOKENS
     return proto_anthropic.build(spec)
 end
 
@@ -321,7 +344,6 @@ local function openai_build(_, request, conf)
     for key, value in pairs(request or {}) do
         spec[key] = value
     end
-    spec.max_tokens = (request and request.max_tokens) or (conf and conf.max_tokens) or DEFAULT_MAX_TOKENS
     return proto_openai.build(spec)
 end
 
@@ -393,8 +415,8 @@ M.openai = LLMPort.new({
 --   port:invoke(args) -> result                              -- how; failure = raise
 --
 -- Today every real tool in this codebase is a Lua closure in the flat spec
--- shape ({name, description, input_schema, handler} — std.fs.tool_specs /
--- tool_loop / knl all agree), so the initial concrete Port is `ToolPort.lua`
+-- shape ({name, description, input_schema, handler} — std.fs.tool_specs and
+-- knl agree on it), so the initial concrete Port is `ToolPort.lua`
 -- alone: a validate-and-passthrough wrapper. There is no Rust-native
 -- handler to bind (bridge/tool.rs is a Lua registry helper; handlers are
 -- always LuaFunction), and MCP binding is the second real source, deferred
@@ -433,10 +455,16 @@ function ToolPort.new(impl)
     return setmetatable(impl, ToolPort)
 end
 
---- The lua Port: wrap one flat spec ({name, description?, input_schema?
---- (`schema` accepted as the legacy alias), handler}) — the shape
---- std.fs.tool_specs returns — into a Port. Pass-through: declare hands the
---- triple back verbatim, invoke calls the closure.
+--- The lua Port: wrap one flat spec ({name, description?, input_schema?,
+--- handler}) — the shape std.fs.tool_specs returns — into a Port.
+--- Pass-through: declare hands the triple back verbatim, invoke calls the
+--- closure.
+---
+--- The schema field is `input_schema` and only that. A spec that spells it
+--- `schema` is a construction error rather than a second accepted spelling:
+--- silently reading one name and declaring the other is how a tool reaches
+--- a provider with no schema at all, and the caller who wrote the wrong key
+--- is the one who can fix it.
 ---
 --- @param spec table  a flat tool spec
 --- @return table port
@@ -450,10 +478,13 @@ function ToolPort.lua(spec)
     if type(spec.handler) ~= "function" then
         error("ToolPort.lua: spec.handler must be a function (tool '" .. spec.name .. "')")
     end
+    if spec.schema ~= nil then
+        error("ToolPort.lua: the field is `input_schema`, not `schema` (tool '" .. spec.name .. "')")
+    end
     local decl = {
         name = spec.name,
         description = spec.description,
-        input_schema = spec.input_schema or spec.schema,
+        input_schema = spec.input_schema,
     }
     return ToolPort.new({
         declare = function()
@@ -472,10 +503,8 @@ end
 --- (`is_error=true`) — normalized to a raise, which the kernel closes as an
 --- ok=false tool_result.
 ---
---- The two translations are `llm_proto`'s (`mcp_tool_decl` /
---- `mcp_result_text`), shared with the agent block, which binds the same
---- servers through its own loop. A namespace that differed between the two
---- would give one tool two names.
+--- The two translations are `mcp_tools`' (`tool_decl` / `result_text`), so
+--- the namespace is one definition however a server's tools were bound.
 ---
 --- The `mcp` global is resolved at invoke time (the bridge's surface), not
 --- captured at load: a VM without the bridge can still require this module.
@@ -490,7 +519,7 @@ function ToolPort.mcp(server, entry)
     if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then
         error("ToolPort.mcp: entry must be a tools/list item with a name")
     end
-    local decl = proto.mcp_tool_decl(server, entry)
+    local decl = mcp_tools.tool_decl(server, entry)
     return ToolPort.new({
         declare = function()
             return decl
@@ -508,8 +537,8 @@ function ToolPort.mcp(server, entry)
                         .. tostring(type(r) == "table" and r.error or "unreadable result")
                 )
             end
-            -- Content extraction, the same one the agent block runs.
-            local text = proto.mcp_result_text(r.content)
+            -- Content extraction, the one shared definition.
+            local text = mcp_tools.result_text(r.content)
             if r.is_error == true then
                 error("mcp tool '" .. decl.name .. "' reported error: " .. tostring(text))
             end

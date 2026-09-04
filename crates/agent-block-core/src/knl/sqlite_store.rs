@@ -13,6 +13,23 @@
 //! same [`validate_event`] and [`stamp`] the in-memory store runs, and
 //! returns the coordinates inline.
 //!
+//! # One backend, two kinds of database
+//!
+//! There is no second implementation of [`EventStore`] in the product: a
+//! session's log is a SQLite table whether or not it outlives the process.
+//! [`SqliteEventStore::open`] takes a file; [`SqliteEventStore::open_memory`]
+//! takes a database that lives in memory under a name derived from the
+//! stream (`file:knl-<stream>?mode=memory&cache=shared`), which is what an
+//! ephemeral session gets.  The shared-cache URI is not decoration: a second
+//! connection to the same name sees the same database, which is what lets the
+//! read side below exist at all — and it is also why the writer connection
+//! must outlive the session, since an in-memory database is reclaimed when
+//! its last connection closes.
+//!
+//! The one thing the in-memory database cannot do is survive the process.
+//! Within it, a stream is a stream: [`super::Session::resume`] reopens one by
+//! name exactly as it reopens a file.
+//!
 //! # Reads are indexed by kind
 //!
 //! The table carries a `(stream, kind, seq)` index beside its `(stream, seq)`
@@ -20,6 +37,21 @@
 //! decision input of [`EventStore::append_if`]) costs the size of the *fold*
 //! rather than the size of the stream: folding the balance reads the
 //! `budget_*` events, not every fact the session ever recorded.
+//!
+//! # The read side is a second connection, and it cannot write
+//!
+//! [`EventStore::query`] answers a caller's own SQL ([`super::query`]) over a
+//! **separate** connection to the same database, opened `READ_ONLY` and put
+//! into `query_only` mode, lazily on the first query and reused after that.
+//! Three independent things therefore have to fail before a query could
+//! change the log: the statement is checked to be a single `SELECT` / `WITH`
+//! before SQLite sees it, the prepared statement is asked whether it writes,
+//! and the connection it runs on has no write capability to lend it.  Values
+//! are bound, never interpolated — including the ids `$sessions` expands to.
+//!
+//! A query runs under a deadline: a watchdog interrupts the connection if the
+//! statement has not finished in time, and the interrupt surfaces as
+//! [`KnlError::Timeout`].
 //!
 //! # Concurrency
 //!
@@ -43,11 +75,14 @@
 //!
 //! [`MemEventStore`]: super::event_store::MemEventStore
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection, TransactionBehavior};
+use rusqlite::types::{Value as SqlValue, ValueRef};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, TransactionBehavior};
 use serde_json::{Map, Value};
 
 use super::event::{stamp, validate_event, FIELD_KIND};
@@ -55,10 +90,95 @@ use super::event_store::{
     stamp_schema_version, Committed, Decision, EventStore, CURRENT_SCHEMA_VERSION,
     SCHEMA_VERSION_FIELD,
 };
+use super::query::{session_slot, QueryParams, QueryPlan, QueryRows, STREAM_PARAM};
 use super::{now_ms, KnlError, KnlResult};
 
 /// How long a contended write waits for the lock before erroring.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The table the log lives in — published as the read contract
+/// ([`events_schema`]).
+pub const EVENTS_TABLE: &str = "events";
+
+/// The DDL for [`EVENTS_TABLE`] and its by-kind index.
+///
+/// `IF NOT EXISTS` on both, so opening a fresh database and reopening one an
+/// earlier build wrote take the same path.  The `(stream, kind, seq)` index is
+/// what makes a kind-filtered read cost the size of the fold rather than the
+/// size of the stream, and it keeps the rows in `seq` order within a kind, so
+/// the read needs no sort.
+const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS events ( \
+         stream         TEXT    NOT NULL, \
+         seq            INTEGER NOT NULL, \
+         epoch_ms       INTEGER NOT NULL, \
+         kind           TEXT    NOT NULL, \
+         schema_version INTEGER NOT NULL, \
+         payload        TEXT    NOT NULL, \
+         PRIMARY KEY (stream, seq) \
+     ); \
+     CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
+         ON events (stream, kind, seq);";
+
+/// One column of [`EVENTS_TABLE`], as SQLite itself reports it.
+///
+/// Published to the shell so a caller writing SQL against the log reads the
+/// column names and types from the database rather than from a list somebody
+/// retyped — and so a test can hold the shell's declaration of the schema
+/// against the table that actually exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaColumn {
+    /// The column name.
+    pub name: String,
+    /// Its declared type, as written in the DDL.
+    pub declared_type: String,
+    /// Whether it is part of the primary key.
+    pub pk: bool,
+}
+
+/// Where a store's database lives.
+///
+/// The store keeps this so it can open a *second* connection to the same
+/// database for reads.  For a file that is the same path; for an in-memory
+/// database it is the shared-cache URI, which is the only way a second
+/// connection can reach one.
+#[derive(Debug, Clone)]
+enum Db {
+    /// A file on disk.
+    File(PathBuf),
+    /// An in-memory database, addressed by its shared-cache URI.
+    Memory(String),
+}
+
+impl Db {
+    /// The URI an in-memory database for `stream` is addressed by.
+    ///
+    /// Derived from the stream id, so reopening the same stream in the same
+    /// process finds the same database — which is what makes an in-memory
+    /// session resumable while it is still alive.
+    fn memory_uri(stream: &str) -> String {
+        format!("file:knl-{stream}?mode=memory&cache=shared")
+    }
+
+    /// Open a connection with `flags`.
+    fn open(&self, flags: OpenFlags) -> rusqlite::Result<Connection> {
+        // `SQLITE_OPEN_URI` is what makes the `file:` form a URI rather than a
+        // relative path called "file:…"; it is in `OpenFlags::default()` and
+        // added explicitly for the read-only flags built below.
+        match self {
+            Self::File(path) => Connection::open_with_flags(path, flags),
+            Self::Memory(uri) => {
+                Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)
+            }
+        }
+    }
+
+    /// The flags a read-only connection is opened with.
+    fn read_only_flags() -> OpenFlags {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI
+    }
+}
 
 /// How many times a write is retried when SQLite reports a retryable code
 /// (`SQLITE_BUSY` / `SQLITE_LOCKED`) before the busy/locked error surfaces.
@@ -92,8 +212,19 @@ fn is_retryable(error: &rusqlite::Error) -> bool {
 /// The session *is* the stream: one instance serves one session's log.
 /// Several instances may point at the same DB file with different streams.
 pub struct SqliteEventStore {
-    /// The open connection to the DB file (or an in-memory database).
+    /// The write connection to the database.
+    ///
+    /// Held for the store's whole life, which for an in-memory database is
+    /// not merely convenient: a shared-cache in-memory database exists only
+    /// while a connection to it is open, so this handle *is* the database.
     conn: Connection,
+    /// Where the database is, so a second connection can be opened to it.
+    db: Db,
+    /// The read-only connection, opened on the first query and reused.
+    ///
+    /// Lazy because most sessions never run one: a store that only appends
+    /// and folds pays nothing for the read side existing.
+    reader: OnceCell<Connection>,
     /// The stream this store is scoped to — the session id.
     stream: String,
 }
@@ -104,44 +235,88 @@ impl SqliteEventStore {
     /// The `events` table is created if it does not exist, so opening a fresh
     /// file and reopening an existing one take the same path.
     pub fn open(path: &Path, stream: impl Into<String>) -> KnlResult<Self> {
-        let conn = Connection::open(path)?;
-        Self::init(conn, stream.into())
+        Self::init(Db::File(path.to_path_buf()), stream.into())
     }
 
-    /// An in-memory database scoped to `stream` (for tests and ephemera).
+    /// Open an in-memory database for `stream`.
     ///
-    /// Nothing persists past the returned value's lifetime — this is *not*
-    /// the durable path, only a backend that behaves like the file one.
-    pub fn open_in_memory(stream: impl Into<String>) -> KnlResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(conn, stream.into())
+    /// The database is named after the stream and opened in shared-cache
+    /// mode, so the read connection reaches the same rows the writer wrote —
+    /// and so reopening the same stream id in the same process finds the same
+    /// log.  It exists only while this store does: an in-memory database is
+    /// reclaimed when its last connection closes, which is exactly what
+    /// "ephemeral" should mean.
+    pub fn open_memory(stream: impl Into<String>) -> KnlResult<Self> {
+        let stream = stream.into();
+        Self::init(Db::Memory(Db::memory_uri(&stream)), stream)
     }
 
-    /// Set the busy timeout and ensure the table and its index, then wrap the
-    /// connection.
-    ///
-    /// The `(stream, kind, seq)` index is what makes a kind-filtered read
-    /// ([`EventStore::read_kinds`]) cost the size of the fold rather than the
-    /// size of the stream, and it keeps the rows in `seq` order within a kind,
-    /// so the read needs no sort.  `IF NOT EXISTS` on both, so opening a fresh
-    /// file and reopening one written by an earlier build take the same path.
-    fn init(conn: Connection, stream: String) -> KnlResult<Self> {
+    /// Open the writer, set the busy timeout, ensure the table and its index.
+    fn init(db: Db, stream: String) -> KnlResult<Self> {
+        let conn = db.open(OpenFlags::default())?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS events ( \
-                 stream         TEXT    NOT NULL, \
-                 seq            INTEGER NOT NULL, \
-                 epoch_ms       INTEGER NOT NULL, \
-                 kind           TEXT    NOT NULL, \
-                 schema_version INTEGER NOT NULL, \
-                 payload        TEXT    NOT NULL, \
-                 PRIMARY KEY (stream, seq) \
-             ); \
-             CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
-                 ON events (stream, kind, seq);",
-        )?;
-        Ok(Self { conn, stream })
+        conn.execute_batch(SCHEMA_DDL)?;
+        Ok(Self {
+            conn,
+            db,
+            reader: OnceCell::new(),
+            stream,
+        })
     }
+
+    /// The read-only connection, opened on first use.
+    ///
+    /// A *second* connection to the same database, with no write capability:
+    /// `SQLITE_OPEN_READ_ONLY` is what SQLite was asked for, and
+    /// `query_only` is the same answer said again inside the connection, so a
+    /// statement that slipped past the checks on the text still has nothing
+    /// to write with.
+    fn reader(&self) -> KnlResult<&Connection> {
+        if let Some(reader) = self.reader.get() {
+            return Ok(reader);
+        }
+        let reader = self.db.open(Db::read_only_flags())?;
+        reader.busy_timeout(BUSY_TIMEOUT)?;
+        reader.execute_batch("PRAGMA query_only = 1;")?;
+        // `set` cannot fail here — nothing else can have filled the cell,
+        // since `&self` is not shared across threads — and the value is
+        // fetched back rather than moved out so the connection stays owned by
+        // the cell for every later query.
+        let _ = self.reader.set(reader);
+        Ok(self
+            .reader
+            .get()
+            .expect("the reader was just placed in the cell"))
+    }
+
+    /// The columns of the `events` table, as SQLite reports them.
+    ///
+    /// Read through the *reader*, because this is the read contract: what a
+    /// caller's SQL may name. `PRAGMA table_info` rather than a list written
+    /// out here, so the published schema cannot drift from the table.
+    pub fn schema(&self) -> KnlResult<Vec<SchemaColumn>> {
+        let reader = self.reader()?;
+        let mut stmt = reader.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SchemaColumn {
+                name: row.get::<_, String>("name")?,
+                declared_type: row.get::<_, String>("type")?,
+                pk: row.get::<_, i64>("pk")? > 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(KnlError::from)
+    }
+}
+
+/// The columns of the `events` table, without a session to ask.
+///
+/// The schema is a property of the kernel, not of any one log, so this opens
+/// a throwaway in-memory store and reads the table back off it — the same
+/// `PRAGMA table_info` a caller's own store would answer with.  It is what
+/// `knl.api()` publishes.
+pub fn events_schema() -> KnlResult<Vec<SchemaColumn>> {
+    SqliteEventStore::open_memory(format!("schema-{}", uuid::Uuid::new_v4()))?.schema()
 }
 
 impl EventStore for SqliteEventStore {
@@ -232,6 +407,302 @@ impl EventStore for SqliteEventStore {
             .map(|n| n as usize)
             .map_err(KnlError::from)
     }
+
+    fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
+        run_query(self.reader()?, plan)
+    }
+}
+
+/// A query's own translation of a rusqlite failure.
+///
+/// The write path's [`From<rusqlite::Error>`] answers a different question —
+/// "can this write be retried" — and has no reason to know about deadlines.
+/// Here there are two more outcomes a caller can act on: a statement the
+/// watchdog cut short is [`KnlError::Timeout`] (the query was too slow, not
+/// the store too busy), and a value that came back and would not read as what
+/// it is declared to be is [`KnlError::Corruption`] — the IO worked, so what
+/// is wrong is the data.  Matched on the error's shape, never on message text.
+fn query_error(error: rusqlite::Error) -> KnlError {
+    if let rusqlite::Error::SqliteFailure(inner, _) = &error {
+        if inner.code == rusqlite::ErrorCode::OperationInterrupted {
+            return KnlError::Timeout(format!("query interrupted: {error}"));
+        }
+    }
+    match error {
+        rusqlite::Error::Utf8Error(_)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..) => {
+            KnlError::Corruption(format!("sqlite: query: {error}"))
+        }
+        other => KnlError::from(other),
+    }
+}
+
+/// The watchdog that ends a query that is taking too long.
+///
+/// SQLite has no per-statement timeout — `busy_timeout` bounds waiting for a
+/// *lock*, which is a different thing from a statement that is simply
+/// expensive — so a deadline has to come from outside: a thread that waits,
+/// and interrupts the connection if the query has not said it is done.
+/// (`Connection::progress_handler`, which would do this in-thread, is behind
+/// rusqlite's `hooks` feature and this build does not enable it.)
+///
+/// The wait ends either way: the query signals completion by dropping the
+/// sender, which wakes the thread immediately, so the interrupt only ever
+/// fires while the statement it belongs to is still running.
+struct Deadline {
+    /// Dropped when the query finishes; that is the signal.
+    done: Option<mpsc::Sender<()>>,
+    /// The waiting thread, joined on drop so no watchdog outlives its query.
+    watchdog: Option<JoinHandle<()>>,
+}
+
+impl Deadline {
+    /// Start watching `conn` for `timeout`.
+    fn arm(conn: &Connection, timeout: Duration) -> Self {
+        let interrupt = conn.get_interrupt_handle();
+        let (done, finished) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            // A disconnect means the query finished first: nothing to do.
+            if finished.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
+                interrupt.interrupt();
+            }
+        });
+        Self {
+            done: Some(done),
+            watchdog: Some(watchdog),
+        }
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        // Dropping the sender wakes the watchdog at once; joining it means the
+        // interrupt cannot land on whatever this connection does next.
+        drop(self.done.take());
+        if let Some(watchdog) = self.watchdog.take() {
+            let _ = watchdog.join();
+        }
+    }
+}
+
+/// Prepare, check, bind and run one query.
+fn run_query(conn: &Connection, plan: &QueryPlan) -> KnlResult<QueryRows> {
+    // A statement that will not compile is the caller's SQL, not the store
+    // failing: report it as the refusal it is, unless the database was too
+    // busy to answer at all.
+    let mut stmt = conn.prepare(&plan.sql).map_err(|error| {
+        if is_retryable(&error) {
+            KnlError::from(error)
+        } else {
+            KnlError::Validation(format!("sql: {error}"))
+        }
+    })?;
+    // The second of the three guards (the text was checked before this, the
+    // connection has no write capability at all): SQLite's own answer to
+    // "does this statement change the database".
+    if !stmt.readonly() {
+        return Err(KnlError::Validation(
+            "a query may not write; only SELECT / WITH statements are run".to_string(),
+        ));
+    }
+    bind(&mut stmt, plan)?;
+
+    // Taken before the rows borrow the statement, and owned, so the columns
+    // outlive the borrow.
+    let columns: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let _deadline = Deadline::arm(conn, plan.timeout);
+    let mut rows = stmt.raw_query();
+    let mut out = Vec::new();
+    while out.len() < plan.limit {
+        let Some(row) = rows.next().map_err(query_error)? else {
+            // The whole result set fitted.
+            return Ok(QueryRows {
+                rows: out,
+                truncated: false,
+            });
+        };
+        let mut record = Map::new();
+        for (index, column) in columns.iter().enumerate() {
+            // A NULL is an absent key rather than a null value: the Lua side
+            // reads it as `nil`, which is what a missing column means there.
+            if let Some(value) = read_value(row.get_ref(index).map_err(query_error)?)? {
+                record.insert(column.clone(), value);
+            }
+        }
+        out.push(record);
+    }
+    // The cap was reached: whether anything was actually cut off is one more
+    // step, so a result that happens to be exactly `limit` long is not
+    // reported as truncated.
+    let truncated = rows.next().map_err(query_error)?.is_some();
+    Ok(QueryRows {
+        rows: out,
+        truncated,
+    })
+}
+
+/// Bind every parameter the statement declares.
+///
+/// Driven by the *statement*, not by the caller's table: SQLite is asked what
+/// parameters it compiled and each one is answered, so a value that matches
+/// nothing and a parameter that nothing matches are both errors instead of a
+/// silent NULL.  The reserved names ([`STREAM_PARAM`] and the
+/// `:knl_sessions_*` slots [`super::query`] wrote) are the kernel's;
+/// everything else is looked up in what the caller passed.
+fn bind(stmt: &mut rusqlite::Statement<'_>, plan: &QueryPlan) -> KnlResult<()> {
+    const NO_VALUES: &[Value] = &[];
+
+    let slots: Vec<String> = (0..plan.sessions.len()).map(session_slot).collect();
+    let given: &[Value] = match &plan.params {
+        QueryParams::Positional(values) => values,
+        _ => NO_VALUES,
+    };
+    let mut taken = 0;
+
+    for index in 1..=stmt.parameter_count() {
+        // Read out as an owned name first: the borrow of the statement ends
+        // here, so the binding below can take it mutably.
+        let name = stmt.parameter_name(index).map(str::to_string);
+        let Some(name) = name else {
+            // An anonymous `?`: the caller's, in the order they were given.
+            // Every parameter the kernel wrote is named, so there is nothing
+            // of ours here to confuse them with.
+            let value = given.get(taken).ok_or_else(|| {
+                KnlError::Validation(format!(
+                    "the query has more `?` parameters than the {} value(s) given",
+                    given.len()
+                ))
+            })?;
+            taken += 1;
+            stmt.raw_bind_parameter(index, SqlParam(value.clone()))
+                .map_err(query_error)?;
+            continue;
+        };
+
+        if name == STREAM_PARAM {
+            stmt.raw_bind_parameter(index, plan.stream.clone())
+                .map_err(query_error)?;
+            continue;
+        }
+        if let Some(slot) = slots.iter().position(|slot| *slot == name) {
+            stmt.raw_bind_parameter(index, plan.sessions[slot].clone())
+                .map_err(query_error)?;
+            continue;
+        }
+
+        let QueryParams::Named(named) = &plan.params else {
+            return Err(KnlError::Validation(format!(
+                "the query names the parameter {name:?}, so params must be a table of names \
+                 to values"
+            )));
+        };
+        // The prefix character is SQLite's, not the caller's: `:kind` is
+        // answered by `kind`.  The full spelling is accepted too, for a
+        // caller that writes what it sees.
+        let value = named
+            .get(&name[1..])
+            .or_else(|| named.get(&name))
+            .ok_or_else(|| {
+                KnlError::Validation(format!("no value was given for the parameter {name:?}"))
+            })?;
+        stmt.raw_bind_parameter(index, SqlParam(value.clone()))
+            .map_err(query_error)?;
+    }
+
+    if given.len() > taken {
+        return Err(KnlError::Validation(format!(
+            "{} value(s) were given for {taken} `?` parameter(s)",
+            given.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A caller's JSON value on its way into a bound parameter.
+///
+/// The four SQLite types a JSON value maps onto without inventing anything:
+/// null, integer, real, text.  A composite — an array or an object — is not a
+/// SQLite value, and encoding one as its JSON text would be the kernel
+/// guessing what the caller meant, so it is refused.
+struct SqlParam(Value);
+
+impl rusqlite::ToSql for SqlParam {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::ToSqlOutput;
+        let value = match &self.0 {
+            Value::Null => SqlValue::Null,
+            Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    SqlValue::Integer(i)
+                } else if let Some(f) = n.as_f64() {
+                    SqlValue::Real(f)
+                } else {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("{n} is not a SQLite number").into(),
+                    ));
+                }
+            }
+            Value::String(s) => SqlValue::Text(s.clone()),
+            other => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("a {} is not a SQLite value", type_name_of(other)).into(),
+                ));
+            }
+        };
+        Ok(ToSqlOutput::Owned(value))
+    }
+}
+
+/// What kind of JSON value this is, for a refusal message.
+fn type_name_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "table",
+    }
+}
+
+/// One column of one row, as JSON — or `None` for `NULL`.
+///
+/// INTEGER and REAL come back as numbers, TEXT as a string.  A BLOB comes
+/// back as a string too, lossily: the boundary above this one is Lua, whose
+/// strings are byte strings, and refusing the row would make a column nobody
+/// selected on purpose fatal.  A TEXT column that is not UTF-8 is a different
+/// matter — it was declared to be text and it is not — so that is corruption.
+/// A REAL that is NaN or infinite has no representation on the other side of
+/// this boundary, and dropping it would hand back a row with a column
+/// silently missing, so it is raised instead.
+fn read_value(value: ValueRef<'_>) -> KnlResult<Option<Value>> {
+    Ok(match value {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(Value::from(i)),
+        ValueRef::Real(f) => {
+            let number = serde_json::Number::from_f64(f).ok_or_else(|| {
+                KnlError::Storage(format!(
+                    "sqlite: a REAL column is {f}, which has no value on the other side of the \
+                     bridge"
+                ))
+            })?;
+            Some(Value::Number(number))
+        }
+        ValueRef::Text(bytes) => {
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                KnlError::Corruption(format!("sqlite: a TEXT column is not valid UTF-8: {e}"))
+            })?;
+            Some(Value::from(text))
+        }
+        ValueRef::Blob(bytes) => Some(Value::from(String::from_utf8_lossy(bytes).into_owned())),
+    })
 }
 
 /// Run one transactional `attempt`, retrying up to [`MAX_TX_ATTEMPTS`] times
@@ -482,6 +953,7 @@ impl From<rusqlite::Error> for KnlError {
 mod tests {
     use super::*;
     use crate::knl::event::{kind_of, seq_of};
+    use crate::knl::query::QueryOpts;
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -497,9 +969,19 @@ mod tests {
         obj(json!({ "kind": format!("e{i}") }))
     }
 
+    /// A store on an in-memory database of its very own.
+    ///
+    /// The name matters: an in-memory database is shared by *name*, which is
+    /// what lets the reader see the writer's rows — and would equally let two
+    /// tests running in parallel see each other's.  A fresh id per store keeps
+    /// each test's log to itself.
+    fn mem_store() -> SqliteEventStore {
+        SqliteEventStore::open_memory(uuid::Uuid::new_v4().to_string()).expect("open")
+    }
+
     #[test]
     fn append_assigns_gap_free_monotonic_seq_from_one() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         assert!(store.is_empty().expect("is_empty"));
         assert_eq!(store.len().expect("len"), 0);
 
@@ -522,7 +1004,7 @@ mod tests {
 
     #[test]
     fn a_rejected_append_records_nothing_and_burns_no_seq() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store
             .append(obj(json!({ "text": "no kind" })))
             .expect_err("kind is required");
@@ -535,7 +1017,7 @@ mod tests {
     /// a `None` commits nothing.
     #[test]
     fn append_if_decides_inside_the_transaction_and_writes_only_a_some() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store.append(ev(1)).expect("seed");
 
         let mut seen_kinds: Vec<String> = Vec::new();
@@ -557,7 +1039,7 @@ mod tests {
     /// A malformed decision is refused and leaves the stream alone.
     #[test]
     fn append_if_validates_the_event_the_decision_returns() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store
             .append_if(None, &mut |_| Some(obj(json!({ "text": "no kind" }))))
             .expect_err("kind is required");
@@ -569,7 +1051,7 @@ mod tests {
     /// exactly as it was, which is the whole reason it is one call.
     #[test]
     fn append_many_is_one_transaction_that_lands_whole_or_not_at_all() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store.append(ev(1)).expect("seed");
 
         let committed = store.append_many(vec![ev(2), ev(3)]).expect("the batch");
@@ -600,7 +1082,7 @@ mod tests {
     /// them.  `None` is the whole stream, an empty selection is nothing.
     #[test]
     fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store
             .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
             .expect("grant");
@@ -652,7 +1134,7 @@ mod tests {
     /// what the decision *reads*, not where its answer goes.
     #[test]
     fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store
             .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
             .expect("grant");
@@ -707,7 +1189,7 @@ mod tests {
 
     #[test]
     fn read_pages_by_from_seq_and_limit() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         for i in 1..=5 {
             store.append(ev(i)).expect("append");
         }
@@ -728,7 +1210,7 @@ mod tests {
 
     #[test]
     fn head_is_none_when_empty_then_tracks_the_max() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         assert_eq!(store.head().expect("head"), None);
 
         store.append(ev(1)).expect("append");
@@ -745,7 +1227,7 @@ mod tests {
 
     #[test]
     fn read_reconstructs_the_stored_envelope_including_the_schema_version() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store
             .append(obj(json!({ "kind": "note", "text": "hi" })))
             .expect("append");
@@ -820,16 +1302,17 @@ mod tests {
     /// would let a resume re-fold a truncated log into the wrong state).
     #[test]
     fn read_errors_on_a_corrupt_payload_row_instead_of_dropping_it() {
-        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        let mut store = mem_store();
         store.append(ev(1)).expect("append");
 
         // Sneak in a row whose payload cannot decode — a corrupt log entry.
+        let stream = store.stream.clone();
         store
             .conn
             .execute(
                 "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params!["s", 2_i64, 0_i64, "note", 1_i64, "{not valid json"],
+                params![stream, 2_i64, 0_i64, "note", 1_i64, "{not valid json"],
             )
             .expect("insert corrupt row");
 
@@ -963,5 +1446,334 @@ mod tests {
 
         assert_eq!(b.head().expect("head"), Some(3));
         assert_eq!(b.read(0, usize::MAX).expect("read").len(), 3);
+    }
+
+    // -- the read side -----------------------------------------------------
+
+    /// Ask `store` for `sql` with everything default.
+    fn ask(store: &SqliteEventStore, sql: &str) -> KnlResult<QueryRows> {
+        ask_with(store, sql, QueryParams::None, &QueryOpts::default())
+    }
+
+    /// Ask `store` for `sql`, saying how.
+    fn ask_with(
+        store: &SqliteEventStore,
+        sql: &str,
+        params: QueryParams,
+        opts: &QueryOpts,
+    ) -> KnlResult<QueryRows> {
+        let plan = crate::knl::query::plan(sql, params, opts, &store.stream)?;
+        store.query(&plan)
+    }
+
+    /// The `kind` column of every row, in order.
+    fn kinds_of(rows: &QueryRows) -> Vec<&str> {
+        rows.rows
+            .iter()
+            .map(|row| row["kind"].as_str().expect("kind is a string"))
+            .collect()
+    }
+
+    /// The reader sees what the writer wrote — on an in-memory database as
+    /// much as on a file, which is the whole reason the memory one is opened
+    /// under a shared-cache URI rather than as a private `:memory:`.
+    #[test]
+    fn the_reader_sees_the_writers_rows_in_memory() {
+        let mut store = mem_store();
+        store.append(ev(1)).expect("append e1");
+        store.append(ev(2)).expect("append e2");
+
+        let rows = ask(
+            &store,
+            "SELECT seq, kind FROM events WHERE stream = $stream ORDER BY seq",
+        )
+        .expect("query");
+        assert_eq!(kinds_of(&rows), ["e1", "e2"]);
+        assert_eq!(rows.rows[0]["seq"], Value::from(1));
+        assert!(!rows.truncated);
+
+        // A write after the first query is visible to the next one: the
+        // reader is a live connection, not a snapshot taken when it opened.
+        store.append(ev(3)).expect("append e3");
+        assert_eq!(
+            kinds_of(&ask(&store, "SELECT kind FROM events ORDER BY seq").expect("query")),
+            ["e1", "e2", "e3"]
+        );
+    }
+
+    /// `$stream` is this store's own stream and nothing else: a second stream
+    /// in the same database is not selected by it.
+    #[test]
+    fn stream_binds_to_this_stores_own_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+
+        let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
+        let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
+        a.append(obj(json!({ "kind": "only_a" }))).expect("a");
+        b.append(obj(json!({ "kind": "only_b" }))).expect("b");
+
+        let rows = ask(&a, "SELECT kind FROM events WHERE stream = $stream").expect("query");
+        assert_eq!(kinds_of(&rows), ["only_a"]);
+        let rows = ask(&b, "SELECT kind FROM events WHERE stream = $stream").expect("query");
+        assert_eq!(kinds_of(&rows), ["only_b"]);
+    }
+
+    /// `$sessions` reads across a set: two streams in one database, one
+    /// statement, and the ids are bound rather than pasted in.
+    #[test]
+    fn sessions_reads_across_the_set_it_was_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+
+        let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
+        let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
+        a.append(obj(json!({ "kind": "from_a" }))).expect("a");
+        b.append(obj(json!({ "kind": "from_b1" }))).expect("b1");
+        b.append(obj(json!({ "kind": "from_b2" }))).expect("b2");
+
+        let opts = QueryOpts {
+            sessions: Some(vec!["stream-a".to_string(), "stream-b".to_string()]),
+            ..QueryOpts::default()
+        };
+        let rows = ask_with(
+            &a,
+            "SELECT stream, kind FROM events WHERE stream IN $sessions ORDER BY stream, seq",
+            QueryParams::None,
+            &opts,
+        )
+        .expect("query");
+        assert_eq!(kinds_of(&rows), ["from_a", "from_b1", "from_b2"]);
+
+        // Left out, the set is the asking store's own stream.
+        let rows = ask(&a, "SELECT kind FROM events WHERE stream IN $sessions").expect("query");
+        assert_eq!(kinds_of(&rows), ["from_a"]);
+    }
+
+    /// A value is bound, never pasted: a quote inside it is a character in a
+    /// string, not the end of one.
+    #[test]
+    fn a_bound_value_with_a_quote_in_it_is_a_value() {
+        let mut store = mem_store();
+        store
+            .append(obj(json!({ "kind": "it's a kind" })))
+            .expect("append");
+        store.append(ev(1)).expect("append e1");
+
+        let rows = ask_with(
+            &store,
+            "SELECT kind FROM events WHERE kind = ?",
+            QueryParams::Positional(vec![json!("it's a kind")]),
+            &QueryOpts::default(),
+        )
+        .expect("query");
+        assert_eq!(kinds_of(&rows), ["it's a kind"]);
+
+        // The same by name, and a value that would be SQL if it were pasted
+        // in matches nothing rather than doing anything.
+        let named = QueryParams::Named(
+            json!({ "kind": "x' OR 1=1 --" })
+                .as_object()
+                .expect("an object")
+                .clone(),
+        );
+        let rows = ask_with(
+            &store,
+            "SELECT kind FROM events WHERE kind = :kind",
+            named,
+            &QueryOpts::default(),
+        )
+        .expect("query");
+        assert!(rows.rows.is_empty(), "{:?}", rows.rows);
+    }
+
+    /// The cap is reported, not silently applied — and a result that happens
+    /// to be exactly `limit` long is not called truncated.
+    #[test]
+    fn the_row_cap_is_reported_when_it_cuts() {
+        let mut store = mem_store();
+        for i in 1..=5 {
+            store.append(ev(i)).expect("append");
+        }
+
+        let capped = QueryOpts {
+            limit: 2,
+            ..QueryOpts::default()
+        };
+        let rows = ask_with(
+            &store,
+            "SELECT kind FROM events ORDER BY seq",
+            QueryParams::None,
+            &capped,
+        )
+        .expect("query");
+        assert_eq!(kinds_of(&rows), ["e1", "e2"]);
+        assert!(rows.truncated, "the cap cut three rows off");
+
+        let exact = QueryOpts {
+            limit: 5,
+            ..QueryOpts::default()
+        };
+        let rows = ask_with(
+            &store,
+            "SELECT kind FROM events ORDER BY seq",
+            QueryParams::None,
+            &exact,
+        )
+        .expect("query");
+        assert_eq!(rows.rows.len(), 5);
+        assert!(!rows.truncated, "nothing was cut off");
+    }
+
+    /// A query that will not finish is cut short, and says so in its own
+    /// class: nothing was contended, so "ask again" would be the wrong advice.
+    #[test]
+    fn a_query_that_runs_too_long_is_a_timeout() {
+        let store = mem_store();
+        let hurried = QueryOpts {
+            timeout_ms: 50,
+            ..QueryOpts::default()
+        };
+        let err = ask_with(
+            &store,
+            // Unbounded on purpose: it ends when the deadline ends it.
+            "WITH RECURSIVE forever(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM forever) \
+             SELECT COUNT(*) FROM forever",
+            QueryParams::None,
+            &hurried,
+        )
+        .expect_err("an endless query must be cut short");
+        assert_eq!(err.kind(), KnlError::TIMEOUT, "{err}");
+        assert!(!err.is_retryable(), "a slow query is not a retry: {err}");
+
+        // The connection is usable afterwards: the interrupt ended a
+        // statement, not the reader.
+        assert!(ask(&store, "SELECT 1 AS one").is_ok());
+    }
+
+    /// The reader cannot write.  The statement checks run on the text, but
+    /// they are not the only thing standing between a caller and the log:
+    /// the connection a query runs on has no write capability at all.
+    #[test]
+    fn the_reader_connection_refuses_a_write() {
+        let mut store = mem_store();
+        store.append(ev(1)).expect("append");
+        let reader = store.reader().expect("open the reader");
+
+        let err = reader
+            .execute(
+                "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
+                 VALUES ('x', 1, 0, 'note', 1, '{}')",
+                [],
+            )
+            .expect_err("the reader must not be able to write");
+        assert!(
+            matches!(KnlError::from(err), KnlError::Storage(_)),
+            "a write through the reader is refused by SQLite itself"
+        );
+
+        // …and the log is as it was.
+        assert_eq!(store.len().expect("len"), 1);
+    }
+
+    /// A statement that is not a read never reaches the connection, and a
+    /// second statement is refused whole.  (The rules are
+    /// [`super::super::query`]'s; this is the path through the store.)
+    #[test]
+    fn a_write_or_a_second_statement_is_refused_before_the_connection() {
+        let store = mem_store();
+        for sql in [
+            "INSERT INTO events (stream) VALUES ('x')",
+            "UPDATE events SET kind = 'x'",
+            "PRAGMA table_info(events)",
+            "ATTACH DATABASE '/tmp/other.db' AS other",
+            "SELECT 1; DROP TABLE events",
+        ] {
+            let err = ask(&store, sql).expect_err("must be refused");
+            assert_eq!(err.kind(), KnlError::VALIDATION, "{sql:?}: {err}");
+        }
+    }
+
+    /// A parameter nobody answered, and a value nobody asked for, are both
+    /// errors: a silent NULL is how a query quietly stops meaning what it
+    /// says.
+    #[test]
+    fn every_parameter_is_answered_and_every_value_is_used() {
+        let store = mem_store();
+
+        let err = ask(&store, "SELECT * FROM events WHERE kind = :kind")
+            .expect_err("an unanswered parameter must be refused");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains(":kind"), "{}", err.reason());
+
+        let err = ask_with(
+            &store,
+            "SELECT * FROM events WHERE kind = ?",
+            QueryParams::Positional(vec![json!("a"), json!("b")]),
+            &QueryOpts::default(),
+        )
+        .expect_err("a value with no parameter must be refused");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+    }
+
+    /// Every SQLite type comes back as itself, and a NULL comes back as an
+    /// absent column rather than a present nothing.
+    #[test]
+    fn the_sqlite_types_map_onto_values_and_null_is_absence() {
+        let store = mem_store();
+        let rows = ask(
+            &store,
+            // `absent`, not `nothing`: NOTHING is a SQLite keyword.
+            "SELECT 1 AS whole, 1.5 AS fraction, 'text' AS words, NULL AS absent, \
+             CAST('bytes' AS BLOB) AS raw",
+        )
+        .expect("query");
+        let row = &rows.rows[0];
+        assert_eq!(row["whole"], Value::from(1));
+        assert_eq!(row["fraction"], Value::from(1.5));
+        assert_eq!(row["words"], Value::from("text"));
+        assert_eq!(row["raw"], Value::from("bytes"));
+        assert!(
+            !row.contains_key("absent"),
+            "a NULL column is absent, so it reads as nil: {row:?}"
+        );
+    }
+
+    /// The published schema is the table: read back off SQLite rather than
+    /// written out, with the two columns that make a stream a stream as its
+    /// primary key.
+    #[test]
+    fn the_published_schema_is_the_events_table() {
+        let columns = events_schema().expect("schema");
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "stream",
+                "seq",
+                "epoch_ms",
+                "kind",
+                "schema_version",
+                "payload"
+            ]
+        );
+
+        let pk: Vec<&str> = columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(pk, ["stream", "seq"], "the log is keyed by (stream, seq)");
+
+        let declared: Vec<&str> = columns.iter().map(|c| c.declared_type.as_str()).collect();
+        assert_eq!(
+            declared,
+            ["TEXT", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT"]
+        );
+
+        // And a query may name every one of them.
+        let store = mem_store();
+        let sql = format!("SELECT {} FROM {EVENTS_TABLE}", names.join(", "));
+        ask(&store, &sql).expect("the published columns are the real ones");
     }
 }
