@@ -35,6 +35,26 @@
 //! and [`MODULE_API`] hold each one's contract in a line — including the
 //! classes it can raise — and are what `knl.api()` hands back.
 //!
+//! # Everything that reaches the store yields
+//!
+//! `knl.open` / `knl.resume` and every session method that touches the log are
+//! bound as **async** functions, so calling one suspends the coroutine rather
+//! than stopping the VM.  That is not an optimization: the Lua VM's thread is
+//! the only worker of its own runtime, so a syscall that waited there would
+//! also stop every other coroutine on that VM, its timers and its
+//! cancellation ([`crate::knl`] § Async).
+//!
+//! **Nothing about the Lua changes.**  A yield inside `pcall` / `xpcall`, a
+//! `<close>` scope ending (cleanly or by error) and a `for` loop over beats
+//! are all yieldable in Lua 5.4, so `s:append(...)` reads and behaves exactly
+//! as it did.  The one requirement is the one the shell already meets: these
+//! methods are reachable from inside a coroutine, which the main chunk and
+//! every bus handler are.
+//!
+//! Three methods stay synchronous — `id`, `scope_id`, `owner` — because they
+//! answer out of the value and wait for nothing, and so do `knl.new_beat_id`,
+//! `knl.error` and `knl.api`.
+//!
 //! # The invariants the surface enforces
 //!
 //! The shell reaches kernel state only through the methods of the
@@ -201,10 +221,9 @@
 //! The Lua kernel runs the mirror image of both, so a syscall added on one
 //! side and not the other goes red rather than drifting.
 
-use std::cell::RefCell;
-
 use mlua::prelude::*;
 use serde_json::{Map, Value};
+use tokio::sync::Mutex;
 
 use super::{json_to_lua, lua_to_json};
 use crate::knl;
@@ -324,24 +343,37 @@ pub const MODULE_API: &[(&str, &str)] = &[
 
 /// K5 session: the only handle the Lua side has on kernel state.
 struct Session {
-    // `RefCell` (not `Mutex`): an Isle drives a single Lua VM on one
-    // thread, and every borrow below is released before control returns
-    // to Lua, so no borrow can overlap another.
-    state: RefCell<knl::Session>,
+    // A `tokio::sync::Mutex`, and not the `RefCell` this used to be.  Every
+    // method that reaches the store yields now, so a second coroutine on the
+    // same VM can call one while the first is suspended in the middle of
+    // another — which a `RefCell` answers by panicking.  An async lock answers
+    // it by making the second call wait for the first, which is the same
+    // serialization the kernel already promises per stream.
+    //
+    // Holding the guard across the store's `.await` is the point rather than a
+    // hazard: a session's own calls are meant to be one at a time, and the
+    // lock's whole job is to say so.
+    state: Mutex<knl::Session>,
 }
 
 impl Session {
     /// Wrap a kernel session as the Lua userdata.
     fn from_state(state: knl::Session) -> Self {
         Self {
-            state: RefCell::new(state),
+            state: Mutex::new(state),
         }
     }
 
     /// Open a session for `owner` with an optional budget grant, on the
     /// in-memory store.
-    fn new(owner: String, grant: Option<knl::BudgetGrant>) -> LuaResult<Self> {
-        let state = knl::Session::new(owner, grant).map_err(|e| knl_err("open", &e))?;
+    async fn new(
+        owner: String,
+        grant: Option<knl::BudgetGrant>,
+        drivers: &knl::IsleDrivers,
+    ) -> LuaResult<Self> {
+        let state = knl::Session::new(owner, grant, drivers)
+            .await
+            .map_err(|e| knl_err("open", &e))?;
         Ok(Self::from_state(state))
     }
 }
@@ -349,31 +381,28 @@ impl Session {
 /// The backstop under `close` and `<close>`: a handle nobody ended still
 /// records the session's boundary, here, where the value dies.
 ///
-/// A dropped handle is the one close path with no caller left to tell, so
-/// it cannot fail loudly the way the other two do: a failed append is a
-/// `warn!` and nothing else.  Panicking in `drop` would abort the process
-/// (a Lua collection cycle is not a place to unwind from), and a session
-/// already past its last reader is not worth that.  What the boundary
-/// costs is one line in the log; what it buys is a resumed or audited
-/// stream that is not silently open forever.
+/// A dropped handle is the one close path with no caller left to tell, and now
+/// also the one with nowhere to wait: `Drop` cannot be `async`, and this runs
+/// on the VM's own thread inside a Lua collection cycle, where blocking on
+/// SQLite would stop every other coroutine, timer and cancellation that VM
+/// owns.  So the boundary is *submitted* rather than awaited
+/// ([`knl::Session::close_detached`]): the event goes to the connection
+/// thread, whose driver the host holds, and lands there while nothing waits
+/// for it.
+///
+/// The lock is taken with `try_lock`, not awaited: a session still borrowed by
+/// a suspended call has an owner, and this collection cycle is not it.  A
+/// failure is a `warn!` and nothing else — panicking in `drop` would abort the
+/// process, and a session already past its last reader is not worth that.
 impl Drop for Session {
     fn drop(&mut self) {
-        // `try_borrow_mut`, not `borrow_mut`: a panic unwinding out of a
-        // method leaves the borrow live, and this runs during that unwind.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
-            tracing::warn!("knl: session dropped while borrowed; session_closed was not recorded");
-            return;
-        };
+        // `get_mut` rather than a lock at all: `Drop` has `&mut self`, so no
+        // other holder of the session can exist by definition.
+        let state = self.state.get_mut();
         if state.is_closed() {
             return;
         }
-        if let Err(e) = state.close(Some(knl::CLOSE_REASON_DROPPED)) {
-            tracing::warn!(
-                session = %state.id(),
-                error = %e,
-                "knl: dropped session could not record session_closed"
-            );
-        }
+        state.close_detached(knl::CLOSE_REASON_DROPPED);
     }
 }
 
@@ -511,10 +540,36 @@ fn table_to_object(
     }
 }
 
+/// The session behind the userdata, for a method that only reads its value.
+///
+/// `try_lock` rather than an await: the three identity reads are synchronous
+/// because they touch nothing that can wait, and the only thing that ever
+/// holds this lock is a store call that is suspended — at which point Lua is
+/// not running and cannot have called us.  So the refusal below is a
+/// contradiction being reported rather than a case to handle, and reporting it
+/// is still better than blocking the VM's one thread on a lock it is holding.
+fn borrowed<'a>(
+    session: &'a Session,
+    method: &str,
+) -> LuaResult<tokio::sync::MutexGuard<'a, knl::Session>> {
+    session
+        .state
+        .try_lock()
+        .map_err(|_| err(method, "the session is busy with another call"))
+}
+
 impl LuaUserData for Session {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        // The three identity reads below are the only synchronous methods on
+        // the session: each answers out of the value itself, touching neither
+        // the store nor anything that can wait, which is the work a sync
+        // `add_method` is still for.  Everything after them reaches the store,
+        // so everything after them yields.
+
         // s:id() -> string
-        methods.add_method("id", |_, this, ()| Ok(this.state.borrow().id().to_string()));
+        methods.add_method("id", |_, this, ()| {
+            Ok(borrowed(this, "id")?.id().to_string())
+        });
 
         // s:scope_id() -> string
         //
@@ -523,7 +578,7 @@ impl LuaUserData for Session {
         // Not `s:id()`: that names the stream, this names the authority the
         // stream is written under, and neither is a caller's to choose.
         methods.add_method("scope_id", |_, this, ()| {
-            Ok(this.state.borrow().scope_id().to_string())
+            Ok(borrowed(this, "scope_id")?.scope_id().to_string())
         });
 
         // s:owner() -> string
@@ -531,7 +586,7 @@ impl LuaUserData for Session {
         // The principal the scope belongs to (a real id, or the reserved
         // "anon" / "system").  Total — never nil.
         methods.add_method("owner", |_, this, ()| {
-            Ok(this.state.borrow().owner().to_string())
+            Ok(borrowed(this, "owner")?.owner().to_string())
         });
 
         // s:append(event) -> seq
@@ -544,11 +599,15 @@ impl LuaUserData for Session {
         // none.  No append touches the budget — that is `reserve` before the
         // call and `spend` after it — and the two `session_*` kinds are
         // refused here, since only `knl.open` / `close` write those.
-        methods.add_method("append", |lua, this, event: LuaValue| {
-            let obj = table_to_object(lua, "append", "event", event)?;
+        methods.add_async_method("append", |lua, this, event: LuaValue| async move {
+            // Converted before the session is reached, exactly as before:
+            // walking a Lua table can call back into Lua.
+            let obj = table_to_object(&lua, "append", "event", event)?;
             this.state
-                .borrow_mut()
+                .lock()
+                .await
                 .append(obj)
+                .await
                 .map_err(|e| knl_err("append", &e))
         });
 
@@ -556,12 +615,15 @@ impl LuaUserData for Session {
         //
         // K1: the returned tables are freshly built from the stored JSON
         // on every call, so mutating them cannot reach kernel state.
-        methods.add_method("events", |lua, this, from: Option<u64>| {
-            let selected = this
-                .state
-                .borrow()
-                .events(from.unwrap_or(0))
-                .map_err(|e| knl_err("events", &e))?;
+        methods.add_async_method("events", |lua, this, from: Option<u64>| async move {
+            let selected = {
+                let state = this.state.lock().await;
+                state
+                    .events(from.unwrap_or(0))
+                    .await
+                    .map_err(|e| knl_err("events", &e))?
+                // The guard is released here, before the conversion below.
+            };
             // The events come out of the kernel as `Current` — the proof that
             // they were read through the upcaster seam — and that proof stops
             // at this boundary: what Lua gets is a table, so the objects are
@@ -570,13 +632,19 @@ impl LuaUserData for Session {
                 .into_iter()
                 .map(|event| Value::Object(event.into_inner()))
                 .collect();
-            // The borrow is released above: json_to_lua re-enters Lua.
-            json_to_lua(lua, Value::Array(selected))
+            // The session is released above: json_to_lua re-enters Lua.
+            json_to_lua(&lua, Value::Array(selected))
         });
 
         // s:len() -> number of recorded events
-        methods.add_method("len", |_, this, ()| {
-            let n = this.state.borrow().len().map_err(|e| knl_err("len", &e))?;
+        methods.add_async_method("len", |_, this, ()| async move {
+            let n = this
+                .state
+                .lock()
+                .await
+                .len()
+                .await
+                .map_err(|e| knl_err("len", &e))?;
             Ok(n as u64)
         });
 
@@ -586,32 +654,39 @@ impl LuaUserData for Session {
         // vocabulary: an unknown name is an error, because a projection the
         // kernel does not name is the shell's to build — from
         // `events(from)`, or as a query view over the published schema.
-        methods.add_method("view", |lua, this, (name, opts): (LuaValue, LuaValue)| {
-            let LuaValue::String(name) = name else {
-                return Err(err(
-                    "view",
-                    format!("name must be a string, got {}", name.type_name()),
-                ));
-            };
-            let name = name.to_str()?.to_string();
-            let opts = match opts {
-                LuaValue::Nil => None,
-                table @ LuaValue::Table(_) => Some(table_to_object(lua, "view", "opts", table)?),
-                other => {
+        methods.add_async_method(
+            "view",
+            |lua, this, (name, opts): (LuaValue, LuaValue)| async move {
+                let LuaValue::String(name) = name else {
                     return Err(err(
                         "view",
-                        format!("opts must be a table, got {}", other.type_name()),
+                        format!("name must be a string, got {}", name.type_name()),
                     ));
-                }
-            };
-            let value = this
-                .state
-                .borrow_mut()
-                .view(&name, opts.as_ref())
-                .map_err(|e| knl_err("view", &e))?;
-            // The borrow is released above: json_to_lua re-enters Lua.
-            json_to_lua(lua, value)
-        });
+                };
+                let name = name.to_str()?.to_string();
+                let opts = match opts {
+                    LuaValue::Nil => None,
+                    table @ LuaValue::Table(_) => {
+                        Some(table_to_object(&lua, "view", "opts", table)?)
+                    }
+                    other => {
+                        return Err(err(
+                            "view",
+                            format!("opts must be a table, got {}", other.type_name()),
+                        ));
+                    }
+                };
+                let value = {
+                    let mut state = this.state.lock().await;
+                    state
+                        .view(&name, opts.as_ref())
+                        .await
+                        .map_err(|e| knl_err("view", &e))?
+                };
+                // The session is released above: json_to_lua re-enters Lua.
+                json_to_lua(&lua, value)
+            },
+        );
 
         // s:query(sql, params?, opts?) -> rows, truncated
         //
@@ -624,9 +699,9 @@ impl LuaUserData for Session {
         // connection that cannot write, values bound rather than pasted, a
         // deadline, a row cap.  The second return says whether the cap cut
         // anything off, so a caller can tell a complete answer from a page.
-        methods.add_method(
+        methods.add_async_method(
             "query",
-            |lua, this, (sql, params, opts): (LuaValue, LuaValue, LuaValue)| {
+            |lua, this, (sql, params, opts): (LuaValue, LuaValue, LuaValue)| async move {
                 let LuaValue::String(sql) = sql else {
                     return Err(err(
                         "query",
@@ -634,19 +709,21 @@ impl LuaUserData for Session {
                     ));
                 };
                 let sql = sql.to_str()?.to_string();
-                // Both conversions happen before the session is borrowed:
+                // Both conversions happen before the session is reached:
                 // walking a Lua table can re-enter Lua.
-                let params = query_params(lua, params)?;
-                let opts = query_opts(lua, opts)?;
+                let params = query_params(&lua, params)?;
+                let opts = query_opts(&lua, opts)?;
 
-                let found = this
-                    .state
-                    .borrow()
-                    .query(&sql, params, &opts)
-                    .map_err(|e| knl_err("query", &e))?;
+                let found = {
+                    let state = this.state.lock().await;
+                    state
+                        .query(&sql, params, &opts)
+                        .await
+                        .map_err(|e| knl_err("query", &e))?
+                };
                 let rows: Vec<Value> = found.rows.into_iter().map(Value::Object).collect();
-                // The borrow is released above: json_to_lua re-enters Lua.
-                let rows = json_to_lua(lua, Value::Array(rows))?;
+                // The session is released above: json_to_lua re-enters Lua.
+                let rows = json_to_lua(&lua, Value::Array(rows))?;
                 Ok((rows, found.truncated))
             },
         );
@@ -658,7 +735,7 @@ impl LuaUserData for Session {
         // and *nothing* was taken, with the grant's `tag` as the second
         // return so a caller can name the allowance that stopped it
         // without reading the log.  Always `true` without a budget.
-        methods.add_method("reserve", |_, this, amount: LuaValue| {
+        methods.add_async_method("reserve", |_, this, amount: LuaValue| async move {
             let Some(amount) = as_whole(&amount) else {
                 return Err(err(
                     "reserve",
@@ -668,8 +745,11 @@ impl LuaUserData for Session {
                     ),
                 ));
             };
-            let mut state = this.state.borrow_mut();
-            let granted = state.reserve(amount).map_err(|e| knl_err("reserve", &e))?;
+            let mut state = this.state.lock().await;
+            let granted = state
+                .reserve(amount)
+                .await
+                .map_err(|e| knl_err("reserve", &e))?;
             // The tag rides along only on a refusal: it answers "which
             // budget stopped you", which is a question only then.
             let tag = if granted {
@@ -690,7 +770,7 @@ impl LuaUserData for Session {
         // saw an error either way and could not tell whether the `budget_spent`
         // was in the log.  Two questions, two calls: this one raises only if
         // the write itself failed, and `s:remaining()` answers the other.
-        methods.add_method("spend", |_, this, amount: LuaValue| {
+        methods.add_async_method("spend", |_, this, amount: LuaValue| async move {
             let Some(amount) = as_whole(&amount) else {
                 return Err(err(
                     "spend",
@@ -701,8 +781,10 @@ impl LuaUserData for Session {
                 ));
             };
             this.state
-                .borrow_mut()
+                .lock()
+                .await
                 .spend(amount)
+                .await
                 .map_err(|e| knl_err("spend", &e))
         });
 
@@ -712,10 +794,12 @@ impl LuaUserData for Session {
         // balance to report, and both values this could otherwise return —
         // a stale number, or the nil that means "no budget here" — read as
         // facts a run would carry on spending against.
-        methods.add_method("remaining", |_, this, ()| {
+        methods.add_async_method("remaining", |_, this, ()| async move {
             this.state
-                .borrow()
+                .lock()
+                .await
                 .remaining()
+                .await
                 .map_err(|e| knl_err("remaining", &e))
         });
 
@@ -724,10 +808,12 @@ impl LuaUserData for Session {
         // Raises for the same reason `remaining` does: a `false` that meant
         // "the store could not be read" is the one answer a run must never
         // be handed, because it reads as "carry on".
-        methods.add_method("exhausted", |_, this, ()| {
+        methods.add_async_method("exhausted", |_, this, ()| async move {
             this.state
-                .borrow()
+                .lock()
+                .await
                 .exhausted()
+                .await
                 .map_err(|e| knl_err("exhausted", &e))
         });
 
@@ -741,9 +827,9 @@ impl LuaUserData for Session {
         // every distinct error message from becoming its own reason, and it
         // is the same split the `<close>` path records.  `detail` is truncated
         // exactly as that path truncates it.
-        methods.add_method(
+        methods.add_async_method(
             "close",
-            |_, this, (reason, detail): (LuaValue, LuaValue)| {
+            |_, this, (reason, detail): (LuaValue, LuaValue)| async move {
                 let reason = close_text("reason", reason)?;
                 let detail = close_text("detail", detail)?.map(|text| truncated(&text));
                 // A close whose `session_closed` append fails (a database
@@ -752,8 +838,10 @@ impl LuaUserData for Session {
                 // boundary was not recorded, instead of a silent closed=true
                 // with no record.
                 this.state
-                    .borrow_mut()
+                    .lock()
+                    .await
                     .close_with(reason.as_deref(), detail.as_deref())
+                    .await
                     .map_err(|e| knl_err("close", &e))?;
                 Ok(())
             },
@@ -785,35 +873,36 @@ impl LuaUserData for Session {
         //   caller is trying to diagnose — a bookkeeping failure must not
         //   overwrite the failure it is bookkeeping for.  It goes to the log
         //   as a `warn!` and the original error propagates unchanged.
-        methods.add_meta_method(LuaMetaMethod::Close, |_, this, error: LuaValue| {
-            if this.state.borrow().is_closed() {
-                return Ok(());
-            }
-            // Computed before the borrow: nothing about the error value is
-            // read while the session is held.
-            let unwinding = !matches!(error, LuaValue::Nil);
-            let (reason, detail) = match error {
-                LuaValue::Nil => (knl::CLOSE_REASON_SCOPE_EXIT, None),
-                error => (knl::CLOSE_REASON_ERROR, Some(error_detail(&error))),
-            };
-            let outcome = this
-                .state
-                .borrow_mut()
-                .close_with(Some(reason), detail.as_deref());
-            match outcome {
-                Ok(()) => Ok(()),
-                Err(e) if unwinding => {
-                    tracing::warn!(
-                        session = %this.state.borrow().id(),
-                        error = %e,
-                        "knl: session_closed was not recorded; \
-                         the block's own error is propagating instead"
-                    );
-                    Ok(())
+        methods.add_async_meta_method(
+            LuaMetaMethod::Close,
+            |_, this, error: LuaValue| async move {
+                // Computed before the session is reached: nothing about the
+                // error value is read while it is held.
+                let unwinding = !matches!(error, LuaValue::Nil);
+                let (reason, detail) = match error {
+                    LuaValue::Nil => (knl::CLOSE_REASON_SCOPE_EXIT, None),
+                    error => (knl::CLOSE_REASON_ERROR, Some(error_detail(&error))),
+                };
+                let mut state = this.state.lock().await;
+                if state.is_closed() {
+                    return Ok(());
                 }
-                Err(e) => Err(knl_err("close", &e)),
-            }
-        });
+                let outcome = state.close_with(Some(reason), detail.as_deref()).await;
+                match outcome {
+                    Ok(()) => Ok(()),
+                    Err(e) if unwinding => {
+                        tracing::warn!(
+                            session = %state.id(),
+                            error = %e,
+                            "knl: session_closed was not recorded; \
+                             the block's own error is propagating instead"
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(knl_err("close", &e)),
+                }
+            },
+        );
     }
 }
 
@@ -1120,12 +1209,19 @@ fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
 /// The stream id is minted here and adopted as the session's own id, so the
 /// id `knl.open` reports (`s:id()`) is exactly the stream a later
 /// `knl.resume` reopens — the durable identity is one string, not two.
-fn open_sqlite(owner: String, grant: Option<knl::BudgetGrant>, path: &str) -> LuaResult<Session> {
+async fn open_sqlite(
+    owner: String,
+    grant: Option<knl::BudgetGrant>,
+    path: &str,
+    drivers: &knl::IsleDrivers,
+) -> LuaResult<Session> {
     let stream = uuid::Uuid::new_v4().to_string();
-    let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone())
+    let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone(), drivers)
+        .await
         .map_err(|e| knl_err("open", &e))?;
-    let mut state =
-        knl::Session::open_on(owner, grant, Box::new(store)).map_err(|e| knl_err("open", &e))?;
+    let mut state = knl::Session::open_on(owner, grant, Box::new(store))
+        .await
+        .map_err(|e| knl_err("open", &e))?;
     state.adopt_id(stream);
     Ok(Session::from_state(state))
 }
@@ -1136,7 +1232,7 @@ fn open_sqlite(owner: String, grant: Option<knl::BudgetGrant>, path: &str) -> Lu
 /// database of that name while some handle still holds it open.
 /// `Session::resume` re-folds the log; the reopened stream's id is adopted so
 /// `s:id()` matches the stream the caller named.
-fn resume_on(
+async fn resume_on(
     grant: Option<knl::BudgetGrant>,
     store: knl::SqliteEventStore,
     session_id: String,
@@ -1145,8 +1241,9 @@ fn resume_on(
     // below runs: a refused resume must leave the stream exactly as it found
     // it, and a `budget_granted` recorded before the refusal would be the
     // caller writing into a stream it was not allowed to touch.
-    let mut state =
-        knl::Session::resume(None, Box::new(store)).map_err(|e| knl_err("resume", &e))?;
+    let mut state = knl::Session::resume(None, Box::new(store))
+        .await
+        .map_err(|e| knl_err("resume", &e))?;
     // The open path refuses an untrusted caller claiming a reserved
     // principal (parse_owner); resume must hold the same line, or Lua could
     // reopen a SYSTEM-owned stream and write into the reserved namespace.
@@ -1161,7 +1258,10 @@ fn resume_on(
     // The stream passed: now the owner's fresh grant is recorded, adding to
     // what the ledger already carried.
     if let Some(grant) = grant {
-        state.grant_more(grant).map_err(|e| knl_err("resume", &e))?;
+        state
+            .grant_more(grant)
+            .await
+            .map_err(|e| knl_err("resume", &e))?;
     }
     state.adopt_id(session_id);
     Ok(Session::from_state(state))
@@ -1173,7 +1273,11 @@ fn resume_on(
 /// `opts.budget` the grant (`{ amount, tag?, desc? }`), and `opts.store`
 /// the backend (in-memory by default, or `{ sqlite = "<path>" }` for a
 /// durable stream).
-fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
+async fn open_session(
+    lua: Lua,
+    opts: LuaValue,
+    drivers: knl::IsleDrivers,
+) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
         LuaValue::Nil => None,
         LuaValue::Table(t) => Some(t),
@@ -1186,9 +1290,14 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     };
     let owner = parse_owner(opts.as_ref())?;
     let grant = parse_budget(opts.as_ref())?;
-    let session = match parse_store("open", opts.as_ref())? {
-        StoreSpec::Mem => Session::new(owner, grant)?,
-        StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path)?,
+    let spec = parse_store("open", opts.as_ref())?;
+    // The options are read out of Lua *before* the first await: `opts` is a
+    // `LuaTable`, which must not be held across a suspension point, and the
+    // three parses above are the only things that touch it.
+    drop(opts);
+    let session = match spec {
+        StoreSpec::Mem => Session::new(owner, grant, &drivers).await?,
+        StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
     };
     lua.create_userdata(session)
 }
@@ -1201,7 +1310,11 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
 /// carries, rather than replacing it.  The returned userdata is the same
 /// one `knl.open` returns, only pre-loaded with the balance folded from the
 /// ledger.
-fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
+async fn resume_session(
+    lua: Lua,
+    opts: LuaValue,
+    drivers: knl::IsleDrivers,
+) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
         LuaValue::Table(t) => t,
         LuaValue::Nil => {
@@ -1232,19 +1345,23 @@ fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
             ));
         }
     };
+    // Nothing more is read out of `opts` past this point, so the Lua table is
+    // released before the first suspension below.
+    drop(opts);
     let store = match store {
         StoreSpec::Sqlite(path) => {
-            knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone())
+            knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone(), &drivers)
+                .await
         }
         // An in-memory stream is reopenable too, for as long as it exists:
         // the database is named after the stream, so a second handle on a
         // live one finds the same log.  It cannot outlive the process, and it
         // does not pretend to — a name nobody is holding open resumes as an
         // empty stream, which is refused for having no session in it.
-        StoreSpec::Mem => knl::SqliteEventStore::open_memory(session_id.clone()),
+        StoreSpec::Mem => knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await,
     }
     .map_err(|e| knl_err("resume", &e))?;
-    let state = resume_on(grant, store, session_id)?;
+    let state = resume_on(grant, store, session_id).await?;
     lua.create_userdata(state)
 }
 
@@ -1400,14 +1517,41 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
 /// a table, and `knl.api()` reports the declared surface.
 /// Each is bound by hand — a `create_function` needs its own signature — and
 /// a test below checks the set of bound names against the table.
-pub fn register(lua: &Lua) -> LuaResult<()> {
+///
+/// `drivers` is where the connection threads a session opens are kept.  They
+/// cannot belong to the session: the drop backstop hands its closing event to
+/// the thread *after* the handle is gone, so a thread the store had already
+/// stopped could not take it.  The host owns them for the length of a run and
+/// drains them once at the end of it ([`knl::IsleDrivers`]).
+///
+/// `open` and `resume` are async because opening a stream waits — for the
+/// connection thread to start, for the schema, for the opening events to land
+/// — and this is called on the Lua VM's own thread, which must not wait for
+/// anything.  Both are reachable only from inside a coroutine, which the main
+/// chunk and every bus handler already are.
+pub fn register(lua: &Lua, drivers: knl::IsleDrivers) -> LuaResult<()> {
     let knl_tbl = lua.create_table()?;
 
     // knl.open(opts?) -> Session userdata
-    knl_tbl.set("open", lua.create_function(open_session)?)?;
+    {
+        let drivers = drivers.clone();
+        knl_tbl.set(
+            "open",
+            lua.create_async_function(move |lua, opts: LuaValue| {
+                let drivers = drivers.clone();
+                open_session(lua, opts, drivers)
+            })?,
+        )?;
+    }
 
     // knl.resume(opts) -> Session userdata (durable stream re-folded)
-    knl_tbl.set("resume", lua.create_function(resume_session)?)?;
+    knl_tbl.set(
+        "resume",
+        lua.create_async_function(move |lua, opts: LuaValue| {
+            let drivers = drivers.clone();
+            resume_session(lua, opts, drivers)
+        })?,
+    )?;
 
     // knl.new_beat_id() -> string (time-ordered, session-free)
     knl_tbl.set("new_beat_id", lua.create_function(new_beat_id)?)?;
@@ -1450,20 +1594,83 @@ mod tests {
         end
     "#;
 
-    /// Fresh Lua VM with only the `knl` bridge registered.
-    fn vm() -> Lua {
-        let lua = Lua::new();
-        register(&lua).expect("register knl");
-        lua.load(FIXTURES).exec().expect("fixtures");
-        lua
+    /// A Lua VM with the `knl` bridge on it, and the two things a session
+    /// now needs around it: a runtime to yield into, and somewhere for its
+    /// connection threads to be owned.
+    ///
+    /// Every session method that reaches the store suspends, so a chunk that
+    /// calls one has to run as a coroutine on a runtime — [`Vm::exec`] is
+    /// that, and it is why the chunks below say `vm.exec(...)` where they
+    /// used to say `lua.load(...).exec()`.  The assertions inside them are
+    /// unchanged.
+    struct Vm {
+        lua: Lua,
+        /// The connection threads of every session the chunks open, held for
+        /// the test's lifetime exactly as the host holds them for a run's.
+        drivers: knl::IsleDrivers,
+        rt: tokio::runtime::Runtime,
     }
 
-    /// Run a chunk that is expected to fail, returning the error message.
-    fn expect_err(lua: &Lua, chunk: &str) -> String {
-        lua.load(chunk)
-            .exec()
-            .expect_err("chunk was expected to fail")
-            .to_string()
+    impl Vm {
+        /// Fresh VM with only the `knl` bridge registered.
+        fn new() -> Self {
+            let lua = Lua::new();
+            let drivers = knl::IsleDrivers::new();
+            register(&lua, drivers.clone()).expect("register knl");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the VM to yield into");
+            rt.block_on(async { lua.load(FIXTURES).exec_async().await })
+                .expect("fixtures");
+            Self { lua, drivers, rt }
+        }
+
+        /// Run `chunk` to completion, as a coroutine.
+        fn exec(&self, chunk: &str) -> LuaResult<()> {
+            self.rt
+                .block_on(async { self.lua.load(chunk).exec_async().await })
+        }
+
+        /// Run `chunk` and take what it returns.
+        fn eval<R: mlua::FromLuaMulti>(&self, chunk: &str) -> LuaResult<R> {
+            self.rt
+                .block_on(async { self.lua.load(chunk).eval_async::<R>().await })
+        }
+
+        /// Run a chunk that is expected to fail, returning the message.
+        fn expect_err(&self, chunk: &str) -> String {
+            self.exec(chunk)
+                .expect_err("chunk was expected to fail")
+                .to_string()
+        }
+
+        /// Drive `f` on this VM's runtime — for the assertions that read a
+        /// store directly rather than through Lua.
+        fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+            self.rt.block_on(f)
+        }
+
+        /// Let go of the VM and drain its connection threads.
+        ///
+        /// Dropping the Lua state collects every session userdata, which is
+        /// where a handle nobody closed submits its boundary without waiting;
+        /// shutting the drivers down is what waits for those writes to land.
+        /// A test that reads the database afterwards calls this first.
+        fn finish(self) {
+            let Self { lua, drivers, rt } = self;
+            drop(lua);
+            let failures = rt.block_on(drivers.shutdown());
+            assert!(
+                failures.is_empty(),
+                "the connection threads did not shut down cleanly: {failures:?}"
+            );
+        }
+    }
+
+    /// Fresh Lua VM with only the `knl` bridge registered.
+    fn vm() -> Vm {
+        Vm::new()
     }
 
     /// (Happy path) append assigns strictly increasing seq numbers, `len`
@@ -1472,8 +1679,8 @@ mod tests {
     /// `session_opened`.
     #[test]
     fn append_assigns_monotonic_seq_and_len_tracks() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             assert(s:len() == 1, "a fresh session holds session_opened")
@@ -1500,15 +1707,14 @@ mod tests {
             assert(err.message:find("under data"), "message: " .. err.message)
         "#,
         )
-        .exec()
         .expect("happy path chunk");
     }
 
     /// (I1) No mutation API is reachable on the session userdata.
     #[test]
     fn session_exposes_no_mutation_api() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             s:append({ kind = "user_msg" })
@@ -1519,7 +1725,6 @@ mod tests {
             end
         "#,
         )
-        .exec()
         .expect("mutation-surface chunk");
     }
 
@@ -1528,8 +1733,8 @@ mod tests {
     /// untouched.
     #[test]
     fn events_returns_a_deep_copy() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             s:append({ kind = "user_msg", meta = { tag = "a" },
@@ -1552,7 +1757,6 @@ mod tests {
             assert(again[2].data.blocks[1].type == "text", "nested table changed")
         "#,
         )
-        .exec()
         .expect("deep copy chunk");
     }
 
@@ -1560,8 +1764,8 @@ mod tests {
     /// overwritten rather than trusted.  There is no `author` field.
     #[test]
     fn kernel_owned_fields_override_caller_values() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             local seq = s:append({ kind = "user_msg", seq = 999, epoch_ms = 1 })
@@ -1572,15 +1776,14 @@ mod tests {
             assert(e.author == nil, "there is no per-event author anymore")
         "#,
         )
-        .exec()
         .expect("kernel-owned field chunk");
     }
 
     /// `events(from)` returns the tail with `seq >= from`.
     #[test]
     fn events_from_filters_by_seq() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             for i = 1, 3 do s:append({ kind = "e" .. i }) end
@@ -1591,7 +1794,6 @@ mod tests {
             assert(#s:events(0) == 4, "from=0 must return everything")
         "#,
         )
-        .exec()
         .expect("events(from) chunk");
     }
 
@@ -1599,22 +1801,22 @@ mod tests {
     /// non-table event, with `knl: append:` in the message.
     #[test]
     fn append_validates_event_shape_with_attributed_errors() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(&lua, r#"knl.open():append({ text = "no kind" })"#);
+        let msg = vm.expect_err(r#"knl.open():append({ text = "no kind" })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("kind is required"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():append({ kind = 42 })"#);
+        let msg = vm.expect_err(r#"knl.open():append({ kind = 42 })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("kind must be a string"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():append("not a table")"#);
+        let msg = vm.expect_err(r#"knl.open():append("not a table")"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("event must be a table"), "{msg}");
 
         // A rejected append leaves no trace in the history.
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open()
             pcall(function() s:append({ text = "no kind" }) end)
@@ -1622,7 +1824,6 @@ mod tests {
             assert(s:append({ kind = "ok" }) == 2, "seq must not be consumed by a failure")
         "#,
         )
-        .exec()
         .expect("rejected-append chunk");
     }
 
@@ -1630,9 +1831,8 @@ mod tests {
     /// and leaves the balance untouched.
     #[test]
     fn spend_rejects_negative_amounts() {
-        let lua = vm();
-        let msg = expect_err(
-            &lua,
+        let vm = vm();
+        let msg = vm.expect_err(
             r#"
             local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             s:spend(-1)
@@ -1641,7 +1841,7 @@ mod tests {
         assert!(msg.contains("knl: spend:"), "missing attribution: {msg}");
         assert!(msg.contains("non-negative"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             pcall(function() s:spend(-1) end)
@@ -1654,7 +1854,6 @@ mod tests {
             assert(not ok2, "a non-numeric amount must be rejected")
         "#,
         )
-        .exec()
         .expect("negative-spend chunk");
     }
 
@@ -1663,8 +1862,8 @@ mod tests {
     /// up.  `spend` itself answers nothing: the balance is `remaining()`.
     #[test]
     fn spend_is_monotonic_and_flips_exhausted() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 1000, tag = "beats" } })
             assert(s:remaining() == 1000)
@@ -1688,7 +1887,6 @@ mod tests {
             assert(s:remaining() == 0, "spending past zero stays at zero")
         "#,
         )
-        .exec()
         .expect("budget monotonicity chunk");
     }
 
@@ -1696,8 +1894,8 @@ mod tests {
     /// and the session is never exhausted.
     #[test]
     fn session_without_budget_reports_nil() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             assert(s:remaining() == nil, "remaining must be nil without a budget")
@@ -1710,7 +1908,6 @@ mod tests {
             assert(s2:remaining() == nil)
         "#,
         )
-        .exec()
         .expect("no-budget chunk");
     }
 
@@ -1718,32 +1915,32 @@ mod tests {
     /// `knl.open` itself.
     #[test]
     fn session_validates_budget_options() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = -1 } })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = { amount = -1 } })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("budget.amount"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = {} })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = {} })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("required"), "{msg}");
 
         // A misspelt field is an error, not a silently ignored cap: the
         // failure a budget exists to prevent is exactly "the limit I set
         // was not read".
-        let msg = expect_err(&lua, r#"knl.open({ budget = { tokens = 100 } })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = { tokens = 100 } })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("unknown budget field"), "{msg}");
         assert!(msg.contains("tokens"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = 10, tag = 7 } })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = { amount = 10, tag = 7 } })"#);
         assert!(msg.contains("budget.tag must be a string"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = 1.5 } })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = { amount = 1.5 } })"#);
         assert!(msg.contains("budget.amount"), "{msg}");
 
         // The words are optional, and carried verbatim when given.
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 42, tag = "tokens",
                                             desc = "one nightly run" } })
@@ -1760,14 +1957,13 @@ mod tests {
                    "a grant with no words must invent none")
         "#,
         )
-        .exec()
         .expect("grant options chunk");
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = 100 })"#);
+        let msg = vm.expect_err(r#"knl.open({ budget = 100 })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("budget must be a table"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open("nope")"#);
+        let msg = vm.expect_err(r#"knl.open("nope")"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("opts must be a table"), "{msg}");
     }
@@ -1776,8 +1972,8 @@ mod tests {
     /// of one is invisible to the other.
     #[test]
     fn two_sessions_are_independent() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local a = knl.open({ budget = { amount = 100, tag = "beats" } })
             local b = knl.open({ budget = { amount = 100, tag = "beats" } })
@@ -1799,7 +1995,6 @@ mod tests {
             assert(b:append({ kind = "still_open" }) == 3)
         "#,
         )
-        .exec()
         .expect("session independence chunk");
     }
 
@@ -1807,10 +2002,9 @@ mod tests {
     /// methods keep working and `close()` is idempotent.
     #[test]
     fn closed_session_rejects_append_and_spend() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             local s = knl.open()
             s:close()
@@ -1820,8 +2014,7 @@ mod tests {
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("session is closed"), "{msg}");
 
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:close()
@@ -1832,8 +2025,7 @@ mod tests {
         assert!(msg.contains("session is closed"), "{msg}");
 
         // A closed session cannot be granted more either.
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:close()
@@ -1843,7 +2035,7 @@ mod tests {
         assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
         assert!(msg.contains("session is closed"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:append({ kind = "before_close" })
@@ -1860,7 +2052,6 @@ mod tests {
             assert(type(s:id()) == "string")
         "#,
         )
-        .exec()
         .expect("closed-session read chunk");
     }
 
@@ -1868,39 +2059,35 @@ mod tests {
     /// there: a second VM starts with its own fresh session.
     #[test]
     fn state_lives_in_the_userdata_not_in_globals() {
-        let lua_a = vm();
-        lua_a
-            .load(
-                r#"
+        let vm_a = vm();
+        vm_a.exec(
+            r#"
             local s = knl.open()
             s:append({ kind = "in_vm_a" })
             assert(s:len() == 2)
             -- `knl` itself carries no session state.
             assert(knl.events == nil and knl.append == nil and knl.spend == nil)
         "#,
-            )
-            .exec()
-            .expect("vm a chunk");
+        )
+        .expect("vm a chunk");
 
-        let lua_b = vm();
-        lua_b
-            .load(
-                r#"
+        let vm_b = vm();
+        vm_b.exec(
+            r#"
             local s = knl.open()
             assert(s:len() == 1, "a second VM starts with only its own session_opened")
             assert(s:events()[1].kind == "session_opened")
         "#,
-            )
-            .exec()
-            .expect("vm b chunk");
+        )
+        .expect("vm b chunk");
     }
 
     /// The kernel brackets the session: `session_opened` on open,
     /// `session_closed` on close, with the caller's reason (or the default).
     #[test]
     fn session_boundaries_are_recorded_by_the_kernel() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             local opened = s:events()[1]
@@ -1922,10 +2109,9 @@ mod tests {
             assert(d:events()[2].data.reason == "closed", "default reason")
         "#,
         )
-        .exec()
         .expect("session boundary chunk");
 
-        let msg = expect_err(&lua, r#"knl.open():close({ not_a = "string" })"#);
+        let msg = vm.expect_err(r#"knl.open():close({ not_a = "string" })"#);
         assert!(msg.contains("knl: close:"), "missing attribution: {msg}");
         assert!(msg.contains("reason must be a string"), "{msg}");
     }
@@ -1935,30 +2121,25 @@ mod tests {
     /// shape of a kind's own `data` is the writer's business, not its.
     #[test]
     fn the_envelope_is_validated_and_a_kinds_own_data_is_not() {
-        let lua = vm();
+        let vm = vm();
 
         // A kind's own field at the top level: refused, and the message says
         // where it goes.
-        let msg = expect_err(
-            &lua,
-            r#"knl.open():append({ kind = "msg_user", content = "hi" })"#,
-        );
+        let msg = vm.expect_err(r#"knl.open():append({ kind = "msg_user", content = "hi" })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("content"), "{msg}");
         assert!(msg.contains("under data"), "{msg}");
 
         // `meta` is shallow: nesting belongs under `data`.
-        let msg = expect_err(
-            &lua,
-            r#"knl.open():append({ kind = "note", meta = { deep = { a = 1 } } })"#,
-        );
+        let msg =
+            vm.expect_err(r#"knl.open():append({ kind = "note", meta = { deep = { a = 1 } } })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("meta is shallow"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():append({ kind = "note", data = 7 })"#);
+        let msg = vm.expect_err(r#"knl.open():append({ kind = "note", data = 7 })"#);
         assert!(msg.contains("data must be a table"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open()
             pcall(function() s:append({ kind = "note", text = "hi" }) end)
@@ -1991,7 +2172,6 @@ mod tests {
             assert(not ok, "a numeric beat was accepted")
         "#,
         )
-        .exec()
         .expect("envelope chunk");
     }
 
@@ -2001,10 +2181,9 @@ mod tests {
     /// move.
     #[test]
     fn lua_cannot_append_the_budget_kinds_by_hand() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:append({ kind = "budget_reserved", data = { amount = 5 } })
@@ -2014,7 +2193,7 @@ mod tests {
         assert!(msg.contains("kernel only"), "{msg}");
         assert!(msg.contains("budget_reserved"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             for _, ev in ipairs({
@@ -2038,7 +2217,6 @@ mod tests {
                    "the kernel's own reservation is readable")
         "#,
         )
-        .exec()
         .expect("kernel-only kind chunk");
     }
 
@@ -2047,8 +2225,8 @@ mod tests {
     /// it refuses.  Every answer is a fact in the log.
     #[test]
     fn reserve_grants_refuses_and_records_both() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 100, tag = "beats" } })
 
@@ -2077,12 +2255,11 @@ mod tests {
             assert(s:reserve(1) == false, "nothing fits past zero")
         "#,
         )
-        .exec()
         .expect("reserve chunk");
 
         // Without a budget every reservation is granted, and nothing is
         // recorded: a session with no quota keeps no ledger.
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open()
             local ok, tag = s:reserve(999999)
@@ -2090,17 +2267,13 @@ mod tests {
             assert(s:len() == 1, "a session with no quota recorded a ledger event")
         "#,
         )
-        .exec()
         .expect("no-budget reserve chunk");
 
-        let msg = expect_err(
-            &lua,
-            r#"knl.open({ budget = { amount = 10 } }):reserve(-1)"#,
-        );
+        let msg = vm.expect_err(r#"knl.open({ budget = { amount = 10 } }):reserve(-1)"#);
         assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
         assert!(msg.contains("non-negative"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():reserve("many")"#);
+        let msg = vm.expect_err(r#"knl.open():reserve("many")"#);
         assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
     }
 
@@ -2108,8 +2281,8 @@ mod tests {
     /// spent` over what Lua can read reproduces `remaining()` exactly.
     #[test]
     fn the_balance_lua_reads_is_the_fold_of_the_ledger() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local function folded(s)
                 local balance = nil
@@ -2145,7 +2318,6 @@ mod tests {
             assert(r.data.usage.input_tokens == 100 and r.data.usage.output_tokens == 50)
         "#,
         )
-        .exec()
         .expect("fold chunk");
     }
 
@@ -2155,10 +2327,9 @@ mod tests {
     /// refused and the session stays open.
     #[test]
     fn lua_cannot_append_the_session_boundary_kinds_by_hand() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             local s = knl.open()
             s:append({ kind = "session_closed", data = { reason = "carried over" } })
@@ -2168,7 +2339,7 @@ mod tests {
         assert!(msg.contains("kernel only"), "{msg}");
         assert!(msg.contains("session_closed"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             for _, ev in ipairs({
@@ -2198,7 +2369,6 @@ mod tests {
             assert(not ok, "a closed session took a write")
         "#,
         )
-        .exec()
         .expect("session boundary kind chunk");
     }
 
@@ -2208,8 +2378,8 @@ mod tests {
     /// they happened.
     #[test]
     fn new_beat_id_mints_distinct_time_ordered_ids() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local a = knl.new_beat_id()
             local b = knl.new_beat_id()
@@ -2232,15 +2402,14 @@ mod tests {
             assert(s:events()[2].beat == a, "the minted beat is recorded verbatim")
         "#,
         )
-        .exec()
         .expect("new_beat_id chunk");
     }
 
     /// `view("tail", { n = k })` returns the last k events verbatim.
     #[test]
     fn view_tail_returns_the_last_events() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             for i = 1, 5 do s:append({ kind = "e" .. i }) end
@@ -2255,10 +2424,9 @@ mod tests {
             assert(#s:view("tail") == 6, "n defaults to 20")
         "#,
         )
-        .exec()
         .expect("tail view chunk");
 
-        let msg = expect_err(&lua, r#"knl.open():view("tail", { n = -1 })"#);
+        let msg = vm.expect_err(r#"knl.open():view("tail", { n = -1 })"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains("non-negative"), "{msg}");
     }
@@ -2267,24 +2435,24 @@ mod tests {
     /// error, and so is a non-string name or non-table opts.
     #[test]
     fn view_rejects_unknown_names_and_bad_arguments() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(&lua, r#"knl.open():view("dialog")"#);
+        let msg = vm.expect_err(r#"knl.open():view("dialog")"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains(r#"unknown view "dialog""#), "{msg}");
 
         // The token account is one of the names the kernel does not have:
         // it reads the `data` of an `llm_response`, so it is a query view in
         // Lua (`knl.views.usage`) over the published schema.
-        let msg = expect_err(&lua, r#"knl.open():view("usage")"#);
+        let msg = vm.expect_err(r#"knl.open():view("usage")"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains(r#"unknown view "usage""#), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():view(42)"#);
+        let msg = vm.expect_err(r#"knl.open():view(42)"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains("name must be a string"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open():view("tail", "n=2")"#);
+        let msg = vm.expect_err(r#"knl.open():view("tail", "n=2")"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains("opts must be a table"), "{msg}");
     }
@@ -2293,8 +2461,8 @@ mod tests {
     /// the history.
     #[test]
     fn view_returns_a_fresh_table_each_call() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open()
             s:append({ kind = "msg_user", data = { content = "hi" } })
@@ -2314,7 +2482,6 @@ mod tests {
             assert(s:events()[2].kind == "msg_user", "the record was reachable")
         "#,
         )
-        .exec()
         .expect("view copy chunk");
     }
 
@@ -2322,8 +2489,8 @@ mod tests {
     /// store string is a `knl: open:` error.
     #[test]
     fn store_mem_is_the_default_and_unknown_stores_are_rejected() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ store = "mem", owner = "x", budget = { amount = 10, tag = "beats" } })
             assert(s:len() == 2, "mem store opens like the default: session_opened + the grant")
@@ -2331,14 +2498,13 @@ mod tests {
             assert(s:append({ kind = "note" }) == 3)
         "#,
         )
-        .exec()
         .expect("mem store chunk");
 
-        let msg = expect_err(&lua, r#"knl.open({ store = "postgres" })"#);
+        let msg = vm.expect_err(r#"knl.open({ store = "postgres" })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("unknown store"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open({ store = { redis = "x" } })"#);
+        let msg = vm.expect_err(r#"knl.open({ store = { redis = "x" } })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("sqlite"), "{msg}");
     }
@@ -2350,19 +2516,19 @@ mod tests {
     /// real principal id is accepted verbatim.
     #[test]
     fn open_rejects_reserved_owner_ids_from_the_caller() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(&lua, r#"knl.open({ owner = "system" })"#);
+        let msg = vm.expect_err(r#"knl.open({ owner = "system" })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("reserved"), "{msg}");
         assert!(msg.contains("system"), "{msg}");
 
-        let msg = expect_err(&lua, r#"knl.open({ owner = "anon" })"#);
+        let msg = vm.expect_err(r#"knl.open({ owner = "anon" })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("reserved"), "{msg}");
         assert!(msg.contains("anon"), "{msg}");
 
-        lua.load(
+        vm.exec(
             r#"
             -- Unspecified owner is the kernel-assigned reserved anon.
             assert(knl.open():owner() == "anon", "default owner must be anon")
@@ -2371,7 +2537,6 @@ mod tests {
             assert(knl.open({ owner = "alice" }):owner() == "alice", "owner not carried")
         "#,
         )
-        .exec()
         .expect("reserved-owner chunk");
     }
 
@@ -2380,8 +2545,8 @@ mod tests {
     /// every `budget_*` event were written under.  Two runs are two scopes.
     #[test]
     fn a_session_reports_its_scope_id_and_records_it_on_the_log() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "alice", budget = { amount = 100, tag = "beats" } })
             local scope = s:scope_id()
@@ -2419,7 +2584,6 @@ mod tests {
                    "two runs must be two scopes")
         "#,
         )
-        .exec()
         .expect("scope id chunk");
     }
 
@@ -2428,12 +2592,12 @@ mod tests {
     /// and the ledger it goes on writing names that same scope.
     #[test]
     fn a_resumed_session_keeps_the_scope_id_the_log_recorded() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path = path.to_str().expect("utf-8 path");
 
-        lua.load(format!(
+        vm.exec(&format!(
             r#"
             local path = "{path}"
             local s = knl.open({{ store = {{ sqlite = path }}, owner = "scoped-user",
@@ -2457,7 +2621,6 @@ mod tests {
                    "continued scope_id: " .. tostring(last.data.scope_id))
         "#
         ))
-        .exec()
         .expect("durable scope chunk");
     }
 
@@ -2469,12 +2632,12 @@ mod tests {
     /// recorded, and added to what was left.
     #[test]
     fn open_and_resume_a_durable_sqlite_session() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path = path.to_str().expect("utf-8 path");
 
-        lua.load(format!(
+        vm.exec(&format!(
             r#"
             local path = "{path}"
             -- The responses in a stream, for the counts a query view sums.
@@ -2540,7 +2703,6 @@ mod tests {
             assert(last.data.amount == 100 and last.data.desc == "a second grant")
         "#
         ))
-        .exec()
         .expect("durable open/resume chunk");
     }
 
@@ -2550,26 +2712,30 @@ mod tests {
     /// through the resume side door.
     #[test]
     fn resume_rejects_a_reserved_system_owned_stream() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path_str = path.to_str().expect("utf-8 path");
 
-        // The host side (Rust) legitimately opens a SYSTEM-owned stream.
+        // The host side (Rust) legitimately opens a SYSTEM-owned stream, on
+        // the same collection of connection threads the VM's sessions use.
         let stream = "system-stream".to_string();
-        let store = crate::knl::SqliteEventStore::open(&path, stream.clone()).expect("open store");
-        let state =
-            crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
-                .expect("open system session");
-        drop(state);
+        let drivers = vm.drivers.clone();
+        vm.block_on(async {
+            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
+                .await
+                .expect("open store");
+            let state =
+                crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
+                    .await
+                    .expect("open system session");
+            drop(state);
+        });
 
         // Lua resuming it is refused, exactly as claiming SYSTEM at open is.
-        let msg = expect_err(
-            &lua,
-            &format!(
-                r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}" }})"#
-            ),
-        );
+        let msg = vm.expect_err(&format!(
+            r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}" }})"#
+        ));
         assert!(
             msg.contains("reserved"),
             "must name the reserved owner: {msg}"
@@ -2580,12 +2746,12 @@ mod tests {
     /// each missing piece is a `knl: resume:` error.
     #[test]
     fn resume_requires_a_session_id_and_a_stream_that_holds_a_session() {
-        let lua = vm();
+        let vm = vm();
 
-        let msg = expect_err(&lua, r#"knl.resume()"#);
+        let msg = vm.expect_err(r#"knl.resume()"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
 
-        let msg = expect_err(&lua, r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
+        let msg = vm.expect_err(r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
         assert!(msg.contains("session is required"), "{msg}");
 
@@ -2593,7 +2759,7 @@ mod tests {
         // an in-memory database exists only while a handle does, so resuming
         // one that has gone is refused for having no opening in it — the same
         // answer a fresh file gives.
-        let msg = expect_err(&lua, r#"knl.resume({ session = "never-opened" })"#);
+        let msg = vm.expect_err(r#"knl.resume({ session = "never-opened" })"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
         assert!(msg.contains("no session to resume"), "{msg}");
     }
@@ -2604,8 +2770,8 @@ mod tests {
     /// process, and nothing here pretends otherwise.
     #[test]
     fn an_in_memory_stream_is_resumable_while_it_is_open() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "beats" } })
             local id = s:id()
@@ -2629,7 +2795,6 @@ mod tests {
             assert(s:remaining() == 50, "the writer sees it: " .. tostring(s:remaining()))
         "#,
         )
-        .exec()
         .expect("in-memory resume chunk");
     }
 
@@ -2640,20 +2805,41 @@ mod tests {
     // whether the record landed, and only the durable log answers that.
 
     /// The persisted events of `stream`, read through a fresh connection.
+    ///
+    /// A runtime of its own, and a collection of its own that is drained
+    /// before the rows are handed back: this is a plain read, and it should
+    /// leave nothing running behind it.
     fn persisted(path: &std::path::Path, stream: &str) -> Vec<Value> {
         use crate::knl::EventStore;
 
-        let store = crate::knl::SqliteEventStore::open(path, stream).expect("reopen the stream");
-        store.read(0, usize::MAX).expect("read the stream")
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime to read on");
+        rt.block_on(async {
+            let drivers = knl::IsleDrivers::new();
+            let store = crate::knl::SqliteEventStore::open(path, stream, &drivers)
+                .await
+                .expect("reopen the stream");
+            let log = store.read(0, usize::MAX).await.expect("read the stream");
+            drop(store);
+            assert!(drivers.shutdown().await.is_empty(), "the reader joined");
+            log
+        })
     }
 
     /// Run `chunk` in a fresh VM and return the session id it yields.
     ///
-    /// The VM is dropped before the caller reads the stream, so anything the
-    /// collector still owed has been paid by the time the log is inspected.
+    /// The VM is dropped *and its connection threads drained* before the
+    /// caller reads the stream: collecting the Lua state is what makes the
+    /// drop backstop submit its boundary, and draining the threads is what
+    /// waits for that submitted write to land.  Only then is the log
+    /// inspected.
     fn stream_id_from(chunk: String) -> String {
-        let lua = vm();
-        lua.load(chunk).eval::<String>().expect("close scope chunk")
+        let vm = vm();
+        let id = vm.eval::<String>(&chunk).expect("close scope chunk");
+        vm.finish();
+        id
     }
 
     /// (I6) A `<close>` scope that ends cleanly records the session's
@@ -2732,97 +2918,117 @@ mod tests {
 
     /// A [`knl::EventStore`] that fails its `nth` append and serves the rest
     /// from an in-memory log the test keeps a handle on.
+    /// The shared log a [`FlakyStore`] writes to.
+    ///
+    /// `Arc<tokio::sync::Mutex<_>>` rather than the `Rc<RefCell<_>>` it used
+    /// to be: an [`knl::EventStore`] is `Send + Sync` now (the durable one's
+    /// calls travel to a connection thread), and the SPI is `async`, so the
+    /// lock has to be one that may be held across a suspension point.
+    type SharedLog = std::sync::Arc<Mutex<knl::MemEventStore>>;
+
     struct FlakyStore {
         /// The real log, shared with the test so it can be read after the
         /// session that owned it is gone.
-        inner: std::rc::Rc<RefCell<knl::MemEventStore>>,
+        inner: SharedLog,
         /// Which append (1-based) fails; `0` fails none.
         fails_on: usize,
         /// How many appends have been attempted.
-        attempts: std::cell::Cell<usize>,
+        attempts: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyStore {
         /// A store whose `fails_on`-th append reports a failure, plus the
         /// handle on the log it writes to.
-        fn new(fails_on: usize) -> (Self, std::rc::Rc<RefCell<knl::MemEventStore>>) {
-            let inner = std::rc::Rc::new(RefCell::new(knl::MemEventStore::new()));
+        fn new(fails_on: usize) -> (Self, SharedLog) {
+            let inner: SharedLog = std::sync::Arc::default();
             let store = Self {
-                inner: std::rc::Rc::clone(&inner),
+                inner: std::sync::Arc::clone(&inner),
                 fails_on,
-                attempts: std::cell::Cell::new(0),
+                attempts: std::sync::atomic::AtomicUsize::new(0),
             };
             (store, inner)
         }
 
         /// Whether this attempt is the one that fails.
         fn fails_now(&self) -> bool {
-            self.attempts.set(self.attempts.get() + 1);
-            self.attempts.get() == self.fails_on
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            attempt == self.fails_on
+        }
+
+        /// The log, borrowed.
+        async fn log(&self) -> tokio::sync::MutexGuard<'_, knl::MemEventStore> {
+            self.inner.lock().await
         }
     }
 
+    #[async_trait::async_trait]
     impl knl::EventStore for FlakyStore {
-        fn append(&mut self, event: Map<String, Value>) -> knl::KnlResult<knl::Committed> {
+        async fn append(&mut self, event: Map<String, Value>) -> knl::KnlResult<knl::Committed> {
             if self.fails_now() {
                 return Err(knl::KnlError::Storage("the store is down".to_string()));
             }
-            self.inner.borrow_mut().append(event)
+            self.log().await.append(event).await
         }
 
         /// A batch is *one* write, as it is on the durable backend: it counts
         /// as one attempt, and when that attempt is the failing one nothing
         /// in the batch is recorded.  A stand-in that let half a batch land
         /// would be modelling a store the SPI does not allow.
-        fn append_many(
+        async fn append_many(
             &mut self,
             events: Vec<Map<String, Value>>,
         ) -> knl::KnlResult<Vec<knl::Committed>> {
             if self.fails_now() {
                 return Err(knl::KnlError::Storage("the store is down".to_string()));
             }
-            let mut inner = self.inner.borrow_mut();
-            events
-                .into_iter()
-                .map(|event| inner.append(event))
-                .collect()
+            let mut log = self.log().await;
+            let mut committed = Vec::with_capacity(events.len());
+            for event in events {
+                committed.push(log.append(event).await?);
+            }
+            Ok(committed)
         }
 
-        fn append_if(
+        async fn append_if(
             &mut self,
             kinds: Option<&[&str]>,
-            decide: &mut knl::Decision<'_>,
+            decide: knl::Decision,
         ) -> knl::KnlResult<Option<knl::Committed>> {
             if self.fails_now() {
                 return Err(knl::KnlError::Storage("the store is down".to_string()));
             }
-            self.inner.borrow_mut().append_if(kinds, decide)
+            self.log().await.append_if(kinds, decide).await
         }
 
-        fn read_kinds(
+        async fn read_kinds(
             &self,
             kinds: Option<&[&str]>,
             from_seq: u64,
             limit: usize,
         ) -> knl::KnlResult<Vec<Value>> {
-            self.inner.borrow().read_kinds(kinds, from_seq, limit)
+            self.log().await.read_kinds(kinds, from_seq, limit).await
         }
 
-        fn head(&self) -> knl::KnlResult<Option<u64>> {
-            self.inner.borrow().head()
+        async fn head(&self) -> knl::KnlResult<Option<u64>> {
+            self.log().await.head().await
         }
 
-        fn len(&self) -> knl::KnlResult<usize> {
-            self.inner.borrow().len()
+        async fn len(&self) -> knl::KnlResult<usize> {
+            self.log().await.len().await
         }
     }
 
     /// The kinds an in-memory log holds, in order.
-    fn kinds_in(log: &RefCell<knl::MemEventStore>) -> Vec<String> {
+    fn kinds_in(log: &SharedLog) -> Vec<String> {
         use crate::knl::EventStore;
 
-        log.borrow()
-            .read(0, usize::MAX)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime to read on");
+        rt.block_on(async { log.lock().await.read(0, usize::MAX).await })
             .expect("read the log")
             .iter()
             .map(|e| e["kind"].as_str().unwrap_or("").to_string())
@@ -2836,25 +3042,32 @@ mod tests {
     /// Lua surface a caller sees is [`MODULE_API`] and nothing else.  It
     /// builds the same userdata `knl.open` builds, so `<close>`, the drop
     /// backstop and every method behave exactly as they do in production.
-    fn vm_with_a_failing_store(fails_on: usize) -> (Lua, std::rc::Rc<RefCell<knl::MemEventStore>>) {
-        let lua = vm();
+    fn vm_with_a_failing_store(fails_on: usize) -> (Vm, SharedLog) {
+        let vm = vm();
         let (store, log) = FlakyStore::new(fails_on);
-        let store = RefCell::new(Some(store));
-        let open_failing = lua
-            .create_function(move |lua, ()| {
-                let store = store
-                    .borrow_mut()
-                    .take()
-                    .ok_or_else(|| err("open", "the failing store can only be opened once"))?;
-                let state = knl::Session::open_on("t".to_string(), None, Box::new(store))
-                    .map_err(|e| knl_err("open", &e))?;
-                lua.create_userdata(Session::from_state(state))
-            })
-            .expect("create open_failing");
-        lua.globals()
+        // Handed over once, from inside an async function like `knl.open`
+        // itself: opening a session is a write, so it suspends.
+        let store = std::sync::Arc::new(Mutex::new(Some(store)));
+        let open_failing =
+            vm.lua
+                .create_async_function(move |lua, ()| {
+                    let store = std::sync::Arc::clone(&store);
+                    async move {
+                        let store = store.lock().await.take().ok_or_else(|| {
+                            err("open", "the failing store can only be opened once")
+                        })?;
+                        let state = knl::Session::open_on("t".to_string(), None, Box::new(store))
+                            .await
+                            .map_err(|e| knl_err("open", &e))?;
+                        lua.create_userdata(Session::from_state(state))
+                    }
+                })
+                .expect("create open_failing");
+        vm.lua
+            .globals()
             .set("open_failing", open_failing)
             .expect("register open_failing");
-        (lua, log)
+        (vm, log)
     }
 
     /// (I6) The block's own error wins over a close that could not be
@@ -2868,9 +3081,9 @@ mod tests {
     #[test]
     fn a_failed_close_does_not_replace_the_error_the_block_raised() {
         // 1: session_opened (no grant, so the close is the second append).
-        let (lua, log) = vm_with_a_failing_store(2);
+        let (vm, log) = vm_with_a_failing_store(2);
 
-        lua.load(
+        vm.exec(
             r#"
             local kept
             local ok, msg = pcall(function()
@@ -2888,7 +3101,6 @@ mod tests {
             assert(kept:len() == 1, "len after the failed close: " .. tostring(kept:len()))
         "#,
         )
-        .exec()
         .expect("failing close chunk");
 
         assert_eq!(
@@ -2903,10 +3115,9 @@ mod tests {
     /// close reporting success with nothing in the log.
     #[test]
     fn a_failed_close_on_a_clean_scope_exit_still_raises() {
-        let (lua, log) = vm_with_a_failing_store(2);
+        let (vm, log) = vm_with_a_failing_store(2);
 
-        let msg = expect_err(
-            &lua,
+        let msg = vm.expect_err(
             r#"
             do
                 local s <close> = open_failing()
@@ -2929,8 +3140,10 @@ mod tests {
     /// This replaces the earlier behaviour, where the two were separate
     /// appends and a failed second one had to be patched over with a
     /// best-effort `session_closed`.
-    #[test]
-    fn an_open_that_cannot_be_recorded_leaves_the_stream_empty() {
+    #[tokio::test]
+    async fn an_open_that_cannot_be_recorded_leaves_the_stream_empty() {
+        use crate::knl::EventStore;
+
         // The whole opening is one write, so it is the first attempt.
         let (store, log) = FlakyStore::new(1);
         let err = knl::Session::open_on(
@@ -2938,29 +3151,35 @@ mod tests {
             Some(knl::BudgetGrant::new(100)),
             Box::new(store),
         )
+        .await
         .expect_err("the open must fail");
         assert_eq!(err.reason(), "the store is down");
 
+        let recorded = log.lock().await.read(0, usize::MAX).await.expect("read");
         assert!(
-            kinds_in(&log).is_empty(),
-            "a failed open records nothing at all: {:?}",
-            kinds_in(&log)
+            recorded.is_empty(),
+            "a failed open records nothing at all: {recorded:?}"
         );
     }
 
     /// The other side of it: an open that *does* land records both events, in
     /// order, from the one write.
-    #[test]
-    fn an_open_records_its_boundary_and_its_grant_together() {
+    #[tokio::test]
+    async fn an_open_records_its_boundary_and_its_grant_together() {
+        use crate::knl::{event::kind_of, EventStore};
+
         let (store, log) = FlakyStore::new(0);
         let session = knl::Session::open_on(
             "t".to_string(),
             Some(knl::BudgetGrant::new(100)),
             Box::new(store),
         )
+        .await
         .expect("the open lands");
-        assert_eq!(kinds_in(&log), ["session_opened", "budget_granted"]);
-        assert_eq!(session.remaining(), Ok(Some(100)));
+        let recorded = log.lock().await.read(0, usize::MAX).await.expect("read");
+        let kinds: Vec<&str> = recorded.iter().map(kind_of).collect();
+        assert_eq!(kinds, ["session_opened", "budget_granted"]);
+        assert_eq!(session.remaining().await, Ok(Some(100)));
     }
 
     /// `close(reason, detail)` records both: the reason stays the short word
@@ -2998,8 +3217,8 @@ mod tests {
 
         // The one- and no-argument forms still work, and a detail is never
         // invented for them.
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local a = knl.open({ owner = "t" })
             a:close("done")
@@ -3014,11 +3233,10 @@ mod tests {
             assert(closed.detail == nil)
         "#,
         )
-        .exec()
         .expect("close forms chunk");
 
         // And a non-string detail is refused, naming which argument it was.
-        let msg = expect_err(&lua, r#"knl.open({ owner = "t" }):close("error", 7)"#);
+        let msg = vm.expect_err(r#"knl.open({ owner = "t" }):close("error", 7)"#);
         assert!(msg.contains("knl: close:"), "missing attribution: {msg}");
         assert!(msg.contains("detail must be a string"), "{msg}");
     }
@@ -3028,8 +3246,8 @@ mod tests {
     /// the log, whichever side records it.
     #[test]
     fn a_long_close_detail_is_truncated() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "t" })
             s:close("error", string.rep("x", 500))
@@ -3038,7 +3256,6 @@ mod tests {
             assert(last.detail:sub(-3) == "...", "a cut detail says it was cut")
         "#,
         )
-        .exec()
         .expect("long detail chunk");
     }
 
@@ -3047,22 +3264,19 @@ mod tests {
     /// instead of handing back a handle onto a finished log.
     #[test]
     fn resume_refuses_a_closed_stream() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path_str = path.to_str().expect("utf-8 path");
 
-        let msg = expect_err(
-            &lua,
-            &format!(
-                r#"
+        let msg = vm.expect_err(&format!(
+            r#"
                 local s = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})
                 local id = s:id()
                 s:close("done")
                 knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = id }})
             "#
-            ),
-        );
+        ));
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
         assert!(msg.contains("session is closed"), "{msg}");
         assert!(msg.contains("disposable"), "{msg}");
@@ -3073,27 +3287,30 @@ mod tests {
     /// `budget_granted` in a stream it was not allowed to reopen.
     #[test]
     fn a_refused_resume_records_no_grant() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path_str = path.to_str().expect("utf-8 path");
 
         // The host side legitimately opens a SYSTEM-owned stream.
         let stream = "system-grant-stream".to_string();
-        let store = crate::knl::SqliteEventStore::open(&path, stream.clone()).expect("open store");
-        let state =
-            crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
-                .expect("open system session");
-        drop(state);
+        let drivers = vm.drivers.clone();
+        vm.block_on(async {
+            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
+                .await
+                .expect("open store");
+            let state =
+                crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
+                    .await
+                    .expect("open system session");
+            drop(state);
+        });
         let before = persisted(&path, &stream).len();
 
-        let msg = expect_err(
-            &lua,
-            &format!(
-                r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}",
+        let msg = vm.expect_err(&format!(
+            r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}",
                                  budget = {{ amount = 100, tag = "beats" }} }})"#
-            ),
-        );
+        ));
         assert!(msg.contains("reserved"), "{msg}");
 
         let log = persisted(&path, &stream);
@@ -3110,7 +3327,7 @@ mod tests {
     /// without an entry in the table fails here.
     #[test]
     fn the_lua_surface_is_exactly_what_is_declared() {
-        let lua = vm();
+        let vm = vm();
 
         // The session's methods, read off the live userdata's metatable.
         let mut declared: Vec<&str> = SESSION_API
@@ -3124,9 +3341,8 @@ mod tests {
         // protects it with `__metatable`), so the reflection is done from
         // here — it is still the registration itself that is being read, not
         // a second list of names.
-        let session: LuaAnyUserData = lua
-            .load(r#"return knl.open({ owner = "t" })"#)
-            .eval()
+        let session: LuaAnyUserData = vm
+            .eval(r#"return knl.open({ owner = "t" })"#)
             .expect("open a session to reflect over");
         let meta = session.metatable().expect("the session's metatable");
         let index: LuaTable = meta.get("__index").expect("the methods table");
@@ -3154,8 +3370,8 @@ mod tests {
         // The module's functions.
         let mut module: Vec<&str> = MODULE_API.iter().map(|(name, _)| *name).collect();
         module.sort_unstable();
-        let mut bound: Vec<String> = lua
-            .load(
+        let mut bound: Vec<String> = vm
+            .eval::<Vec<String>>(
                 r#"
                 local names = {}
                 for name, value in pairs(knl) do
@@ -3164,14 +3380,13 @@ mod tests {
                 return names
             "#,
             )
-            .eval::<Vec<String>>()
             .expect("reflect over the knl global");
         bound.sort();
         assert_eq!(bound, module, "the module surface is MODULE_API");
 
         // And `knl.api()` hands the same two lists to Lua, each entry with
         // the name and its one-line contract.
-        lua.load(
+        vm.exec(
             r#"
             local api = knl.api()
             assert(#api.session > 0 and #api.module > 0, "api() must list both halves")
@@ -3184,12 +3399,10 @@ mod tests {
             assert(api.session[1].name == "id", "first: " .. tostring(api.session[1].name))
         "#,
         )
-        .exec()
         .expect("api() chunk");
 
-        let counted: usize = lua
-            .load(r#"local a = knl.api() return #a.session + #a.module"#)
-            .eval()
+        let counted: usize = vm
+            .eval(r#"local a = knl.api() return #a.session + #a.module"#)
             .expect("count the api entries");
         assert_eq!(counted, SESSION_API.len() + MODULE_API.len());
     }
@@ -3199,8 +3412,8 @@ mod tests {
     /// a sentence that is free to be reworded.
     #[test]
     fn a_raised_failure_reports_its_class_through_knl_error() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             -- A closed handle refusing its own write.  The session is over,
             -- and asking again is not what fixes that.
@@ -3238,7 +3451,6 @@ mod tests {
             assert(b.method == "append", "method: " .. tostring(b.method))
         "#,
         )
-        .exec()
         .expect("classified failures chunk");
     }
 
@@ -3247,8 +3459,8 @@ mod tests {
     /// the table stands in for the raised value wherever one was.
     #[test]
     fn a_classified_failure_still_reads_as_a_message() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "t" })
             s:close()
@@ -3275,7 +3487,6 @@ mod tests {
             assert(fake.message == "knl: append: nonsense: hello")
         "#,
         )
-        .exec()
         .expect("message compatibility chunk");
     }
 
@@ -3284,10 +3495,9 @@ mod tests {
     /// against a list somebody retyped.
     #[test]
     fn api_publishes_the_error_vocabulary() {
-        let lua = vm();
-        let published: Vec<String> = lua
-            .load(r#"return knl.api().errors"#)
-            .eval()
+        let vm = vm();
+        let published: Vec<String> = vm
+            .eval(r#"return knl.api().errors"#)
             .expect("read knl.api().errors");
         let declared: Vec<String> = knl::KnlError::KINDS
             .iter()
@@ -3319,8 +3529,8 @@ mod tests {
     /// could not do the work.
     #[test]
     fn a_store_that_is_down_surfaces_as_storage() {
-        let (lua, _log) = vm_with_a_failing_store(2);
-        lua.load(
+        let (vm, _log) = vm_with_a_failing_store(2);
+        vm.exec(
             r#"
             local e = failure(function()
                 do local s <close> = open_failing() end
@@ -3331,7 +3541,6 @@ mod tests {
             assert(e.message == "the store is down", "message: " .. tostring(e.message))
         "#,
         )
-        .exec()
         .expect("failing store chunk");
     }
 
@@ -3410,8 +3619,8 @@ mod tests {
     /// bound, and the second return says whether the cap cut anything off.
     #[test]
     fn query_reads_the_log_with_sql() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "q" })
             s:append({ kind = "msg_user", beat = "b1", data = { content = "hi" } })
@@ -3479,7 +3688,6 @@ mod tests {
             assert(#s:query("SELECT 1 AS one") == 1, "a closed handle still reads")
         "#,
         )
-        .exec()
         .expect("query chunk");
     }
 
@@ -3487,12 +3695,12 @@ mod tests {
     /// database, one statement.  This is what a session tree reads with.
     #[test]
     fn query_reads_across_the_session_set() {
-        let lua = vm();
+        let vm = vm();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
         let path = path.to_str().expect("utf-8 path");
 
-        lua.load(format!(
+        vm.exec(&format!(
             r#"
             local path = "{path}"
             local a = knl.open({{ store = {{ sqlite = path }}, owner = "a" }})
@@ -3518,7 +3726,6 @@ mod tests {
             assert(e.method == "query", "method: " .. tostring(e.method))
         "#
         ))
-        .exec()
         .expect("session set chunk");
     }
 
@@ -3527,8 +3734,8 @@ mod tests {
     /// is reached, and on a connection that could not do it anyway.
     #[test]
     fn query_refuses_everything_that_is_not_one_read() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "q" })
             s:append({ kind = "note" })
@@ -3558,15 +3765,14 @@ mod tests {
             assert(m.message:find("sql must be a string", 1, true), m.message)
         "#,
         )
-        .exec()
         .expect("refusal chunk");
     }
 
     /// The row cap is reported, so a page can be told from a whole answer.
     #[test]
     fn query_caps_the_rows_and_says_when_it_cut() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "q" })
             for i = 1, 5 do s:append({ kind = "e" .. i }) end
@@ -3580,7 +3786,6 @@ mod tests {
             assert(#all == 6 and whole == false, "nothing was cut off")
         "#,
         )
-        .exec()
         .expect("limit chunk");
     }
 
@@ -3588,8 +3793,8 @@ mod tests {
     /// class — "ask again" would be the wrong advice for a slow read.
     #[test]
     fn query_that_runs_too_long_reports_a_timeout() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local s = knl.open({ owner = "q" })
             local e = failure(function()
@@ -3606,7 +3811,6 @@ mod tests {
             assert(#s:query("SELECT 1 AS one") == 1)
         "#,
         )
-        .exec()
         .expect("timeout chunk");
     }
 
@@ -3614,8 +3818,8 @@ mod tests {
     /// its columns as SQLite reports them — including which two are the key.
     #[test]
     fn api_publishes_the_events_schema() {
-        let lua = vm();
-        lua.load(
+        let vm = vm();
+        vm.exec(
             r#"
             local schema = knl.api().schema
             assert(schema.table == "events", "table: " .. tostring(schema.table))
@@ -3645,7 +3849,120 @@ mod tests {
             assert(type(rows[1].data) == "string", "and so does data")
         "#,
         )
-        .exec()
         .expect("schema chunk");
+    }
+
+    // -- the rule this round exists for -------------------------------------
+
+    /// **A slow write does not stop the VM.**
+    ///
+    /// This is the property the whole round is about, so it is asserted
+    /// directly rather than inferred from the shape of the code: a second
+    /// coroutine on the same Lua state goes on running — advancing a counter
+    /// through an async function of its own — for the *whole* time an
+    /// `s:append` is waiting on a write lock another connection is holding.
+    ///
+    /// Before this round the session's methods were synchronous, so the
+    /// append would have parked the VM's one thread and the ticker would have
+    /// counted nothing until the lock was released.
+    #[test]
+    fn a_slow_write_does_not_block_another_coroutine_on_the_same_vm() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// How long the blocker holds the write lock.
+        const HELD: Duration = Duration::from_millis(300);
+        /// How long each tick takes, so ~60 fit inside `HELD`.
+        const TICK: Duration = Duration::from_millis(5);
+        /// The floor the assertion uses.  Far below what should actually
+        /// happen (~60), because the point is "the VM kept running", not a
+        /// measurement of how fast it ran.
+        const AT_LEAST: usize = 5;
+
+        let vm = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        // `tick()` waits like any async bridge function does; `ticks()` reads
+        // the counter without waiting for anything.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let tick = vm
+            .lua
+            .create_async_function(move |_, ()| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    tokio::time::sleep(TICK).await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            })
+            .expect("create tick");
+        vm.lua.globals().set("tick", tick).expect("set tick");
+        let counter = Arc::clone(&ticks);
+        let read_ticks = vm
+            .lua
+            .create_function(move |_, ()| Ok(counter.load(Ordering::Relaxed)))
+            .expect("create ticks");
+        vm.lua
+            .globals()
+            .set("ticks", read_ticks)
+            .expect("set ticks");
+
+        // The session is opened before the lock is taken, so the only thing
+        // waiting on it is the append below.
+        vm.exec(&format!(
+            r#"session = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})"#
+        ))
+        .expect("open the durable session");
+
+        // A second connection holds the write lock for `HELD`, on a thread of
+        // its own so the test can go on driving the VM.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker_path = path.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&blocker_path).expect("open the blocker");
+            conn.busy_timeout(HELD).expect("busy timeout");
+            conn.execute_batch("BEGIN EXCLUSIVE")
+                .expect("take the write lock");
+            locked_tx.send(()).expect("announce the lock");
+            std::thread::sleep(HELD);
+            conn.execute_batch("ROLLBACK").expect("release the lock");
+        });
+        locked_rx.recv().expect("the lock was taken");
+
+        // Two coroutines, driven together on the VM's runtime: one blocked on
+        // the write, one counting.  `during` is the number of ticks that
+        // landed while the append was waiting.
+        let during: usize = vm.block_on(async {
+            let writer = vm
+                .lua
+                .load(
+                    r#"
+                    local before = ticks()
+                    session:append({ kind = "slow" })
+                    return ticks() - before
+                "#,
+                )
+                .eval_async::<usize>();
+            let ticker = vm.lua.load(r#"for _ = 1, 200 do tick() end"#).exec_async();
+            // Both futures poll the same Lua state on this one thread, which
+            // is exactly what the VM's own LocalSet does with its coroutines.
+            let (written, _ticked) = tokio::join!(writer, ticker);
+            written.expect("the append eventually lands")
+        });
+
+        blocker.join().expect("the blocker thread");
+
+        assert!(
+            during >= AT_LEAST,
+            "the VM stopped while the write was waiting: only {during} tick(s) ran"
+        );
+
+        // And the write itself landed once the lock was released.
+        vm.exec(r#"assert(kinds_of(session) == "session_opened,slow", kinds_of(session))"#)
+            .expect("the slow append landed");
     }
 }

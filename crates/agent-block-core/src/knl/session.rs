@@ -151,7 +151,8 @@
 //!
 //! [`close`]: Session::close
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Map, Value};
 
@@ -166,7 +167,7 @@ use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore};
 use super::projection::{tail_count, VIEW_TAIL};
 use super::query::{self, QueryOpts, QueryParams, QueryRows};
 use super::scope::{Scope, ScopeId};
-use super::sqlite_store::SqliteEventStore;
+use super::sqlite_store::{IsleDrivers, SqliteEventStore};
 use super::{projection, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
@@ -200,8 +201,8 @@ const CLOSED: &str = "session is closed";
 /// It reads the one kind it is asking about, and at most one of those: the
 /// question is whether an ending exists, not where it is or how many there
 /// are.
-fn has_ended(store: &CurrentStore) -> KnlResult<bool> {
-    let ending = store.read_kinds(Some(&[KIND_SESSION_CLOSED]), 0, 1)?;
+async fn has_ended(store: &CurrentStore) -> KnlResult<bool> {
+    let ending = store.read_kinds(Some(&[KIND_SESSION_CLOSED]), 0, 1).await?;
     Ok(!ending.is_empty())
 }
 
@@ -280,6 +281,25 @@ fn refused_event(
     kernel_event(KIND_BUDGET_REFUSED, data)
 }
 
+/// The `session_closed` event a close records.
+///
+/// One builder for both close paths — the awaited [`Session::close_with`] and
+/// the detached [`Session::close_detached`] — so a boundary written by the
+/// backstop is the same event, with the same fields, as one a caller asked
+/// for.  The reason defaults to [`DEFAULT_CLOSE_REASON`]; an absent `detail`
+/// is an absent field rather than a null.
+fn closing_event(reason: Option<&str>, detail: Option<&str>) -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert(
+        FIELD_REASON.to_string(),
+        Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
+    );
+    if let Some(detail) = detail {
+        data.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
+    }
+    kernel_event(KIND_SESSION_CLOSED, data)
+}
+
 /// What a caller should have called instead of hand-appending `kind`.
 ///
 /// The refusal names the method that legitimately writes the kind, so the
@@ -318,10 +338,13 @@ pub struct Session {
     /// stream two handles write to, and costs one head read on a stream that
     /// has not moved.
     ///
-    /// A [`Cell`] because reading a balance is a read: [`Session::remaining`]
-    /// takes `&self`, and the cache it refreshes is derived state, not a
-    /// change to the session.
-    balance: Cell<(u64, Option<i64>)>,
+    /// Behind a lock because reading a balance is a read —
+    /// [`Session::remaining`] takes `&self`, and the cache it refreshes is
+    /// derived state rather than a change to the session — and because that
+    /// read is an `async fn` now, whose future has to be `Send`; a `Cell`
+    /// would not be.  The guard is never held across an `.await`: the cached
+    /// pair is copied out, the store is asked, and the answer written back.
+    balance: Mutex<(u64, Option<i64>)>,
     /// Set by `close()`; blocks this handle's further `append` / `reserve` /
     /// `spend` / `close`.
     ///
@@ -335,12 +358,15 @@ impl std::fmt::Debug for Session {
     /// The store is a trait object (`dyn EventStore` is not `Debug`), so it
     /// is summarised rather than printed; the fields that identify the
     /// session are shown.
+    ///
+    /// The length is not among them: reading it is a call to the store now,
+    /// and `Debug` cannot wait for one.  A caller that wants it asks
+    /// [`Session::len`].
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.id)
             .field("scope", &self.scope)
             .field("closed", &self.closed)
-            .field("len", &self.store.len())
             .finish_non_exhaustive()
     }
 }
@@ -364,10 +390,14 @@ impl Session {
     /// [`Session::id`] names the stream this session writes — the same
     /// identity a durable session has, and what `$stream` binds to in a
     /// [`Session::query`].
-    pub fn new(owner: String, grant: Option<BudgetGrant>) -> KnlResult<Self> {
+    pub async fn new(
+        owner: String,
+        grant: Option<BudgetGrant>,
+        drivers: &IsleDrivers,
+    ) -> KnlResult<Self> {
         let stream = uuid::Uuid::new_v4().to_string();
-        let store = SqliteEventStore::open_memory(stream.clone())?;
-        let mut session = Self::open_on(owner, grant, Box::new(store))?;
+        let store = SqliteEventStore::open_memory(stream.clone(), drivers).await?;
+        let mut session = Self::open_on(owner, grant, Box::new(store)).await?;
         session.adopt_id(stream);
         Ok(session)
     }
@@ -388,7 +418,7 @@ impl Session {
     /// durable stream either carries the opening *and* the quota it opened
     /// under, or carries nothing at all: an open that fails leaves no session
     /// behind to close.
-    pub fn open_on(
+    pub async fn open_on(
         owner: String,
         grant: Option<BudgetGrant>,
         store: Box<dyn EventStore>,
@@ -408,7 +438,7 @@ impl Session {
             // Nothing folded yet, over a stream with nothing in it: the first
             // read of the balance sees the head move and folds the ledger the
             // two appends below are about to write.
-            balance: Cell::new((0, None)),
+            balance: Mutex::new((0, None)),
             closed: false,
         };
         // The scope rides on the opening: the id the kernel just issued, next
@@ -445,7 +475,7 @@ impl Session {
         //
         // The session is being built, so it cannot have been closed: the
         // guarded path `append_kernel` takes has nothing to check yet.
-        session.store.append_many(opening)?;
+        session.store.append_many(opening).await?;
         Ok(session)
     }
 
@@ -481,12 +511,12 @@ impl Session {
     /// Nothing is restored for the read side: a resumed session's reads —
     /// `events`, `tail`, a query — go to the reopened store, so they see the
     /// whole stream on the first call.
-    pub fn resume(grant: Option<BudgetGrant>, store: Box<dyn EventStore>) -> KnlResult<Self> {
+    pub async fn resume(grant: Option<BudgetGrant>, store: Box<dyn EventStore>) -> KnlResult<Self> {
         // The upcasting seam goes on first, so the restore below reads the
         // same projected shape every other read of this session gets: a log
         // written under an older shape resumes as what it means today, and the
         // stored bytes stay as they were written.
-        Self::resume_on(grant, CurrentStore::new(store, kernel_upcasters()))
+        Self::resume_on(grant, CurrentStore::new(store, kernel_upcasters())).await
     }
 
     /// [`Session::resume`] on a store that is already behind the seam.
@@ -494,7 +524,7 @@ impl Session {
     /// The body of the resume, split off so a test can hand it a chain of its
     /// own; the public entry wraps the backend in [`kernel_upcasters`] and
     /// calls this.
-    fn resume_on(grant: Option<BudgetGrant>, store: CurrentStore) -> KnlResult<Self> {
+    async fn resume_on(grant: Option<BudgetGrant>, store: CurrentStore) -> KnlResult<Self> {
         // Fallible read: a transient busy read or an undecodable row surfaces
         // here rather than being silently folded into a wrong resumed state.
         //
@@ -503,7 +533,7 @@ impl Session {
         // *whatever it was written as* — the chain may have renamed the kind
         // on the way through, and a filter selects on the stored name
         // ([`EventStore::read_kinds`]).
-        let log = store.read(0, usize::MAX)?;
+        let log = store.read(0, usize::MAX).await?;
 
         // Resuming an empty or mistyped stream is a caller error, not an
         // anonymous zero session: a real session always opens with a
@@ -523,7 +553,7 @@ impl Session {
         // kind, so any `session_closed` in the stream is the session's
         // ending: a handle that carried on past it would be appending to a
         // log whose readers were told nothing more was coming.
-        if has_ended(&store)? {
+        if has_ended(&store).await? {
             return Err(KnlError::Closed(format!(
                 "{CLOSED} (disposable; open a new session)"
             )));
@@ -561,7 +591,7 @@ impl Session {
             id: uuid::Uuid::new_v4().to_string(),
             scope: Scope::restore(scope_id, owner, last_grant(&log)),
             store,
-            balance: Cell::new((head, fold_balance(&log))),
+            balance: Mutex::new((head, fold_balance(&log))),
             closed: false,
         };
 
@@ -575,7 +605,7 @@ impl Session {
         // resumes with no grant and calls [`Session::grant_more`] once the
         // stream has passed.
         if let Some(grant) = grant {
-            session.grant_more(grant)?;
+            session.grant_more(grant).await?;
         }
         Ok(session)
     }
@@ -587,9 +617,9 @@ impl Session {
     /// is a number in the counter — a failed append leaves the balance
     /// exactly as the ledger describes it.  Refused on a closed session, like
     /// every other write: a run that has ended cannot be granted more.
-    pub fn grant_more(&mut self, grant: BudgetGrant) -> KnlResult<()> {
+    pub async fn grant_more(&mut self, grant: BudgetGrant) -> KnlResult<()> {
         let event = granted_event(&grant, self.scope.id());
-        self.append_kernel(event)?;
+        self.append_kernel(event).await?;
         self.scope.grant_more(grant)
     }
 
@@ -662,7 +692,7 @@ impl Session {
     /// The one refusal is this handle having closed.  Another handle's close
     /// is not: it set *that* handle's flag, and a write landing after the
     /// `session_closed` it wrote is recorded, because that is what happened.
-    pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
+    pub async fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         // The kernel's own kinds are refused before the closed check has
         // anything to say about it — the kind is wrong whatever state the
         // session is in.  The balance is a fold of the `budget_*` events, so
@@ -676,7 +706,7 @@ impl Session {
                 kernel_only_hint(kind)
             )));
         }
-        self.append_kernel(event)
+        self.append_kernel(event).await
     }
 
     /// [`Session::append`] without the kernel-only guard: the path the
@@ -692,13 +722,13 @@ impl Session {
     /// The store is not asked whether the stream has ended, because a write
     /// arriving after an ending is a fact — evidence of a bug or a misuse —
     /// and dropping it would hide the one thing an audit is reading for.
-    fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
+    async fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
             return Err(KnlError::Closed(CLOSED.to_string()));
         }
 
         // The store orders the write and hands back where it landed.
-        let committed = self.store.append(event)?;
+        let committed = self.store.append(event).await?;
         Ok(committed.seq)
     }
 
@@ -713,19 +743,19 @@ impl Session {
     /// Fallible: a durable backend can hit a transient busy read or a row it
     /// cannot decode, which surfaces here rather than being dropped silently.
     /// The in-memory backend is always `Ok`.
-    pub fn events(&self, from: u64) -> KnlResult<Vec<Current>> {
-        self.store.read(from, usize::MAX)
+    pub async fn events(&self, from: u64) -> KnlResult<Vec<Current>> {
+        self.store.read(from, usize::MAX).await
     }
 
     /// Number of recorded events.  Fallible like [`Session::events`].
-    pub fn len(&self) -> KnlResult<usize> {
-        self.store.len()
+    pub async fn len(&self) -> KnlResult<usize> {
+        self.store.len().await
     }
 
     /// Whether the history is empty (only before `session_opened`, i.e.
     /// never for a session built by [`Session::new`]).
-    pub fn is_empty(&self) -> KnlResult<bool> {
-        self.store.is_empty()
+    pub async fn is_empty(&self) -> KnlResult<bool> {
+        self.store.is_empty().await
     }
 
     /// Ask the budget to allow `amount`: `true` when it was taken, `false`
@@ -754,7 +784,7 @@ impl Session {
     /// quota has no ledger to keep.  A handle that has closed refuses, like
     /// [`Session::spend`]; another handle's close is nothing to this one —
     /// the balance is the whole of the invariant.
-    pub fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
+    pub async fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
         if self.closed {
             return Err(KnlError::Closed(CLOSED.to_string()));
         }
@@ -766,10 +796,15 @@ impl Session {
         let scope_id = self.scope.id().to_string();
 
         // The balance the decision saw, as the ledger read inside the store
-        // folds to.  Written by `decide`, which the backend may run more than
-        // once (a retried transaction), so the last run is the one that
-        // counts — and it is the run whose answer was committed.
-        let mut balance = 0_i64;
+        // folds to.  Shared rather than captured by reference, because the
+        // decision now runs wherever the store serializes its writes — the
+        // connection's own thread — and a refusal has to be recorded against
+        // the number the decision actually measured, not against a second
+        // read that could see a different stream.
+        let seen = Arc::new(AtomicI64::new(0));
+        let measured = Arc::clone(&seen);
+        let decided_tag = tag.clone();
+        let decided_scope = scope_id.clone();
         // The whole of the decision: does the ledger cover what was asked.
         // Whether the stream carries an ending is not part of it — a
         // reservation past the boundary is a fact about a run that overran
@@ -778,19 +813,33 @@ impl Session {
         // The decision names the kinds it folds, so the store hands it the
         // ledger and not the whole stream: the invariant is exact either way,
         // and this way it costs the size of the ledger.
-        let committed = self.store.append_if(Some(BUDGET_KINDS), &mut |events| {
-            balance = fold_balance(events).unwrap_or(0);
-            (balance >= amount)
-                .then(|| budget_move_event(KIND_BUDGET_RESERVED, amount, tag.as_deref(), &scope_id))
-        })?;
+        let committed = self
+            .store
+            .append_if(
+                Some(BUDGET_KINDS),
+                Box::new(move |events: Vec<Current>| {
+                    let balance = fold_balance(&events).unwrap_or(0);
+                    measured.store(balance, Ordering::Relaxed);
+                    (balance >= amount).then(|| {
+                        budget_move_event(
+                            KIND_BUDGET_RESERVED,
+                            amount,
+                            decided_tag.as_deref(),
+                            &decided_scope,
+                        )
+                    })
+                }),
+            )
+            .await?;
 
         if committed.is_none() {
             // Refused: nothing was written by the decision, so the refusal is
             // recorded here as the ordinary fact it is, carrying what was
             // asked for and what there was.  It moves no balance, and a later
             // read folds the ledger including it and finds the same number.
+            let balance = seen.load(Ordering::Relaxed);
             let event = refused_event(amount, balance, tag.as_deref(), &scope_id);
-            self.append_kernel(event)?;
+            self.append_kernel(event).await?;
             return Ok(false);
         }
         Ok(true)
@@ -818,7 +867,7 @@ impl Session {
     /// It always writes.  A handle that has closed refuses before the store
     /// is reached; another handle's close does not, and a settlement landing
     /// after one is recorded as what it is.
-    pub fn spend(&mut self, amount: i64) -> KnlResult<()> {
+    pub async fn spend(&mut self, amount: i64) -> KnlResult<()> {
         if self.closed {
             return Err(KnlError::Closed(CLOSED.to_string()));
         }
@@ -830,7 +879,7 @@ impl Session {
         let scope_id = self.scope.id().to_string();
 
         let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id);
-        self.append_kernel(event)?;
+        self.append_kernel(event).await?;
         Ok(())
     }
 
@@ -860,10 +909,13 @@ impl Session {
     /// most likely to act on it is a loop deciding whether it may go on
     /// spending.  So the failure surfaces, and what to do about a transient
     /// busy read ([`KnlError::is_retryable`]) is the caller's to decide.
-    pub fn remaining(&self) -> KnlResult<Option<i64>> {
-        let (folded_head_seq, cached) = self.balance.get();
+    pub async fn remaining(&self) -> KnlResult<Option<i64>> {
+        // Copied out and the guard released: nothing below waits while it is
+        // held.
+        let (folded_head_seq, cached) =
+            *self.balance.lock().unwrap_or_else(PoisonError::into_inner);
 
-        let head = self.store.head()?.unwrap_or(0);
+        let head = self.store.head().await?.unwrap_or(0);
         // The log has not moved since the fold, so neither has the balance.
         if head <= folded_head_seq {
             return Ok(cached);
@@ -874,9 +926,12 @@ impl Session {
         // the whole stream's, so any write at all makes the next read refold.
         // Conservative in the safe direction: an event that moves no balance
         // costs one extra fold, never a stale answer.
-        let ledger = self.store.read_kinds(Some(BUDGET_KINDS), 0, usize::MAX)?;
+        let ledger = self
+            .store
+            .read_kinds(Some(BUDGET_KINDS), 0, usize::MAX)
+            .await?;
         let balance = fold_balance(&ledger);
-        self.balance.set((head, balance));
+        *self.balance.lock().unwrap_or_else(PoisonError::into_inner) = (head, balance);
         Ok(balance)
     }
 
@@ -886,8 +941,8 @@ impl Session {
     /// fallible for the same reason: a `false` that meant "the store could
     /// not be read" is the one answer a run must never be given, because it
     /// reads as "carry on".
-    pub fn exhausted(&self) -> KnlResult<bool> {
-        Ok(matches!(self.remaining()?, Some(remaining) if remaining <= 0))
+    pub async fn exhausted(&self) -> KnlResult<bool> {
+        Ok(matches!(self.remaining().await?, Some(remaining) if remaining <= 0))
     }
 
     /// Whether the session has ended.
@@ -909,8 +964,8 @@ impl Session {
     /// caller knows the boundary was NOT recorded and can retry — a close
     /// that reports success with no `session_closed` in the log would
     /// silently break resume/audit reads.
-    pub fn close(&mut self, reason: Option<&str>) -> KnlResult<()> {
-        self.close_with(reason, None)
+    pub async fn close(&mut self, reason: Option<&str>) -> KnlResult<()> {
+        self.close_with(reason, None).await
     }
 
     /// [`Session::close`] with a free-text `detail` recorded beside the
@@ -923,19 +978,15 @@ impl Session {
     /// becoming its own reason.
     ///
     /// Idempotent and fallible exactly like [`Session::close`].
-    pub fn close_with(&mut self, reason: Option<&str>, detail: Option<&str>) -> KnlResult<()> {
+    pub async fn close_with(
+        &mut self,
+        reason: Option<&str>,
+        detail: Option<&str>,
+    ) -> KnlResult<()> {
         if self.closed {
             return Ok(());
         }
-        let mut data = Map::new();
-        data.insert(
-            FIELD_REASON.to_string(),
-            Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
-        );
-        if let Some(detail) = detail {
-            data.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
-        }
-        let event = kernel_event(KIND_SESSION_CLOSED, data);
+        let event = closing_event(reason, detail);
 
         // A plain append, taken through the kernel's own path because
         // `session_closed` is kernel-only and the guarded `append` would
@@ -948,9 +999,33 @@ impl Session {
         // leaves this handle open and the caller free to retry — a close that
         // reported success with nothing in the log would break every later
         // read of it.
-        self.append_kernel(event)?;
+        self.append_kernel(event).await?;
         self.closed = true;
         Ok(())
+    }
+
+    /// End the session by handing `session_closed` to the store and *not*
+    /// waiting for it — the drop backstop.
+    ///
+    /// The one close path with nobody left to tell.  A handle that was
+    /// collected without ever being closed is being dropped right now, on the
+    /// VM's own thread, inside a Lua collection cycle: there is no task to
+    /// suspend in and nothing that may block, so the event goes to the store's
+    /// own writer ([`super::EventStore::detach_append`]) and whether it landed
+    /// is reported to the log rather than to a caller.
+    ///
+    /// The connection thread outlives this handle — its driver belongs to the
+    /// host, not to the session ([`super::IsleDrivers`]) — so the submitted
+    /// event is still executed, and the host's shutdown drains it.
+    ///
+    /// Idempotent per handle, like [`Session::close`]: a session this handle
+    /// already closed records nothing.
+    pub fn close_detached(&mut self, reason: &str) {
+        if self.closed {
+            return;
+        }
+        self.store.detach_append(closing_event(Some(reason), None));
+        self.closed = true;
     }
 
     /// A named projection over the history.
@@ -968,11 +1043,15 @@ impl Session {
     /// than to today's members of it — a fold the kernel names again may
     /// keep a cache, and a caller should not have to be recompiled when one
     /// does.
-    pub fn view(&mut self, name: &str, opts: Option<&Map<String, Value>>) -> KnlResult<Value> {
+    pub async fn view(
+        &mut self,
+        name: &str,
+        opts: Option<&Map<String, Value>>,
+    ) -> KnlResult<Value> {
         match name {
             VIEW_TAIL => {
                 let n = tail_count(opts)?;
-                let events = self.store.read(0, usize::MAX)?;
+                let events = self.store.read(0, usize::MAX).await?;
                 Ok(projection::tail_of(&events, n))
             }
             other => Err(KnlError::Validation(format!("unknown view {other:?}"))),
@@ -999,9 +1078,14 @@ impl Session {
     ///
     /// Reads keep working after this handle closed, like every other read
     /// here: the record outlives the session.
-    pub fn query(&self, sql: &str, params: QueryParams, opts: &QueryOpts) -> KnlResult<QueryRows> {
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: QueryParams,
+        opts: &QueryOpts,
+    ) -> KnlResult<QueryRows> {
         let plan = query::plan(sql, params, opts, &self.id)?;
-        self.store.query(&plan)
+        self.store.query(&plan).await
     }
 }
 
@@ -1036,13 +1120,20 @@ mod tests {
     ///
     /// With a budget it opens with two events, not one: `session_opened` and
     /// the `budget_granted` that records what the owner allowed.
-    fn new_session(budget: Option<i64>) -> Session {
-        Session::new(ANON.to_string(), budget.map(grant)).expect("open")
+    ///
+    /// The [`IsleDrivers`] it opens against is thrown away on the spot, and
+    /// that is safe here: the connection thread lives while *any* handle on it
+    /// does, and the store keeps one.  What the discarded driver costs is the
+    /// join at the end — which a test process does not need and a host does.
+    async fn new_session(budget: Option<i64>) -> Session {
+        Session::new(ANON.to_string(), budget.map(grant), &IsleDrivers::new())
+            .await
+            .expect("open")
     }
 
     /// The balance the log implies, for checking the counter against it.
-    fn folded(s: &Session) -> Option<i64> {
-        fold_balance(&s.events(0).expect("events"))
+    async fn folded(s: &Session) -> Option<i64> {
+        fold_balance(&s.events(0).await.expect("events"))
     }
 
     /// A raw backend read, as the folds take it.
@@ -1065,18 +1156,19 @@ mod tests {
     /// has no balance to report; the stores these tests drive do not fail, so
     /// an error here is a broken fixture rather than an outcome to assert on.
     /// The tests that *are* about a failing store call the method directly.
-    fn remaining(session: &Session) -> Option<i64> {
-        session.remaining().expect("the balance was readable")
+    async fn remaining(session: &Session) -> Option<i64> {
+        session.remaining().await.expect("the balance was readable")
     }
 
     /// [`Session::exhausted`], read the same way and for the same reason.
-    fn exhausted(session: &Session) -> bool {
-        session.exhausted().expect("the balance was readable")
+    async fn exhausted(session: &Session) -> bool {
+        session.exhausted().await.expect("the balance was readable")
     }
 
     /// The `budget_*` events of a session, in seq order.
-    fn ledger(s: &Session) -> Vec<Current> {
+    async fn ledger(s: &Session) -> Vec<Current> {
         s.events(0)
+            .await
             .expect("events")
             .into_iter()
             .filter(|e| e.kind().starts_with("budget_"))
@@ -1103,11 +1195,11 @@ mod tests {
         data_field(event, name).unwrap_or_else(|| panic!("data.{name} is missing: {event}"))
     }
 
-    #[test]
-    fn a_new_session_already_carries_session_opened() {
-        let s = new_session(None);
-        assert_eq!(s.len().expect("len"), 1);
-        let events = s.events(0).expect("events");
+    #[tokio::test]
+    async fn a_new_session_already_carries_session_opened() {
+        let s = new_session(None).await;
+        assert_eq!(s.len().await.expect("len"), 1);
+        let events = s.events(0).await.expect("events");
         assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(events[0].seq(), 1);
         assert!(!s.is_closed());
@@ -1117,10 +1209,10 @@ mod tests {
     /// The scope is issued when the session opens, and it is not the
     /// session: two ids, both real, and neither taken from a caller.  Two
     /// sessions are two scopes.
-    #[test]
-    fn open_issues_a_scope_id_distinct_from_the_session_id() {
-        let a = new_session(None);
-        let b = new_session(None);
+    #[tokio::test]
+    async fn open_issues_a_scope_id_distinct_from_the_session_id() {
+        let a = new_session(None).await;
+        let b = new_session(None).await;
 
         assert!(!a.scope_id().is_empty(), "a session opens under a scope");
         assert!(!a.id().is_empty());
@@ -1139,15 +1231,15 @@ mod tests {
     /// The scope is in the log, not only in the value: it rides on the
     /// session's opening and on every entry of the ledger, so a reader can
     /// tell whose authority each move of the balance was made under.
-    #[test]
-    fn session_opened_and_every_budget_event_carry_the_scope_id() {
-        let mut s = new_session(Some(100));
-        assert_eq!(s.reserve(30), Ok(true));
-        s.spend(10).expect("spend");
-        assert_eq!(s.reserve(10_000), Ok(false));
+    #[tokio::test]
+    async fn session_opened_and_every_budget_event_carry_the_scope_id() {
+        let mut s = new_session(Some(100)).await;
+        assert_eq!(s.reserve(30).await, Ok(true));
+        s.spend(10).await.expect("spend");
+        assert_eq!(s.reserve(10_000).await, Ok(false));
 
         let scope_id = s.scope_id().to_string();
-        let events = s.events(0).expect("events");
+        let events = s.events(0).await.expect("events");
 
         let opened = &events[0];
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
@@ -1162,7 +1254,7 @@ mod tests {
             "beside the owner: {opened}"
         );
 
-        let moves = ledger(&s);
+        let moves = ledger(&s).await;
         assert_eq!(
             kinds(&moves),
             vec![
@@ -1183,118 +1275,175 @@ mod tests {
 
         // An event a caller appends carries no scope id: the field is the
         // kernel's, on the kinds only the kernel writes.
-        s.append(obj(json!({ "kind": "note" }))).expect("append");
-        let note = s.events(0).expect("events").pop().expect("note");
+        s.append(obj(json!({ "kind": "note" })))
+            .await
+            .expect("append");
+        let note = s.events(0).await.expect("events").pop().expect("note");
         assert_eq!(data_field(&note, FIELD_SCOPE_ID), None, "{note}");
         assert_eq!(note[FIELD_DATA], json!({}), "and no data of its own");
     }
 
-    #[test]
-    fn the_owner_is_total_and_read_back_verbatim() {
-        assert_eq!(new_session(None).owner(), ANON);
+    #[tokio::test]
+    async fn the_owner_is_total_and_read_back_verbatim() {
+        assert_eq!(new_session(None).await.owner(), ANON);
         assert_eq!(
-            Session::new(SYSTEM.to_string(), None)
+            Session::new(SYSTEM.to_string(), None, &IsleDrivers::new())
+                .await
                 .expect("open")
                 .owner(),
             SYSTEM
         );
         assert_eq!(
-            Session::new("user-42".to_string(), None)
+            Session::new("user-42".to_string(), None, &IsleDrivers::new())
+                .await
                 .expect("open")
                 .owner(),
             "user-42"
         );
     }
 
-    #[test]
-    fn close_records_session_closed_once_with_the_given_reason() {
-        let mut s = new_session(None);
-        s.close(Some("budget_exhausted")).expect("close");
-        s.close(Some("ignored")).expect("close (idempotent)");
-        assert_eq!(s.len().expect("len"), 2, "close must be idempotent");
+    #[tokio::test]
+    async fn close_records_session_closed_once_with_the_given_reason() {
+        let mut s = new_session(None).await;
+        s.close(Some("budget_exhausted")).await.expect("close");
+        s.close(Some("ignored")).await.expect("close (idempotent)");
+        assert_eq!(s.len().await.expect("len"), 2, "close must be idempotent");
 
-        let last = s.events(2).expect("events").pop().expect("session_closed");
+        let last = s
+            .events(2)
+            .await
+            .expect("events")
+            .pop()
+            .expect("session_closed");
         assert_eq!(last.kind(), KIND_SESSION_CLOSED);
         assert_eq!(*field(&last, FIELD_REASON), json!("budget_exhausted"));
         assert!(s.is_closed());
     }
 
-    #[test]
-    fn close_without_a_reason_records_the_default() {
-        let mut s = new_session(None);
-        s.close(None).expect("close");
-        let last = s.events(2).expect("events").pop().expect("session_closed");
+    #[tokio::test]
+    async fn close_without_a_reason_records_the_default() {
+        let mut s = new_session(None).await;
+        s.close(None).await.expect("close");
+        let last = s
+            .events(2)
+            .await
+            .expect("events")
+            .pop()
+            .expect("session_closed");
         assert_eq!(*field(&last, FIELD_REASON), json!(DEFAULT_CLOSE_REASON));
     }
 
-    #[test]
-    fn a_closed_session_rejects_writes_but_keeps_serving_reads() {
-        let mut s = new_session(Some(10));
-        s.append(obj(json!({ "kind": "note" }))).expect("append");
-        s.spend(4).expect("spend");
-        s.close(None).expect("close");
+    /// The detached close is the same boundary, written without waiting: the
+    /// backstop's path, exercised here on the store that can take it.
+    #[tokio::test]
+    async fn a_detached_close_records_the_same_boundary() {
+        let mut s = new_session(None).await;
+        s.close_detached(CLOSE_REASON_DROPPED);
+        assert!(s.is_closed(), "the handle is closed straight away");
+        // …and closing again writes nothing, exactly as the awaited path.
+        s.close_detached(CLOSE_REASON_DROPPED);
+        s.close(Some("ignored")).await.expect("close is a no-op");
+
+        // Nothing was awaited above, so the read below is what waits: the
+        // connection runs one job at a time in the order it took them, so a
+        // read submitted after the detached write is answered after it.
+        let last = s
+            .events(0)
+            .await
+            .expect("events")
+            .pop()
+            .expect("session_closed");
+        assert_eq!(last.kind(), KIND_SESSION_CLOSED);
+        assert_eq!(
+            *field(&last, FIELD_REASON),
+            json!(CLOSE_REASON_DROPPED),
+            "exactly one boundary, carrying the backstop's reason"
+        );
+        assert_eq!(s.len().await.expect("len"), 2, "session_opened + closed");
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_rejects_writes_but_keeps_serving_reads() {
+        let mut s = new_session(Some(10)).await;
+        s.append(obj(json!({ "kind": "note" })))
+            .await
+            .expect("append");
+        s.spend(4).await.expect("spend");
+        s.close(None).await.expect("close");
 
         let err = s
             .append(obj(json!({ "kind": "note" })))
+            .await
             .expect_err("append after close");
         assert_eq!(err.reason(), "session is closed");
-        let err = s.spend(1).expect_err("spend after close");
+        let err = s.spend(1).await.expect_err("spend after close");
         assert_eq!(err.reason(), "session is closed");
-        let err = s.reserve(1).expect_err("reserve after close");
+        let err = s.reserve(1).await.expect_err("reserve after close");
         assert_eq!(err.reason(), "session is closed");
 
         assert_eq!(
-            s.len().expect("len"),
+            s.len().await.expect("len"),
             5,
             "session_opened + budget_granted + note + budget_spent + session_closed"
         );
-        assert_eq!(remaining(&s), Some(6));
-        assert_eq!(folded(&s), remaining(&s), "the ledger is the balance");
-        assert!(!exhausted(&s));
-        assert_eq!(s.events(0).expect("events")[2].kind(), "note");
+        assert_eq!(remaining(&s).await, Some(6));
+        assert_eq!(
+            folded(&s).await,
+            remaining(&s).await,
+            "the ledger is the balance"
+        );
+        assert!(!exhausted(&s).await);
+        assert_eq!(s.events(0).await.expect("events")[2].kind(), "note");
     }
 
-    #[test]
-    fn two_sessions_share_nothing() {
-        let mut a = new_session(Some(100));
-        let mut b = new_session(Some(100));
+    #[tokio::test]
+    async fn two_sessions_share_nothing() {
+        let mut a = new_session(Some(100)).await;
+        let mut b = new_session(Some(100)).await;
         assert_ne!(a.id(), b.id());
 
         a.append(obj(json!({ "kind": "only_in_a" })))
+            .await
             .expect("append");
-        a.spend(60).expect("spend");
+        a.spend(60).await.expect("spend");
 
         assert_eq!(
-            a.len().expect("len"),
+            a.len().await.expect("len"),
             4,
             "session_opened + budget_granted + only_in_a + budget_spent"
         );
-        assert_eq!(b.len().expect("len"), 2, "session_opened + budget_granted");
-        assert_eq!(remaining(&a), Some(40));
-        assert_eq!(remaining(&b), Some(100));
+        assert_eq!(
+            b.len().await.expect("len"),
+            2,
+            "session_opened + budget_granted"
+        );
+        assert_eq!(remaining(&a).await, Some(40));
+        assert_eq!(remaining(&b).await, Some(100));
         // The ledgers are as separate as the histories.
-        assert_eq!(folded(&a), Some(40));
-        assert_eq!(folded(&b), Some(100));
+        assert_eq!(folded(&a).await, Some(40));
+        assert_eq!(folded(&b).await, Some(100));
 
-        a.close(None).expect("close");
-        assert!(b.append(obj(json!({ "kind": "still_open" }))).is_ok());
+        a.close(None).await.expect("close");
+        assert!(b.append(obj(json!({ "kind": "still_open" }))).await.is_ok());
     }
 
-    #[test]
-    fn view_serves_the_one_named_projection_and_rejects_anything_else() {
-        let mut s = new_session(None);
+    #[tokio::test]
+    async fn view_serves_the_one_named_projection_and_rejects_anything_else() {
+        let mut s = new_session(None).await;
         s.append(obj(
             json!({ "kind": "msg_user", "data": { "content": "hi" } }),
         ))
+        .await
         .expect("append");
-        s.append(response(9)).expect("recorded");
+        s.append(response(9)).await.expect("recorded");
 
         let tail = s
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .await
             .expect("tail");
         assert_eq!(tail.as_array().map(Vec::len), Some(1));
 
-        let err = s.view("nope", None).expect_err("unknown view");
+        let err = s.view("nope", None).await.expect_err("unknown view");
         assert_eq!(err.reason(), r#"unknown view "nope""#);
     }
 
@@ -1302,17 +1451,22 @@ mod tests {
     /// reads the `llm_response` payload, so it is a query view written over
     /// the published schema.  Asking the kernel for it is the same error as
     /// asking for any other name it does not have.
-    #[test]
-    fn the_token_account_is_not_a_named_view() {
-        let mut s = new_session(None);
-        s.append(response(9)).expect("recorded");
+    #[tokio::test]
+    async fn the_token_account_is_not_a_named_view() {
+        let mut s = new_session(None).await;
+        s.append(response(9)).await.expect("recorded");
 
-        let err = s.view("usage", None).expect_err("usage was served");
+        let err = s.view("usage", None).await.expect_err("usage was served");
         assert_eq!(err.reason(), r#"unknown view "usage""#);
         assert_eq!(err.kind(), KnlError::VALIDATION);
 
         // What it needs is in the log, verbatim, for a reader to sum.
-        let recorded = s.events(2).expect("events").pop().expect("llm_response");
+        let recorded = s
+            .events(2)
+            .await
+            .expect("events")
+            .pop()
+            .expect("llm_response");
         assert_eq!(*field(&recorded, "usage"), json!({ "input_tokens": 9 }));
     }
 
@@ -1320,18 +1474,22 @@ mod tests {
     /// request — which role each kind takes, whether a system message
     /// belongs in it, where to cut it off — is the shell's decision, and
     /// it builds it from `events` rather than asking the kernel for it.
-    #[test]
-    fn the_conversation_is_not_a_named_view() {
-        let mut s = new_session(None);
+    #[tokio::test]
+    async fn the_conversation_is_not_a_named_view() {
+        let mut s = new_session(None).await;
         s.append(obj(
             json!({ "kind": "msg_user", "data": { "content": "hi" } }),
         ))
+        .await
         .expect("append");
 
-        let err = s.view("dialogue", None).expect_err("dialogue was served");
+        let err = s
+            .view("dialogue", None)
+            .await
+            .expect_err("dialogue was served");
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
-        let events = s.events(0).expect("events");
+        let events = s.events(0).await.expect("events");
         assert_eq!(events[1].kind(), "msg_user");
         assert_eq!(*field(&events[1], "content"), json!("hi"));
     }
@@ -1340,9 +1498,9 @@ mod tests {
     /// and leaves the budget alone.  What a call was allowed to cost was
     /// decided before it happened; the record of it happening is not a
     /// second place where that is decided.
-    #[test]
-    fn appending_an_llm_response_records_it_verbatim_without_charging() {
-        let mut s = new_session(Some(100));
+    #[tokio::test]
+    async fn appending_an_llm_response_records_it_verbatim_without_charging() {
+        let mut s = new_session(Some(100)).await;
         let seq = s
             .append(obj(json!({
                 "kind": "llm_response",
@@ -1353,9 +1511,15 @@ mod tests {
                     "usage": { "input_tokens": 20, "output_tokens": 10 }
                 }
             })))
+            .await
             .expect("append");
 
-        let recorded = s.events(seq).expect("events").pop().expect("llm_response");
+        let recorded = s
+            .events(seq)
+            .await
+            .expect("events")
+            .pop()
+            .expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(
             recorded[FIELD_BEAT],
@@ -1363,9 +1527,9 @@ mod tests {
             "the declared beat is recorded as given"
         );
 
-        assert_eq!(remaining(&s), Some(100), "an append must not charge");
+        assert_eq!(remaining(&s).await, Some(100), "an append must not charge");
         assert_eq!(
-            ledger(&s).len(),
+            ledger(&s).await.len(),
             1,
             "only the opening grant is in the ledger"
         );
@@ -1375,7 +1539,7 @@ mod tests {
             "the counts are stored as they came: {recorded}"
         );
         assert_eq!(
-            folded(&s),
+            folded(&s).await,
             Some(100),
             "what was consumed and the balance are separate readings"
         );
@@ -1383,8 +1547,8 @@ mod tests {
 
     /// The grant is the first thing the ledger says, right after the
     /// session's own boundary, with the owner's words on it.
-    #[test]
-    fn opening_with_a_grant_records_it() {
+    #[tokio::test]
+    async fn opening_with_a_grant_records_it() {
         let s = Session::new(
             ANON.to_string(),
             Some(BudgetGrant {
@@ -1392,10 +1556,12 @@ mod tests {
                 tag: Some("tokens".to_string()),
                 desc: Some("one nightly run".to_string()),
             }),
+            &IsleDrivers::new(),
         )
+        .await
         .expect("open");
 
-        let events = s.events(0).expect("events");
+        let events = s.events(0).await.expect("events");
         assert_eq!(events.len(), 2, "session_opened + budget_granted");
         assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(
@@ -1409,40 +1575,44 @@ mod tests {
         assert_eq!(*field(granted, FIELD_AMOUNT), json!(500));
         assert_eq!(*field(granted, FIELD_TAG), json!("tokens"));
         assert_eq!(*field(granted, FIELD_DESC), json!("one nightly run"));
-        assert_eq!(remaining(&s), Some(500));
-        assert_eq!(folded(&s), remaining(&s));
+        assert_eq!(remaining(&s).await, Some(500));
+        assert_eq!(folded(&s).await, remaining(&s).await);
 
         // A session with no grant keeps no ledger at all.
-        let bare = new_session(None);
-        assert_eq!(bare.len().expect("len"), 1, "session_opened only");
-        assert!(ledger(&bare).is_empty());
-        assert_eq!(folded(&bare), None);
+        let bare = new_session(None).await;
+        assert_eq!(bare.len().await.expect("len"), 1, "session_opened only");
+        assert!(ledger(&bare).await.is_empty());
+        assert_eq!(folded(&bare).await, None);
     }
 
     /// A reservation the balance covers is recorded once, deducts exactly
     /// what it asked for, and carries the grant's tag.
-    #[test]
-    fn a_granted_reservation_is_one_event_and_one_deduction() {
-        let mut s = new_session(Some(100));
-        assert_eq!(s.reserve(30), Ok(true));
+    #[tokio::test]
+    async fn a_granted_reservation_is_one_event_and_one_deduction() {
+        let mut s = new_session(Some(100)).await;
+        assert_eq!(s.reserve(30).await, Ok(true));
 
-        let moves = ledger(&s);
+        let moves = ledger(&s).await;
         assert_eq!(moves.len(), 2, "the grant and the reservation");
         assert_eq!(moves[1].kind(), KIND_BUDGET_RESERVED);
         assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(30));
         assert_eq!(*field(&moves[1], FIELD_TAG), json!("tokens"));
-        assert_eq!(remaining(&s), Some(70));
-        assert_eq!(folded(&s), remaining(&s), "the ledger is the balance");
+        assert_eq!(remaining(&s).await, Some(70));
+        assert_eq!(
+            folded(&s).await,
+            remaining(&s).await,
+            "the ledger is the balance"
+        );
     }
 
     /// A refusal is a fact: it is recorded, with what was asked for and
     /// what there was, and it moves nothing.
-    #[test]
-    fn a_refused_reservation_is_recorded_and_changes_no_balance() {
-        let mut s = new_session(Some(10));
-        assert_eq!(s.reserve(11), Ok(false));
+    #[tokio::test]
+    async fn a_refused_reservation_is_recorded_and_changes_no_balance() {
+        let mut s = new_session(Some(10)).await;
+        assert_eq!(s.reserve(11).await, Ok(false));
 
-        let moves = ledger(&s);
+        let moves = ledger(&s).await;
         assert_eq!(moves.len(), 2, "the grant and the refusal");
         assert_eq!(moves[1].kind(), KIND_BUDGET_REFUSED);
         assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(11));
@@ -1452,29 +1622,29 @@ mod tests {
             "what there was"
         );
         assert_eq!(*field(&moves[1], FIELD_TAG), json!("tokens"));
-        assert_eq!(remaining(&s), Some(10), "a refusal must not deduct");
-        assert!(!exhausted(&s));
-        assert_eq!(folded(&s), remaining(&s));
+        assert_eq!(remaining(&s).await, Some(10), "a refusal must not deduct");
+        assert!(!exhausted(&s).await);
+        assert_eq!(folded(&s).await, remaining(&s).await);
 
         // And the run can still spend what it has: nothing was consumed.
-        assert_eq!(s.reserve(10), Ok(true));
-        assert_eq!(remaining(&s), Some(0));
-        assert_eq!(folded(&s), Some(0));
+        assert_eq!(s.reserve(10).await, Ok(true));
+        assert_eq!(remaining(&s).await, Some(0));
+        assert_eq!(folded(&s).await, Some(0));
     }
 
     /// The settlement is recorded like everything else, and what the session
     /// reports is the fold of the ledger after any sequence of moves.
-    #[test]
-    fn the_balance_is_the_fold_after_any_sequence_of_moves() {
-        let mut s = new_session(Some(1000));
-        assert_eq!(s.reserve(200), Ok(true));
-        s.append(response(40)).expect("recorded");
-        s.spend(50).expect("spend");
-        assert_eq!(s.reserve(10_000), Ok(false));
-        assert_eq!(s.reserve(300), Ok(true));
-        s.spend(0).expect("spend");
+    #[tokio::test]
+    async fn the_balance_is_the_fold_after_any_sequence_of_moves() {
+        let mut s = new_session(Some(1000)).await;
+        assert_eq!(s.reserve(200).await, Ok(true));
+        s.append(response(40)).await.expect("recorded");
+        s.spend(50).await.expect("spend");
+        assert_eq!(s.reserve(10_000).await, Ok(false));
+        assert_eq!(s.reserve(300).await, Ok(true));
+        s.spend(0).await.expect("spend");
 
-        let moves = ledger(&s);
+        let moves = ledger(&s).await;
         assert_eq!(
             kinds(&moves),
             vec![
@@ -1487,23 +1657,26 @@ mod tests {
             ],
             "every move left exactly one event"
         );
-        assert_eq!(remaining(&s), Some(450), "1000 - 200 - 50 - 300");
-        assert_eq!(folded(&s), remaining(&s));
+        assert_eq!(remaining(&s).await, Some(450), "1000 - 200 - 50 - 300");
+        assert_eq!(folded(&s).await, remaining(&s).await);
     }
 
     /// The ledger is the kernel's to write: a caller cannot grant itself a
     /// budget, or drain one, by appending the events the balance folds
     /// from.
-    #[test]
-    fn a_caller_cannot_append_the_budget_kinds() {
-        let mut s = new_session(Some(10));
+    #[tokio::test]
+    async fn a_caller_cannot_append_the_budget_kinds() {
+        let mut s = new_session(Some(10)).await;
         for event in [
             json!({ "kind": "budget_granted", "data": { "amount": 1_000_000 } }),
             json!({ "kind": "budget_reserved", "data": { "amount": 5 } }),
             json!({ "kind": "budget_refused", "data": { "amount": 5, "remaining": 0 } }),
             json!({ "kind": "budget_spent", "data": { "amount": 5 } }),
         ] {
-            let err = s.append(obj(event.clone())).expect_err("kernel-only kind");
+            let err = s
+                .append(obj(event.clone()))
+                .await
+                .expect_err("kernel-only kind");
             assert!(
                 err.reason().contains("kernel only"),
                 "{event}: {}",
@@ -1511,23 +1684,30 @@ mod tests {
             );
         }
 
-        assert_eq!(remaining(&s), Some(10), "no forged event moved the balance");
-        assert_eq!(ledger(&s).len(), 1, "nothing was recorded");
-        assert_eq!(folded(&s), remaining(&s));
+        assert_eq!(
+            remaining(&s).await,
+            Some(10),
+            "no forged event moved the balance"
+        );
+        assert_eq!(ledger(&s).await.len(), 1, "nothing was recorded");
+        assert_eq!(folded(&s).await, remaining(&s).await);
     }
 
     /// The session's boundaries are the kernel's alone: a caller cannot
     /// hand-append either one, so a stream cannot claim an opening it never
     /// had or an ending it never reached.  The refusal leaves the session
     /// open and the log untouched.
-    #[test]
-    fn a_caller_cannot_append_the_session_boundary_kinds() {
-        let mut s = new_session(Some(100));
+    #[tokio::test]
+    async fn a_caller_cannot_append_the_session_boundary_kinds() {
+        let mut s = new_session(Some(100)).await;
         for event in [
             json!({ "kind": "session_opened", "data": { "scope_id": "s", "owner": "me" } }),
             json!({ "kind": "session_closed", "data": { "reason": "carried over" } }),
         ] {
-            let err = s.append(obj(event.clone())).expect_err("kernel-only kind");
+            let err = s
+                .append(obj(event.clone()))
+                .await
+                .expect_err("kernel-only kind");
             assert!(
                 err.reason().contains("kernel only"),
                 "{event}: {}",
@@ -1536,32 +1716,36 @@ mod tests {
         }
 
         assert!(!s.is_closed(), "a refused append ended the session");
-        assert_eq!(s.len().expect("len"), 2, "nothing was recorded");
-        assert_eq!(s.append(obj(json!({ "kind": "note" }))), Ok(3));
-        assert_eq!(s.spend(10), Ok(()));
-        assert_eq!(remaining(&s), Some(90), "the settlement landed");
+        assert_eq!(s.len().await.expect("len"), 2, "nothing was recorded");
+        assert_eq!(s.append(obj(json!({ "kind": "note" }))).await, Ok(3));
+        assert_eq!(s.spend(10).await, Ok(()));
+        assert_eq!(remaining(&s).await, Some(90), "the settlement landed");
     }
 
     /// Only `close` records `session_closed`, and it records exactly one:
     /// the flag and the event move together, so the log and the state
     /// cannot disagree.
-    #[test]
-    fn only_close_records_session_closed() {
-        let mut s = new_session(Some(100));
-        s.append(obj(json!({ "kind": "note" }))).expect("append");
+    #[tokio::test]
+    async fn only_close_records_session_closed() {
+        let mut s = new_session(Some(100)).await;
+        s.append(obj(json!({ "kind": "note" })))
+            .await
+            .expect("append");
         assert!(
             !s.events(0)
+                .await
                 .expect("events")
                 .iter()
                 .any(|e| e.kind() == KIND_SESSION_CLOSED),
             "nothing but close writes the boundary"
         );
 
-        s.close(Some("done")).expect("close");
+        s.close(Some("done")).await.expect("close");
         assert!(s.is_closed());
 
         let closed: Vec<Current> = s
             .events(0)
+            .await
             .expect("events")
             .into_iter()
             .filter(|e| e.kind() == KIND_SESSION_CLOSED)
@@ -1570,6 +1754,7 @@ mod tests {
         assert_eq!(*field(&closed[0], FIELD_REASON), json!("done"));
         assert_eq!(
             s.append(obj(json!({ "kind": "note" })))
+                .await
                 .expect_err("append after close")
                 .reason(),
             "session is closed"
@@ -1580,31 +1765,45 @@ mod tests {
     /// session: the response is in the history, counts and all, and the
     /// balance is exactly what was granted, because nobody reserved
     /// anything.
-    #[test]
-    fn a_recorded_response_is_in_the_history_without_being_charged() {
-        let mut s = new_session(Some(100));
-        s.append(response(30)).expect("recorded");
+    #[tokio::test]
+    async fn a_recorded_response_is_in_the_history_without_being_charged() {
+        let mut s = new_session(Some(100)).await;
+        s.append(response(30)).await.expect("recorded");
 
-        assert_eq!(remaining(&s), Some(100));
-        assert!(!exhausted(&s));
+        assert_eq!(remaining(&s).await, Some(100));
+        assert!(!exhausted(&s).await);
 
-        let recorded = s.events(3).expect("events").pop().expect("llm_response");
+        let recorded = s
+            .events(3)
+            .await
+            .expect("events")
+            .pop()
+            .expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(*field(&recorded, "stop_reason"), json!("end_turn"));
         assert_eq!(field(&recorded, "usage")["input_tokens"], json!(30));
-        assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
+        assert_eq!(
+            folded(&s).await,
+            Some(100),
+            "the ledger recorded no consumption"
+        );
     }
 
     /// The beat belongs to the layer above: the kernel never mints one, so
     /// an event that declares none carries none, and one that declares a
     /// beat carries exactly the string it was given — on any kind, and
     /// repeated across the facts of one beat without the kernel objecting.
-    #[test]
-    fn beats_are_the_callers_word_and_the_kernel_adds_none() {
-        let mut s = new_session(None);
+    #[tokio::test]
+    async fn beats_are_the_callers_word_and_the_kernel_adds_none() {
+        let mut s = new_session(None).await;
 
-        let seq = s.append(response(1)).expect("an undeclared beat");
-        let bare = s.events(seq).expect("events").pop().expect("response");
+        let seq = s.append(response(1)).await.expect("an undeclared beat");
+        let bare = s
+            .events(seq)
+            .await
+            .expect("events")
+            .pop()
+            .expect("response");
         assert_eq!(
             bare.get(FIELD_BEAT),
             None,
@@ -1626,32 +1825,38 @@ mod tests {
             }),
             json!({ "kind": "llm_call_failed", "beat": "b-1", "data": { "error": "boom" } }),
         ] {
-            let seq = s.append(obj(event.clone())).expect("declared beat");
-            let recorded = s.events(seq).expect("events").pop().expect("recorded");
+            let seq = s.append(obj(event.clone())).await.expect("declared beat");
+            let recorded = s
+                .events(seq)
+                .await
+                .expect("events")
+                .pop()
+                .expect("recorded");
             assert_eq!(recorded[FIELD_BEAT], json!("b-1"), "{event}");
         }
 
         // A non-string beat is the one thing refused, on any kind.
         let err = s
             .append(obj(json!({ "kind": "note", "beat": 1 })))
+            .await
             .expect_err("a numbered beat");
         assert!(err.reason().contains("beat must be a string"), "{err}");
     }
 
-    #[test]
-    fn a_closed_session_records_nothing() {
-        let mut s = new_session(Some(100));
-        s.close(None).expect("close");
+    #[tokio::test]
+    async fn a_closed_session_records_nothing() {
+        let mut s = new_session(Some(100)).await;
+        s.close(None).await.expect("close");
 
-        let err = s.append(response(10)).expect_err("closed session");
+        let err = s.append(response(10)).await.expect_err("closed session");
         assert_eq!(err.reason(), "session is closed");
 
         assert_eq!(
-            s.len().expect("len"),
+            s.len().await.expect("len"),
             3,
             "session_opened + budget_granted + session_closed only"
         );
-        assert_eq!(remaining(&s), Some(100), "nothing was consumed");
+        assert_eq!(remaining(&s).await, Some(100), "nothing was consumed");
     }
 
     /// The budget stops a session *before* it spends, not after: a
@@ -1659,13 +1864,14 @@ mod tests {
     /// for never happens.  This replaces the old contract, where the budget
     /// was a flag that only stood up once a recorded call had already used
     /// the allowance up — by which time the spending was done.
-    #[test]
-    fn the_budget_refuses_before_the_call_rather_than_flagging_after_it() {
-        let mut s = new_session(Some(10));
+    #[tokio::test]
+    async fn the_budget_refuses_before_the_call_rather_than_flagging_after_it() {
+        let mut s = new_session(Some(10)).await;
 
         /// How many model responses the log holds.
-        fn responses(s: &Session) -> usize {
+        async fn responses(s: &Session) -> usize {
             s.events(0)
+                .await
                 .expect("events")
                 .iter()
                 .filter(|e| e.kind() == "llm_response")
@@ -1673,50 +1879,55 @@ mod tests {
         }
 
         // The estimate fits, so the beat proceeds and records its response.
-        assert_eq!(s.reserve(10), Ok(true));
-        s.append(response(25)).expect("recorded");
-        assert_eq!(remaining(&s), Some(0), "the reservation took it all");
-        assert!(exhausted(&s));
+        assert_eq!(s.reserve(10).await, Ok(true));
+        s.append(response(25)).await.expect("recorded");
+        assert_eq!(remaining(&s).await, Some(0), "the reservation took it all");
+        assert!(exhausted(&s).await);
 
         // The next beat asks first and is turned away, so no second
         // response is recorded: the caller never made the call.
-        assert_eq!(s.reserve(1), Ok(false));
-        assert_eq!(responses(&s), 1, "the refused beat made no call");
-        assert_eq!(remaining(&s), Some(0));
-        assert_eq!(folded(&s), remaining(&s));
+        assert_eq!(s.reserve(1).await, Ok(false));
+        assert_eq!(responses(&s).await, 1, "the refused beat made no call");
+        assert_eq!(remaining(&s).await, Some(0));
+        assert_eq!(folded(&s).await, remaining(&s).await);
 
         // The kernel still does not police it: a caller that ignores the
         // refusal can append anyway, and the history says that it did.
-        s.append(response(5)).expect("recorded");
-        assert_eq!(responses(&s), 2, "stopping is the caller's decision");
+        s.append(response(5)).await.expect("recorded");
+        assert_eq!(responses(&s).await, 2, "stopping is the caller's decision");
     }
 
-    #[test]
-    fn without_a_budget_a_call_reports_no_remaining_and_is_never_exhausted() {
-        let mut s = new_session(None);
-        s.append(response(9_000)).expect("recorded");
-        assert_eq!(remaining(&s), None);
-        assert!(!exhausted(&s));
+    #[tokio::test]
+    async fn without_a_budget_a_call_reports_no_remaining_and_is_never_exhausted() {
+        let mut s = new_session(None).await;
+        s.append(response(9_000)).await.expect("recorded");
+        assert_eq!(remaining(&s).await, None);
+        assert!(!exhausted(&s).await);
 
         // No budget, no ledger: reserve always grants, spend does nothing,
         // and neither leaves a trace.
-        assert_eq!(s.reserve(1_000_000), Ok(true));
-        assert_eq!(s.spend(1_000_000), Ok(()));
-        assert!(ledger(&s).is_empty(), "a run with no quota keeps no ledger");
-        assert_eq!(remaining(&s), None);
-        assert!(!exhausted(&s));
+        assert_eq!(s.reserve(1_000_000).await, Ok(true));
+        assert_eq!(s.spend(1_000_000).await, Ok(()));
+        assert!(
+            ledger(&s).await.is_empty(),
+            "a run with no quota keeps no ledger"
+        );
+        assert_eq!(remaining(&s).await, None);
+        assert!(!exhausted(&s).await);
     }
 
-    #[test]
-    fn views_stay_readable_and_correct_after_close() {
-        let mut s = new_session(None);
-        s.append(response(9)).expect("recorded");
+    #[tokio::test]
+    async fn views_stay_readable_and_correct_after_close() {
+        let mut s = new_session(None).await;
+        s.append(response(9)).await.expect("recorded");
         let before = s
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .await
             .expect("tail");
-        s.close(None).expect("close");
+        s.close(None).await.expect("close");
         let after = s
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .await
             .expect("tail after close");
 
         // The read keeps working, and it reads the log as it now stands: the
@@ -1730,22 +1941,28 @@ mod tests {
             KIND_SESSION_CLOSED
         );
 
-        assert_eq!(s.len().expect("len"), 3);
-        assert_eq!(s.events(0).expect("events")[2].kind(), KIND_SESSION_CLOSED);
+        assert_eq!(s.len().await.expect("len"), 3);
+        assert_eq!(
+            s.events(0).await.expect("events")[2].kind(),
+            KIND_SESSION_CLOSED
+        );
     }
 
     /// `open_on` on a durable backend records the session's owner on the
     /// `session_opened` boundary, so resume can recover it from the log
     /// alone.
-    #[test]
-    fn open_on_records_the_owner_on_session_opened() {
+    #[tokio::test]
+    async fn open_on_records_the_owner_on_session_opened() {
         use crate::knl::SqliteEventStore;
 
-        let store = SqliteEventStore::open_memory("owner-stream").expect("open");
+        let store = SqliteEventStore::open_memory("owner-stream", &IsleDrivers::new())
+            .await
+            .expect("open");
         let s = Session::open_on("user-7".to_string(), Some(grant(100)), Box::new(store))
+            .await
             .expect("open");
 
-        let events = s.events(0).expect("events");
+        let events = s.events(0).await.expect("events");
         let opened = events.first().expect("session_opened");
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
@@ -1763,37 +1980,48 @@ mod tests {
     /// Resume re-folds a persisted SQLite stream: the owner and the
     /// *balance* come back from the log, because every move of the balance
     /// is in it.
-    #[test]
-    fn resume_restores_the_owner_and_the_folded_balance() {
+    #[tokio::test]
+    async fn resume_restores_the_owner_and_the_folded_balance() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "resume-stream";
+        let drivers = IsleDrivers::new();
 
         // A durable session: two beats that reserved and settled.
         let before_close = {
-            let store = SqliteEventStore::open(&path, stream).expect("open");
-            let mut s = Session::open_on("user-42".to_string(), Some(grant(100)), Box::new(store))
+            let store = SqliteEventStore::open(&path, stream, &drivers)
+                .await
                 .expect("open");
-            assert_eq!(s.reserve(30), Ok(true));
-            s.append(response(30)).expect("first response");
+            let mut s = Session::open_on("user-42".to_string(), Some(grant(100)), Box::new(store))
+                .await
+                .expect("open");
+            assert_eq!(s.reserve(30).await, Ok(true));
+            s.append(response(30)).await.expect("first response");
             s.append(obj(
                 json!({ "kind": "msg_user", "data": { "content": "more" } }),
             ))
+            .await
             .expect("msg_user");
-            assert_eq!(s.reserve(15), Ok(true));
-            s.append(response(20)).expect("second response");
-            s.spend(5).expect("the second call overran its estimate");
-            assert_eq!(remaining(&s), Some(50), "100 - 30 - 15 - 5");
-            assert_eq!(folded(&s), remaining(&s));
-            remaining(&s)
-        }; // dropped: the connection closes, the log persists.
+            assert_eq!(s.reserve(15).await, Ok(true));
+            s.append(response(20)).await.expect("second response");
+            s.spend(5)
+                .await
+                .expect("the second call overran its estimate");
+            assert_eq!(remaining(&s).await, Some(50), "100 - 30 - 15 - 5");
+            assert_eq!(folded(&s).await, remaining(&s).await);
+            remaining(&s).await
+        }; // dropped: the handle goes, the log persists.
 
         // Reopen the same stream and resume — no new session_opened is
         // written, and no new grant either.
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let mut resumed = Session::resume(None, Box::new(store)).expect("resume");
+        let store = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
+        let mut resumed = Session::resume(None, Box::new(store))
+            .await
+            .expect("resume");
 
         assert_eq!(
             resumed.owner(),
@@ -1801,7 +2029,7 @@ mod tests {
             "owner restored from session_opened"
         );
         assert_eq!(
-            remaining(&resumed),
+            remaining(&resumed).await,
             before_close,
             "the balance is what the ledger says it was"
         );
@@ -1812,7 +2040,7 @@ mod tests {
         );
         // Resume appended nothing: the log is exactly what was persisted.
         assert_eq!(
-            resumed.len().expect("len"),
+            resumed.len().await.expect("len"),
             8,
             "session_opened + granted + reserved + response + msg_user \
              + reserved + response + spent — and nothing from resume itself"
@@ -1823,6 +2051,7 @@ mod tests {
         // work from.
         let responses: Vec<Current> = resumed
             .events(0)
+            .await
             .expect("events")
             .into_iter()
             .filter(|e| e.kind() == "llm_response")
@@ -1833,37 +2062,44 @@ mod tests {
 
         // The ledger continues: the next reservation comes off the restored
         // balance, and what the resumed session records is its own.
-        assert_eq!(resumed.reserve(5), Ok(true));
-        let seq = resumed.append(response(5)).expect("third response");
+        assert_eq!(resumed.reserve(5).await, Ok(true));
+        let seq = resumed.append(response(5)).await.expect("third response");
         let recorded = resumed
             .events(seq)
+            .await
             .expect("events")
             .pop()
             .expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
-        assert_eq!(remaining(&resumed), Some(45), "5 reserved off the 50");
-        assert_eq!(folded(&resumed), remaining(&resumed));
+        assert_eq!(remaining(&resumed).await, Some(45), "5 reserved off the 50");
+        assert_eq!(folded(&resumed).await, remaining(&resumed).await);
     }
 
     /// A `grant` on resume is the owner allowing *more*: it is recorded and
     /// added to what the log left, rather than replacing it.
-    #[test]
-    fn resume_with_a_grant_records_it_and_raises_the_balance() {
+    #[tokio::test]
+    async fn resume_with_a_grant_records_it_and_raises_the_balance() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "regrant-stream";
+        let drivers = IsleDrivers::new();
 
         {
-            let store = SqliteEventStore::open(&path, stream).expect("open");
-            let mut s = Session::open_on("user-9".to_string(), Some(grant(100)), Box::new(store))
+            let store = SqliteEventStore::open(&path, stream, &drivers)
+                .await
                 .expect("open");
-            assert_eq!(s.reserve(80), Ok(true));
-            assert_eq!(remaining(&s), Some(20));
+            let mut s = Session::open_on("user-9".to_string(), Some(grant(100)), Box::new(store))
+                .await
+                .expect("open");
+            assert_eq!(s.reserve(80).await, Ok(true));
+            assert_eq!(remaining(&s).await, Some(20));
         }
 
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let store = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
         let mut resumed = Session::resume(
             Some(BudgetGrant {
                 amount: 50,
@@ -1872,12 +2108,13 @@ mod tests {
             }),
             Box::new(store),
         )
+        .await
         .expect("resume");
 
-        assert_eq!(remaining(&resumed), Some(70), "20 left + 50 granted");
-        assert_eq!(folded(&resumed), remaining(&resumed));
+        assert_eq!(remaining(&resumed).await, Some(70), "20 left + 50 granted");
+        assert_eq!(folded(&resumed).await, remaining(&resumed).await);
 
-        let moves = ledger(&resumed);
+        let moves = ledger(&resumed).await;
         assert_eq!(
             kinds(&moves),
             vec![
@@ -1891,10 +2128,10 @@ mod tests {
         assert_eq!(*field(&moves[2], FIELD_DESC), json!("a little more"));
 
         // And the resumed run spends against the raised balance.
-        assert_eq!(resumed.reserve(70), Ok(true));
-        assert_eq!(resumed.reserve(1), Ok(false));
-        assert_eq!(remaining(&resumed), Some(0));
-        assert_eq!(folded(&resumed), remaining(&resumed));
+        assert_eq!(resumed.reserve(70).await, Ok(true));
+        assert_eq!(resumed.reserve(1).await, Ok(false));
+        assert_eq!(remaining(&resumed).await, Some(0));
+        assert_eq!(folded(&resumed).await, remaining(&resumed).await);
     }
 
     /// Seed `stream` with a `session_opened` whose `data` is empty.
@@ -1904,11 +2141,19 @@ mod tests {
     /// stream an upcaster could not bring all the way would look like.  The
     /// resume fallbacks below are for exactly that, and this is the only way
     /// to reach them.
-    fn seed_an_opening_with_no_scope(path: &std::path::Path, stream: &str) {
+    async fn seed_an_opening_with_no_scope(path: &std::path::Path, stream: &str) {
         use crate::knl::SqliteEventStore;
 
         // Open once so the table is there, then write past the validator.
-        drop(SqliteEventStore::open(path, stream).expect("open"));
+        // The collection is shut down rather than dropped, so the connection
+        // has actually finished before the direct write below.
+        let drivers = IsleDrivers::new();
+        drop(
+            SqliteEventStore::open(path, stream, &drivers)
+                .await
+                .expect("open"),
+        );
+        assert!(drivers.shutdown().await.is_empty(), "the writer joined");
         let conn = rusqlite::Connection::open(path).expect("open the database directly");
         conn.execute(
             "INSERT INTO events \
@@ -1922,43 +2167,59 @@ mod tests {
     /// A log whose `session_opened` carries no `owner` resumes as [`ANON`]
     /// rather than failing: a stream that arrives missing the field is still
     /// a session, and refusing it would lose the log rather than protect it.
-    #[test]
-    fn resume_falls_back_to_anon_when_the_log_has_no_owner() {
+    #[tokio::test]
+    async fn resume_falls_back_to_anon_when_the_log_has_no_owner() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "legacy-stream";
-        seed_an_opening_with_no_scope(&path, stream);
+        seed_an_opening_with_no_scope(&path, stream).await;
 
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let resumed = Session::resume(None, Box::new(store)).expect("resume");
+        let store = SqliteEventStore::open(&path, stream, &IsleDrivers::new())
+            .await
+            .expect("reopen");
+        let resumed = Session::resume(None, Box::new(store))
+            .await
+            .expect("resume");
         assert_eq!(resumed.owner(), ANON);
-        assert_eq!(remaining(&resumed), None, "resumed without a budget cap");
+        assert_eq!(
+            remaining(&resumed).await,
+            None,
+            "resumed without a budget cap"
+        );
     }
 
     /// Resume restores the *scope*, not just a fresh one: the id and the
     /// owner come back off `session_opened`, so the session continues under
     /// the authority the log says it opened with, and the ledger it goes on
     /// writing names that same scope.
-    #[test]
-    fn resume_restores_the_scope_id_and_owner_from_the_log() {
+    #[tokio::test]
+    async fn resume_restores_the_scope_id_and_owner_from_the_log() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "scope-resume-stream";
+        let drivers = IsleDrivers::new();
 
         let opened_scope = {
-            let store = SqliteEventStore::open(&path, stream).expect("open");
-            let mut s = Session::open_on("user-11".to_string(), Some(grant(100)), Box::new(store))
+            let store = SqliteEventStore::open(&path, stream, &drivers)
+                .await
                 .expect("open");
-            assert_eq!(s.reserve(40), Ok(true));
+            let mut s = Session::open_on("user-11".to_string(), Some(grant(100)), Box::new(store))
+                .await
+                .expect("open");
+            assert_eq!(s.reserve(40).await, Ok(true));
             s.scope_id().to_string()
         };
 
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let mut resumed = Session::resume(None, Box::new(store)).expect("resume");
+        let store = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
+        let mut resumed = Session::resume(None, Box::new(store))
+            .await
+            .expect("resume");
         assert_eq!(
             resumed.scope_id(),
             opened_scope,
@@ -1966,11 +2227,15 @@ mod tests {
         );
         assert_eq!(resumed.owner(), "user-11");
         assert_eq!(resumed.scope().owner(), "user-11");
-        assert_eq!(remaining(&resumed), Some(60), "the balance is the fold's");
+        assert_eq!(
+            remaining(&resumed).await,
+            Some(60),
+            "the balance is the fold's"
+        );
 
         // What the resumed session records goes on naming the same scope.
-        assert_eq!(resumed.reserve(10), Ok(true));
-        let last = ledger(&resumed).pop().expect("budget_reserved");
+        assert_eq!(resumed.reserve(10).await, Ok(true));
+        let last = ledger(&resumed).await.pop().expect("budget_reserved");
         assert_eq!(last.kind(), KIND_BUDGET_RESERVED);
         assert_eq!(
             field(&last, FIELD_SCOPE_ID).as_str(),
@@ -1982,20 +2247,24 @@ mod tests {
     /// A log whose `session_opened` carries no `scope_id` resumes under a
     /// fresh kernel-issued one rather than failing — the sibling of the
     /// `owner` fallback above, and for the same reason.
-    #[test]
-    fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
+    #[tokio::test]
+    async fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "legacy-scope-stream";
-        seed_an_opening_with_no_scope(&path, stream);
+        seed_an_opening_with_no_scope(&path, stream).await;
 
-        let store = SqliteEventStore::open(&path, stream).expect("reopen");
-        let resumed = Session::resume(Some(grant(50)), Box::new(store)).expect("resume");
+        let store = SqliteEventStore::open(&path, stream, &IsleDrivers::new())
+            .await
+            .expect("reopen");
+        let resumed = Session::resume(Some(grant(50)), Box::new(store))
+            .await
+            .expect("resume");
 
         // The fallback is visible from both sides: the log says nothing…
-        let opened = resumed.events(0).expect("events").remove(0);
+        let opened = resumed.events(0).await.expect("events").remove(0);
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(data_field(&opened, FIELD_SCOPE_ID), None, "{opened}");
         assert_eq!(data_field(&opened, FIELD_OWNER), None, "{opened}");
@@ -2007,7 +2276,7 @@ mod tests {
         assert_eq!(resumed.owner(), ANON, "the sibling fallback");
 
         // And it is the one everything written from here on names.
-        let granted = ledger(&resumed).pop().expect("budget_granted");
+        let granted = ledger(&resumed).await.pop().expect("budget_granted");
         assert_eq!(granted.kind(), KIND_BUDGET_GRANTED);
         assert_eq!(
             field(&granted, FIELD_SCOPE_ID).as_str(),
@@ -2018,9 +2287,10 @@ mod tests {
 
     /// (Fix 5) Resuming an empty log is a caller error — a mistyped or
     /// nonexistent stream must not fold into an anonymous zero session.
-    #[test]
-    fn resume_of_an_empty_store_is_a_caller_error_not_an_anon_session() {
+    #[tokio::test]
+    async fn resume_of_an_empty_store_is_a_caller_error_not_an_anon_session() {
         let err = Session::resume(Some(grant(100)), Box::new(MemEventStore::new()))
+            .await
             .expect_err("an empty store has no session to resume");
         assert!(
             err.reason().contains("no session to resume"),
@@ -2032,13 +2302,15 @@ mod tests {
     /// (Fix 5) A log that has events but no opening the kernel recognises —
     /// under any shape it has ever been written in — is a caller error too:
     /// the ANON fallback is only for a real `session_opened`.
-    #[test]
-    fn resume_of_a_store_without_an_opening_is_a_caller_error() {
+    #[tokio::test]
+    async fn resume_of_a_store_without_an_opening_is_a_caller_error() {
         let mut store = MemEventStore::new();
         store
             .append(obj(json!({ "kind": "note" })))
+            .await
             .expect("seed a non-opening event");
         let err = Session::resume(None, Box::new(store))
+            .await
             .expect_err("a log with no opening has no session to resume");
         assert!(
             err.reason().contains("no session to resume"),
@@ -2049,27 +2321,31 @@ mod tests {
 
     /// A session is disposable: once its ending is in the log, the stream is
     /// not continued.  What comes after an ending is a new session.
-    #[test]
-    fn a_closed_stream_is_not_resumed() {
+    #[tokio::test]
+    async fn a_closed_stream_is_not_resumed() {
         let mut store = MemEventStore::new();
         store
             .append(obj(json!({
                 "kind": "session_opened",
                 "data": { "scope_id": "scope-5", "owner": "user-5" }
             })))
+            .await
             .expect("seed the opening");
         store
             .append(obj(
                 json!({ "kind": "budget_granted", "data": { "amount": 100 } }),
             ))
+            .await
             .expect("seed the grant");
         store
             .append(obj(
                 json!({ "kind": "session_closed", "data": { "reason": "done" } }),
             ))
+            .await
             .expect("seed the ending");
 
         let err = Session::resume(None, Box::new(store))
+            .await
             .expect_err("a closed session must not be resumed");
         assert!(
             err.reason().contains("session is closed"),
@@ -2089,72 +2365,78 @@ mod tests {
         injected: bool,
     }
 
+    #[async_trait::async_trait]
     impl EventStore for BusyStore {
         /// A session's appends come through here, so this is where the
         /// competing writer gets in: once, just before the response this
         /// session is about to record.
-        fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+        async fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
             if !self.injected
                 && event.get(FIELD_KIND).and_then(Value::as_str) == Some("llm_response")
             {
                 self.injected = true;
                 self.inner
                     .append(obj(json!({ "kind": "sneaked_in" })))
+                    .await
                     .expect("injected concurrent write");
             }
-            self.inner.append(event)
+            self.inner.append(event).await
         }
 
-        fn append_if(
+        async fn append_if(
             &mut self,
             kinds: Option<&[&str]>,
-            decide: &mut crate::knl::Decision<'_>,
+            decide: crate::knl::Decision,
         ) -> KnlResult<Option<crate::knl::Committed>> {
-            self.inner.append_if(kinds, decide)
+            self.inner.append_if(kinds, decide).await
         }
 
-        fn read_kinds(
+        async fn read_kinds(
             &self,
             kinds: Option<&[&str]>,
             from_seq: u64,
             limit: usize,
         ) -> KnlResult<Vec<Value>> {
-            self.inner.read_kinds(kinds, from_seq, limit)
+            self.inner.read_kinds(kinds, from_seq, limit).await
         }
 
-        fn head(&self) -> KnlResult<Option<u64>> {
-            self.inner.head()
+        async fn head(&self) -> KnlResult<Option<u64>> {
+            self.inner.head().await
         }
 
-        fn len(&self) -> KnlResult<usize> {
-            self.inner.len()
+        async fn len(&self) -> KnlResult<usize> {
+            self.inner.len().await
         }
     }
 
     /// An append records a fact and the store orders it: another writer
     /// getting there first does not turn this session's append into a
     /// failure, it only decides where the two land.
-    #[test]
-    fn an_append_lands_after_a_competing_write_rather_than_being_refused() {
+    #[tokio::test]
+    async fn an_append_lands_after_a_competing_write_rather_than_being_refused() {
         let store = BusyStore {
             inner: MemEventStore::new(),
             injected: false,
         };
-        let mut s =
-            Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store)).expect("open");
+        let mut s = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store))
+            .await
+            .expect("open");
         assert_eq!(
-            s.len().expect("len"),
+            s.len().await.expect("len"),
             2,
             "session_opened + budget_granted so far"
         );
 
         // The competing write lands at seq 3, so the response lands at 4 —
         // and it lands.
-        let seq = s.append(response(10)).expect("an append is not refused");
+        let seq = s
+            .append(response(10))
+            .await
+            .expect("an append is not refused");
         assert_eq!(seq, 4, "the seq is where the event really landed");
-        assert_eq!(s.len().expect("len"), 4, "both writes are in the log");
+        assert_eq!(s.len().await.expect("len"), 4, "both writes are in the log");
 
-        let log = s.events(0).expect("events");
+        let log = s.events(0).await.expect("events");
         assert_eq!(
             kinds(&log),
             [
@@ -2165,7 +2447,11 @@ mod tests {
             ],
             "the log interleaves in arrival order"
         );
-        assert_eq!(remaining(&s), Some(1000), "an append still charges nothing");
+        assert_eq!(
+            remaining(&s).await,
+            Some(1000),
+            "an append still charges nothing"
+        );
     }
 
     /// A store whose `head` read is down: appends land, but nothing can ask
@@ -2174,34 +2460,35 @@ mod tests {
         inner: MemEventStore,
     }
 
+    #[async_trait::async_trait]
     impl EventStore for HeadlessStore {
-        fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
-            self.inner.append(event)
+        async fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            self.inner.append(event).await
         }
 
-        fn append_if(
+        async fn append_if(
             &mut self,
             kinds: Option<&[&str]>,
-            decide: &mut crate::knl::Decision<'_>,
+            decide: crate::knl::Decision,
         ) -> KnlResult<Option<crate::knl::Committed>> {
-            self.inner.append_if(kinds, decide)
+            self.inner.append_if(kinds, decide).await
         }
 
-        fn read_kinds(
+        async fn read_kinds(
             &self,
             kinds: Option<&[&str]>,
             from_seq: u64,
             limit: usize,
         ) -> KnlResult<Vec<Value>> {
-            self.inner.read_kinds(kinds, from_seq, limit)
+            self.inner.read_kinds(kinds, from_seq, limit).await
         }
 
-        fn head(&self) -> KnlResult<Option<u64>> {
+        async fn head(&self) -> KnlResult<Option<u64>> {
             Err(KnlError::Busy("the head read is contended".to_string()))
         }
 
-        fn len(&self) -> KnlResult<usize> {
-            self.inner.len()
+        async fn len(&self) -> KnlResult<usize> {
+            self.inner.len().await
         }
     }
 
@@ -2214,26 +2501,28 @@ mod tests {
     /// loop deciding whether it may go on spending.  So the failure
     /// surfaces, classified, and what to do about a contended read is the
     /// caller's.
-    #[test]
-    fn a_balance_that_cannot_be_read_is_an_error_not_a_stale_fold() {
+    #[tokio::test]
+    async fn a_balance_that_cannot_be_read_is_an_error_not_a_stale_fold() {
         let store = HeadlessStore {
             inner: MemEventStore::new(),
         };
         let s = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store))
+            .await
             .expect("the appends land; only the head read is down");
 
         let err = s
             .remaining()
+            .await
             .expect_err("a failed read must not fold into a number");
         assert_eq!(err.kind(), KnlError::BUSY, "the class travels out intact");
         assert!(err.is_retryable(), "contention is the one retryable class");
 
-        let err = s.exhausted().expect_err("nor into a boolean");
+        let err = s.exhausted().await.expect_err("nor into a boolean");
         assert_eq!(err.kind(), KnlError::BUSY);
 
         // Only the reading failed: the record itself is exactly as written.
         assert_eq!(
-            s.len().expect("len"),
+            s.len().await.expect("len"),
             2,
             "session_opened + budget_granted landed"
         );
@@ -2241,15 +2530,18 @@ mod tests {
 
     /// (Fix 5) Resuming a nonexistent SQLite stream is a caller error, not an
     /// anonymous empty session.
-    #[test]
-    fn resume_of_a_nonexistent_sqlite_stream_is_a_caller_error() {
+    #[tokio::test]
+    async fn resume_of_a_nonexistent_sqlite_stream_is_a_caller_error() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         // A stream that was never opened as a session: its log is empty.
-        let store = SqliteEventStore::open(&path, "ghost-stream").expect("open");
+        let store = SqliteEventStore::open(&path, "ghost-stream", &IsleDrivers::new())
+            .await
+            .expect("open");
         let err = Session::resume(Some(grant(100)), Box::new(store))
+            .await
             .expect_err("an empty stream has no session to resume");
         assert!(
             err.reason().contains("no session to resume"),
@@ -2263,45 +2555,55 @@ mod tests {
     /// holds both in the order they arrived.  This is the scenario that used
     /// to be a head conflict — an append records a fact, and a fact is not
     /// refused for what its writer had last seen.
-    #[test]
-    fn two_sessions_on_one_stream_both_append_and_the_log_interleaves() {
+    #[tokio::test]
+    async fn two_sessions_on_one_stream_both_append_and_the_log_interleaves() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "interleave-stream";
+        let drivers = IsleDrivers::new();
 
         // A opens the session on the shared stream: `session_opened` at seq 1
         // and its `budget_granted` at seq 2, so A has seen head 2.
-        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open A");
         let mut a = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store_a))
+            .await
             .expect("open A");
 
         // B resumes the SAME stream while it holds only those two, so both
         // handles have seen exactly head 2.  (It resumes before A closes: a
         // closed session is not resumable.)
-        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
-        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(remaining(&b), Some(1000), "B resumed on A's ledger");
+        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b))
+            .await
+            .expect("resume B");
+        assert_eq!(remaining(&b).await, Some(1000), "B resumed on A's ledger");
         assert_eq!(
-            (a.len().expect("len"), b.len().expect("len")),
+            (a.len().await.expect("len"), b.len().await.expect("len")),
             (2, 2),
             "both see the same two events"
         );
 
         // A appends, so B's view is now out of date — and B appends anyway.
-        assert_eq!(a.append(response(10)).expect("A appends"), 3);
+        assert_eq!(a.append(response(10)).await.expect("A appends"), 3);
         assert_eq!(
-            b.append(response(20)).expect("B appends too"),
+            b.append(response(20)).await.expect("B appends too"),
             4,
             "B's write lands after A's, rather than being refused"
         );
         // And A, now out of date in its turn, goes on writing.
-        assert_eq!(a.append(response(30)).expect("A appends again"), 5);
+        assert_eq!(a.append(response(30)).await.expect("A appends again"), 5);
 
         // The durable log holds all three, in arrival order.
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
+        let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
         let responses: Vec<u64> = log
             .iter()
             .filter(|e| e.kind() == "llm_response")
@@ -2314,34 +2616,44 @@ mod tests {
     /// stream, ten granted, each asking for six.  The decision is taken inside
     /// the store, against the ledger as it stands there, so exactly one is
     /// allowed — and the fold says four, not minus two.
-    #[test]
-    fn two_sessions_cannot_both_reserve_the_same_allowance() {
+    #[tokio::test]
+    async fn two_sessions_cannot_both_reserve_the_same_allowance() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "reserve-race-stream";
+        let drivers = IsleDrivers::new();
 
-        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store_a))
+        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+            .await
             .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
-        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(remaining(&b), Some(10), "both see the whole grant");
-        assert_eq!(remaining(&a), Some(10));
+        let mut a = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store_a))
+            .await
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b))
+            .await
+            .expect("resume B");
+        assert_eq!(remaining(&b).await, Some(10), "both see the whole grant");
+        assert_eq!(remaining(&a).await, Some(10));
 
         // A takes six.  B still believes it has ten — and is refused all the
         // same, because the balance it is measured against is the one in the
         // store, not the one it cached.
-        assert_eq!(a.reserve(6), Ok(true), "the first reservation fits");
-        assert_eq!(b.reserve(6), Ok(false), "the second does not");
-        assert_eq!(remaining(&b), Some(4), "B's balance is the ledger's");
-        assert_eq!(remaining(&a), Some(4), "and so is A's");
+        assert_eq!(a.reserve(6).await, Ok(true), "the first reservation fits");
+        assert_eq!(b.reserve(6).await, Ok(false), "the second does not");
+        assert_eq!(remaining(&b).await, Some(4), "B's balance is the ledger's");
+        assert_eq!(remaining(&a).await, Some(4), "and so is A's");
 
         // The ledger is the answer: 10 granted − 6 reserved = 4, with the
         // refusal recorded and moving nothing.
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
+        let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
         assert_eq!(fold_balance(&log), Some(4), "no allowance was taken twice");
         let moves: Vec<&str> = kinds(&log)
             .into_iter()
@@ -2371,25 +2683,37 @@ mod tests {
     /// which is the fact an audit is reading for, and would be gone if the
     /// store had refused them.  A second handle closing writes a second
     /// ending, because that is what happened.
-    #[test]
-    fn a_close_is_the_handles_and_the_log_records_what_arrives_after_it() {
+    #[tokio::test]
+    async fn a_close_is_the_handles_and_the_log_records_what_arrives_after_it() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "close-race-stream";
+        let drivers = IsleDrivers::new();
 
-        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
+        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open A");
         let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .await
             .expect("open A");
         // Both resume while the stream is open — a closed one is not
         // resumable — so both hold `closed = false` across A's close.
-        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
-        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        let store_c = SqliteEventStore::open(&path, stream).expect("open C");
-        let mut c = Session::resume(None, Box::new(store_c)).expect("resume C");
+        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b))
+            .await
+            .expect("resume B");
+        let store_c = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open C");
+        let mut c = Session::resume(None, Box::new(store_c))
+            .await
+            .expect("resume C");
 
-        a.close(Some("done")).expect("A closes");
+        a.close(Some("done")).await.expect("A closes");
         assert!(a.is_closed());
         assert!(!b.is_closed(), "B's flag is its own and has not moved");
         assert!(!c.is_closed());
@@ -2397,7 +2721,7 @@ mod tests {
         // B writes, and the write lands: the store serializes appends, it does
         // not adjudicate them.
         assert_eq!(
-            b.append(obj(json!({ "kind": "note" }))),
+            b.append(obj(json!({ "kind": "note" }))).await,
             Ok(4),
             "an append after another handle's close is recorded"
         );
@@ -2405,18 +2729,26 @@ mod tests {
 
         // C's budget moves are decided on the balance alone — 100 granted,
         // nothing spent, so both go through.
-        assert_eq!(c.reserve(5), Ok(true), "the ledger covers it");
-        assert_eq!(c.spend(10), Ok(()), "the settlement lands");
-        assert_eq!(remaining(&c), Some(85), "100 − 5 − 10, folded in the tx");
+        assert_eq!(c.reserve(5).await, Ok(true), "the ledger covers it");
+        assert_eq!(c.spend(10).await, Ok(()), "the settlement lands");
+        assert_eq!(
+            remaining(&c).await,
+            Some(85),
+            "100 − 5 − 10, folded in the tx"
+        );
         assert!(!c.is_closed());
 
         // B closing writes a *second* ending; A closing again writes nothing,
         // because A's own flag is set.
-        b.close(Some("late")).expect("B closes");
-        a.close(Some("again")).expect("A is idempotent per handle");
+        b.close(Some("late")).await.expect("B closes");
+        a.close(Some("again"))
+            .await
+            .expect("A is idempotent per handle");
 
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
+        let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
         assert_eq!(
             kinds(&log),
             [
@@ -2449,36 +2781,53 @@ mod tests {
     /// balance afterwards is the ledger's, so it is exact on a stream two
     /// handles write to — B reads what the log says, not a number it was
     /// holding before A spent.
-    #[test]
-    fn a_settlement_records_the_move_and_the_balance_is_the_ledgers() {
+    #[tokio::test]
+    async fn a_settlement_records_the_move_and_the_balance_is_the_ledgers() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "spend-race-stream";
+        let drivers = IsleDrivers::new();
 
-        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+            .await
             .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
-        let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!((remaining(&a), remaining(&b)), (Some(100), Some(100)));
-
-        assert_eq!(a.spend(30), Ok(()), "A settles 30 of the 100");
-        assert_eq!(remaining(&a), Some(70), "and reads the balance separately");
+        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .await
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open B");
+        let mut b = Session::resume(None, Box::new(store_b))
+            .await
+            .expect("resume B");
         assert_eq!(
-            remaining(&b),
+            (remaining(&a).await, remaining(&b).await),
+            (Some(100), Some(100))
+        );
+
+        assert_eq!(a.spend(30).await, Ok(()), "A settles 30 of the 100");
+        assert_eq!(
+            remaining(&a).await,
+            Some(70),
+            "and reads the balance separately"
+        );
+        assert_eq!(
+            remaining(&b).await,
             Some(70),
             "B wrote nothing and still reads A's settlement off the ledger"
         );
 
         // B's own settlement measures against the ledger — 100 − 30 − 20 —
         // rather than subtracting 20 from a number it was holding.
-        assert_eq!(b.spend(20), Ok(()), "B settles 20");
-        assert_eq!(remaining(&b), Some(50), "both settlements are in it");
+        assert_eq!(b.spend(20).await, Ok(()), "B settles 20");
+        assert_eq!(remaining(&b).await, Some(50), "both settlements are in it");
 
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
+        let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
         assert_eq!(fold_balance(&log), Some(50), "the balance is the fold");
         let moves: Vec<&str> = kinds(&log)
             .into_iter()
@@ -2491,13 +2840,17 @@ mod tests {
         );
 
         // A settlement never refuses: it floors at zero, as the fold does.
-        assert_eq!(a.spend(1_000), Ok(()));
-        assert_eq!(b.spend(1), Ok(()));
-        assert_eq!(remaining(&a), Some(0));
-        assert_eq!(remaining(&b), Some(0));
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        assert_eq!(a.spend(1_000).await, Ok(()));
+        assert_eq!(b.spend(1).await, Ok(()));
+        assert_eq!(remaining(&a).await, Some(0));
+        assert_eq!(remaining(&b).await, Some(0));
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
         assert_eq!(
-            fold_balance(&as_current(verify.read(0, usize::MAX).expect("read log"))),
+            fold_balance(&as_current(
+                verify.read(0, usize::MAX).await.expect("read log")
+            )),
             Some(0),
             "the ledger floors at zero rather than going into debt"
         );
@@ -2507,46 +2860,66 @@ mod tests {
     /// that has written nothing at all still reports what the other one
     /// spent: `B` never calls a write in this test, and every answer it gives
     /// comes from folding the stream it shares with `A`.
-    #[test]
-    fn a_handle_that_wrote_nothing_reports_what_the_other_spent() {
+    #[tokio::test]
+    async fn a_handle_that_wrote_nothing_reports_what_the_other_spent() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "shared-balance-stream";
+        let drivers = IsleDrivers::new();
 
-        let store_a = SqliteEventStore::open(&path, stream).expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+            .await
             .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream).expect("open B");
+        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
+            .await
+            .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open B");
         // Not `mut`: reading a balance is a read, and B does nothing else.
-        let b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(remaining(&b), Some(100), "both start on the same ledger");
-
-        assert_eq!(a.spend(30), Ok(()), "A settles 30");
+        let b = Session::resume(None, Box::new(store_b))
+            .await
+            .expect("resume B");
         assert_eq!(
-            remaining(&b),
+            remaining(&b).await,
+            Some(100),
+            "both start on the same ledger"
+        );
+
+        assert_eq!(a.spend(30).await, Ok(()), "A settles 30");
+        assert_eq!(
+            remaining(&b).await,
             Some(70),
             "B sees the settlement it did not make"
         );
 
-        assert_eq!(a.reserve(20), Ok(true), "A reserves 20");
-        assert_eq!(remaining(&b), Some(50), "and the reservation too");
-        assert!(!exhausted(&b));
+        assert_eq!(a.reserve(20).await, Ok(true), "A reserves 20");
+        assert_eq!(remaining(&b).await, Some(50), "and the reservation too");
+        assert!(!exhausted(&b).await);
 
         // Reading twice over a stream that has not moved repeats the fold's
         // answer rather than drifting from it.
-        assert_eq!(remaining(&b), Some(50), "a second read is the same read");
+        assert_eq!(
+            remaining(&b).await,
+            Some(50),
+            "a second read is the same read"
+        );
 
-        assert_eq!(a.spend(1_000), Ok(()), "A overspends");
-        assert_eq!(remaining(&b), Some(0), "the floor is the ledger's");
-        assert!(exhausted(&b));
+        assert_eq!(a.spend(1_000).await, Ok(()), "A overspends");
+        assert_eq!(remaining(&b).await, Some(0), "the floor is the ledger's");
+        assert!(exhausted(&b).await);
 
         // And the log is the whole of the story: nothing B holds was needed.
-        let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
+        let verify = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen to verify");
         assert_eq!(
-            fold_balance(&as_current(verify.read(0, usize::MAX).expect("read log"))),
-            remaining(&b)
+            fold_balance(&as_current(
+                verify.read(0, usize::MAX).await.expect("read log")
+            )),
+            remaining(&b).await
         );
     }
 
@@ -2584,33 +2957,37 @@ mod tests {
     /// wrapped round its backend — the restore fold a resume takes, `events`,
     /// the `tail` view and the balance fold alike — while the rows on disk
     /// keep the shape they were written in.
-    #[test]
-    fn a_session_reads_every_path_through_the_upcaster_seam() {
+    #[tokio::test]
+    async fn a_session_reads_every_path_through_the_upcaster_seam() {
         use crate::knl::{
             SqliteEventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
         };
-        use std::sync::Arc;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "seam-stream";
+        let drivers = IsleDrivers::new();
 
         // Seeded under the older kind names, through the store itself: the
         // rows are ordinary appends, so they carry the version they were
         // written under.
         {
-            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            let mut store = SqliteEventStore::open(&path, stream, &drivers)
+                .await
+                .expect("open");
             store
                 .append(obj(json!({
                     "kind": "legacy_opened",
                     "data": { "owner": "user-3", "scope_id": "scope-from-the-log" }
                 })))
+                .await
                 .expect("the opening");
             store
                 .append(obj(json!({
                     "kind": "budget_granted",
                     "data": { "amount": 100, "tag": "tokens" }
                 })))
+                .await
                 .expect("the grant");
             store
                 .append(obj(json!({
@@ -2620,6 +2997,7 @@ mod tests {
                         "usage": { "input_tokens": 7 }
                     }
                 })))
+                .await
                 .expect("the response");
         }
 
@@ -2628,10 +3006,16 @@ mod tests {
         // session is otherwise the one production builds.
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
         let seamed = CurrentStore::new(
-            Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
+            Box::new(
+                SqliteEventStore::open(&path, stream, &drivers)
+                    .await
+                    .expect("reopen"),
+            ),
             chain,
         );
-        let mut resumed = Session::resume_on(None, seamed).expect("resume through the seam");
+        let mut resumed = Session::resume_on(None, seamed)
+            .await
+            .expect("resume through the seam");
 
         // The restore read went through the chain: the opening was only a
         // `session_opened` after the step, and the scope came off it.
@@ -2644,7 +3028,7 @@ mod tests {
         );
 
         // …and so do `events`, the `tail` view and the balance fold.
-        let log = resumed.events(0).expect("events");
+        let log = resumed.events(0).await.expect("events");
         assert_eq!(
             kinds(&log),
             [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, "llm_response"],
@@ -2652,6 +3036,7 @@ mod tests {
         );
         let tail = resumed
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .await
             .expect("tail");
         let last = &tail.as_array().expect("array")[0];
         assert_eq!(
@@ -2660,13 +3045,19 @@ mod tests {
             "the view read the projected kind: {last}"
         );
         assert_eq!(last[FIELD_DATA]["usage"]["input_tokens"], json!(7));
-        assert_eq!(remaining(&resumed), Some(100), "the balance folds too");
+        assert_eq!(
+            remaining(&resumed).await,
+            Some(100),
+            "the balance folds too"
+        );
 
         // The stored rows were not rewritten: read them without the seam and
         // the old names are still there, under the version they were written
         // with.
-        let raw = SqliteEventStore::open(&path, stream).expect("reopen raw");
-        let stored = raw.read(0, usize::MAX).expect("read raw");
+        let raw = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen raw");
+        let stored = raw.read(0, usize::MAX).await.expect("read raw");
         assert_eq!(kind_of(&stored[0]), "legacy_opened", "{}", stored[0]);
         assert_eq!(kind_of(&stored[2]), "legacy_response", "{}", stored[2]);
         // And a filtered read of the *stored* stream selects on those old
@@ -2675,6 +3066,7 @@ mod tests {
         // never are.
         assert!(
             raw.read_kinds(Some(&[KIND_SESSION_OPENED]), 0, usize::MAX)
+                .await
                 .expect("read raw")
                 .is_empty(),
             "the kind filter selects on what is stored"
@@ -2690,37 +3082,46 @@ mod tests {
     /// (Upcasting seam) A stream whose ending is only visible *after* the
     /// step is still an ending: the disposable rule reads the projected log,
     /// not the stored one.
-    #[test]
-    fn a_closed_stream_seen_through_the_seam_is_still_refused() {
+    #[tokio::test]
+    async fn a_closed_stream_seen_through_the_seam_is_still_refused() {
         use crate::knl::{SqliteEventStore, Upcaster};
-        use std::sync::Arc;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "seam-closed-stream";
+        let drivers = IsleDrivers::new();
 
         {
-            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            let mut store = SqliteEventStore::open(&path, stream, &drivers)
+                .await
+                .expect("open");
             store
                 .append(obj(json!({
                     "kind": "legacy_opened",
                     "data": { "owner": "user-3", "scope_id": "scope-from-the-log" }
                 })))
+                .await
                 .expect("the opening");
             store
                 .append(obj(json!({
                     "kind": "session_closed", "data": { "reason": "done" }
                 })))
+                .await
                 .expect("the ending");
         }
 
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
         let seamed = CurrentStore::new(
-            Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
+            Box::new(
+                SqliteEventStore::open(&path, stream, &drivers)
+                    .await
+                    .expect("reopen"),
+            ),
             chain,
         );
-        let err =
-            Session::resume_on(None, seamed).expect_err("a stream that ended must not be resumed");
+        let err = Session::resume_on(None, seamed)
+            .await
+            .expect_err("a stream that ended must not be resumed");
         assert!(
             err.reason().contains("session is closed"),
             "{}",
@@ -2735,20 +3136,25 @@ mod tests {
     /// resuming it restores the state.  What it cannot do is outlive the
     /// process — the database is reclaimed when the last handle on it goes —
     /// and nothing here pretends otherwise.
-    #[test]
-    fn an_in_memory_stream_is_resumable_while_it_is_open() {
-        let mut s = new_session(Some(100));
-        assert_eq!(s.reserve(30), Ok(true));
+    #[tokio::test]
+    async fn an_in_memory_stream_is_resumable_while_it_is_open() {
+        let mut s = new_session(Some(100)).await;
+        assert_eq!(s.reserve(30).await, Ok(true));
         s.append(obj(json!({ "kind": "note", "data": { "text": "hi" } })))
+            .await
             .expect("append");
 
         // The session id *is* the stream, so it is what a resume names.
-        let store = SqliteEventStore::open_memory(s.id()).expect("reopen the stream");
-        let resumed = Session::resume(None, Box::new(store)).expect("resume");
+        let store = SqliteEventStore::open_memory(s.id(), &IsleDrivers::new())
+            .await
+            .expect("reopen the stream");
+        let resumed = Session::resume(None, Box::new(store))
+            .await
+            .expect("resume");
         assert_eq!(resumed.owner(), ANON);
-        assert_eq!(remaining(&resumed), Some(70), "the ledger came back");
+        assert_eq!(remaining(&resumed).await, Some(70), "the ledger came back");
         assert_eq!(
-            kinds(&resumed.events(0).expect("events")),
+            kinds(&resumed.events(0).await.expect("events")),
             vec![
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
@@ -2758,10 +3164,10 @@ mod tests {
         );
 
         // Two sessions are two databases: neither name is the other's.
-        let other = new_session(Some(100));
+        let other = new_session(Some(100)).await;
         assert_ne!(other.id(), s.id());
         assert_eq!(
-            other.len().expect("len"),
+            other.len().await.expect("len"),
             2,
             "opened + granted, and no note"
         );
@@ -2769,14 +3175,15 @@ mod tests {
 
     /// A session reads its own log with SQL, and `$stream` is what makes
     /// "its own" true without the caller having to know its id.
-    #[test]
-    fn a_session_reads_its_own_log_with_sql() {
-        let mut s = new_session(None);
+    #[tokio::test]
+    async fn a_session_reads_its_own_log_with_sql() {
+        let mut s = new_session(None).await;
         s.append(obj(
             json!({ "kind": "msg_user", "data": { "content": "hi" } }),
         ))
+        .await
         .expect("append");
-        s.append(response(9)).expect("recorded");
+        s.append(response(9)).await.expect("recorded");
 
         let found = s
             .query(
@@ -2784,6 +3191,7 @@ mod tests {
                 QueryParams::None,
                 &QueryOpts::default(),
             )
+            .await
             .expect("query");
         assert!(!found.truncated);
         let kinds: Vec<&str> = found
@@ -2802,14 +3210,16 @@ mod tests {
                 QueryParams::None,
                 &QueryOpts::default(),
             )
+            .await
             .expect("query");
         assert_eq!(counted.rows.len(), 3);
 
         // Another session's stream is not this one's, even in the same
         // process: the set a query reads is the set it named.
-        let mut other = new_session(None);
+        let mut other = new_session(None).await;
         other
             .append(obj(json!({ "kind": "only_theirs" })))
+            .await
             .expect("append");
         let mine = s
             .query(
@@ -2817,6 +3227,7 @@ mod tests {
                 QueryParams::None,
                 &QueryOpts::default(),
             )
+            .await
             .expect("query");
         assert!(
             !mine.rows.iter().any(|row| row["kind"] == "only_theirs"),
@@ -2825,9 +3236,10 @@ mod tests {
         );
 
         // Reads keep working after the handle closed, like every other read.
-        s.close(None).expect("close");
+        s.close(None).await.expect("close");
         assert!(s
             .query("SELECT 1 AS one", QueryParams::None, &QueryOpts::default())
+            .await
             .is_ok());
     }
 }

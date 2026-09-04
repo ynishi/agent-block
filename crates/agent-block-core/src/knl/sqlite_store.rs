@@ -71,19 +71,26 @@
 //! and the connection it runs on has no write capability to lend it.  Values
 //! are bound, never interpolated — including the ids `$sessions` expands to.
 //!
-//! A query runs under a deadline: [`Isle::call_timeout`] interrupts the
+//! A query runs under a deadline: [`AsyncIsle::call_timeout`] interrupts the
 //! statement if it has not finished in time, and that surfaces as
 //! [`KnlError::Timeout`].
 //!
-//! # The connection lives on a thread of its own
+//! # The connection lives on a thread of its own, and nobody waits on it
 //!
 //! Neither connection is held by this struct: each is owned by a
-//! [`rusqlite_isle::Isle`], a thread that takes closures and runs them one at
-//! a time.  A store method is therefore a closure sent to that thread and a
-//! result sent back, which is what makes the whole log safe to touch from a
-//! host that is otherwise asynchronous — SQLite blocks the isle's thread, not
-//! the caller's runtime — and it is why the writer and the reader are two
-//! isles rather than two connections behind a lock.
+//! [`rusqlite_isle::AsyncIsle`], a thread that takes closures and runs them
+//! one at a time.  A store method is therefore a closure sent to that thread
+//! and a result **awaited** — the caller's task yields while SQLite works, so
+//! the one thread that must never stop (the Lua VM's, which is the sole worker
+//! of its own runtime) goes on driving every other coroutine, timer and cancel
+//! it owns.  That is why the whole SPI below is `async`: an event store that
+//! can only be waited for synchronously is an event store that stops the VM.
+//!
+//! The handle is cloneable and cheap; what is *not* cloneable is the
+//! [`rusqlite_isle::AsyncIsleDriver`] that owns the thread's join handle.
+//! Those go to an [`IsleDrivers`] the host holds, so a session's threads
+//! outlive the session — a dropped handle can still hand its closing event to
+//! the isle without waiting for it — and are drained once, at host shutdown.
 //!
 //! # Concurrency
 //!
@@ -93,39 +100,40 @@
 //! `busy_timeout` actually covers — a `DEFERRED` transaction can still hit
 //! `SQLITE_BUSY` on lock *promotion* even with a timeout set.  Contention with
 //! another connection is waited out by the busy timeout the isle was opened
-//! with, and `append` / `append_many` sit inside [`Isle::call_retry`], which
-//! re-submits the whole job on `SQLITE_BUSY` with exponential backoff.  A
-//! write that is still contended after that surfaces as [`KnlError::Busy`],
-//! which is the one class that tells the caller another try is worth making.
+//! with, and `append` / `append_many` sit inside [`AsyncIsle::call_retry`],
+//! which re-submits the whole job on `SQLITE_BUSY`, backing off with
+//! `tokio::time::sleep` rather than parking a thread.  A write that is still
+//! contended after that surfaces as [`KnlError::Busy`], which is the one class
+//! that tells the caller another try is worth making.
 //!
-//! `append_if` is the exception, and for a structural reason: its decision
-//! runs on the *caller's* thread (it is a borrowed closure, so it cannot be
-//! sent anywhere), which means the caller cannot be sitting inside a blocking
-//! `call_retry` while the job waits for its answer.  It gets the busy timeout
-//! and the retryable error, not the backoff loop.
+//! `append_if` gets the busy timeout and the retryable error, not the backoff
+//! loop — its decision is a `FnOnce`, so an attempt consumes it.  What it no
+//! longer needs is the channel round trip the borrowed-closure form required:
+//! the decision is owned and `Send`, so it travels *with* the job and runs on
+//! the isle's own thread, inside the transaction, with nothing on either side
+//! waiting for the other.
 //!
 //! That is what makes the SPI's promise true here: appends to one stream are
 //! *serialized* — two handles both write and the log interleaves in arrival
 //! order — a batch is one transaction, so it lands whole or not at all, and a
 //! decision taken by `append_if` runs against the stream inside the same
 //! transaction that records its answer, so no concurrent writer can slip
-//! between the two.  The decision is asked for over a channel while that
-//! transaction is open and the write lock is held, so where the closure
-//! *runs* changes nothing about when it is answered.
+//! between the two.
 //!
 //! [`MemEventStore`]: super::event_store::MemEventStore
-//! [`Isle::call_timeout`]: rusqlite_isle::Isle::call_timeout
-//! [`Isle::call_retry`]: rusqlite_isle::Isle::call_retry
+//! [`AsyncIsle::call_retry`]: rusqlite_isle::AsyncIsle::call_retry
+//! [`AsyncIsle::call_timeout`]: rusqlite_isle::AsyncIsle::call_timeout
 
-use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, TransactionBehavior};
-use rusqlite_isle::{Isle, IsleError, RetryPolicy};
+use rusqlite_isle::{AsyncIsle, AsyncIsleDriver, IsleError, RetryPolicy};
 use serde_json::{Map, Value};
+use tokio::sync::OnceCell;
 
 use super::event::{
     stamp, validate_event, FIELD_BEAT, FIELD_DATA, FIELD_EPOCH_MS, FIELD_KIND, FIELD_META,
@@ -140,6 +148,94 @@ use super::{now_ms, KnlError, KnlResult};
 
 /// How long a contended write waits for the lock before erroring.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The lifecycle owners of the connection threads a session's log lives on.
+///
+/// [`rusqlite_isle::AsyncIsle`] hands back a cloneable handle and a driver
+/// that is not clonable: the driver owns the thread's join handle and is the
+/// only thing that can drain and stop it.  A session cannot hold its own —
+/// the whole point of the drop backstop is that a handle nobody closed can
+/// still hand its `session_closed` to the isle *after* the handle is gone, and
+/// a thread its own store had already stopped could not take it.
+///
+/// So the drivers are parked here instead: one collection per host run, shut
+/// down once at the end of it, exactly as the `sql` / `kv` connection threads
+/// are.  Cheap to clone (an `Arc`), because every site that opens a store
+/// needs to reach it.
+///
+/// The lock is a plain [`Mutex`] and is never held across an `.await`:
+/// [`IsleDrivers::shutdown`] takes the whole list out under the lock and
+/// releases it before it starts waiting on the first thread.
+#[derive(Clone, Default)]
+pub struct IsleDrivers {
+    parked: Arc<Mutex<Vec<AsyncIsleDriver>>>,
+}
+
+impl std::fmt::Debug for IsleDrivers {
+    /// The drivers themselves have nothing worth printing; the count is what
+    /// a caller debugging a leak wants.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IsleDrivers")
+            .field("parked", &self.len())
+            .finish()
+    }
+}
+
+impl IsleDrivers {
+    /// A fresh, empty collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take ownership of `driver` for the rest of the run.
+    ///
+    /// A poisoned lock is stepped over rather than raised on: this runs while
+    /// a store is being opened, the data behind the lock is a plain `Vec` that
+    /// no half-finished write can corrupt, and refusing to keep the driver
+    /// would leak the thread outright.
+    fn park(&self, driver: AsyncIsleDriver) {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(driver);
+    }
+
+    /// How many connection threads are still owned here.
+    pub fn len(&self) -> usize {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether no connection thread has been opened (or all were drained).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drain every thread: queued jobs run to completion, then each thread
+    /// stops and is joined.
+    ///
+    /// The queued jobs matter — the drop backstop submits its `session_closed`
+    /// without waiting for it, so this is where those land.  Failures are
+    /// collected rather than raised on the first one: a thread that panicked
+    /// is no reason to leave the rest running.
+    ///
+    /// Idempotent: a second call finds nothing parked and returns an empty
+    /// list.
+    pub async fn shutdown(&self) -> Vec<IsleError> {
+        // The guard is released here, before the first `.await` below.
+        let drivers: Vec<AsyncIsleDriver> =
+            std::mem::take(&mut *self.parked.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut failures = Vec::new();
+        for driver in drivers {
+            if let Err(e) = driver.shutdown().await {
+                failures.push(e);
+            }
+        }
+        failures
+    }
+}
 
 /// The table the log lives in — published as the read contract
 /// ([`events_schema`]).
@@ -242,26 +338,38 @@ impl Db {
     /// Start the writing isle: the thread that owns the connection every
     /// append goes through, with the `events` table ensured before it takes
     /// its first job.
-    fn spawn_writer(&self) -> KnlResult<Isle> {
-        Isle::builder()
+    ///
+    /// The thread is created by `std::thread::Builder` inside the isle and
+    /// needs no runtime of its own; what this call awaits is the oneshot that
+    /// says the connection opened and the DDL ran.  So the caller yields
+    /// rather than blocking, which is what lets `knl.open` be reached from
+    /// inside the Lua VM at all.
+    async fn spawn_writer(&self, drivers: &IsleDrivers) -> KnlResult<AsyncIsle> {
+        let (isle, driver) = AsyncIsle::builder()
             .thread_name("knl-events")
             .open_flags(Self::write_flags())
             .wal(BUSY_TIMEOUT)
             .spawn(self.target(), |conn| conn.execute_batch(SCHEMA_DDL))
-            .map_err(KnlError::from)
+            .await
+            .map_err(KnlError::from)?;
+        drivers.park(driver);
+        Ok(isle)
     }
 
     /// Start the reading isle: a second thread, a second connection, and no
     /// write capability on it at all.
-    fn spawn_reader(&self) -> KnlResult<Isle> {
-        Isle::builder()
+    async fn spawn_reader(&self, drivers: &IsleDrivers) -> KnlResult<AsyncIsle> {
+        let (isle, driver) = AsyncIsle::builder()
             .thread_name("knl-events-read")
             .open_flags(Self::read_only_flags())
             .busy_timeout(BUSY_TIMEOUT)
             .spawn(self.target(), |conn| {
                 conn.execute_batch("PRAGMA query_only = 1;")
             })
-            .map_err(KnlError::from)
+            .await
+            .map_err(KnlError::from)?;
+        drivers.park(driver);
+        Ok(isle)
     }
 }
 
@@ -317,20 +425,25 @@ fn is_retryable(error: &rusqlite::Error) -> bool {
 /// The session *is* the stream: one instance serves one session's log.
 /// Several instances may point at the same DB file with different streams.
 pub struct SqliteEventStore {
-    /// The thread that owns the writing connection.
+    /// The handle on the thread that owns the writing connection.
     ///
     /// Held for the store's whole life, which for an in-memory database is
     /// not merely convenient: a shared-cache in-memory database exists only
     /// while a connection to it is open, so this isle *is* the database.
-    writer: Isle,
+    writer: AsyncIsle,
     /// Where the database is, so a second connection can be opened to it.
     db: Db,
     /// The read-only isle, started on the first query and reused.
     ///
     /// Lazy because most sessions never run one: a store that only appends
     /// and folds pays nothing — not even a thread — for the read side
-    /// existing.
-    reader: OnceCell<Isle>,
+    /// existing.  A [`tokio::sync::OnceCell`] rather than the `std` one
+    /// because opening it is now an `await`, and because the cell has to stay
+    /// `Sync` for the store's `&self` reads to be `Send` futures.
+    reader: OnceCell<AsyncIsle>,
+    /// Where the drivers of both threads went, so the reader can park its own
+    /// when it is opened.
+    drivers: IsleDrivers,
     /// The stream this store is scoped to — the session id.
     stream: String,
 }
@@ -340,8 +453,15 @@ impl SqliteEventStore {
     ///
     /// The `events` table is created if it does not exist, so opening a fresh
     /// file and reopening an existing one take the same path.
-    pub fn open(path: &Path, stream: impl Into<String>) -> KnlResult<Self> {
-        Self::init(Db::File(path.to_path_buf()), stream.into())
+    ///
+    /// `drivers` takes ownership of the connection thread this starts (and of
+    /// the read thread, if a query ever opens one): see [`IsleDrivers`].
+    pub async fn open(
+        path: &Path,
+        stream: impl Into<String>,
+        drivers: &IsleDrivers,
+    ) -> KnlResult<Self> {
+        Self::init(Db::File(path.to_path_buf()), stream.into(), drivers).await
     }
 
     /// Open an in-memory database for `stream`.
@@ -349,22 +469,22 @@ impl SqliteEventStore {
     /// The database is named after the stream and opened in shared-cache
     /// mode, so the read connection reaches the same rows the writer wrote —
     /// and so reopening the same stream id in the same process finds the same
-    /// log.  It exists only while this store does: an in-memory database is
-    /// reclaimed when its last connection closes, which is exactly what
-    /// "ephemeral" should mean.
-    pub fn open_memory(stream: impl Into<String>) -> KnlResult<Self> {
+    /// log.  It lives as long as a connection to it is open, which is until
+    /// `drivers` is shut down.
+    pub async fn open_memory(stream: impl Into<String>, drivers: &IsleDrivers) -> KnlResult<Self> {
         let stream = stream.into();
-        Self::init(Db::Memory(Db::memory_uri(&stream)), stream)
+        Self::init(Db::Memory(Db::memory_uri(&stream)), stream, drivers).await
     }
 
     /// Start the writing isle — which sets the busy timeout, applies the WAL
     /// preset and ensures the table and its indexes before it takes a job.
-    fn init(db: Db, stream: String) -> KnlResult<Self> {
-        let writer = db.spawn_writer()?;
+    async fn init(db: Db, stream: String, drivers: &IsleDrivers) -> KnlResult<Self> {
+        let writer = db.spawn_writer(drivers).await?;
         Ok(Self {
             writer,
             db,
             reader: OnceCell::new(),
+            drivers: drivers.clone(),
             stream,
         })
     }
@@ -376,20 +496,13 @@ impl SqliteEventStore {
     /// asked for, and `query_only` is the same answer said again inside the
     /// connection, so a statement that slipped past the checks on the text
     /// still has nothing to write with.
-    fn reader(&self) -> KnlResult<&Isle> {
-        if let Some(reader) = self.reader.get() {
-            return Ok(reader);
-        }
-        let reader = self.db.spawn_reader()?;
-        // `set` cannot fail here — nothing else can have filled the cell,
-        // since `&self` is not shared across threads — and the value is
-        // fetched back rather than moved out so the isle stays owned by the
-        // cell for every later query.
-        let _ = self.reader.set(reader);
-        Ok(self
-            .reader
-            .get()
-            .expect("the reader was just placed in the cell"))
+    ///
+    /// A failed open is not remembered: the cell stays empty, so the next
+    /// query tries again rather than reporting the first failure forever.
+    async fn reader(&self) -> KnlResult<&AsyncIsle> {
+        self.reader
+            .get_or_try_init(|| self.db.spawn_reader(&self.drivers))
+            .await
     }
 
     /// The columns of the `events` table, as SQLite reports them.
@@ -397,47 +510,51 @@ impl SqliteEventStore {
     /// Read through the *reader*, because this is the read contract: what a
     /// caller's SQL may name. `PRAGMA table_info` rather than a list written
     /// out here, so the published schema cannot drift from the table.
-    pub fn schema(&self) -> KnlResult<Vec<SchemaColumn>> {
-        self.reader()?
-            .call(|conn| {
-                let mut stmt = conn.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(SchemaColumn {
-                        name: row.get::<_, String>("name")?,
-                        declared_type: row.get::<_, String>("type")?,
-                        pk: row.get::<_, i64>("pk")? > 0,
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
+    pub async fn schema(&self) -> KnlResult<Vec<SchemaColumn>> {
+        self.reader()
+            .await?
+            .call(schema_of)
+            .await
             .map_err(KnlError::from)
     }
 }
 
-/// Stop both connection threads when the store goes.
+/// `PRAGMA table_info(events)`, as [`SchemaColumn`]s.
 ///
-/// Best-effort: a shutdown that fails has nothing left to report to — the
-/// store is being dropped — and the isle's own `Drop` still signals the
-/// thread, so the connection is released either way.  For an in-memory
-/// database this is the moment it ceases to exist, which is what "ephemeral"
-/// means here.
-impl Drop for SqliteEventStore {
-    fn drop(&mut self) {
-        if let Some(reader) = self.reader.get() {
-            let _ = reader.shutdown();
-        }
-        let _ = self.writer.shutdown();
-    }
+/// One reader for both callers: a live store's [`SqliteEventStore::schema`],
+/// which runs it on the reading isle, and [`events_schema`], which runs it on
+/// a connection of its own.
+fn schema_of(conn: &mut Connection) -> rusqlite::Result<Vec<SchemaColumn>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SchemaColumn {
+            name: row.get::<_, String>("name")?,
+            declared_type: row.get::<_, String>("type")?,
+            pk: row.get::<_, i64>("pk")? > 0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
 }
 
 /// The columns of the `events` table, without a session to ask.
 ///
-/// The schema is a property of the kernel, not of any one log, so this opens
-/// a throwaway in-memory store and reads the table back off it — the same
-/// `PRAGMA table_info` a caller's own store would answer with.  It is what
-/// `knl.api()` publishes.
+/// The schema is a property of the kernel, not of any one log, so this creates
+/// the table in a private in-memory database and reads it straight back — the
+/// same `PRAGMA table_info` a caller's own store would answer with.  It is
+/// what `knl.api()` publishes.
+///
+/// Deliberately **not** async, and deliberately not an isle.  It opens a
+/// nameless in-memory database, runs `CREATE TABLE IF NOT EXISTS` and one
+/// pragma against it, and drops it: no file is touched, no lock can be
+/// contended, and no thread is started, so there is nothing here for the
+/// caller to wait on.  That is what keeps `knl.api()` a synchronous call —
+/// a declaration of the surface should not have to be awaited — while the
+/// rule that the VM thread never waits on the OS still holds, because this
+/// never reaches the OS.
 pub fn events_schema() -> KnlResult<Vec<SchemaColumn>> {
-    SqliteEventStore::open_memory(format!("schema-{}", uuid::Uuid::new_v4()))?.schema()
+    let mut conn = Connection::open_in_memory().map_err(KnlError::from)?;
+    conn.execute_batch(SCHEMA_DDL).map_err(KnlError::from)?;
+    schema_of(&mut conn).map_err(KnlError::from)
 }
 
 /// The kinds a read was asked for, owned, so the selection can be sent to the
@@ -446,8 +563,9 @@ fn owned_kinds(kinds: Option<&[&str]>) -> Option<Vec<String>> {
     kinds.map(|kinds| kinds.iter().map(|kind| (*kind).to_string()).collect())
 }
 
+#[async_trait]
 impl EventStore for SqliteEventStore {
-    fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<Committed> {
+    async fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<Committed> {
         // Reject before touching the stream: a rejected event burns no seq.
         validate_event(&event)?;
         // Stamp the schema version once, before the job is submitted; the
@@ -459,10 +577,11 @@ impl EventStore for SqliteEventStore {
             .call_retry(retry_policy(), move |conn| {
                 finish(append_in(conn, &stream, &event))
             })
+            .await
             .map_err(KnlError::from)?
     }
 
-    fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
+    async fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -480,50 +599,31 @@ impl EventStore for SqliteEventStore {
             .call_retry(retry_policy(), move |conn| {
                 finish(append_many_in(conn, &stream, &events))
             })
+            .await
             .map_err(KnlError::from)?
     }
 
-    fn append_if(
+    async fn append_if(
         &mut self,
         kinds: Option<&[&str]>,
-        decide: &mut Decision<'_>,
+        decide: Decision,
     ) -> KnlResult<Option<Committed>> {
         // The read, the decision and the insert share one IMMEDIATE
         // transaction, so the invariant `decide` checks holds at the instant
-        // the event lands.
-        //
-        // `decide` is borrowed from the caller, so it cannot travel to the
-        // isle's thread; instead the job asks for its answer over a channel
-        // while the transaction is open, and the caller — which is *not*
-        // blocked, because the job was spawned rather than called — answers
-        // it.  The write lock is held for the whole exchange, so the decision
-        // still sees, and still answers about, the stream it writes into.
+        // the event lands — and all three now run in one job, on the isle's
+        // own thread, because the decision is an owned `Send` closure that
+        // travels with it.  The channel round trip the borrowed form needed
+        // (job asks, caller answers, both waiting on each other with the write
+        // lock held) is gone with it.
         let stream = self.stream.clone();
         let kinds = owned_kinds(kinds);
-        let (ask, asked) = mpsc::channel::<Vec<Value>>();
-        let (answer, answered) = mpsc::channel::<Option<Map<String, Value>>>();
-        let job = self
-            .writer
-            .spawn_call(move |conn| {
-                finish(append_if_in(
-                    conn,
-                    &stream,
-                    kinds.as_deref(),
-                    &ask,
-                    &answered,
-                ))
-            })
-            .map_err(KnlError::from)?;
-        // A `recv` that fails means the job ended before it asked — a
-        // contended `BEGIN`, say — and the error it ended with is what
-        // `job.wait()` is about to return.
-        if let Ok(events) = asked.recv() {
-            let _ = answer.send(decide(&events));
-        }
-        job.wait().map_err(KnlError::from)?
+        self.writer
+            .call(move |conn| finish(append_if_in(conn, &stream, kinds.as_deref(), decide)))
+            .await
+            .map_err(KnlError::from)?
     }
 
-    fn read_kinds(
+    async fn read_kinds(
         &self,
         kinds: Option<&[&str]>,
         from_seq: u64,
@@ -541,20 +641,22 @@ impl EventStore for SqliteEventStore {
         let stream = self.stream.clone();
         self.writer
             .call(move |conn| finish(read_in(conn, &stream, kinds.as_deref(), from_seq, capped)))
+            .await
             .map_err(KnlError::from)?
     }
 
-    fn head(&self) -> KnlResult<Option<u64>> {
+    async fn head(&self) -> KnlResult<Option<u64>> {
         // A transient busy read must surface, not read as "empty": a caller
         // deciding open-vs-resume (or a CAS) on a swallowed error would
         // treat a populated stream as fresh.  Same discipline as read().
         let stream = self.stream.clone();
         self.writer
             .call(move |conn| head_in(conn, &stream))
+            .await
             .map_err(KnlError::from)
     }
 
-    fn len(&self) -> KnlResult<usize> {
+    async fn len(&self) -> KnlResult<usize> {
         let stream = self.stream.clone();
         self.writer
             .call(move |conn| {
@@ -564,19 +666,43 @@ impl EventStore for SqliteEventStore {
                     |row| row.get::<_, i64>(0),
                 )
             })
+            .await
             .map(|n| n as usize)
             .map_err(KnlError::from)
     }
 
-    fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
+    async fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
         // The deadline is the isle's: it interrupts the statement when the
         // time is up and reports `Timeout`, so there is no watchdog thread
         // here to outlive the query it was watching.
         let timeout = plan.timeout;
         let plan = plan.clone();
-        self.reader()?
+        self.reader()
+            .await?
             .call_timeout(timeout, move |conn| Ok(run_query(conn, &plan)))
+            .await
             .map_err(KnlError::from)?
+    }
+
+    fn detach_append(&self, mut event: Map<String, Value>) {
+        // The drop backstop's path, and the one write nobody awaits.  A
+        // handle that was collected has no caller left to raise to and no
+        // task left to wait in, so the job is handed to the isle and let go
+        // of: the thread runs it because its driver outlives every session
+        // ([`IsleDrivers`]), and the boundary lands before the host drains
+        // that thread at shutdown.
+        if let Err(e) = validate_event(&event) {
+            tracing::warn!(error = %e, "knl: a detached append was refused before it was submitted");
+            return;
+        }
+        stamp_schema_version(&mut event);
+        let stream = self.stream.clone();
+        // `detach`, not a dropped task: dropping an `AsyncTask` cancels the
+        // job it stands for, which would throw away the very event this
+        // exists to record.
+        self.writer
+            .spawn_call(move |conn| finish(append_in(conn, &stream, &event)))
+            .detach();
     }
 }
 
@@ -882,15 +1008,14 @@ fn append_many_in(
     Ok(committed)
 }
 
-/// One `IMMEDIATE` decide-then-append: read the stream, ask the caller what to
-/// record, and insert its answer in the same transaction.
+/// One `IMMEDIATE` decide-then-append: read the stream, ask the caller's
+/// closure what to record, and insert its answer in the same transaction.
 ///
-/// The decision itself is the caller's closure and stays on the caller's
-/// thread; this job sends it the events over `ask` and waits on `answered`
-/// with the write lock still held, so the decision is taken against the stream
-/// it is about to be written into.  A channel that is gone means the caller
-/// went away mid-decision — the transaction is dropped and the stream is as it
-/// was.
+/// The decision travels *with* the job — it is owned and `Send` — so it runs
+/// here, on the isle's thread, between the read and the insert, with the write
+/// lock held throughout.  Nothing waits on anything else: the caller's task is
+/// suspended on the job's own oneshot and there is no second channel for the
+/// two sides to deadlock across.
 ///
 /// `kinds` narrows what the decision is shown, not where its answer lands:
 /// the new event's `seq` comes from the stream's live head, so a filtered
@@ -903,15 +1028,13 @@ fn append_if_in(
     conn: &mut Connection,
     stream: &str,
     kinds: Option<&[String]>,
-    ask: &mpsc::Sender<Vec<Value>>,
-    answered: &mpsc::Receiver<Option<Map<String, Value>>>,
+    decide: Decision,
 ) -> Result<Option<Committed>, JobError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(JobError::Sqlite)?;
     let events = read_in(&tx, stream, kinds, 0, i64::MAX)?;
-    ask.send(events).map_err(|_| gone())?;
-    let Some(event) = answered.recv().map_err(|_| gone())? else {
+    let Some(event) = decide(events) else {
         // Nothing to write: the transaction is rolled back on drop.
         return Ok(None);
     };
@@ -928,17 +1051,6 @@ fn append_if_in(
     insert_row(&tx, stream, seq, epoch_ms, &row)?;
     tx.commit().map_err(JobError::Sqlite)?;
     Ok(Some(Committed { seq, epoch_ms }))
-}
-
-/// The caller of `append_if` disappeared before it answered.
-///
-/// Storage rather than busy: nothing about the database was wrong, and
-/// nothing about it will be different next time, so this is not an invitation
-/// to try again.
-fn gone() -> JobError {
-    JobError::Terminal(KnlError::Storage(
-        "sqlite: the caller of append_if went away before deciding".to_string(),
-    ))
 }
 
 /// The columns a read selects, in the order [`read_row`] takes them.
@@ -1251,32 +1363,49 @@ mod tests {
         obj(json!({ "kind": kind, "data": { "amount": amount } }))
     }
 
-    /// A store on an in-memory database of its very own.
+    /// A store on an in-memory database of its very own, with the collection
+    /// that owns its connection thread.
     ///
     /// The name matters: an in-memory database is shared by *name*, which is
     /// what lets the reader see the writer's rows — and would equally let two
     /// tests running in parallel see each other's.  A fresh id per store keeps
     /// each test's log to itself.
-    fn mem_store() -> SqliteEventStore {
-        SqliteEventStore::open_memory(uuid::Uuid::new_v4().to_string()).expect("open")
+    ///
+    /// The [`IsleDrivers`] comes back with the store because the caller has to
+    /// hold it: it owns the connection thread, and a test that dropped it
+    /// early would be pulling the database out from under its own assertions.
+    async fn mem_store() -> (SqliteEventStore, IsleDrivers) {
+        let drivers = IsleDrivers::new();
+        let store = SqliteEventStore::open_memory(uuid::Uuid::new_v4().to_string(), &drivers)
+            .await
+            .expect("open");
+        (store, drivers)
     }
 
-    #[test]
-    fn append_assigns_gap_free_monotonic_seq_from_one() {
-        let mut store = mem_store();
-        assert!(store.is_empty().expect("is_empty"));
-        assert_eq!(store.len().expect("len"), 0);
+    /// A decision as [`EventStore::append_if`] takes one: owned, and handed
+    /// its input by value.
+    fn decide(
+        f: impl FnOnce(Vec<Value>) -> Option<Map<String, Value>> + Send + 'static,
+    ) -> Decision {
+        Box::new(f)
+    }
 
-        let a = store.append(ev(1)).expect("append e1");
-        let b = store.append(ev(2)).expect("append e2");
-        let c = store.append(ev(3)).expect("append e3");
+    #[tokio::test]
+    async fn append_assigns_gap_free_monotonic_seq_from_one() {
+        let (mut store, _drivers) = mem_store().await;
+        assert!(store.is_empty().await.expect("is_empty"));
+        assert_eq!(store.len().await.expect("len"), 0);
+
+        let a = store.append(ev(1)).await.expect("append e1");
+        let b = store.append(ev(2)).await.expect("append e2");
+        let c = store.append(ev(3)).await.expect("append e3");
 
         assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
-        assert_eq!(store.len().expect("len"), 3);
-        assert!(!store.is_empty().expect("is_empty"));
+        assert_eq!(store.len().await.expect("len"), 3);
+        assert!(!store.is_empty().await.expect("is_empty"));
 
         // The stamped epoch is what is stored.
-        let stored = store.read(0, usize::MAX).expect("read");
+        let stored = store.read(0, usize::MAX).await.expect("read");
         let stored_epoch = stored[0]
             .get("epoch_ms")
             .and_then(Value::as_u64)
@@ -1284,65 +1413,85 @@ mod tests {
         assert_eq!(stored_epoch, a.epoch_ms);
     }
 
-    #[test]
-    fn a_rejected_append_records_nothing_and_burns_no_seq() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn a_rejected_append_records_nothing_and_burns_no_seq() {
+        let (mut store, _drivers) = mem_store().await;
         store
             .append(obj(json!({ "text": "no kind" })))
+            .await
             .expect_err("kind is required");
-        assert_eq!(store.len().expect("len"), 0);
-        assert_eq!(store.append(ev(1)).expect("append").seq, 1);
+        assert_eq!(store.len().await.expect("len"), 0);
+        assert_eq!(store.append(ev(1)).await.expect("append").seq, 1);
     }
 
     /// `append_if` decides on the stream inside its transaction: the events
     /// it is handed are the durable ones, a `Some` lands at the next seq, and
     /// a `None` commits nothing.
-    #[test]
-    fn append_if_decides_inside_the_transaction_and_writes_only_a_some() {
-        let mut store = mem_store();
-        store.append(ev(1)).expect("seed");
+    #[tokio::test]
+    async fn append_if_decides_inside_the_transaction_and_writes_only_a_some() {
+        let (mut store, _drivers) = mem_store().await;
+        store.append(ev(1)).await.expect("seed");
 
-        let mut seen_kinds: Vec<String> = Vec::new();
+        // The decision runs on the connection's own thread now, so what it
+        // saw comes back through a shared cell rather than a borrow.
+        let seen_kinds: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&seen_kinds);
         let committed = store
-            .append_if(None, &mut |events| {
-                seen_kinds = events.iter().map(|e| kind_of(e).to_string()).collect();
-                Some(ev(2))
-            })
+            .append_if(
+                None,
+                decide(move |events| {
+                    *recorded.lock().expect("not poisoned") =
+                        events.iter().map(|e| kind_of(e).to_string()).collect();
+                    Some(ev(2))
+                }),
+            )
+            .await
             .expect("append_if");
-        assert_eq!(seen_kinds, ["e1"], "decide saw the durable stream");
+        assert_eq!(
+            *seen_kinds.lock().expect("not poisoned"),
+            ["e1"],
+            "decide saw the durable stream"
+        );
         assert_eq!(committed.map(|c| c.seq), Some(2));
 
-        let nothing = store.append_if(None, &mut |_| None).expect("append_if");
+        let nothing = store
+            .append_if(None, decide(|_| None))
+            .await
+            .expect("append_if");
         assert_eq!(nothing, None);
-        assert_eq!(store.len().expect("len"), 2, "a None commits nothing");
-        assert_eq!(store.append(ev(3)).expect("append").seq, 3);
+        assert_eq!(store.len().await.expect("len"), 2, "a None commits nothing");
+        assert_eq!(store.append(ev(3)).await.expect("append").seq, 3);
     }
 
     /// A malformed decision is refused and leaves the stream alone.
-    #[test]
-    fn append_if_validates_the_event_the_decision_returns() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn append_if_validates_the_event_the_decision_returns() {
+        let (mut store, _drivers) = mem_store().await;
         store
-            .append_if(None, &mut |_| Some(obj(json!({ "text": "no kind" }))))
+            .append_if(None, decide(|_| Some(obj(json!({ "text": "no kind" })))))
+            .await
             .expect_err("kind is required");
-        assert_eq!(store.len().expect("len"), 0);
+        assert_eq!(store.len().await.expect("len"), 0);
     }
 
     /// A batch is one transaction: the events land together, numbered on from
     /// the live head — and a batch that fails part-way leaves the stream
     /// exactly as it was, which is the whole reason it is one call.
-    #[test]
-    fn append_many_is_one_transaction_that_lands_whole_or_not_at_all() {
-        let mut store = mem_store();
-        store.append(ev(1)).expect("seed");
+    #[tokio::test]
+    async fn append_many_is_one_transaction_that_lands_whole_or_not_at_all() {
+        let (mut store, _drivers) = mem_store().await;
+        store.append(ev(1)).await.expect("seed");
 
-        let committed = store.append_many(vec![ev(2), ev(3)]).expect("the batch");
+        let committed = store
+            .append_many(vec![ev(2), ev(3)])
+            .await
+            .expect("the batch");
         assert_eq!(
             committed.iter().map(|c| c.seq).collect::<Vec<_>>(),
             [2, 3],
             "numbered on from the head that was there"
         );
-        let stored = store.read(0, usize::MAX).expect("read");
+        let stored = store.read(0, usize::MAX).await.expect("read");
         let kinds: Vec<&str> = stored.iter().map(kind_of).collect();
         assert_eq!(kinds, ["e1", "e2", "e3"]);
 
@@ -1350,28 +1499,48 @@ mod tests {
         // the same call is not in the log either.
         store
             .append_many(vec![ev(4), obj(json!({ "text": "no kind" }))])
+            .await
             .expect_err("kind is required");
-        assert_eq!(store.len().expect("len"), 3, "a failed batch wrote nothing");
-        assert_eq!(store.append(ev(5)).expect("append").seq, 4, "no seq burnt");
+        assert_eq!(
+            store.len().await.expect("len"),
+            3,
+            "a failed batch wrote nothing"
+        );
+        assert_eq!(
+            store.append(ev(5)).await.expect("append").seq,
+            4,
+            "no seq burnt"
+        );
 
         // An empty batch is nothing to write, not an empty transaction.
-        assert!(store.append_many(Vec::new()).expect("empty").is_empty());
-        assert_eq!(store.len().expect("len"), 4);
+        assert!(store
+            .append_many(Vec::new())
+            .await
+            .expect("empty")
+            .is_empty());
+        assert_eq!(store.len().await.expect("len"), 4);
     }
 
     /// A kind-filtered read is answered off the index: only the kinds asked
     /// for come back, in `seq` order, still carrying the `seq` the stream gave
     /// them.  `None` is the whole stream, an empty selection is nothing.
-    #[test]
-    fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
-        let mut store = mem_store();
-        store.append(budget("budget_granted", 100)).expect("grant");
-        store.append(ev(1)).expect("noise");
-        store.append(budget("budget_spent", 10)).expect("spend");
-        store.append(ev(2)).expect("more noise");
+    #[tokio::test]
+    async fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
+        let (mut store, _drivers) = mem_store().await;
+        store
+            .append(budget("budget_granted", 100))
+            .await
+            .expect("grant");
+        store.append(ev(1)).await.expect("noise");
+        store
+            .append(budget("budget_spent", 10))
+            .await
+            .expect("spend");
+        store.append(ev(2)).await.expect("more noise");
 
         let ledger = store
             .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, usize::MAX)
+            .await
             .expect("read_kinds");
         let kinds: Vec<&str> = ledger.iter().map(kind_of).collect();
         assert_eq!(kinds, ["budget_granted", "budget_spent"]);
@@ -1382,6 +1551,7 @@ mod tests {
         assert_eq!(
             store
                 .read_kinds(Some(&["budget_granted"]), 2, usize::MAX)
+                .await
                 .expect("read_kinds")
                 .len(),
             0
@@ -1389,6 +1559,7 @@ mod tests {
         assert_eq!(
             store
                 .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, 1)
+                .await
                 .expect("read_kinds")
                 .len(),
             1
@@ -1396,11 +1567,13 @@ mod tests {
 
         assert!(store
             .read_kinds(Some(&[]), 0, usize::MAX)
+            .await
             .expect("read_kinds")
             .is_empty());
         assert_eq!(
             store
                 .read_kinds(None, 0, usize::MAX)
+                .await
                 .expect("read_kinds")
                 .len(),
             4
@@ -1410,103 +1583,120 @@ mod tests {
     /// A decision that names its kinds is shown those and nothing else, and
     /// its write is still numbered against the whole stream — the filter is
     /// what the decision *reads*, not where its answer goes.
-    #[test]
-    fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
-        let mut store = mem_store();
-        store.append(budget("budget_granted", 100)).expect("grant");
-        store.append(ev(1)).expect("noise");
-        store.append(ev(2)).expect("more noise");
+    #[tokio::test]
+    async fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
+        let (mut store, _drivers) = mem_store().await;
+        store
+            .append(budget("budget_granted", 100))
+            .await
+            .expect("grant");
+        store.append(ev(1)).await.expect("noise");
+        store.append(ev(2)).await.expect("more noise");
 
-        let mut seen: Vec<String> = Vec::new();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
         let committed = store
-            .append_if(Some(&["budget_granted"]), &mut |events| {
-                seen = events.iter().map(|e| kind_of(e).to_string()).collect();
-                Some(budget("budget_spent", 10))
-            })
+            .append_if(
+                Some(&["budget_granted"]),
+                decide(move |events| {
+                    *recorded.lock().expect("not poisoned") =
+                        events.iter().map(|e| kind_of(e).to_string()).collect();
+                    Some(budget("budget_spent", 10))
+                }),
+            )
+            .await
             .expect("append_if");
-        assert_eq!(seen, ["budget_granted"], "only the kinds asked for");
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            ["budget_granted"],
+            "only the kinds asked for"
+        );
         assert_eq!(
             committed.map(|c| c.seq),
             Some(4),
             "the write lands after everything, not after the filtered read"
         );
-        assert_eq!(store.len().expect("len"), 4);
+        assert_eq!(store.len().await.expect("len"), 4);
     }
 
     /// Two handles on one stream, one invariant: each decides inside its own
     /// transaction, so the second sees what the first wrote and exactly one
     /// of them may write.  This is the property a compare-and-swap against a
     /// cached head could only detect after the fact.
-    #[test]
-    fn append_if_across_two_handles_decides_on_the_other_handles_write() {
+    #[tokio::test]
+    async fn append_if_across_two_handles_decides_on_the_other_handles_write() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "s").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s").expect("open b");
+        let mut a = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open b");
 
         // "Write the marker, but only if nobody has written one yet."
-        let mut only_once_a = |events: &[Value]| {
-            (!events.iter().any(|e| kind_of(e) == "marker"))
-                .then(|| obj(json!({ "kind": "marker" })))
-        };
-        let mut only_once_b = |events: &[Value]| {
-            (!events.iter().any(|e| kind_of(e) == "marker"))
-                .then(|| obj(json!({ "kind": "marker" })))
+        let only_once = || {
+            decide(|events: Vec<Value>| {
+                (!events.iter().any(|e| kind_of(e) == "marker"))
+                    .then(|| obj(json!({ "kind": "marker" })))
+            })
         };
 
-        let first = a.append_if(None, &mut only_once_a).expect("a decides");
+        let first = a.append_if(None, only_once()).await.expect("a decides");
         assert_eq!(first.map(|c| c.seq), Some(1), "a wrote the marker");
 
-        let second = b.append_if(None, &mut only_once_b).expect("b decides");
+        let second = b.append_if(None, only_once()).await.expect("b decides");
         assert_eq!(second, None, "b saw a's marker and wrote nothing");
-        assert_eq!(b.len().expect("len"), 1, "exactly one marker");
+        assert_eq!(b.len().await.expect("len"), 1, "exactly one marker");
     }
 
-    #[test]
-    fn read_pages_by_from_seq_and_limit() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn read_pages_by_from_seq_and_limit() {
+        let (mut store, _drivers) = mem_store().await;
         for i in 1..=5 {
-            store.append(ev(i)).expect("append");
+            store.append(ev(i)).await.expect("append");
         }
 
-        assert_eq!(store.read(0, usize::MAX).expect("read").len(), 5);
-        assert_eq!(store.read(1, usize::MAX).expect("read").len(), 5);
-        assert_eq!(store.read(3, usize::MAX).expect("read").len(), 3);
-        assert_eq!(store.read(6, usize::MAX).expect("read").len(), 0);
+        assert_eq!(store.read(0, usize::MAX).await.expect("read").len(), 5);
+        assert_eq!(store.read(1, usize::MAX).await.expect("read").len(), 5);
+        assert_eq!(store.read(3, usize::MAX).await.expect("read").len(), 3);
+        assert_eq!(store.read(6, usize::MAX).await.expect("read").len(), 0);
 
-        let page = store.read(2, 2).expect("read");
+        let page = store.read(2, 2).await.expect("read");
         assert_eq!(page.len(), 2);
         assert_eq!(kind_of(&page[0]), "e2");
         assert_eq!(kind_of(&page[1]), "e3");
 
         // A zero limit returns nothing even when events match.
-        assert!(store.read(0, 0).expect("read").is_empty());
+        assert!(store.read(0, 0).await.expect("read").is_empty());
     }
 
-    #[test]
-    fn head_is_none_when_empty_then_tracks_the_max() {
-        let mut store = mem_store();
-        assert_eq!(store.head().expect("head"), None);
+    #[tokio::test]
+    async fn head_is_none_when_empty_then_tracks_the_max() {
+        let (mut store, _drivers) = mem_store().await;
+        assert_eq!(store.head().await.expect("head"), None);
 
-        store.append(ev(1)).expect("append");
-        assert_eq!(store.head().expect("head"), Some(1));
-        store.append(ev(2)).expect("append");
-        assert_eq!(store.head().expect("head"), Some(2));
+        store.append(ev(1)).await.expect("append");
+        assert_eq!(store.head().await.expect("head"), Some(1));
+        store.append(ev(2)).await.expect("append");
+        assert_eq!(store.head().await.expect("head"), Some(2));
 
         // A rejected append does not move the head.
         store
             .append(obj(json!({ "text": "no kind" })))
+            .await
             .expect_err("kind is required");
-        assert_eq!(store.head().expect("head"), Some(2));
+        assert_eq!(store.head().await.expect("head"), Some(2));
     }
 
     /// A read rebuilds the object that was written: the envelope out of its
     /// columns, `meta` and `data` out of theirs, and the beat back as an
     /// absent key when there was none.
-    #[test]
-    fn read_reconstructs_the_written_event_out_of_its_columns() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn read_reconstructs_the_written_event_out_of_its_columns() {
+        let (mut store, _drivers) = mem_store().await;
         store
             .append(obj(json!({
                 "kind": "note",
@@ -1514,12 +1704,14 @@ mod tests {
                 "meta": { "label": "a", "attempt": 2, "retried": true },
                 "data": { "text": "hi", "nested": { "deep": [1, 2] } }
             })))
+            .await
             .expect("append");
         store
             .append(obj(json!({ "kind": "note" })))
+            .await
             .expect("append a bare one");
 
-        let stored = store.read(0, usize::MAX).expect("read");
+        let stored = store.read(0, usize::MAX).await.expect("read");
         assert_eq!(kind_of(&stored[0]), "note");
         assert_eq!(stored[0]["beat"], json!("b1"));
         assert_eq!(
@@ -1547,18 +1739,20 @@ mod tests {
 
     /// The beat lands in its own column — a plain `SELECT beat` sees it —
     /// and the index that makes a by-beat read a range is on the table.
-    #[test]
-    fn the_beat_is_a_column_of_its_own_with_an_index() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn the_beat_is_a_column_of_its_own_with_an_index() {
+        let (mut store, _drivers) = mem_store().await;
         store
             .append(obj(json!({ "kind": "e1", "beat": "b1" })))
+            .await
             .expect("append");
-        store.append(ev(2)).expect("append with no beat");
+        store.append(ev(2)).await.expect("append with no beat");
 
         let rows = ask(
             &store,
             "SELECT seq, beat FROM events WHERE stream = $stream ORDER BY seq",
         )
+        .await
         .expect("query");
         assert_eq!(rows.rows[0]["beat"], Value::from("b1"));
         assert!(
@@ -1577,6 +1771,7 @@ mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>();
                 names
             })
+            .await
             .expect("index_list");
         assert!(
             indexes.iter().any(|name| name == "events_stream_beat_seq"),
@@ -1588,25 +1783,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn events_persist_across_a_reopen_of_the_same_path_and_stream() {
+    #[tokio::test]
+    async fn events_persist_across_a_reopen_of_the_same_path_and_stream() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
 
         {
-            let mut store = SqliteEventStore::open(&path, "s").expect("open");
+            // Its own collection, shut down at the end of the block, so the
+            // first connection is drained and joined before the reopen below
+            // — the same "the store is gone" the sync version got from Drop.
+            let drivers = IsleDrivers::new();
+            let mut store = SqliteEventStore::open(&path, "s", &drivers)
+                .await
+                .expect("open");
             store
                 .append(obj(
                     json!({ "kind": "note", "data": { "text": "durable" } }),
                 ))
+                .await
                 .expect("append note");
-            store.append(ev(2)).expect("append e2");
-        } // the store — and its connection — is dropped here.
+            store.append(ev(2)).await.expect("append e2");
+            drop(store);
+            assert!(drivers.shutdown().await.is_empty(), "the writer joined");
+        }
 
         // Reopening the same file and stream reads the same events back: the
         // durability payoff.
-        let store = SqliteEventStore::open(&path, "s").expect("reopen");
-        let events = store.read(0, usize::MAX).expect("read");
+        let drivers = IsleDrivers::new();
+        let store = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("reopen");
+        let events = store.read(0, usize::MAX).await.expect("read");
         assert_eq!(events.len(), 2);
         assert_eq!(kind_of(&events[0]), "note");
         assert_eq!(events[0]["data"], json!({ "text": "durable" }));
@@ -1616,32 +1823,43 @@ mod tests {
             Some(CURRENT_SCHEMA_VERSION),
             "the schema version survives the round-trip too"
         );
-        assert_eq!(store.head().expect("head"), Some(2));
+        assert_eq!(store.head().await.expect("head"), Some(2));
     }
 
-    #[test]
-    fn two_streams_in_one_db_file_do_not_see_each_others_events() {
+    #[tokio::test]
+    async fn two_streams_in_one_db_file_do_not_see_each_others_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
+        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
+            .await
+            .expect("open b");
 
         a.append(obj(json!({ "kind": "only_a" })))
+            .await
             .expect("append a");
         b.append(obj(json!({ "kind": "only_b1" })))
+            .await
             .expect("append b1");
         b.append(obj(json!({ "kind": "only_b2" })))
+            .await
             .expect("append b2");
 
-        assert_eq!(a.len().expect("len"), 1);
-        assert_eq!(b.len().expect("len"), 2);
+        assert_eq!(a.len().await.expect("len"), 1);
+        assert_eq!(b.len().await.expect("len"), 2);
         // Each stream numbers its own seq from 1, independent of the other.
-        assert_eq!(a.head().expect("head"), Some(1));
-        assert_eq!(b.head().expect("head"), Some(2));
+        assert_eq!(a.head().await.expect("head"), Some(1));
+        assert_eq!(b.head().await.expect("head"), Some(2));
 
-        assert_eq!(kind_of(&a.read(0, usize::MAX).expect("read")[0]), "only_a");
-        let b_events = b.read(0, usize::MAX).expect("read");
+        assert_eq!(
+            kind_of(&a.read(0, usize::MAX).await.expect("read")[0]),
+            "only_a"
+        );
+        let b_events = b.read(0, usize::MAX).await.expect("read");
         let b_kinds: Vec<&str> = b_events.iter().map(kind_of).collect();
         assert_eq!(b_kinds, ["only_b1", "only_b2"]);
     }
@@ -1651,15 +1869,15 @@ mod tests {
     /// (which would let a resume re-fold a truncated log into the wrong
     /// state).  Both JSON columns are checked, and a scalar where an object
     /// was written is the same fault as text that will not parse.
-    #[test]
-    fn read_errors_on_a_corrupt_row_instead_of_dropping_it() {
+    #[tokio::test]
+    async fn read_errors_on_a_corrupt_row_instead_of_dropping_it() {
         for (seq, meta, data, column) in [
             (2_i64, "{}", "{not valid json", "data"),
             (3_i64, "not valid json either", "{}", "meta"),
             (4_i64, "{}", "7", "data"),
         ] {
-            let mut store = mem_store();
-            store.append(ev(1)).expect("append");
+            let (mut store, _drivers) = mem_store().await;
+            store.append(ev(1)).await.expect("append");
 
             // Sneak in a row the store itself could not have written.
             let stream = store.stream.clone();
@@ -1683,10 +1901,12 @@ mod tests {
                         ],
                     )
                 })
+                .await
                 .expect("insert corrupt row");
 
             let err = store
                 .read(0, usize::MAX)
+                .await
                 .expect_err("a corrupt row must surface, not be dropped");
             assert!(
                 err.reason().contains(&format!("corrupt event {column}")),
@@ -1749,13 +1969,16 @@ mod tests {
     /// not only what the translation function returns in isolation: a second
     /// connection holds the write lock, so the retries are exhausted and the
     /// error the caller gets says "ask again".
-    #[test]
-    fn a_write_that_stays_contended_surfaces_as_busy() {
+    #[tokio::test]
+    async fn a_write_that_stays_contended_surfaces_as_busy() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut store = SqliteEventStore::open(&path, "s").expect("open");
-        store.append(ev(1)).expect("seed");
+        let mut store = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open");
+        store.append(ev(1)).await.expect("seed");
 
         // A blocker holding an EXCLUSIVE transaction: every attempt this
         // store makes finds the database locked, and the busy_timeout is cut
@@ -1767,10 +1990,12 @@ mod tests {
         store
             .writer
             .call(|conn| conn.busy_timeout(Duration::from_millis(0)))
+            .await
             .expect("no waiting");
 
         let err = store
             .append(ev(2))
+            .await
             .expect_err("a write against a held lock must not succeed");
         assert_eq!(err.kind(), KnlError::BUSY, "{err}");
         assert!(err.is_retryable(), "{err}");
@@ -1779,62 +2004,72 @@ mod tests {
     /// Two handles on one stream both write: an append records a fact, so it
     /// is serialized and assigned the next seq rather than refused for the
     /// head one of them last saw.
-    #[test]
-    fn two_handles_on_one_stream_both_append_in_arrival_order() {
+    #[tokio::test]
+    async fn two_handles_on_one_stream_both_append_in_arrival_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "s").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s").expect("open b");
+        let mut a = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open b");
 
-        a.append(ev(1)).expect("seed"); // both handles now see head 1
+        a.append(ev(1)).await.expect("seed"); // both handles now see head 1
 
         // A writes, then B writes — neither is refused, and the log holds
         // them in the order they arrived.
-        assert_eq!(a.append(ev(2)).expect("a appends").seq, 2);
-        assert_eq!(b.append(ev(3)).expect("b appends").seq, 3);
+        assert_eq!(a.append(ev(2)).await.expect("a appends").seq, 2);
+        assert_eq!(b.append(ev(3)).await.expect("b appends").seq, 3);
 
-        let events = b.read(0, usize::MAX).expect("read");
+        let events = b.read(0, usize::MAX).await.expect("read");
         let kinds: Vec<&str> = events.iter().map(kind_of).collect();
         assert_eq!(kinds, ["e1", "e2", "e3"]);
-        assert_eq!(b.head().expect("head"), Some(3));
+        assert_eq!(b.head().await.expect("head"), Some(3));
     }
 
     /// (Fix 3) Under the IMMEDIATE transaction + `busy_timeout`, interleaved
     /// single-threaded appends across two handles on one stream serialize and
     /// round-trip cleanly.
-    #[test]
-    fn immediate_tx_appends_round_trip_across_two_handles() {
+    #[tokio::test]
+    async fn immediate_tx_appends_round_trip_across_two_handles() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "s").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s").expect("open b");
+        let mut a = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "s", &drivers)
+            .await
+            .expect("open b");
 
-        assert_eq!(a.append(ev(1)).expect("a1").seq, 1);
-        assert_eq!(b.append(ev(2)).expect("b2").seq, 2);
-        assert_eq!(a.append(ev(3)).expect("a3").seq, 3);
+        assert_eq!(a.append(ev(1)).await.expect("a1").seq, 1);
+        assert_eq!(b.append(ev(2)).await.expect("b2").seq, 2);
+        assert_eq!(a.append(ev(3)).await.expect("a3").seq, 3);
 
-        assert_eq!(b.head().expect("head"), Some(3));
-        assert_eq!(b.read(0, usize::MAX).expect("read").len(), 3);
+        assert_eq!(b.head().await.expect("head"), Some(3));
+        assert_eq!(b.read(0, usize::MAX).await.expect("read").len(), 3);
     }
 
     // -- the read side -----------------------------------------------------
 
     /// Ask `store` for `sql` with everything default.
-    fn ask(store: &SqliteEventStore, sql: &str) -> KnlResult<QueryRows> {
-        ask_with(store, sql, QueryParams::None, &QueryOpts::default())
+    async fn ask(store: &SqliteEventStore, sql: &str) -> KnlResult<QueryRows> {
+        ask_with(store, sql, QueryParams::None, &QueryOpts::default()).await
     }
 
     /// Ask `store` for `sql`, saying how.
-    fn ask_with(
+    async fn ask_with(
         store: &SqliteEventStore,
         sql: &str,
         params: QueryParams,
         opts: &QueryOpts,
     ) -> KnlResult<QueryRows> {
         let plan = crate::knl::query::plan(sql, params, opts, &store.stream)?;
-        store.query(&plan)
+        store.query(&plan).await
     }
 
     /// The `kind` column of every row, in order.
@@ -1848,16 +2083,17 @@ mod tests {
     /// The reader sees what the writer wrote — on an in-memory database as
     /// much as on a file, which is the whole reason the memory one is opened
     /// under a shared-cache URI rather than as a private `:memory:`.
-    #[test]
-    fn the_reader_sees_the_writers_rows_in_memory() {
-        let mut store = mem_store();
-        store.append(ev(1)).expect("append e1");
-        store.append(ev(2)).expect("append e2");
+    #[tokio::test]
+    async fn the_reader_sees_the_writers_rows_in_memory() {
+        let (mut store, _drivers) = mem_store().await;
+        store.append(ev(1)).await.expect("append e1");
+        store.append(ev(2)).await.expect("append e2");
 
         let rows = ask(
             &store,
             "SELECT seq, kind FROM events WHERE stream = $stream ORDER BY seq",
         )
+        .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["e1", "e2"]);
         assert_eq!(rows.rows[0]["seq"], Value::from(1));
@@ -1865,43 +2101,61 @@ mod tests {
 
         // A write after the first query is visible to the next one: the
         // reader is a live connection, not a snapshot taken when it opened.
-        store.append(ev(3)).expect("append e3");
-        assert_eq!(
-            kinds_of(&ask(&store, "SELECT kind FROM events ORDER BY seq").expect("query")),
-            ["e1", "e2", "e3"]
-        );
+        store.append(ev(3)).await.expect("append e3");
+        let again = ask(&store, "SELECT kind FROM events ORDER BY seq")
+            .await
+            .expect("query");
+        assert_eq!(kinds_of(&again), ["e1", "e2", "e3"]);
     }
 
     /// `$stream` is this store's own stream and nothing else: a second stream
     /// in the same database is not selected by it.
-    #[test]
-    fn stream_binds_to_this_stores_own_stream() {
+    #[tokio::test]
+    async fn stream_binds_to_this_stores_own_stream() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
-        a.append(obj(json!({ "kind": "only_a" }))).expect("a");
-        b.append(obj(json!({ "kind": "only_b" }))).expect("b");
+        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
+            .await
+            .expect("open b");
+        a.append(obj(json!({ "kind": "only_a" }))).await.expect("a");
+        b.append(obj(json!({ "kind": "only_b" }))).await.expect("b");
 
-        let rows = ask(&a, "SELECT kind FROM events WHERE stream = $stream").expect("query");
+        let rows = ask(&a, "SELECT kind FROM events WHERE stream = $stream")
+            .await
+            .expect("query");
         assert_eq!(kinds_of(&rows), ["only_a"]);
-        let rows = ask(&b, "SELECT kind FROM events WHERE stream = $stream").expect("query");
+        let rows = ask(&b, "SELECT kind FROM events WHERE stream = $stream")
+            .await
+            .expect("query");
         assert_eq!(kinds_of(&rows), ["only_b"]);
     }
 
     /// `$sessions` reads across a set: two streams in one database, one
     /// statement, and the ids are bound rather than pasted in.
-    #[test]
-    fn sessions_reads_across_the_set_it_was_given() {
+    #[tokio::test]
+    async fn sessions_reads_across_the_set_it_was_given() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
 
-        let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
-        a.append(obj(json!({ "kind": "from_a" }))).expect("a");
-        b.append(obj(json!({ "kind": "from_b1" }))).expect("b1");
-        b.append(obj(json!({ "kind": "from_b2" }))).expect("b2");
+        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
+            .await
+            .expect("open a");
+        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
+            .await
+            .expect("open b");
+        a.append(obj(json!({ "kind": "from_a" }))).await.expect("a");
+        b.append(obj(json!({ "kind": "from_b1" })))
+            .await
+            .expect("b1");
+        b.append(obj(json!({ "kind": "from_b2" })))
+            .await
+            .expect("b2");
 
         let opts = QueryOpts {
             sessions: Some(vec!["stream-a".to_string(), "stream-b".to_string()]),
@@ -1913,23 +2167,27 @@ mod tests {
             QueryParams::None,
             &opts,
         )
+        .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["from_a", "from_b1", "from_b2"]);
 
         // Left out, the set is the asking store's own stream.
-        let rows = ask(&a, "SELECT kind FROM events WHERE stream IN $sessions").expect("query");
+        let rows = ask(&a, "SELECT kind FROM events WHERE stream IN $sessions")
+            .await
+            .expect("query");
         assert_eq!(kinds_of(&rows), ["from_a"]);
     }
 
     /// A value is bound, never pasted: a quote inside it is a character in a
     /// string, not the end of one.
-    #[test]
-    fn a_bound_value_with_a_quote_in_it_is_a_value() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn a_bound_value_with_a_quote_in_it_is_a_value() {
+        let (mut store, _drivers) = mem_store().await;
         store
             .append(obj(json!({ "kind": "it's a kind" })))
+            .await
             .expect("append");
-        store.append(ev(1)).expect("append e1");
+        store.append(ev(1)).await.expect("append e1");
 
         let rows = ask_with(
             &store,
@@ -1937,6 +2195,7 @@ mod tests {
             QueryParams::Positional(vec![json!("it's a kind")]),
             &QueryOpts::default(),
         )
+        .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["it's a kind"]);
 
@@ -1954,17 +2213,18 @@ mod tests {
             named,
             &QueryOpts::default(),
         )
+        .await
         .expect("query");
         assert!(rows.rows.is_empty(), "{:?}", rows.rows);
     }
 
     /// The cap is reported, not silently applied — and a result that happens
     /// to be exactly `limit` long is not called truncated.
-    #[test]
-    fn the_row_cap_is_reported_when_it_cuts() {
-        let mut store = mem_store();
+    #[tokio::test]
+    async fn the_row_cap_is_reported_when_it_cuts() {
+        let (mut store, _drivers) = mem_store().await;
         for i in 1..=5 {
-            store.append(ev(i)).expect("append");
+            store.append(ev(i)).await.expect("append");
         }
 
         let capped = QueryOpts {
@@ -1977,6 +2237,7 @@ mod tests {
             QueryParams::None,
             &capped,
         )
+        .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["e1", "e2"]);
         assert!(rows.truncated, "the cap cut three rows off");
@@ -1991,6 +2252,7 @@ mod tests {
             QueryParams::None,
             &exact,
         )
+        .await
         .expect("query");
         assert_eq!(rows.rows.len(), 5);
         assert!(!rows.truncated, "nothing was cut off");
@@ -1998,9 +2260,9 @@ mod tests {
 
     /// A query that will not finish is cut short, and says so in its own
     /// class: nothing was contended, so "ask again" would be the wrong advice.
-    #[test]
-    fn a_query_that_runs_too_long_is_a_timeout() {
-        let store = mem_store();
+    #[tokio::test]
+    async fn a_query_that_runs_too_long_is_a_timeout() {
+        let (store, _drivers) = mem_store().await;
         let hurried = QueryOpts {
             timeout_ms: 50,
             ..QueryOpts::default()
@@ -2013,23 +2275,24 @@ mod tests {
             QueryParams::None,
             &hurried,
         )
+        .await
         .expect_err("an endless query must be cut short");
         assert_eq!(err.kind(), KnlError::TIMEOUT, "{err}");
         assert!(!err.is_retryable(), "a slow query is not a retry: {err}");
 
         // The connection is usable afterwards: the interrupt ended a
         // statement, not the reader.
-        assert!(ask(&store, "SELECT 1 AS one").is_ok());
+        assert!(ask(&store, "SELECT 1 AS one").await.is_ok());
     }
 
     /// The reader cannot write.  The statement checks run on the text, but
     /// they are not the only thing standing between a caller and the log:
     /// the connection a query runs on has no write capability at all.
-    #[test]
-    fn the_reader_connection_refuses_a_write() {
-        let mut store = mem_store();
-        store.append(ev(1)).expect("append");
-        let reader = store.reader().expect("open the reader");
+    #[tokio::test]
+    async fn the_reader_connection_refuses_a_write() {
+        let (mut store, _drivers) = mem_store().await;
+        store.append(ev(1)).await.expect("append");
+        let reader = store.reader().await.expect("open the reader");
 
         let err = reader
             .call(|conn| {
@@ -2040,6 +2303,7 @@ mod tests {
                     [],
                 )
             })
+            .await
             .expect_err("the reader must not be able to write");
         assert!(
             matches!(KnlError::from(err), KnlError::Storage(_)),
@@ -2047,15 +2311,15 @@ mod tests {
         );
 
         // …and the log is as it was.
-        assert_eq!(store.len().expect("len"), 1);
+        assert_eq!(store.len().await.expect("len"), 1);
     }
 
     /// A statement that is not a read never reaches the connection, and a
     /// second statement is refused whole.  (The rules are
     /// [`super::super::query`]'s; this is the path through the store.)
-    #[test]
-    fn a_write_or_a_second_statement_is_refused_before_the_connection() {
-        let store = mem_store();
+    #[tokio::test]
+    async fn a_write_or_a_second_statement_is_refused_before_the_connection() {
+        let (store, _drivers) = mem_store().await;
         for sql in [
             "INSERT INTO events (stream) VALUES ('x')",
             "UPDATE events SET kind = 'x'",
@@ -2063,7 +2327,7 @@ mod tests {
             "ATTACH DATABASE '/tmp/other.db' AS other",
             "SELECT 1; DROP TABLE events",
         ] {
-            let err = ask(&store, sql).expect_err("must be refused");
+            let err = ask(&store, sql).await.expect_err("must be refused");
             assert_eq!(err.kind(), KnlError::VALIDATION, "{sql:?}: {err}");
         }
     }
@@ -2071,11 +2335,12 @@ mod tests {
     /// A parameter nobody answered, and a value nobody asked for, are both
     /// errors: a silent NULL is how a query quietly stops meaning what it
     /// says.
-    #[test]
-    fn every_parameter_is_answered_and_every_value_is_used() {
-        let store = mem_store();
+    #[tokio::test]
+    async fn every_parameter_is_answered_and_every_value_is_used() {
+        let (store, _drivers) = mem_store().await;
 
         let err = ask(&store, "SELECT * FROM events WHERE kind = :kind")
+            .await
             .expect_err("an unanswered parameter must be refused");
         assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
         assert!(err.reason().contains(":kind"), "{}", err.reason());
@@ -2086,21 +2351,23 @@ mod tests {
             QueryParams::Positional(vec![json!("a"), json!("b")]),
             &QueryOpts::default(),
         )
+        .await
         .expect_err("a value with no parameter must be refused");
         assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
     }
 
     /// Every SQLite type comes back as itself, and a NULL comes back as an
     /// absent column rather than a present nothing.
-    #[test]
-    fn the_sqlite_types_map_onto_values_and_null_is_absence() {
-        let store = mem_store();
+    #[tokio::test]
+    async fn the_sqlite_types_map_onto_values_and_null_is_absence() {
+        let (store, _drivers) = mem_store().await;
         let rows = ask(
             &store,
             // `absent`, not `nothing`: NOTHING is a SQLite keyword.
             "SELECT 1 AS whole, 1.5 AS fraction, 'text' AS words, NULL AS absent, \
              CAST('bytes' AS BLOB) AS raw",
         )
+        .await
         .expect("query");
         let row = &rows.rows[0];
         assert_eq!(row["whole"], Value::from(1));
@@ -2116,8 +2383,8 @@ mod tests {
     /// The published schema is the table: read back off SQLite rather than
     /// written out, with the two columns that make a stream a stream as its
     /// primary key.
-    #[test]
-    fn the_published_schema_is_the_events_table() {
+    #[tokio::test]
+    async fn the_published_schema_is_the_events_table() {
         let columns = events_schema().expect("schema");
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -2148,8 +2415,22 @@ mod tests {
         );
 
         // And a query may name every one of them.
-        let store = mem_store();
+        let (store, _drivers) = mem_store().await;
         let sql = format!("SELECT {} FROM {EVENTS_TABLE}", names.join(", "));
-        ask(&store, &sql).expect("the published columns are the real ones");
+        ask(&store, &sql)
+            .await
+            .expect("the published columns are the real ones");
+    }
+
+    /// The published schema is also the *live* one: a store's own reader
+    /// reports the same columns the schema-only path does, which is what
+    /// makes reading it off a throwaway connection sound.
+    #[tokio::test]
+    async fn a_live_store_reports_the_published_schema() {
+        let (store, _drivers) = mem_store().await;
+        assert_eq!(
+            store.schema().await.expect("schema"),
+            events_schema().expect("published schema")
+        );
     }
 }

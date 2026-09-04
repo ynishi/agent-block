@@ -247,18 +247,39 @@
 //! reads through the chain and hands back [`Current`]s, and every fold takes
 //! those — so a read that went round the chain does not compile.
 //!
-//! # Async: the device yields, the syscalls do not
+//! # Async: everything that waits, yields
 //!
-//! The asynchronous boundary is device I/O.  An HTTP request or an MCP call
-//! is an async function on the host, so the coroutine running a beat yields
-//! at the device call, and the beat itself needs no await of its own.
+//! **The VM thread never waits on the OS.**  That is the whole rule, and the
+//! syscalls follow it: `append`, `reserve`, `spend`, the reads and `close`
+//! are `async fn`, and so are `Session::new` / `open_on` / `resume` and the
+//! [`EventStore`] SPI underneath them.
 //!
-//! The kernel syscalls — `append`, `reserve`, `spend`, the reads, `close` —
-//! are local store operations and stay synchronous.  Making them async would
-//! colour the whole surface for the sake of a local SQLite write.  Should a
-//! blocking write ever be measured starving an async worker, the answer is
-//! to move that write off the worker in the bridge: an optimization, not a
-//! change to this interface.
+//! The thread this matters for is the Lua VM's.  It is the *only* worker of
+//! the runtime that also drives every other coroutine that VM owns, every
+//! timer they set and every cancellation watching them, so a syscall that
+//! parked it would stop all of them — for as long as a contended SQLite write
+//! takes, which is bounded by a busy timeout and a retry policy rather than by
+//! anything a caller chose.  These calls used to be synchronous, and the
+//! reasoning for that ("a local SQLite write is quick") mistook *where* the
+//! blocking landed: the connection lives on its own thread, but the caller
+//! was waiting on it from the one thread that must not wait.
+//!
+//! So waiting is yielding, everywhere.  [`SqliteEventStore`] sends each call
+//! to the thread that owns its connection ([`rusqlite_isle::AsyncIsle`]) and
+//! suspends on the answer; the bridge binds the session's methods with
+//! `add_async_method`, so `s:append(...)` is a coroutine yield on the Lua
+//! side and the beat's `pcall` / `<close>` / step structure is unchanged
+//! (Lua 5.4 yields across all three).  Device I/O — an HTTP request, an MCP
+//! call — was already async and is unaffected; what changed is that the
+//! syscalls now behave the same way it does.
+//!
+//! Two things stay synchronous, and both are deliberate: the identity reads
+//! (`id` / `scope_id` / `owner`), which answer out of the value and touch no
+//! store, and [`Session::close_detached`], the drop backstop — `Drop` cannot
+//! await and must not block, so it hands its `session_closed` to the store's
+//! writer and lets go ([`EventStore::detach_append`]).  That works because the
+//! connection threads outlive the sessions: their drivers belong to an
+//! [`IsleDrivers`] the host holds and drains once, at shutdown.
 
 pub mod budget;
 pub mod event;
@@ -287,7 +308,7 @@ pub use session::{
     Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
     DEFAULT_CLOSE_REASON, SYSTEM,
 };
-pub use sqlite_store::{events_schema, SchemaColumn, SqliteEventStore, EVENTS_TABLE};
+pub use sqlite_store::{events_schema, IsleDrivers, SchemaColumn, SqliteEventStore, EVENTS_TABLE};
 
 /// What went wrong in the kernel core, classified.
 ///

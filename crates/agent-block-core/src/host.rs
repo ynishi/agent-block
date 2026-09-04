@@ -804,6 +804,19 @@ pub struct HostContext {
     /// edit, which is what a build-and-fix loop needs when it decides an
     /// iteration made things worse.
     pub fs_snapshots: crate::bridge::fs::SnapshotStore,
+    /// The connection threads every `knl` session's event log lives on.
+    ///
+    /// A kernel session opens its own SQLite thread (and a second, read-only
+    /// one the first time it is queried), and hands the *driver* — the only
+    /// thing that can drain and join that thread — here rather than keeping
+    /// it. That is what lets the drop backstop work: a handle nobody closed
+    /// submits its `session_closed` from `Drop`, without waiting, and the
+    /// thread is still there to run it because its lifetime is the host's
+    /// rather than the session's.
+    ///
+    /// Cloneable and shared, like the isle handles beside it; the run loop
+    /// drains it once, in [`shutdown`], after the Lua VM is gone.
+    pub knl_drivers: crate::knl::IsleDrivers,
 }
 
 impl HostContext {
@@ -1557,13 +1570,20 @@ async fn drain_auto_serve(auto_serve_state: AutoServeState) {
 }
 
 /// Tear down host resources in order: disconnect MCP servers, shut down the
-/// main Isle driver (fatal on error), then the handler Isle driver and the
-/// SQLite connection threads (logged, non-fatal so a worker-thread panic does
-/// not poison the process exit).
+/// main Isle driver (fatal on error), then the handler Isle driver, the
+/// kernel's per-session connection threads and the sql / kv ones (logged,
+/// non-fatal so a worker-thread panic does not poison the process exit).
+///
+/// The kernel's threads go *after* the Isles on purpose. Dropping a VM runs
+/// its collector, which is where a session nobody closed submits its
+/// `session_closed` without waiting for it — so those threads have to be
+/// alive to take that write, and drained only once nothing can still be
+/// handed to them.
 async fn shutdown(
     mcp_manager: &Arc<RwLock<McpManager>>,
     driver: AsyncIsleDriver,
     handler_driver: AsyncIsleDriver,
+    knl_drivers: crate::knl::IsleDrivers,
     #[cfg(feature = "sqlite")] sqlite_drivers: SqliteDrivers,
 ) -> BlockResult<()> {
     let _shutdown_span = info_span!("shutdown");
@@ -1589,6 +1609,24 @@ async fn shutdown(
             thread_name = "agent-block-handler-isle",
             "handler Isle shutdown failed"
         ),
+    }
+
+    // The kernel's session threads. Both Isles are gone by now, so every Lua
+    // session userdata has been collected and every drop backstop has
+    // submitted its boundary; a graceful shutdown is what runs those queued
+    // writes before the threads exit.
+    {
+        let count = knl_drivers.len();
+        let failures = knl_drivers.shutdown().await;
+        if failures.is_empty() {
+            if count > 0 {
+                info!(count, "knl session connection threads shut down");
+            }
+        } else {
+            for e in &failures {
+                tracing::error!(error = %e, "knl session connection thread shutdown failed");
+            }
+        }
     }
 
     // The sql / kv connection threads: a graceful shutdown drains whatever
@@ -1801,7 +1839,11 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         bus_tx: bus_tx.clone(),
         event_bus: Arc::clone(&event_bus),
         fs_snapshots: Default::default(),
+        knl_drivers: crate::knl::IsleDrivers::new(),
     };
+    // Kept out of the context clone the bridges get: the run loop needs its
+    // own reference to drain the threads after the VM has gone.
+    let knl_drivers = ctx.knl_drivers.clone();
 
     register_bridges(&ctx, &isle, &handler_isle).await?;
 
@@ -1836,6 +1878,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         &mcp_manager,
         driver,
         handler_driver,
+        knl_drivers,
         #[cfg(feature = "sqlite")]
         sqlite_drivers,
     )
