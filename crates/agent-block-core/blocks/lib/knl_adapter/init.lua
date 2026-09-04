@@ -1,7 +1,7 @@
 --- knl_adapter — the Device IF backend for the Lua kernel, as a Port.
 ---
 --- The interface, not a shim of literals
----   `knl.turn` calls `conf.llm(request)` and reads a *status string* off the
+---   `knl.beat` calls `ctx.llm(request)` and reads a *status string* off the
 ---   answer: "ok" | "refused" | "error". Turning an llm_proto answer into that
 ---   contract needs three provider-specific steps — build the wire, parse the
 ---   raw response, and classify the result — and only the last one carries a
@@ -36,8 +36,8 @@
 --- Usage
 ---   local knl_adapter = require("knl_adapter")
 ---   local llm = knl_adapter.anthropic:open({ model = ..., max_tokens = ... })
----   local ctx = knl.open(...)
----   local outcome = knl.turn({ ctx = ctx, llm = llm })
+---   local ctx = knl.open({ owner = ..., llm = llm })
+---   local outcome = knl.beat(ctx)
 ---
 ---   `open`'s conf is forwarded to llm_proto verbatim: model / api_key /
 ---   max_tokens / thinking / tool_choice / ... are llm_proto's vocabulary and
@@ -139,7 +139,7 @@ function LLMPort.new(impl)
     return setmetatable(impl, LLMPort)
 end
 
---- Open the Port into a knl backend: the closure `knl.turn` binds as
+--- Open the Port into a knl backend: the closure a knl ctx binds as
 --- `conf.llm`. Shared by every Port instance — it knows no provider dialect,
 --- it only calls `self:build` / `self:parse` / `self:classify`. There is no
 --- `== "refusal"` here and no status of its own; the one judgement it makes is
@@ -413,5 +413,241 @@ M.openai = LLMPort.new({
     parse = openai_parse,
     classify = openai_classify,
 })
+
+-- ============================================================
+-- ToolPort — the tool-source Port (tool-port-design.md)
+-- ============================================================
+--
+-- The tool-side sibling of LLMPort: a source's private vocabulary (how it
+-- declares a tool, how its failures look) closes behind two methods, and
+-- the generic binding below turns any Port into a knl tools entry without
+-- a single source literal.
+--
+--   port:declare() -> { name, description?, input_schema? }  -- what may be called
+--   port:invoke(args) -> result                              -- how; failure = raise
+--
+-- Today every real tool in this codebase is a Lua closure in the flat spec
+-- shape ({name, description, input_schema, handler} — std.fs.tool_specs /
+-- tool_loop / knl all agree), so the initial concrete Port is `ToolPort.lua`
+-- alone: a validate-and-passthrough wrapper. There is no Rust-native
+-- handler to bind (bridge/tool.rs is a Lua registry helper; handlers are
+-- always LuaFunction), and MCP binding is the second real source, deferred
+-- to its own ST.
+
+--- The declare() contract — the same triple fold's wire_tools puts on the
+--- request. Asserted in dev mode; `name` is checked loudly always (a
+--- nameless tool is a construction error, not a policy).
+local TOOL_DECL = T.shape({
+    name = T.string,
+    description = T.string:is_optional(),
+    input_schema = T.any:is_optional(),
+})
+
+local ToolPort = {}
+ToolPort.__index = ToolPort
+M.ToolPort = ToolPort
+
+--- Construct a Port instance from a source impl.
+---
+--- @param impl table  { declare, invoke } — both required functions.
+---                     `declare() -> {name, description?, input_schema?}`,
+---                     `invoke(args) -> result` (failure = raise; the
+---                     source's failure vocabulary is normalized to a raise
+---                     inside invoke, never surfaced as a convention).
+--- @return table port  a Port instance (impl with the ToolPort metatable)
+function ToolPort.new(impl)
+    if type(impl) ~= "table" then
+        error("ToolPort.new: impl must be a table")
+    end
+    for _, method in ipairs({ "declare", "invoke" }) do
+        if type(impl[method]) ~= "function" then
+            error("ToolPort.new: missing method: " .. method)
+        end
+    end
+    return setmetatable(impl, ToolPort)
+end
+
+--- The lua Port: wrap one flat spec ({name, description?, input_schema?
+--- (`schema` accepted as the legacy alias), handler}) — the shape
+--- std.fs.tool_specs returns — into a Port. Pass-through: declare hands the
+--- triple back verbatim, invoke calls the closure.
+---
+--- @param spec table  a flat tool spec
+--- @return table port
+function ToolPort.lua(spec)
+    if type(spec) ~= "table" then
+        error("ToolPort.lua: spec must be a table")
+    end
+    if type(spec.name) ~= "string" or spec.name == "" then
+        error("ToolPort.lua: spec.name must be a non-empty string")
+    end
+    if type(spec.handler) ~= "function" then
+        error("ToolPort.lua: spec.handler must be a function (tool '" .. spec.name .. "')")
+    end
+    local decl = {
+        name = spec.name,
+        description = spec.description,
+        input_schema = spec.input_schema or spec.schema,
+    }
+    return ToolPort.new({
+        declare = function()
+            return decl
+        end,
+        invoke = function(_, args)
+            return spec.handler(args)
+        end,
+    })
+end
+
+--- The mcp Port: one MCP tool (a `tools/list` entry) behind the Port. MCP's
+--- private vocabulary closes inside: the camelCase `inputSchema`, the
+--- `<server>__<tool>` namespacing (the agent block's existing pattern), the
+--- content-block extraction, and both failure forms — transport (`ok=false`)
+--- and server-reported (`is_error=true`) — normalized to a raise, which the
+--- kernel closes as an ok=false tool_result.
+---
+--- The `mcp` global is resolved at invoke time (the bridge's surface), not
+--- captured at load: a VM without the bridge can still require this module.
+---
+--- @param server string  connected MCP server name
+--- @param entry table  one entry from `mcp.list_tools(server).tools`
+--- @return table port
+function ToolPort.mcp(server, entry)
+    if type(server) ~= "string" or server == "" then
+        error("ToolPort.mcp: server must be a non-empty string")
+    end
+    if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then
+        error("ToolPort.mcp: entry must be a tools/list item with a name")
+    end
+    local decl = {
+        name = server .. "__" .. entry.name,
+        description = entry.description or "",
+        input_schema = entry.inputSchema or entry.input_schema or { type = "object", properties = {} },
+    }
+    return ToolPort.new({
+        declare = function()
+            return decl
+        end,
+        invoke = function(_, args)
+            if mcp == nil then
+                error("ToolPort.mcp: the mcp bridge is not available in this VM")
+            end
+            local r = mcp.call(server, entry.name, args)
+            if type(r) ~= "table" or not r.ok then
+                error(
+                    "mcp call failed ('"
+                        .. decl.name
+                        .. "'): "
+                        .. tostring(type(r) == "table" and r.error or "unreadable result")
+                )
+            end
+            -- Content extraction, mirroring the agent block: one text block
+            -- verbatim, none the empty string, anything else JSON-encoded.
+            local blocks = r.content or {}
+            local text
+            if #blocks == 1 and blocks[1].type == "text" then
+                text = blocks[1].text
+            elseif #blocks == 0 then
+                text = ""
+            else
+                text = std.json.encode(blocks)
+            end
+            if r.is_error == true then
+                error("mcp tool '" .. decl.name .. "' reported error: " .. tostring(text))
+            end
+            return text
+        end,
+    })
+end
+
+--- Source-level mcp binding: every tool a connected server lists, as Ports
+--- (1 server = many tools). Feed the result to `knl_adapter.tools` —
+--- name collisions with other sources land on its loud error.
+---
+--- @param server string  connected MCP server name
+--- @param opts table|nil  { allow = { "<tool name>", ... } } — unlisted
+---                        tools are skipped; absent allow = every tool
+--- @return table ports  array of ToolPort
+function M.mcp_tools(server, opts)
+    if mcp == nil then
+        error("knl_adapter.mcp_tools: the mcp bridge is not available in this VM")
+    end
+    local list = mcp.list_tools(server)
+    if type(list) ~= "table" or not list.ok then
+        error(
+            "knl_adapter.mcp_tools: list_tools failed for '"
+                .. tostring(server)
+                .. "': "
+                .. tostring(type(list) == "table" and list.error or "unreadable result")
+        )
+    end
+    local allow = nil
+    if opts and opts.allow then
+        allow = {}
+        for _, n in ipairs(opts.allow) do
+            allow[n] = true
+        end
+    end
+    local ports = {}
+    for _, t in ipairs(list.tools or {}) do
+        if allow == nil or allow[t.name] then
+            ports[#ports + 1] = ToolPort.mcp(server, t)
+        end
+    end
+    return ports
+end
+
+--- Bind one Port into a knl tools entry. Returns (name, entry) so `tools`
+--- below can key the map. The handler closes over the Port — knl's
+--- execute_tools sees a plain `fn(args)` and a raise from invoke closes the
+--- pair as ok=false, exactly the kernel contract.
+---
+--- @param port table  a ToolPort
+--- @return string name
+--- @return table entry  { description?, input_schema?, handler }
+function M.tool(port)
+    if getmetatable(port) ~= ToolPort then
+        error("knl_adapter.tool: not a ToolPort (build one with ToolPort.new / ToolPort.lua)")
+    end
+    local decl = port:declare()
+    if type(decl) ~= "table" or type(decl.name) ~= "string" or decl.name == "" then
+        error("knl_adapter.tool: declare() must return { name = <non-empty string>, ... }")
+    end
+    shape.assert_dev(decl, TOOL_DECL, "tool_decl")
+    return decl.name,
+        {
+            description = decl.description,
+            input_schema = decl.input_schema,
+            handler = function(args)
+                return port:invoke(args)
+            end,
+        }
+end
+
+--- Bind a list into the knl tools map (`name -> entry`). Items are
+--- ToolPorts or flat specs (auto-wrapped through ToolPort.lua, so
+--- `std.fs.tool_specs()` output drops in as-is). A duplicate name is a
+--- loud error — two sources claiming one name is a wiring bug, not a
+--- merge policy.
+---
+--- @param list table  array of ToolPort | flat spec
+--- @return table tools  knl's `config.tools` map
+function M.tools(list)
+    if type(list) ~= "table" then
+        error("knl_adapter.tools: list must be an array")
+    end
+    local out = {}
+    for _, item in ipairs(list) do
+        local port = getmetatable(item) == ToolPort and item or ToolPort.lua(item)
+        local name, entry = M.tool(port)
+        if out[name] ~= nil then
+            error("knl_adapter.tools: duplicate tool name '" .. name .. "'")
+        end
+        out[name] = entry
+    end
+    return out
+end
+
+M.shapes.tool_decl = TOOL_DECL
 
 return M

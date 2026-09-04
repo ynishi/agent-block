@@ -103,8 +103,9 @@ impl Session {
 
     /// Open a run for `owner` with an optional token budget, on the
     /// in-memory store.
-    fn new(owner: String, budget_tokens: Option<i64>) -> Self {
-        Self::from_state(knl::Session::new(owner, budget_tokens))
+    fn new(owner: String, budget_tokens: Option<i64>) -> LuaResult<Self> {
+        let state = knl::Session::new(owner, budget_tokens).map_err(|e| err("open", e))?;
+        Ok(Self::from_state(state))
     }
 }
 
@@ -217,7 +218,10 @@ impl LuaUserData for Session {
         });
 
         // s:len() -> number of recorded events
-        methods.add_method("len", |_, this, ()| Ok(this.state.borrow().len() as u64));
+        methods.add_method("len", |_, this, ()| {
+            let n = this.state.borrow().len().map_err(|e| err("len", e))?;
+            Ok(n as u64)
+        });
 
         // s:view(name, opts?) -> projection (fresh table each call)
         //
@@ -299,7 +303,14 @@ impl LuaUserData for Session {
                     ));
                 }
             };
-            this.state.borrow_mut().close(reason.as_deref());
+            // A close whose `run_finished` append fails (CAS conflict on a
+            // shared durable stream, busy database) surfaces here: the
+            // session stays open and the caller knows the boundary was not
+            // recorded, instead of a silent closed=true with no record.
+            this.state
+                .borrow_mut()
+                .close(reason.as_deref())
+                .map_err(|e| err("close", e))?;
             Ok(())
         });
     }
@@ -431,7 +442,8 @@ fn open_sqlite(owner: String, budget_tokens: Option<i64>, path: &str) -> LuaResu
     let stream = uuid::Uuid::new_v4().to_string();
     let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone())
         .map_err(|e| err("open", e))?;
-    let mut state = knl::Session::open_on(owner, budget_tokens, Box::new(store));
+    let mut state =
+        knl::Session::open_on(owner, budget_tokens, Box::new(store)).map_err(|e| err("open", e))?;
     state.adopt_id(stream);
     Ok(Session::from_state(state))
 }
@@ -455,6 +467,17 @@ fn resume_sqlite(budget_tokens: Option<i64>, path: &str, session_id: String) -> 
     let store = knl::SqliteEventStore::open(std::path::Path::new(path), session_id.clone())
         .map_err(|e| err("resume", e))?;
     let mut state = knl::Session::resume(budget_tokens, Box::new(store)).map_err(|e| err("resume", e))?;
+    // The open path refuses an untrusted caller claiming a reserved
+    // principal (parse_owner); resume must hold the same line, or Lua could
+    // reopen a SYSTEM-owned stream and write into the reserved namespace.
+    // ANON streams stay resumable — they are what unspecified-owner Lua
+    // sessions (and pre-owner logs) record as.
+    if state.owner() == knl::SYSTEM {
+        return Err(err(
+            "resume",
+            format!("stream owner {:?} is reserved", knl::SYSTEM),
+        ));
+    }
     state.adopt_id(session_id);
     Ok(Session::from_state(state))
 }
@@ -487,7 +510,7 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     let owner = parse_owner(opts.as_ref())?;
     let budget_tokens = parse_budget(opts.as_ref())?;
     let session = match parse_store("open", opts.as_ref())? {
-        StoreSpec::Mem => Session::new(owner, budget_tokens),
+        StoreSpec::Mem => Session::new(owner, budget_tokens)?,
         StoreSpec::Sqlite(path) => open_sqlite(owner, budget_tokens, &path)?,
     };
     lua.create_userdata(session)
@@ -1262,6 +1285,33 @@ mod tests {
         ))
         .exec()
         .expect("durable open/resume chunk");
+    }
+
+    /// (owner namespace) resume holds the same reserved-principal line as
+    /// open: a stream the host opened as SYSTEM cannot be reopened from
+    /// Lua, or an untrusted caller could write into the reserved namespace
+    /// through the resume side door.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_rejects_a_reserved_system_owned_stream() {
+        let lua = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        // The host side (Rust) legitimately opens a SYSTEM-owned stream.
+        let stream = "system-stream".to_string();
+        let store = crate::knl::SqliteEventStore::open(&path, stream.clone()).expect("open store");
+        let state = crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
+            .expect("open system session");
+        drop(state);
+
+        // Lua resuming it is refused, exactly as claiming SYSTEM at open is.
+        let msg = expect_err(
+            &lua,
+            &format!(r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}" }})"#),
+        );
+        assert!(msg.contains("reserved"), "must name the reserved owner: {msg}");
     }
 
     /// (attribution) resume needs a sqlite store and a session id; each

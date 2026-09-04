@@ -236,20 +236,21 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 describe("knl turn (session-scope model)", function()
-    it("counts a turn's model_response in usage and gives it a kernel turn", function()
-        local h = kernel.open({ owner = "test", budget = { tokens = 100 } })
-        expect(h:owner()).to.equal("test")
-        h:append({ kind = "msg_user", content = "hi" })
-
-        local o = kernel.turn({
-            ctx = h,
+    it("counts a beat's model_response in usage and gives it a kernel number", function()
+        local h = kernel.open({
+            owner = "test",
+            budget = { tokens = 100 },
             llm = stub(response("ok", { { type = "text", text = "hello" } }, {
                 input_tokens = 10,
                 output_tokens = 3,
             })),
         })
+        expect(h:owner()).to.equal("test")
+        h:append({ kind = "msg_user", content = "hi" })
+
+        local o = kernel.beat(h)
         expect(Outcome.is_ok(o)).to.equal(true)
-        expect(o.out.turn).to.equal(1)
+        expect(o.out.beat).to.equal(1)
 
         local u = h:view("usage")
         expect(u.model_calls).to.equal(1)
@@ -261,11 +262,14 @@ describe("knl turn (session-scope model)", function()
         expect(h:turns()).to.equal(1)
     end)
 
-    it("numbers successive turns 1 then 2 (kernel-owned)", function()
-        local h = kernel.open({ budget = { tokens = 1000 } })
+    it("numbers successive beats 1 then 2 (kernel-owned)", function()
+        local h = kernel.open({
+            budget = { tokens = 1000 },
+            llm = stub(response("ok"), response("ok")),
+        })
 
-        kernel.turn({ ctx = h, llm = stub(response("ok")) })
-        kernel.turn({ ctx = h, llm = stub(response("ok")) })
+        kernel.beat(h)
+        kernel.beat(h)
 
         local turns = response_turns(h)
         expect(#turns).to.equal(2)
@@ -273,11 +277,9 @@ describe("knl turn (session-scope model)", function()
         expect(turns[2]).to.equal(2)
     end)
 
-    it("shares one turn number across a response's tool_call/tool_result pairs", function()
-        local h = kernel.open({ budget = { tokens = 100 } })
-
-        kernel.turn({
-            ctx = h,
+    it("shares one beat number across a response's tool_call/tool_result pairs", function()
+        local h = kernel.open({
+            budget = { tokens = 100 },
             llm = stub(response("ok", {
                 tool_use("a", "noop", {}),
                 tool_use("b", "noop", {}),
@@ -290,6 +292,8 @@ describe("knl turn (session-scope model)", function()
                 },
             },
         })
+
+        kernel.beat(h)
 
         local model_turn
         local call_turns, result_turns = {}, {}

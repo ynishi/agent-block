@@ -173,11 +173,14 @@ impl EventStore for SqliteEventStore {
         Ok(events)
     }
 
-    fn head(&self) -> Option<u64> {
-        head_in(&self.conn, &self.stream).unwrap_or(None)
+    fn head(&self) -> KnlResult<Option<u64>> {
+        // A transient busy read must surface, not read as "empty": a caller
+        // deciding open-vs-resume (or a CAS) on a swallowed error would
+        // treat a populated stream as fresh.  Same discipline as read().
+        head_in(&self.conn, &self.stream).map_err(sqlite_err)
     }
 
-    fn len(&self) -> usize {
+    fn len(&self) -> KnlResult<usize> {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM events WHERE stream = ?1",
@@ -185,7 +188,7 @@ impl EventStore for SqliteEventStore {
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n as usize)
-            .unwrap_or(0)
+            .map_err(sqlite_err)
     }
 }
 
@@ -359,16 +362,16 @@ mod tests {
     #[test]
     fn append_assigns_gap_free_monotonic_seq_from_one() {
         let mut store = SqliteEventStore::open_in_memory("s").expect("open");
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
+        assert!(store.is_empty().expect("is_empty"));
+        assert_eq!(store.len().expect("len"), 0);
 
         let a = store.append(ev(1)).expect("append e1");
         let b = store.append(ev(2)).expect("append e2");
         let c = store.append(ev(3)).expect("append e3");
 
         assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
-        assert_eq!(store.len(), 3);
-        assert!(!store.is_empty());
+        assert_eq!(store.len().expect("len"), 3);
+        assert!(!store.is_empty().expect("is_empty"));
 
         // The stamped epoch is what is stored.
         let stored = store.read(0, usize::MAX).expect("read");
@@ -385,7 +388,7 @@ mod tests {
         store
             .append(obj(json!({ "text": "no kind" })))
             .expect_err("kind is required");
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.len().expect("len"), 0);
         assert_eq!(store.append(ev(1)).expect("append").seq, 1);
     }
 
@@ -405,7 +408,7 @@ mod tests {
         assert!(err.reason().contains("head conflict"), "{err}");
         assert!(err.reason().contains("expected 0"), "{err}");
         assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(store.len(), 1, "the conflicting append did not happen");
+        assert_eq!(store.len().expect("len"), 1, "the conflicting append did not happen");
 
         // Matching the real head succeeds and advances it.
         let second = store.append_if_head(ev(2), 1).expect("head matches");
@@ -415,7 +418,7 @@ mod tests {
         let err = store.append_if_head(ev(3), 5).expect_err("stale head");
         assert!(err.reason().contains("expected 5"), "{err}");
         assert!(err.reason().contains("actual Some(2)"), "{err}");
-        assert_eq!(store.len(), 2, "no append on conflict");
+        assert_eq!(store.len().expect("len"), 2, "no append on conflict");
     }
 
     #[test]
@@ -442,18 +445,18 @@ mod tests {
     #[test]
     fn head_is_none_when_empty_then_tracks_the_max() {
         let mut store = SqliteEventStore::open_in_memory("s").expect("open");
-        assert_eq!(store.head(), None);
+        assert_eq!(store.head().expect("head"), None);
 
         store.append(ev(1)).expect("append");
-        assert_eq!(store.head(), Some(1));
+        assert_eq!(store.head().expect("head"), Some(1));
         store.append(ev(2)).expect("append");
-        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.head().expect("head"), Some(2));
 
         // A rejected append does not move the head.
         store
             .append(obj(json!({ "text": "no kind" })))
             .expect_err("kind is required");
-        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.head().expect("head"), Some(2));
     }
 
     #[test]
@@ -498,7 +501,7 @@ mod tests {
             Some(CURRENT_SCHEMA_VERSION),
             "the schema version survives the round-trip too"
         );
-        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.head().expect("head"), Some(2));
     }
 
     #[test]
@@ -515,11 +518,11 @@ mod tests {
         b.append(obj(json!({ "kind": "only_b2" })))
             .expect("append b2");
 
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.len(), 2);
+        assert_eq!(a.len().expect("len"), 1);
+        assert_eq!(b.len().expect("len"), 2);
         // Each stream numbers its own seq from 1, independent of the other.
-        assert_eq!(a.head(), Some(1));
-        assert_eq!(b.head(), Some(2));
+        assert_eq!(a.head().expect("head"), Some(1));
+        assert_eq!(b.head().expect("head"), Some(2));
 
         assert_eq!(kind_of(&a.read(0, usize::MAX).expect("read")[0]), "only_a");
         let b_events = b.read(0, usize::MAX).expect("read");
@@ -577,7 +580,7 @@ mod tests {
             .append_if_head(ev(3), observed)
             .expect_err("b's CAS is stale");
         assert!(err.reason().contains("head conflict"), "{}", err.reason());
-        assert_eq!(b.head(), Some(2), "the stale CAS wrote nothing");
+        assert_eq!(b.head().expect("head"), Some(2), "the stale CAS wrote nothing");
         assert_eq!(b.read(0, usize::MAX).expect("read").len(), 2);
     }
 
@@ -596,7 +599,7 @@ mod tests {
         assert_eq!(b.append(ev(2)).expect("b2").seq, 2);
         assert_eq!(a.append(ev(3)).expect("a3").seq, 3);
 
-        assert_eq!(b.head(), Some(3));
+        assert_eq!(b.head().expect("head"), Some(3));
         assert_eq!(b.read(0, usize::MAX).expect("read").len(), 3);
     }
 }

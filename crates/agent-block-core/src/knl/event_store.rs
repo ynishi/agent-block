@@ -120,14 +120,19 @@ pub trait EventStore {
     fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>>;
 
     /// The current head: the highest `seq`, or `None` for an empty stream.
-    fn head(&self) -> Option<u64>;
+    ///
+    /// Fallible for the same reason as [`EventStore::read`]: a durable
+    /// backend can hit a transient busy read, and swallowing it would make
+    /// a populated stream look empty — the caller deciding open-vs-resume
+    /// (or a CAS comparing heads) must see the fault, not a wrong answer.
+    fn head(&self) -> KnlResult<Option<u64>>;
 
-    /// Number of recorded events.
-    fn len(&self) -> usize;
+    /// Number of recorded events.  Fallible like [`EventStore::head`].
+    fn len(&self) -> KnlResult<usize>;
 
     /// Whether nothing has been recorded yet.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn is_empty(&self) -> KnlResult<bool> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -191,7 +196,7 @@ impl EventStore for MemEventStore {
         event: Map<String, Value>,
         expected_head: u64,
     ) -> KnlResult<Committed> {
-        let actual = self.head();
+        let actual = self.head()?;
         let matches = match expected_head {
             0 => actual.is_none(),
             expected => actual == Some(expected),
@@ -212,14 +217,14 @@ impl EventStore for MemEventStore {
         Ok(events)
     }
 
-    fn head(&self) -> Option<u64> {
+    fn head(&self) -> KnlResult<Option<u64>> {
         // `seq` is monotonic and gap-free, so the last event carries the
-        // highest one.
-        self.history.events().last().map(seq_of)
+        // highest one.  Infallible in memory; the `Ok` is the SPI's shape.
+        Ok(self.history.events().last().map(seq_of))
     }
 
-    fn len(&self) -> usize {
-        self.history.len()
+    fn len(&self) -> KnlResult<usize> {
+        Ok(self.history.len())
     }
 }
 
@@ -271,11 +276,11 @@ impl EventStore for UpcastingEventStore {
         Ok(apply_upcasters(&self.chain, events))
     }
 
-    fn head(&self) -> Option<u64> {
+    fn head(&self) -> KnlResult<Option<u64>> {
         self.inner.head()
     }
 
-    fn len(&self) -> usize {
+    fn len(&self) -> KnlResult<usize> {
         self.inner.len()
     }
 }
@@ -302,8 +307,8 @@ mod tests {
     #[test]
     fn append_assigns_gap_free_monotonic_seq_from_one() {
         let mut store = MemEventStore::new();
-        assert!(store.is_empty());
-        assert_eq!(store.len(), 0);
+        assert!(store.is_empty().expect("is_empty"));
+        assert_eq!(store.len().expect("len"), 0);
 
         let a = store.append(ev(1)).expect("append e1");
         let b = store.append(ev(2)).expect("append e2");
@@ -311,8 +316,8 @@ mod tests {
 
         assert_eq!((a.seq, b.seq, c.seq), (1, 2, 3));
         assert!(a.epoch_ms >= 1 || a.epoch_ms == 0, "epoch is stamped");
-        assert_eq!(store.len(), 3);
-        assert!(!store.is_empty());
+        assert_eq!(store.len().expect("len"), 3);
+        assert!(!store.is_empty().expect("is_empty"));
 
         // The stamped epoch is what is stored.
         let stored = store.read(0, usize::MAX).expect("read");
@@ -329,7 +334,7 @@ mod tests {
         store
             .append(obj(json!({ "text": "no kind" })))
             .expect_err("kind is required");
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.len().expect("len"), 0);
         assert_eq!(store.append(ev(1)).expect("append").seq, 1);
     }
 
@@ -349,7 +354,7 @@ mod tests {
         assert!(err.reason().contains("head conflict"), "{err}");
         assert!(err.reason().contains("expected 0"), "{err}");
         assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(store.len(), 1, "the conflicting append did not happen");
+        assert_eq!(store.len().expect("len"), 1, "the conflicting append did not happen");
 
         // Matching the real head succeeds and advances it.
         let second = store.append_if_head(ev(2), 1).expect("head matches");
@@ -361,7 +366,7 @@ mod tests {
             .expect_err("stale head");
         assert!(err.reason().contains("expected 5"), "{err}");
         assert!(err.reason().contains("actual Some(2)"), "{err}");
-        assert_eq!(store.len(), 2, "no append on conflict");
+        assert_eq!(store.len().expect("len"), 2, "no append on conflict");
     }
 
     #[test]
@@ -389,24 +394,24 @@ mod tests {
     #[test]
     fn head_is_none_when_empty_then_tracks_the_max() {
         let mut store = MemEventStore::new();
-        assert_eq!(store.head(), None);
+        assert_eq!(store.head().expect("head"), None);
 
         store.append(ev(1)).expect("append");
-        assert_eq!(store.head(), Some(1));
+        assert_eq!(store.head().expect("head"), Some(1));
         store.append(ev(2)).expect("append");
-        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.head().expect("head"), Some(2));
 
         // A rejected append does not move the head.
         store
             .append(obj(json!({ "text": "no kind" })))
             .expect_err("kind is required");
-        assert_eq!(store.head(), Some(2));
+        assert_eq!(store.head().expect("head"), Some(2));
     }
 
     #[test]
     fn default_matches_new_and_starts_seq_at_one() {
         let mut store = MemEventStore::default();
-        assert!(store.is_empty());
+        assert!(store.is_empty().expect("is_empty"));
         // Guards against `History::default()` (next_seq == 0) leaking in.
         assert_eq!(store.append(ev(1)).expect("append").seq, 1);
     }
@@ -502,9 +507,9 @@ mod tests {
         // Write path passes through: coordinates and counters are the backend's.
         let a = store.append(ev(1)).expect("append e1");
         assert_eq!(a.seq, 1);
-        assert_eq!(store.head(), Some(1));
-        assert_eq!(store.len(), 1);
-        assert!(!store.is_empty());
+        assert_eq!(store.head().expect("head"), Some(1));
+        assert_eq!(store.len().expect("len"), 1);
+        assert!(!store.is_empty().expect("is_empty"));
 
         // read projects the marker on.
         let first = store.read(0, usize::MAX).expect("read");
@@ -523,8 +528,8 @@ mod tests {
         // and head / len stay in step with the backend.
         let b = store.append(ev(2)).expect("append e2");
         assert_eq!(b.seq, 2);
-        assert_eq!(store.head(), Some(2));
-        assert_eq!(store.len(), 2);
+        assert_eq!(store.head().expect("head"), Some(2));
+        assert_eq!(store.len().expect("len"), 2);
         let both = store.read(0, usize::MAX).expect("read both");
         assert_eq!(both.len(), 2);
         assert_eq!(kind_of(&both[1]), "e2");
@@ -537,7 +542,7 @@ mod tests {
     #[test]
     fn upcasting_store_with_an_empty_chain_returns_events_unchanged() {
         let mut store = UpcastingEventStore::new(Box::new(MemEventStore::new()), Vec::new());
-        assert!(store.is_empty());
+        assert!(store.is_empty().expect("is_empty"));
 
         store.append(ev(1)).expect("append");
         let read = store.read(0, usize::MAX).expect("read");
@@ -548,7 +553,7 @@ mod tests {
             "an empty chain adds nothing: {}",
             read[0]
         );
-        assert_eq!(store.head(), Some(1));
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.head().expect("head"), Some(1));
+        assert_eq!(store.len().expect("len"), 1);
     }
 }

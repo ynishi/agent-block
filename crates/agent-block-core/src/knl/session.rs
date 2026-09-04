@@ -118,7 +118,7 @@ impl Session {
     /// `owner` is total: pass a real principal id, or [`ANON`] / [`SYSTEM`]
     /// for the reserved ones.  The `run_started` event is appended here, so
     /// a fresh session already has one event.
-    pub fn new(owner: String, budget_tokens: Option<i64>) -> Self {
+    pub fn new(owner: String, budget_tokens: Option<i64>) -> KnlResult<Self> {
         Self::open_on(owner, budget_tokens, Box::new(MemEventStore::new()))
     }
 
@@ -131,7 +131,11 @@ impl Session {
     /// later [`Session::resume`] can recover the principal from the log
     /// alone.  `run_started` is an open-shape reserved kind, so the extra
     /// `owner` field is accepted without any change to the validator.
-    pub fn open_on(owner: String, budget_tokens: Option<i64>, store: Box<dyn EventStore>) -> Self {
+    pub fn open_on(
+        owner: String,
+        budget_tokens: Option<i64>,
+        store: Box<dyn EventStore>,
+    ) -> KnlResult<Self> {
         // Wrap the chosen backend in the read-time upcasting seam, so every one
         // of this session's reads (view folds, `events`) passes through it by
         // construction.  The chain is empty today (v1), making the decorator a
@@ -150,15 +154,17 @@ impl Session {
             head: 0,
             closed: false,
         };
-        // `run_started` is well-formed and the session is open, so this
-        // append cannot fail; the same one path records it as records
-        // everything else.  The owner rides along so resume can recover it.
+        // The same one path records `run_started` as records everything
+        // else, and it CAN fail on a durable backend (a non-empty stream
+        // fails the CAS; a busy database exhausts its retries) — a session
+        // that could not record its own opening must not exist, so the
+        // error surfaces instead of leaving a run with no `run_started`.
         // The append advances `self.head` to the run_started's seq, so a
         // freshly opened session observes the head right after open.
         let mut started = kernel_event(KIND_RUN_STARTED);
         started.insert(FIELD_OWNER.to_string(), Value::from(session.owner.clone()));
-        let _ = session.append(started);
-        session
+        session.append(started)?;
+        Ok(session)
     }
 
     /// Continue an existing run by re-folding its persisted log.
@@ -346,14 +352,14 @@ impl Session {
         self.store.read(from, usize::MAX)
     }
 
-    /// Number of recorded events.
-    pub fn len(&self) -> usize {
+    /// Number of recorded events.  Fallible like [`Session::events`].
+    pub fn len(&self) -> KnlResult<usize> {
         self.store.len()
     }
 
     /// Whether the history is empty (only before `run_started`, i.e.
     /// never for a session built by [`Session::new`]).
-    pub fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> KnlResult<bool> {
         self.store.is_empty()
     }
 
@@ -403,19 +409,25 @@ impl Session {
     /// (defaulting to [`DEFAULT_CLOSE_REASON`]).
     ///
     /// Idempotent: closing an already closed session records nothing.
-    pub fn close(&mut self, reason: Option<&str>) {
+    ///
+    /// Fallible on a durable backend: the `run_finished` append CASes
+    /// against the observed head, and a concurrent writer can make that
+    /// fail.  On failure the session stays open (closed is not set), so
+    /// the caller knows the boundary was NOT recorded and can retry —
+    /// a close that reports success with no `run_finished` in the log
+    /// would silently break resume/audit reads.
+    pub fn close(&mut self, reason: Option<&str>) -> KnlResult<()> {
         if self.closed {
-            return;
+            return Ok(());
         }
         let mut event = kernel_event(KIND_RUN_FINISHED);
         event.insert(
             FIELD_REASON.to_string(),
             Value::from(reason.unwrap_or(DEFAULT_CLOSE_REASON)),
         );
-        // The same append records the boundary; it is well-formed and the
-        // session is still open, so it cannot fail.
-        let _ = self.append(event);
+        self.append(event)?;
         self.closed = true;
+        Ok(())
     }
 
     /// A named projection over the history.
@@ -464,7 +476,7 @@ mod tests {
 
     /// A session owned by the reserved anonymous principal.
     fn new_session(budget: Option<i64>) -> Session {
-        Session::new(ANON.to_string(), budget)
+        Session::new(ANON.to_string(), budget).expect("open")
     }
 
     /// A `model_response` event charging `tokens`, as the kernel accepts it.
@@ -480,7 +492,7 @@ mod tests {
     #[test]
     fn a_new_session_already_carries_run_started() {
         let s = new_session(None);
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.len().expect("len"), 1);
         let events = s.events(0).expect("events");
         assert_eq!(kind_of(&events[0]), KIND_RUN_STARTED);
         assert_eq!(seq_of(&events[0]), 1);
@@ -491,9 +503,12 @@ mod tests {
     #[test]
     fn the_owner_is_total_and_read_back_verbatim() {
         assert_eq!(new_session(None).owner(), ANON);
-        assert_eq!(Session::new(SYSTEM.to_string(), None).owner(), SYSTEM);
         assert_eq!(
-            Session::new("user-42".to_string(), None).owner(),
+            Session::new(SYSTEM.to_string(), None).expect("open").owner(),
+            SYSTEM
+        );
+        assert_eq!(
+            Session::new("user-42".to_string(), None).expect("open").owner(),
             "user-42"
         );
     }
@@ -501,9 +516,9 @@ mod tests {
     #[test]
     fn close_records_run_finished_once_with_the_given_reason() {
         let mut s = new_session(None);
-        s.close(Some("budget_exhausted"));
-        s.close(Some("ignored"));
-        assert_eq!(s.len(), 2, "close must be idempotent");
+        s.close(Some("budget_exhausted")).expect("close");
+        s.close(Some("ignored")).expect("close (idempotent)");
+        assert_eq!(s.len().expect("len"), 2, "close must be idempotent");
 
         let last = s.events(2).expect("events").pop().expect("run_finished");
         assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
@@ -514,7 +529,7 @@ mod tests {
     #[test]
     fn close_without_a_reason_records_the_default() {
         let mut s = new_session(None);
-        s.close(None);
+        s.close(None).expect("close");
         let last = s.events(2).expect("events").pop().expect("run_finished");
         assert_eq!(last["reason"], json!(DEFAULT_CLOSE_REASON));
     }
@@ -524,7 +539,7 @@ mod tests {
         let mut s = new_session(Some(10));
         s.append(obj(json!({ "kind": "note" }))).expect("append");
         s.spend(4).expect("spend");
-        s.close(None);
+        s.close(None).expect("close");
 
         let err = s
             .append(obj(json!({ "kind": "note" })))
@@ -533,7 +548,7 @@ mod tests {
         let err = s.spend(1).expect_err("spend after close");
         assert_eq!(err.reason(), "session is closed");
 
-        assert_eq!(s.len(), 3, "run_started + note + run_finished");
+        assert_eq!(s.len().expect("len"), 3, "run_started + note + run_finished");
         assert_eq!(s.remaining(), Some(6));
         assert!(!s.exhausted());
         assert_eq!(kind_of(&s.events(0).expect("events")[1]), "note");
@@ -549,12 +564,12 @@ mod tests {
             .expect("append");
         a.spend(60).expect("spend");
 
-        assert_eq!(a.len(), 2);
-        assert_eq!(b.len(), 1);
+        assert_eq!(a.len().expect("len"), 2);
+        assert_eq!(b.len().expect("len"), 1);
         assert_eq!(a.remaining(), Some(40));
         assert_eq!(b.remaining(), Some(100));
 
-        a.close(None);
+        a.close(None).expect("close");
         assert!(b.append(obj(json!({ "kind": "still_open" }))).is_ok());
     }
 
@@ -647,7 +662,7 @@ mod tests {
 
         // Closing still writes the kernel's own boundary, and only then
         // do writes stop.
-        s.close(Some("done"));
+        s.close(Some("done")).expect("close");
         assert!(s.is_closed());
         let last = s.events(0).expect("events").pop().expect("run_finished");
         assert_eq!(kind_of(&last), KIND_RUN_FINISHED);
@@ -700,12 +715,12 @@ mod tests {
     #[test]
     fn a_closed_session_records_nothing() {
         let mut s = new_session(Some(100));
-        s.close(None);
+        s.close(None).expect("close");
 
         let err = s.append(response(10)).expect_err("closed session");
         assert_eq!(err.reason(), "session is closed");
 
-        assert_eq!(s.len(), 2, "run_started + run_finished only");
+        assert_eq!(s.len().expect("len"), 2, "run_started + run_finished only");
         assert_eq!(s.remaining(), Some(100), "nothing was charged");
         assert_eq!(s.turns(), 0);
     }
@@ -722,7 +737,7 @@ mod tests {
         s.append(response(5)).expect("recorded");
         assert_eq!(s.turns(), 2);
         assert!(s.exhausted());
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len().expect("len"), 3);
     }
 
     #[test]
@@ -738,7 +753,7 @@ mod tests {
         let mut s = new_session(None);
         s.append(response(9)).expect("recorded");
         let before = s.view(VIEW_USAGE, None).expect("usage");
-        s.close(None);
+        s.close(None).expect("close");
         let after = s.view(VIEW_USAGE, None).expect("usage after close");
 
         // `run_finished` costs nothing, so the totals are unchanged even
@@ -748,7 +763,7 @@ mod tests {
         assert_eq!(before["at_seq"], json!(2));
         assert_eq!(after["at_seq"], json!(3));
 
-        assert_eq!(s.len(), 3);
+        assert_eq!(s.len().expect("len"), 3);
         assert_eq!(kind_of(&s.events(0).expect("events")[2]), KIND_RUN_FINISHED);
     }
 
@@ -760,7 +775,7 @@ mod tests {
         use crate::knl::SqliteEventStore;
 
         let store = SqliteEventStore::open_in_memory("owner-stream").expect("open");
-        let s = Session::open_on("user-7".to_string(), Some(100), Box::new(store));
+        let s = Session::open_on("user-7".to_string(), Some(100), Box::new(store)).expect("open");
 
         let started = s.events(0).expect("events");
         let started = started.first().expect("run_started");
@@ -788,7 +803,8 @@ mod tests {
         // A durable session: two charged responses and a user message.
         {
             let store = SqliteEventStore::open(&path, stream).expect("open");
-            let mut s = Session::open_on("user-42".to_string(), Some(100), Box::new(store));
+            let mut s = Session::open_on("user-42".to_string(), Some(100), Box::new(store))
+                .expect("open");
             s.append(response(30)).expect("first response");
             s.append(obj(json!({ "kind": "msg_user", "content": "more" })))
                 .expect("msg_user");
@@ -809,7 +825,11 @@ mod tests {
             "spent budget restored (30 + 20 charged)"
         );
         // Resume appended nothing: the log is exactly what was persisted.
-        assert_eq!(resumed.len(), 4, "run_started + response + msg_user + response");
+        assert_eq!(
+            resumed.len().expect("len"),
+            4,
+            "run_started + response + msg_user + response"
+        );
 
         // The usage view re-folds correctly from the reopened store.
         let usage = resumed.view(VIEW_USAGE, None).expect("usage");
@@ -912,11 +932,11 @@ mod tests {
             self.inner.read(from_seq, limit)
         }
 
-        fn head(&self) -> Option<u64> {
+        fn head(&self) -> KnlResult<Option<u64>> {
             self.inner.head()
         }
 
-        fn len(&self) -> usize {
+        fn len(&self) -> KnlResult<usize> {
             self.inner.len()
         }
     }
@@ -932,8 +952,9 @@ mod tests {
             inner: MemEventStore::new(),
             injected: false,
         };
-        let mut s = Session::open_on("user".to_string(), Some(1000), Box::new(store));
-        assert_eq!(s.len(), 1, "only run_started so far");
+        let mut s =
+            Session::open_on("user".to_string(), Some(1000), Box::new(store)).expect("open");
+        assert_eq!(s.len().expect("len"), 1, "only run_started so far");
         assert_eq!(s.turns(), 0);
 
         // The CAS sees a head advanced by the injected competing writer.
@@ -994,7 +1015,8 @@ mod tests {
         // A opens the run on the shared stream: `run_started` lands at seq 1,
         // so A observes head 1 (H).
         let store_a = SqliteEventStore::open(&path, stream).expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(1000), Box::new(store_a));
+        let mut a =
+            Session::open_on("user".to_string(), Some(1000), Box::new(store_a)).expect("open A");
         assert_eq!(a.turns(), 0);
 
         // B resumes the SAME stream while it holds only `run_started`, so B
