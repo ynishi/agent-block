@@ -40,13 +40,20 @@
 //! | `run_started`     | — (appended by the kernel when a session opens)       |
 //! | `run_finished`    | `reason: string` (appended by the kernel on close)   |
 //! | `msg_user`        | `content: string \| array`                           |
-//! | `model_response`  | `content: array`, `usage: table` (`turn` is kernel-assigned) |
-//! | `tool_call`       | `turn: integer`, `call_id: string`, `name: string`, `args: table` |
-//! | `tool_result`     | `turn: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
+//! | `model_response`  | `content: array`, `usage: table` (`beat` is kernel-assigned) |
+//! | `tool_call`       | `beat: integer`, `call_id: string`, `name: string`, `args: table` |
+//! | `tool_result`     | `beat: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
 //! | `budget_granted`  | `amount: integer` (`tag` / `desc` optional)          |
 //! | `budget_reserved` | `amount: integer` (`tag` optional)                   |
 //! | `budget_refused`  | `amount: integer`, `remaining: integer` (`tag` optional) |
 //! | `budget_spent`    | `amount: integer` (`tag` optional)                   |
+//!
+//! The kernel writes two more fields onto some of those, neither of them
+//! required: `owner` and [`FIELD_SCOPE_ID`] on `run_started`, and
+//! [`FIELD_SCOPE_ID`] on each `budget_*` event.  They record the scope the
+//! run was written under ([`super::Scope`]) so it can be recovered from the
+//! log alone; leaving them out of the required set is what lets a log
+//! written before they existed still validate and still resume.
 //!
 //! # Kernel-only kinds
 //!
@@ -63,11 +70,12 @@
 //! append, so they carry the same `seq` / `epoch_ms` guarantees as
 //! everything else.
 //!
-//! `model_response` does not require a caller-supplied `turn`: the kernel
+//! `model_response` does not require a caller-supplied `beat`: the kernel
 //! numbers it from its own count of the responses recorded (like `seq`), so
 //! the number cannot be forged or restarted by a loop.  `tool_call` /
-//! `tool_result` keep their `turn` field — they reference the model call's
-//! turn, which the shell learns after the response is appended and supplies.
+//! `tool_result` keep their `beat` field — they reference the beat the model
+//! call belongs to, which the shell learns after the response is appended
+//! and supplies.
 //!
 //! The literal request/response bytes are not stored: they are derivable
 //! from these facts by a projection, and byte-level fidelity is the dump
@@ -115,9 +123,10 @@ pub const FIELD_REASON: &str = "reason";
 /// reader can fold on, and an error message is not part of it.
 pub const FIELD_DETAIL: &str = "detail";
 /// Payload field of `model_response` / `tool_call` / `tool_result`: which
-/// model call the fact belongs to.  On a `model_response` the kernel
-/// assigns it; on `tool_call` / `tool_result` the shell supplies it.
-pub const FIELD_TURN: &str = "turn";
+/// beat — which model call — the fact belongs to.  On a `model_response`
+/// the kernel assigns it; on `tool_call` / `tool_result` the shell supplies
+/// it.
+pub const FIELD_BEAT: &str = "beat";
 /// Payload field of `msg_user` / `model_response`.
 pub const FIELD_CONTENT: &str = "content";
 /// Payload field of `model_response`.
@@ -139,6 +148,17 @@ pub const FIELD_DESC: &str = "desc";
 /// Payload field of `budget_refused`: the balance at the moment of the
 /// refusal, which the refusal did not change.
 pub const FIELD_REMAINING: &str = "remaining";
+/// Payload field of `run_started` and of every `budget_*` kind: the
+/// kernel-issued id of the scope the event was written under
+/// ([`super::Scope`]).
+///
+/// It rides on the events that define the boundary — the run's opening and
+/// every move of its balance — so a reader can tell whose authority a
+/// ledger entry was written with from the log alone, and a resume can
+/// restore the scope without being told.  Both kinds are open-shaped as far
+/// as this field is concerned (nothing below requires it), so a log written
+/// before it existed still validates and still resumes.
+pub const FIELD_SCOPE_ID: &str = "scope_id";
 
 /// Expected JSON shape of a required field on a reserved kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,20 +213,20 @@ const RUN_FINISHED_FIELDS: &[(&str, Shape)] = &[(FIELD_REASON, Shape::Str)];
 const MSG_USER_FIELDS: &[(&str, Shape)] = &[(FIELD_CONTENT, Shape::StringOrArray)];
 /// Required fields of `model_response`.
 ///
-/// `turn` is not among them: the kernel assigns it on append, so a caller
+/// `beat` is not among them: the kernel assigns it on append, so a caller
 /// does not have to supply it and cannot renumber the run by doing so.
 const MODEL_RESPONSE_FIELDS: &[(&str, Shape)] =
     &[(FIELD_CONTENT, Shape::Array), (FIELD_USAGE, Shape::Object)];
 /// Required fields of `tool_call`.
 const TOOL_CALL_FIELDS: &[(&str, Shape)] = &[
-    (FIELD_TURN, Shape::Integer),
+    (FIELD_BEAT, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     ("name", Shape::Str),
     ("args", Shape::Object),
 ];
 /// Required fields of `tool_result`.
 const TOOL_RESULT_FIELDS: &[(&str, Shape)] = &[
-    (FIELD_TURN, Shape::Integer),
+    (FIELD_BEAT, Shape::Integer),
     (FIELD_CALL_ID, Shape::Str),
     (FIELD_OK, Shape::Bool),
     (FIELD_RESULT, Shape::Any),
@@ -400,29 +420,29 @@ mod tests {
             json!({ "kind": "run_finished", "reason": "closed" }),
             json!({ "kind": "msg_user", "content": "hi" }),
             json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "hi" }] }),
-            // A model_response with no turn is valid: the kernel assigns it.
+            // A model_response with no beat is valid: the kernel assigns it.
             json!({
                 "kind": "model_response",
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 3 }
             }),
-            // …and one that carries a turn is valid too (an extra field).
+            // …and one that carries a beat is valid too (an extra field).
             json!({
                 "kind": "model_response",
-                "turn": 1,
+                "beat": 1,
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 3 }
             }),
             json!({
                 "kind": "tool_call",
-                "turn": 1,
+                "beat": 1,
                 "call_id": "c1",
                 "name": "sh",
                 "args": { "cmd": "ls" }
             }),
             json!({
                 "kind": "tool_result",
-                "turn": 1,
+                "beat": 1,
                 "call_id": "c1",
                 "ok": false,
                 "result": null
@@ -448,7 +468,7 @@ mod tests {
 
         let err = validate_event(&obj(json!({
             "kind": "tool_call",
-            "turn": 1,
+            "beat": 1,
             "call_id": "c1",
             "args": {}
         })))
@@ -457,14 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn model_response_does_not_require_a_turn() {
-        // No turn field at all is fine — the kernel numbers it on append.
+    fn model_response_does_not_require_a_beat() {
+        // No beat field at all is fine — the kernel numbers it on append.
         validate_event(&obj(json!({
             "kind": "model_response",
             "content": [],
             "usage": {}
         })))
-        .expect("turn is kernel-assigned, not caller-required");
+        .expect("beat is kernel-assigned, not caller-required");
     }
 
     #[test]
@@ -484,7 +504,7 @@ mod tests {
 
         let err = validate_event(&obj(json!({
             "kind": "tool_result",
-            "turn": 1,
+            "beat": 1,
             "call_id": "c1",
             "ok": "yes",
             "result": 1
@@ -497,12 +517,12 @@ mod tests {
     fn tool_result_requires_result_to_be_present_but_not_of_any_shape() {
         // Present-but-null is accepted; absent is not.
         validate_event(&obj(json!({
-            "kind": "tool_result", "turn": 1, "call_id": "c", "ok": true, "result": null
+            "kind": "tool_result", "beat": 1, "call_id": "c", "ok": true, "result": null
         })))
         .expect("null result is present");
 
         let err = validate_event(&obj(json!({
-            "kind": "tool_result", "turn": 1, "call_id": "c", "ok": true
+            "kind": "tool_result", "beat": 1, "call_id": "c", "ok": true
         })))
         .expect_err("result is required");
         assert!(err.reason().contains("result"), "{err}");
@@ -511,14 +531,14 @@ mod tests {
     #[test]
     fn whole_floats_count_as_integers() {
         // Lua numbers arrive as floats when they are written `1.0`.  A
-        // tool_call's turn is a caller-supplied integer.
+        // tool_call's beat is a caller-supplied integer.
         validate_event(&obj(json!({
-            "kind": "tool_call", "turn": 1.0, "call_id": "c", "name": "sh", "args": {}
+            "kind": "tool_call", "beat": 1.0, "call_id": "c", "name": "sh", "args": {}
         })))
         .expect("1.0 is a whole number");
 
         let err = validate_event(&obj(json!({
-            "kind": "tool_call", "turn": 1.5, "call_id": "c", "name": "sh", "args": {}
+            "kind": "tool_call", "beat": 1.5, "call_id": "c", "name": "sh", "args": {}
         })))
         .expect_err("1.5 is not whole");
         assert!(err.reason().contains("whole number"), "{err}");

@@ -1,25 +1,28 @@
 -- scope_spec.lua — mlua-lspec unit tests for the session-scope model of the
--- Lua kernel (knl.open + kernel-assigned turn numbering via ctx:append).
+-- Lua kernel (knl.open + kernel-assigned beat numbering via ctx:append).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/scope_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
 -- What this proves (scope-design.md rev 3 checklist, pure-VM half):
---   1 appending a model_response is counted by usage and gets a kernel turn
+--   1 appending a model_response is counted by usage and gets a kernel beat
 --     (the old usage=0 divergence, and the per-event scope stamp, are both
---     gone — the kernel numbers/charges/counts by kind).
---   2 turn numbering is kernel-owned: two successive responses are 1 then 2.
+--     gone — the kernel numbers/counts by kind), while the balance moved
+--     only where the beat reserved it.
+--   2 beat numbering is kernel-owned: two successive responses are 1 then 2.
 --   3 one model response with two tool_use blocks: both tool_call/tool_result
---     pairs share the response's kernel-assigned turn.
+--     pairs share the response's kernel-assigned beat.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
 -- a faithful Lua fake stands in below. It reproduces the facts the model
 -- rests on, mirroring crates/agent-block-core/src/bridge/knl.rs:
 --   * append overwrites the kernel-owned seq/epoch_ms and passes every other
 --     field through untouched (there is no author field);
---   * appending a model_response assigns the turn (turns + 1), charges the
---     usage, and advances the counter — read back with s:turns();
+--   * appending a model_response assigns the beat (beats + 1) and advances
+--     the counter — read back with s:beats() — and moves no balance;
+--   * reserve is the only decision point: it deducts, or refuses with the
+--     grant's tag and leaves the balance alone;
 --   * view("usage") counts every model_response in the session.
 -- The e2e coverage against the *real* bridge lives in
 -- crates/agent-block/tests/fixtures/knl_turn_test.lua.
@@ -35,34 +38,18 @@ local uuid_counter = 0
 
 local COUNTERS = { "input_tokens", "output_tokens", "thinking_tokens" }
 
-local function charge_of(usage)
-    if type(usage) ~= "table" then
-        return 0
-    end
-    local total = 0
-    for _, counter in ipairs(COUNTERS) do
-        local n = usage[counter]
-        if type(n) == "number" then
-            total = total + n
-        end
-    end
-    if total < 0 then
-        total = 0
-    end
-    return total
-end
-
 local function fake_session(opts)
     opts = opts or {}
     local owner = opts.owner or "anon"
-    local budget = opts.budget and opts.budget.tokens or nil
+    local grant = opts.budget or {}
     uuid_counter = uuid_counter + 1
     local id = string.format("sess-%08d-0000-4000-8000-000000000000", uuid_counter)
     local events = {}
     local seq = 0
-    local remaining = budget
+    local remaining = grant.amount
+    local tag = grant.tag
     local closed = false
-    local turns = 0
+    local beats = 0
 
     local function deep_copy(v)
         if type(v) ~= "table" then
@@ -98,27 +85,38 @@ local function fake_session(opts)
         return owner
     end
 
-    -- The one write path. A model_response is numbered, charged and counted
-    -- here (mirrors the Rust Session::append).
+    -- The one write path. A model_response is numbered and counted here,
+    -- and nothing is charged (mirrors the Rust Session::append).
     function s:append(event)
         assert(not closed, "knl: append: session is closed")
         assert(type(event) == "table", "knl: append: event must be a table")
         assert(type(event.kind) == "string", "knl: append: kind is required")
         if event.kind == "model_response" then
-            turns = turns + 1
+            beats = beats + 1
             local rec = deep_copy(event)
-            rec.turn = turns -- kernel-owned, overwrites any caller value
-            local charged = charge_of(rec.usage)
-            if remaining ~= nil then
-                remaining = math.max(0, remaining - charged)
-            end
+            rec.beat = beats -- kernel-owned, overwrites any caller value
             return store(rec)
         end
         return store(event)
     end
 
-    function s:turns()
-        return turns
+    function s:beats()
+        return beats
+    end
+
+    -- The decision point: allow and deduct, or refuse (naming the grant)
+    -- and leave the balance exactly where it was.
+    function s:reserve(n)
+        assert(not closed, "knl: reserve: session is closed")
+        assert(type(n) == "number" and n >= 0, "knl: reserve: amount must be non-negative")
+        if remaining == nil then
+            return true
+        end
+        if remaining < n then
+            return false, tag
+        end
+        remaining = remaining - n
+        return true
     end
 
     function s:events(from)
@@ -220,26 +218,26 @@ local function tool_use(id, name, input)
     return { type = "tool_use", id = id, name = name, input = input or {} }
 end
 
--- Every model_response's turn number, in seq order.
-local function response_turns(h)
-    local turns = {}
+-- Every model_response's beat number, in seq order.
+local function response_beats(h)
+    local numbers = {}
     for _, ev in ipairs(h:events()) do
         if ev.kind == "model_response" then
-            turns[#turns + 1] = ev.turn
+            numbers[#numbers + 1] = ev.beat
         end
     end
-    return turns
+    return numbers
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Tests
 -- ─────────────────────────────────────────────────────────────────────────────
 
-describe("knl turn (session-scope model)", function()
+describe("knl beat (session-scope model)", function()
     it("counts a beat's model_response in usage and gives it a kernel number", function()
         local h = kernel.open({
             owner = "test",
-            budget = { tokens = 100 },
+            budget = { amount = 100, tag = "tokens" },
             llm = stub(response("ok", { { type = "text", text = "hello" } }, {
                 input_tokens = 10,
                 output_tokens = 3,
@@ -257,29 +255,30 @@ describe("knl turn (session-scope model)", function()
         expect(u.input_tokens).to.equal(10)
         expect(u.output_tokens).to.equal(3)
 
-        -- Charged: the append deducted the usage from the budget.
-        expect(h:remaining()).to.equal(87)
-        expect(h:turns()).to.equal(1)
+        -- Reserved, not charged: the beat took one unit before the call and
+        -- the appends moved nothing. The usage above is the other reading.
+        expect(h:remaining()).to.equal(99)
+        expect(h:beats()).to.equal(1)
     end)
 
     it("numbers successive beats 1 then 2 (kernel-owned)", function()
         local h = kernel.open({
-            budget = { tokens = 1000 },
+            budget = { amount = 1000, tag = "tokens" },
             llm = stub(response("ok"), response("ok")),
         })
 
         kernel.beat(h)
         kernel.beat(h)
 
-        local turns = response_turns(h)
-        expect(#turns).to.equal(2)
-        expect(turns[1]).to.equal(1)
-        expect(turns[2]).to.equal(2)
+        local numbers = response_beats(h)
+        expect(#numbers).to.equal(2)
+        expect(numbers[1]).to.equal(1)
+        expect(numbers[2]).to.equal(2)
     end)
 
     it("shares one beat number across a response's tool_call/tool_result pairs", function()
         local h = kernel.open({
-            budget = { tokens = 100 },
+            budget = { amount = 100, tag = "tokens" },
             llm = stub(response("ok", {
                 tool_use("a", "noop", {}),
                 tool_use("b", "noop", {}),
@@ -295,24 +294,24 @@ describe("knl turn (session-scope model)", function()
 
         kernel.beat(h)
 
-        local model_turn
-        local call_turns, result_turns = {}, {}
+        local model_beat
+        local call_beats, result_beats = {}, {}
         for _, ev in ipairs(h:events()) do
             if ev.kind == "model_response" then
-                model_turn = ev.turn
+                model_beat = ev.beat
             elseif ev.kind == "tool_call" then
-                call_turns[#call_turns + 1] = ev.turn
+                call_beats[#call_beats + 1] = ev.beat
             elseif ev.kind == "tool_result" then
-                result_turns[#result_turns + 1] = ev.turn
+                result_beats[#result_beats + 1] = ev.beat
             end
         end
 
-        expect(model_turn).to.equal(1)
-        expect(#call_turns).to.equal(2)
-        expect(#result_turns).to.equal(2)
-        expect(call_turns[1]).to.equal(1)
-        expect(call_turns[2]).to.equal(1)
-        expect(result_turns[1]).to.equal(1)
-        expect(result_turns[2]).to.equal(1)
+        expect(model_beat).to.equal(1)
+        expect(#call_beats).to.equal(2)
+        expect(#result_beats).to.equal(2)
+        expect(call_beats[1]).to.equal(1)
+        expect(call_beats[2]).to.equal(1)
+        expect(result_beats[1]).to.equal(1)
+        expect(result_beats[2]).to.equal(1)
     end)
 end)

@@ -29,11 +29,21 @@
 --- Beat numbering (kernel-owned)
 ---   The ctx is the numbering authority. Appending a `model_response`
 ---   through `ctx:append` is what numbers it: the Rust kernel assigns the
----   number (like `seq`) and charges the usage in the same step. beat reads
----   the number back with `ctx:turns()` afterwards and stamps it onto the
----   tool_call / tool_result events. (The Rust-side event field is still
----   named `turn`; renaming it to `beat` is a deferred ST — the Lua Outcome
----   already speaks `beat`.)
+---   `beat` (like `seq`). An append records, it does not charge. beat reads
+---   the number back with `ctx:beats()` afterwards and stamps it onto the
+---   tool_call / tool_result events.
+---
+--- The budget (budget-design.md §2)
+---   The budget is a quota the owner granted the run, not a tally of what it
+---   used. beat asks for permission BEFORE it calls — `ctx:reserve(n)`, after
+---   the request is known and before anything is recorded — and a refusal is
+---   a planned stop: `Ok{ budget_stopped = true, tag = <the grant's tag> }`
+---   with no `request` event and no call. How much a beat asks for is beat's
+---   own policy, not the kernel's: `config.cost(request)` when the caller
+---   supplies one, otherwise one unit per beat. What a unit *means* is
+---   whatever the owner tagged the grant with — the kernel reads the number
+---   and nothing else, and token usage (`view("usage")`) is a separate
+---   reading that beat never folds back into the budget.
 ---
 --- What the POC deliberately leaves out
 ---   Real provider adapters (llm is `fn(req) -> {status, content, usage,
@@ -68,8 +78,8 @@ local Outcome = {}
 local STATUSES = { "ok", "refused", "error" }
 
 --- A beat that ran (a budget stop is one too — it ran and stopped on
---- purpose). `out` is the call's return, or `{ budget_stopped = true }` when
---- the gate stopped before calling.
+--- purpose). `out` is the call's return, or `{ budget_stopped = true, tag }`
+--- when the reservation was refused before calling.
 function Outcome.ok(out)
     return { status = "ok", out = out }
 end
@@ -323,8 +333,8 @@ local REQUEST = T.shape({
 local EVENT_BASE = T.shape({ kind = T.string })
 
 --- Per-kind shapes for the kinds this module itself writes (plus the
---- msg_user seed). Open shapes: the kernel stamps seq / epoch_ms / turn on
---- the way in, and those ride alongside. `turn` is optional on the tool
+--- msg_user seed). Open shapes: the kernel stamps seq / epoch_ms / beat on
+--- the way in, and those ride alongside. `beat` is optional on the tool
 --- pair (stamped from out.beat by execute_tools).
 local EVENT_SHAPES = {
     msg_user = T.shape({
@@ -347,14 +357,14 @@ local EVENT_SHAPES = {
     }),
     tool_call = T.shape({
         kind = T.literal("tool_call"),
-        turn = T.number:is_optional(),
+        beat = T.number:is_optional(),
         call_id = T.string,
         name = T.string,
         args = T.table,
     }),
     tool_result = T.shape({
         kind = T.literal("tool_result"),
-        turn = T.number:is_optional(),
+        beat = T.number:is_optional(),
         call_id = T.string,
         ok = T.boolean,
         result = T.any,
@@ -402,7 +412,7 @@ local CONFIG_KEYS = {
     fold = true,
     filters = true,
     system = true,
-    max_turns = true,
+    cost = true,
 }
 
 --- Minimal config shape check. Returns an error string, or nil when the
@@ -424,6 +434,9 @@ local function config_problem(config)
     if config.fold ~= nil and type(config.fold) ~= "function" then
         return "fold must be a function"
     end
+    if config.cost ~= nil and type(config.cost) ~= "function" then
+        return "cost must be a function (fn(request) -> integer >= 1)"
+    end
     return nil
 end
 
@@ -432,11 +445,20 @@ local ctx_with -- forward declaration (referenced by make_ctx's __index)
 --- Wrap a kernel session handle and a frozen config into a ctx.
 ---
 --- Reads resolve in order: `with` / internals, then config fields (the
---- memory-map read: `ctx.llm`, `ctx.max_turns`, ... are direct), then the
+--- memory-map read: `ctx.llm`, `ctx.system`, ... are direct), then the
 --- handle's own surface (state methods — `ctx:append`, `ctx:events`,
---- `ctx:turns`, `ctx:view`, ... delegate to the kernel handle). Writes
+--- `ctx:beats`, `ctx:reserve`, `ctx:view`, ... delegate to the kernel
+--- handle). Writes
 --- raise: the ctx is immutable, derive with `ctx:with{...}`.
 local function make_ctx(handle, config)
+    -- A ctx resolves config fields before handle methods, so a config key
+    -- named like a session method would silently replace it (`ctx:reserve`
+    -- turning into a policy function). Refuse that at construction.
+    for k in pairs(config) do
+        if handle[k] ~= nil then
+            error("ctx config '" .. tostring(k) .. "' shadows a session method; use another key", 3)
+        end
+    end
     local mt = {
         __index = function(_, k)
             if k == "with" then
@@ -561,7 +583,7 @@ local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 ---
 --- @param opts table  { owner?, budget?, store?,
 ---                      llm?, tools?, tool_policy?, fold?, filters?,
----                      system?, max_turns? }
+---                      system?, cost? }
 --- @return table ctx  an immutable knl ctx
 function M.open(opts)
     opts = opts or {}
@@ -587,7 +609,7 @@ end
 ---
 --- @param opts table  { store = { sqlite = <path> }, session = <id>, budget?,
 ---                      llm?, tools?, tool_policy?, fold?, filters?,
----                      system?, max_turns? }
+---                      system?, cost? }
 --- @return table ctx  an immutable knl ctx, pre-loaded with the log
 function M.resume(opts)
     opts = opts or {}
@@ -628,12 +650,10 @@ local function execute_tools(ctx, config, out)
             local args = block.input or {}
 
             -- Record the call before running it: a run that dies mid-tool
-            -- leaves a history that says a call was made. (Event field name
-            -- `turn` is the Rust bridge's — the beat rename there is a
-            -- deferred ST.)
+            -- leaves a history that says a call was made.
             ctx:append({
                 kind = "tool_call",
-                turn = out.beat,
+                beat = out.beat,
                 call_id = call_id,
                 name = name,
                 args = args,
@@ -681,7 +701,7 @@ local function execute_tools(ctx, config, out)
 
             ctx:append({
                 kind = "tool_result",
-                turn = out.beat,
+                beat = out.beat,
                 call_id = call_id,
                 ok = ok,
                 result = result,
@@ -694,7 +714,16 @@ local function execute_tools(ctx, config, out)
     return summary
 end
 
---- One complete beat: gate, fold, filter, record, call, record + charge, run
+--- How much one beat asks the budget for when the ctx names no policy.
+---
+--- One beat, one unit: a beat is the thing being bounded, so the default
+--- makes the grant a count of beats. It must be >= 1 — that is what makes
+--- the budget a ranking function and the run finite. What the unit *means*
+--- is the owner's (`budget = { amount = N, tag = "tokens" }` counts tokens,
+--- and then a ctx supplies `cost` to say how many one beat may take).
+local DEFAULT_COST = 1
+
+--- One complete beat: gate, fold, filter, reserve, record, call, record, run
 --- its tools. Single argument — everything is read off the ctx (state +
 --- config), and the ctx is never mutated. Per-beat variation is the
 --- caller's: `knl.beat(ctx:with{ llm = strong })`.
@@ -721,11 +750,6 @@ function M.beat(ctx)
     if config.llm == nil then
         return emit(Outcome.err("conf", "no llm in ctx (open with llm=..., or derive ctx:with{ llm = ... })"))
     end
-    -- Budget stop is a planned stop, not a failure: Ok before the call.
-    if ctx:exhausted() then
-        return emit(Outcome.ok({ budget_stopped = true }))
-    end
-
     -- [1] request <- fold(events, config) ---------------------------------
     local fold_fn = config.fold or M.fold
     local folded_ok, request = pcall(fold_fn, ctx:events(), config)
@@ -757,7 +781,37 @@ function M.beat(ctx)
     -- a filter that broke the request shape fails loud here, not in the wire.
     shape.assert_dev(request, REQUEST, "knl_request")
 
-    -- [3] record the request write-ahead (open kind "request") ------------
+    -- [3] reserve before anything is recorded or called -------------------
+    -- The quota decides here, with the request known and nothing spent yet:
+    -- a refusal leaves no `request` event, makes no call, and is a planned
+    -- stop rather than a failure (Ok, carrying the grant's tag so a caller
+    -- can name what stopped it). How much to ask for is this layer's policy
+    -- — `config.cost(request)`, or one unit per beat — and it is never
+    -- derived from token counts: the budget and the `usage` view are
+    -- separate readings (budget-design.md §4-8).
+    local amount = DEFAULT_COST
+    if config.cost then
+        local est_ok, est = pcall(config.cost, request)
+        if not est_ok then
+            return emit(Outcome.err("conf", "cost failed: " .. tostring(est)))
+        end
+        if type(est) ~= "number" or est < 1 or est % 1 ~= 0 then
+            return emit(Outcome.err("conf", "cost must return a whole number >= 1, got " .. tostring(est)))
+        end
+        amount = est
+    end
+    -- The handle raises on a closed session, and beat's contract is an
+    -- Outcome, so the call is pcall'd. (`ctx:reserve` reaches the same
+    -- method: make_ctx refuses a config key that would shadow one.)
+    local res_ok, granted, tag = pcall(handle.reserve, handle, amount)
+    if not res_ok then
+        return emit(Outcome.err("state", "reserve failed: " .. tostring(granted)))
+    end
+    if not granted then
+        return emit(Outcome.ok({ budget_stopped = true, tag = tag }))
+    end
+
+    -- [4] record the request write-ahead (open kind "request") ------------
     -- The request as actually sent is a fact in the history before the call,
     -- so a call that then fails leaves the request event behind.  An append
     -- can fail (closed session, CAS head conflict, validation) — beat's
@@ -770,7 +824,7 @@ function M.beat(ctx)
         return emit(Outcome.err("state", "request append failed: " .. tostring(rec_err)))
     end
 
-    -- [4] beat calls the llm directly ------------------------------------
+    -- [5] beat calls the llm directly ------------------------------------
     -- resp = { status = "ok"|"refused"|"error", content, usage, stop_reason }.
     -- The status is the adapter's judgement; beat reads it, it does not
     -- invent one (status is llm-supplied).  The call is pcall'd: an adapter
@@ -782,7 +836,7 @@ function M.beat(ctx)
         resp = nil
     end
 
-    -- [5] status branch — beat lays down the record and the charge ---------
+    -- [6] status branch — beat lays down the record -----------------------
     -- error / transport failure: the beat did not come off. Note it and stop.
     -- The failure note is best-effort (the state may be what failed); the
     -- call error stays the primary detail either way.
@@ -800,8 +854,8 @@ function M.beat(ctx)
         return emit(Outcome.err("call", tostring(reason)))
     end
     -- ok / refused: the model answered. Appending the model_response is
-    -- what records it, numbers it and charges it — the kernel does all
-    -- three in the one append (no Lua-side spend, no Lua-side counting).
+    -- what records it and numbers it — the kernel does both in the one
+    -- append, and charges nothing (the quota was settled at [3]).
     -- Read the kernel-assigned number back afterwards to stamp the tools.
     -- `usage` defaults to an empty count: the llm contract leaves it
     -- optional, but the kernel validator requires the field on a
@@ -817,13 +871,14 @@ function M.beat(ctx)
     if not resp_ok then
         return emit(Outcome.err("state", "model_response append failed: " .. tostring(resp_err)))
     end
-    resp.beat = ctx:turns()
-    -- A refusal is a recorded, charged response the model would not build on.
+    resp.beat = ctx:beats()
+    -- A refusal is a recorded response the model would not build on — and
+    -- the beat that produced it reserved its amount like any other.
     if resp.status == "refused" then
         return emit(Outcome.refused(resp.stop_reason or "refused", resp))
     end
 
-    -- [6] tool execution (skeleton) --------------------------------------
+    -- [7] tool execution (skeleton) --------------------------------------
     -- execute_tools raises only on a state failure (an append that did not
     -- land); handler/policy failures close their pair as data (ok=false).
     local tools_ok, tools_or_err = pcall(execute_tools, ctx, config, resp)

@@ -42,13 +42,16 @@ local tools = adapter.tools({
     },
 })
 
+-- The loop's own cap: knl has no max_turns config — the loop lives here, and
+-- the stopping guarantee is the budget the owner granted.
+local MAX_BEATS = 4
+
 local ctx = kernel.open({
     owner = "beat-e2e",
-    budget = { tokens = 50000 },
+    budget = { amount = 50000, tag = "tokens" },
     llm = llm,
     tools = tools,
     system = "You are a terse assistant. Use the add tool for any arithmetic.",
-    max_turns = 4,
 })
 
 ctx:append({
@@ -65,11 +68,10 @@ local function has_tool_use(out)
     return false
 end
 
--- The loop, written where it is needed (ctx.max_turns is just a config
--- field the caller reads back off the ctx).
+-- The loop, written where it is needed, bounded by its own local cap.
 local beats = 0
 local last
-while beats < ctx.max_turns do
+while beats < MAX_BEATS do
     last = kernel.beat(ctx)
     beats = beats + 1
     print(string.format("[BEAT %d] status=%s", beats, tostring(last.status)))
@@ -101,9 +103,9 @@ Outcome.match(last, {
 
 local usage = ctx:view("usage")
 print(string.format(
-    "[E2E] beats=%d turns=%d usage: calls=%s in=%s out=%s remaining=%s",
+    "[E2E] beats=%d recorded=%d usage: calls=%s in=%s out=%s remaining=%s",
     beats,
-    ctx:turns(),
+    ctx:beats(),
     tostring(usage.model_calls),
     tostring(usage.input_tokens),
     tostring(usage.output_tokens),

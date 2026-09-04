@@ -197,13 +197,13 @@ fn a_run_records_its_turns_in_order() {
 
         local evs = s:events()
         assert(evs[2].content == "ask", "prompt: " .. tostring(evs[2].content))
-        assert(evs[3].turn == 1 and evs[3].content[1].type == "tool_use")
+        assert(evs[3].beat == 1 and evs[3].content[1].type == "tool_use")
         assert(evs[3].usage.input_tokens == 10, "usage: " .. tostring(evs[3].usage.input_tokens))
         assert(evs[4].call_id == "call_1" and evs[4].name == "echo")
         assert(evs[4].args.path == "a.txt", "args: " .. tostring(evs[4].args.path))
         assert(evs[5].call_id == "call_1" and evs[5].ok == true)
         assert(evs[5].result == "read a.txt", "result: " .. tostring(evs[5].result))
-        assert(evs[6].turn == 2 and evs[6].content[1].text == "done")
+        assert(evs[6].beat == 2 and evs[6].content[1].text == "done")
     "#,
     );
 }
@@ -211,7 +211,7 @@ fn a_run_records_its_turns_in_order() {
 /// A session opened with a backend of its own is the one that takes the call:
 /// the loop hands it a provider-neutral request and never reaches for the
 /// transport its `llm` conf describes. The facts around the response are filed
-/// under the turn the kernel stamped, not under the loop's own count.
+/// under the beat the kernel stamped, not under the loop's own count.
 #[test]
 fn a_session_backend_takes_the_call_instead_of_the_wire() {
     let lua = vm();
@@ -262,10 +262,10 @@ fn a_session_backend_takes_the_call_instead_of_the_wire() {
             "recorded: " .. kinds_of(s)
         )
         local evs = s:events()
-        assert(evs[3].turn == 1, "the kernel stamped turn: " .. tostring(evs[3].turn))
-        assert(evs[4].turn == 1 and evs[5].turn == 1, "the tool facts must echo the response's turn")
+        assert(evs[3].beat == 1, "the kernel stamped beat: " .. tostring(evs[3].beat))
+        assert(evs[4].beat == 1 and evs[5].beat == 1, "the tool facts must echo the response's beat")
         assert(evs[5].result == "read a.txt", "result: " .. tostring(evs[5].result))
-        assert(evs[6].turn == 2, "second response turn: " .. tostring(evs[6].turn))
+        assert(evs[6].beat == 2, "second response beat: " .. tostring(evs[6].beat))
     "#,
     );
 }

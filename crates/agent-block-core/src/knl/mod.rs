@@ -14,8 +14,15 @@
 //!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
 //!   overwritten rather than trusted.  Reads hand back clones, so a caller
 //!   cannot reach recorded state through a returned value.
-//! - **Scope is the session.**  There is no per-event author.  A session
-//!   holds only its own events, so ownership is the session-level
+//! - **A session has a scope.**  The two are different concepts sharing one
+//!   lifetime: the session is the stream (history, projections, beat
+//!   numbering), the [`Scope`] is the authority it is written under (a
+//!   kernel-issued [`ScopeId`], the owner, the granted quota).  A session
+//!   holds its scope by value, since neither outlives the other.  The scope
+//!   id is recorded on `run_started` and on every `budget_*` event, so the
+//!   boundary is recoverable from the log — and unforgeable, since those
+//!   kinds are the kernel's alone to write.  There is no per-event author:
+//!   a session holds only its own events, so ownership is the scope-level
 //!   [`Session::owner`] — a real principal id, or the reserved
 //!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
 //!   layer above the kernel.  The accounting keys on the `kind`: the
@@ -38,7 +45,7 @@
 //! - **I6 run scope.**  All state lives inside a [`Session`] value — no
 //!   statics — so two sessions are fully independent, and `close` ends
 //!   the run scope (later `append` / `spend` are errors).
-//! - **Turn numbering.**  The turn a `model_response` carries is the
+//! - **Beat numbering.**  The beat a `model_response` carries is the
 //!   kernel's own count of the responses recorded, assigned on
 //!   [`Session::append`] (like `seq`), so a loop cannot restart or forge
 //!   it.
@@ -55,6 +62,7 @@ pub mod event;
 pub mod event_store;
 pub mod history;
 pub mod projection;
+pub mod scope;
 pub mod session;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_store;
@@ -69,6 +77,7 @@ pub use event_store::{
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};
+pub use scope::{Scope, ScopeId};
 pub use session::{
     Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
     DEFAULT_CLOSE_REASON, SYSTEM,

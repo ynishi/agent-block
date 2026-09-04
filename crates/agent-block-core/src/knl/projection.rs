@@ -252,7 +252,7 @@ mod tests {
             &mut h,
             json!({
                 "kind": "model_response",
-                "turn": 1,
+                "beat": 1,
                 "content": [{ "type": "text", "text": "ok" }],
                 "usage": { "input_tokens": 10, "output_tokens": 3 }
             }),
@@ -260,14 +260,14 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "tool_call", "turn": 1, "call_id": "c1",
+                "kind": "tool_call", "beat": 1, "call_id": "c1",
                 "name": "sh", "args": { "cmd": "ls" }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "tool_result", "turn": 1, "call_id": "c1",
+                "kind": "tool_result", "beat": 1, "call_id": "c1",
                 "ok": false, "result": "boom"
             }),
         );
@@ -321,7 +321,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response", "turn": 1,
+                "kind": "model_response", "beat": 1,
                 "content": [{ "type": "text", "text": "said last time" }],
                 "usage": { "input_tokens": 9_000 }
             }),
@@ -347,14 +347,14 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response", "turn": 1, "content": [],
+                "kind": "model_response", "beat": 1, "content": [],
                 "usage": { "input_tokens": 4, "output_tokens": 2 }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "model_response", "turn": 2, "content": [],
+                "kind": "model_response", "beat": 2, "content": [],
                 "usage": { "input_tokens": 5, "thinking_tokens": 7 }
             }),
         );
@@ -377,7 +377,7 @@ mod tests {
             &mut h,
             json!({
                 "kind": "model_response",
-                "turn": 2,
+                "beat": 2,
                 "content": [],
                 "usage": { "input_tokens": 5, "thinking_tokens": 7 }
             }),
@@ -434,7 +434,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "model_response", "turn": 1, "content": [],
+                "kind": "model_response", "beat": 1, "content": [],
                 "usage": { "input_tokens": 4 }
             }),
         );
@@ -456,24 +456,24 @@ mod tests {
             json!({ "kind": "msg_user", "content": "one" }),
             json!({ "kind": "note", "text": "ignored" }),
             json!({
-                "kind": "model_response", "turn": 1, "content": [],
+                "kind": "model_response", "beat": 1, "content": [],
                 "usage": { "input_tokens": 4, "output_tokens": 2 }
             }),
             json!({
-                "kind": "tool_call", "turn": 1, "call_id": "c",
+                "kind": "tool_call", "beat": 1, "call_id": "c",
                 "name": "sh", "args": {}
             }),
             json!({
-                "kind": "tool_result", "turn": 1, "call_id": "c",
+                "kind": "tool_result", "beat": 1, "call_id": "c",
                 "ok": true, "result": { "out": "ok" }
             }),
             json!({ "kind": "msg_user", "content": [{ "type": "text", "text": "two" }] }),
             json!({
-                "kind": "model_response", "turn": 2, "content": [],
+                "kind": "model_response", "beat": 2, "content": [],
                 "usage": { "input_tokens": 9_000 }
             }),
             json!({
-                "kind": "model_response", "turn": 3, "content": [],
+                "kind": "model_response", "beat": 3, "content": [],
                 "usage": { "input_tokens": 6, "thinking_tokens": 1 }
             }),
         ];

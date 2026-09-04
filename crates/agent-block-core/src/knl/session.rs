@@ -4,21 +4,35 @@
 //! together and is the only handle on kernel state.  All of it lives in
 //! the value: two sessions share nothing.
 //!
-//! # The session *is* the scope
+//! # The session *has a* scope
+//!
+//! A scope and a session are two things, sharing one lifetime: both begin
+//! when a run opens and end when it closes.  The session is the stream —
+//! this history, its projections, its beat numbering.  The [`Scope`] is the
+//! authority the run is written under: a kernel-issued [`ScopeId`], the
+//! `owner`, and the quota that owner granted.  The session holds it *by
+//! value*, because neither outlives the other and there is nothing to share.
 //!
 //! A session holds only its own events, so ownership is not a per-event
-//! question: the session carries one `owner` — a real principal id, or the
+//! question: the scope carries one `owner` — a real principal id, or the
 //! reserved [`ANON`] / [`SYSTEM`] id — and it is *total* (never `Option`,
-//! never a "kernel vs caller" flag).  System-originated work is a session
-//! whose owner is [`SYSTEM`]; unspecified is [`ANON`].  The policy layer
-//! above the kernel reads [`Session::owner`] to authorize; the kernel
-//! itself does not branch on it.
+//! never a "kernel vs caller" flag).  System-originated work is a run whose
+//! owner is [`SYSTEM`]; unspecified is [`ANON`].  The policy layer above the
+//! kernel reads [`Session::owner`] to authorize; the kernel itself does not
+//! branch on it.
+//!
+//! The scope is in the log, not only in the value.  Its id is recorded on
+//! `run_started` beside the owner, and on every `budget_*` event, so the
+//! boundary is recoverable — and unforgeable, since the kinds that carry it
+//! are the kernel's alone to write ([`super::event::is_kernel_only`]).
+//! [`Session::resume`] restores the scope from those records rather than
+//! being told what it was.
 //!
 //! # One append
 //!
 //! There is a single write path.  [`Session::append`] validates, stamps
 //! the kernel-owned `seq` / `epoch_ms`, and pushes.  When the event is a
-//! `model_response` it also *numbers* it: the kernel assigns the `turn`
+//! `model_response` it also *numbers* it: the kernel assigns the `beat`
 //! from its own count, overwriting any the caller supplied.
 //!
 //! It does not charge.  An append is a record of something that happened,
@@ -58,14 +72,15 @@ use serde_json::{Map, Value};
 
 use super::budget::{self, fold_balance, last_grant, BudgetGrant};
 use super::event::{
-    is_kernel_only, kernel_event, kind_of, seq_of, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL,
-    FIELD_KIND, FIELD_REASON, FIELD_REMAINING, FIELD_TAG, FIELD_TURN, KIND_BUDGET_GRANTED,
-    KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_MODEL_RESPONSE,
-    KIND_RUN_FINISHED, KIND_RUN_STARTED,
+    is_kernel_only, kernel_event, kind_of, seq_of, FIELD_AMOUNT, FIELD_BEAT, FIELD_DESC,
+    FIELD_DETAIL, FIELD_KIND, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG,
+    KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT,
+    KIND_MODEL_RESPONSE, KIND_RUN_FINISHED, KIND_RUN_STARTED,
 };
 use super::event_store::{EventStore, MemEventStore, UpcastingEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
-use super::{projection, Budget, KnlError, KnlResult};
+use super::scope::{Scope, ScopeId};
+use super::{projection, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
 pub const DEFAULT_CLOSE_REASON: &str = "closed";
@@ -84,19 +99,24 @@ pub const ANON: &str = "anon";
 /// Reserved owner: the session belongs to the system itself.
 pub const SYSTEM: &str = "system";
 
-/// Payload field the kernel records on `run_started` so a later
-/// [`Session::resume`] can recover the session's `owner` from the log.
+/// Payload field the kernel records on `run_started`, beside
+/// [`FIELD_SCOPE_ID`], so a later [`Session::resume`] can recover the run's
+/// scope — who it belonged to — from the log.
 ///
 /// `run_started` is an open-shape reserved kind (no required fields), so
 /// carrying this extra field needs no change to the event validator.
 const FIELD_OWNER: &str = "owner";
 
-/// A `budget_granted` event for `grant`.
+/// A `budget_granted` event for `grant`, written under `scope_id`.
 ///
 /// Only what the owner said is written — an absent `tag` is an absent
 /// field, not a null — so the record carries the grant and nothing more.
-fn granted_event(grant: &BudgetGrant) -> Map<String, Value> {
+fn granted_event(grant: &BudgetGrant, scope_id: &str) -> Map<String, Value> {
     let mut event = kernel_event(KIND_BUDGET_GRANTED);
+    event.insert(
+        FIELD_SCOPE_ID.to_string(),
+        Value::from(scope_id.to_string()),
+    );
     event.insert(FIELD_AMOUNT.to_string(), Value::from(grant.amount));
     if let Some(tag) = grant.tag.as_ref() {
         event.insert(FIELD_TAG.to_string(), Value::from(tag.clone()));
@@ -107,10 +127,24 @@ fn granted_event(grant: &BudgetGrant) -> Map<String, Value> {
     event
 }
 
-/// A `budget_reserved` / `budget_spent` event for `amount`, tagged with the
-/// grant's unit so the ledger reads without a join.
-fn budget_move_event(kind: &str, amount: i64, tag: Option<&str>) -> Map<String, Value> {
+/// A `budget_reserved` / `budget_spent` / `budget_refused` event for
+/// `amount`, written under `scope_id` and tagged with the grant's unit so
+/// the ledger reads without a join.
+///
+/// The scope id is on every move of the balance, not only on the run's
+/// opening: the ledger is the one part of the log that says what was
+/// *allowed*, so each entry names the authority it was allowed under.
+fn budget_move_event(
+    kind: &str,
+    amount: i64,
+    tag: Option<&str>,
+    scope_id: &str,
+) -> Map<String, Value> {
     let mut event = kernel_event(kind);
+    event.insert(
+        FIELD_SCOPE_ID.to_string(),
+        Value::from(scope_id.to_string()),
+    );
     event.insert(FIELD_AMOUNT.to_string(), Value::from(amount));
     if let Some(tag) = tag {
         event.insert(FIELD_TAG.to_string(), Value::from(tag.to_string()));
@@ -118,26 +152,23 @@ fn budget_move_event(kind: &str, amount: i64, tag: Option<&str>) -> Map<String, 
     event
 }
 
-/// One run scope.
+/// One run: a stream, and the scope it is written under.
 pub struct Session {
-    /// Run-correlation id, unique per session.
+    /// Run-correlation id, unique per session — the stream this session
+    /// writes.  Distinct from [`Scope::id`], which names the authority the
+    /// stream is written under.
     id: String,
-    /// Whose scope this is: a real principal id, or [`ANON`] / [`SYSTEM`].
-    /// Total — never absent, read by the policy layer above the kernel.
-    owner: String,
+    /// The run's scope: its kernel-issued id, its owner, and the budget an
+    /// owner granted it.  Held by value — a scope and its session begin and
+    /// end together, so there is nothing to point at.
+    scope: Scope,
     /// K1 append-only history, held behind the event-store SPI so the
     /// backend can be the in-memory store or the durable SQLite one.
     store: Box<dyn EventStore>,
-    /// K4 budget counter.
-    budget: Budget,
-    /// The grant this run opened with, kept for its words: a refused
-    /// [`Session::reserve`] hands the `tag` back so a caller can say which
-    /// allowance stopped it.  `None` when the run has no budget.
-    grant: Option<BudgetGrant>,
     /// Cached projection folds (derived, never authoritative).
     views: Views,
-    /// Model responses recorded so far: the turn number's authority.
-    turns: u64,
+    /// Model responses recorded so far: the beat number's authority.
+    beats: u64,
     /// The stream head this session has observed and writes against.
     ///
     /// The compare-and-swap expectation for the next [`append`] — *not* a
@@ -145,7 +176,7 @@ pub struct Session {
     /// this always equals the real head and every CAS succeeds.  A second
     /// session on the same stream keeps the head it last saw, so the moment
     /// another writer advances the real head this one goes stale and its next
-    /// append fails loud with a head-conflict instead of duplicating a turn.
+    /// append fails loud with a head-conflict instead of duplicating a beat.
     ///
     /// [`append`]: Session::append
     head: u64,
@@ -160,9 +191,8 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("id", &self.id)
-            .field("owner", &self.owner)
-            .field("budget", &self.budget)
-            .field("turns", &self.turns)
+            .field("scope", &self.scope)
+            .field("beats", &self.beats)
             .field("closed", &self.closed)
             .field("len", &self.store.len())
             .finish_non_exhaustive()
@@ -185,11 +215,12 @@ impl Session {
     ///
     /// Like [`Session::new`] but takes the backend, so the shell decides
     /// whether the log is ephemeral or persisted.  It appends the same
-    /// `run_started` boundary, recording the session's `owner` on it so a
-    /// later [`Session::resume`] can recover the principal from the log
-    /// alone — and the `grant`, so the log says what the owner allowed
-    /// this run.  `run_started` is an open-shape reserved kind, so both
-    /// extra fields are accepted without any change to the validator.
+    /// `run_started` boundary, recording the run's scope on it — the
+    /// kernel-issued [`ScopeId`] and the `owner` — so a later
+    /// [`Session::resume`] can recover the scope from the log alone, and
+    /// the `grant`, so the log says what the owner allowed this run.
+    /// `run_started` is an open-shape reserved kind, so both extra fields
+    /// are accepted without any change to the validator.
     pub fn open_on(
         owner: String,
         grant: Option<BudgetGrant>,
@@ -202,12 +233,12 @@ impl Session {
         let store: Box<dyn EventStore> = Box::new(UpcastingEventStore::new(store, Vec::new()));
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
-            owner,
+            // The scope is issued here, before the first event: the
+            // `run_started` below is already written under it.
+            scope: Scope::new(owner, grant),
             store,
-            budget: Budget::new(grant.as_ref().map(|g| g.amount)),
-            grant,
             views: Views::default(),
-            turns: 0,
+            beats: 0,
             // A fresh run opens on an empty stream: the first append (the
             // `run_started` below) CASes against head 0 (expect empty) and
             // advances the observed head to the seq it lands at.
@@ -221,8 +252,20 @@ impl Session {
         // error surfaces instead of leaving a run with no `run_started`.
         // The append advances `self.head` to the run_started's seq, so a
         // freshly opened session observes the head right after open.
+        //
+        // The scope rides on it: the id the kernel just issued, next to the
+        // owner.  Together they are the whole of what a resume needs to
+        // restore the scope, so the boundary is in the log and not only in
+        // this value.
         let mut started = kernel_event(KIND_RUN_STARTED);
-        started.insert(FIELD_OWNER.to_string(), Value::from(session.owner.clone()));
+        started.insert(
+            FIELD_OWNER.to_string(),
+            Value::from(session.scope.owner().to_string()),
+        );
+        started.insert(
+            FIELD_SCOPE_ID.to_string(),
+            Value::from(session.scope.id().to_string()),
+        );
         session.append_kernel(started)?;
 
         // The grant is its own fact, right after the boundary: what the
@@ -230,8 +273,9 @@ impl Session {
         // from, not a decoration on the run's opening.  A session that
         // could not record its own grant must not exist either — the error
         // surfaces rather than leaving a counter no event accounts for.
-        if let Some(grant) = session.grant.clone() {
-            session.append_kernel(granted_event(&grant))?;
+        if let Some(grant) = session.scope.grant().cloned() {
+            let event = granted_event(&grant, session.scope.id());
+            session.append_kernel(event)?;
         }
         Ok(session)
     }
@@ -243,10 +287,12 @@ impl Session {
     /// started.  It reads the whole log once and restores the run's state
     /// from it:
     ///
-    /// - `owner` from the first `run_started` event's [`FIELD_OWNER`] field,
-    ///   falling back to [`ANON`] for an older log written before it was
-    ///   recorded;
-    /// - the turn counter from the number of `model_response` events, so the
+    /// - the scope, from the first `run_started` event: its [`ScopeId`]
+    ///   ([`FIELD_SCOPE_ID`]) and its `owner` ([`FIELD_OWNER`]).  An older
+    ///   log written before either was recorded falls back — to a fresh
+    ///   kernel-issued scope id, and to [`ANON`] — rather than failing the
+    ///   resume;
+    /// - the beat counter from the number of `model_response` events, so the
     ///   kernel-owned numbering continues where it left off;
     /// - the balance, by folding the `budget_*` ledger
     ///   ([`fold_balance`]) — the counter is a cache of the log, so a
@@ -276,16 +322,23 @@ impl Session {
                 KnlError::new("resume: stream has no run to resume (no run_started event)")
             })?;
 
-        // The owner rides on `run_started`; an older log written before the
-        // field existed falls back to ANON — but only for a real `run_started`,
-        // never for an absent one.
+        // The scope rides on `run_started`; an older log written before
+        // either field existed falls back — the owner to ANON, the scope id
+        // to a fresh kernel-issued one (`Scope::restore` mints it) — but
+        // only for a real `run_started`, never for an absent one.  A run
+        // that predates a field is still a run, and refusing to resume it
+        // would lose the log rather than protect it.
         let owner = run_started
             .get(FIELD_OWNER)
             .and_then(Value::as_str)
             .unwrap_or(ANON)
             .to_string();
+        let scope_id: Option<ScopeId> = run_started
+            .get(FIELD_SCOPE_ID)
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
-        let turns = log
+        let beats = log
             .iter()
             .filter(|event| kind_of(event) == KIND_MODEL_RESPONSE)
             .count() as u64;
@@ -307,12 +360,10 @@ impl Session {
         // tag to report) even when the caller grants nothing new.
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
-            owner,
+            scope: Scope::restore(scope_id, owner, fold_balance(&log), last_grant(&log)),
             store,
-            budget: Budget::new(fold_balance(&log)),
-            grant: last_grant(&log),
             views: Views::default(),
-            turns,
+            beats,
             head,
             closed: false,
         };
@@ -322,9 +373,9 @@ impl Session {
         // lands first, and a failed append leaves the restored balance
         // exactly as the log describes it.
         if let Some(grant) = grant {
-            session.append_kernel(granted_event(&grant))?;
-            session.budget.grant(grant.amount)?;
-            session.grant = Some(grant);
+            let event = granted_event(&grant, session.scope.id());
+            session.append_kernel(event)?;
+            session.scope.grant_more(grant)?;
         }
         Ok(session)
     }
@@ -340,15 +391,35 @@ impl Session {
     /// stream it writes to share one id: `open_on` / `resume` mint a fresh
     /// id like `new`, and the bridge overrides it to the stream it opened,
     /// so the id a caller resumes by *is* the stream.  `run_started` records
-    /// the `owner`, not the id, so overriding the id does not desync the log.
+    /// the scope (its id and the `owner`), never the session id, so
+    /// overriding the id does not desync the log.
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub(crate) fn adopt_id(&mut self, id: impl Into<String>) {
         self.id = id.into();
     }
 
+    /// The scope this run is written under.
+    ///
+    /// The scope and the session are two things with one lifetime: this is
+    /// the authority half — the id, the owner, the granted quota — while the
+    /// session is the stream.  [`Session::owner`] / [`Session::scope_id`]
+    /// read through to it for the two call sites that want one field.
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// The scope's kernel-issued id, as recorded on `run_started` and on
+    /// every `budget_*` event.
+    ///
+    /// Not the session id: [`Session::id`] names the stream, this names the
+    /// authority the stream is written under.
+    pub fn scope_id(&self) -> &str {
+        self.scope.id()
+    }
+
     /// Whose scope this is (a principal id, or [`ANON`] / [`SYSTEM`]).
     pub fn owner(&self) -> &str {
-        &self.owner
+        self.scope.owner()
     }
 
     /// Record an event, returning its `seq`.  The one write path.
@@ -358,7 +429,7 @@ impl Session {
     /// are stamped here and overwrite any caller-supplied value.
     ///
     /// A `model_response` is numbered as it is recorded: the kernel assigns
-    /// the `turn` from its own count, overwriting whatever the caller put
+    /// the `beat` from its own count, overwriting whatever the caller put
     /// there — the number is kernel-owned, like `seq`.
     ///
     /// No append moves the budget, this one included.  What a call may
@@ -378,7 +449,7 @@ impl Session {
     /// a second session on the same stream keeps the head it last saw: the
     /// moment the first writes, the second's observed head is stale, and its
     /// next append fails loud with a head-conflict rather than reading the
-    /// already-advanced head and silently duplicating a turn.
+    /// already-advanced head and silently duplicating a beat.
     pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         // The budget ledger is the kernel's to write: the balance is a fold
         // of those events, so accepting one from a caller would be letting
@@ -418,19 +489,19 @@ impl Session {
             return Ok(committed.seq);
         }
 
-        // Kernel-owned turn, assigned before the event is stored so the
+        // Kernel-owned beat, assigned before the event is stored so the
         // record carries the number the run will refer to it by.
-        let turn = self.next_turn();
-        event.insert(FIELD_TURN.to_string(), Value::from(turn));
+        let beat = self.next_beat();
+        event.insert(FIELD_BEAT.to_string(), Value::from(beat));
 
         // Validate + stamp + push, guarded by the observed head.  A malformed
         // response is rejected, and an observed head another writer has moved
         // past is a head-conflict error — either way the observed head and the
-        // turn counter are left untouched, advancing only after the append
+        // beat counter are left untouched, advancing only after the append
         // actually lands.
         let committed = self.store.append_if_head(event, self.head)?;
         self.head = committed.seq;
-        self.turns = turn;
+        self.beats = beat;
         Ok(committed.seq)
     }
 
@@ -477,24 +548,27 @@ impl Session {
         }
         budget::check_amount(amount)?;
         // No budget, no ledger: nothing to decide and nothing to record.
-        let Some(tag) = self.grant.as_ref().map(|g| g.tag.clone()) else {
+        let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
             return Ok(true);
         };
 
-        let remaining = self.budget.remaining().unwrap_or(0);
+        let remaining = self.scope.remaining().unwrap_or(0);
         if remaining < amount {
-            let mut event = budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref());
+            let mut event =
+                budget_move_event(KIND_BUDGET_REFUSED, amount, tag.as_deref(), self.scope.id());
             event.insert(FIELD_REMAINING.to_string(), Value::from(remaining));
             self.append_kernel(event)?;
             return Ok(false);
         }
 
-        self.append_kernel(budget_move_event(
+        let event = budget_move_event(
             KIND_BUDGET_RESERVED,
             amount,
             tag.as_deref(),
-        ))?;
-        self.budget.reserve(amount)
+            self.scope.id(),
+        );
+        self.append_kernel(event)?;
+        self.scope.reserve(amount)
     }
 
     /// Settle `amount` against the budget, returning the new balance.
@@ -508,11 +582,12 @@ impl Session {
             return Err(KnlError::new("session is closed"));
         }
         budget::check_amount(amount)?;
-        let Some(tag) = self.grant.as_ref().map(|g| g.tag.clone()) else {
+        let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
             return Ok(None);
         };
-        self.append_kernel(budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref()))?;
-        self.budget.spend(amount)
+        let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), self.scope.id());
+        self.append_kernel(event)?;
+        self.scope.spend(amount)
     }
 
     /// The grant this run opened (or resumed) with, if any.
@@ -521,36 +596,36 @@ impl Session {
     /// is refused.  The kernel itself reads only `amount`, and only once,
     /// when the counter is built.
     pub fn grant(&self) -> Option<&BudgetGrant> {
-        self.grant.as_ref()
+        self.scope.grant()
     }
 
-    /// The turn number the next recorded model response will carry.
+    /// The beat number the next recorded model response will carry.
     ///
     /// Also the number a *failed* call names in its `model_call_failed`
     /// event: the failure does not consume it, so the next success takes
-    /// the same one and the successful turns stay 1, 2, 3 … without gaps.
+    /// the same one and the successful beats stay 1, 2, 3 … without gaps.
     ///
     /// A counter, not a scan of the history: it advances in
     /// [`Session::append`]'s `model_response` branch and nowhere else, so
-    /// the `turn` field of an appended event — whatever it says — cannot
+    /// the `beat` field of an appended event — whatever it says — cannot
     /// renumber the run.
-    pub fn next_turn(&self) -> u64 {
-        self.turns.saturating_add(1)
+    pub fn next_beat(&self) -> u64 {
+        self.beats.saturating_add(1)
     }
 
     /// How many model responses this session has recorded.
-    pub fn turns(&self) -> u64 {
-        self.turns
+    pub fn beats(&self) -> u64 {
+        self.beats
     }
 
     /// The remaining balance (`None` without a budget).
     pub fn remaining(&self) -> Option<i64> {
-        self.budget.remaining()
+        self.scope.remaining()
     }
 
     /// Whether the budget is used up.
     pub fn exhausted(&self) -> bool {
-        self.budget.exhausted()
+        self.scope.exhausted()
     }
 
     /// Whether the run scope has ended.
@@ -694,6 +769,81 @@ mod tests {
         assert_eq!(seq_of(&events[0]), 1);
         assert!(!s.is_closed());
         assert!(!s.id().is_empty());
+    }
+
+    /// The scope is issued when the run opens, and it is not the session:
+    /// two ids, both real, and neither taken from a caller.  Two runs are
+    /// two scopes.
+    #[test]
+    fn open_issues_a_scope_id_distinct_from_the_session_id() {
+        let a = new_session(None);
+        let b = new_session(None);
+
+        assert!(!a.scope_id().is_empty(), "a run opens under a scope");
+        assert!(!a.id().is_empty());
+        assert_ne!(
+            a.scope_id(),
+            a.id(),
+            "the scope id names the authority, the session id names the stream"
+        );
+        assert_eq!(a.scope().id(), a.scope_id(), "the delegate reads the scope");
+        assert_eq!(a.scope().owner(), a.owner(), "and so does the owner");
+
+        assert_ne!(a.scope_id(), b.scope_id(), "two runs, two scopes");
+        assert_ne!(a.id(), b.id());
+    }
+
+    /// The scope is in the log, not only in the value: it rides on the run's
+    /// opening and on every entry of the ledger, so a reader can tell whose
+    /// authority each move of the balance was made under.
+    #[test]
+    fn run_started_and_every_budget_event_carry_the_scope_id() {
+        let mut s = new_session(Some(100));
+        assert_eq!(s.reserve(30), Ok(true));
+        s.spend(10).expect("spend");
+        assert_eq!(s.reserve(10_000), Ok(false));
+
+        let scope_id = s.scope_id().to_string();
+        let events = s.events(0).expect("events");
+
+        let started = &events[0];
+        assert_eq!(kind_of(started), KIND_RUN_STARTED);
+        assert_eq!(
+            started.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            Some(scope_id.as_str()),
+            "the scope rides on run_started: {started}"
+        );
+        assert_eq!(
+            started.get("owner").and_then(Value::as_str),
+            Some(ANON),
+            "beside the owner: {started}"
+        );
+
+        let moves = ledger(&s);
+        let kinds: Vec<&str> = moves.iter().map(kind_of).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_RESERVED,
+                KIND_BUDGET_SPENT,
+                KIND_BUDGET_REFUSED,
+            ],
+            "every kind of move is exercised"
+        );
+        for event in &moves {
+            assert_eq!(
+                event.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+                Some(scope_id.as_str()),
+                "a ledger entry must name the scope it was allowed under: {event}"
+            );
+        }
+
+        // An event a caller appends carries no scope id: the field is the
+        // kernel's, on the kinds only the kernel writes.
+        s.append(obj(json!({ "kind": "note" }))).expect("append");
+        let note = s.events(0).expect("events").pop().expect("note");
+        assert_eq!(note.get(FIELD_SCOPE_ID), None, "{note}");
     }
 
     #[test]
@@ -840,8 +990,8 @@ mod tests {
         let seq = s
             .append(obj(json!({
                 "kind": "model_response",
-                // A turn the caller supplied is ignored: the kernel owns it.
-                "turn": 99,
+                // A beat the caller supplied is ignored: the kernel owns it.
+                "beat": 99,
                 "content": [{ "type": "text", "text": "hi" }],
                 "usage": { "input_tokens": 20, "output_tokens": 10 }
             })))
@@ -853,9 +1003,9 @@ mod tests {
             .pop()
             .expect("model_response");
         assert_eq!(kind_of(&recorded), KIND_MODEL_RESPONSE);
-        assert_eq!(recorded[FIELD_TURN], json!(1), "the kernel numbered it 1");
+        assert_eq!(recorded[FIELD_BEAT], json!(1), "the kernel numbered it 1");
 
-        assert_eq!(s.turns(), 1);
+        assert_eq!(s.beats(), 1);
         assert_eq!(s.remaining(), Some(100), "an append must not charge");
         assert_eq!(
             ledger(&s).len(),
@@ -1043,38 +1193,38 @@ mod tests {
         let mut s = new_session(Some(100));
         s.append(response(30)).expect("recorded");
 
-        assert_eq!(s.turns(), 1);
+        assert_eq!(s.beats(), 1);
         assert_eq!(s.remaining(), Some(100));
         assert!(!s.exhausted());
 
         let recorded = s.events(3).expect("events").pop().expect("model_response");
         assert_eq!(kind_of(&recorded), "model_response");
-        assert_eq!(recorded[FIELD_TURN], json!(1));
+        assert_eq!(recorded[FIELD_BEAT], json!(1));
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
         assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["input_tokens"], 30);
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
     }
 
     #[test]
-    fn turns_are_numbered_by_the_kernel_over_the_recorded_responses() {
+    fn beats_are_numbered_by_the_kernel_over_the_recorded_responses() {
         let mut s = new_session(None);
-        assert_eq!(s.next_turn(), 1);
+        assert_eq!(s.next_beat(), 1);
 
         s.append(response(1)).expect("first");
-        assert_eq!(s.turns(), 1);
+        assert_eq!(s.beats(), 1);
 
         // An open-kind event between responses does not advance the counter.
         s.append(obj(
-            json!({ "kind": "model_call_failed", "turn": 2, "error": "boom" }),
+            json!({ "kind": "model_call_failed", "beat": 2, "error": "boom" }),
         ))
         .expect("note");
-        assert_eq!(s.turns(), 1, "a non-response must not advance the counter");
-        assert_eq!(s.next_turn(), 2);
+        assert_eq!(s.beats(), 1, "a non-response must not advance the counter");
+        assert_eq!(s.next_beat(), 2);
 
         s.append(response(1)).expect("second");
-        assert_eq!(s.turns(), 2);
+        assert_eq!(s.beats(), 2);
         s.append(response(1)).expect("third");
-        assert_eq!(s.turns(), 3);
+        assert_eq!(s.beats(), 3);
     }
 
     #[test]
@@ -1091,7 +1241,7 @@ mod tests {
             "run_started + budget_granted + run_finished only"
         );
         assert_eq!(s.remaining(), Some(100), "nothing was consumed");
-        assert_eq!(s.turns(), 0);
+        assert_eq!(s.beats(), 0);
     }
 
     /// The budget stops a run *before* it spends, not after: a reservation
@@ -1112,14 +1262,14 @@ mod tests {
         // The next beat asks first and is turned away, so no second
         // response is recorded: the caller never made the call.
         assert_eq!(s.reserve(1), Ok(false));
-        assert_eq!(s.turns(), 1, "the refused beat made no call");
+        assert_eq!(s.beats(), 1, "the refused beat made no call");
         assert_eq!(s.remaining(), Some(0));
         assert_eq!(folded(&s), s.remaining());
 
         // The kernel still does not police it: a caller that ignores the
         // refusal can append anyway, and the history says that it did.
         s.append(response(5)).expect("recorded");
-        assert_eq!(s.turns(), 2, "stopping is the caller's decision");
+        assert_eq!(s.beats(), 2, "stopping is the caller's decision");
     }
 
     #[test]
@@ -1183,12 +1333,12 @@ mod tests {
         assert_eq!(events[1]["amount"], json!(100));
     }
 
-    /// Resume re-folds a persisted SQLite stream: the turn counter, the
+    /// Resume re-folds a persisted SQLite stream: the beat counter, the
     /// owner and the *balance* all come back from the log, because every
     /// move of the balance is in it.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn resume_restores_turn_owner_and_the_folded_balance() {
+    fn resume_restores_beat_owner_and_the_folded_balance() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1207,7 +1357,7 @@ mod tests {
             assert_eq!(s.reserve(15), Ok(true));
             s.append(response(20)).expect("second response");
             s.spend(5).expect("the second call overran its estimate");
-            assert_eq!(s.turns(), 2);
+            assert_eq!(s.beats(), 2);
             assert_eq!(s.remaining(), Some(50), "100 - 30 - 15 - 5");
             assert_eq!(folded(&s), s.remaining());
             s.remaining()
@@ -1223,7 +1373,7 @@ mod tests {
             "user-42",
             "owner restored from run_started"
         );
-        assert_eq!(resumed.turns(), 2, "turn counter restored");
+        assert_eq!(resumed.beats(), 2, "beat counter restored");
         assert_eq!(
             resumed.remaining(),
             before_close,
@@ -1257,11 +1407,11 @@ mod tests {
             .pop()
             .expect("model_response");
         assert_eq!(
-            recorded[FIELD_TURN],
+            recorded[FIELD_BEAT],
             json!(3),
             "numbering continues from the restored count"
         );
-        assert_eq!(resumed.turns(), 3);
+        assert_eq!(resumed.beats(), 3);
         assert_eq!(resumed.remaining(), Some(45), "5 reserved off the 50");
         assert_eq!(folded(&resumed), resumed.remaining());
     }
@@ -1342,8 +1492,97 @@ mod tests {
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(None, Box::new(store)).expect("resume");
         assert_eq!(resumed.owner(), ANON);
-        assert_eq!(resumed.turns(), 0);
+        assert_eq!(resumed.beats(), 0);
         assert_eq!(resumed.remaining(), None, "resumed without a budget cap");
+    }
+
+    /// Resume restores the *scope*, not just a fresh one: the id and the
+    /// owner come back off `run_started`, so the run continues under the
+    /// authority the log says it opened with, and the ledger it goes on
+    /// writing names that same scope.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_restores_the_scope_id_and_owner_from_the_log() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "scope-resume-stream";
+
+        let opened_scope = {
+            let store = SqliteEventStore::open(&path, stream).expect("open");
+            let mut s = Session::open_on("user-11".to_string(), Some(grant(100)), Box::new(store))
+                .expect("open");
+            assert_eq!(s.reserve(40), Ok(true));
+            s.scope_id().to_string()
+        };
+
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let mut resumed = Session::resume(None, Box::new(store)).expect("resume");
+        assert_eq!(
+            resumed.scope_id(),
+            opened_scope,
+            "the scope id is restored from run_started, not re-issued"
+        );
+        assert_eq!(resumed.owner(), "user-11");
+        assert_eq!(resumed.scope().owner(), "user-11");
+        assert_eq!(resumed.remaining(), Some(60), "the balance is the fold's");
+
+        // What the resumed run records goes on naming the same scope.
+        assert_eq!(resumed.reserve(10), Ok(true));
+        let last = ledger(&resumed).pop().expect("budget_reserved");
+        assert_eq!(kind_of(&last), KIND_BUDGET_RESERVED);
+        assert_eq!(
+            last.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            Some(opened_scope.as_str()),
+            "{last}"
+        );
+    }
+
+    /// An older log with no `scope_id` on `run_started` resumes under a
+    /// fresh kernel-issued one rather than failing — the field is a later
+    /// addition, exactly like `owner` above, and a run that predates it is
+    /// still a run.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn resume_issues_a_fresh_scope_id_when_the_log_records_none() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "legacy-scope-stream";
+
+        // An old-style opening: a run_started carrying neither field.
+        {
+            let mut store = SqliteEventStore::open(&path, stream).expect("open");
+            store
+                .append(kernel_event(KIND_RUN_STARTED))
+                .expect("run_started");
+        }
+
+        let store = SqliteEventStore::open(&path, stream).expect("reopen");
+        let resumed = Session::resume(Some(grant(50)), Box::new(store)).expect("resume");
+
+        // The fallback is visible from both sides: the log says nothing…
+        let started = resumed.events(0).expect("events").remove(0);
+        assert_eq!(kind_of(&started), KIND_RUN_STARTED);
+        assert_eq!(started.get(FIELD_SCOPE_ID), None, "{started}");
+        assert_eq!(started.get("owner"), None, "{started}");
+        // …and the resumed run has a real scope all the same.
+        assert!(
+            !resumed.scope_id().is_empty(),
+            "an older log must still resume under a scope"
+        );
+        assert_eq!(resumed.owner(), ANON, "the sibling fallback");
+
+        // And it is the one everything written from here on names.
+        let granted = ledger(&resumed).pop().expect("budget_granted");
+        assert_eq!(kind_of(&granted), KIND_BUDGET_GRANTED);
+        assert_eq!(
+            granted.get(FIELD_SCOPE_ID).and_then(Value::as_str),
+            Some(resumed.scope_id()),
+            "{granted}"
+        );
     }
 
     /// (Fix 5) Resuming an empty log is a caller error — a mistyped or
@@ -1423,10 +1662,10 @@ mod tests {
 
     /// (Fix 1) `Session::append` is a compare-and-swap on the head: a second
     /// writer landing between the head read and the write makes the append a
-    /// stale CAS, which fails loud instead of silently duplicating a turn —
-    /// and neither the turn counter nor the budget move on the failure.
+    /// stale CAS, which fails loud instead of silently duplicating a beat —
+    /// and neither the beat counter nor the budget move on the failure.
     #[test]
-    fn append_cas_rejects_a_stale_writer_without_duplicating_a_turn() {
+    fn append_cas_rejects_a_stale_writer_without_duplicating_a_beat() {
         // Single-writer construction is unaffected: run_started lands as usual.
         let store = RacyStore {
             inner: MemEventStore::new(),
@@ -1439,7 +1678,7 @@ mod tests {
             2,
             "run_started + budget_granted so far"
         );
-        assert_eq!(s.turns(), 0);
+        assert_eq!(s.beats(), 0);
 
         // The CAS sees a head advanced by the injected competing writer.
         let err = s
@@ -1447,11 +1686,11 @@ mod tests {
             .expect_err("a stale CAS must fail loud");
         assert!(err.reason().contains("head conflict"), "{}", err.reason());
 
-        // Neither the turn counter nor the budget moved: the append did not land.
-        assert_eq!(s.turns(), 0, "a failed CAS must not advance the turn");
+        // Neither the beat counter nor the budget moved: the append did not land.
+        assert_eq!(s.beats(), 0, "a failed CAS must not advance the beat");
         assert_eq!(s.remaining(), Some(1000), "a failed CAS must not consume");
 
-        // No model_response reached the log — no duplicate turn was written.
+        // No model_response reached the log — no duplicate beat was written.
         let log = s.events(0).expect("events");
         let responses = log
             .iter()
@@ -1488,15 +1727,15 @@ mod tests {
     /// observing the same head `H`.  Session A appends a response, so the head
     /// advances; Session B — whose observed head is still `H`, from *before* A's
     /// write — appends a response and MUST get a head-conflict, write nothing,
-    /// and leave no duplicate turn in the log.
+    /// and leave no duplicate beat in the log.
     ///
     /// This is the exact bug a fresh `self.store.head()` read would *not* catch:
     /// B would read the already-advanced head, its CAS would match, and it would
-    /// silently write a second event carrying the same turn.  CASing against the
+    /// silently write a second event carrying the same beat.  CASing against the
     /// head each session *observed* is what makes B's stale write fail loud.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn two_sessions_interleaving_on_one_stream_conflict_without_duplicating_a_turn() {
+    fn two_sessions_interleaving_on_one_stream_conflict_without_duplicating_a_beat() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1508,7 +1747,7 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream).expect("open A");
         let mut a = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store_a))
             .expect("open A");
-        assert_eq!(a.turns(), 0);
+        assert_eq!(a.beats(), 0);
 
         // B resumes the SAME stream while it holds only those two, so B
         // observes the same head 2 — genuinely from before A's write, not
@@ -1516,25 +1755,25 @@ mod tests {
         // nothing new (a second grant would be a second write).
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(b.turns(), 0);
+        assert_eq!(b.beats(), 0);
         assert_eq!(b.remaining(), Some(1000), "B resumed on A's ledger");
 
         // A appends a model_response: its observed head still matches the real
-        // one, so it lands (seq 3, turn 1) and A advances its observed head.
+        // one, so it lands (seq 3, beat 1) and A advances its observed head.
         let a_seq = a.append(response(10)).expect("A appends");
         assert_eq!(a_seq, 3);
-        assert_eq!(a.turns(), 1);
+        assert_eq!(a.beats(), 1);
 
         // B's observed head is still 2 — it never saw A's write — so its CAS is
-        // stale: a head-conflict, with no write, no charge, and no turn advance.
+        // stale: a head-conflict, with no write, no charge, and no beat advance.
         let err = b
             .append(response(20))
             .expect_err("B's stale observed head must conflict");
         assert!(err.reason().contains("head conflict"), "{}", err.reason());
         assert_eq!(
-            b.turns(),
+            b.beats(),
             0,
-            "a conflicting append must not advance B's turn"
+            "a conflicting append must not advance B's beat"
         );
         assert_eq!(
             b.remaining(),
@@ -1551,7 +1790,7 @@ mod tests {
         assert_eq!(b.remaining(), Some(1000), "a failed CAS must not deduct");
 
         // The durable log: exactly one event past H = 2 (A's response at seq 3)
-        // and exactly one model_response, numbered turn 1 — no duplicate.
+        // and exactly one model_response, numbered beat 1 — no duplicate.
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         let log = verify.read(0, usize::MAX).expect("read log");
         let past_h: Vec<_> = log.iter().filter(|e| seq_of(e) > 2).collect();
@@ -1563,12 +1802,12 @@ mod tests {
         assert_eq!(
             responses.len(),
             1,
-            "no duplicate turn: one model_response only"
+            "no duplicate beat: one model_response only"
         );
         assert_eq!(
-            responses[0][FIELD_TURN],
+            responses[0][FIELD_BEAT],
             json!(1),
-            "the single recorded response is turn 1"
+            "the single recorded response is beat 1"
         );
     }
 }

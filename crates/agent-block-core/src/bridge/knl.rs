@@ -21,11 +21,17 @@
 //!   a caller that mutates a returned value cannot reach recorded state.
 //!   `seq` and `epoch_ms` are assigned by the kernel and overwrite any
 //!   caller-supplied field of the same name; so is a `model_response`'s
-//!   `turn`.
-//! - **Scope is the session.**  There is no per-event author.  The session
-//!   carries one `owner` (a principal id, or the reserved "anon" /
-//!   "system"), read with `s:owner()`, and holds only its own events — so
-//!   `view("usage")` and the turn numbering key on the `kind`: they count
+//!   `beat`.
+//! - **A session has a scope.**  The two are different things sharing one
+//!   lifetime: the session is the stream (`s:id()`), the scope is the
+//!   authority it is written under — a kernel-issued scope id (`s:scope_id()`)
+//!   and the principal it belongs to (`s:owner()`, a real id or the reserved
+//!   "anon" / "system").  Neither id is a caller's to choose, and they are
+//!   not each other: `s:id()` names the stream a `knl.resume` reopens.  The
+//!   scope id is recorded on `run_started` and on every `budget_*` event, so
+//!   the boundary is readable — and unforgeable — from the log alone.  There
+//!   is no per-event author: a session holds only its own events, so
+//!   `view("usage")` and the beat numbering key on the `kind`: they count
 //!   every `model_response`.  Appending a `model_response` records and
 //!   numbers it, and appending a `run_finished` records a line without
 //!   ending a run that only `close` can end.
@@ -66,7 +72,7 @@
 //! local ok, tag = s:reserve(est)
 //! if not ok then return { budget_stopped = true, tag = tag } end
 //! s:append({ kind = "model_response", content = blocks, usage = u })
-//! local turn = s:turns()                 -- the kernel-assigned turn
+//! local beat = s:beats()                 -- the kernel-assigned beat
 //! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
 //! local usage  = s:view("usage")         -- token totals + `at_seq`
@@ -85,7 +91,7 @@
 //! `{ sqlite = "<path>" }` opens a durable, per-session SQLite stream (only
 //! in a build with the `sqlite` feature).  `knl.resume({ store = { sqlite =
 //! "<path>" }, session = "<id>", budget? })` reopens a persisted stream and
-//! re-folds it, so a resumed session takes new turns whose numbering and
+//! re-folds it, so a resumed session takes new beats whose numbering and
 //! accounting continue from the recorded state — it behaves exactly like a
 //! fresh session, only pre-loaded.
 //!
@@ -245,27 +251,37 @@ impl LuaUserData for Session {
         // s:id() -> string
         methods.add_method("id", |_, this, ()| Ok(this.state.borrow().id().to_string()));
 
+        // s:scope_id() -> string
+        //
+        // The kernel-issued id of the scope this run is written under, as
+        // recorded on `run_started` and on every `budget_*` event.  Not
+        // `s:id()`: that names the stream, this names the authority the
+        // stream is written under, and neither is a caller's to choose.
+        methods.add_method("scope_id", |_, this, ()| {
+            Ok(this.state.borrow().scope_id().to_string())
+        });
+
         // s:owner() -> string
         //
-        // The principal the session belongs to (a real id, or the reserved
+        // The principal the scope belongs to (a real id, or the reserved
         // "anon" / "system").  Total — never nil.
         methods.add_method("owner", |_, this, ()| {
             Ok(this.state.borrow().owner().to_string())
         });
 
-        // s:turns() -> number of model responses recorded so far
+        // s:beats() -> number of model responses recorded so far
         //
-        // Also the turn the last `model_response` append was numbered with:
-        // after appending one, this is the kernel-assigned turn the shell
+        // Also the beat the last `model_response` append was numbered with:
+        // after appending one, this is the kernel-assigned beat the shell
         // stamps onto its `tool_call` / `tool_result` events.
-        methods.add_method("turns", |_, this, ()| Ok(this.state.borrow().turns()));
+        methods.add_method("beats", |_, this, ()| Ok(this.state.borrow().beats()));
 
         // s:append(event) -> seq
         //
         // K1: the only way to add to the history, and there is no way to
         // change what is already in it.  Appending a `model_response`
-        // numbers it (the kernel's turn, overwriting any the caller
-        // supplied); read the number back with `s:turns()`.  No append
+        // numbers it (the kernel's beat, overwriting any the caller
+        // supplied); read the number back with `s:beats()`.  No append
         // touches the budget — that is `reserve` before the call and
         // `spend` after it.
         methods.add_method("append", |lua, this, event: LuaValue| {
@@ -723,7 +739,7 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
 /// "<stream id>"`.  `opts.budget` is optional and means the owner grants
 /// *again*: it is recorded and added to the balance the log already
 /// carries, rather than replacing it.  The returned userdata is the same
-/// one `knl.open` returns, only pre-loaded with the recorded turn count
+/// one `knl.open` returns, only pre-loaded with the recorded beat count
 /// and the balance folded from the ledger.
 fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
@@ -1289,14 +1305,14 @@ mod tests {
 
         let msg = expect_err(
             &lua,
-            r#"knl.open():append({ kind = "tool_result", turn = 1, call_id = "c", ok = "yes", result = 1 })"#,
+            r#"knl.open():append({ kind = "tool_result", beat = 1, call_id = "c", ok = "yes", result = 1 })"#,
         );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("a boolean"), "{msg}");
 
         let msg = expect_err(
             &lua,
-            r#"knl.open():append({ kind = "tool_call", turn = 1, call_id = "c1", args = {} })"#,
+            r#"knl.open():append({ kind = "tool_call", beat = 1, call_id = "c1", args = {} })"#,
         );
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("name"), "{msg}");
@@ -1309,9 +1325,9 @@ mod tests {
 
             -- The documented shapes are accepted.
             s:append({ kind = "msg_user", content = "hi" })
-            s:append({ kind = "tool_call", turn = 1, call_id = "c1",
+            s:append({ kind = "tool_call", beat = 1, call_id = "c1",
                        name = "sh", args = { cmd = "ls" } })
-            s:append({ kind = "tool_result", turn = 1, call_id = "c1",
+            s:append({ kind = "tool_result", beat = 1, call_id = "c1",
                        ok = false, result = "boom" })
             assert(s:len() == 4)
         "#,
@@ -1637,9 +1653,92 @@ mod tests {
         .expect("reserved-owner chunk");
     }
 
+    /// (scope) A session has a scope: `s:scope_id()` is a real kernel-issued
+    /// string, it is not the session id, and it is what `run_started` and
+    /// every `budget_*` event were written under.  Two runs are two scopes.
+    #[test]
+    fn a_session_reports_its_scope_id_and_records_it_on_the_log() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ owner = "alice", budget = { amount = 100, tag = "tokens" } })
+            local scope = s:scope_id()
+            assert(type(scope) == "string" and #scope > 0, "scope_id must be a non-empty string")
+            assert(scope ~= s:id(), "the scope names the authority, the id names the stream")
+
+            s:reserve(30)     -- budget_reserved
+            s:spend(10)       -- budget_spent
+            s:reserve(10000)  -- budget_refused
+
+            local seen = 0
+            for _, e in ipairs(s:events()) do
+                if e.kind == "run_started" then
+                    assert(e.scope_id == scope, "run_started scope_id: " .. tostring(e.scope_id))
+                    assert(e.owner == "alice", "the owner rides beside it")
+                    seen = seen + 1
+                elseif e.kind:sub(1, 7) == "budget_" then
+                    assert(e.scope_id == scope,
+                           e.kind .. " scope_id: " .. tostring(e.scope_id))
+                    seen = seen + 1
+                end
+            end
+            assert(seen == 5,
+                   "run_started + granted + reserved + spent + refused: " .. tostring(seen))
+
+            -- A caller's own event carries no scope id: the field is on the
+            -- kinds only the kernel writes.
+            s:append({ kind = "note" })
+            local evs = s:events()
+            assert(evs[#evs].scope_id == nil, "a caller's event must not carry a scope id")
+
+            assert(knl.open({ owner = "bob" }):scope_id() ~= scope,
+                   "two runs must be two scopes")
+        "#,
+        )
+        .exec()
+        .expect("scope id chunk");
+    }
+
+    /// (scope, durable) The scope outlives the process: a reopened stream
+    /// resumes under the id its `run_started` recorded — not a fresh one —
+    /// and the ledger it goes on writing names that same scope.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_resumed_session_keeps_the_scope_id_the_log_recorded() {
+        let lua = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path = path.to_str().expect("utf-8 path");
+
+        lua.load(format!(
+            r#"
+            local path = "{path}"
+            local s = knl.open({{ store = {{ sqlite = path }}, owner = "scoped-user",
+                                  budget = {{ amount = 100, tag = "tokens" }} }})
+            local id, scope = s:id(), s:scope_id()
+            assert(scope ~= id, "the scope id is not the stream id")
+            s:reserve(20)
+            s:close()
+
+            local r = knl.resume({{ store = {{ sqlite = path }}, session = id }})
+            assert(r:id() == id, "resumed id is the stream it reopened")
+            assert(r:scope_id() == scope, "resumed scope: " .. tostring(r:scope_id()))
+            assert(r:owner() == "scoped-user", "resumed owner: " .. tostring(r:owner()))
+
+            r:reserve(5)
+            local evs = r:events()
+            local last = evs[#evs]
+            assert(last.kind == "budget_reserved", "last kind: " .. tostring(last.kind))
+            assert(last.scope_id == scope, "continued scope_id: " .. tostring(last.scope_id))
+        "#
+        ))
+        .exec()
+        .expect("durable scope chunk");
+    }
+
     /// (durable) `knl.open({ store = { sqlite = path } })` writes to a
     /// persisted stream, and `knl.resume` reopens it and re-folds the
-    /// record: owner, turn count, the balance the budget ledger implies and
+    /// record: owner, beat count, the balance the budget ledger implies and
     /// the usage view all come back, and the resumed run carries on from
     /// there.  A `budget` on resume is the owner granting again: recorded,
     /// and added to what was left.
@@ -1666,7 +1765,7 @@ mod tests {
                         content = {{ {{ type = "text", text = "b" }} }},
                         usage = {{ input_tokens = 20 }} }})
             s:spend(5)  -- the second call overran its estimate
-            assert(s:turns() == 2, "open turns: " .. tostring(s:turns()))
+            assert(s:beats() == 2, "open beats: " .. tostring(s:beats()))
             assert(s:remaining() == 50, "open remaining: " .. tostring(s:remaining()))
             local id = s:id()
             s:close()
@@ -1675,7 +1774,7 @@ mod tests {
             -- grant: the balance is what the ledger says was left.
             local r = knl.resume({{ store = {{ sqlite = path }}, session = id }})
             assert(r:owner() == "durable-user", "resumed owner: " .. tostring(r:owner()))
-            assert(r:turns() == 2, "resumed turns: " .. tostring(r:turns()))
+            assert(r:beats() == 2, "resumed beats: " .. tostring(r:beats()))
             assert(r:remaining() == 50, "resumed remaining: " .. tostring(r:remaining()))
             assert(r:id() == id, "resumed id is the stream it reopened")
             local u = r:view("usage")
@@ -1691,7 +1790,7 @@ mod tests {
             r:append({{ kind = "model_response",
                         content = {{ {{ type = "text", text = "c" }} }},
                         usage = {{ input_tokens = 5 }} }})
-            assert(r:turns() == 3, "continued turns: " .. tostring(r:turns()))
+            assert(r:beats() == 3, "continued beats: " .. tostring(r:beats()))
             assert(r:remaining() == 45, "continued remaining: " .. tostring(r:remaining()))
             r:close()
 

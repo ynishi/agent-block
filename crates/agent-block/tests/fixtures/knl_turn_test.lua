@@ -10,10 +10,12 @@
 -- surface (core-loop-design.md: run is gone — a loop is written by the
 -- caller on the spot):
 --   inv1 Outcome 3-values + predicates + match loud fail
---   inv2 the beat turns (write-ahead: request event before model_response)
+--   inv2 the beat runs (write-ahead: reservation, then the request event,
+--        then the model_response)
 --   inv3 the tool pair (known tool runs; unknown tool closes ok=false)
 --   inv4 the request event is in the store and readable via events()
---   inv5 budget stop (beat-level Ok, and a caller loop stops on it)
+--   inv5 budget stop (a refused reservation is a beat-level Ok that made no
+--        call, and a caller loop stops on it)
 --   inv6 loop composition (a self-written while-beat loop settles on a
 --        plain answer and is bounded by the caller's own cap)
 --   inv7 fold's three-kind mapping + tool_result attribution
@@ -152,13 +154,13 @@ do
         { kind = "msg_user", content = "hi", seq = 2 },
         {
             kind = "model_response",
-            turn = 1,
+            beat = 1,
             content = { { type = "text", text = "a" }, tool_use("c1", "t", {}) },
             seq = 3,
         },
-        { kind = "tool_call", turn = 1, call_id = "c1", seq = 4 },
-        { kind = "tool_result", turn = 1, call_id = "c1", ok = true, result = "R", seq = 5 },
-        { kind = "model_response", turn = 2, content = { { type = "text", text = "done" } }, seq = 6 },
+        { kind = "tool_call", beat = 1, call_id = "c1", seq = 4 },
+        { kind = "tool_result", beat = 1, call_id = "c1", ok = true, result = "R", seq = 5 },
+        { kind = "model_response", beat = 2, content = { { type = "text", text = "done" } }, seq = 6 },
         { kind = "note", seq = 7 },
     }
     local req = kernel.fold(events, {})
@@ -177,8 +179,8 @@ do
 
     -- a non-string tool_result is JSON-encoded
     local encoded = kernel.fold({
-        { kind = "model_response", turn = 1, content = {}, seq = 1 },
-        { kind = "tool_result", turn = 1, call_id = "c1", ok = true, result = { x = 1 }, seq = 2 },
+        { kind = "model_response", beat = 1, content = {}, seq = 1 },
+        { kind = "tool_result", beat = 1, call_id = "c1", ok = true, result = { x = 1 }, seq = 2 },
     }, {})
     assert(type(encoded.messages[2].content[1].content) == "string", "non-string result must be encoded")
 
@@ -195,21 +197,23 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv2 + inv4 — the beat turns write-ahead; the request event is readable
+-- inv2 + inv4 — the beat reserves, then records write-ahead; the request
+-- event is readable
 -- ---------------------------------------------------------------------------
 
 do
     local ctx = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub(response("ok", { { type = "text", text = "hello" } })),
     })
     ctx:append({ kind = "msg_user", content = "hi" })
     local o = kernel.beat(ctx)
     assert(Outcome.is_ok(o))
 
+    -- the grant opens the ledger, the beat reserves before it calls, and the
     -- request is recorded before the model_response (write-ahead)
-    assert(kinds_of(ctx) == "run_started,msg_user,request,model_response", kinds_of(ctx))
+    assert(kinds_of(ctx) == "run_started,budget_granted,msg_user,budget_reserved,request,model_response", kinds_of(ctx))
 
     -- inv4: the request that was sent is in the store, readable via events()
     local req_ev = first_of(ctx, "request")
@@ -219,11 +223,14 @@ do
     -- The appended model_response was numbered and counted by the kernel:
     -- beat 1, and usage counts it (no author, no Lua-side spend).
     local resp = first_of(ctx, "model_response")
-    assert(resp ~= nil and resp.turn == 1, "kernel number: " .. tostring(resp and resp.turn))
+    assert(resp ~= nil and resp.beat == 1, "kernel number: " .. tostring(resp and resp.beat))
     assert(o.out.beat == 1, "out beat: " .. tostring(o.out.beat))
-    assert(ctx:turns() == 1, "ctx:turns(): " .. tostring(ctx:turns()))
+    assert(ctx:beats() == 1, "ctx:beats(): " .. tostring(ctx:beats()))
     assert(ctx:view("usage").model_calls == 1, "usage did not count the response")
-    assert(ctx:remaining() < 100, "the response was not charged")
+    -- The balance moved once, where the beat reserved it (one unit by
+    -- default) — the appends themselves charge nothing, and the 7 tokens the
+    -- usage view counted are a separate reading.
+    assert(ctx:remaining() == 99, "reserved balance: " .. tostring(ctx:remaining()))
 
     mark("inv2_writeahead")
     mark("inv4_request_event")
@@ -238,7 +245,7 @@ do
     local ran = {}
     local ctx = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),
         tools = {
             echo = {
@@ -254,7 +261,10 @@ do
     local o = kernel.beat(ctx)
     assert(Outcome.is_ok(o))
     assert(#ran == 1 and ran[1] == "x", "handler did not run")
-    assert(kinds_of(ctx) == "run_started,request,model_response,tool_call,tool_result", kinds_of(ctx))
+    assert(
+        kinds_of(ctx) == "run_started,budget_granted,budget_reserved,request,model_response,tool_call,tool_result",
+        kinds_of(ctx)
+    )
 
     local tr = first_of(ctx, "tool_result")
     assert(tr.ok == true and tr.result == "echoed:x" and tr.call_id == "c1")
@@ -263,7 +273,7 @@ do
     -- unknown tool: the pair is still closed, ok=false, machine-minimal error
     local ctx2 = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub(response("ok", { tool_use("c9", "ghost", {}) })),
         tools = {},
     })
@@ -276,7 +286,7 @@ do
     -- a handler that raises also closes the pair ok=false
     local ctx3 = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub(response("ok", { tool_use("c3", "boom", {}) })),
         tools = { boom = {
             handler = function()
@@ -298,25 +308,27 @@ end
 
 do
     -- ok
-    local co = kernel.open({ owner = "test", budget = { tokens = 100 }, llm = stub(response("ok")) })
+    local co = kernel.open({ owner = "test", budget = { amount = 100, tag = "tokens" }, llm = stub(response("ok")) })
     assert(Outcome.is_ok(kernel.beat(co)))
 
-    -- refused: the model answered (recorded + charged) but refused to proceed
+    -- refused: the model answered (recorded) but refused to proceed
     local cr = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub(response("refused", { { type = "text", text = "no" } })),
     })
     local before = cr:remaining()
     local orf = kernel.beat(cr)
     assert(Outcome.is_refused(orf), "refused status must map to Refused")
     assert(first_of(cr, "model_response") ~= nil, "a refusal is still a recorded response")
-    assert(cr:remaining() < before, "a refusal still costs its tokens")
+    -- A refusing beat reserved like any other: the allowance went before the
+    -- call, and the recorded response added nothing on top of it.
+    assert(cr:remaining() == before - 1, "refused beat balance: " .. tostring(cr:remaining()))
 
     -- error: the beat did not come off — no model_response, a model_call_failed
     local ce = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = stub({ status = "error", detail = "boom", content = {}, usage = {} }),
     })
     local oe = kernel.beat(ce)
@@ -327,7 +339,7 @@ do
     -- a transport failure (nil, err) is also Error(call)
     local ct = kernel.open({
         owner = "test",
-        budget = { tokens = 100 },
+        budget = { amount = 100, tag = "tokens" },
         llm = function()
             return nil, "network down"
         end,
@@ -339,23 +351,45 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv5 — budget stop: beat returns Ok(budget), and a caller loop halts on it
+-- inv5 — budget stop: a refused reservation is Ok(budget_stopped) with no
+-- call, and a caller loop halts on it
 -- ---------------------------------------------------------------------------
 
 do
-    -- beat-level: an exhausted session stops at the gate, before any call
-    local ctx = kernel.open({ owner = "test", budget = { tokens = 10 }, llm = stub(response("ok")) })
+    -- beat-level: nothing left to reserve, so the beat stops before calling
+    local ctx = kernel.open({
+        owner = "test",
+        budget = { amount = 10, tag = "tokens" },
+        llm = stub(response("ok")),
+    })
     ctx:spend(10)
     assert(ctx:exhausted())
     local o = kernel.beat(ctx)
-    assert(Outcome.is_ok(o) and o.out.budget_stopped == true, "exhausted beat must be Ok(budget_stopped)")
+    assert(Outcome.is_ok(o) and o.out.budget_stopped == true, "a refused beat must be Ok(budget_stopped)")
+    assert(o.out.tag == "tokens", "the refusal names its grant: " .. tostring(o.out.tag))
     assert(first_of(ctx, "request") == nil, "no call is made once the budget is gone")
 
-    -- loop-level: the first call exhausts the budget and asks for a tool, so
-    -- the second beat stops at the gate — the caller's own loop halts on it.
+    -- the reservation policy is the caller's: one that asks for the whole
+    -- grant leaves nothing for a second beat.
+    local cp = kernel.open({
+        owner = "test",
+        budget = { amount = 10, tag = "tokens" },
+        cost = function()
+            return 10
+        end,
+        llm = stub(response("ok"), response("ok")),
+    })
+    assert(Outcome.is_ok(kernel.beat(cp)) and cp:remaining() == 0)
+    local refused = kernel.beat(cp)
+    assert(Outcome.is_ok(refused) and refused.out.budget_stopped == true)
+    assert(count_of(cp, "model_response") == 1, "the refused beat made no call")
+
+    -- loop-level: one unit granted, one unit per beat, and the first answer
+    -- asks for a tool — so the second beat is refused and the caller's own
+    -- loop halts on it.
     local cl = kernel.open({
         owner = "test",
-        budget = { tokens = 10 },
+        budget = { amount = 1, tag = "tokens" },
         llm = stub(
             response("ok", { tool_use("c1", "noop", {}) }, { input_tokens = 100 }),
             response("ok", { { type = "text", text = "unreached" } })
@@ -388,17 +422,20 @@ end
 -- ---------------------------------------------------------------------------
 
 do
+    -- The cap is the loop's own local: knl has no max_turns config, because
+    -- the loop is written here and the stopping guarantee is the budget's.
+    local MAX_BEATS = 5
+
     -- settles: no tool_use, so the loop stops after one beat, and close
     -- lays down the run_finished record
     local ctx = kernel.open({
         owner = "test",
-        max_turns = 5,
-        budget = { tokens = 1000 },
+        budget = { amount = 1000, tag = "tokens" },
         llm = stub(response("ok", { { type = "text", text = "done" } })),
     })
     ctx:append({ kind = "msg_user", content = "hi" })
     local calls = 0
-    while calls < ctx.max_turns do
+    while calls < MAX_BEATS do
         local o = kernel.beat(ctx)
         assert(Outcome.is_ok(o) and not o.out.budget_stopped)
         calls = calls + 1
@@ -412,11 +449,11 @@ do
     assert(count_of(ctx, "run_finished") == 1, "close must lay down the run_finished record")
 
     -- bounded: the model never stops asking for a tool, so the caller's own
-    -- cap (ctx.max_turns, a config field read off the ctx) stops the loop
+    -- cap — a local of the loop that uses it — stops it
+    local CAP = 3
     local cb = kernel.open({
         owner = "test",
-        max_turns = 3,
-        budget = { tokens = 1000 },
+        budget = { amount = 1000, tag = "tokens" },
         llm = stub(
             response("ok", { tool_use("a", "noop", {}) }),
             response("ok", { tool_use("b", "noop", {}) }),
@@ -430,7 +467,7 @@ do
     })
     cb:append({ kind = "msg_user", content = "loop" })
     local n = 0
-    while n < cb.max_turns do
+    while n < CAP do
         local o = kernel.beat(cb)
         assert(Outcome.is_ok(o))
         n = n + 1
@@ -458,7 +495,7 @@ do
         return response("ok", { { type = "text", text = "strong" } })
     end
 
-    local ctx = kernel.open({ owner = "test", budget = { tokens = 1000 }, llm = weak })
+    local ctx = kernel.open({ owner = "test", budget = { amount = 1000, tag = "tokens" }, llm = weak })
     ctx:append({ kind = "msg_user", content = "q" })
 
     -- mutating the ctx raises (immutable handle)
@@ -474,7 +511,7 @@ do
     assert(Outcome.is_ok(kernel.beat(ctx)))
     assert(weak_called == 2 and strong_called == 1, weak_called .. "/" .. strong_called)
     assert(count_of(ctx, "model_response") == 3, "all beats must land in the one session")
-    assert(ctx:turns() == 3)
+    assert(ctx:beats() == 3)
 
     mark("inv9_ctx_with")
 end

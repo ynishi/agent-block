@@ -25,12 +25,13 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 
 local function fake_session(opts)
     opts = opts or {}
-    local s = { _events = {}, _seq = 0, _turns = 0 }
+    local s = { _events = {}, _seq = 0, _beats = 0 }
     function s:append(ev)
         self._seq = self._seq + 1
         ev.seq = self._seq
         if ev.kind == "model_response" then
-            self._turns = self._turns + 1
+            self._beats = self._beats + 1
+            ev.beat = self._beats
         end
         self._events[#self._events + 1] = ev
         return ev.seq
@@ -38,8 +39,16 @@ local function fake_session(opts)
     function s:events()
         return self._events
     end
-    function s:turns()
-        return self._turns
+    function s:beats()
+        return self._beats
+    end
+    -- No grant here, so every reservation is allowed and nothing is
+    -- recorded — the kernel's "no budget, no ledger" answer.
+    function s:reserve(_n)
+        return true
+    end
+    function s:remaining()
+        return nil
     end
     function s:exhausted()
         return false

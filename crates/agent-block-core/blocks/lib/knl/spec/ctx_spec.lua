@@ -12,16 +12,17 @@
 --     (memory-map: ctx.llm); state methods delegate to the kernel handle.
 --   3 with derives: new ctx, same session, config delta applied; the
 --     original is untouched; owner/store/session in the delta raise.
---   4 beat(ctx) is the whole primitive: gate (llm / budget), fold, record,
---     call, record + number + charge via append, tools stamped with the
+--   4 beat(ctx) is the whole primitive: gate (llm), fold, reserve, record,
+--     call, record + number via append, tools stamped with the
 --     kernel-assigned beat number.
 --   5 escalation shape: knl.beat(ctx:with{ llm = strong }) uses the strong
 --     llm for that beat only.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
 -- a faithful Lua fake stands in below (mirroring bridge/knl.rs facts: append
--- stamps kernel-owned seq; appending a model_response assigns the number,
--- charges the usage; events/turns/exhausted read back).
+-- stamps kernel-owned seq and numbers a model_response, and moves the budget
+-- for nothing; `reserve` is the one decision point — it deducts or refuses
+-- with the grant's tag; events/beats/remaining read back).
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -30,27 +31,15 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- what the module captures as its syscall layer at load time).
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function charge_of(usage)
-    if type(usage) ~= "table" then
-        return 0
-    end
-    local total = 0
-    for _, k in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
-        if type(usage[k]) == "number" then
-            total = total + usage[k]
-        end
-    end
-    return total
-end
-
 local function fake_session(opts)
     opts = opts or {}
+    local grant = opts.budget or {}
     local s = {
         _events = {},
         _seq = 0,
-        _turns = 0,
-        _spent = 0,
-        _budget = opts.budget and opts.budget.tokens or nil,
+        _beats = 0,
+        _remaining = grant.amount,
+        _tag = grant.tag,
         owner = opts.owner or "anon",
         closed = false,
     }
@@ -58,8 +47,8 @@ local function fake_session(opts)
         self._seq = self._seq + 1
         ev.seq = self._seq
         if ev.kind == "model_response" then
-            self._turns = self._turns + 1
-            self._spent = self._spent + charge_of(ev.usage)
+            self._beats = self._beats + 1
+            ev.beat = self._beats -- kernel-owned
         end
         self._events[#self._events + 1] = ev
         return ev.seq
@@ -67,17 +56,33 @@ local function fake_session(opts)
     function s:events()
         return self._events
     end
-    function s:turns()
-        return self._turns
+    function s:beats()
+        return self._beats
     end
-    function s:exhausted()
-        return self._budget ~= nil and self._spent >= self._budget
+    -- The quota, asked before the spending: it deducts and answers true, or
+    -- refuses with the grant's tag and leaves the balance where it was.
+    function s:reserve(n)
+        if self._remaining == nil then
+            return true
+        end
+        if self._remaining < n then
+            return false, self._tag
+        end
+        self._remaining = self._remaining - n
+        return true
     end
-    function s:remaining()
-        if self._budget == nil then
+    function s:spend(n)
+        if self._remaining == nil then
             return nil
         end
-        return self._budget - self._spent
+        self._remaining = math.max(0, self._remaining - n)
+        return self._remaining
+    end
+    function s:exhausted()
+        return self._remaining ~= nil and self._remaining <= 0
+    end
+    function s:remaining()
+        return self._remaining
     end
     function s:close(_reason)
         self.closed = true
@@ -116,9 +121,9 @@ end
 describe("knl.open — state/config split", function()
     it("returns a ctx whose config fields read directly (memory map)", function()
         local llm = stub_llm("hi")
-        local ctx = K.open({ owner = "spec", llm = llm, max_turns = 7 })
+        local ctx = K.open({ owner = "spec", llm = llm, system = "be terse" })
         expect(ctx.llm).to.be(llm)
-        expect(ctx.max_turns).to.be(7)
+        expect(ctx.system).to.be("be terse")
         -- state field passes through the handle
         expect(ctx.owner).to.be("spec")
     end)
@@ -210,14 +215,57 @@ describe("knl.beat — the primitive", function()
         expect(evs[3].kind).to.be("model_response")
     end)
 
-    it("stops ok/budget_stopped when the budget is exhausted", function()
-        local ctx = K.open({ llm = stub_llm("x"), budget = { tokens = 10 } })
+    it("stops ok/budget_stopped when the reservation is refused", function()
+        -- One unit granted, one unit per beat: the second beat is refused.
+        local ctx = K.open({ llm = stub_llm("x"), budget = { amount = 1, tag = "tokens" } })
         ctx:append({ kind = "msg_user", content = "q" })
-        local first = K.beat(ctx) -- charges 15 > 10
+        local first = K.beat(ctx)
         expect(Outcome.is_ok(first)).to.be(true)
+        expect(ctx:remaining()).to.be(0) -- the beat reserved it; the appends did not
+
+        local before = #ctx:events()
         local second = K.beat(ctx)
         expect(Outcome.is_ok(second)).to.be(true)
         expect(second.out.budget_stopped).to.be(true)
+        expect(second.out.tag).to.be("tokens") -- which allowance stopped it
+        -- A refused beat records nothing and calls nobody.
+        expect(#ctx:events()).to.be(before)
+    end)
+
+    it("asks config.cost how much one beat costs", function()
+        local asked = {}
+        local ctx = K.open({
+            llm = stub_llm("x"),
+            budget = { amount = 10, tag = "tokens" },
+            cost = function(request)
+                asked[#asked + 1] = #request.messages
+                return 4
+            end,
+        })
+        ctx:append({ kind = "msg_user", content = "q" })
+        expect(Outcome.is_ok(K.beat(ctx))).to.be(true)
+        expect(ctx:remaining()).to.be(6)
+        expect(asked[1]).to.be(1) -- the policy saw the request, not the events
+    end)
+
+    it("a cost policy that answers 0 is a conf error (no ranking function)", function()
+        local ctx = K.open({
+            llm = stub_llm("x"),
+            budget = { amount = 10, tag = "tokens" },
+            cost = function()
+                return 0
+            end,
+        })
+        local o = K.beat(ctx)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("conf")
+        expect(ctx:remaining()).to.be(10)
+    end)
+
+    it("a config key that shadows a session method is refused at construction", function()
+        local ok, err = pcall(K._make_ctx, { reserve = function() end }, { reserve = function() end })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("shadows a session method", 1, true) ~= nil).to.be(true)
     end)
 
     it("escalation: beat(ctx:with{llm=strong}) uses strong for that beat only", function()
@@ -281,8 +329,8 @@ describe("knl.beat — the primitive", function()
                 result = ev
             end
         end
-        expect(call.turn).to.be(o.out.beat)
-        expect(result.turn).to.be(o.out.beat)
+        expect(call.beat).to.be(o.out.beat)
+        expect(result.beat).to.be(o.out.beat)
         expect(result.ok).to.be(true)
     end)
 end)
@@ -474,7 +522,7 @@ describe("fold hardening (review findings)", function()
             { kind = "msg_user", content = "go", seq = 1 },
             {
                 kind = "model_response",
-                turn = 1,
+                beat = 1,
                 content = {
                     { type = "text", text = "using tools" },
                     { type = "tool_use", id = "c1", name = "t", input = {} },
@@ -483,7 +531,7 @@ describe("fold hardening (review findings)", function()
                 seq = 2,
             },
             -- c1 was answered before the crash; c2 was not
-            { kind = "tool_result", turn = 1, call_id = "c1", ok = true, result = "R", seq = 3 },
+            { kind = "tool_result", beat = 1, call_id = "c1", ok = true, result = "R", seq = 3 },
         }
         local req = K.fold(events, {})
         -- user "go" / assistant / user [c1 result + synthetic c2 result]
@@ -499,12 +547,12 @@ describe("fold hardening (review findings)", function()
         local events = {
             {
                 kind = "model_response",
-                turn = 1,
+                beat = 1,
                 content = { { type = "tool_use", id = "c1", name = "t", input = {} } },
                 seq = 1,
             },
-            { kind = "tool_result", turn = 1, call_id = "c1", ok = true, result = "R", seq = 2 },
-            { kind = "model_response", turn = 2, content = { { type = "text", text = "done" } }, seq = 3 },
+            { kind = "tool_result", beat = 1, call_id = "c1", ok = true, result = "R", seq = 2 },
+            { kind = "model_response", beat = 2, content = { { type = "text", text = "done" } }, seq = 3 },
         }
         local req = K.fold(events, {})
         expect(#req.messages).to.be(3)
