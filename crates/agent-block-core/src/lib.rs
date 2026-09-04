@@ -13,7 +13,7 @@
 //! | Feature    | Enables                                                          | Pulls in |
 //! |------------|------------------------------------------------------------------|----------|
 //! | `mesh`     | `mesh.*` Lua bridge, relay connect, Ed25519 mesh identity        | `agent-mesh-core`, `agent-mesh-sdk` |
-//! | `sqlite`   | `sql.*` / `kv.*` / `ts.*` Lua bridges (SQLite-backed)            | `rusqlite` (bundled), `mlua-batteries/{sql,kv}` |
+//! | `sqlite`   | `sql.*` / `kv.*` / `ts.*` Lua bridges (SQLite-backed)            | `mlua-batteries/{sql,kv}` |
 //! | `mcp-http` | `mcp.connect_http` (Streamable HTTP / SSE MCP transport)         | `agent-block-mcp/mcp-http` → rmcp HTTP-client transports |
 //!
 //! The stdio MCP transport (`mcp.connect`), `http.*`, `tool.*`, `sh.*`,
@@ -24,7 +24,10 @@
 //!   / `secret_key` are accepted but ignored.
 //! - `sqlite`: the `sql.*` / `kv.*` / `ts.*` bridges are not registered;
 //!   `BlockConfig::sql_path` / `kv_path` / `ts_path` are accepted but ignored
-//!   (fields retained for API stability).
+//!   (fields retained for API stability).  It does not gate `rusqlite`
+//!   itself: the kernel ([`knl`]) keeps every session's event log in a
+//!   SQLite table — the log is read with SQL — so `rusqlite` is an ordinary
+//!   dependency and a session is a session in every build.
 //! - `mcp-http`: `mcp.connect_http` returns an explicit error when called.
 //!
 //! # Sandbox

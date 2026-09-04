@@ -501,8 +501,10 @@ describe("knl.views — every predefined view is declared (view-design.md §3-8)
         expect(K.shapes.api.views.members).to.be(views)
     end)
 
-    it("covers the three the design names", function()
-        for _, name in ipairs({ "beats", "tool_pairs", "ledger" }) do
+    it("covers the four the design names", function()
+        -- `usage` is one of them: the token counts are a question put to the
+        -- log like any other, not a reading the kernel serves itself.
+        for _, name in ipairs({ "beats", "tool_pairs", "ledger", "usage" }) do
             expect(type(K.views[name])).to.be("function")
             expect(views[name]).to.exist()
         end

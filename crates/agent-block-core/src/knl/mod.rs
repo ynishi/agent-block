@@ -46,17 +46,17 @@
 //!   holds only its own events, so ownership is the scope-level
 //!   [`Session::owner`] — a real principal id, or the reserved
 //!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
-//!   layer above the kernel.  The accounting keys on the `kind`: the
-//!   `usage` view folds over every `llm_response`, because in a session's
-//!   own log an `llm_response` is a call it made.
+//!   layer above the kernel.  An accounting of what was consumed keys on the
+//!   `kind`: in a session's own log an `llm_response` is a call it made, so
+//!   a reader that sums the counts needs no author to key on.
 //! - **I3 budget monotonicity.**  The ledger accepts non-negative amounts
 //!   only, and within a session the balance can only decrease — it rises
 //!   only when an owner grants again, which a resumed session records like
 //!   any other fact.  It is a quota, not accounting: the decision is taken
 //!   *before* the spending ([`Session::reserve`], which refuses without
 //!   deducting) and settled after ([`Session::spend`]), by the layer that
-//!   knows what a call costs.  No `append` moves it, and the `usage` view
-//!   is the independent reading of what was consumed.
+//!   knows what a call costs.  No `append` moves it, and what was actually
+//!   consumed is read independently, off the recorded payloads.
 //! - **The balance is a fold, and only a fold.**  Every move is a `budget_*`
 //!   event first, written by the kernel alone ([`is_kernel_only`]), and
 //!   [`fold_balance`] over those events *is* the balance — there is no
@@ -86,17 +86,40 @@
 //!   is SQL, and a log that could not be queried would be a second, lesser
 //!   kind of session.  The `Vec`-backed store is `#[cfg(test)]`.
 //!
-//! Projections ([`projection`]) are *derived*: folding never changes the
-//! history and a fold result is a cache, not a capture — it can always be
-//! recomputed from the events.  The kernel names only the folds whose
-//! consumer is fixed in its own terms (`usage`, `tail`); one whose shape is
-//! a caller's decision is either built on the shell side from
-//! [`Session::events`], or read straight off the log with SQL
-//! ([`Session::query`], [`query`]) — one statement, and it reads, on a
-//! connection that cannot write.  The columns it may name are published
-//! ([`events_schema`]), which is what makes that a contract rather than a
-//! leak: the table is the read interface, and changing it is a change to the
-//! interface.
+//! # A view is derived, and the views are spread across two halves
+//!
+//! The log is the only source of truth.  A *view* ([`projection`]) is
+//! derived from it: folding never changes the history, and a view's result
+//! is a cache rather than a capture — whatever it says is recomputable from
+//! the events, so reading one is never what makes it true, and a view that
+//! disagreed with the log would be the view that is wrong.
+//!
+//! The kernel is written in two halves, and the views are deliberately spread
+//! across both.  The Rust half is the kernel context: the session's state,
+//! the syscalls that move it, and two fixed read primitives —
+//! [`Session::events`] (`events(from)`, the record from a position on) and
+//! [`Session::view`] (`tail`, the last events verbatim).  The Lua half is
+//! the shell's kernel library (`knl`): the beat, the device, and the query
+//! views — the conversation a provider is sent, the beats of a run, the
+//! token account (`knl.views.usage`) — each of them a `SELECT` over the
+//! published event schema rather than a name the kernel had to be taught.
+//!
+//! So the Rust half names a fold only when its consumer is fixed in kernel
+//! terms, and `tail` is the one that is.  A projection whose shape is a
+//! caller's decision is built on the shell side from [`Session::events`], or
+//! read straight off the log with SQL ([`Session::query`], [`query`]) — one
+//! statement, and it reads, on a connection that cannot write.  The columns
+//! it may name are published ([`events_schema`]), which is what makes that a
+//! contract rather than a leak: the table is the read interface, and
+//! changing it is a change to the interface.
+//!
+//! The Rust half therefore does not grow a query language of its own, or a
+//! way to register folds into it.  That is the design and not a gap: the
+//! full expressiveness of SQLite is already reachable through
+//! [`Session::query`], over a table whose columns are published, so "the
+//! kernel needs dynamic queries" is answered by writing a Lua query view.
+//! Adding a second, weaker query surface in Rust would only give the same
+//! answers a name the kernel then has to keep.
 
 pub mod budget;
 pub mod event;
@@ -119,7 +142,7 @@ pub use event_store::{
     EventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
-pub use projection::{UsageFold, Views};
+pub use projection::Views;
 pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
 pub use scope::{Scope, ScopeId};
 pub use session::{

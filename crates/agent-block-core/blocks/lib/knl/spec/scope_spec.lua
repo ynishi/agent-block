@@ -7,9 +7,10 @@
 --
 -- What this proves (scope-design.md rev 3 + session-device-design.md §9-a,
 -- pure-VM half):
---   1 appending an llm_response is counted by usage (the old usage=0
---     divergence, and the per-event scope stamp, are both gone — the kernel
---     counts by kind), while the balance moved only where the beat reserved it.
+--   1 a beat's llm_response lands with the counts the provider reported, and
+--     the reading of them is a query view (`knl.views.usage`) rather than a
+--     kernel built-in — while the balance moved only where the beat reserved
+--     it, which is the other, unrelated reading.
 --   2 beat ids are the shell's: two successive beats carry two distinct
 --     opaque strings, and the session is never asked to number anything.
 --   3 one model response with two tool_use blocks: both tool_call/tool_result
@@ -23,7 +24,9 @@
 --     and no beat numbering: the kernel stores the id it is given);
 --   * reserve is the only decision point: it deducts, or refuses with the
 --     grant's tag and leaves the balance alone;
---   * view("usage") counts every llm_response in the session;
+--   * query records the statement it was given and answers whatever the case
+--     queued (no SQLite stands behind it — what a statement SELECTS is asked
+--     in crates/agent-block/tests/fixtures/knl_beat_test.lua);
 --   * new_beat_id mints a fresh, time-ordered id per call.
 -- The e2e coverage against the *real* bridge lives in
 -- crates/agent-block/tests/fixtures/knl_beat_test.lua.
@@ -160,25 +163,19 @@ local function fake_session(opts)
         end
     end
 
-    -- Usage counts every llm_response in the session (kind-keyed, no
-    -- author) — the Rust view("usage") under the new model.
-    function s:view(name)
-        assert(name == "usage", "knl: view: unknown view")
-        local u = { input_tokens = 0, output_tokens = 0, thinking_tokens = 0, model_calls = 0 }
-        for _, e in ipairs(events) do
-            if e.kind == "llm_response" then
-                u.model_calls = u.model_calls + 1
-                if type(e.usage) == "table" then
-                    for _, counter in ipairs(COUNTERS) do
-                        local n = e.usage[counter]
-                        if type(n) == "number" then
-                            u[counter] = u[counter] + n
-                        end
-                    end
-                end
-            end
-        end
-        return u
+    -- The SQL read (view-design.md §2), which is how token usage is read
+    -- now: a view is a named function that runs one SELECT, and this fake
+    -- records the statement rather than running one. What a statement
+    -- selects is a question only a database can answer, and it is asked
+    -- where there is one (knl_beat_test.lua inv11).
+    s._queries = {}
+    s._query_rows = {}
+
+    function s:query(sql, params, opts)
+        assert(not closed, "knl: query: session is closed")
+        assert(type(sql) == "string", "knl: query: sql must be a string")
+        self._queries[#self._queries + 1] = { sql = sql, params = params, opts = opts }
+        return self._query_rows, false
     end
 
     return s
@@ -243,7 +240,7 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 
 describe("knl beat (session-scope model)", function()
-    it("counts a beat's llm_response in usage and carries the declared id", function()
+    it("records a beat's llm_response with its counts, and reads them as a query view", function()
         local s = kernel.open({
             owner = "test",
             budget = { amount = 100, tag = "beats" },
@@ -261,13 +258,35 @@ describe("knl beat (session-scope model)", function()
         expect(Outcome.is_ok(o)).to.equal(true)
         expect(type(o.out.beat)).to.equal("string")
 
-        local u = s:view("usage")
-        expect(u.model_calls).to.equal(1)
-        expect(u.input_tokens).to.equal(10)
-        expect(u.output_tokens).to.equal(3)
+        -- The counts the provider reported are on the response event, which
+        -- is what the accounting reads.
+        local recorded
+        for _, ev in ipairs(s:events()) do
+            if ev.kind == "llm_response" then
+                recorded = ev
+            end
+        end
+        expect(recorded.usage.input_tokens).to.equal(10)
+        expect(recorded.usage.output_tokens).to.equal(3)
+
+        -- And reading them is a query, not a kernel view: `knl.views.usage`
+        -- runs one SELECT over the llm_response records, naming the streams
+        -- with $sessions and summing each counter out of the payload. The
+        -- rows themselves are a database's answer and are checked where
+        -- there is one (knl_beat_test.lua inv11).
+        expect(type(kernel.views.usage)).to.equal("function")
+        kernel.views.usage(s)
+        expect(#s._queries).to.equal(1)
+        local sql = s._queries[1].sql
+        expect(sql:match("^%s*SELECT") ~= nil).to.equal(true)
+        expect(sql:find("$sessions", 1, true) ~= nil).to.equal(true)
+        expect(sql:find("llm_response", 1, true) ~= nil).to.equal(true)
+        for _, counter in ipairs(COUNTERS) do
+            expect(sql:find("$.usage." .. counter, 1, true) ~= nil).to.equal(true)
+        end
 
         -- Reserved, and only there: the beat took one unit before the call
-        -- and the appends did not move the budget. The usage above is the
+        -- and the appends did not move the budget. The counts above are the
         -- other reading.
         expect(s:remaining()).to.equal(99)
         -- The kernel does not number beats: nothing to read back.

@@ -27,9 +27,10 @@
 --        directions (§9-m) — methods, module functions and the error
 --        vocabulary — and a real raise reads back classified (§9-r)
 --  inv11 the SQL read (view-design.md): the published read schema matches the
---        shell's declaration, the three predefined views answer what the beat
---        wrote, a write is refused as "validation", and one statement reads
---        across a named set of sessions
+--        shell's declaration, the four predefined views answer what the beat
+--        wrote (token usage among them — it is a query view, not a kernel
+--        built-in), a write is refused as "validation", and one statement
+--        reads across a named set of sessions
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately (design §0.5).
@@ -274,7 +275,35 @@ do
     assert(resp ~= nil and resp.beat == o.out.beat, "response beat: " .. tostring(resp and resp.beat))
     assert(req_ev.beat == o.out.beat, "request beat: " .. tostring(req_ev.beat))
     assert(first_of(s, "msg_user").beat == nil, "the caller's seed is not part of a beat")
-    assert(s:view("usage").model_calls == 1, "usage did not count the response")
+
+    -- The accounting is a query view now (`knl.views.usage`), and it counts
+    -- the same thing the kernel's built-in used to: the responses this
+    -- session recorded, with the counts the provider reported for them.
+    local usage_rows = kernel.views.usage(s)
+    assert(#usage_rows == 1, "one stream that answered, " .. #usage_rows .. " rows")
+    assert(usage_rows[1].calls == 1, "usage did not count the response: " .. tostring(usage_rows[1].calls))
+    assert(usage_rows[1].stream == s:id(), "the row names the stream: " .. tostring(usage_rows[1].stream))
+    assert(usage_rows[1].input_tokens == 5, "input: " .. tostring(usage_rows[1].input_tokens))
+    assert(usage_rows[1].output_tokens == 2, "output: " .. tostring(usage_rows[1].output_tokens))
+    -- The stub reported no thinking tokens; a missing counter is 0, never nil.
+    assert(usage_rows[1].thinking_tokens == 0, "thinking: " .. tostring(usage_rows[1].thinking_tokens))
+
+    -- And the kernel does not serve that reading itself any longer: the
+    -- built-in reads are `events` and `tail`, so asking it for "usage" is an
+    -- unknown view — refused in the caller's own class, "validation".
+    local served, raised = pcall(s.view, s, "usage")
+    assert(
+        not served,
+        'the kernel still answers s:view("usage"): the Rust half of this round '
+            .. "(removing the built-in usage view) has not landed yet — this one assertion is the only "
+            .. "thing here that depends on it"
+    )
+    local refused = knl.error(raised)
+    assert(
+        refused.kind == "validation",
+        's:view("usage") must be refused as an unknown view; kind: ' .. tostring(refused.kind)
+    )
+
     -- The balance moved once, where the beat reserved it (one unit by
     -- default) — the appends themselves do not move the budget, and the 7
     -- tokens the usage view counted are a separate reading.
@@ -660,7 +689,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv11 — the SQL read (view-design.md): the published schema, the three
+-- inv11 — the SQL read (view-design.md): the published schema, the four
 -- predefined views over a real store, the refusal of anything that is not a
 -- read, and one statement spanning a set of sessions
 -- ---------------------------------------------------------------------------
@@ -697,7 +726,8 @@ do
         assert(published_cols[name] ~= nil, "the shell declares a column the kernel does not publish: " .. name)
     end
 
-    -- (b) the three views over a session that ran one beat with a tool call
+    -- (b) the log-shaped views over a session that ran one beat with a tool
+    -- call (`usage`, the fourth, is read against a real store in inv2 above)
     local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
     local d = kernel.device({
         llm = stub(response("ok", { tool_use("c1", "echo", { v = "x" }) })),

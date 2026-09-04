@@ -20,10 +20,13 @@
 //! kernel recorded read back as the caller's and fall out of the account
 //! (the `usage = 0` bug); that mechanism is gone.
 //!
-//! Because a session's log is exactly the calls it made, the accounting
-//! keys on the `kind` alone: [`super::projection::UsageFold`] counts every
-//! `llm_response` in the session.  An `llm_response` in the history is one
-//! this run made.
+//! Because a session's log is exactly the calls it made, an accounting of
+//! what it consumed keys on the `kind` alone: an `llm_response` in the
+//! history is one this run made, so a reader summing the counts has nothing
+//! foreign to exclude and no author to key on.  That reader is not the
+//! kernel.  The totals are a query view over the recorded payloads
+//! (`knl.views.usage`, SQL over the published schema); what the kernel does
+//! is keep the payload verbatim and hold the shape below.
 //!
 //! # Two layers of `kind`
 //!
@@ -47,6 +50,15 @@
 //! | `budget_reserved` | `amount: integer` (`tag` optional)                   |
 //! | `budget_refused`  | `amount: integer`, `remaining: integer` (`tag` optional) |
 //! | `budget_spent`    | `amount: integer` (`tag` optional)                   |
+//!
+//! `llm_response` keeps its required fields although nothing in the kernel
+//! reads them any more: a reserved kind's shape is a *contract*, not a
+//! fold's input.  The layer above keeps no second copy of it on purpose (a
+//! copy drifted, so the Lua device checks the `beat` stamp and nothing
+//! else); the provider adapter normalises an empty answer to an empty
+//! *array* because this check is what says `content` is one; and the token
+//! account reads `usage` back out of the log.  Dropping the check would not
+//! remove it, it would move it into every reader.
 //!
 //! The kernel writes two more fields onto some of those, neither of them
 //! required: `owner` and [`FIELD_SCOPE_ID`] on `session_opened`, and
@@ -742,8 +754,8 @@ mod tests {
 
     /// Validation is about shape only.  An `llm_response` is as acceptable
     /// from a caller as from the kernel, because a hand-written one moves no
-    /// state — a session holds only its own events, so the usage fold has
-    /// nothing foreign to count.  The kernel-only kinds pass here too: their
+    /// state — a session holds only its own events, so a reader counting
+    /// them has nothing foreign to exclude.  The kernel-only kinds pass here too: their
     /// shape is fine, it is the authorship that is not, and that is stopped
     /// by [`is_kernel_only`] on the append path rather than here.
     #[test]

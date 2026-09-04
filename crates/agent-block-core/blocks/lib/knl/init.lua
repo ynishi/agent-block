@@ -48,9 +48,17 @@
 ---   that is not one SELECT / WITH, and resolves `$stream` (this session)
 ---   and `$sessions` (`opts.sessions`, the set to read across). A "view" is
 ---   nothing more than a named function that runs one of those statements —
----   `knl.views.beats` / `tool_pairs` / `ledger` are the three the kernel
----   ships, and a consumer writes its own in exactly the same form. The
----   kernel's built-in `events` / `usage` / `tail` are unaffected.
+---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` are the four the
+---   kernel ships, and a consumer writes its own in exactly the same form.
+---   The kernel's own built-in reads are `events(from)` and `tail(n)` and
+---   nothing else: token usage is not special, it is a query view like the
+---   rest.
+---
+---   `usage` reads what the providers reported. Every `llm_response` carries
+---   the counts its adapter normalized out of the provider's answer, so the
+---   view is an accounting of facts already in the log — and it is a reading
+---   apart from the budget, which is a quota the owner granted and never a
+---   tally of tokens (see below).
 ---
 --- The budget (budget-design.md §2)
 ---   The budget is a quota the owner granted the session, not a tally of
@@ -61,7 +69,7 @@
 ---   event and no call. How much a beat asks for is the device's policy:
 ---   `device.cost(request)`, one unit per beat by default. What a unit
 ---   *means* is whatever the owner tagged the grant with — the kernel reads
----   the number and nothing else, and token usage (`view("usage")`) is a
+---   the number and nothing else, and token usage (`knl.views.usage`) is a
 ---   separate reading that beat never folds back into the budget.
 ---
 --- When something raises (session-device-design.md §9-r)
@@ -795,7 +803,10 @@ M.shapes.session = {
     append = { args = { EVENT_BASE }, returns = "integer seq; refused after session_closed and for kernel-only kinds" },
     events = { args = { "integer from?" }, returns = T.array_of(EVENT_BASE) },
     len = { args = "none", returns = "integer" },
-    view = { args = { T.one_of({ "usage", "tail" }), "table opts?" }, returns = "table (the named fold)" },
+    -- The one built-in fold beside `events`: the last `n` records, verbatim.
+    -- Token usage used to be the second name here and is not one any more —
+    -- it is `knl.views.usage`, one SELECT like every other view.
+    view = { args = { T.one_of({ "tail" }), "table opts?" }, returns = "table (the named fold)" },
     -- The SQL read (view-design.md §2). The statement is the caller's and
     -- the kernel touches two things in it: it refuses anything that is not
     -- one SELECT / WITH, and it expands `$sessions` into one bound
@@ -864,6 +875,11 @@ local VIEWS = {
     ledger = {
         args = view_args(),
         returns = "{ { seq, kind, amount, tag }, ... }, truncated — the budget_* events in seq order",
+    },
+    usage = {
+        args = view_args(),
+        returns = "{ { stream, calls, input_tokens, output_tokens, thinking_tokens }, ... }, truncated"
+            .. " — one row per stream that answered, the counts the providers reported",
     },
 }
 
@@ -1744,7 +1760,7 @@ function M.beat(session, device)
     -- stop rather than a failure (`stopped`, carrying the grant's tag so a
     -- caller can name what stopped it). How much to ask for is the device's
     -- policy — `device.cost(request)` — and it is never derived from token
-    -- counts: the budget and the `usage` view are separate readings
+    -- counts: the budget and `knl.views.usage` are separate readings
     -- (budget-design.md §4-8).
     local est_ok, amount = xpcall(device.cost, traced, request)
     if not est_ok then
@@ -1893,15 +1909,18 @@ M._execute_tools = execute_tools
 -- A view is a named function that runs one SELECT. That is the whole of the
 -- mechanism: no builder, no query object, no registration hook. The kernel
 -- publishes the table (`knl.shapes.schema`) and a caller writes SQL against
--- it, and these three are the ones the kernel ships because they read what
+-- it, and these four are the ones the kernel ships because they read what
 -- the kernel itself wrote — the beat grouping it stamps, the tool pairs it
--- closes, the ledger it keeps. A consumer's own view is a function of
--- exactly this form in exactly this way (`local function tool_error_rate(s)
--- return s:query([[...]]) end`); nothing here is privileged.
+-- closes, the ledger it keeps, the token counts the providers reported. A
+-- consumer's own view is a function of exactly this form in exactly this way
+-- (`local function tool_error_rate(s) return s:query([[...]]) end`); nothing
+-- here is privileged.
 --
--- They do not duplicate the built-in views. `events` / `usage` / `tail` stay
--- the kernel's own (d3-input rev 2), and `usage` in particular is not
--- rewritten as SQL here.
+-- They do not duplicate the built-in reads, which are `events(from)` and
+-- `tail(n)` and nothing else. Token usage is NOT one of them: it is an
+-- aggregate over the log like any other question a caller asks of it, so it
+-- is `knl.views.usage` — one SELECT, in this file, on the same footing as a
+-- view a consumer writes.
 --
 -- Two rules hold for every statement below and for a consumer's own:
 --
@@ -1990,6 +2009,37 @@ SELECT seq,
  ORDER BY stream, seq
 ]]
 
+--- The token accounting: one row per stream, over the `llm_response` events
+--- that stream recorded.
+---
+--- `calls` is how many answers landed and the three counters are what the
+--- providers reported for them — facts already in the log, since an adapter
+--- normalizes a provider's usage into the three numbers before the response
+--- is ever appended. Nothing here is a budget: the grant is a quota the owner
+--- gave (`ledger` is its reading), and no arithmetic connects the two.
+---
+--- A counter a stored response does not carry contributes 0: `json_extract`
+--- answers NULL for a missing key, `SUM` skips it, and the `COALESCE` turns
+--- an all-NULL sum back into a number so a caller never reads a nil count.
+---
+--- The grouping is by `stream`, which is what makes the row set answer for a
+--- read across a set of sessions rather than blending them. A stream that
+--- recorded no response has no row at all — that absence IS its zero, and
+--- filling it in would mean naming the streams in the statement, which is
+--- exactly what `$sessions` exists not to do.
+local USAGE_SQL = [[
+SELECT stream,
+       COUNT(*)                                                        AS calls,
+       COALESCE(SUM(json_extract(payload, '$.usage.input_tokens')), 0) AS input_tokens,
+       COALESCE(SUM(json_extract(payload, '$.usage.output_tokens')), 0) AS output_tokens,
+       COALESCE(SUM(json_extract(payload, '$.usage.thinking_tokens')), 0) AS thinking_tokens
+  FROM events
+ WHERE stream IN $sessions
+   AND kind = 'llm_response'
+ GROUP BY stream
+ ORDER BY stream
+]]
+
 --- Run one view's statement over `session`.
 ---
 --- The options are the caller's, passed through untouched: `sessions` is
@@ -2058,6 +2108,17 @@ end
 --- @return boolean truncated
 function M.views.ledger(session, opts)
     return read_view(session, LEDGER_SQL, opts)
+end
+
+--- The token accounting: `{ stream, calls, input_tokens, output_tokens,
+--- thinking_tokens }`, one row per stream that answered.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` to span a set of streams)
+--- @return table rows
+--- @return boolean truncated
+function M.views.usage(session, opts)
+    return read_view(session, USAGE_SQL, opts)
 end
 
 -- ============================================================

@@ -117,8 +117,9 @@
 //! [`Session::reserve`], which the layer that knows what a call costs
 //! calls, then settles with [`Session::spend`].  Folding the two together
 //! is what turned the budget into a flag that only stands up once the
-//! allowance is already gone; the balance and the `usage` projection are
-//! independent readings and neither is the other's ledger.
+//! allowance is already gone; the balance and what a run actually consumed
+//! (a query view over the recorded `llm_response` payloads, on the Lua side)
+//! are independent readings and neither is the other's ledger.
 //!
 //! # The budget is in the log, and nowhere else
 //!
@@ -162,7 +163,7 @@ use super::event::{
     KIND_SESSION_OPENED,
 };
 use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore};
-use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
+use super::projection::{tail_count, VIEW_TAIL};
 use super::query::{self, QueryOpts, QueryParams, QueryRows};
 use super::scope::{Scope, ScopeId};
 use super::sqlite_store::SqliteEventStore;
@@ -291,8 +292,6 @@ pub struct Session {
     /// the seam is what makes every read of it — here and in the folds — an
     /// event at the current shape.
     store: CurrentStore,
-    /// Cached projection folds (derived, never authoritative).
-    views: Views,
     /// The last balance fold, and the store head it was taken at.
     ///
     /// Not a counter: nothing adds to it or subtracts from it.  A read of
@@ -389,7 +388,6 @@ impl Session {
             // `session_opened` below is already written under it.
             scope: Scope::new(owner, grant),
             store,
-            views: Views::default(),
             // Nothing folded yet, over a stream with nothing in it: the first
             // read of the balance sees the head move and folds the ledger the
             // two appends below are about to write.
@@ -453,16 +451,17 @@ impl Session {
     /// as a new `budget_granted` and raises the restored balance, rather
     /// than replacing it.  Omit it to continue on what is left.  Nothing is
     /// deducted for the earlier `llm_response` usage — an append never
-    /// charged, and what was consumed is the `usage` projection's answer,
-    /// not the quota's.
+    /// charged, and what was consumed is a query view's answer over the
+    /// recorded payloads, not the quota's.
     ///
     /// A closed stream is not resumed.  A session is disposable: it opens
     /// once and ends once, so a log that already carries its `session_closed`
     /// is an ending, not a state to continue from — the caller opens a new
     /// session instead.
     ///
-    /// The projection caches start empty and re-fold lazily from the store,
-    /// so a resumed session's `usage` view is correct on first read.
+    /// Nothing is restored for the read side: a resumed session's reads —
+    /// `events`, `tail`, a query — go to the reopened store, so they see the
+    /// whole stream on the first call.
     pub fn resume(grant: Option<BudgetGrant>, store: Box<dyn EventStore>) -> KnlResult<Self> {
         // The upcasting seam goes on first, so the restore below reads the
         // same projected shape every other read of this session gets: a log
@@ -544,7 +543,6 @@ impl Session {
             id: uuid::Uuid::new_v4().to_string(),
             scope: Scope::restore(scope_id, owner, last_grant(&log)),
             store,
-            views: Views::default(),
             balance: Cell::new((head, fold_balance(&log))),
             closed: false,
         };
@@ -940,24 +938,21 @@ impl Session {
 
     /// A named projection over the history.
     ///
-    /// `usage` is served from the incremental cache and reports `at_seq`,
-    /// the position it folded to; `tail` reads `opts.n` (default
-    /// [`projection::DEFAULT_TAIL_N`]).  An unknown name is an error —
-    /// the vocabulary is closed on purpose, and short: a projection whose
-    /// shape depends on what the caller does with it (a conversation
-    /// rendered for a provider, say) is built from [`Session::events`] on
-    /// the shell side rather than named here.
+    /// `tail` is the only name, and it reads `opts.n` (default
+    /// [`projection::DEFAULT_TAIL_N`]) events from the end.  An unknown name
+    /// is an error — the vocabulary is closed on purpose, and it is as short
+    /// as it goes: a projection whose shape depends on what the caller does
+    /// with it is built above the kernel, from [`Session::events`] or with
+    /// SQL over the published schema ([`Session::query`]).  The token
+    /// account is one of those now: it reads the `llm_response` payload,
+    /// which is the shell's vocabulary and not the kernel's.
+    ///
+    /// `&mut self` because the signature belongs to the vocabulary rather
+    /// than to today's members of it — a fold the kernel names again may
+    /// keep a cache, and a caller should not have to be recompiled when one
+    /// does.
     pub fn view(&mut self, name: &str, opts: Option<&Map<String, Value>>) -> KnlResult<Value> {
         match name {
-            VIEW_USAGE => {
-                // Fold only what the cache has not seen: read on from the
-                // position it folded to, so the view is amortised in new
-                // events and Session works against the `EventStore` trait
-                // alone — no reach into a concrete `History`.
-                let from = self.views.usage_folded_seq().saturating_add(1);
-                let fresh = self.store.read(from, usize::MAX)?;
-                Ok(self.views.usage(&fresh))
-            }
             VIEW_TAIL => {
                 let n = tail_count(opts)?;
                 let events = self.store.read(0, usize::MAX)?;
@@ -1258,20 +1253,11 @@ mod tests {
     }
 
     #[test]
-    fn view_serves_the_named_projections_and_rejects_anything_else() {
+    fn view_serves_the_one_named_projection_and_rejects_anything_else() {
         let mut s = new_session(None);
         s.append(obj(json!({ "kind": "msg_user", "content": "hi" })))
             .expect("append");
         s.append(response(9)).expect("recorded");
-
-        let usage = s.view(VIEW_USAGE, None).expect("usage");
-        assert_eq!(usage["input_tokens"], json!(9));
-        assert_eq!(usage["model_calls"], json!(1));
-        assert_eq!(
-            usage["at_seq"],
-            json!(3),
-            "session_opened + msg_user + response"
-        );
 
         let tail = s
             .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
@@ -1280,6 +1266,24 @@ mod tests {
 
         let err = s.view("nope", None).expect_err("unknown view");
         assert_eq!(err.reason(), r#"unknown view "nope""#);
+    }
+
+    /// The token account is not a name the kernel answers to any more: it
+    /// reads the `llm_response` payload, so it is a query view written over
+    /// the published schema.  Asking the kernel for it is the same error as
+    /// asking for any other name it does not have.
+    #[test]
+    fn the_token_account_is_not_a_named_view() {
+        let mut s = new_session(None);
+        s.append(response(9)).expect("recorded");
+
+        let err = s.view("usage", None).expect_err("usage was served");
+        assert_eq!(err.reason(), r#"unknown view "usage""#);
+        assert_eq!(err.kind(), KnlError::VALIDATION);
+
+        // What it needs is in the log, verbatim, for a reader to sum.
+        let recorded = s.events(2).expect("events").pop().expect("llm_response");
+        assert_eq!(recorded["usage"], json!({ "input_tokens": 9 }));
     }
 
     /// The conversation is not one of the names: how a record becomes a
@@ -1331,14 +1335,15 @@ mod tests {
             1,
             "only the opening grant is in the ledger"
         );
-        let usage = s.view(VIEW_USAGE, None).expect("usage");
-        assert_eq!(usage["model_calls"], json!(1));
-        assert_eq!(usage["input_tokens"], json!(20));
-        assert_eq!(usage["output_tokens"], json!(10));
+        assert_eq!(
+            recorded["usage"],
+            json!({ "input_tokens": 20, "output_tokens": 10 }),
+            "the counts are stored as they came: {recorded}"
+        );
         assert_eq!(
             folded(&s),
             Some(100),
-            "usage and the balance are separate readings"
+            "what was consumed and the balance are separate readings"
         );
     }
 
@@ -1534,7 +1539,7 @@ mod tests {
     }
 
     /// The record and the account are separate readings of the same
-    /// session: the response is in the history and in `usage`, and the
+    /// session: the response is in the history, counts and all, and the
     /// balance is exactly what was granted, because nobody reserved
     /// anything.
     #[test]
@@ -1548,7 +1553,7 @@ mod tests {
         let recorded = s.events(3).expect("events").pop().expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
-        assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["input_tokens"], 30);
+        assert_eq!(recorded["usage"]["input_tokens"], json!(30));
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
     }
 
@@ -1668,16 +1673,24 @@ mod tests {
     fn views_stay_readable_and_correct_after_close() {
         let mut s = new_session(None);
         s.append(response(9)).expect("recorded");
-        let before = s.view(VIEW_USAGE, None).expect("usage");
+        let before = s
+            .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .expect("tail");
         s.close(None).expect("close");
-        let after = s.view(VIEW_USAGE, None).expect("usage after close");
+        let after = s
+            .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .expect("tail after close");
 
-        // `session_closed` costs nothing, so the totals are unchanged even
-        // though the history grew — and `at_seq` says the fold saw it.
-        assert_eq!(before["input_tokens"], after["input_tokens"]);
-        assert_eq!(before["model_calls"], after["model_calls"]);
-        assert_eq!(before["at_seq"], json!(2));
-        assert_eq!(after["at_seq"], json!(3));
+        // The read keeps working, and it reads the log as it now stands: the
+        // ending this handle wrote is the last thing in it.
+        assert_eq!(
+            kind_of(&before.as_array().expect("array")[0]),
+            "llm_response"
+        );
+        assert_eq!(
+            kind_of(&after.as_array().expect("array")[0]),
+            KIND_SESSION_CLOSED
+        );
 
         assert_eq!(s.len().expect("len"), 3);
         assert_eq!(s.events(0).expect("events")[2].kind(), KIND_SESSION_CLOSED);
@@ -1765,10 +1778,18 @@ mod tests {
              + reserved + response + spent — and nothing from resume itself"
         );
 
-        // The usage view re-folds correctly from the reopened store.
-        let usage = resumed.view(VIEW_USAGE, None).expect("usage");
-        assert_eq!(usage["model_calls"], json!(2));
-        assert_eq!(usage["input_tokens"], json!(50));
+        // The record came back whole, so a reader that sums the counts —
+        // the Lua query view, over the published schema — has both calls to
+        // work from.
+        let responses: Vec<Current> = resumed
+            .events(0)
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+            .collect();
+        assert_eq!(responses.len(), 2, "{responses:?}");
+        assert_eq!(responses[0]["usage"]["input_tokens"], json!(30));
+        assert_eq!(responses[1]["usage"]["input_tokens"], json!(20));
 
         // The ledger continues: the next reservation comes off the restored
         // balance, and what the resumed session records is its own.
@@ -2503,7 +2524,7 @@ mod tests {
 
     /// (Upcasting seam) Every read a session makes goes through the chain
     /// wrapped round its backend — the restore fold a resume takes, `events`,
-    /// the `usage` view and the balance fold alike — while the rows on disk
+    /// the `tail` view and the balance fold alike — while the rows on disk
     /// keep the shape they were written in.
     #[test]
     fn a_session_reads_every_path_through_the_upcaster_seam() {
@@ -2562,20 +2583,23 @@ mod tests {
             "and the grant with it"
         );
 
-        // …and so do `events`, the view fold and the balance fold.
+        // …and so do `events`, the `tail` view and the balance fold.
         let log = resumed.events(0).expect("events");
         assert_eq!(
             kinds(&log),
             [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, KIND_LLM_RESPONSE],
             "every read is projected"
         );
-        let usage = resumed.view(VIEW_USAGE, None).expect("usage");
+        let tail = resumed
+            .view(VIEW_TAIL, Some(&obj(json!({ "n": 1 }))))
+            .expect("tail");
+        let last = &tail.as_array().expect("array")[0];
         assert_eq!(
-            usage["model_calls"],
-            json!(1),
-            "the view folded the projected kind: {usage}"
+            kind_of(last),
+            KIND_LLM_RESPONSE,
+            "the view read the projected kind: {last}"
         );
-        assert_eq!(usage["input_tokens"], json!(7));
+        assert_eq!(last["usage"]["input_tokens"], json!(7));
         assert_eq!(remaining(&resumed), Some(100), "the balance folds too");
 
         // The stored rows were not rewritten: read them without the seam and

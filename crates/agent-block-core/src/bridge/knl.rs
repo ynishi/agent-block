@@ -44,7 +44,8 @@
 //!   scope id is recorded on `session_opened` and on every `budget_*` event,
 //!   so the boundary is readable — and unforgeable — from the log alone.
 //!   There is no per-event author: a session holds only its own events, so
-//!   `view("usage")` keys on the `kind` and counts every `llm_response`.
+//!   an accounting of what a run consumed keys on the `kind` alone — every
+//!   `llm_response` in the log is a call this run made.
 //! - **Beats are yours.**  `knl.new_beat_id()` mints a time-ordered id; you
 //!   stamp it on the `llm_response`, `tool_call` and `tool_result` events
 //!   that belong to one beat.  The kernel does not number beats, does not
@@ -58,8 +59,8 @@
 //!   answer, and `remaining()` is the separate question of what is left.
 //!   Both take non-negative whole amounts and the balance can only decrease;
 //!   there is no API to raise or reset it, and no `append` moves it.  What a
-//!   session actually consumed is `view("usage")`, which is independent of
-//!   the balance.
+//!   session actually consumed is read off the responses it recorded
+//!   (`knl.views.usage`, a query view in Lua), independent of the balance.
 //! - **I6 session lifecycle.**  All state lives inside the userdata — no
 //!   module-level statics, no Lua globals — so two sessions are fully
 //!   independent.  There is no "run" inside a session: `knl.open()` records
@@ -102,18 +103,20 @@
 //! s:append({ kind = "llm_response", beat = beat, content = blocks, usage = u })
 //! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
-//! local usage  = s:view("usage")         -- token totals + `at_seq`
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
 //! s:close("done")
 //! ```
 //!
-//! Three named read faces and no more: the events, the account, the last of
-//! the record.  Turning events into a request for a provider — which role a
-//! kind takes, whether a system message goes in front, where to cut the
-//! history off — is the shell's policy, so it is written in Lua over
-//! `events(from)` rather than named as a view here.
+//! Two named read faces and no more: the events, and the last of the record.
+//! Turning events into a request for a provider — which role a kind takes,
+//! whether a system message goes in front, where to cut the history off — is
+//! the shell's policy, so it is written in Lua over `events(from)` rather
+//! than named as a view here.  The token account went the same way: it reads
+//! the `usage` the adapter recorded on each `llm_response`, which is the
+//! shell's vocabulary, so it is a query view in Lua (`knl.views.usage`) and
+//! not a name the kernel answers to.
 //!
-//! The fourth face is not a name but a language: `s:query(sql, params?,
+//! The third face is not a name but a language: `s:query(sql, params?,
 //! opts?)` reads the log with one `SELECT` / `WITH` over the table the events
 //! live in, whose columns `knl.api().schema` publishes.  That is what keeps
 //! the list of names short — a fold the kernel has no opinion about is a
@@ -184,8 +187,8 @@ pub const SESSION_API: &[(&str, &str)] = &[
     ),
     (
         "view",
-        "view(name, opts?) -> table — a named fold: \"usage\" or \"tail\" { n } \
-         [raises: validation, busy, storage, corruption]",
+        "view(name, opts?) -> table — the one named fold: \"tail\" { n }; anything else is a \
+         query [raises: validation, busy, storage, corruption]",
     ),
     (
         "query",
@@ -514,10 +517,10 @@ impl LuaUserData for Session {
 
         // s:view(name, opts?) -> projection (fresh table each call)
         //
-        // `usage` (totals plus the `at_seq` they reach) and `tail`
-        // (`opts.n` events from the end).  Named folds only, and an
-        // unknown name is an error: a projection the kernel does not name
-        // is the shell's to build from `events(from)`.
+        // `tail` (`opts.n` events from the end), and that is the whole
+        // vocabulary: an unknown name is an error, because a projection the
+        // kernel does not name is the shell's to build — from
+        // `events(from)`, or as a query view over the published schema.
         methods.add_method("view", |lua, this, (name, opts): (LuaValue, LuaValue)| {
             let LuaValue::String(name) = name else {
                 return Err(err(
@@ -1557,7 +1560,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             s:spend(-1)
         "#,
         );
@@ -1566,7 +1569,7 @@ mod tests {
 
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             pcall(function() s:spend(-1) end)
             assert(s:remaining() == 100, "balance changed: " .. tostring(s:remaining()))
             -- A negative spend is rejected even without a budget.
@@ -1589,7 +1592,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 1000, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 1000, tag = "beats" } })
             assert(s:remaining() == 1000)
             assert(s:exhausted() == false)
 
@@ -1701,8 +1704,8 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local a = knl.open({ budget = { amount = 100, tag = "tokens" } })
-            local b = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local a = knl.open({ budget = { amount = 100, tag = "beats" } })
+            local b = knl.open({ budget = { amount = 100, tag = "beats" } })
 
             assert(type(a:id()) == "string" and #a:id() > 0, "id must be a non-empty string")
             assert(a:id() ~= b:id(), "session ids must be unique")
@@ -1745,7 +1748,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:close()
             s:spend(1)
         "#,
@@ -1757,7 +1760,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:close()
             s:reserve(1)
         "#,
@@ -1767,7 +1770,7 @@ mod tests {
 
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:append({ kind = "before_close" })
             s:spend(4)
             s:close()
@@ -1917,7 +1920,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             s:append({ kind = "budget_reserved", amount = 5 })
         "#,
         );
@@ -1927,7 +1930,7 @@ mod tests {
 
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 10, tag = "beats" } })
             for _, ev in ipairs({
                 { kind = "budget_granted", amount = 1000000 },
                 { kind = "budget_reserved", amount = 5 },
@@ -1961,7 +1964,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 100, tag = "beats" } })
 
             local ok, tag = s:reserve(30)
             assert(ok == true, "a covered reservation must be granted")
@@ -1970,14 +1973,14 @@ mod tests {
 
             local ok2, tag2 = s:reserve(1000)
             assert(ok2 == false, "an uncovered reservation must be refused")
-            assert(tag2 == "tokens", "a refusal must name the budget: " .. tostring(tag2))
+            assert(tag2 == "beats", "a refusal must name the budget: " .. tostring(tag2))
             assert(s:remaining() == 70, "a refusal must not deduct")
             assert(s:exhausted() == false, "a refusal must not exhaust")
 
             -- Both answers are in the log, with what was asked for.
             local evs = s:events()
             assert(evs[3].kind == "budget_reserved" and evs[3].amount == 30)
-            assert(evs[3].tag == "tokens")
+            assert(evs[3].tag == "beats")
             assert(evs[4].kind == "budget_refused" and evs[4].amount == 1000)
             assert(evs[4].remaining == 70, "the refusal records what there was")
 
@@ -2034,7 +2037,7 @@ mod tests {
                 return balance
             end
 
-            local s = knl.open({ budget = { amount = 500, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 500, tag = "beats" } })
             assert(folded(s) == s:remaining())
 
             s:reserve(120)
@@ -2048,10 +2051,12 @@ mod tests {
             assert(s:remaining() == 350, "remaining: " .. tostring(s:remaining()))
             assert(folded(s) == s:remaining(), "the fold and the counter disagree")
 
-            -- The usage view is the other, independent reading.
-            local u = s:view("usage")
-            assert(u.input_tokens == 100 and u.output_tokens == 50)
-            assert(u.model_calls == 1)
+            -- What the call consumed is the other, independent reading, and
+            -- it is in the log rather than in the ledger: the counts sit on
+            -- the response, for a query view to sum.
+            local r = s:events()[4]  -- opened, granted, reserved, the response
+            assert(r.kind == "llm_response", "kind: " .. tostring(r.kind))
+            assert(r.usage.input_tokens == 100 and r.usage.output_tokens == 50)
         "#,
         )
         .exec()
@@ -2079,7 +2084,7 @@ mod tests {
 
         lua.load(
             r#"
-            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ budget = { amount = 100, tag = "beats" } })
             for _, ev in ipairs({
                 { kind = "session_opened" },
                 { kind = "session_closed", reason = "carried over" },
@@ -2181,6 +2186,13 @@ mod tests {
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains(r#"unknown view "dialog""#), "{msg}");
 
+        // The token account is one of the names the kernel does not have:
+        // it reads the `llm_response` payload, so it is a query view in Lua
+        // (`knl.views.usage`) over the published schema.
+        let msg = expect_err(&lua, r#"knl.open():view("usage")"#);
+        assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
+        assert!(msg.contains(r#"unknown view "usage""#), "{msg}");
+
         let msg = expect_err(&lua, r#"knl.open():view(42)"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
         assert!(msg.contains("name must be a string"), "{msg}");
@@ -2191,7 +2203,7 @@ mod tests {
     }
 
     /// (I1) A view is a fresh table every call: mutating it cannot reach
-    /// the cached fold or the history.
+    /// the history.
     #[test]
     fn view_returns_a_fresh_table_each_call() {
         let lua = vm();
@@ -2210,12 +2222,9 @@ mod tests {
             assert(again[1].kind == "msg_user", "kind changed: " .. tostring(again[1].kind))
             assert(again[1].content == "hi", "content changed")
 
-            local u = s:view("usage")
-            u.input_tokens = 999
-            u.at_seq = 999
-            local fresh = s:view("usage")
-            assert(fresh.input_tokens == 0, "usage cache was reachable")
-            assert(fresh.at_seq == 2, "at_seq: " .. tostring(fresh.at_seq))
+            -- …and the history itself is untouched by any of it.
+            assert(s:len() == 2, "len: " .. tostring(s:len()))
+            assert(s:events()[2].kind == "msg_user", "the record was reachable")
         "#,
         )
         .exec()
@@ -2229,7 +2238,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ store = "mem", owner = "x", budget = { amount = 10, tag = "tokens" } })
+            local s = knl.open({ store = "mem", owner = "x", budget = { amount = 10, tag = "beats" } })
             assert(s:len() == 2, "mem store opens like the default: session_opened + the grant")
             assert(s:owner() == "x")
             assert(s:append({ kind = "note" }) == 3)
@@ -2287,7 +2296,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ owner = "alice", budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ owner = "alice", budget = { amount = 100, tag = "beats" } })
             local scope = s:scope_id()
             assert(type(scope) == "string" and #scope > 0, "scope_id must be a non-empty string")
             assert(scope ~= s:id(), "the scope names the authority, the id names the stream")
@@ -2339,7 +2348,7 @@ mod tests {
             r#"
             local path = "{path}"
             local s = knl.open({{ store = {{ sqlite = path }}, owner = "scoped-user",
-                                  budget = {{ amount = 100, tag = "tokens" }} }})
+                                  budget = {{ amount = 100, tag = "beats" }} }})
             local id, scope = s:id(), s:scope_id()
             assert(scope ~= id, "the scope id is not the stream id")
             s:reserve(20)
@@ -2365,9 +2374,9 @@ mod tests {
     /// (durable) `knl.open({ store = { sqlite = path } })` writes to a
     /// persisted stream, and `knl.resume` reopens it and re-folds the
     /// record: the owner, the balance the budget ledger implies and the
-    /// usage view all come back, and the resumed session carries on from
-    /// there.  A `budget` on resume is the owner granting again: recorded,
-    /// and added to what was left.
+    /// recorded events all come back, and the resumed session carries on
+    /// from there.  A `budget` on resume is the owner granting again:
+    /// recorded, and added to what was left.
     #[test]
     fn open_and_resume_a_durable_sqlite_session() {
         let lua = vm();
@@ -2378,8 +2387,17 @@ mod tests {
         lua.load(format!(
             r#"
             local path = "{path}"
+            -- The responses in a stream, for the counts a query view sums.
+            local function responses(s)
+                local out = {{}}
+                for _, ev in ipairs(s:events()) do
+                    if ev.kind == "llm_response" then out[#out + 1] = ev end
+                end
+                return out
+            end
+
             local s = knl.open({{ store = {{ sqlite = path }}, owner = "durable-user",
-                                  budget = {{ amount = 100, tag = "tokens" }} }})
+                                  budget = {{ amount = 100, tag = "beats" }} }})
             s:reserve(30)
             s:append({{ kind = "llm_response",
                         content = {{ {{ type = "text", text = "a" }} }},
@@ -2401,26 +2419,28 @@ mod tests {
             assert(r:owner() == "durable-user", "resumed owner: " .. tostring(r:owner()))
             assert(r:remaining() == 50, "resumed remaining: " .. tostring(r:remaining()))
             assert(r:id() == id, "resumed id is the stream it reopened")
-            local u = r:view("usage")
-            assert(u.model_calls == 2, "resumed usage model_calls: " .. tostring(u.model_calls))
-            assert(u.input_tokens == 50, "resumed usage input_tokens: " .. tostring(u.input_tokens))
+            -- The record came back whole: the counts are on the responses,
+            -- where a query view reads them.
+            local rs = responses(r)
+            assert(#rs == 2, "resumed responses: " .. tostring(#rs))
+            assert(rs[1].usage.input_tokens == 30 and rs[2].usage.input_tokens == 20,
+                   "the counts came back with the record")
 
             -- The grant's words came back too: a refusal still names it.
             local ok, tag = r:reserve(1000)
-            assert(ok == false and tag == "tokens", "refused tag: " .. tostring(tag))
+            assert(ok == false and tag == "beats", "refused tag: " .. tostring(tag))
 
             -- The record and the ledger continue on the resumed session.
             r:reserve(5)
             r:append({{ kind = "llm_response", beat = knl.new_beat_id(),
                         content = {{ {{ type = "text", text = "c" }} }},
                         usage = {{ input_tokens = 5 }} }})
-            local u2 = r:view("usage")
-            assert(u2.model_calls == 3, "continued model_calls: " .. tostring(u2.model_calls))
+            assert(#responses(r) == 3, "continued responses: " .. tostring(#responses(r)))
             assert(r:remaining() == 45, "continued remaining: " .. tostring(r:remaining()))
 
             -- Granting again on resume adds to what is left, and is recorded.
             local g = knl.resume({{ store = {{ sqlite = path }}, session = id,
-                                    budget = {{ amount = 100, tag = "tokens",
+                                    budget = {{ amount = 100, tag = "beats",
                                                 desc = "a second grant" }} }})
             assert(g:remaining() == 145, "re-granted remaining: " .. tostring(g:remaining()))
             local evs = g:events()
@@ -2496,7 +2516,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "tokens" } })
+            local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "beats" } })
             local id = s:id()
             s:reserve(30)
             s:append({ kind = "note", text = "in memory" })
@@ -2976,7 +2996,7 @@ mod tests {
             &lua,
             &format!(
                 r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}",
-                                 budget = {{ amount = 100, tag = "tokens" }} }})"#
+                                 budget = {{ amount = 100, tag = "beats" }} }})"#
             ),
         );
         assert!(msg.contains("reserved"), "{msg}");

@@ -75,7 +75,7 @@ kernel.session({
     -- kernel reads the number and nothing else: with the default cost (one
     -- unit per beat) the unit here is a beat, not a token. Tagging it
     -- "tokens" would promise a bound the kernel does not enforce — token
-    -- usage is the separate `view("usage")` reading printed below.
+    -- usage is the separate `knl.views.usage` reading printed below.
     budget = { amount = 8, tag = "beats", desc = "one unit per beat" },
 }, function(s)
     s:append({
@@ -140,13 +140,17 @@ kernel.session({
         kinds[#kinds + 1] = ev.kind
     end
 
-    local usage = s:view("usage")
+    -- The token accounting is a view like the grouping above — one SELECT,
+    -- one row per stream that answered — and not something the kernel serves
+    -- itself. This run reads its own stream, so there is one row (or none,
+    -- had no beat come off).
+    local usage = kernel.views.usage(s)[1] or { calls = 0, input_tokens = 0, output_tokens = 0 }
     print(
         string.format(
             "[E2E] beats=%d declared=%d usage: calls=%s in=%s out=%s remaining=%s",
             beats,
             #grouped,
-            tostring(usage.model_calls),
+            tostring(usage.calls),
             tostring(usage.input_tokens),
             tostring(usage.output_tokens),
             tostring(s:remaining())

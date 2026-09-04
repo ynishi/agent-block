@@ -1373,7 +1373,7 @@ describe("knl.views — the predefined reads (view-design.md §2)", function()
     -- what is asked here is the part that is this layer's own: that a view
     -- is one query, that it reads the set the caller named, that it binds
     -- rather than splices, and how it reads the rows back.
-    local VIEW_NAMES = { "beats", "tool_pairs", "ledger" }
+    local VIEW_NAMES = { "beats", "tool_pairs", "ledger", "usage" }
 
     local function last_query(s)
         return s._queries[#s._queries]
@@ -1447,6 +1447,30 @@ describe("knl.views — the predefined reads (view-design.md §2)", function()
         expect(rows[2].ok).to.be(false)
         -- and the row the query answered is not written to on the way
         expect(s._query_rows[1].ok).to.be(1)
+    end)
+
+    it("counts usage by kind, one row per stream (the accounting reading)", function()
+        -- What the statement selects is a question for a database (asked in
+        -- knl_beat_test.lua inv11). What is this layer's own is that the
+        -- read is one SELECT over the `llm_response` records, grouped by
+        -- stream — token usage is a query view now, not a kernel built-in.
+        local s = K.open({})
+        s._query_rows = {
+            { stream = "sess-a", calls = 2, input_tokens = 20, output_tokens = 6, thinking_tokens = 0 },
+        }
+        local rows, truncated = K.views.usage(s)
+        expect(#rows).to.be(1)
+        expect(rows[1].calls).to.be(2)
+        expect(rows[1].input_tokens).to.be(20)
+        expect(truncated).to.be(false)
+
+        local sql = last_query(s).sql
+        expect(sql:find("llm_response", 1, true) ~= nil).to.be(true)
+        expect(sql:find("COUNT(*)", 1, true) ~= nil).to.be(true)
+        expect(sql:find("GROUP BY stream", 1, true) ~= nil).to.be(true)
+        for _, counter in ipairs({ "input_tokens", "output_tokens", "thinking_tokens" }) do
+            expect(sql:find("$.usage." .. counter, 1, true) ~= nil).to.be(true)
+        end
     end)
 
     it("declares every view it exports, and exports every view it declares", function()
