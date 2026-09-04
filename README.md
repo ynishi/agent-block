@@ -917,6 +917,57 @@ local ok, why = lshape.check.check({ name = "Ada", age = 36 }, User)
 assert(ok, why)
 ```
 
+### Lua kernel (knl — `require("knl")`)
+
+`knl` is the Lua half of a kernel/shell split. Rust owns the **session**: an
+append-only event log, a budget the owner granted it, and a scope it is written
+under. Lua owns the **beat** — one model call plus the tools that call asks for
+— and the **device** it runs against, a frozen bundle of policy (`llm`, `tools`,
+`tool_policy`, `fold`, `filters`, `system`, `cost`). `knl.beat(session, device)`
+takes the two separately because they differ in owner, lifetime and mutability.
+There is no run loop: a caller writes the loop, which is why the primitive is
+one beat.
+
+```lua
+local kernel  = require("knl")
+local adapter = require("knl_adapter")
+
+local device = kernel.device({
+    llm   = adapter.anthropic:open({ model = "claude-haiku-4-5-20251001", max_tokens = 1024 }),
+    tools = adapter.tools({ ... }),        -- flat specs or ToolPorts
+})
+
+kernel.session({ owner = "u", budget = { amount = 8, tag = "beats" } }, function(s)
+    s:append({ kind = "msg_user", data = { content = "..." } })
+
+    local out                                -- the loop is yours to write
+    for _ = 1, 8 do
+        out = kernel.beat(s, device)         -- ok | refused | error | stopped
+        if not kernel.Outcome.is_ok(out) then break end
+        if #out.out.tools == 0 then break end -- nothing left to answer
+    end
+
+    local rows = kernel.views.usage(s)       -- one SELECT over the log
+    for _, row in ipairs(rows) do
+        print(row.calls, row.input_tokens, row.output_tokens)
+    end
+end)                                         -- the bracket closes either way
+```
+
+Views come in two tiers. A **built-in view** is a kernel read reached with
+`s:view(name, opts?)`, and there are exactly two fixed reads —
+`s:events(from)` and `view("tail", { n })`. Everything else is a **query
+view**: a named Lua function running one `SELECT` through `s:query(sql,
+params?, opts?)` over the published event table. `knl.views.beats` /
+`tool_pairs` / `ledger` / `usage` are the four shipped, and a consumer's own
+view is a function of the same form — nothing about the four is privileged.
+
+The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
+(the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the
+syscall surface Lua sees) and
+`crates/agent-block-core/blocks/lib/knl/init.lua` (this half: beat, device,
+Outcome, shapes, views).
+
 ### log.*
 - `log.info/warn/error/debug(msg)`
 

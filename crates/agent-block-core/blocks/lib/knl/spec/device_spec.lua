@@ -1,11 +1,11 @@
 -- device_spec.lua — mlua-lspec unit tests for the session / device split
--- (session-device-design.md: state and policy are two arguments, not one bundle).
+-- (state and policy are two arguments, not one bundle).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/device_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
--- What this proves (session-device-design.md §8, pure-VM half):
+-- What this proves (the pure-VM half):
 --   1 knl.device resolves its defaults once (fold / filters / cost), checks
 --     types at construction, and rejects unknown keys loudly (no silent
 --     policy typos). knl.open takes state keys only — a policy key is an
@@ -24,19 +24,19 @@
 --     way — "scope_exit" on a clean exit (the one word for leaving a scope,
 --     whichever form wrote it) and "error" on a failing one — a body error
 --     wins over the close, and a close that fails on that path is warned
---     rather than raised or swallowed (§9-f).
+--     rather than raised or swallowed (the suppressed-exception rule).
 --   7 tool_policy's decision vocabulary is nil / "run" / "deny" and nothing
 --     else; a raise denies (fail-closed) and a fourth value stops the beat
---     with err("conf") before any tool runs (§9-l).
---   8 the shapes M.shapes publishes cover every public IF (§9-k) — the
---     `data` shape of every kind a beat writes among them (view-design.md
---     §6 item 2: the kernel validates the envelope and its own kinds, the
+--     with err("conf") before any tool runs.
+--   8 the shapes M.shapes publishes cover every public interface — the
+--     `data` shape of every kind a beat writes among them (the kernel
+--     validates the envelope and its own kinds, the
 --     writer owns the rest), plus the two envelope rules this layer mirrors
 --     so they fail at the append instead of at the syscall (`beat` is a
 --     string, `meta` is shallow).
 --   9 a syscall failure is reported as the kernel's own reading of it
 --     (`Outcome.err("state").detail` = { kind?, method?, retryable,
---     message }, §9-r) rather than as a sentence, and beat never acts on
+--     message }) rather than as a sentence, and beat never acts on
 --     `retryable` itself. A raise out of the CALLER's code (fold, a filter,
 --     cost, the llm) is the other kind of failure: its detail is the
 --     message, plus a traceback in dev mode only.
@@ -105,7 +105,7 @@ local function fake_session(opts)
     function s:events()
         return self._events
     end
-    -- The SQL read (view-design.md §2). No SQLite stands behind this: the
+    -- The SQL read. No SQLite stands behind this: the
     -- fake records the call and answers whatever the case queued, which is
     -- what makes a view's CONTRACT testable here — that it runs one
     -- statement, that the statement names `$sessions`, that the caller's
@@ -682,7 +682,7 @@ describe("knl.session — the canonical bracket", function()
         end).to.fail()
     end)
 
-    -- §9-f: the body's error is the winner. A close that fails on the way
+    -- The body's error is the winner. A close that fails on the way
     -- out is bookkeeping about a failure — it must not replace it, and it
     -- must not vanish either, so it goes to the host log when there is one.
     it("a close that fails on the error path is warned as a record, not raised", function()
@@ -1229,7 +1229,7 @@ describe("beat contract hardening (review findings)", function()
     end)
 end)
 
--- session-device-design.md §9-l. The vocabulary is three values and no
+-- The tool_policy contract. The vocabulary is three values and no
 -- more: nil (no opinion), "run", "deny". A policy is a gate, so its own
 -- failures close (a raise denies) and its own mistakes stop the beat
 -- rather than being read as some fourth intention.
@@ -1404,7 +1404,7 @@ describe("fold hardening (review findings)", function()
     end)
 end)
 
-describe("knl.views — the predefined reads (view-design.md §2)", function()
+describe("knl.views — the query views the module ships", function()
     -- No SQLite here on purpose. What a statement SELECTS is a question for
     -- a database and is asked where there is one (knl_beat_test.lua inv11);
     -- what is asked here is the part that is this layer's own: that a view

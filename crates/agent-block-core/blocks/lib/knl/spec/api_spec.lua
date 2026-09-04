@@ -1,12 +1,12 @@
--- api_spec.lua — the machine check that knl's public IF is fully declared
--- (session-device-design.md §9-m, the Lua half).
+-- api_spec.lua — the machine check that knl's public interface is fully
+-- declared (the Lua half; the bridge holds the other).
 --
 -- Run via:
 --   test_launch(code_file=".../knl/spec/api_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
 -- Why this file exists
---   §9-k says every public IF of knl is defined as a shape and published
+--   Every public interface of knl is defined as a shape and published
 --   through `knl.shapes`. A rule like that decays the moment it depends on
 --   someone remembering it: an export is added, the registry is not, and the
 --   contract quietly stops being the contract. So the completeness is
@@ -27,7 +27,7 @@
 --   through the registry in dev, and reaches the function's own answer in
 --   prod, where the wrapper is not installed at all.
 --
--- TODO (§9-m, the other half — a later pass): the same check across the
+-- TODO (the other half — a later pass): the same check across the
 -- bridge. `knl.api()` answers the bridge's own SESSION_API / MODULE_API
 -- tables, and a test that has the bridge in its VM will hold every name it
 -- declares against `knl.shapes.session` / `knl.shapes.module`, so adding a
@@ -212,8 +212,8 @@ describe("knl.shapes.api — every export is declared", function()
 
     it("covers the exports the design names one by one", function()
         -- The walk above would still pass if the module lost an export and
-        -- the registry lost it too. These are the names §9-m lists, plus
-        -- the views view-design.md §3 decision 8 adds.
+        -- the registry lost it too. These are the names the module doc
+        -- declares, plus the query views it ships.
         for _, name in ipairs({
             "open",
             "resume",
@@ -395,7 +395,7 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
     it("closes `kind` on exactly knl.shapes.error_kinds", function()
         -- One constant, two readers: the shape and anything that
         -- enumerates the classes. A list retyped beside the shape is the
-        -- second source of truth §9-m exists to rule out — and the third
+        -- second source of truth the registry exists to rule out — and the third
         -- (the kernel's own `KnlError::KINDS`) is held against this one
         -- where a bridge exists (knl_beat_test.lua, inv10).
         local declared = K.shapes.error_kinds
@@ -417,8 +417,8 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
     end)
 
     it("names the class a read that ran too long comes back as", function()
-        -- The read side has a failure of its own (view-design.md §3
-        -- decision 2): a query past its deadline is interrupted, and the
+        -- The read side has a failure of its own: a query past its
+        -- deadline is interrupted, and the
         -- class it raises is in the same closed list as every other.
         local declared = {}
         for _, kind in ipairs(K.shapes.error_kinds) do
@@ -457,7 +457,7 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
     end)
 end)
 
-describe("knl.views — every predefined view is declared (view-design.md §3-8)", function()
+describe("knl.views — every predefined query view is declared", function()
     -- The same rule as the module registry, on the read side: a view is a
     -- named function that runs one SELECT, and the name has to be declared
     -- or the contract is only what someone remembered to write down.
@@ -512,8 +512,8 @@ describe("knl.views — every predefined view is declared (view-design.md §3-8)
 end)
 
 describe("knl.shapes.schema — the read schema is published as data", function()
-    -- The columns a caller writes SQL against (view-design.md §3 decision
-    -- 4). It is checked for being well formed here, and held against the
+    -- The columns a caller writes SQL against. It is checked for being
+    -- well formed here, and held against the
     -- kernel's own declaration where a bridge exists (knl_beat_test.lua,
     -- inv11) — the same two-sided arrangement as the syscall registries.
     local schema = K.shapes.schema
@@ -555,7 +555,7 @@ describe("knl.shapes.schema — the read schema is published as data", function(
         for _, column in ipairs(schema.columns) do
             names[column.name] = true
         end
-        -- The envelope is the row (view-design.md §6 item 2): `kind` is the
+        -- The envelope is the row: `kind` is the
         -- indexed column a kind-filtered view uses, `beat` is the
         -- correlation key `knl.views.beats` groups on without a JSON path,
         -- `meta` holds the shallow labels — and `data` is the one column a

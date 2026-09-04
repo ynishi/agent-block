@@ -1,13 +1,15 @@
---- knl — the Lua kernel (session + device / beat / fold / Outcome).
+--- knl — the Lua kernel: session + device, the beat, Outcome, shapes, views.
 ---
 --- What this is
----   The driving half of the kernel/shell split: Rust is the pure syscall
----   layer (session / append / events / view / reserve / spend / close), and
----   this module runs a beat — one model call plus the tools that call asks
----   for — over it, returning an `Outcome`. See `session-device-design.md`
----   (the two-argument beat) over `knl-kernel-design.md`.
+---   The driving half of the kernel/shell split. Rust is the pure syscall
+---   layer (session / append / events / view / query / reserve / spend /
+---   close) and states the kernel's own invariants in its module doc; this
+---   module runs a BEAT — one model call plus the tools that call asks for —
+---   over that layer and hands back an `Outcome`. There is no loop here: a
+---   caller composes beats on the spot, which is why the primitive is one
+---   beat and not a run.
 ---
---- Two arguments, two owners (session-device-design.md §1/§4)
+--- Two arguments, two owners
 ---   `knl.open{ owner?, budget?, store? }` hands back the kernel's session
 ---   userdata verbatim — the durable half: the fact-log and the quota, owned
 ---   by the kernel, advanced only by appending. `knl.device{ llm?, tools?,
@@ -16,11 +18,12 @@
 ---   and then frozen. `knl.beat(session, device)` takes both. They are not
 ---   bundled into one handle because they differ in owner (kernel / caller),
 ---   lifetime (durable / per-process) and mutability (append-only / frozen),
----   and the config is consumed at construction rather than carried.
+---   and the config is CONSUMED at construction rather than carried: a
+---   device holds resolved fields, never the table it was configured with.
 ---   Per-beat policy variation is not an override argument: derive another
 ---   device with `d:with{ llm = strong }` and beat with that one.
 ---
---- Lifecycle belongs to the session (session-device-design.md §9-e)
+--- Lifecycle belongs to the session
 ---   The canonical bracket is the callback form — the kernel opens, runs the
 ---   body, and closes, so an error escaping the body still records the
 ---   boundary:
@@ -31,9 +34,10 @@
 ---   `knl.session` resumes instead of opening when the opts name a session.
 ---   `local s <close> = knl.open{...}` is the alternative and the Rust Drop
 ---   backstop is the last resort; a body error always wins over a close that
----   failed on its way out (§9-f).
+---   failed on its way out (the suppressed-exception rule, and the loser is
+---   logged as a record rather than dropped).
 ---
---- Beats are declared, not numbered (session-device-design.md §9-a)
+--- Beats are declared, not numbered
 ---   The kernel does not count beats. `knl.beat` mints one id per beat with
 ---   `knl.new_beat_id()` (time-ordered, session-free) and stamps it on every
 ---   event that beat writes — llm_request, llm_response, the tool pair, and
@@ -41,7 +45,48 @@
 ---   only that it be a string; grouping and ordering read it back, nothing
 ---   more. `resp.beat` carries the same id out to the caller.
 ---
---- What a stored event looks like (view-design.md §6 item 2)
+--- The steps of a beat
+---   [0]   the gate: a knl session first, a knl device second, an `llm` on
+---         the device — any of the three missing is `Outcome.err("conf")`
+---   [0.5] the beat names itself (`knl.new_beat_id`)
+---   [1]   request = `device.fold(session:events(), device)`
+---   [2]   the filter chain, each `fn(request) -> request`
+---   [3]   `session:reserve(device.cost(request))` — a refusal stops here,
+---         with nothing recorded and no call made
+---   [4]   append `llm_request`
+---   [5]   `device.llm(request)`
+---   [6]   append `llm_response` (or `llm_call_failed`), then settle
+---   [7]   the tools that response asked for: `tool_call` / `tool_result`
+---
+--- Outcome — the four statuses
+---   A beat answers with a value, never a raise, and the value is one of
+---   four tagged tables. `Outcome.match(o, arms)` is exhaustive: all four
+---   arms are required, and an unknown status is a loud error — the
+---   dynamic-language stand-in for a compiler's exhaustiveness check.
+---
+---     ok       the beat ran. `out` is the call's answer (content / usage /
+---              stop_reason) plus the `beat` id and the tool summary
+---     refused  the model answered and declined to make progress. `reason`
+---              is the adapter's provider-neutral classification of the
+---              refusal ("model" / "content_filter") and `detail` is the
+---              whole answer, so a caller can inspect what came back
+---     error    the mechanism failed: the beat did not come off
+---     stopped  the beat stopped ON PURPOSE before calling — the quota
+---              would not cover it. Nothing broke and the model was never
+---              asked; this is the branch a caller's loop exits on, and
+---              `tag` names the grant that stopped it
+---
+---   `Outcome.err(kind, detail)` carries TWO vocabularies and they answer
+---   different questions. `kind` names the STAGE that failed — "conf" (the
+---   device or a caller function it holds), "filter", "call" (the llm), or
+---   "state" (a record that could not be laid down). What the failure WAS,
+---   and whether asking again could work, is in `detail`: a "state" failure
+---   carries the kernel's own reading, `detail.kind` one of
+---   `knl.shapes.error_kinds` and `detail.retryable`. A loop deciding on a
+---   retry reads `detail.retryable` and never the stage: "state" says
+---   where, not whether.
+---
+--- What a stored event looks like
 ---   One envelope, one place for structure. An event is `{ kind, beat?,
 ---   meta?, data? }` and nothing else at the top level — a stray key is
 ---   refused, not stored — and the kernel stamps `seq` / `epoch_ms` /
@@ -68,26 +113,31 @@
 ---       s:append{ kind = "msg_user", meta = { label = "seed" },
 ---                 data = { content = "hi" } }
 ---
---- Reading the log back (view-design.md)
----   The log is a SQLite table whose columns the kernel publishes
----   (`knl.shapes.schema`), and a caller reads it by writing SQL:
----   `session:query(sql, params?, opts?)` binds values, refuses anything
+--- Reading the log back: two tiers, and only two
+---   BUILT-IN VIEW — `session:view(name, opts?)`, plus `session:events(from)`
+---   beside it. These are the kernel's own reads, they are fixed, and they
+---   do not grow: the record from a position on, and `tail` (the last `n`
+---   events, verbatim). A fold whose consumer is not fixed in kernel terms
+---   never becomes a name here.
+---
+---   QUERY VIEW — a named Lua function that runs ONE `SELECT`. The log is a
+---   SQLite table whose columns the kernel publishes (`knl.shapes.schema`),
+---   and `session:query(sql, params?, opts?)` binds values, refuses anything
 ---   that is not one SELECT / WITH, and resolves `$stream` (this session)
----   and `$sessions` (`opts.sessions`, the set to read across). A "view" is
----   nothing more than a named function that runs one of those statements —
----   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` are the four the
----   kernel ships, and a consumer writes its own in exactly the same form.
----   The kernel's own built-in reads are `events(from)` and `tail(n)` and
----   nothing else: token usage is not special, it is a query view like the
----   rest.
+---   and `$sessions` (`opts.sessions`, the set to read across). That is the
+---   whole mechanism: no builder, no query object, no registration hook.
+---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` are the four this
+---   module ships, and a consumer's own view is a function of exactly the
+---   same form — nothing about the four is privileged.
 ---
----   `usage` reads what the providers reported. Every `llm_response` carries
----   the counts its adapter normalized out of the provider's answer, so the
----   view is an accounting of facts already in the log — and it is a reading
----   apart from the budget, which is a quota the owner granted and never a
----   tally of tokens (see below).
+---   Token usage is a query view and not a built-in one, deliberately.
+---   Every `llm_response` carries the counts its adapter normalized out of
+---   the provider's answer, so `knl.views.usage` is an accounting of facts
+---   already in the log, in the shell's vocabulary rather than the kernel's
+---   — and it is a reading apart from the budget, which is a quota the owner
+---   granted and never a tally of tokens (see below).
 ---
---- The budget (budget-design.md §2)
+--- The budget
 ---   The budget is a quota the owner granted the session, not a tally of
 ---   what it used. beat asks for permission BEFORE it calls —
 ---   `session:reserve(n)`, after the request is known and before anything is
@@ -99,7 +149,34 @@
 ---   the number and nothing else, and token usage (`knl.views.usage`) is a
 ---   separate reading that beat never folds back into the budget.
 ---
---- When something raises (session-device-design.md §9-r)
+--- What a device promises, function by function
+---   Every one of these is the caller's code, and beat holds it to a written
+---   contract rather than guessing at a return it does not recognise.
+---
+---     fold(events, device) -> request
+---       pure; the default (`knl.fold`) folds the log into the neutral
+---       content-block shape. A raise is `err("conf")`.
+---     filter(request) -> request
+---       each filter replaces the request wholesale. Returning a non-table
+---       is `err("filter")` — loudly, in prod as well as dev, because the
+---       value goes into the durable record and onto the wire.
+---     cost(request) -> integer >= 1
+---       what the beat reserves. Checked in prod, not only asserted in dev:
+---       a beat that could ask for zero is how a run stops being finite.
+---       The default answers 1, so a grant counts beats.
+---     llm(request) -> llm_result | nil, err
+---       `knl.shapes.llm_result`: `status` is "ok" or "refused" and there is
+---       no third value; `content` is an array of blocks, `usage` is three
+---       counts, and a "refused" answer names the refusal's `kind`. A
+---       transport or provider failure is `nil, err` (or a raise), which
+---       beat records as `llm_call_failed` and reports as `err("call")`.
+---     tool_policy(tool_use_block, out) -> decision, reason?
+---       `nil` (no opinion — run), `"run"` or `"deny"`, and nothing else: a
+---       fourth word is a device-contract violation, not a fourth meaning.
+---       A policy that RAISES denies — a gate written to veto tools must not
+---       fall open on its own bug — and its message becomes the reason.
+---
+--- When something raises
 ---   Two kinds of failure meet inside a beat and they are reported
 ---   differently. A KERNEL SYSCALL raises attributed text — `knl:
 ---   <method>: <kind>: <message>` — because mlua cannot carry a table out
@@ -114,11 +191,37 @@
 ---   failure, so its detail is the message it raised — plus, in dev mode
 ---   only, the `traceback` of where it raised.
 ---
---- What the POC deliberately leaves out
----   Real provider adapters (llm is `fn(req) -> {status, content, usage,
----   stop_reason}`), the full fold vocabulary, realistic tool / filter
----   policies, and fork (branching the history — deferred until the basic
----   shape is wired into real loops).
+--- knl.shapes is a registry that is EXECUTED
+---   Every public interface of this module is declared as an lshape and
+---   published through `knl.shapes`, so a caller reads the contract as data
+---   rather than out of prose. `knl.shapes.api` goes one further: it names
+---   the shape of every argument of every export, and in dev mode each
+---   declared export is wrapped once, at load, by a gate that holds the call
+---   to its entry. A registry nobody runs is prose with a table around it.
+---   Prod installs no wrapper and pays nothing, which is why the checks a
+---   call must not get through WITHOUT — a device's config, a filter's
+---   return, cost's bound — stay where they are and stay loud in both modes.
+---   `knl/spec/api_spec.lua` closes the loop from the other side: an export
+---   with no entry, an entry with no export, and a device field
+---   `device_config` does not describe are each a failure.
+---
+--- Clean by construction: no legacy, no fabrication
+---   This module and `knl_adapter` are kept free of consumer legacy on
+---   purpose, because a compat shim taken in here becomes the kernel's
+---   vocabulary forever. Nothing is invented on a caller's behalf: an llm
+---   answer with no `usage` is `err("call")` rather than `usage or {}`, a
+---   refusal without a `kind` is the same rather than a default word, a
+---   third llm status does not exist, a nameless `tool_use` block is the
+---   provider breaking its contract rather than a hole to fill with an empty
+---   string, and no request field (`max_tokens` and friends) is injected
+---   behind the caller's back. There are no compat aliases: a tool entry
+---   declares `input_schema`, and nothing else is read in its place.
+---
+--- Deliberately not here
+---   Fork (branching a history), scope trees and sub-scope allowances,
+---   parallel tool execution, streaming, and a structured error type for a
+---   tool_result beyond the raised string. Each is deferred until a real
+---   loop asks for it, not designed ahead of the need.
 
 --- The Rust syscall bridge, captured before `require("knl")` shadows the
 --- name (see the header). `nil` in a VM that has no bridge (e.g. the pure
@@ -150,7 +253,7 @@ local function bridge(method)
 end
 
 --- Read a raised kernel failure back as data: `{ kind?, method?, retryable,
---- message }` (session-device-design.md §9-r).
+--- message }` — the *When something raises* section of the header.
 ---
 --- The bridge cannot raise a table, so it raises the text `knl: <method>:
 --- <kind>: <message>` and publishes `knl.error` to read it back. That
@@ -310,7 +413,7 @@ local function wire_tools(tools)
         out[#out + 1] = {
             name = name,
             description = spec.description,
-            input_schema = spec.input_schema or spec.schema,
+            input_schema = spec.input_schema,
         }
     end
     return out
@@ -445,8 +548,8 @@ end
 -- ============================================================
 --
 -- Every public IF is defined here and published through `M.shapes`
--- (session-device-design.md §9-k), so a caller reads the contract as data
--- rather than out of prose, and `M.shapes.api` (§9-m) names the shape of
+-- so a caller reads the contract as data
+-- rather than out of prose, and `M.shapes.api` names the shape of
 -- every export so a spec can check the registry is complete instead of a
 -- person remembering to update it.
 --
@@ -465,7 +568,8 @@ end
 -- The event vocabulary this layer writes (msg_user / llm_request /
 -- llm_response / llm_call_failed / tool_call / tool_result) is here too,
 -- as `knl.shapes.events` — but only the `data` half of each, because that
--- is the half whose owner is the writer (view-design.md §6 item 2). There
+-- is the half whose owner is the writer (the *stored event* section of the
+-- header). There
 -- is no second copy of anything: the kernel validates the envelope and the
 -- `data` of ITS own kinds (`session_*`, `budget_*`) and stopped judging
 -- these, so the shapes below are the only declaration of them, and the
@@ -537,7 +641,7 @@ local REQUEST = T.shape({
     tools = T.array_of(WIRE_TOOL):is_optional(),
 })
 
---- An event's `meta`: labels, and only labels (view-design.md §6 item 2).
+--- An event's `meta`: labels, and only labels.
 ---
 --- Shallow by rule — string / number / boolean values and nothing else —
 --- because `meta` is the half of the envelope a view can read without ever
@@ -567,7 +671,7 @@ local EVENT_BASE = T.shape({
 })
 
 --- The `data` of every kind this layer writes — its shape, owned here
---- because the writer owns it (view-design.md §6 item 2).
+--- because the writer owns it.
 ---
 --- Closed, every one of them: `data` is what a SQL view reads a path out
 --- of, so a key that arrived by accident is a column somebody will
@@ -616,15 +720,15 @@ local EVENT_DATA = {
 
 --- One entry of a device's `tools` map: what the model may call
 --- (description / input_schema, both optional and both provider
---- vocabulary) plus how to call it. Open: `schema` is still accepted as
---- the legacy alias for `input_schema` by fold's wire_tools.
+--- vocabulary) plus how to call it. Only `input_schema` is read; there is
+--- no alias.
 local TOOL_ENTRY = T.shape({
     description = T.string:is_optional(),
     input_schema = T.any:is_optional(),
     handler = FUNCTION,
 })
 
---- What a `tool_policy` may decide (session-device-design.md §9-l): `nil`
+--- What a `tool_policy` may decide: `nil`
 --- is "no opinion" and runs, and the two words are the whole vocabulary.
 --- Anything else is a device-contract violation, not a third meaning.
 local TOOL_POLICY_DECISION = T.one_of({ "run", "deny" }):is_optional()
@@ -745,21 +849,21 @@ local LLM_RESULT = T.discriminated("status", {
 })
 
 --- Every class a kernel failure can have, in one closed list — the Lua
---- side of the Rust `KnlError::KINDS` (session-device-design.md §9-r).
+--- side of the Rust `KnlError::KINDS`.
 ---
 --- One constant, used by the shape below and by the check that holds this
 --- declaration against the bridge's own (`knl.api().errors`, compared in
 --- `tests/fixtures/knl_beat_test.lua` inv10, the test that has a bridge).
 --- Retyping the list beside the shape would make a second place to keep in
---- step, which is the thing §9-m exists to rule out.
+--- step, which is the drift the api registry exists to rule out.
 ---
---- `timeout` is the read side's own class (view-design.md §3 decision 2): a
+--- `timeout` is the read side's own class: a
 --- `session:query` that ran past its deadline was interrupted, and it is not
 --- retryable — the same statement over the same data would run just as long.
 --- `busy` remains the one class the kernel calls worth asking about again.
 local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported", "timeout" }
 
---- A raised kernel failure, read back as data (`knl.error(e)`, §9-r).
+--- A raised kernel failure, read back as data (`knl.error(e)`).
 ---
 --- `kind` and `method` are optional because a raise that carried no
 --- attribution — a Lua-side `error("...")`, a message from another module,
@@ -783,7 +887,7 @@ local ERROR = T.shape({
     cause = T.string:is_optional(),
 })
 
---- What a caller asks for beyond the SQL itself (view-design.md §2).
+--- What a caller asks for beyond the SQL itself.
 ---
 --- `sessions` is the set `$sessions` expands to — the streams this read
 --- spans, which is how one statement reads a session tree or a set of
@@ -805,8 +909,7 @@ local QUERY_OPTS = T.shape({
 }, { open = false })
 
 --- The read schema, as data: the kernel's table and its columns, published
---- as the contract a caller writes SQL against (view-design.md §3 decision
---- 4, persistence-design.md §3.2).
+--- as the contract a caller writes SQL against.
 ---
 --- This is plain data rather than an lshape schema on purpose — it describes
 --- a SQL table, not a Lua value, and what it is FOR is to be compared:
@@ -867,7 +970,7 @@ M.shapes = {
     budget_grant = BUDGET_GRANT,
 }
 
---- The API registry (session-device-design.md §9-m): one entry per public
+--- The API registry: one entry per public
 --- export, naming the shape of what goes in and what comes out. It exists
 --- so the completeness of the contract is *checked* rather than remembered
 --- — `knl/spec/api_spec.lua` walks this module and fails on an export with
@@ -912,7 +1015,7 @@ M.shapes.session = {
     -- Token usage used to be the second name here and is not one any more —
     -- it is `knl.views.usage`, one SELECT like every other view.
     view = { args = { T.one_of({ "tail" }), "table opts?" }, returns = "table (the named fold)" },
-    -- The SQL read (view-design.md §2). The statement is the caller's and
+    -- The SQL read. The statement is the caller's and
     -- the kernel touches two things in it: it refuses anything that is not
     -- one SELECT / WITH, and it expands `$sessions` into one bound
     -- placeholder per id. Values are bound, never interpolated — `$stream`
@@ -961,7 +1064,7 @@ local function view_args()
     return { arg_of(SESSION_HANDLE, "session"), arg_of(QUERY_OPTS, "opts?") }
 end
 
---- The predefined views, declared (view-design.md §3 decision 8).
+--- The predefined query views, declared.
 ---
 --- One table, published twice: as `knl.shapes.views` (the registry a caller
 --- reads) and as the `members` of the `views` entry below (what the dev-mode
@@ -1332,7 +1435,7 @@ function M.device(config)
         fold = config.fold or M.fold,
         cost = config.cost or default_cost,
         -- The caller's arrays/maps are copied, so writing to them after
-        -- construction cannot reach the device (session-device-design §9-d).
+        -- construction cannot reach the device.
         filters = copy_array(config.filters),
         tools = config.tools and frozen(shallow_copy(config.tools), "a device's tools map", TOOLS_TAG) or nil,
     }
@@ -1440,7 +1543,7 @@ function M.resume(opts)
     })
 end
 
---- The canonical bracket (session-device-design.md §9-e): open (or resume),
+--- The canonical bracket: open (or resume),
 --- run the body with the session, close it either way.
 ---
 ---     local out = knl.session({ owner = "u" }, function(s)
@@ -1451,14 +1554,14 @@ end
 --- The body's return values are the bracket's. When the body raises, the
 --- session is closed with reason "error" first and the body's error is then
 --- re-raised unchanged: a bookkeeping failure must not replace the failure
---- it is bookkeeping for (§9-f), so a close that itself fails on that path
+--- it is bookkeeping for, so a close that itself fails on that path
 --- is warned about rather than raised. On the clean path a failing close
 --- raises instead, since a bracket
 --- that reports success with no boundary recorded is the one outcome this
 --- exists to rule out.
 ---
 --- When both fail, the body error wins and the close failure is the
---- suppressed one (§9-f, try-with-resources' suppressed exception). It is
+--- suppressed one (try-with-resources' suppressed exception). It is
 --- not silent either: it goes to the host `log` global as a warning when
 --- the VM has one, as a record — `{ event =
 --- "close_failed_after_body_error", body = <the winner, as text>, close =
@@ -1499,7 +1602,7 @@ function M.session(opts, fn)
     -- The body is failing: close best-effort with the body's error as the
     -- boundary's `detail`, then let that error through. A close that fails
     -- here is reported, not raised and not swallowed — the body's error is
-    -- the one that propagates (§9-f, the suppressed exception of
+    -- the one that propagates (the suppressed exception of
     -- try-with-resources).
     local closed_ok, cerr = pcall(s.close, s, "error", tostring(returned[2]))
     if not closed_ok then
@@ -1536,7 +1639,7 @@ function M.session(opts, fn)
 end
 
 --- Mint a beat id: a time-ordered, session-free string the caller stamps on
---- the events of one beat (session-device-design.md §9-a). A module
+--- the events of one beat. A module
 --- function, not a direct bridge call, so a spec can stand in for it.
 ---
 --- @return string beat_id
@@ -1634,7 +1737,7 @@ local function llm_contract_violation(resp)
     return nil
 end
 
---- Ask the policy about one tool_use block (session-device-design.md §9-l).
+--- Ask the policy about one tool_use block.
 ---
 --- The contract is `tool_policy(tool_use_block, out) -> decision, reason?`
 --- with a decision of `nil` (no opinion — run), `"run"` or `"deny"`, and
@@ -1824,7 +1927,7 @@ function M.beat(session, device)
 
     -- [0.5] the beat names itself ----------------------------------------
     -- One id per beat, minted here and stamped on every event this beat
-    -- writes. The kernel neither numbers nor requires it (§9-a).
+    -- writes. The kernel neither numbers nor requires it.
     local id_ok, beat_id = pcall(M.new_beat_id)
     if not id_ok or type(beat_id) ~= "string" then
         return emit(Outcome.err("conf", "no beat id: " .. tostring(beat_id)))
@@ -1881,8 +1984,8 @@ function M.beat(session, device)
     -- stop rather than a failure (`stopped`, carrying the grant's tag so a
     -- caller can name what stopped it). How much to ask for is the device's
     -- policy — `device.cost(request)` — and it is never derived from token
-    -- counts: the budget and `knl.views.usage` are separate readings
-    -- (budget-design.md §4-8).
+    -- counts: the budget and `knl.views.usage` are separate readings (the
+    -- *budget* section of the header).
     local est_ok, amount = xpcall(device.cost, traced, request)
     if not est_ok then
         return emit(Outcome.err("conf", raised_detail("cost failed: " .. raised_text(amount), amount)))
@@ -2026,7 +2129,7 @@ end
 M._execute_tools = execute_tools
 
 -- ============================================================
--- views — the predefined reads (view-design.md §2)
+-- views — the query views this module ships
 -- ============================================================
 --
 -- A view is a named function that runs one SELECT. That is the whole of the
@@ -2056,7 +2159,7 @@ M._execute_tools = execute_tools
 --     nothing that came from a caller.
 --
 -- Which half of the stored event a statement reads decides what can break
--- it (view-design.md §6 item 2). `beat` is a COLUMN — the envelope's
+-- it. `beat` is a COLUMN — the envelope's
 -- correlation key — so `beats` groups on it and is untouched by any change
 -- to what a kind carries. The rest reach into `data`, and each of those
 -- paths is tied to one kind's shape: `tool_pairs` to the tool pair,
@@ -2255,7 +2358,7 @@ function M.views.usage(session, opts)
 end
 
 -- ============================================================
--- The registry, executed (session-device-design.md §9-m)
+-- The registry, executed
 -- ============================================================
 --
 -- `M.shapes.api` names the shape of every argument of every export. A

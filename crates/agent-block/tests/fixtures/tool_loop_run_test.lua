@@ -145,7 +145,7 @@ describe("tool_loop.run result contract", function()
 
     -- The keys of a plain run, pinned. tool_loop took an `opts.session`
     -- once, routing the call through a `s:call` the bridge never had; that
-    -- path is gone (session-device-design.md §11 R1) and running a loop over
+    -- path is gone (see the `knl` module doc) and running a loop over
     -- a recorded session is `knl.beat(session, device)` now. What this case
     -- holds is that nothing was left behind by the removal: the same keys,
     -- the same values, no field appearing from a feature that is not there.

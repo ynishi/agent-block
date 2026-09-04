@@ -5,8 +5,7 @@
 --   test_launch(code_file=".../knl/spec/scope_spec.lua",
 --               search_paths=[".../blocks/lib"])   -- so require("knl") resolves
 --
--- What this proves (scope-design.md rev 3 + session-device-design.md §9-a,
--- pure-VM half):
+-- What this proves (the scope model and declared beat ids, pure-VM half):
 --   1 a beat's llm_response lands with the counts the provider reported, and
 --     the reading of them is a query view (`knl.views.usage`) rather than a
 --     kernel built-in — while the balance moved only where the beat reserved
@@ -78,7 +77,7 @@ local function fake_session(opts)
     end
 
     -- The kernel's own kinds go in the same envelope as everybody's: what
-    -- the kind is about lives under `data` (view-design.md §6 item 2).
+    -- the kind is about lives under `data`.
     store({ kind = "session_opened", data = { scope_id = "scope-" .. id, owner = owner } })
 
     local s = {}
@@ -165,7 +164,7 @@ local function fake_session(opts)
         end
     end
 
-    -- The SQL read (view-design.md §2), which is how token usage is read
+    -- The SQL read, which is how token usage is read
     -- now: a view is a named function that runs one SELECT, and this fake
     -- records the statement rather than running one. What a statement
     -- selects is a question only a database can answer, and it is asked

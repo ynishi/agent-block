@@ -1,29 +1,41 @@
 //! `knl.*` — Lua surface of the kernel syscall layer.
 //!
 //! This module is an adapter, nothing more.  The domain rules live in
-//! [`crate::knl`] (pure Rust, unit-tested without a VM); here we only:
+//! [`crate::knl`] (pure Rust, unit-tested without a VM) and are stated in
+//! that module's doc; here we only:
 //!
 //! 1. define the `Session` userdata and bind its methods,
 //! 2. convert Lua tables ⇄ `serde_json::Value`,
 //! 3. attribute failures as `knl: <method>: <kind>: <reason>`.
 //!
-//! # Failures carry their class
-//!
-//! A failure is raised as a message, because mlua raises every error a Rust
-//! callback returns as its own userdata and offers no way to make a Lua table
-//! *be* the raised value.  So the message is given a shape instead: the first
-//! three fields are a closed vocabulary — the prefix, the method, and the
-//! class ([`knl::KnlError::KINDS`]) — and only the fourth is prose.
-//! `knl.error(e)` reads it back as `{ kind, method, retryable, message }`,
-//! and `knl.api().errors` publishes the class list so the shell's own
-//! declaration of it can be checked rather than trusted.  A caller that only
-//! wants to print keeps working: the table renders as the message it came
-//! from, and the message still contains what it always did.
-//!
 //! Keeping the conversion in one place is what makes the re-entrancy
 //! discipline checkable: walking a Lua table can call back into Lua, so
 //! every conversion happens *outside* an active borrow of the session,
 //! and the kernel core never sees a Lua value at all.
+//!
+//! # The Lua surface
+//!
+//! Five module functions and one userdata.
+//!
+//! - `knl.open(opts?) -> session` — `{ owner?, budget? = { amount, tag?,
+//!   desc? }, store? }`.  State only: the policy half a beat runs against is
+//!   built by the Lua kernel's own constructor, never here.
+//! - `knl.resume(opts) -> session` — `{ store, session, budget? }`: reopen a
+//!   stream and re-fold it.
+//! - `knl.new_beat_id() -> string` — a time-ordered, session-free id for the
+//!   caller to stamp on the events of one beat.
+//! - `knl.error(e) -> { kind, method, retryable, message }` — read a raised
+//!   failure back as data (see *Failures carry their class*).
+//! - `knl.api() -> { session, module, errors, schema }` — the declared
+//!   surface, the failure vocabulary, and the columns a query may name.
+//!
+//! The session userdata answers `id`, `scope_id`, `owner`, `append`,
+//! `events`, `len`, `view`, `query`, `reserve`, `spend`, `remaining`,
+//! `exhausted` and `close`, plus the `__close` metamethod.  [`SESSION_API`]
+//! and [`MODULE_API`] hold each one's contract in a line — including the
+//! classes it can raise — and are what `knl.api()` hands back.
+//!
+//! # The invariants the surface enforces
 //!
 //! The shell reaches kernel state only through the methods of the
 //! userdata returned by `knl.open(opts?)`, so the invariants are enforced
@@ -77,8 +89,8 @@
 //!   `session_opened` and the grant, so the log says what was allowed, and
 //!   `close` records `session_closed`.  Both events are the kernel's alone —
 //!   appending either by hand is an error — so the lifecycle in the log is
-//!   the lifecycle that happened.  Three paths reach
-//!   the closing boundary and the log never loses it: `close(reason?)` said
+//!   the lifecycle that happened.  Three paths reach the closing boundary
+//!   and the log never loses it: `close(reason?)` said
 //!   explicitly; a `local s <close> = knl.open{...}` scope ending, which
 //!   records `scope_exit` — or `error` with the message in `detail` when the
 //!   block raised; and the drop backstop, `dropped`, for a handle nobody
@@ -99,6 +111,8 @@
 //!   call will cost, calls the backend itself, appends the `llm_response`,
 //!   and settles the difference with `spend`.
 //!
+//! # Driving a beat from Lua
+//!
 //! ```lua
 //! local s = knl.open({
 //!     owner  = "user-42",              -- default: the reserved "anon"
@@ -117,6 +131,8 @@
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
 //! s:close("done")
 //! ```
+//!
+//! # Reading the log
 //!
 //! Two named read faces and no more: the events, and the last of the record.
 //! Turning events into a request for a provider — which role a kind takes,
@@ -137,7 +153,9 @@
 //! it runs on cannot write; and it returns `rows, truncated`, so a page can
 //! be told from a complete answer.
 //!
-//! Storage backend.  `knl.open` takes an optional `store`: absent or `"mem"`
+//! # Storage backend
+//!
+//! `knl.open` takes an optional `store`: absent or `"mem"`
 //! is an in-memory SQLite database that lives as long as the session does,
 //! while `{ sqlite = "<path>" }` is a durable, per-session stream in a file.
 //! One backend, two kinds of database — the log is a table either way, which
@@ -148,8 +166,40 @@
 //! database does not, so resuming one is only possible while another handle
 //! still holds it open.
 //!
-//! Scope: effect execution and the Lua-side projection seam are separate
-//! steps of the kernel/shell base design.
+//! # Failures carry their class
+//!
+//! A failure is raised as a message, because mlua raises every error a Rust
+//! callback returns as its own userdata and offers no way to make a Lua table
+//! *be* the raised value.  So the message is given a shape instead:
+//!
+//! ```text
+//! knl: <method>: <kind>: <reason>
+//!  │      │        │        └── prose, and the only part that is
+//!  │      │        └── one of knl.api().errors (knl::KnlError::KINDS)
+//!  │      └── the method that raised
+//!  └── the fixed prefix
+//! ```
+//!
+//! The first three fields are a closed vocabulary ([`knl::KnlError::KINDS`])
+//! and only the fourth is prose.  `knl.error(e)` reads it back as
+//! `{ kind, method, retryable, message }` — with `retryable` the kernel's own
+//! judgement, true for `busy` alone — and an unattributed raise comes back
+//! whole, `kind` absent and the entire text as `message`, so the reader never
+//! fails on input it does not recognise.  `knl.api().errors` publishes the
+//! class list, so the shell's own declaration of it is checked rather than
+//! trusted.  A caller that only wants to print keeps working: the table
+//! renders as the message it came from, and the message still contains what
+//! it always did.
+//!
+//! # The declared surface, and the check that holds it
+//!
+//! What Lua can reach is [`SESSION_API`] plus [`MODULE_API`] and nothing
+//! else, and that is a checked claim rather than a documented intention: a
+//! test reflects over a live userdata and over the `knl` table and fails on a
+//! method bound without an entry, and on an entry with no method.  A second
+//! test holds `knl.api().schema` against the columns the store actually has.
+//! The Lua kernel runs the mirror image of both, so a syscall added on one
+//! side and not the other goes red rather than drifting.
 
 use std::cell::RefCell;
 

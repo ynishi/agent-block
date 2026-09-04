@@ -38,6 +38,30 @@
 ---   and `classify` must see the FULL parse result to judge a refusal. So the
 ---   Port delegates the middle (`transport`) and keeps the ends.
 ---
+--- The tool side is the same shape
+---   `ToolPort` is LLMPort's sibling and exists for the same reason: a tool
+---   SOURCE has a private vocabulary too — how it declares what may be
+---   called, what its failures look like — and two methods close it off.
+---   `port:declare() -> { name, description?, input_schema? }` says what may
+---   be called; `port:invoke(args) -> result` says how, and a failure is a
+---   raise (the source's own failure form is normalized to one inside
+---   `invoke`, never surfaced as a convention). `adapter.tool(port)` turns
+---   one Port into a knl tools entry and `adapter.tools(ports)` turns a list
+---   into the map a device takes, keyed by `declare().name`, with a
+---   collision a loud error. Neither contains a single source literal.
+---
+---   Raw devices (a shell, a filesystem, an HTTP client) are deliberately
+---   NOT wrapped here. What a model may be handed is a policy decision that
+---   belongs to the agent using it, not to the module that binds interfaces
+---   — the same separation that kept the provider's refusal vocabulary out
+---   of `LLMPort:open`.
+---
+--- The result contract, in one sentence
+---   Whatever the source, what reaches `knl.beat` is `knl.shapes.llm_result`
+---   for a call and a knl tools entry for a tool. Those two shapes are the
+---   kernel's, published by it; this module re-exports rather than redefines
+---   them, so there is one copy to keep true.
+---
 --- Usage
 ---   local knl = require("knl")
 ---   local adapter = require("knl_adapter")
@@ -81,9 +105,10 @@ local M = {}
 --- What `LLMPort:open`'s closure hands back is the kernel's `llm_result`, not
 --- a shape of this module's own: it is the contract `knl.beat` reads at its
 --- call step, so the kernel publishes it (`knl.shapes.llm_result`,
---- session-device-design.md §9-k) and every adapter is held to that one copy.
---- Two definitions of the same boundary is exactly the drift §11 R7 removed on
---- the event side.
+--- and every adapter is held to that one copy. Two definitions of the same
+--- boundary is exactly the drift that was removed on the event side, where
+--- the kernel's validator became the single source of truth for the kinds it
+--- owns.
 ---
 --- It is closed, so a contract gap in one provider's parse cannot leak past
 --- the Port boundary: `content` is an array of blocks (tagged as an empty
@@ -403,7 +428,7 @@ M.openai = LLMPort.new({
 })
 
 -- ============================================================
--- ToolPort — the tool-source Port (tool-port-design.md)
+-- ToolPort — the tool-source Port
 -- ============================================================
 --
 -- The tool-side sibling of LLMPort: a source's private vocabulary (how it
@@ -414,13 +439,17 @@ M.openai = LLMPort.new({
 --   port:declare() -> { name, description?, input_schema? }  -- what may be called
 --   port:invoke(args) -> result                              -- how; failure = raise
 --
--- Today every real tool in this codebase is a Lua closure in the flat spec
--- shape ({name, description, input_schema, handler} — std.fs.tool_specs and
--- knl agree on it), so the initial concrete Port is `ToolPort.lua`
--- alone: a validate-and-passthrough wrapper. There is no Rust-native
--- handler to bind (bridge/tool.rs is a Lua registry helper; handlers are
--- always LuaFunction), and MCP binding is the second real source, deferred
--- to its own ST.
+-- There are two concrete Ports because there are two real sources.
+-- `ToolPort.lua` wraps a Lua closure in the flat spec shape ({name,
+-- description, input_schema, handler} — what std.fs.tool_specs answers and
+-- what knl's tools map takes), so it is a validate-and-passthrough: no
+-- vocabulary to close. `ToolPort.mcp` is where the closing happens — the
+-- `<server>__<tool>` namespace, the content blocks, `is_error` becoming a
+-- raise — and it borrows all three from `mcp_tools`, shared with the block
+-- that binds the same servers through its own loop.
+--
+-- There is no Rust Port and there is nothing for one to bind: `bridge/tool.rs`
+-- is a Lua registry helper and a handler is always a LuaFunction.
 
 --- The declare() contract — the same triple fold's wire_tools puts on the
 --- request. Asserted in dev mode; `name` is checked loudly always (a

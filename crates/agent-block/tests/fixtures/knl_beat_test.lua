@@ -6,9 +6,8 @@
 -- Every case is an `assert` (a failure exits non-zero) plus a `[KNL] ...`
 -- marker line the Rust harness can match. The final line is `[KNL] all_ok`.
 --
--- Coverage maps to poc-knl-turn.md's invariants, restated for the
--- session/device surface (session-device-design.md: beat takes the state and
--- the policy as two arguments, and the loop is written by the caller):
+-- Coverage, on the session / device surface (beat takes the state and the
+-- policy as two arguments, and the loop is written by the caller):
 --   inv1 Outcome 4 values + predicates + match loud fail
 --   inv2 the beat runs (write-ahead: reservation, then the llm_request
 --        event, then the llm_response)
@@ -24,20 +23,21 @@
 --   inv9 the device is frozen, with-derivation swaps policy for one beat,
 --        and every event of one beat carries the id that beat declared
 --  inv10 the bridge's declared surface and the Lua registry agree in both
---        directions (§9-m) — methods, module functions and the error
---        vocabulary — and a real raise reads back classified (§9-r)
---  inv11 the SQL read (view-design.md): the published read schema matches the
+--        directions — methods, module functions and the error
+--        vocabulary — and a real raise reads back classified
+--  inv11 the SQL read: the published read schema matches the
 --        shell's declaration, the four predefined views answer what the beat
 --        wrote (token usage among them — it is a query view, not a kernel
 --        built-in), a write is refused as "validation", and one statement
 --        reads across a named set of sessions
---  inv12 the stored shape (view-design.md §6 item 2): the envelope is closed
+--  inv12 the stored shape: the envelope is closed
 --        (a stray top-level key is refused as "validation"), `meta` is
 --        shallow (a nested one is refused the same way), and a label given
 --        in `meta` comes back verbatim
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
--- module under test. They share the name deliberately (design §0.5).
+-- module under test. They share the name deliberately: the Lua kernel is the
+-- shell's face of the same kernel the bridge exposes.
 local kernel = require("knl")
 local Outcome = kernel.Outcome
 
@@ -189,7 +189,7 @@ end
 
 do
     -- The stored shape: one envelope (kind / beat / meta / data) with the
-    -- kind's own content under `data` (view-design.md §6 item 2).
+    -- kind's own content under `data`.
     local events = {
         { kind = "session_opened", seq = 1 },
         { kind = "msg_user", data = { content = "hi" }, seq = 2 },
@@ -620,7 +620,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv10 — the bridge's declared surface and the Lua registry agree (§9-m)
+-- inv10 — the bridge's declared surface and the Lua registry agree
 -- ---------------------------------------------------------------------------
 
 do
@@ -649,7 +649,7 @@ do
         assert(declared_module[name], "stale module shape (bridge declares no such function): " .. name)
     end
 
-    -- The failure vocabulary is the same list on both sides (§9-r). The
+    -- The failure vocabulary is the same list on both sides. The
     -- kernel publishes it (`knl.api().errors`, built from KnlError::KINDS)
     -- and the shell closes its `error` shape on its own declaration; a
     -- class added to one and not the other goes red here, in both
@@ -703,7 +703,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv11 — the SQL read (view-design.md): the published schema, the four
+-- inv11 — the SQL read: the published schema, the four
 -- predefined views over a real store, the refusal of anything that is not a
 -- read, and one statement spanning a set of sessions
 -- ---------------------------------------------------------------------------
@@ -838,7 +838,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- inv12 — the stored shape (view-design.md §6 item 2): the envelope is
+-- inv12 — the stored shape: the envelope is
 -- closed, `meta` is shallow, and a label given rides through verbatim
 -- ---------------------------------------------------------------------------
 

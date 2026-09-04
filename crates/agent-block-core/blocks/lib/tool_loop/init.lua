@@ -30,8 +30,8 @@
 ---   the call through `s:call`, but that surface never existed on the bridge,
 ---   so the option could only fail on first use. Running a loop over a
 ---   recorded session is the kernel's own arrangement now — `knl.beat(session,
----   device)` with the loop written by the caller (session-device-design.md
----   §11 R1) — and there is one way to do it rather than two.
+---   device)` with the loop written by the caller (see the `knl` module doc)
+---   — and there is one way to do it rather than two.
 ---
 --- The model call
 ---   Whatever the wire needs — the provider dialect, the retries, the parse —

@@ -1,101 +1,155 @@
-//! `knl` — kernel core (K1 History / K4 Budget ledger / K5 Session).
+//! `knl` — the kernel core: the log, the ledger, the session and its scope.
 //!
-//! Pure Rust: nothing here knows about Lua.  Events are plain
-//! `serde_json` objects, so the Lua ⇄ JSON conversion — and the
-//! re-entrancy discipline that comes with walking a Lua table — stays in
-//! the [`crate::bridge::knl`] adapter, one place, while the domain rules
-//! below stay unit-testable without a VM.  This is the layering the
-//! kernel/shell base design (D1) asks for.
+//! This module doc is the kernel's design, stated once.  Each section below
+//! is an invariant the code is held to, named so that the code depending on
+//! it can cite it.
 //!
-//! The invariants the kernel owns:
+//! # The kernel and the shell
 //!
-//! - **I1 append-only.**  [`History`] has no mutation API — no `update`,
-//!   `delete` or `replace`.  `seq` is assigned by the kernel, starts at
-//!   `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
-//!   overwritten rather than trusted.  Reads hand back clones, so a caller
-//!   cannot reach recorded state through a returned value.
-//! - **An append lands; a command decides inside the store.**  Recording a
-//!   fact is never refused for what the writing handle last saw: the store
-//!   assigns the `seq` and serializes writes per stream, so two handles on
-//!   one stream both append and the log interleaves in arrival order.  The
-//!   one place a check belongs — "reserve `n` only if the balance covers
-//!   it" — runs inside that same serialized write
-//!   ([`EventStore::append_if`]), never against a cached balance.
-//! - **A session is disposable.**  It opens once and closes once, and
-//!   [`Session::resume`] refuses a stream whose `session_closed` is already
-//!   in the log: after an ending there is a new session, not a second life
-//!   for the old one.
-//! - **Stored shape change ⇒ upcaster, from the first release on.**  Stored
-//!   bytes are never rewritten.  A change to the shape of a stored event
-//!   ships with a bump of [`CURRENT_SCHEMA_VERSION`] and the matching
-//!   read-time [`Upcaster`] ([`kernel_upcasters`]), which every session's
-//!   reads pass through.  Nothing has been released yet, so the chain is
-//!   empty and the version is `1`: the seam is in place and tested, and the
-//!   first step that is owed has one site to be registered at.  The seam is
-//!   a type: a backend deals in raw `Value`s, [`CurrentStore`] reads through
-//!   the chain and hands back [`Current`]s, and every fold below takes those
-//!   — so a read that went round the chain does not compile.
-//! - **A session has a scope.**  The two are different concepts sharing one
-//!   lifetime: the session is the stream (history, projections), the
-//!   [`Scope`] is the authority it is written under (a kernel-issued
-//!   [`ScopeId`], the owner, the granted quota).  A session holds its scope
-//!   by value, since neither outlives the other.  The scope id is recorded
-//!   on `session_opened` and on every `budget_*` event, so the boundary is
-//!   recoverable from the log — and unforgeable, since those kinds are the
-//!   kernel's alone to write.  There is no per-event author: a session
-//!   holds only its own events, so ownership is the scope-level
-//!   [`Session::owner`] — a real principal id, or the reserved
-//!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
-//!   layer above the kernel.  An accounting of what was consumed keys on the
-//!   `kind`: in a session's own log an `llm_response` is a call it made, so
-//!   a reader that sums the counts needs no author to key on.
-//! - **I3 budget monotonicity.**  The ledger accepts non-negative amounts
-//!   only, and within a session the balance can only decrease — it rises
-//!   only when an owner grants again, which a resumed session records like
-//!   any other fact.  It is a quota, not accounting: the decision is taken
-//!   *before* the spending ([`Session::reserve`], which refuses without
-//!   deducting) and settled after ([`Session::spend`]), by the layer that
-//!   knows what a call costs.  No `append` moves it, and what was actually
-//!   consumed is read independently, off the recorded payloads.
-//! - **The balance is a fold, and only a fold.**  Every move is a `budget_*`
-//!   event first, written by the kernel alone ([`is_kernel_only`]), and
-//!   [`fold_balance`] over those events *is* the balance — there is no
-//!   counter beside them.  [`Session::remaining`] reads it back off the
-//!   stream (cached against the store's head, refolded when the head moves),
-//!   so two handles on one stream cannot hold two different answers.
-//! - **I6 session lifecycle.**  All state lives inside a [`Session`] value
-//!   — no statics — so two sessions are fully independent.  There is no
-//!   "run" inside a session: the lifecycle is the session's own, bracketed
-//!   by the `session_opened` that [`Session::open_on`] records and the
-//!   `session_closed` that [`Session::close`] records.  Both are
-//!   kernel-only ([`is_kernel_only`]), so a caller can neither fake an
-//!   opening nor end a session by appending an event.  Closed is the
-//!   handle's state, not the stream's: a handle that closed refuses its own
-//!   later `append` / `spend`, while the log itself never refuses a write
-//!   (a write arriving after another handle's ending lands, as evidence),
-//!   and `resume` is the only reader of `session_closed`.
-//! - **Beats are declared, not numbered.**  A `beat` is an opaque string
-//!   the layer above mints and stamps on the facts that belong together.
-//!   The kernel never generates one and never requires one; it only
-//!   insists that a present `beat` is a string.
+//! The kernel is written in two halves, and only the first of them is here.
 //!
-//! - **The stored shape is envelope + meta + data.**  An event is an
-//!   envelope ([`FIELD_KIND`], an optional `beat`, the kernel's `seq` /
-//!   `epoch_ms` / `_schema_version`), a shallow `meta`, and a `data` object
-//!   that holds the kind's own content.  Nothing else may sit at the top
-//!   level — see the section below.
+//! The **Rust half** — this module — is the kernel context: the session's
+//! state, the syscalls that move it, and two fixed reads.  It is pure Rust:
+//! nothing here knows about Lua.  Events are plain `serde_json` objects, so
+//! the Lua ⇄ JSON conversion — and the re-entrancy discipline that comes
+//! with walking a Lua table — stays in the [`crate::bridge::knl`] adapter,
+//! one place, while the domain rules below stay unit-testable without a VM.
 //!
-//! - **One backend, and the log is a table.**  A session's events live in
-//!   SQLite whether the session is durable (a file) or ephemeral (an
-//!   in-memory database) — [`SqliteEventStore`], the only [`EventStore`] the
-//!   product has.  That is not an implementation detail: the read side below
-//!   is SQL, and a log that could not be queried would be a second, lesser
-//!   kind of session.  The `Vec`-backed store is `#[cfg(test)]`.
+//! The **Lua half** is the shell's kernel library (`knl`): the beat — one
+//! model call plus the tools that call asks for — the device a beat calls
+//! through, and the query views.  What a conversation looks like on the
+//! wire, what a beat is allowed to cost, which tools may run, when to stop
+//! asking: all of that is the shell's, and none of it is here.
 //!
-//! # Stored shape
+//! The line between the halves is what each of them refuses to renegotiate.
+//! The kernel fixes the record, the quota and the boundaries of a session.
+//! Everything a caller could reasonably want different sits above it.
 //!
-//! An event has three levels, and they are separated so that a reader can
-//! tell which of them it is reading:
+//! # Session and scope
+//!
+//! A session has a scope.  The two are different concepts sharing one
+//! lifetime: the session is the stream (its history and the projections over
+//! it), the [`Scope`] is the authority it is written under — a kernel-issued
+//! [`ScopeId`], the owner, the granted quota.  A session holds its scope by
+//! value, since neither outlives the other.
+//!
+//! The scope id is recorded on `session_opened` and on every `budget_*`
+//! event, so the boundary is recoverable from the log — and unforgeable,
+//! since those kinds are the kernel's alone to write ([`is_kernel_only`]).
+//!
+//! There is no per-event author: a session holds only its own events, so
+//! ownership is the scope-level [`Session::owner`] — a real principal id, or
+//! the reserved [`session::ANON`] / [`session::SYSTEM`] — total, and read by
+//! the policy layer above the kernel.  An accounting of what was consumed
+//! keys on the `kind`: in a session's own log an `llm_response` is a call it
+//! made, so a reader that sums the counts needs no author to key on.
+//!
+//! All state lives inside a [`Session`] value — no statics — so two sessions
+//! are fully independent.
+//!
+//! # A beat is declared, not numbered
+//!
+//! A `beat` is an opaque string the layer above mints and stamps on the
+//! facts that belong together.  The kernel never generates one and never
+//! requires one; it only insists that a present `beat` is a string.
+//! Grouping and ordering read it back, and nothing else does.
+//!
+//! Numbering it here would put a cursor back into kernel state, and that
+//! number would then have to survive a resume, two handles, and a store that
+//! serializes writes in arrival order.  A declared id survives all three
+//! while the kernel holds nothing.
+//!
+//! # The budget is a quota
+//!
+//! The budget is what an owner allows a session to consume — not a record of
+//! what it used.  It buys two things: a stopping guarantee (termination is
+//! undecidable, so a monotonically decreasing resource is injected from
+//! outside) and an authority boundary (whatever the model decides, the owner
+//! has bounded the run).
+//!
+//! **The decision comes before the spending.**  [`Session::reserve`] asks
+//! whether the balance covers `n` and refuses *without deducting* when it
+//! does not; [`Session::spend`] settles afterwards, from the layer that
+//! knows what a call actually cost.  No `append` moves the balance.
+//!
+//! **Every move is an event, and the balance is a fold over them.**  A
+//! grant, a reservation, a refusal and a settlement are each a `budget_*`
+//! event ([`BUDGET_KINDS`]), written by the kernel alone, and
+//! [`fold_balance`] over those events *is* the balance — there is no counter
+//! beside them.  [`Session::remaining`] reads it back off the stream (cached
+//! against the store's head, refolded when the head moves), so two handles
+//! on one stream cannot hold two different answers.  A refusal is recorded
+//! like the rest: that a request was turned down is a fact about the run.
+//!
+//! **Monotonicity.**  The ledger accepts non-negative amounts only, and
+//! within a session the balance can only decrease.  It rises only when an
+//! owner grants again ([`BudgetGrant`]), which a resumed session records like
+//! any other fact.  There is no API to raise or reset it, and no release: a
+//! reservation that was made is not handed back.
+//!
+//! **Usage is not accounting.**  What the providers reported is a separate
+//! reading, taken off the recorded responses, and the kernel never folds it
+//! into the balance.  A budget denominated in tokens will — if the layer
+//! above settles honestly — end with `granted - remaining` equal to the
+//! usage total, because both are folds over the same log.  That is a
+//! consequence, not a requirement, and nothing here checks it.
+//!
+//! **Allocation, not limit.**  A budget is an *allocation* axis: units are
+//! consumed and do not come back, and a child scope can only be given what
+//! its parent already holds.  A rate limit is a *limit* axis — replenished
+//! by the passage of time — with different arithmetic, and it does not
+//! belong in the same counter.  If the ledger ever grows named axes, each
+//! axis declares which of the two it is.
+//!
+//! # Views: the log is the only source of truth
+//!
+//! A *view* ([`projection`]) is derived from the log.  Folding never changes
+//! the history, and a view's result is a cache rather than a capture —
+//! whatever it says is recomputable from the events, so reading one is never
+//! what makes it true, and a view that disagreed with the log would be the
+//! view that is wrong.
+//!
+//! The views are deliberately spread across the two halves.  **The Rust half
+//! has two built-in reads and they never grow**: [`Session::events`]
+//! (`events(from)`, the record from a position on) and [`Session::view`]
+//! (`tail`, the last events verbatim).  **Everything else is a Lua query
+//! view** over [`Session::query`] — the conversation a provider is sent, the
+//! beats of a run, the tool pairs, the ledger, the token account — each of
+//! them one `SELECT` over the published event schema rather than a name the
+//! kernel had to be taught.
+//!
+//! So the Rust half names a fold only when its consumer is fixed in kernel
+//! terms, and `tail` is the one that is.  Token usage is not: the counts are
+//! what an adapter normalized out of a provider's answer, which is the
+//! shell's vocabulary, so it is a query view written in Lua.
+//!
+//! **Why the Rust side does not take query or fold features.**  There is no
+//! query language here and no way to register a fold into one, and that is
+//! the design rather than a gap.  The whole expressiveness of SQLite is
+//! already reachable through [`Session::query`] ([`query`]) — one statement,
+//! read-only, over a table whose columns are published ([`events_schema`]) —
+//! so "the kernel needs dynamic queries" is answered by writing a Lua query
+//! view.  A second, weaker query surface in Rust would only give the same
+//! answers a name the kernel then has to keep.  A fold-registration hook
+//! would be worse: it moves a caller's code inside the kernel, where neither
+//! its cost nor its purity is the caller's problem any more.  That the table
+//! *is* the read interface is what makes this a contract rather than a leak
+//! — changing it is a change to the interface.
+//!
+//! **One backend, and the log is a table.**  A session's events live in
+//! SQLite whether the session is durable (a file) or ephemeral (an in-memory
+//! database) — [`SqliteEventStore`], the only [`EventStore`] the product has.
+//! That is not an implementation detail: the read side above is SQL, and a
+//! log that could not be queried would be a second, lesser kind of session.
+//! The `Vec`-backed store is `#[cfg(test)]`.
+//!
+//! # Stored shape: envelope, meta, data
+//!
+//! An event is an envelope ([`FIELD_KIND`], an optional `beat`, the kernel's
+//! `seq` / `epoch_ms` / `_schema_version`), a shallow `meta`, and a `data`
+//! object holding the kind's own content.  Nothing else may sit at the top
+//! level.  The three levels are separated so that a reader can tell which of
+//! them it is reading:
 //!
 //! ```text
 //! envelope   kind, beat, seq, epoch_ms, _schema_version   ← columns; never renamed
@@ -112,7 +166,7 @@
 //! - **`data`** is the only place structured JSON lives, and its shape
 //!   belongs to whoever writes the kind.  The kernel checks the `data` of the
 //!   six kinds it writes itself ([`is_kernel_only`]) and of no others; the
-//!   kinds a turn is made of are the Lua kernel's, declared where they are
+//!   kinds a beat is made of are the Lua kernel's, declared where they are
 //!   written.
 //!
 //! The rule that follows, and the reason for the split: **a SQL view that
@@ -126,40 +180,85 @@
 //! ([`Upcaster`], [`Current`]) applies to the event as it was stored, and
 //! `data` is simply where the changes it will have to absorb happen.
 //!
-//! # A view is derived, and the views are spread across two halves
+//! # An append lands; a command decides in the store
 //!
-//! The log is the only source of truth.  A *view* ([`projection`]) is
-//! derived from it: folding never changes the history, and a view's result
-//! is a cache rather than a capture — whatever it says is recomputable from
-//! the events, so reading one is never what makes it true, and a view that
-//! disagreed with the log would be the view that is wrong.
+//! **The record is append-only.**  [`History`] has no mutation API — no
+//! `update`, `delete` or `replace`.  `seq` is assigned by the kernel, starts
+//! at `1` and increases strictly; a caller-supplied `seq` / `epoch_ms` is
+//! overwritten rather than trusted.  Reads hand back clones, so a caller
+//! cannot reach recorded state through a returned value.
 //!
-//! The kernel is written in two halves, and the views are deliberately spread
-//! across both.  The Rust half is the kernel context: the session's state,
-//! the syscalls that move it, and two fixed read primitives —
-//! [`Session::events`] (`events(from)`, the record from a position on) and
-//! [`Session::view`] (`tail`, the last events verbatim).  The Lua half is
-//! the shell's kernel library (`knl`): the beat, the device, and the query
-//! views — the conversation a provider is sent, the beats of a run, the
-//! token account (`knl.views.usage`) — each of them a `SELECT` over the
-//! published event schema rather than a name the kernel had to be taught.
+//! **An append lands.**  Recording a fact is never refused for what the
+//! writing handle last saw: the store assigns the `seq` and serializes
+//! writes per stream, so two handles on one stream both append and the log
+//! interleaves in arrival order.  The one place a check belongs — "reserve
+//! `n` only if the balance covers it" — runs inside that same serialized
+//! write ([`EventStore::append_if`]), never against a cached balance.
 //!
-//! So the Rust half names a fold only when its consumer is fixed in kernel
-//! terms, and `tail` is the one that is.  A projection whose shape is a
-//! caller's decision is built on the shell side from [`Session::events`], or
-//! read straight off the log with SQL ([`Session::query`], [`query`]) — one
-//! statement, and it reads, on a connection that cannot write.  The columns
-//! it may name are published ([`events_schema`]), which is what makes that a
-//! contract rather than a leak: the table is the read interface, and
-//! changing it is a change to the interface.
+//! **The lifecycle is the session's own.**  There is no "run" inside a
+//! session: it is bracketed by the `session_opened` that
+//! [`Session::open_on`] records and the `session_closed` that
+//! [`Session::close`] records.  Both are kernel-only ([`is_kernel_only`]), so
+//! a caller can neither fake an opening nor end a session by appending an
+//! event.
 //!
-//! The Rust half therefore does not grow a query language of its own, or a
-//! way to register folds into it.  That is the design and not a gap: the
-//! full expressiveness of SQLite is already reachable through
-//! [`Session::query`], over a table whose columns are published, so "the
-//! kernel needs dynamic queries" is answered by writing a Lua query view.
-//! Adding a second, weaker query surface in Rust would only give the same
-//! answers a name the kernel then has to keep.
+//! **Closed is the handle's, not the stream's.**  A handle that closed
+//! refuses its own later `append` / `spend`, while the log itself never
+//! refuses a write: one arriving from another handle after an ending lands,
+//! as evidence, and two handles that both close leave two endings rather
+//! than one.  Exactly one reader consults `session_closed`, and it is
+//! [`Session::resume`].
+//!
+//! **A session is disposable.**  It opens once and closes once, and
+//! [`Session::resume`] refuses a stream whose `session_closed` is already in
+//! the log: after an ending there is a new session, not a second life for
+//! the old one.
+//!
+//! # Errors
+//!
+//! A failure is classified rather than described.  [`KnlError`] is a closed
+//! set of seven classes ([`KnlError::KINDS`]) — `busy`, `storage`,
+//! `corruption`, `closed`, `validation`, `unsupported`, `timeout` — and the
+//! variant *is* the classification: the payload is a human-readable reason
+//! and nothing a caller should branch on.  [`KnlError::is_retryable`] answers
+//! the one question that belongs to a program rather than to a person, and
+//! it is true for `busy` and nothing else.
+//!
+//! The core does not know which method a caller invoked, so
+//! [`Display`](std::fmt::Display) writes `<kind>: <reason>` and the adapter
+//! adds the attribution: a failure reaches Lua as the raised text
+//! `knl: <method>: <kind>: <reason>`, which `knl.error(e)` reads back as
+//! `{ kind, method, retryable, message }`.  The message is given a shape
+//! because mlua cannot carry a table out of a Rust callback — the first
+//! three fields are a closed vocabulary and only the last is prose.  See
+//! [`crate::bridge::knl`].
+//!
+//! # Upcasting: a stored shape change ships with its upcaster
+//!
+//! Stored bytes are never rewritten.  A change to the shape of a stored
+//! event ships with a bump of [`CURRENT_SCHEMA_VERSION`] and the matching
+//! read-time [`Upcaster`] ([`kernel_upcasters`]), which every session's reads
+//! pass through.
+//!
+//! Nothing has been released yet, so v1 is fixed until the first release:
+//! the chain is empty and the version is `1`.  The seam is in place and
+//! tested, and the first step that is owed has one site to be registered at.
+//! The seam is a type: a backend deals in raw `Value`s, [`CurrentStore`]
+//! reads through the chain and hands back [`Current`]s, and every fold takes
+//! those — so a read that went round the chain does not compile.
+//!
+//! # Async: the device yields, the syscalls do not
+//!
+//! The asynchronous boundary is device I/O.  An HTTP request or an MCP call
+//! is an async function on the host, so the coroutine running a beat yields
+//! at the device call, and the beat itself needs no await of its own.
+//!
+//! The kernel syscalls — `append`, `reserve`, `spend`, the reads, `close` —
+//! are local store operations and stay synchronous.  Making them async would
+//! colour the whole surface for the sake of a local SQLite write.  Should a
+//! blocking write ever be measured starving an async worker, the answer is
+//! to move that write off the worker in the bridge: an optimization, not a
+//! change to this interface.
 
 pub mod budget;
 pub mod event;

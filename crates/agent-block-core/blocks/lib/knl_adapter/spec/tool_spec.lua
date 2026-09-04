@@ -1,5 +1,5 @@
 -- tool_spec.lua — mlua-lspec unit tests for the ToolPort / tool binding
--- (tool-port-design.md ST1: lua binding + Port contract as the mcp seam).
+-- (the lua binding, and the Port contract that is the mcp seam).
 --
 -- Run via:
 --   test_launch(code_file=".../knl_adapter/spec/tool_spec.lua",

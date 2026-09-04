@@ -15,7 +15,7 @@
 --   * fake `std` (json encode/decode, task.sleep) and `http` globals stub the
 --     device layer the shim's returned closure touches at call time.
 --
--- What this proves (device-if-design.md §1 Port + §2 classify behind the Port):
+-- What this proves (the Port, and classify behind it):
 --   1 LLMPort.new  — rejects an impl missing any of build/parse/classify.
 --   2 shim no literal + error path — with a *test* port whose parse/classify are
 --     scripted, the closure returns { status = <the port's verdict>,

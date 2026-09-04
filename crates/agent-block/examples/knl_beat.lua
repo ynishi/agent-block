@@ -79,10 +79,9 @@ kernel.session({
     budget = { amount = 8, tag = "beats", desc = "one unit per beat" },
 }, function(s)
     -- The seed is an event like any other: the envelope is `{ kind, beat?,
-    -- meta?, data? }` and what the kind is about goes under `data`
-    -- (view-design.md §6 item 2). `meta` is the shallow-label half — string
-    -- / number / boolean values only — and it is what a view can read
-    -- without being tied to any kind's shape.
+    -- meta?, data? }` and what the kind is about goes under `data`. `meta`
+    -- is the shallow-label half — string / number / boolean values only —
+    -- and it is what a view can read without being tied to any kind's shape.
     s:append({
         kind = "msg_user",
         meta = { label = "seed" },
@@ -137,7 +136,7 @@ kernel.session({
 
     -- One id per beat, declared by the shell — and the grouping is a read,
     -- not a loop written here: `knl.views.beats` runs one SELECT over the
-    -- log and answers a row per beat (view-design.md §2). A consumer's own
+    -- log and answers a row per beat. A consumer's own
     -- view is a function of exactly this form.
     local grouped = kernel.views.beats(s)
 
