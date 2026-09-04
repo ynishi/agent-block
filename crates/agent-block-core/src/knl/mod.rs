@@ -31,7 +31,10 @@
 //!   read-time [`Upcaster`] ([`kernel_upcasters`]), which every session's
 //!   reads pass through.  Nothing has been released yet, so the chain is
 //!   empty and the version is `1`: the seam is in place and tested, and the
-//!   first step that is owed has one site to be registered at.
+//!   first step that is owed has one site to be registered at.  The seam is
+//!   a type: a backend deals in raw `Value`s, [`CurrentStore`] reads through
+//!   the chain and hands back [`Current`]s, and every fold below takes those
+//!   — so a read that went round the chain does not compile.
 //! - **A session has a scope.**  The two are different concepts sharing one
 //!   lifetime: the session is the stream (history, projections), the
 //!   [`Scope`] is the authority it is written under (a kernel-issued
@@ -93,13 +96,13 @@ pub mod session;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_store;
 
-use std::fmt;
-
 pub use budget::{fold_balance, BudgetGrant};
-pub use event::{is_kernel_only, now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
+pub use event::{
+    is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
+};
 pub use event_store::{
-    apply_upcasters, kernel_upcasters, Committed, Decision, EventStore, MemEventStore, Upcaster,
-    UpcastingEventStore, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    apply_upcasters, kernel_upcasters, Committed, Current, CurrentDecision, CurrentStore, Decision,
+    EventStore, MemEventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};
@@ -111,33 +114,209 @@ pub use session::{
 #[cfg(feature = "sqlite")]
 pub use sqlite_store::SqliteEventStore;
 
-/// Failure reason produced by the kernel core.
+/// What went wrong in the kernel core, classified.
+///
+/// A failure is not one thing.  A contended database will succeed if it is
+/// asked again; a row that will not decode never will.  A caller that passed
+/// a negative amount has a bug in its own code; a caller that wrote to a
+/// closed handle has finished with the session and needs a new one.  Folding
+/// all four into one opaque string leaves every caller — the Lua shell most
+/// of all — matching on message text to tell them apart, and message text is
+/// the one part of an error that is meant to change.
+///
+/// So the variant *is* the classification, and it is the whole of it: the
+/// payload is a human-readable sentence and nothing a caller should branch
+/// on.  [`KnlError::kind`] names the class in one stable word, and
+/// [`KnlError::is_retryable`] answers the only question whose answer is a
+/// program's rather than a person's.
 ///
 /// The core does not know which Lua method the caller invoked, so the
 /// message carries the reason only; the adapter renders the
-/// `knl: <method>: <reason>` attribution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KnlError(String);
+/// `knl: <method>: <kind>: <reason>` attribution.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KnlError {
+    /// Lock contention: the store was busy and the same call may succeed if
+    /// it is made again.  The one retryable class ([`KnlError::is_retryable`]).
+    #[error("busy: {0}")]
+    Busy(String),
+    /// The store could not do the work — an IO fault, a connection that is
+    /// gone, an encode failure on the way in.  Not busy, so retrying it is a
+    /// caller's gamble rather than the kernel's advice.
+    #[error("storage: {0}")]
+    Storage(String),
+    /// A stored row could not be read back as the event it was written as.
+    /// Distinct from [`KnlError::Storage`] on purpose: the IO succeeded and
+    /// the bytes came back, so what is wrong is the data, and no retry and
+    /// no reconnect will change it.
+    #[error("corruption: {0}")]
+    Corruption(String),
+    /// The session is over — this handle closed, or a resume was pointed at
+    /// a stream whose log already carries its ending.  A session is
+    /// disposable, so the answer is to open another, not to try again.
+    #[error("closed: {0}")]
+    Closed(String),
+    /// The caller asked for something the kernel refuses to record: an event
+    /// that does not meet its kind's shape, a kernel-only kind, a negative
+    /// amount, an unknown view or a malformed option.  Nothing was written.
+    #[error("validation: {0}")]
+    Validation(String),
+    /// The request is well-formed but this build or this backend cannot
+    /// serve it — resuming an in-memory store, or a durable store in a build
+    /// without the `sqlite` feature.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+}
 
 impl KnlError {
-    /// Build an error from a human-readable reason.
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self(reason.into())
+    /// The stable name of the [`KnlError::Busy`] class.
+    pub const BUSY: &'static str = "busy";
+    /// The stable name of the [`KnlError::Storage`] class.
+    pub const STORAGE: &'static str = "storage";
+    /// The stable name of the [`KnlError::Corruption`] class.
+    pub const CORRUPTION: &'static str = "corruption";
+    /// The stable name of the [`KnlError::Closed`] class.
+    pub const CLOSED: &'static str = "closed";
+    /// The stable name of the [`KnlError::Validation`] class.
+    pub const VALIDATION: &'static str = "validation";
+    /// The stable name of the [`KnlError::Unsupported`] class.
+    pub const UNSUPPORTED: &'static str = "unsupported";
+
+    /// Every class a kernel failure can have, in one closed list.
+    ///
+    /// Published so a caller can hold its own error vocabulary against the
+    /// kernel's — the Lua bridge hands this to `knl.api()`, and the shell's
+    /// declaration is checked against it rather than against a list somebody
+    /// retyped.
+    pub const KINDS: &'static [&'static str] = &[
+        Self::BUSY,
+        Self::STORAGE,
+        Self::CORRUPTION,
+        Self::CLOSED,
+        Self::VALIDATION,
+        Self::UNSUPPORTED,
+    ];
+
+    /// This failure's class, as one of [`KnlError::KINDS`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Busy(_) => Self::BUSY,
+            Self::Storage(_) => Self::STORAGE,
+            Self::Corruption(_) => Self::CORRUPTION,
+            Self::Closed(_) => Self::CLOSED,
+            Self::Validation(_) => Self::VALIDATION,
+            Self::Unsupported(_) => Self::UNSUPPORTED,
+        }
     }
 
-    /// The reason, without any attribution prefix.
+    /// Whether making the same call again could succeed.
+    ///
+    /// True for [`KnlError::Busy`] and nothing else.  A storage fault *might*
+    /// clear, but the kernel does not know that it will, and an error that
+    /// says "try again" when it means "maybe" is how a retry loop becomes an
+    /// infinite one.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy(_))
+    }
+
+    /// Whether a class *name* is the retryable one.
+    ///
+    /// The same answer as [`KnlError::is_retryable`], for a caller that has
+    /// the word rather than the value — the Lua bridge, which parses a kind
+    /// back out of an attributed message.
+    pub fn kind_is_retryable(kind: &str) -> bool {
+        kind == Self::BUSY
+    }
+
+    /// The reason, without the class name or any attribution prefix.
+    ///
+    /// [`Display`](std::fmt::Display) writes `<kind>: <reason>`; this is the
+    /// second half alone, for a caller that renders the class itself.
     pub fn reason(&self) -> &str {
-        &self.0
+        match self {
+            Self::Busy(reason)
+            | Self::Storage(reason)
+            | Self::Corruption(reason)
+            | Self::Closed(reason)
+            | Self::Validation(reason)
+            | Self::Unsupported(reason) => reason,
+        }
     }
 }
-
-impl fmt::Display for KnlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for KnlError {}
 
 /// Result alias for the kernel core.
 pub type KnlResult<T> = Result<T, KnlError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One error of every class, so a test over the classification cannot
+    /// quietly skip a variant that was added later.
+    fn one_of_each() -> Vec<KnlError> {
+        vec![
+            KnlError::Busy("contended".to_string()),
+            KnlError::Storage("gone".to_string()),
+            KnlError::Corruption("not json".to_string()),
+            KnlError::Closed("session is closed".to_string()),
+            KnlError::Validation("kind is required".to_string()),
+            KnlError::Unsupported("no sqlite feature".to_string()),
+        ]
+    }
+
+    /// Every variant names its class with a stable word, and the published
+    /// list is exactly those words in that order.
+    #[test]
+    fn every_variant_names_its_class() {
+        let kinds: Vec<&str> = one_of_each().iter().map(KnlError::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "busy",
+                "storage",
+                "corruption",
+                "closed",
+                "validation",
+                "unsupported"
+            ]
+        );
+        assert_eq!(
+            kinds,
+            KnlError::KINDS.to_vec(),
+            "KINDS is the vocabulary itself, not a second copy of it"
+        );
+    }
+
+    /// Only contention says "ask again".  A storage fault might clear on its
+    /// own, but the kernel does not know that, and an error that promises a
+    /// retry it cannot back is how a loop stops terminating.
+    #[test]
+    fn only_busy_is_retryable() {
+        for error in one_of_each() {
+            let expected = error.kind() == KnlError::BUSY;
+            assert_eq!(error.is_retryable(), expected, "{error}");
+            assert_eq!(
+                KnlError::kind_is_retryable(error.kind()),
+                expected,
+                "the name and the value must agree: {error}"
+            );
+        }
+        assert!(!KnlError::kind_is_retryable("nonsense"));
+    }
+
+    /// `Display` is `<kind>: <reason>`, and `reason` is the second half on
+    /// its own — the adapter renders the class itself, so it must be able to
+    /// get the sentence without it.
+    #[test]
+    fn display_carries_the_class_and_reason_carries_only_the_sentence() {
+        let error = KnlError::Validation("kind is required (string)".to_string());
+        assert_eq!(error.to_string(), "validation: kind is required (string)");
+        assert_eq!(error.reason(), "kind is required (string)");
+
+        for error in one_of_each() {
+            assert_eq!(
+                error.to_string(),
+                format!("{}: {}", error.kind(), error.reason())
+            );
+        }
+    }
+}

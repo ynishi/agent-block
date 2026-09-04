@@ -123,14 +123,16 @@ local function fake_session(opts)
         return out
     end
 
+    -- The write IS the result: spend answers nothing, and a caller that
+    -- wants the balance reads it with `remaining()` (the kernel's surface,
+    -- mirrored here so the fake cannot promise more than the bridge does).
     function s:spend(n)
         assert(not closed, "knl: spend: session is closed")
         assert(type(n) == "number" and n >= 0, "knl: spend: amount must be non-negative")
         if remaining == nil then
-            return nil
+            return
         end
         remaining = math.max(0, remaining - n)
-        return remaining
     end
 
     function s:remaining()

@@ -23,16 +23,19 @@
 --- What stays in llm_proto
 ---   The wire format, request building, response parsing, error classification
 ---   and retry policy all live in `llm_proto` and are reused, not reimplemented.
----   `build` / `parse` here are thin delegations to `llm_proto.adapter(...)`;
----   the retry loop reuses `llm_proto`'s exported `classify_error` /
----   `retry_delay`. llm_proto is untouched.
+---   `build` / `parse` here are thin delegations to `llm_proto.adapter(...)`,
+---   and the whole middle of a call — POST, retries, the classified non-200,
+---   the JSON decode — is `llm_proto.transport`, the same one `llm_proto.backend`
+---   runs. The shim holds no transport policy of its own.
 ---
 --- Why the shim does not call llm_proto's own backend closure
----   `llm_proto.backend` bundles build + POST + parse and hands back a reduced
----   result: it drops `stop_details` and reports the HTTP integer as `status`.
----   A Port's `status(result)` must see the *full* parse result to judge a
----   refusal, so the shim runs build -> http -> parse itself and passes the
----   whole parse result to `status`.
+---   `llm_proto.backend` is the whole call in one value: it picks the adapter
+---   from a provider NAME, and hands back a reduced result (it drops
+---   `stop_details` and reports the HTTP integer as `status`). A Port is the
+---   other decomposition — `build` / `parse` are the Port's own methods, which
+---   is what lets a caller supply a provider this build has never heard of —
+---   and `classify` must see the FULL parse result to judge a refusal. So the
+---   Port delegates the middle (`transport`) and keeps the ends.
 ---
 --- Usage
 ---   local knl = require("knl")
@@ -64,14 +67,6 @@ local T = lshape.t
 local shape = lshape.check
 
 local M = {}
-
---- Retries for transient API failures — mirrors llm_proto's own default,
---- because `llm_proto.post_with_retry` is module-local (not exported) so the
---- shim drives its own loop with the exported classify_error / retry_delay.
-local DEFAULT_MAX_RETRIES = 2
-
---- Seconds a request may take when the conf does not say.
-local DEFAULT_TIMEOUT = 120
 
 --- Output cap when neither the request nor the conf names one.
 local DEFAULT_MAX_TOKENS = 4096
@@ -140,15 +135,14 @@ end
 --- delegated to `self:classify`.
 ---
 --- @param conf table  Forwarded verbatim to the Port's build (model, api_key,
----                     max_tokens, thinking, tool_choice, ...). Shim-level keys:
----                     max_retries (default 2), timeout (default 120), dump.
+---                     max_tokens, thinking, tool_choice, ...). Shim-level keys
+---                     (handed to `llm_proto.transport`, which owns their
+---                     defaults): max_retries, timeout, dump.
 --- @return function llm  function(request) -> resp | nil, err, where resp is
 ---                       { status, content, usage, stop_reason, refusal? }
 function LLMPort:open(conf)
     conf = conf or {}
     local port = self
-    local max_retries = tonumber(conf.max_retries) or DEFAULT_MAX_RETRIES
-    local timeout = conf.timeout or DEFAULT_TIMEOUT
 
     --- @param request table  knl.fold output: { messages, system?, tools? }.
     return function(request)
@@ -158,52 +152,30 @@ function LLMPort:open(conf)
             return nil, berr
         end
 
-        -- POST with retry. The loop is the shim's, but the policy is
-        -- llm_proto's: classify_error decides whether a non-200 is worth
-        -- retrying, retry_delay decides how long to wait. Nothing about the
-        -- wire format or the parse is reimplemented here.
-        local request_opts = {
-            method = "POST",
-            headers = wire.headers,
-            body = std.json.encode(wire.body),
-            timeout = timeout,
+        -- transport: POST with retries, the classified non-200, the decode —
+        -- all of it llm_proto's, none of it reimplemented here. It raises on
+        -- a transport failure (that is what the host's http device does), and
+        -- this closure's contract is `resp | nil, err`, so the raise is caught
+        -- and returned rather than let out.
+        local transported, raw, terr = pcall(proto.transport, wire, {
+            max_retries = conf.max_retries,
+            timeout = conf.timeout,
             dump = conf.dump,
-        }
-        local attempt = 0
-        local resp
-        while true do
-            local http_ok, resp_or_err = pcall(http.request, wire.url, request_opts)
-            if not http_ok then
-                return nil, "http transport error: " .. tostring(resp_or_err)
-            end
-            resp = resp_or_err
-            if resp.status == 200 or attempt >= max_retries then
-                break
-            end
-            local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-            if not classified.retryable then
-                break
-            end
-            attempt = attempt + 1
-            std.task.sleep(proto.retry_delay(attempt, classified, attempt) * 1000)
+        })
+        if not transported then
+            return nil, "http transport error: " .. tostring(raw)
         end
-
-        -- Non-200 after retries: the beat did not come off. beat records the
-        -- (nil, err) as `llm_call_failed` and reports Outcome.err("call").
-        if resp.status ~= 200 then
-            local classified = proto.classify_error(resp.status, resp.body, resp.headers)
-            return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
-        end
-
-        local ok_decode, raw = pcall(std.json.decode, resp.body)
-        if not ok_decode then
-            return nil, "response JSON decode failed"
+        -- A non-200 after retries, or a body that would not decode: the beat
+        -- did not come off. beat records the (nil, err) as `llm_call_failed`
+        -- and reports Outcome.err("call").
+        if not raw then
+            return nil, terr
         end
 
         -- parse: provider raw -> full neutral result (content, usage,
         -- stop_reason, and whatever else the parse carries, e.g. stop_details).
-        -- The full result is what status() needs; that is why proto.backend is
-        -- not used (it drops stop_details).
+        -- The full result is what classify() needs, which is why the Port keeps
+        -- this end instead of taking proto.backend's reduced one.
         local result, perr = port:parse(raw)
         if not result then
             return nil, perr
@@ -495,10 +467,15 @@ end
 
 --- The mcp Port: one MCP tool (a `tools/list` entry) behind the Port. MCP's
 --- private vocabulary closes inside: the camelCase `inputSchema`, the
---- `<server>__<tool>` namespacing (the agent block's existing pattern), the
---- content-block extraction, and both failure forms — transport (`ok=false`)
---- and server-reported (`is_error=true`) — normalized to a raise, which the
---- kernel closes as an ok=false tool_result.
+--- `<server>__<tool>` namespacing, the content-block extraction, and both
+--- failure forms — transport (`ok=false`) and server-reported
+--- (`is_error=true`) — normalized to a raise, which the kernel closes as an
+--- ok=false tool_result.
+---
+--- The two translations are `llm_proto`'s (`mcp_tool_decl` /
+--- `mcp_result_text`), shared with the agent block, which binds the same
+--- servers through its own loop. A namespace that differed between the two
+--- would give one tool two names.
 ---
 --- The `mcp` global is resolved at invoke time (the bridge's surface), not
 --- captured at load: a VM without the bridge can still require this module.
@@ -513,11 +490,7 @@ function ToolPort.mcp(server, entry)
     if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then
         error("ToolPort.mcp: entry must be a tools/list item with a name")
     end
-    local decl = {
-        name = server .. "__" .. entry.name,
-        description = entry.description or "",
-        input_schema = entry.inputSchema or entry.input_schema or { type = "object", properties = {} },
-    }
+    local decl = proto.mcp_tool_decl(server, entry)
     return ToolPort.new({
         declare = function()
             return decl
@@ -535,17 +508,8 @@ function ToolPort.mcp(server, entry)
                         .. tostring(type(r) == "table" and r.error or "unreadable result")
                 )
             end
-            -- Content extraction, mirroring the agent block: one text block
-            -- verbatim, none the empty string, anything else JSON-encoded.
-            local blocks = r.content or {}
-            local text
-            if #blocks == 1 and blocks[1].type == "text" then
-                text = blocks[1].text
-            elseif #blocks == 0 then
-                text = ""
-            else
-                text = std.json.encode(blocks)
-            end
+            -- Content extraction, the same one the agent block runs.
+            local text = proto.mcp_result_text(r.content)
             if r.is_error == true then
                 error("mcp tool '" .. decl.name .. "' reported error: " .. tostring(text))
             end

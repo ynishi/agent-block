@@ -53,6 +53,21 @@
 ---   the number and nothing else, and token usage (`view("usage")`) is a
 ---   separate reading that beat never folds back into the budget.
 ---
+--- When something raises (session-device-design.md §9-r)
+---   Two kinds of failure meet inside a beat and they are reported
+---   differently. A KERNEL SYSCALL raises attributed text — `knl:
+---   <method>: <kind>: <message>` — because mlua cannot carry a table out
+---   of a Rust callback; beat reads it back with `knl.error` and the
+---   reading is what lands in `Outcome.err("state").detail`: `{ kind?,
+---   method?, retryable, message }`, with `kind` one of
+---   `knl.shapes.error_kinds` and `retryable` true for exactly one of them.
+---   beat never acts on `retryable` itself — asking again is the caller's
+---   loop's decision, because only the loop knows how many times and for
+---   how long it may. A CALLER'S OWN FUNCTION raising (fold, a filter,
+---   cost, the llm) is a bug in the device rather than a class of kernel
+---   failure, so its detail is the message it raised — plus, in dev mode
+---   only, the `traceback` of where it raised.
+---
 --- What the POC deliberately leaves out
 ---   Real provider adapters (llm is `fn(req) -> {status, content, usage,
 ---   stop_reason}`), the full fold vocabulary, realistic tool / filter
@@ -88,6 +103,36 @@ local function bridge(method)
     return b[method]
 end
 
+--- Read a raised kernel failure back as data: `{ kind?, method?, retryable,
+--- message }` (session-device-design.md §9-r).
+---
+--- The bridge cannot raise a table, so it raises the text `knl: <method>:
+--- <kind>: <message>` and publishes `knl.error` to read it back. That
+--- reader is resolved through the same lazy `bridge()` lookup
+--- `new_beat_id` uses, so a spec that installs a fake bridge after this
+--- module loaded still reaches it.
+---
+--- A VM with no bridge at all (the pure lspec runner) gets the same fields
+--- with nothing read out of them, so `Outcome.err("state").detail` has one
+--- shape everywhere: unclassified (`kind` and `method` absent), not
+--- retryable, and the raised text verbatim. That is also what an
+--- unattributed raise gets from the bridge itself — a reader that raised on
+--- unfamiliar input would make a second failure inside the handler for the
+--- first.
+---
+--- @param e any  the value a pcall'd syscall raised
+--- @return table  { kind?, method?, retryable, message }
+local function read_error(e)
+    local reader_ok, reader = pcall(bridge, "error")
+    if reader_ok then
+        local read_ok, structured = pcall(reader, e)
+        if read_ok and type(structured) == "table" then
+            return structured
+        end
+    end
+    return { retryable = false, message = tostring(e) }
+end
+
 -- ============================================================
 -- Outcome — the result type of a beat
 -- ============================================================
@@ -118,6 +163,14 @@ end
 --- kernel's own failure points — "conf", "filter", "call" or "state" (a
 --- record that could not be laid down: closed session, CAS head conflict,
 --- event validation).
+---
+--- Two vocabularies meet on this value and they answer different questions.
+--- `kind` here names the STAGE of the beat that failed. What the failure
+--- *was* — and whether asking again could work — is in `detail`: a "state"
+--- failure carries the kernel's reading (`detail.kind` one of
+--- `knl.shapes.error_kinds`, `detail.retryable`). A loop deciding on a retry
+--- reads `detail.retryable`, never this `kind`; "state" says where, not
+--- whether.
 function Outcome.err(kind, detail)
     return { status = "error", kind = kind, detail = detail }
 end
@@ -233,6 +286,18 @@ end
 ---
 --- `system` and `tools` are composed from the device each beat, not read
 --- from the history.
+---
+--- What "provider-neutral" names here
+---   Neutral is a choice of shape, not the absence of one: the request and
+---   response this fold speaks ARE the Anthropic content-block shape. An
+---   assistant turn is an array of blocks, a `tool_use` block carries a call
+---   and a `tool_result` block answers it by `tool_use_id`. `close_dangling`
+---   below depends on exactly that — it pairs the `tool_use` ids of an
+---   assistant message against the results that answered them, a repair no
+---   flatter shape could express. Other providers do not arrive here in
+---   their own dialect: `llm_proto`'s adapters normalise them into these
+---   blocks on the way in and render them back to the provider's wire on the
+---   way out, so fold never sees a provider-specific shape.
 ---
 --- @param events table  array of stored events (from `session:events()`)
 --- @param device table  a knl device (any table carrying system / tools)
@@ -361,6 +426,19 @@ local USERDATA = setmetatable({ kind = "prim", prim = "userdata" }, lshape.t._in
 --- `callable` below, run loudly at construction; this is its data shape.
 local CALLABLE = T.any_of({ FUNCTION, T.table, USERDATA })
 
+--- A session handle, as a shape: the kernel's own userdata, or the faithful
+--- Lua stand-in a spec drives a beat with. Which methods it must answer is
+--- `is_session`'s duck-type (append / reserve / events) and no schema can ask
+--- a userdata that — so this says the two types the handle can have, and the
+--- entry point that receives one still makes the real judgement.
+local SESSION_HANDLE = T.any_of({ T.table, USERDATA })
+
+--- The STAGE of a beat an `error` Outcome names (see `Outcome.err`). One
+--- constant: the shape below closes on it and the registry declares
+--- `Outcome.err`'s first argument with it, so the four words are written
+--- once.
+local OUTCOME_KIND = T.one_of({ "conf", "filter", "call", "state" })
+
 --- An Outcome, as data. Discriminated on `status` — exactly the kernel's
 --- four, each variant carrying only its own fields.
 local OUTCOME = T.discriminated("status", {
@@ -375,7 +453,7 @@ local OUTCOME = T.discriminated("status", {
     }),
     error = T.shape({
         status = T.literal("error"),
-        kind = T.one_of({ "conf", "filter", "call", "state" }),
+        kind = OUTCOME_KIND,
         detail = T.any,
     }),
     stopped = T.shape({
@@ -513,9 +591,47 @@ local LLM_RESULT = T.shape({
     refusal = REFUSAL:is_optional(),
 }, { open = false })
 
+--- Every class a kernel failure can have, in one closed list — the Lua
+--- side of the Rust `KnlError::KINDS` (session-device-design.md §9-r).
+---
+--- One constant, used by the shape below and by the check that holds this
+--- declaration against the bridge's own (`knl.api().errors`, compared in
+--- `tests/fixtures/knl_turn_test.lua` inv10, the test that has a bridge).
+--- Retyping the list beside the shape would make a second place to keep in
+--- step, which is the thing §9-m exists to rule out.
+local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported" }
+
+--- A raised kernel failure, read back as data (`knl.error(e)`, §9-r).
+---
+--- `kind` and `method` are optional because a raise that carried no
+--- attribution — a Lua-side `error("...")`, a message from another module,
+--- or any raise at all in a VM with no bridge — is reported whole rather
+--- than rejected: `message` then holds the entire text. So `message` is the
+--- field a reader can always count on, and `kind` is the one it must ask
+--- for.
+---
+--- `retryable` is the only judgement in the table and it is the kernel's:
+--- true for contention (`busy`) and nothing else. What to *do* about it is
+--- the caller's loop's — see `Outcome.err`.
+local ERROR = T.shape({
+    kind = T.one_of(ERROR_KINDS):is_optional(),
+    method = T.string:is_optional(),
+    retryable = T.boolean,
+    message = T.string,
+    -- The suppressed failure when two happened at once (a call that failed
+    -- and then a note that could not be recorded): the winner is the record
+    -- the kernel could not lay down, the cause is what the beat was trying
+    -- to write about.
+    cause = T.string:is_optional(),
+})
+
 --- The contracts this module holds itself to, as data.
 M.shapes = {
     outcome = OUTCOME,
+    error = ERROR,
+    -- The vocabulary as a list, next to the shape that closes on it: a
+    -- caller enumerating the classes reads the same constant the shape does.
+    error_kinds = ERROR_KINDS,
     request = REQUEST,
     event_base = EVENT_BASE,
     device_config = DEVICE_CONFIG,
@@ -535,10 +651,26 @@ M.shapes = {
 --- no entry, an entry with no export, and a device field that
 --- `device_config` does not describe.
 ---
---- `args` is a shape, or an ordered list of shapes and descriptions for
---- the arguments a shape cannot express (a session handle, a callback).
---- `returns` is the same. `members` names the functions of an export that
---- is itself a namespace (`Outcome`).
+--- `args` is an ordered list, one item per positional argument, each
+--- `{ shape = <lshape schema>, desc = <word for it> }` — and an empty list
+--- for an export that takes nothing (or is not a function at all). One
+--- representation, no exceptions: an argument a schema cannot pin down gets
+--- the widest shape that is still true (`T.any`, or the union a session
+--- handle can be) and carries the rest of the meaning in `desc`, rather than
+--- dropping out of the machine-readable half into prose. That is what lets
+--- the registry be RUN — see the dev-mode gate at the foot of this file,
+--- which holds every declared call to the entry above it.
+---
+--- `returns` stays a shape or a sentence: nothing executes it, because what
+--- an export answers is already checked where it is built (`emit`, the
+--- Mapper's boundary assert) rather than at the call.
+---
+--- `members` names the functions of an export that is itself a namespace
+--- (`Outcome`), and the methods a returned value carries (`device:with`).
+--- The gate reaches the first — they are functions on an exported table —
+--- and not the second: `with` is reached off a device, which is a value this
+--- module hands out rather than an export it owns, so its entry documents
+--- and is walked, but nothing wraps it.
 ---
 --- This registry covers the Lua module. The bridge declares its own surface
 --- through `knl.api()` (SESSION_API / MODULE_API in bridge/knl.rs), and
@@ -555,7 +687,10 @@ M.shapes.session = {
     len = { args = "none", returns = "integer" },
     view = { args = { T.one_of({ "usage", "tail" }), "table opts?" }, returns = "table (the named fold)" },
     reserve = { args = { "integer n >= 0" }, returns = "true | false, tag — decided inside the store" },
-    spend = { args = { "integer n >= 0" }, returns = "integer remaining | nil (no grant)" },
+    -- The write is the whole result: spend records the deduction and
+    -- answers nothing. What is left is a separate reading (`remaining`), so
+    -- a caller cannot mistake one call's return for a balance it can hold.
+    spend = { args = { "integer n >= 0" }, returns = "nothing" },
     remaining = { args = "none", returns = "integer | nil (no grant)" },
     exhausted = { args = "none", returns = "boolean" },
     close = {
@@ -569,58 +704,83 @@ M.shapes.module = {
     open = { args = OPEN_OPTS, returns = "session" },
     resume = { args = RESUME_OPTS, returns = "session" },
     new_beat_id = { args = "none", returns = "string" },
-    api = { args = "none", returns = "{ session = { {name, doc}... }, module = { {name, doc}... } }" },
+    error = { args = { "string err" }, returns = ERROR },
+    api = {
+        args = "none",
+        returns = "{ session = { {name, doc}... }, module = { {name, doc}... }, errors = { kind... } }",
+    },
 }
+
+--- One declared argument: the shape it is held to, and the word for it.
+--- Two fields rather than one so the widest-true shape (`T.any`, a union)
+--- costs no meaning — `desc` keeps saying "session" where the schema has
+--- stopped being able to.
+local function arg_of(schema, desc)
+    return { shape = schema, desc = desc }
+end
 
 M.shapes.api = {
     open = {
-        args = OPEN_OPTS,
+        args = { arg_of(OPEN_OPTS, "opts") },
         returns = "session (the kernel's userdata, unwrapped)",
     },
     resume = {
-        args = RESUME_OPTS,
+        args = { arg_of(RESUME_OPTS, "opts") },
         returns = "session (pre-loaded with the persisted log)",
     },
     session = {
-        args = { "open_opts | resume_opts", "function fn(session)" },
+        args = {
+            arg_of(T.any_of({ OPEN_OPTS, RESUME_OPTS }), "open_opts | resume_opts"),
+            arg_of(FUNCTION, "fn(session)"),
+        },
         returns = "whatever fn returned (the session is closed either way)",
     },
     device = {
-        args = DEVICE_CONFIG,
+        args = { arg_of(DEVICE_CONFIG, "config") },
         returns = "device (frozen; d:with derives another)",
+        members = {
+            -- Reached off a device value, not off this module: declared and
+            -- walked, never wrapped (see the registry's header).
+            with = {
+                args = { arg_of(T.table, "the device (d:with, a method call)"), arg_of(DEVICE_CONFIG, "delta") },
+                returns = "device' (a new frozen device; the original is untouched)",
+            },
+        },
     },
     beat = {
-        args = { "session", "device" },
+        args = { arg_of(SESSION_HANDLE, "session"), arg_of(T.table, "device") },
         returns = OUTCOME,
     },
     fold = {
-        args = { T.array_of(EVENT_BASE), "device (read for system / tools)" },
+        args = { arg_of(T.array_of(EVENT_BASE), "events"), arg_of(T.table, "device (read for system / tools)") },
         returns = REQUEST,
     },
     new_beat_id = {
-        args = "none",
+        args = {},
         returns = "string (time-ordered, session-free)",
     },
     Outcome = {
-        args = "none (a namespace table, not a function)",
+        -- A namespace table, not a function: nothing to hold, and the
+        -- members below are what the gate reaches.
+        args = {},
         returns = "the Outcome constructors, predicates and match",
         members = {
-            ok = { args = { "table out" }, returns = OUTCOME },
-            refused = { args = { "string reason", "table detail?" }, returns = OUTCOME },
-            err = { args = { T.one_of({ "conf", "filter", "call", "state" }), "any detail" }, returns = OUTCOME },
-            stopped = { args = { "string reason", "string tag?" }, returns = OUTCOME },
-            is_ok = { args = { "any" }, returns = "boolean" },
-            is_refused = { args = { "any" }, returns = "boolean" },
-            is_error = { args = { "any" }, returns = "boolean" },
-            is_stopped = { args = { "any" }, returns = "boolean" },
+            ok = { args = { arg_of(T.table, "out") }, returns = OUTCOME },
+            refused = { args = { arg_of(T.string, "reason"), arg_of(T.table, "detail?") }, returns = OUTCOME },
+            err = { args = { arg_of(OUTCOME_KIND, "kind"), arg_of(T.any, "detail") }, returns = OUTCOME },
+            stopped = { args = { arg_of(T.string, "reason"), arg_of(T.string, "tag?") }, returns = OUTCOME },
+            is_ok = { args = { arg_of(T.any, "value") }, returns = "boolean" },
+            is_refused = { args = { arg_of(T.any, "value") }, returns = "boolean" },
+            is_error = { args = { arg_of(T.any, "value") }, returns = "boolean" },
+            is_stopped = { args = { arg_of(T.any, "value") }, returns = "boolean" },
             match = {
-                args = { OUTCOME, "table arms { ok, refused, error, stopped }" },
+                args = { arg_of(OUTCOME, "outcome"), arg_of(T.table, "arms { ok, refused, error, stopped }") },
                 returns = "whatever the taken arm returned",
             },
         },
     },
     shapes = {
-        args = "none (a data table)",
+        args = {},
         returns = "this registry: every shape above, plus `api`, `session` and `module`",
     },
 }
@@ -638,8 +798,76 @@ local function assert_event_dev(ev)
 end
 
 --- Dev-mode gate for an Outcome on its way out of beat. No-op in prod.
+---
+--- `OUTCOME` leaves `detail` as `any` — three of the four error kinds carry
+--- a message a person reads — but a "state" detail is a contract: it is the
+--- kernel's failure read back, and a loop decides on a retry from its
+--- `retryable`. So that one is held to `ERROR` here, which is where a call
+--- site that reported a raw string instead of the reading goes red.
 local function emit(o)
-    return shape.assert_dev(o, OUTCOME, "knl_outcome")
+    shape.assert_dev(o, OUTCOME, "knl_outcome")
+    if o.status == "error" and o.kind == "state" then
+        shape.assert_dev(o.detail, ERROR, "knl_state_detail")
+    end
+    return o
+end
+
+--- `xpcall`'s message handler for a function the CALLER supplied — fold, a
+--- filter, cost, the llm — keeping the raised value and the stack apart.
+---
+--- `debug.traceback` on its own folds the two into one string, and the
+--- message is what a beat reports in prod: a detail that grew a stack
+--- traceback behind it would be a different report, not a richer one. So
+--- the raise is kept verbatim and the stack rides beside it.
+---
+--- The stack is captured in dev mode only. It is a development aid — which
+--- line of somebody's own fold raised, through the pcall that turned the
+--- raise into an Outcome — and a production run should not pay for one on
+--- every failure.
+---
+--- `traced` marks the capture rather than letting the traceback's presence
+--- stand for it: the `debug` library is not in every VM this module runs in
+--- (mlua's safe stdlib leaves it out), and a detail whose TYPE depended on
+--- that would make dev mode mean two different things. Dev mode is one
+--- thing — a structured detail — and the stack is a field in it that a VM
+--- without `debug` simply cannot fill.
+local function traced(raised)
+    if shape.is_dev_mode() then
+        -- Level 2: skip this handler, so the top frame is the raise itself.
+        local tb
+        if type(debug) == "table" and type(debug.traceback) == "function" then
+            tb = debug.traceback("", 2)
+        end
+        return { raised = raised, traced = true, traceback = tb }
+    end
+    return { raised = raised }
+end
+
+--- The `detail` for a failure that came out of a caller-supplied function:
+--- the message beat reports, and in dev mode the traceback beside it.
+---
+--- In prod this is exactly the string it has always been. In dev it is a
+--- table with the same text under `message`, which is the one place the
+--- two modes differ in what a beat returns — deliberately, because a
+--- traceback is an answer to "where in my code", a question only the person
+--- writing that code is asking.
+---
+--- @param message string  what beat reports about the failure
+--- @param caught table  what `traced` handed back
+--- @return string|table detail
+local function raised_detail(message, caught)
+    if type(caught) == "table" and caught.traced then
+        return { message = message, traceback = caught.traceback }
+    end
+    return message
+end
+
+--- What a `traced` failure raised, as text.
+local function raised_text(caught)
+    if type(caught) == "table" then
+        return tostring(caught.raised)
+    end
+    return tostring(caught)
 end
 
 -- ============================================================
@@ -933,14 +1161,20 @@ end
 --- session is closed with reason "error" first and the body's error is then
 --- re-raised unchanged: a bookkeeping failure must not replace the failure
 --- it is bookkeeping for (§9-f), so a close that itself fails on that path
---- is dropped. On the clean path a failing close raises, since a bracket
+--- is warned about rather than raised. On the clean path a failing close
+--- raises instead, since a bracket
 --- that reports success with no boundary recorded is the one outcome this
 --- exists to rule out.
 ---
---- A close that fails on the error path is not silent either: it goes to
---- the host `log` global as a warning when the VM has one. It cannot be
---- raised (that would replace the body's error) and it cannot be returned
---- (this path does not return).
+--- When both fail, the body error wins and the close failure is the
+--- suppressed one (§9-f, try-with-resources' suppressed exception). It is
+--- not silent either: it goes to the host `log` global as a warning when
+--- the VM has one, as a record — `{ event =
+--- "close_failed_after_body_error", body = <the winner, as text>, close =
+--- <the kernel's reading, knl.shapes.error> }` — so the loser is at least
+--- structured. It cannot be raised (that would replace the body's error)
+--- and it cannot be returned (this path does not return), which is why a
+--- log is the only place left for it.
 ---
 --- The reason vocabulary is the kernel's, and a normal exit has one word in
 --- it: "scope_exit" — what this bracket closes with and what `<close>`
@@ -980,7 +1214,31 @@ function M.session(opts, fn)
     if not closed_ok then
         local host_log = rawget(_G, "log")
         if type(host_log) == "table" and type(host_log.warn) == "function" then
-            pcall(host_log.warn, "knl.session: close failed after body error: " .. tostring(cerr))
+            -- The suppressed failure, as a record rather than a sentence:
+            -- which of the two errors this is, the body error that beat it,
+            -- and the kernel's reading of the close itself (so a reader can
+            -- tell a store that was busy from one that is gone).
+            local warning = {
+                event = "close_failed_after_body_error",
+                body = tostring(returned[2]),
+                close = read_error(cerr),
+            }
+            -- The host's `log.warn` takes a string [実測: bridge/log.rs:37,
+            -- `msg: String`], so the structured form is offered first and
+            -- the text is the fallback. Both are pcall'd: a warning about a
+            -- failure must not become one.
+            local warned = pcall(host_log.warn, warning)
+            if not warned then
+                pcall(
+                    host_log.warn,
+                    "knl.session: "
+                        .. warning.event
+                        .. ": body="
+                        .. warning.body
+                        .. "; close="
+                        .. tostring(warning.close.message)
+                )
+            end
         end
     end
     error(returned[2], 0)
@@ -1073,6 +1331,14 @@ end
 --- tool_call written, rather than half a response's worth of side effects
 --- and a report that the config was wrong.
 ---
+--- The handler and the policy are the caller's code, like fold and the llm,
+--- but their raises are not traced: a raising handler or policy is closed
+--- as DATA — the `result` of a tool_result, a durable record a later fold
+--- reads back and sends to the model — and a record that carried a stack in
+--- dev and not in prod would be two different histories. The traceback is
+--- attached where a failure is *reported* (an Outcome the caller reads and
+--- drops), never where one is *recorded*.
+---
 --- @param session userdata|table  a knl session
 --- @param device table  a knl device
 --- @param out table  the model response being executed
@@ -1162,6 +1428,14 @@ end
 --- Re-entrant and stateless: a beat is decided entirely by its two
 --- arguments, so it can be called from any driver, resumed, or interleaved.
 ---
+--- Every syscall it makes is pcall'd and every failure comes back as an
+--- Outcome — `err("state")`, carrying the kernel's own reading of the raise
+--- (`detail.kind` / `detail.retryable`, `knl.shapes.error`). beat does NOT
+--- act on `retryable`: a beat that quietly repeated a `busy` reserve would
+--- be a loop nobody wrote and nobody bounded, and it would make a second
+--- attempt at a call the caller may no longer want. Asking again is the
+--- caller's loop's decision, and this is the value it decides from.
+---
 --- @param session userdata|table  a knl session (knl.open / knl.resume)
 --- @param device table  a knl device (knl.device / d:with)
 --- @return table outcome  an `Outcome`
@@ -1195,18 +1469,23 @@ function M.beat(session, device)
     -- not fold it.
     local read_ok, events = pcall(session.events, session)
     if not read_ok then
-        return emit(Outcome.err("state", "events read failed: " .. tostring(events)))
+        -- The kernel's own reading of its own failure: `events` holds the
+        -- raise on this path, and what a caller needs off it (which class,
+        -- whether asking again is worth anything) is in the table, not in
+        -- a sentence somebody would have to parse.
+        return emit(Outcome.err("state", read_error(events)))
     end
-    local folded_ok, request = pcall(device.fold, events, device)
+    -- The fold is the caller's code, so its failures are traced (dev mode).
+    local folded_ok, request = xpcall(device.fold, traced, events, device)
     if not folded_ok then
-        return emit(Outcome.err("conf", "fold failed: " .. tostring(request)))
+        return emit(Outcome.err("conf", raised_detail("fold failed: " .. raised_text(request), request)))
     end
 
     -- [2] filter chain (fn(req) -> req) -----------------------------------
     for i, filter in ipairs(device.filters) do
-        local filtered_ok, filtered = pcall(filter, request)
+        local filtered_ok, filtered = xpcall(filter, traced, request)
         if not filtered_ok then
-            return emit(Outcome.err("filter", tostring(filtered)))
+            return emit(Outcome.err("filter", raised_detail(raised_text(filtered), filtered)))
         end
         -- A filter's return replaces the request wholesale, so a filter
         -- that mutates and forgets to return (nil) or returns a
@@ -1234,9 +1513,9 @@ function M.beat(session, device)
     -- policy — `device.cost(request)` — and it is never derived from token
     -- counts: the budget and the `usage` view are separate readings
     -- (budget-design.md §4-8).
-    local est_ok, amount = pcall(device.cost, request)
+    local est_ok, amount = xpcall(device.cost, traced, request)
     if not est_ok then
-        return emit(Outcome.err("conf", "cost failed: " .. tostring(amount)))
+        return emit(Outcome.err("conf", raised_detail("cost failed: " .. raised_text(amount), amount)))
     end
     -- `cost_result` carries the type; the bound and the integrality are
     -- here, because lshape has no combinator for either. Checked rather than
@@ -1249,7 +1528,8 @@ function M.beat(session, device)
     -- Outcome, so the call is pcall'd.
     local res_ok, granted, tag = pcall(session.reserve, session, amount)
     if not res_ok then
-        return emit(Outcome.err("state", "reserve failed: " .. tostring(granted)))
+        -- `granted` holds the raise here; `busy` is the class a loop may act on.
+        return emit(Outcome.err("state", read_error(granted)))
     end
     if not granted then
         return emit(Outcome.stopped("budget", tag))
@@ -1267,18 +1547,21 @@ function M.beat(session, device)
         request = request,
     })
     if not rec_ok then
-        return emit(Outcome.err("state", "llm_request append failed: " .. tostring(rec_err)))
+        return emit(Outcome.err("state", read_error(rec_err)))
     end
 
     -- [5] beat calls the llm directly ------------------------------------
     -- resp = { status = "ok"|"refused"|"error", content, usage, stop_reason }.
     -- The status is the adapter's judgement; beat reads it, it does not
-    -- invent one (status is llm-supplied).  The call is pcall'd: an adapter
+    -- invent one (status is llm-supplied).  The call is caught: an adapter
     -- that raises (instead of returning nil, err) is still a call failure,
-    -- not an escape from the Outcome contract.
-    local call_ok, resp, berr = pcall(device.llm, request)
+    -- not an escape from the Outcome contract — and it is the caller's own
+    -- code, so the raise is traced (dev mode).
+    local call_ok, resp, berr = xpcall(device.llm, traced, request)
+    local raised
     if not call_ok then
-        berr = "llm raised: " .. tostring(resp)
+        raised = resp
+        berr = "llm raised: " .. raised_text(raised)
         resp = nil
     end
 
@@ -1308,17 +1591,18 @@ function M.beat(session, device)
             error = tostring(reason),
         })
         if not noted_ok then
-            return emit(
-                Outcome.err(
-                    "state",
-                    "call failed ("
-                        .. tostring(reason)
-                        .. ") and the failure note could not be recorded: "
-                        .. tostring(note_err)
-                )
-            )
+            -- Two failures, one Outcome. The state is the one reported:
+            -- the call failing is a fact this beat could not write down,
+            -- and a caller that cannot write cannot go on either way. The
+            -- kernel's reading of the append is the detail (so a loop can
+            -- still tell contention from a dead store), and the call's own
+            -- reason — the note that did not land — rides along as `cause`
+            -- (the suppressed failure, not the winner).
+            local detail = read_error(note_err)
+            detail.cause = tostring(reason)
+            return emit(Outcome.err("state", detail))
         end
-        return emit(Outcome.err("call", tostring(reason)))
+        return emit(Outcome.err("call", raised_detail(tostring(reason), raised)))
     end
     -- ok / refused: the model answered. Appending the llm_response is
     -- what records it, under this beat's id, and it charges nothing (the
@@ -1334,7 +1618,7 @@ function M.beat(session, device)
         stop_reason = resp.stop_reason,
     })
     if not resp_ok then
-        return emit(Outcome.err("state", "llm_response append failed: " .. tostring(resp_err)))
+        return emit(Outcome.err("state", read_error(resp_err)))
     end
     resp.beat = beat_id
     -- A refusal is a recorded response the model would not build on — and
@@ -1352,7 +1636,10 @@ function M.beat(session, device)
     -- either way — the beat happened, it is the device that is wrong.
     local tools_ok, summary, policy_problem = pcall(execute_tools, session, device, resp, beat_id)
     if not tools_ok then
-        return emit(Outcome.err("state", "tool record append failed: " .. tostring(summary)))
+        -- Only an append raises out of execute_tools (a handler's or a
+        -- policy's raise is closed as data inside it), so this is the
+        -- kernel's failure and is read like any other.
+        return emit(Outcome.err("state", read_error(summary)))
     end
     if policy_problem then
         return emit(Outcome.err("conf", policy_problem))
@@ -1365,5 +1652,64 @@ end
 -- Internals exposed for the spec (the fixture drives these directly).
 M._execute_tools = execute_tools
 M._wire_tools = wire_tools
+
+-- ============================================================
+-- The registry, executed (session-device-design.md §9-m)
+-- ============================================================
+--
+-- `M.shapes.api` names the shape of every argument of every export. A
+-- registry nobody runs is prose with a table around it — the entry drifts
+-- from the function and nothing goes red — so in dev mode each declared
+-- export is replaced, once, here at load, by a wrapper that holds the call
+-- to its entry before letting it through. Prod is untouched: the exports
+-- are the functions themselves and a call pays nothing, which is why this
+-- is a gate and not the argument checking a function needs to be correct.
+-- The checks a call must not get through WITHOUT (a device's config, a
+-- filter's return, cost's bound) stay where they are, loud in both modes.
+--
+-- What the gate judges is the shape of the arguments that were PASSED. An
+-- argument that is absent — not supplied, or supplied as nil — is left to
+-- the function: which arguments are required, and what a missing one means,
+-- is its own business, and `knl.beat(s, nil)` must go on answering
+-- `Outcome.err("conf")` rather than raising. The registry answers for what
+-- it was given.
+
+--- Wrap `fn` so every argument it is passed is held to `declared[i].shape`
+--- (dev mode only — `assert_dev` is a no-op otherwise, and this wrapper is
+--- not even installed in prod).
+---
+--- The hint names the registry entry and the position, so a violation reads
+--- as a broken call to a declared API rather than as an anonymous shape
+--- failure somewhere inside the module.
+local function arg_checked(name, fn, declared)
+    return function(...)
+        for i = 1, #declared do
+            local value = select(i, ...)
+            if value ~= nil then
+                shape.assert_dev(value, declared[i].shape, name .. " arg " .. i .. " (" .. declared[i].desc .. ")")
+            end
+        end
+        return fn(...)
+    end
+end
+
+if shape.is_dev_mode() then
+    for name, entry in pairs(M.shapes.api) do
+        local export = M[name]
+        if type(export) == "function" then
+            M[name] = arg_checked("knl." .. name, export, entry.args)
+        elseif type(export) == "table" and type(entry.members) == "table" then
+            -- A namespace (`Outcome`): its members are exports too. A
+            -- member of something this module does not export as a table
+            -- (`device:with`) has no function here to replace, and is
+            -- skipped rather than hunted down.
+            for member, member_entry in pairs(entry.members) do
+                if type(export[member]) == "function" then
+                    export[member] = arg_checked("knl." .. name .. "." .. member, export[member], member_entry.args)
+                end
+            end
+        end
+    end
+end
 
 return M

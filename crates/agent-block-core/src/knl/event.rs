@@ -122,6 +122,22 @@ pub const KIND_BUDGET_REFUSED: &str = "budget_refused";
 /// Kernel-only kind: a settlement after the fact, deducted from the balance.
 pub const KIND_BUDGET_SPENT: &str = "budget_spent";
 
+/// The four kinds the ledger is made of — everything
+/// [`super::fold_balance`] reads, and nothing else.
+///
+/// Named here so the reads that fold the balance
+/// ([`super::EventStore::read_kinds`]) ask for exactly the kinds the fold
+/// looks at: one list, so a kind cannot be added to the ledger and left out
+/// of the read that folds it.  `budget_refused` moves no balance and is in
+/// the list all the same — it is a ledger entry, and a fold that could not
+/// see it would be reading a different log from the one an audit reads.
+pub const BUDGET_KINDS: &[&str] = &[
+    KIND_BUDGET_GRANTED,
+    KIND_BUDGET_RESERVED,
+    KIND_BUDGET_REFUSED,
+    KIND_BUDGET_SPENT,
+];
+
 /// Payload field of `session_closed`.
 pub const FIELD_REASON: &str = "reason";
 /// Optional payload field of `session_closed`: free text about the close
@@ -326,12 +342,16 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
     let kind = match obj.get(FIELD_KIND) {
         Some(Value::String(kind)) => kind.as_str(),
         Some(other) => {
-            return Err(KnlError::new(format!(
+            return Err(KnlError::Validation(format!(
                 "kind must be a string, got {}",
                 json_type_name(other)
             )));
         }
-        None => return Err(KnlError::new("kind is required (string)")),
+        None => {
+            return Err(KnlError::Validation(
+                "kind is required (string)".to_string(),
+            ))
+        }
     };
 
     // The beat is the caller's to declare and never the kernel's to mint,
@@ -342,7 +362,7 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
         None => {}
         Some(Value::String(_)) => {}
         Some(other) => {
-            return Err(KnlError::new(format!(
+            return Err(KnlError::Validation(format!(
                 "beat must be a string, got {}",
                 json_type_name(other)
             )));
@@ -357,13 +377,13 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
     for (name, shape) in fields {
         match obj.get(*name) {
             None => {
-                return Err(KnlError::new(format!(
+                return Err(KnlError::Validation(format!(
                     "reserved kind {kind:?} requires {name:?} ({})",
                     shape.name()
                 )));
             }
             Some(value) if !shape.accepts(value) => {
-                return Err(KnlError::new(format!(
+                return Err(KnlError::Validation(format!(
                     "reserved kind {kind:?}: {name:?} must be {}, got {}",
                     shape.name(),
                     json_type_name(value)

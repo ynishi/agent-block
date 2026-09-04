@@ -62,9 +62,13 @@
 //! same allowance twice.  The kernel has exactly one:
 //! [`Session::reserve`] writes only if the ledger covers what was asked.
 //! [`Session::spend`] is not one of them — a settlement has nothing to
-//! decide, so it is a plain append, and the balance it reports is read back
-//! off the ledger afterwards.  Neither asks whether the session ended — see
-//! below.
+//! decide, so it is a plain append, and it reports nothing but that the
+//! write landed.  Neither asks whether the session ended — see below.
+//!
+//! The one thing written as a *batch* is the session's own opening:
+//! [`Session::open_on`] records `session_opened` and the `budget_granted`
+//! that says what it opened under through [`EventStore::append_many`], so a
+//! reader never meets a session that opened without its quota.
 //!
 //! # The log never refuses a write
 //!
@@ -101,6 +105,12 @@
 //! no released shape to read yet; from then on, a round that changes what is
 //! stored ships the matching `n → n+1` step in the same breath.  See the
 //! [`super::event_store`] module docs.
+//!
+//! That is a property of the types here, not a rule to remember: a session
+//! holds a [`CurrentStore`] and never a bare backend, so every event it hands
+//! to a fold — or out through [`Session::events`] — is a
+//! [`Current`](super::event_store::Current), and a read that skipped the
+//! chain has no way to reach one.
 //!
 //! An append does not charge.  It is a record of something that happened,
 //! and the budget is a permission asked for *before* something happens —
@@ -146,12 +156,12 @@ use serde_json::{Map, Value};
 
 use super::budget::{self, fold_balance, last_grant, BudgetGrant};
 use super::event::{
-    is_kernel_only, kernel_event, kind_of, seq_of, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL,
-    FIELD_KIND, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED,
+    is_kernel_only, kernel_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL, FIELD_KIND,
+    FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED,
     KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED,
     KIND_SESSION_OPENED,
 };
-use super::event_store::{kernel_upcasters, EventStore, MemEventStore, UpcastingEventStore};
+use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore, MemEventStore};
 use super::projection::{tail_count, Views, VIEW_TAIL, VIEW_USAGE};
 use super::scope::{Scope, ScopeId};
 use super::{projection, KnlError, KnlResult};
@@ -176,17 +186,20 @@ pub const CLOSE_REASON_DROPPED: &str = "dropped";
 /// go and open another.
 const CLOSED: &str = "session is closed";
 
-/// Whether `events` already carry the stream's ending.
+/// Whether the stream already carries its ending.
 ///
-/// Read in exactly one place, [`Session::resume`], because a session is
+/// Asked in exactly one place, [`Session::resume`], because a session is
 /// disposable: there is no reopening kind, so a single `session_closed`
 /// anywhere in the log means the stream is not a state to continue from.
 /// No *write* asks this — a write records what happened, and something
 /// writing after an ending is the fact an audit most wants recorded.
-fn has_ended(events: &[Value]) -> bool {
-    events
-        .iter()
-        .any(|event| kind_of(event) == KIND_SESSION_CLOSED)
+///
+/// It reads the one kind it is asking about, and at most one of those: the
+/// question is whether an ending exists, not where it is or how many there
+/// are.
+fn has_ended(store: &CurrentStore) -> KnlResult<bool> {
+    let ending = store.read_kinds(Some(&[KIND_SESSION_CLOSED]), 0, 1)?;
+    Ok(!ending.is_empty())
 }
 
 /// Reserved owner: no principal was named when the session opened.
@@ -269,9 +282,13 @@ pub struct Session {
     /// an owner granted it.  Held by value — a scope and its session begin
     /// and end together, so there is nothing to point at.
     scope: Scope,
-    /// K1 append-only history, held behind the event-store SPI so the
-    /// backend can be the in-memory store or the durable SQLite one.
-    store: Box<dyn EventStore>,
+    /// K1 append-only history, held behind the upcasting seam.
+    ///
+    /// A [`CurrentStore`] and never a bare `Box<dyn EventStore>`: the backend
+    /// inside it can be the in-memory store or the durable SQLite one, and
+    /// the seam is what makes every read of it — here and in the folds — an
+    /// event at the current shape.
+    store: CurrentStore,
     /// Cached projection folds (derived, never authoritative).
     views: Views,
     /// The last balance fold, and the store head it was taken at.
@@ -332,6 +349,11 @@ impl Session {
     /// the `grant`, so the log says what the owner allowed.
     /// `session_opened` is an open-shape reserved kind, so both extra fields
     /// are accepted without any change to the validator.
+    ///
+    /// The two are written as one batch ([`EventStore::append_many`]), so a
+    /// durable stream either carries the opening *and* the quota it opened
+    /// under, or carries nothing at all: an open that fails leaves no session
+    /// behind to close.
     pub fn open_on(
         owner: String,
         grant: Option<BudgetGrant>,
@@ -342,8 +364,7 @@ impl Session {
         // decision a `reserve` takes inside the store) passes through it by
         // construction.  The chain is empty until the first release; a shape
         // change after it registers its step at that one site.
-        let store: Box<dyn EventStore> =
-            Box::new(UpcastingEventStore::new(store, kernel_upcasters()));
+        let store = CurrentStore::new(store, kernel_upcasters());
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             // The scope is issued here, before the first event: the
@@ -357,14 +378,8 @@ impl Session {
             balance: Cell::new((0, None)),
             closed: false,
         };
-        // The same one path records `session_opened` as records everything
-        // else, and it CAN fail on a durable backend (a busy database
-        // exhausts its retries) — a session that could not record its own
-        // opening must not exist, so the error surfaces instead of leaving a
-        // stream with no `session_opened`.
-        //
-        // The scope rides on it: the id the kernel just issued, next to the
-        // owner.  Together they are the whole of what a resume needs to
+        // The scope rides on the opening: the id the kernel just issued, next
+        // to the owner.  Together they are the whole of what a resume needs to
         // restore the scope, so the boundary is in the log and not only in
         // this value.
         let mut started = kernel_event(KIND_SESSION_OPENED);
@@ -376,36 +391,26 @@ impl Session {
             FIELD_SCOPE_ID.to_string(),
             Value::from(session.scope.id().to_string()),
         );
-        session.append_kernel(started)?;
 
         // The grant is its own fact, right after the boundary: what the
         // owner allowed is the first entry of the ledger the balance folds
-        // from, not a decoration on the run's opening.  A session that
-        // could not record its own grant must not exist either — the error
-        // surfaces rather than leaving a counter no event accounts for.
-        //
-        // But the opening is already in the log by then, so returning the
-        // error alone would leave a stream that opened and never ended.  The
-        // boundary is written first, best effort: a close that fails too is
-        // logged, not raised, because the error that matters to the caller is
-        // the one that stopped the open.
+        // from, not a decoration on the run's opening.
+        let mut opening = vec![started];
         if let Some(grant) = session.scope.grant().cloned() {
-            let event = granted_event(&grant, session.scope.id());
-            if let Err(failed) = session.append_kernel(event) {
-                if let Err(unclosed) = session.close_with(
-                    Some(CLOSE_REASON_ERROR),
-                    Some(&format!("open: budget_granted: {failed}")),
-                ) {
-                    tracing::warn!(
-                        error = %unclosed,
-                        cause = %failed,
-                        "knl: a failed open could not record session_closed; \
-                         the stream is left open"
-                    );
-                }
-                return Err(failed);
-            }
+            opening.push(granted_event(&grant, session.scope.id()));
         }
+
+        // One write for both.  It CAN fail on a durable backend (a busy
+        // database exhausts its retries) — a session that could not record
+        // its own opening must not exist, so the error surfaces — and because
+        // the two events are one write, a failure leaves the stream *empty*
+        // rather than opened-without-a-grant.  There is no half-opened stream
+        // to close on the way out, which is what the earlier best-effort
+        // `session_closed` here was patching over.
+        //
+        // The session is being built, so it cannot have been closed: the
+        // guarded path `append_kernel` takes has nothing to check yet.
+        session.store.append_many(opening)?;
         Ok(session)
     }
 
@@ -445,11 +450,23 @@ impl Session {
         // same projected shape every other read of this session gets: a log
         // written under an older shape resumes as what it means today, and the
         // stored bytes stay as they were written.
-        let store: Box<dyn EventStore> =
-            Box::new(UpcastingEventStore::new(store, kernel_upcasters()));
+        Self::resume_on(grant, CurrentStore::new(store, kernel_upcasters()))
+    }
 
+    /// [`Session::resume`] on a store that is already behind the seam.
+    ///
+    /// The body of the resume, split off so a test can hand it a chain of its
+    /// own; the public entry wraps the backend in [`kernel_upcasters`] and
+    /// calls this.
+    fn resume_on(grant: Option<BudgetGrant>, store: CurrentStore) -> KnlResult<Self> {
         // Fallible read: a transient busy read or an undecodable row surfaces
         // here rather than being silently folded into a wrong resumed state.
+        //
+        // Unfiltered, unlike the reads a running session takes: a resume is
+        // restoring the whole of the state, and it is looking for the opening
+        // *whatever it was written as* — the chain may have renamed the kind
+        // on the way through, and a filter selects on the stored name
+        // ([`EventStore::read_kinds`]).
         let log = store.read(0, usize::MAX)?;
 
         // Resuming an empty or mistyped stream is a caller error, not an
@@ -457,17 +474,21 @@ impl Session {
         // `session_opened`.
         let opened = log
             .iter()
-            .find(|event| kind_of(event) == KIND_SESSION_OPENED)
+            .find(|event| event.kind() == KIND_SESSION_OPENED)
             .ok_or_else(|| {
-                KnlError::new("stream has no session to resume (no session_opened event)")
+                // The caller pointed a resume at a stream that is not a
+                // session — a bad argument, not a damaged log.
+                KnlError::Validation(
+                    "stream has no session to resume (no session_opened event)".to_string(),
+                )
             })?;
 
         // …and an ended one is not resumed at all.  There is no reopening
         // kind, so any `session_closed` in the stream is the session's
         // ending: a handle that carried on past it would be appending to a
         // log whose readers were told nothing more was coming.
-        if has_ended(&log) {
-            return Err(KnlError::new(format!(
+        if has_ended(&store)? {
+            return Err(KnlError::Closed(format!(
                 "{CLOSED} (disposable; open a new session)"
             )));
         }
@@ -494,11 +515,13 @@ impl Session {
         // in seq order).  A resume errors above on an empty /
         // session_opened-less log, so this is a real event's seq; the `0`
         // fallback is unreachable but keeps it total.
-        let head = log.last().map(seq_of).unwrap_or(0);
+        let head = log.last().map(Current::seq).unwrap_or(0);
 
         // The grant comes back off the log: a resumed session keeps having a
         // budget (and a tag to report) even when the caller grants nothing
-        // new.  What is left of it is the fold, seeded just below.
+        // new.  What is left of it is the fold, seeded just below — over the
+        // whole log, which folds to the same balance as the ledger alone
+        // because nothing else moves it.
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             scope: Scope::restore(scope_id, owner, last_grant(&log)),
@@ -614,7 +637,7 @@ impl Session {
         // a resume and an audit read off the log.
         let kind = event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("");
         if is_kernel_only(kind) {
-            return Err(KnlError::new(format!(
+            return Err(KnlError::Validation(format!(
                 "{kind:?} is written by the kernel only ({})",
                 kernel_only_hint(kind)
             )));
@@ -637,7 +660,7 @@ impl Session {
     /// and dropping it would hide the one thing an audit is reading for.
     fn append_kernel(&mut self, event: Map<String, Value>) -> KnlResult<u64> {
         if self.closed {
-            return Err(KnlError::new(CLOSED));
+            return Err(KnlError::Closed(CLOSED.to_string()));
         }
 
         // The store orders the write and hands back where it landed.
@@ -645,12 +668,18 @@ impl Session {
         Ok(committed.seq)
     }
 
-    /// Events with `seq >= from`, cloned.
+    /// Events with `seq >= from`, cloned, at the current shape.
+    ///
+    /// They come back as [`Current`]s: the read went through the upcaster
+    /// seam, and the type says so, so a caller folding them cannot be folding
+    /// a shape that has been superseded.  A caller that needs to own the
+    /// underlying object — the Lua bridge, building tables — takes it with
+    /// [`Current::into_inner`].
     ///
     /// Fallible: a durable backend can hit a transient busy read or a row it
     /// cannot decode, which surfaces here rather than being dropped silently.
     /// The in-memory backend is always `Ok`.
-    pub fn events(&self, from: u64) -> KnlResult<Vec<Value>> {
+    pub fn events(&self, from: u64) -> KnlResult<Vec<Current>> {
         self.store.read(from, usize::MAX)
     }
 
@@ -693,7 +722,7 @@ impl Session {
     /// the balance is the whole of the invariant.
     pub fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
         if self.closed {
-            return Err(KnlError::new(CLOSED));
+            return Err(KnlError::Closed(CLOSED.to_string()));
         }
         budget::check_amount(amount)?;
         // No budget, no ledger: nothing to decide and nothing to record.
@@ -711,7 +740,11 @@ impl Session {
         // Whether the stream carries an ending is not part of it — a
         // reservation past the boundary is a fact about a run that overran
         // its own close, and the log is where facts go.
-        let committed = self.store.append_if(&mut |events| {
+        //
+        // The decision names the kinds it folds, so the store hands it the
+        // ledger and not the whole stream: the invariant is exact either way,
+        // and this way it costs the size of the ledger.
+        let committed = self.store.append_if(Some(BUDGET_KINDS), &mut |events| {
             balance = fold_balance(events).unwrap_or(0);
             (balance >= amount)
                 .then(|| budget_move_event(KIND_BUDGET_RESERVED, amount, tag.as_deref(), &scope_id))
@@ -731,7 +764,7 @@ impl Session {
         Ok(true)
     }
 
-    /// Settle `amount` against the budget, returning the new balance.
+    /// Settle `amount` against the budget.
     ///
     /// The after-the-fact half of [`Session::reserve`]: what a call really
     /// cost, beyond what was reserved for it.  It is recorded as a
@@ -740,31 +773,33 @@ impl Session {
     ///
     /// A settlement has no invariant to hold — it floors at `0` rather than
     /// refusing — so it is a plain serialized [`Session::append`], not a
-    /// command: there is nothing to decide inside the store.  What it hands
-    /// back is the balance read through [`Session::remaining`] *after* the
-    /// event landed, which is [`fold_balance`] over the whole ledger — so the
-    /// answer is exact even when another handle settled in between, where
-    /// arithmetic on a number this handle was holding would not be.
+    /// command: there is nothing to decide inside the store.
+    ///
+    /// **The write is the result.**  It used to hand back the balance it read
+    /// afterwards, which made a `spend` that landed and then failed its
+    /// read-back indistinguishable from one that never landed: the caller got
+    /// an error either way and could not tell whether the settlement was in
+    /// the log.  Two questions, two calls — this one says the settlement was
+    /// recorded, and [`Session::remaining`] says what is left, failing on its
+    /// own terms.
     ///
     /// It always writes.  A handle that has closed refuses before the store
     /// is reached; another handle's close does not, and a settlement landing
     /// after one is recorded as what it is.
-    pub fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
+    pub fn spend(&mut self, amount: i64) -> KnlResult<()> {
         if self.closed {
-            return Err(KnlError::new(CLOSED));
+            return Err(KnlError::Closed(CLOSED.to_string()));
         }
         budget::check_amount(amount)?;
         let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
-            return Ok(None);
+            // No budget, no ledger: nothing to settle and nothing to record.
+            return Ok(());
         };
         let scope_id = self.scope.id().to_string();
 
         let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id);
         self.append_kernel(event)?;
-
-        // Read back, do not compute: the settlement is in the log now, and
-        // so is everything anyone else wrote before it.
-        Ok(self.remaining())
+        Ok(())
     }
 
     /// The grant this run opened (or resumed) with, if any.
@@ -777,7 +812,7 @@ impl Session {
         self.scope.grant()
     }
 
-    /// The remaining balance (`None` without a budget).
+    /// The remaining balance: `Ok(None)` without a budget.
     ///
     /// The ledger's answer, not a counter's: [`fold_balance`] over the
     /// stream, so a handle that has written nothing still sees what another
@@ -785,52 +820,42 @@ impl Session {
     /// only when the head has moved, so a read on a quiet stream costs one
     /// head query.
     ///
-    /// A store that cannot be read serves the last fold and says so in a
-    /// warning: the balance is a report, and a transient busy read is not a
-    /// reason to claim there is no budget.  The two writes that turn on the
-    /// balance — [`Session::reserve`] and [`Session::grant_more`] — are
-    /// fallible and surface such a failure themselves.
-    pub fn remaining(&self) -> Option<i64> {
+    /// Fallible, and deliberately so.  A store that cannot be read has *no*
+    /// answer to give, and the two answers this call can otherwise hand back
+    /// — the last fold, or `None` — both read as facts about the budget:
+    /// "you have this much" and "there is no budget here".  Serving either
+    /// off a failed read would fold a failure into a value, and the caller
+    /// most likely to act on it is a loop deciding whether it may go on
+    /// spending.  So the failure surfaces, and what to do about a transient
+    /// busy read ([`KnlError::is_retryable`]) is the caller's to decide.
+    pub fn remaining(&self) -> KnlResult<Option<i64>> {
         let (folded_head_seq, cached) = self.balance.get();
 
-        let head = match self.store.head() {
-            Ok(head) => head.unwrap_or(0),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "knl: the stream head could not be read; \
-                     the balance is served from the last fold"
-                );
-                return cached;
-            }
-        };
+        let head = self.store.head()?.unwrap_or(0);
         // The log has not moved since the fold, so neither has the balance.
         if head <= folded_head_seq {
-            return cached;
+            return Ok(cached);
         }
 
-        match self.store.read(0, usize::MAX) {
-            Ok(events) => {
-                let balance = fold_balance(&events);
-                self.balance.set((head, balance));
-                balance
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "knl: the ledger could not be read; \
-                     the balance is served from the last fold"
-                );
-                cached
-            }
-        }
+        // Only the ledger is folded — the balance is a fold of the `budget_*`
+        // kinds and nothing else — while the *head* it is recorded against is
+        // the whole stream's, so any write at all makes the next read refold.
+        // Conservative in the safe direction: an event that moves no balance
+        // costs one extra fold, never a stale answer.
+        let ledger = self.store.read_kinds(Some(BUDGET_KINDS), 0, usize::MAX)?;
+        let balance = fold_balance(&ledger);
+        self.balance.set((head, balance));
+        Ok(balance)
     }
 
     /// Whether the budget is used up (never true without a budget).
     ///
-    /// The same fold [`Session::remaining`] reads, asked as a question.
-    pub fn exhausted(&self) -> bool {
-        matches!(self.remaining(), Some(remaining) if remaining <= 0)
+    /// The same fold [`Session::remaining`] reads, asked as a question — and
+    /// fallible for the same reason: a `false` that meant "the store could
+    /// not be read" is the one answer a run must never be given, because it
+    /// reads as "carry on".
+    pub fn exhausted(&self) -> KnlResult<bool> {
+        Ok(matches!(self.remaining()?, Some(remaining) if remaining <= 0))
     }
 
     /// Whether the session has ended.
@@ -920,7 +945,7 @@ impl Session {
                 let events = self.store.read(0, usize::MAX)?;
                 Ok(projection::tail_of(&events, n))
             }
-            other => Err(KnlError::new(format!("unknown view {other:?}"))),
+            other => Err(KnlError::Validation(format!("unknown view {other:?}"))),
         }
     }
 }
@@ -928,7 +953,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, seq_of, FIELD_BEAT, KIND_LLM_RESPONSE};
+    use crate::knl::event::{kind_of, FIELD_BEAT, KIND_LLM_RESPONSE};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -961,12 +986,41 @@ mod tests {
         fold_balance(&s.events(0).expect("events"))
     }
 
+    /// A raw backend read, as the folds take it.
+    ///
+    /// The tests that verify a durable stream reopen the backend directly —
+    /// outside the seam, on purpose, to see what was really written — so
+    /// they say where their `Current`s come from.
+    fn as_current(events: Vec<Value>) -> Vec<Current> {
+        events.into_iter().map(Current::assume_current).collect()
+    }
+
+    /// The kinds of `events`, in order.
+    fn kinds(events: &[Current]) -> Vec<&str> {
+        events.iter().map(Current::kind).collect()
+    }
+
+    /// The balance, as a test that is not about failure reads it.
+    ///
+    /// [`Session::remaining`] is fallible because a store that cannot be read
+    /// has no balance to report; the stores these tests drive do not fail, so
+    /// an error here is a broken fixture rather than an outcome to assert on.
+    /// The tests that *are* about a failing store call the method directly.
+    fn remaining(session: &Session) -> Option<i64> {
+        session.remaining().expect("the balance was readable")
+    }
+
+    /// [`Session::exhausted`], read the same way and for the same reason.
+    fn exhausted(session: &Session) -> bool {
+        session.exhausted().expect("the balance was readable")
+    }
+
     /// The `budget_*` events of a session, in seq order.
-    fn ledger(s: &Session) -> Vec<Value> {
+    fn ledger(s: &Session) -> Vec<Current> {
         s.events(0)
             .expect("events")
             .into_iter()
-            .filter(|e| kind_of(e).starts_with("budget_"))
+            .filter(|e| e.kind().starts_with("budget_"))
             .collect()
     }
 
@@ -985,8 +1039,8 @@ mod tests {
         let s = new_session(None);
         assert_eq!(s.len().expect("len"), 1);
         let events = s.events(0).expect("events");
-        assert_eq!(kind_of(&events[0]), KIND_SESSION_OPENED);
-        assert_eq!(seq_of(&events[0]), 1);
+        assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
+        assert_eq!(events[0].seq(), 1);
         assert!(!s.is_closed());
         assert!(!s.id().is_empty());
     }
@@ -1027,7 +1081,7 @@ mod tests {
         let events = s.events(0).expect("events");
 
         let opened = &events[0];
-        assert_eq!(kind_of(opened), KIND_SESSION_OPENED);
+        assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
             opened.get(FIELD_SCOPE_ID).and_then(Value::as_str),
             Some(scope_id.as_str()),
@@ -1040,9 +1094,8 @@ mod tests {
         );
 
         let moves = ledger(&s);
-        let kinds: Vec<&str> = moves.iter().map(kind_of).collect();
         assert_eq!(
-            kinds,
+            kinds(&moves),
             vec![
                 KIND_BUDGET_GRANTED,
                 KIND_BUDGET_RESERVED,
@@ -1091,7 +1144,7 @@ mod tests {
         assert_eq!(s.len().expect("len"), 2, "close must be idempotent");
 
         let last = s.events(2).expect("events").pop().expect("session_closed");
-        assert_eq!(kind_of(&last), KIND_SESSION_CLOSED);
+        assert_eq!(last.kind(), KIND_SESSION_CLOSED);
         assert_eq!(last["reason"], json!("budget_exhausted"));
         assert!(s.is_closed());
     }
@@ -1125,10 +1178,10 @@ mod tests {
             5,
             "session_opened + budget_granted + note + budget_spent + session_closed"
         );
-        assert_eq!(s.remaining(), Some(6));
-        assert_eq!(folded(&s), s.remaining(), "the ledger is the balance");
-        assert!(!s.exhausted());
-        assert_eq!(kind_of(&s.events(0).expect("events")[2]), "note");
+        assert_eq!(remaining(&s), Some(6));
+        assert_eq!(folded(&s), remaining(&s), "the ledger is the balance");
+        assert!(!exhausted(&s));
+        assert_eq!(s.events(0).expect("events")[2].kind(), "note");
     }
 
     #[test]
@@ -1147,8 +1200,8 @@ mod tests {
             "session_opened + budget_granted + only_in_a + budget_spent"
         );
         assert_eq!(b.len().expect("len"), 2, "session_opened + budget_granted");
-        assert_eq!(a.remaining(), Some(40));
-        assert_eq!(b.remaining(), Some(100));
+        assert_eq!(remaining(&a), Some(40));
+        assert_eq!(remaining(&b), Some(100));
         // The ledgers are as separate as the histories.
         assert_eq!(folded(&a), Some(40));
         assert_eq!(folded(&b), Some(100));
@@ -1196,7 +1249,7 @@ mod tests {
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
         let events = s.events(0).expect("events");
-        assert_eq!(kind_of(&events[1]), "msg_user");
+        assert_eq!(events[1].kind(), "msg_user");
         assert_eq!(events[1]["content"], json!("hi"));
     }
 
@@ -1218,14 +1271,14 @@ mod tests {
             .expect("append");
 
         let recorded = s.events(seq).expect("events").pop().expect("llm_response");
-        assert_eq!(kind_of(&recorded), KIND_LLM_RESPONSE);
+        assert_eq!(recorded.kind(), KIND_LLM_RESPONSE);
         assert_eq!(
             recorded[FIELD_BEAT],
             json!("beat-7"),
             "the declared beat is recorded as given"
         );
 
-        assert_eq!(s.remaining(), Some(100), "an append must not charge");
+        assert_eq!(remaining(&s), Some(100), "an append must not charge");
         assert_eq!(
             ledger(&s).len(),
             1,
@@ -1258,7 +1311,7 @@ mod tests {
 
         let events = s.events(0).expect("events");
         assert_eq!(events.len(), 2, "session_opened + budget_granted");
-        assert_eq!(kind_of(&events[0]), KIND_SESSION_OPENED);
+        assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(
             events[0].get("budget"),
             None,
@@ -1266,12 +1319,12 @@ mod tests {
         );
 
         let granted = &events[1];
-        assert_eq!(kind_of(granted), KIND_BUDGET_GRANTED);
+        assert_eq!(granted.kind(), KIND_BUDGET_GRANTED);
         assert_eq!(granted["amount"], json!(500));
         assert_eq!(granted["tag"], json!("tokens"));
         assert_eq!(granted["desc"], json!("one nightly run"));
-        assert_eq!(s.remaining(), Some(500));
-        assert_eq!(folded(&s), s.remaining());
+        assert_eq!(remaining(&s), Some(500));
+        assert_eq!(folded(&s), remaining(&s));
 
         // A session with no grant keeps no ledger at all.
         let bare = new_session(None);
@@ -1289,11 +1342,11 @@ mod tests {
 
         let moves = ledger(&s);
         assert_eq!(moves.len(), 2, "the grant and the reservation");
-        assert_eq!(kind_of(&moves[1]), KIND_BUDGET_RESERVED);
+        assert_eq!(moves[1].kind(), KIND_BUDGET_RESERVED);
         assert_eq!(moves[1]["amount"], json!(30));
         assert_eq!(moves[1]["tag"], json!("tokens"));
-        assert_eq!(s.remaining(), Some(70));
-        assert_eq!(folded(&s), s.remaining(), "the ledger is the balance");
+        assert_eq!(remaining(&s), Some(70));
+        assert_eq!(folded(&s), remaining(&s), "the ledger is the balance");
     }
 
     /// A refusal is a fact: it is recorded, with what was asked for and
@@ -1305,17 +1358,17 @@ mod tests {
 
         let moves = ledger(&s);
         assert_eq!(moves.len(), 2, "the grant and the refusal");
-        assert_eq!(kind_of(&moves[1]), KIND_BUDGET_REFUSED);
+        assert_eq!(moves[1].kind(), KIND_BUDGET_REFUSED);
         assert_eq!(moves[1]["amount"], json!(11));
         assert_eq!(moves[1]["remaining"], json!(10), "what there was");
         assert_eq!(moves[1]["tag"], json!("tokens"));
-        assert_eq!(s.remaining(), Some(10), "a refusal must not deduct");
-        assert!(!s.exhausted());
-        assert_eq!(folded(&s), s.remaining());
+        assert_eq!(remaining(&s), Some(10), "a refusal must not deduct");
+        assert!(!exhausted(&s));
+        assert_eq!(folded(&s), remaining(&s));
 
         // And the run can still spend what it has: nothing was consumed.
         assert_eq!(s.reserve(10), Ok(true));
-        assert_eq!(s.remaining(), Some(0));
+        assert_eq!(remaining(&s), Some(0));
         assert_eq!(folded(&s), Some(0));
     }
 
@@ -1332,9 +1385,8 @@ mod tests {
         s.spend(0).expect("spend");
 
         let moves = ledger(&s);
-        let kinds: Vec<&str> = moves.iter().map(kind_of).collect();
         assert_eq!(
-            kinds,
+            kinds(&moves),
             vec![
                 KIND_BUDGET_GRANTED,
                 KIND_BUDGET_RESERVED,
@@ -1345,8 +1397,8 @@ mod tests {
             ],
             "every move left exactly one event"
         );
-        assert_eq!(s.remaining(), Some(450), "1000 - 200 - 50 - 300");
-        assert_eq!(folded(&s), s.remaining());
+        assert_eq!(remaining(&s), Some(450), "1000 - 200 - 50 - 300");
+        assert_eq!(folded(&s), remaining(&s));
     }
 
     /// The ledger is the kernel's to write: a caller cannot grant itself a
@@ -1369,9 +1421,9 @@ mod tests {
             );
         }
 
-        assert_eq!(s.remaining(), Some(10), "no forged event moved the balance");
+        assert_eq!(remaining(&s), Some(10), "no forged event moved the balance");
         assert_eq!(ledger(&s).len(), 1, "nothing was recorded");
-        assert_eq!(folded(&s), s.remaining());
+        assert_eq!(folded(&s), remaining(&s));
     }
 
     /// The session's boundaries are the kernel's alone: a caller cannot
@@ -1396,7 +1448,8 @@ mod tests {
         assert!(!s.is_closed(), "a refused append ended the session");
         assert_eq!(s.len().expect("len"), 2, "nothing was recorded");
         assert_eq!(s.append(obj(json!({ "kind": "note" }))), Ok(3));
-        assert_eq!(s.spend(10), Ok(Some(90)));
+        assert_eq!(s.spend(10), Ok(()));
+        assert_eq!(remaining(&s), Some(90), "the settlement landed");
     }
 
     /// Only `close` records `session_closed`, and it records exactly one:
@@ -1410,18 +1463,18 @@ mod tests {
             !s.events(0)
                 .expect("events")
                 .iter()
-                .any(|e| kind_of(e) == KIND_SESSION_CLOSED),
+                .any(|e| e.kind() == KIND_SESSION_CLOSED),
             "nothing but close writes the boundary"
         );
 
         s.close(Some("done")).expect("close");
         assert!(s.is_closed());
 
-        let closed: Vec<Value> = s
+        let closed: Vec<Current> = s
             .events(0)
             .expect("events")
             .into_iter()
-            .filter(|e| kind_of(e) == KIND_SESSION_CLOSED)
+            .filter(|e| e.kind() == KIND_SESSION_CLOSED)
             .collect();
         assert_eq!(closed.len(), 1, "exactly one boundary: {closed:?}");
         assert_eq!(closed[0]["reason"], json!("done"));
@@ -1442,11 +1495,11 @@ mod tests {
         let mut s = new_session(Some(100));
         s.append(response(30)).expect("recorded");
 
-        assert_eq!(s.remaining(), Some(100));
-        assert!(!s.exhausted());
+        assert_eq!(remaining(&s), Some(100));
+        assert!(!exhausted(&s));
 
         let recorded = s.events(3).expect("events").pop().expect("llm_response");
-        assert_eq!(kind_of(&recorded), "llm_response");
+        assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(recorded["stop_reason"], json!("end_turn"));
         assert_eq!(s.view(VIEW_USAGE, None).expect("usage")["input_tokens"], 30);
         assert_eq!(folded(&s), Some(100), "the ledger recorded no consumption");
@@ -1508,7 +1561,7 @@ mod tests {
             3,
             "session_opened + budget_granted + session_closed only"
         );
-        assert_eq!(s.remaining(), Some(100), "nothing was consumed");
+        assert_eq!(remaining(&s), Some(100), "nothing was consumed");
     }
 
     /// The budget stops a session *before* it spends, not after: a
@@ -1525,22 +1578,22 @@ mod tests {
             s.events(0)
                 .expect("events")
                 .iter()
-                .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
+                .filter(|e| e.kind() == KIND_LLM_RESPONSE)
                 .count()
         }
 
         // The estimate fits, so the beat proceeds and records its response.
         assert_eq!(s.reserve(10), Ok(true));
         s.append(response(25)).expect("recorded");
-        assert_eq!(s.remaining(), Some(0), "the reservation took it all");
-        assert!(s.exhausted());
+        assert_eq!(remaining(&s), Some(0), "the reservation took it all");
+        assert!(exhausted(&s));
 
         // The next beat asks first and is turned away, so no second
         // response is recorded: the caller never made the call.
         assert_eq!(s.reserve(1), Ok(false));
         assert_eq!(responses(&s), 1, "the refused beat made no call");
-        assert_eq!(s.remaining(), Some(0));
-        assert_eq!(folded(&s), s.remaining());
+        assert_eq!(remaining(&s), Some(0));
+        assert_eq!(folded(&s), remaining(&s));
 
         // The kernel still does not police it: a caller that ignores the
         // refusal can append anyway, and the history says that it did.
@@ -1552,16 +1605,16 @@ mod tests {
     fn without_a_budget_a_call_reports_no_remaining_and_is_never_exhausted() {
         let mut s = new_session(None);
         s.append(response(9_000)).expect("recorded");
-        assert_eq!(s.remaining(), None);
-        assert!(!s.exhausted());
+        assert_eq!(remaining(&s), None);
+        assert!(!exhausted(&s));
 
         // No budget, no ledger: reserve always grants, spend does nothing,
         // and neither leaves a trace.
         assert_eq!(s.reserve(1_000_000), Ok(true));
-        assert_eq!(s.spend(1_000_000), Ok(None));
+        assert_eq!(s.spend(1_000_000), Ok(()));
         assert!(ledger(&s).is_empty(), "a run with no quota keeps no ledger");
-        assert_eq!(s.remaining(), None);
-        assert!(!s.exhausted());
+        assert_eq!(remaining(&s), None);
+        assert!(!exhausted(&s));
     }
 
     #[test]
@@ -1580,10 +1633,7 @@ mod tests {
         assert_eq!(after["at_seq"], json!(3));
 
         assert_eq!(s.len().expect("len"), 3);
-        assert_eq!(
-            kind_of(&s.events(0).expect("events")[2]),
-            KIND_SESSION_CLOSED
-        );
+        assert_eq!(s.events(0).expect("events")[2].kind(), KIND_SESSION_CLOSED);
     }
 
     /// `open_on` on a durable backend records the session's owner on the
@@ -1600,7 +1650,7 @@ mod tests {
 
         let events = s.events(0).expect("events");
         let opened = events.first().expect("session_opened");
-        assert_eq!(kind_of(opened), KIND_SESSION_OPENED);
+        assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
             opened.get("owner").and_then(Value::as_str),
             Some("user-7"),
@@ -1609,7 +1659,7 @@ mod tests {
         assert_eq!(s.owner(), "user-7");
 
         // The grant is durable too, as its own event.
-        assert_eq!(kind_of(&events[1]), KIND_BUDGET_GRANTED);
+        assert_eq!(events[1].kind(), KIND_BUDGET_GRANTED);
         assert_eq!(events[1]["amount"], json!(100));
     }
 
@@ -1637,9 +1687,9 @@ mod tests {
             assert_eq!(s.reserve(15), Ok(true));
             s.append(response(20)).expect("second response");
             s.spend(5).expect("the second call overran its estimate");
-            assert_eq!(s.remaining(), Some(50), "100 - 30 - 15 - 5");
-            assert_eq!(folded(&s), s.remaining());
-            s.remaining()
+            assert_eq!(remaining(&s), Some(50), "100 - 30 - 15 - 5");
+            assert_eq!(folded(&s), remaining(&s));
+            remaining(&s)
         }; // dropped: the connection closes, the log persists.
 
         // Reopen the same stream and resume — no new session_opened is
@@ -1653,7 +1703,7 @@ mod tests {
             "owner restored from session_opened"
         );
         assert_eq!(
-            resumed.remaining(),
+            remaining(&resumed),
             before_close,
             "the balance is what the ledger says it was"
         );
@@ -1684,9 +1734,9 @@ mod tests {
             .expect("events")
             .pop()
             .expect("llm_response");
-        assert_eq!(kind_of(&recorded), KIND_LLM_RESPONSE);
-        assert_eq!(resumed.remaining(), Some(45), "5 reserved off the 50");
-        assert_eq!(folded(&resumed), resumed.remaining());
+        assert_eq!(recorded.kind(), KIND_LLM_RESPONSE);
+        assert_eq!(remaining(&resumed), Some(45), "5 reserved off the 50");
+        assert_eq!(folded(&resumed), remaining(&resumed));
     }
 
     /// A `grant` on resume is the owner allowing *more*: it is recorded and
@@ -1705,7 +1755,7 @@ mod tests {
             let mut s = Session::open_on("user-9".to_string(), Some(grant(100)), Box::new(store))
                 .expect("open");
             assert_eq!(s.reserve(80), Ok(true));
-            assert_eq!(s.remaining(), Some(20));
+            assert_eq!(remaining(&s), Some(20));
         }
 
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
@@ -1719,13 +1769,12 @@ mod tests {
         )
         .expect("resume");
 
-        assert_eq!(resumed.remaining(), Some(70), "20 left + 50 granted");
-        assert_eq!(folded(&resumed), resumed.remaining());
+        assert_eq!(remaining(&resumed), Some(70), "20 left + 50 granted");
+        assert_eq!(folded(&resumed), remaining(&resumed));
 
         let moves = ledger(&resumed);
-        let kinds: Vec<&str> = moves.iter().map(kind_of).collect();
         assert_eq!(
-            kinds,
+            kinds(&moves),
             vec![
                 KIND_BUDGET_GRANTED,
                 KIND_BUDGET_RESERVED,
@@ -1739,8 +1788,8 @@ mod tests {
         // And the resumed run spends against the raised balance.
         assert_eq!(resumed.reserve(70), Ok(true));
         assert_eq!(resumed.reserve(1), Ok(false));
-        assert_eq!(resumed.remaining(), Some(0));
-        assert_eq!(folded(&resumed), resumed.remaining());
+        assert_eq!(remaining(&resumed), Some(0));
+        assert_eq!(folded(&resumed), remaining(&resumed));
     }
 
     /// An older log with no `owner` on `session_opened` resumes as [`ANON`]
@@ -1766,7 +1815,7 @@ mod tests {
         let store = SqliteEventStore::open(&path, stream).expect("reopen");
         let resumed = Session::resume(None, Box::new(store)).expect("resume");
         assert_eq!(resumed.owner(), ANON);
-        assert_eq!(resumed.remaining(), None, "resumed without a budget cap");
+        assert_eq!(remaining(&resumed), None, "resumed without a budget cap");
     }
 
     /// Resume restores the *scope*, not just a fresh one: the id and the
@@ -1799,12 +1848,12 @@ mod tests {
         );
         assert_eq!(resumed.owner(), "user-11");
         assert_eq!(resumed.scope().owner(), "user-11");
-        assert_eq!(resumed.remaining(), Some(60), "the balance is the fold's");
+        assert_eq!(remaining(&resumed), Some(60), "the balance is the fold's");
 
         // What the resumed session records goes on naming the same scope.
         assert_eq!(resumed.reserve(10), Ok(true));
         let last = ledger(&resumed).pop().expect("budget_reserved");
-        assert_eq!(kind_of(&last), KIND_BUDGET_RESERVED);
+        assert_eq!(last.kind(), KIND_BUDGET_RESERVED);
         assert_eq!(
             last.get(FIELD_SCOPE_ID).and_then(Value::as_str),
             Some(opened_scope.as_str()),
@@ -1838,7 +1887,7 @@ mod tests {
 
         // The fallback is visible from both sides: the log says nothing…
         let opened = resumed.events(0).expect("events").remove(0);
-        assert_eq!(kind_of(&opened), KIND_SESSION_OPENED);
+        assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(opened.get(FIELD_SCOPE_ID), None, "{opened}");
         assert_eq!(opened.get("owner"), None, "{opened}");
         // …and the resumed session has a real scope all the same.
@@ -1850,7 +1899,7 @@ mod tests {
 
         // And it is the one everything written from here on names.
         let granted = ledger(&resumed).pop().expect("budget_granted");
-        assert_eq!(kind_of(&granted), KIND_BUDGET_GRANTED);
+        assert_eq!(granted.kind(), KIND_BUDGET_GRANTED);
         assert_eq!(
             granted.get(FIELD_SCOPE_ID).and_then(Value::as_str),
             Some(resumed.scope_id()),
@@ -1942,13 +1991,19 @@ mod tests {
 
         fn append_if(
             &mut self,
+            kinds: Option<&[&str]>,
             decide: &mut crate::knl::Decision<'_>,
         ) -> KnlResult<Option<crate::knl::Committed>> {
-            self.inner.append_if(decide)
+            self.inner.append_if(kinds, decide)
         }
 
-        fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
-            self.inner.read(from_seq, limit)
+        fn read_kinds(
+            &self,
+            kinds: Option<&[&str]>,
+            from_seq: u64,
+            limit: usize,
+        ) -> KnlResult<Vec<Value>> {
+            self.inner.read_kinds(kinds, from_seq, limit)
         }
 
         fn head(&self) -> KnlResult<Option<u64>> {
@@ -1984,9 +2039,8 @@ mod tests {
         assert_eq!(s.len().expect("len"), 4, "both writes are in the log");
 
         let log = s.events(0).expect("events");
-        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
         assert_eq!(
-            kinds,
+            kinds(&log),
             [
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
@@ -1995,7 +2049,78 @@ mod tests {
             ],
             "the log interleaves in arrival order"
         );
-        assert_eq!(s.remaining(), Some(1000), "an append still charges nothing");
+        assert_eq!(remaining(&s), Some(1000), "an append still charges nothing");
+    }
+
+    /// A store whose `head` read is down: appends land, but nothing can ask
+    /// the ledger where it stands.
+    struct HeadlessStore {
+        inner: MemEventStore,
+    }
+
+    impl EventStore for HeadlessStore {
+        fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            self.inner.append(event)
+        }
+
+        fn append_if(
+            &mut self,
+            kinds: Option<&[&str]>,
+            decide: &mut crate::knl::Decision<'_>,
+        ) -> KnlResult<Option<crate::knl::Committed>> {
+            self.inner.append_if(kinds, decide)
+        }
+
+        fn read_kinds(
+            &self,
+            kinds: Option<&[&str]>,
+            from_seq: u64,
+            limit: usize,
+        ) -> KnlResult<Vec<Value>> {
+            self.inner.read_kinds(kinds, from_seq, limit)
+        }
+
+        fn head(&self) -> KnlResult<Option<u64>> {
+            Err(KnlError::Busy("the head read is contended".to_string()))
+        }
+
+        fn len(&self) -> KnlResult<usize> {
+            self.inner.len()
+        }
+    }
+
+    /// A store that cannot be read has no balance to report, and the kernel
+    /// says so rather than serving the last fold.
+    ///
+    /// Both values this call can otherwise hand back read as facts about the
+    /// budget — a number says "you have this much", a `false` from
+    /// `exhausted` says "carry on" — and the caller acting on either is a
+    /// loop deciding whether it may go on spending.  So the failure
+    /// surfaces, classified, and what to do about a contended read is the
+    /// caller's.
+    #[test]
+    fn a_balance_that_cannot_be_read_is_an_error_not_a_stale_fold() {
+        let store = HeadlessStore {
+            inner: MemEventStore::new(),
+        };
+        let s = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store))
+            .expect("the appends land; only the head read is down");
+
+        let err = s
+            .remaining()
+            .expect_err("a failed read must not fold into a number");
+        assert_eq!(err.kind(), KnlError::BUSY, "the class travels out intact");
+        assert!(err.is_retryable(), "contention is the one retryable class");
+
+        let err = s.exhausted().expect_err("nor into a boolean");
+        assert_eq!(err.kind(), KnlError::BUSY);
+
+        // Only the reading failed: the record itself is exactly as written.
+        assert_eq!(
+            s.len().expect("len"),
+            2,
+            "session_opened + budget_granted landed"
+        );
     }
 
     /// (Fix 5) Resuming a nonexistent SQLite stream is a caller error, not an
@@ -2043,7 +2168,7 @@ mod tests {
         // closed session is not resumable.)
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(b.remaining(), Some(1000), "B resumed on A's ledger");
+        assert_eq!(remaining(&b), Some(1000), "B resumed on A's ledger");
         assert_eq!(
             (a.len().expect("len"), b.len().expect("len")),
             (2, 2),
@@ -2062,11 +2187,11 @@ mod tests {
 
         // The durable log holds all three, in arrival order.
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = verify.read(0, usize::MAX).expect("read log");
+        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
         let responses: Vec<u64> = log
             .iter()
-            .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
-            .map(seq_of)
+            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
+            .map(Current::seq)
             .collect();
         assert_eq!(responses, [3, 4, 5], "every append landed, in order");
     }
@@ -2089,25 +2214,24 @@ mod tests {
             .expect("open A");
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(b.remaining(), Some(10), "both see the whole grant");
-        assert_eq!(a.remaining(), Some(10));
+        assert_eq!(remaining(&b), Some(10), "both see the whole grant");
+        assert_eq!(remaining(&a), Some(10));
 
         // A takes six.  B still believes it has ten — and is refused all the
         // same, because the balance it is measured against is the one in the
         // store, not the one it cached.
         assert_eq!(a.reserve(6), Ok(true), "the first reservation fits");
         assert_eq!(b.reserve(6), Ok(false), "the second does not");
-        assert_eq!(b.remaining(), Some(4), "B's balance is the ledger's");
-        assert_eq!(a.remaining(), Some(4), "and so is A's");
+        assert_eq!(remaining(&b), Some(4), "B's balance is the ledger's");
+        assert_eq!(remaining(&a), Some(4), "and so is A's");
 
         // The ledger is the answer: 10 granted − 6 reserved = 4, with the
         // refusal recorded and moving nothing.
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = verify.read(0, usize::MAX).expect("read log");
+        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
         assert_eq!(fold_balance(&log), Some(4), "no allowance was taken twice");
-        let moves: Vec<&str> = log
-            .iter()
-            .map(kind_of)
+        let moves: Vec<&str> = kinds(&log)
+            .into_iter()
             .filter(|k| k.starts_with("budget_"))
             .collect();
         assert_eq!(
@@ -2166,7 +2290,8 @@ mod tests {
         // C's budget moves are decided on the balance alone — 100 granted,
         // nothing spent, so both go through.
         assert_eq!(c.reserve(5), Ok(true), "the ledger covers it");
-        assert_eq!(c.spend(10), Ok(Some(85)), "100 − 5 − 10, folded in the tx");
+        assert_eq!(c.spend(10), Ok(()), "the settlement lands");
+        assert_eq!(remaining(&c), Some(85), "100 − 5 − 10, folded in the tx");
         assert!(!c.is_closed());
 
         // B closing writes a *second* ending; A closing again writes nothing,
@@ -2175,10 +2300,9 @@ mod tests {
         a.close(Some("again")).expect("A is idempotent per handle");
 
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = verify.read(0, usize::MAX).expect("read log");
-        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
+        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
         assert_eq!(
-            kinds,
+            kinds(&log),
             [
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
@@ -2191,9 +2315,9 @@ mod tests {
             "everything that happened, in the order it arrived"
         );
 
-        let endings: Vec<&Value> = log
+        let endings: Vec<&Current> = log
             .iter()
-            .filter(|event| kind_of(event) == KIND_SESSION_CLOSED)
+            .filter(|event| event.kind() == KIND_SESSION_CLOSED)
             .collect();
         assert_eq!(endings.len(), 2, "two handles closed, two endings recorded");
         assert_eq!(endings[0]["reason"], json!("done"));
@@ -2205,12 +2329,13 @@ mod tests {
         );
     }
 
-    /// (Concurrency) A settlement reads its answer back off the ledger, so it
-    /// is exact on a stream two handles write to: B settles against what the
-    /// log says, not against a number it was holding before A spent.
+    /// (Concurrency) A settlement records the move and says nothing else; the
+    /// balance afterwards is the ledger's, so it is exact on a stream two
+    /// handles write to — B reads what the log says, not a number it was
+    /// holding before A spent.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_settlement_reads_its_answer_back_off_the_ledger() {
+    fn a_settlement_records_the_move_and_the_balance_is_the_ledgers() {
         use crate::knl::SqliteEventStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2222,26 +2347,26 @@ mod tests {
             .expect("open A");
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         let mut b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!((a.remaining(), b.remaining()), (Some(100), Some(100)));
+        assert_eq!((remaining(&a), remaining(&b)), (Some(100), Some(100)));
 
-        assert_eq!(a.spend(30), Ok(Some(70)), "A settles 30 of the 100");
+        assert_eq!(a.spend(30), Ok(()), "A settles 30 of the 100");
+        assert_eq!(remaining(&a), Some(70), "and reads the balance separately");
         assert_eq!(
-            b.remaining(),
+            remaining(&b),
             Some(70),
             "B wrote nothing and still reads A's settlement off the ledger"
         );
 
         // B's own settlement measures against the ledger — 100 − 30 − 20 —
         // rather than subtracting 20 from a number it was holding.
-        assert_eq!(b.spend(20), Ok(Some(50)), "both settlements are in it");
-        assert_eq!(b.remaining(), Some(50));
+        assert_eq!(b.spend(20), Ok(()), "B settles 20");
+        assert_eq!(remaining(&b), Some(50), "both settlements are in it");
 
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
-        let log = verify.read(0, usize::MAX).expect("read log");
+        let log = as_current(verify.read(0, usize::MAX).expect("read log"));
         assert_eq!(fold_balance(&log), Some(50), "the balance is the fold");
-        let moves: Vec<&str> = log
-            .iter()
-            .map(kind_of)
+        let moves: Vec<&str> = kinds(&log)
+            .into_iter()
             .filter(|kind| kind.starts_with("budget_"))
             .collect();
         assert_eq!(
@@ -2251,11 +2376,13 @@ mod tests {
         );
 
         // A settlement never refuses: it floors at zero, as the fold does.
-        assert_eq!(a.spend(1_000), Ok(Some(0)));
-        assert_eq!(b.spend(1), Ok(Some(0)));
+        assert_eq!(a.spend(1_000), Ok(()));
+        assert_eq!(b.spend(1), Ok(()));
+        assert_eq!(remaining(&a), Some(0));
+        assert_eq!(remaining(&b), Some(0));
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         assert_eq!(
-            fold_balance(&verify.read(0, usize::MAX).expect("read log")),
+            fold_balance(&as_current(verify.read(0, usize::MAX).expect("read log"))),
             Some(0),
             "the ledger floors at zero rather than going into debt"
         );
@@ -2280,58 +2407,52 @@ mod tests {
         let store_b = SqliteEventStore::open(&path, stream).expect("open B");
         // Not `mut`: reading a balance is a read, and B does nothing else.
         let b = Session::resume(None, Box::new(store_b)).expect("resume B");
-        assert_eq!(b.remaining(), Some(100), "both start on the same ledger");
+        assert_eq!(remaining(&b), Some(100), "both start on the same ledger");
 
-        assert_eq!(a.spend(30), Ok(Some(70)), "A settles 30");
+        assert_eq!(a.spend(30), Ok(()), "A settles 30");
         assert_eq!(
-            b.remaining(),
+            remaining(&b),
             Some(70),
             "B sees the settlement it did not make"
         );
 
         assert_eq!(a.reserve(20), Ok(true), "A reserves 20");
-        assert_eq!(b.remaining(), Some(50), "and the reservation too");
-        assert!(!b.exhausted());
+        assert_eq!(remaining(&b), Some(50), "and the reservation too");
+        assert!(!exhausted(&b));
 
         // Reading twice over a stream that has not moved repeats the fold's
         // answer rather than drifting from it.
-        assert_eq!(b.remaining(), Some(50), "a second read is the same read");
+        assert_eq!(remaining(&b), Some(50), "a second read is the same read");
 
-        assert_eq!(a.spend(1_000), Ok(Some(0)), "A overspends");
-        assert_eq!(b.remaining(), Some(0), "the floor is the ledger's");
-        assert!(b.exhausted());
+        assert_eq!(a.spend(1_000), Ok(()), "A overspends");
+        assert_eq!(remaining(&b), Some(0), "the floor is the ledger's");
+        assert!(exhausted(&b));
 
         // And the log is the whole of the story: nothing B holds was needed.
         let verify = SqliteEventStore::open(&path, stream).expect("reopen to verify");
         assert_eq!(
-            fold_balance(&verify.read(0, usize::MAX).expect("read log")),
-            b.remaining()
+            fold_balance(&as_current(verify.read(0, usize::MAX).expect("read log"))),
+            remaining(&b)
         );
     }
 
-    /// A test-local `1 → 2` step, standing in for a real one: it renames the
-    /// two kinds a hypothetical earlier shape used and marks what it
-    /// produced.  The kernel chain is empty until the first release, so the
-    /// seam is exercised with a chain the test owns — wrapped round the
-    /// backend before the session is handed it, so the session's own (empty)
-    /// wrap sits outside it as an identity.
+    /// A test-local step, standing in for a real one: it renames the two kinds
+    /// a hypothetical earlier shape used.  The kernel chain is empty until the
+    /// first release, so the seam is exercised with a chain the test owns.
+    ///
+    /// It leaves the version alone.  The version a step *produces* is
+    /// [`CURRENT_SCHEMA_VERSION`], which is still `1` — the same one these
+    /// rows were written under — and a `Current` is asserted to be at it, so
+    /// a fixture that stamped `2` would be claiming a version the kernel does
+    /// not have.
     #[cfg(feature = "sqlite")]
     struct RenameLegacyKinds;
 
     #[cfg(feature = "sqlite")]
     impl crate::knl::Upcaster for RenameLegacyKinds {
         fn upcast(&self, mut event: Value) -> Value {
-            use crate::knl::SCHEMA_VERSION_FIELD;
-
-            // Already at the shape this step produces, or not an object at
-            // all: unchanged.  An upcaster is total and infallible.
-            let version = event
-                .get(SCHEMA_VERSION_FIELD)
-                .and_then(Value::as_u64)
-                .unwrap_or(1);
-            if version >= 2 {
-                return event;
-            }
+            // Not an object at all: unchanged.  An upcaster is total and
+            // infallible.
             let Some(map) = event.as_object_mut() else {
                 return event;
             };
@@ -2343,7 +2464,6 @@ mod tests {
             if let Some(kind) = renamed {
                 map.insert(FIELD_KIND.to_string(), Value::from(kind));
             }
-            map.insert(SCHEMA_VERSION_FIELD.to_string(), Value::from(2_u64));
             event
         }
     }
@@ -2390,12 +2510,15 @@ mod tests {
                 .expect("the response");
         }
 
+        // The seam the session reads through, carrying the test's own chain:
+        // `resume_on` is the body of `resume` for exactly this, so the
+        // session is otherwise the one production builds.
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
-        let seamed = UpcastingEventStore::new(
+        let seamed = CurrentStore::new(
             Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
             chain,
         );
-        let mut resumed = Session::resume(None, Box::new(seamed)).expect("resume through the seam");
+        let mut resumed = Session::resume_on(None, seamed).expect("resume through the seam");
 
         // The restore read went through the chain: the opening was only a
         // `session_opened` after the step, and the scope came off it.
@@ -2409,9 +2532,8 @@ mod tests {
 
         // …and so do `events`, the view fold and the balance fold.
         let log = resumed.events(0).expect("events");
-        let kinds: Vec<&str> = log.iter().map(kind_of).collect();
         assert_eq!(
-            kinds,
+            kinds(&log),
             [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, KIND_LLM_RESPONSE],
             "every read is projected"
         );
@@ -2422,7 +2544,7 @@ mod tests {
             "the view folded the projected kind: {usage}"
         );
         assert_eq!(usage["input_tokens"], json!(7));
-        assert_eq!(resumed.remaining(), Some(100), "the balance folds too");
+        assert_eq!(remaining(&resumed), Some(100), "the balance folds too");
 
         // The stored rows were not rewritten: read them without the seam and
         // the old names are still there, under the version they were written
@@ -2431,6 +2553,16 @@ mod tests {
         let stored = raw.read(0, usize::MAX).expect("read raw");
         assert_eq!(kind_of(&stored[0]), "legacy_opened", "{}", stored[0]);
         assert_eq!(kind_of(&stored[2]), "legacy_response", "{}", stored[2]);
+        // And a filtered read of the *stored* stream selects on those old
+        // names, which is the obligation a renaming step takes on: the
+        // projected name finds nothing until the rows are rewritten, and they
+        // never are.
+        assert!(
+            raw.read_kinds(Some(&[KIND_SESSION_OPENED]), 0, usize::MAX)
+                .expect("read raw")
+                .is_empty(),
+            "the kind filter selects on what is stored"
+        );
         assert_eq!(
             stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
             Some(CURRENT_SCHEMA_VERSION),
@@ -2463,12 +2595,12 @@ mod tests {
         }
 
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
-        let seamed = UpcastingEventStore::new(
+        let seamed = CurrentStore::new(
             Box::new(SqliteEventStore::open(&path, stream).expect("reopen")),
             chain,
         );
-        let err = Session::resume(None, Box::new(seamed))
-            .expect_err("a stream that ended must not be resumed");
+        let err =
+            Session::resume_on(None, seamed).expect_err("a stream that ended must not be resumed");
         assert!(
             err.reason().contains("session is closed"),
             "{}",

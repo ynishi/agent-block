@@ -28,6 +28,12 @@
 //! ordinary append is never refused for an out-of-date view of the head:
 //! that would be asking a fact to prove it knew the future.
 //!
+//! Facts that belong together are written with [`EventStore::append_many`],
+//! which the durable backend takes in one transaction: a session's opening
+//! and the grant it opened with either both land or neither does, so no
+//! reader ever meets a stream that opened without the quota it was opened
+//! under.
+//!
 //! A *command* with an invariant — "reserve n only if the balance covers
 //! it" — is the other case, and it is expressed by
 //! [`EventStore::append_if`]: the backend reads the stream, calls the
@@ -35,29 +41,50 @@
 //! serialized write.  The check therefore runs against the stream as it is
 //! at that instant, not against a head someone cached earlier.
 //!
+//! # Reads name the kinds they need
+//!
+//! [`EventStore::read_kinds`] takes the kinds a caller is folding over
+//! (`None` for all of them), and [`EventStore::append_if`] filters the
+//! decision's input the same way.  The kernel does not interpret the kinds
+//! here — the caller names them, because the caller is the one that knows
+//! what its fold reads: the balance folds the four `budget_*` kinds, a
+//! resume asks whether a `session_closed` is there.  A durable backend
+//! answers those off an index rather than walking the stream.
+//!
 //! # Stored shape change ⇒ upcaster, always — from the first release on
 //!
 //! Stored bytes are never rewritten.  Every change to the shape of a stored
 //! event ships in the same round as (a) a bump of
 //! [`CURRENT_SCHEMA_VERSION`], which every new event is stamped with, and
 //! (b) an [`Upcaster`] for the `n → n+1` step, registered in
-//! [`kernel_upcasters`] and applied at read time by
-//! [`UpcastingEventStore`].  A round that renames a kind or a field without
-//! an upcaster is incomplete: an old log would be silently misread, which is
-//! the one failure an append-only store exists to prevent.
+//! [`kernel_upcasters`] and applied at read time by [`CurrentStore`].  A
+//! round that renames a kind or a field without an upcaster is incomplete:
+//! an old log would be silently misread, which is the one failure an
+//! append-only store exists to prevent.
 //!
 //! That obligation starts at the first release.  Until then the stored shape
 //! is still being settled, there is no log anyone has to keep, and a rename
 //! is a rename — so [`kernel_upcasters`] returns an empty chain and
 //! [`CURRENT_SCHEMA_VERSION`] stays at `1`.  The seam is built and tested all
 //! the same, so the first step that is owed has one site to be registered at.
+//!
+//! # Only upcasted events reach the domain
+//!
+//! The seam is a *type*, not a habit.  [`EventStore`] deals in raw
+//! [`Value`]s — whatever shape the bytes were written in — while
+//! [`CurrentStore`], which is deliberately **not** an [`EventStore`], reads
+//! through the chain and hands back [`Current`]s.  Nothing else can build
+//! one: the constructor is private to this module.  So every fold the kernel
+//! runs takes `&[Current]`, and a read path that went round the chain does
+//! not type-check rather than quietly folding a stale shape.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use super::event::{seq_of, FIELD_EPOCH_MS};
-use super::{History, KnlResult};
+use super::event::{kind_of, seq_of, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
+use super::{History, KnlError, KnlResult};
 
 /// Reserved envelope key: the schema version an event was written under.
 ///
@@ -78,7 +105,7 @@ pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 /// The upcaster chain every session reads through, newest step last.
 ///
 /// [`super::Session::open_on`] and [`super::Session::resume`] wrap their
-/// backend in an [`UpcastingEventStore`] carrying this chain, so every read a
+/// backend in a [`CurrentStore`] carrying this chain, so every read a
 /// session makes — the restore fold, the view folds, `events` — sees the
 /// current shape while the stored bytes stay exactly as they were written.
 ///
@@ -86,6 +113,13 @@ pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 /// there is no step owed.  This is the one site a step is registered at, and
 /// the seam around it is exercised by the tests below with a chain of their
 /// own.
+///
+/// A step registered here that *renames a kind* owes one thing more: the
+/// kind-filtered reads select on the stored name ([`EventStore::read_kinds`]),
+/// so every caller that names that kind — [`super::Session::reserve`] and the
+/// balance fold name the `budget_*` ones, a resume names `session_closed` —
+/// has to name the old spelling beside the new one, or the older events fall
+/// out of the fold.
 pub fn kernel_upcasters() -> Vec<Arc<dyn Upcaster>> {
     Vec::new()
 }
@@ -127,13 +161,116 @@ pub fn apply_upcasters(chain: &[Arc<dyn Upcaster>], events: Vec<Value>) -> Vec<V
         .collect()
 }
 
+/// An event as the current shape: read through the upcaster chain.
+///
+/// The proof that a fold is looking at today's shape, carried in the type.
+/// A backend hands back what it stored, under whatever version it was
+/// written with; only [`CurrentStore`] turns those into `Current`s, because
+/// [`Current::from_upcasted`] is private to this module.  Every kernel fold
+/// takes `&[Current]`, so a read that skipped the seam cannot be handed to
+/// one — the call does not compile.
+///
+/// It derefs to the event's object, so a fold reads fields exactly as it did
+/// when it was handed a plain map; [`Current::into_inner`] gives that map up
+/// for a caller that has to own it (the Lua bridge, building tables).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current(Map<String, Value>);
+
+impl Current {
+    /// Take an upcasted event as the current shape.  Private to the seam:
+    /// this is the one place a `Current` comes from.
+    ///
+    /// The debug assertion is the registration check.  Every stored event
+    /// carries the version it was written under, and the chain's job is to
+    /// bring it to [`CURRENT_SCHEMA_VERSION`]; an event that arrives here
+    /// still older than that is a step nobody registered, which is exactly
+    /// the mistake the seam exists to catch, and it is silent in every other
+    /// way.  It is a `debug_assert` because it is a check on the kernel's own
+    /// wiring, not on anything a caller passed in.
+    ///
+    /// A value that is not an object is corruption: the store's own writes
+    /// are objects (the validator refuses anything else), so a non-object
+    /// came back from the bytes rather than from a caller.
+    fn from_upcasted(event: Value) -> KnlResult<Self> {
+        let Value::Object(map) = event else {
+            return Err(KnlError::Corruption(format!(
+                "stored event is not an object: {event}"
+            )));
+        };
+        debug_assert_eq!(
+            map.get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
+            Some(CURRENT_SCHEMA_VERSION),
+            "the upcaster chain must bring every event to the current schema \
+             version; a step is missing from kernel_upcasters(): {map:?}"
+        );
+        Ok(Self(map))
+    }
+
+    /// Take a map as current *without* the chain — tests only.
+    ///
+    /// For the unit tests that drive a fold or a store directly, where there
+    /// is no seam to read through and the fixture is written in today's shape
+    /// by construction.  Not available outside `cfg(test)`, so it cannot
+    /// become a way round [`CurrentStore`].
+    #[cfg(test)]
+    pub fn assume_current(event: Value) -> Self {
+        match event {
+            Value::Object(map) => Self(map),
+            other => panic!("a test fixture event must be an object, got {other}"),
+        }
+    }
+
+    /// The `kind` of the event (empty when absent).
+    pub fn kind(&self) -> &str {
+        self.0.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// The store-assigned `seq` of the event (`0` when absent).
+    pub fn seq(&self) -> u64 {
+        self.0.get(FIELD_SEQ).and_then(Value::as_u64).unwrap_or(0)
+    }
+
+    /// Give up the event's object — for a caller that has to own it.
+    pub fn into_inner(self) -> Map<String, Value> {
+        self.0
+    }
+}
+
+impl Deref for Current {
+    type Target = Map<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Current {
+    /// The event as JSON — what a failure message about an event wants to
+    /// show.  An object that will not serialise falls back to its debug
+    /// form rather than failing the formatter: this runs while something is
+    /// already being reported.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_string(&self.0) {
+            Ok(json) => f.write_str(&json),
+            Err(_) => write!(f, "{:?}", self.0),
+        }
+    }
+}
+
 /// What a command decides, given the stream it is decided against.
 ///
-/// Handed the stream's events in `seq` order and returning the event to
-/// record — or `None` to record nothing.  [`EventStore::append_if`] runs it
-/// inside the backend's serialization, which is what makes the decision and
-/// the write one step.
+/// Handed the (kind-filtered) events in `seq` order and returning the event
+/// to record — or `None` to record nothing.  [`EventStore::append_if`] runs
+/// it inside the backend's serialization, which is what makes the decision
+/// and the write one step.
+///
+/// The backend's own form, in raw [`Value`]s: the kernel's commands are
+/// written against [`CurrentDecision`] and [`CurrentStore`] projects between
+/// the two.
 pub type Decision<'a> = dyn FnMut(&[Value]) -> Option<Map<String, Value>> + 'a;
+
+/// [`Decision`] as the kernel writes one: decided on upcasted events.
+pub type CurrentDecision<'a> = dyn FnMut(&[Current]) -> Option<Map<String, Value>> + 'a;
 
 /// The coordinates a store assigns to an appended event.
 ///
@@ -165,8 +302,32 @@ pub trait EventStore {
     /// insert; the in-memory store is owned by one session in one process.
     fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed>;
 
+    /// Append `events` as one write, in the order given.
+    ///
+    /// For facts that are one fact: a session's `session_opened` and the
+    /// `budget_granted` it opened under are not two things that happened,
+    /// they are one opening, and a reader that can see the first without the
+    /// second is reading a stream that never existed.
+    ///
+    /// **All or nothing on a backend that can do it.**  SQLite takes a
+    /// single `IMMEDIATE` transaction, so a batch that fails part-way leaves
+    /// the stream exactly as it was.  The default below is the most a
+    /// backend with no transaction can offer — it appends one at a time, so
+    /// a failure part-way leaves what already landed — and the in-memory
+    /// store overrides it to validate the whole batch before writing any of
+    /// it, which is the only way its writes fail.
+    fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
+        events.into_iter().map(|event| self.append(event)).collect()
+    }
+
     /// Decide *inside* the store's serialization: read the stream, ask
     /// `decide` what to write, and append its answer in the same write.
+    ///
+    /// `kinds` filters what the decision is shown, exactly as
+    /// [`EventStore::read_kinds`] filters a read (`None` = the whole
+    /// stream): a decision that folds the ledger asks for the `budget_*`
+    /// kinds and is handed those, in `seq` order.  What it *writes* is
+    /// unfiltered — the event it returns is appended whatever its kind.
     ///
     /// The form a command with an invariant takes — "reserve `n` only if the
     /// balance covers it".  `decide` is handed the stream's events (in `seq`
@@ -180,19 +341,47 @@ pub trait EventStore {
     /// its transaction, so it must be a pure function of the events it is
     /// given.
     ///
-    /// The whole stream is read to decide, which is fine while streams are
-    /// small; a future optimisation reads only the range a decision needs
-    /// (a snapshot plus the events after it).
-    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>>;
+    /// The kinds the decision asked for are read whole, which is what makes
+    /// the invariant exact; naming them is what keeps that from meaning the
+    /// whole stream.
+    fn append_if(
+        &mut self,
+        kinds: Option<&[&str]>,
+        decide: &mut Decision<'_>,
+    ) -> KnlResult<Option<Committed>>;
 
-    /// Events with `seq >= from_seq`, at most `limit`, cloned in `seq`
-    /// order (a paged range read).
+    /// Events of `kinds` with `seq >= from_seq`, at most `limit`, cloned in
+    /// `seq` order.
+    ///
+    /// `None` reads every kind — the whole stream, as a plain range read.
+    /// `Some(kinds)` reads only those, and `limit` counts what came back
+    /// rather than what was skipped: a caller asking for two `budget_*`
+    /// events gets two, however much else is in between.  An empty slice
+    /// selects nothing.
+    ///
+    /// **The kind is the stored one.**  The selection happens in the backend,
+    /// before [`CurrentStore`] runs the upcaster chain, so an event is found
+    /// under the kind its bytes carry rather than the one it reads as.  While
+    /// no registered step renames a kind the two are the same word; a step
+    /// that *does* rename one obliges every filtered read of it to name both,
+    /// and [`kernel_upcasters`] is the site that has to say so.
     ///
     /// Fallible: a durable backend can hit a transient busy read or a row it
     /// cannot decode, and those must surface rather than be silently dropped
     /// (a dropped row would let [`super::Session::resume`] re-fold a truncated
     /// log into the wrong state). The in-memory backend never errors.
-    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>>;
+    fn read_kinds(
+        &self,
+        kinds: Option<&[&str]>,
+        from_seq: u64,
+        limit: usize,
+    ) -> KnlResult<Vec<Value>>;
+
+    /// Every event with `seq >= from_seq`, at most `limit`: the unfiltered
+    /// [`EventStore::read_kinds`].
+    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+        self.read_kinds(None, from_seq, limit)
+    }
 
     /// The current head: the highest `seq`, or `None` for an empty stream.
     ///
@@ -266,21 +455,45 @@ impl EventStore for MemEventStore {
         Ok(Committed { seq, epoch_ms })
     }
 
-    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+    fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
+        // Validation is the only way an in-memory append fails, so checking
+        // the whole batch first is all this backend needs to make a batch
+        // all-or-nothing: past this loop every append below lands.
+        for event in &events {
+            validate_event(event)?;
+        }
+        events.into_iter().map(|event| self.append(event)).collect()
+    }
+
+    fn append_if(
+        &mut self,
+        kinds: Option<&[&str]>,
+        decide: &mut Decision<'_>,
+    ) -> KnlResult<Option<Committed>> {
         // One process, one owner: the read and the append below cannot be
         // interleaved with another writer's, which is all the serialization
         // this backend needs.
-        let events = self.read(0, usize::MAX)?;
+        let events = self.read_kinds(kinds, 0, usize::MAX)?;
         match decide(&events) {
             Some(event) => self.append(event).map(Some),
             None => Ok(None),
         }
     }
 
-    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+    fn read_kinds(
+        &self,
+        kinds: Option<&[&str]>,
+        from_seq: u64,
+        limit: usize,
+    ) -> KnlResult<Vec<Value>> {
         // The in-memory history is infallible; the `Ok` is the SPI's shape,
         // not a failure the mem backend can actually produce.
         let mut events = self.history.since(from_seq);
+        if let Some(kinds) = kinds {
+            // Filtered before the cap, so `limit` counts what the caller
+            // asked for rather than what was skipped on the way.
+            events.retain(|event| kinds.contains(&kind_of(event)));
+        }
         events.truncate(limit);
         Ok(events)
     }
@@ -296,69 +509,133 @@ impl EventStore for MemEventStore {
     }
 }
 
-/// An [`EventStore`] decorator that upcasts on read.
+/// The seam: the only way to read a stream as the current shape.
 ///
-/// Wraps any backend and a `chain` of [`Upcaster`]s.  Reads fold the chain
-/// over the events before returning them (read-time projection); every write
+/// Wraps a backend and a `chain` of [`Upcaster`]s.  Reads fold the chain over
+/// the events and hand back [`Current`]s (read-time projection); every write
 /// passes straight through, so the stored bytes are never rewritten — the same
 /// old-log-stays-readable discipline [`Upcaster`] describes, established once
-/// here as the single seam a future upcaster registers into.
+/// here as the single site a future upcaster registers into.
+///
+/// **Not an [`EventStore`], on purpose.**  It offers the same calls, but its
+/// reads are `Vec<Current>` rather than `Vec<Value>`, so it cannot stand in
+/// for a backend and a backend cannot stand in for it.  [`super::Session`]
+/// holds one of these and never a bare `Box<dyn EventStore>`, which is what
+/// makes "the folds only ever see upcasted events" a property of the types
+/// instead of a rule someone has to remember.
 ///
 /// An empty chain is a functional no-op, which is the state today: v1 has no
-/// upcaster, so the decorator changes nothing, but a later shape change
+/// upcaster, so the projection changes nothing, but a later shape change
 /// registers its `n → n+1` step here and every read path picks it up.
-pub struct UpcastingEventStore {
+pub struct CurrentStore {
     /// The wrapped backend that actually holds the events.
     inner: Box<dyn EventStore>,
     /// The read-time upcaster chain, applied front to back on every read.
     chain: Vec<Arc<dyn Upcaster>>,
 }
 
-impl UpcastingEventStore {
+impl CurrentStore {
     /// Wrap `inner` so its reads are upcasted through `chain`.
     ///
-    /// An empty `chain` makes this an identity decorator over `inner`.
+    /// An empty `chain` projects the events unchanged — they are already the
+    /// current shape.
     pub fn new(inner: Box<dyn EventStore>, chain: Vec<Arc<dyn Upcaster>>) -> Self {
         Self { inner, chain }
     }
-}
 
-impl EventStore for UpcastingEventStore {
-    fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed> {
+    /// Fold `chain` over `events` and take the results as [`Current`].
+    ///
+    /// The one place a `Current` is minted, so every one of them has been
+    /// through the chain by construction.
+    fn project(chain: &[Arc<dyn Upcaster>], events: Vec<Value>) -> KnlResult<Vec<Current>> {
+        apply_upcasters(chain, events)
+            .into_iter()
+            .map(Current::from_upcasted)
+            .collect()
+    }
+
+    /// Validate, stamp and append an event ([`EventStore::append`]).
+    pub fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed> {
         // Write path untouched: upcasting is read-time only.
         self.inner.append(event)
     }
 
-    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+    /// Append events as one write ([`EventStore::append_many`]).
+    pub fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
+        self.inner.append_many(events)
+    }
+
+    /// Decide inside the store's serialization ([`EventStore::append_if`]),
+    /// on events projected to the current shape.
+    pub fn append_if(
+        &mut self,
+        kinds: Option<&[&str]>,
+        decide: &mut CurrentDecision<'_>,
+    ) -> KnlResult<Option<Committed>> {
         // The decision is a read, so it is upcasted like every other read: the
         // backend hands over the stored events, the chain projects them, and
         // `decide` sees the current shape — a v1 log decides the same way a
         // v2 one does.
         let chain = self.chain.clone();
-        let mut upcasted = |events: &[Value]| decide(&apply_upcasters(&chain, events.to_vec()));
-        self.inner.append_if(&mut upcasted)
+        // A projection failure has nowhere to go through the backend's
+        // `Decision`, which answers with an event or nothing.  So it is
+        // parked here and raised below: `decide` is not called, nothing is
+        // written, and the caller is told the read failed rather than being
+        // handed the `None` that would read as "the invariant said no".
+        let mut projection_failed: Option<KnlError> = None;
+        let mut upcasted = |events: &[Value]| match Self::project(&chain, events.to_vec()) {
+            Ok(current) => decide(&current),
+            Err(failure) => {
+                projection_failed = Some(failure);
+                None
+            }
+        };
+        let committed = self.inner.append_if(kinds, &mut upcasted);
+        match projection_failed {
+            Some(failure) => Err(failure),
+            None => committed,
+        }
     }
 
-    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+    /// Events of `kinds` from `from_seq` on, as the current shape
+    /// ([`EventStore::read_kinds`]).
+    pub fn read_kinds(
+        &self,
+        kinds: Option<&[&str]>,
+        from_seq: u64,
+        limit: usize,
+    ) -> KnlResult<Vec<Current>> {
         // The single read-time application point: read from the backend, then
         // fold the chain over the events before handing them back.
-        let events = self.inner.read(from_seq, limit)?;
-        Ok(apply_upcasters(&self.chain, events))
+        let events = self.inner.read_kinds(kinds, from_seq, limit)?;
+        Self::project(&self.chain, events)
     }
 
-    fn head(&self) -> KnlResult<Option<u64>> {
+    /// Every event from `from_seq` on, as the current shape.
+    pub fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Current>> {
+        self.read_kinds(None, from_seq, limit)
+    }
+
+    /// The backend's head ([`EventStore::head`]).
+    pub fn head(&self) -> KnlResult<Option<u64>> {
         self.inner.head()
     }
 
-    fn len(&self) -> KnlResult<usize> {
+    /// How many events the backend holds ([`EventStore::len`]).
+    pub fn len(&self) -> KnlResult<usize> {
         self.inner.len()
+    }
+
+    /// Whether the backend holds nothing yet.
+    pub fn is_empty(&self) -> KnlResult<bool> {
+        self.inner.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, FIELD_KIND};
+    use crate::knl::event::{KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -418,7 +695,7 @@ mod tests {
         // The decision sees the stream as it is, in seq order.
         let mut seen = 0;
         let committed = store
-            .append_if(&mut |events| {
+            .append_if(None, &mut |events| {
                 seen = events.len();
                 Some(ev(2))
             })
@@ -427,7 +704,7 @@ mod tests {
         assert_eq!(committed.map(|c| c.seq), Some(2));
 
         // `None` is a decision too: nothing is written and no seq is burnt.
-        let nothing = store.append_if(&mut |_| None).expect("append_if");
+        let nothing = store.append_if(None, &mut |_| None).expect("append_if");
         assert_eq!(nothing, None);
         assert_eq!(store.len().expect("len"), 2, "a None writes nothing");
         assert_eq!(store.append(ev(3)).expect("append").seq, 3);
@@ -439,9 +716,140 @@ mod tests {
     fn append_if_validates_the_event_the_decision_returns() {
         let mut store = MemEventStore::new();
         store
-            .append_if(&mut |_| Some(obj(json!({ "text": "no kind" }))))
+            .append_if(None, &mut |_| Some(obj(json!({ "text": "no kind" }))))
             .expect_err("kind is required");
         assert_eq!(store.len().expect("len"), 0);
+    }
+
+    /// A decision names the kinds it folds, and is handed those and nothing
+    /// else — in `seq` order, from the whole stream, however much else is in
+    /// between.  What it *writes* is not filtered.
+    #[test]
+    fn append_if_shows_the_decision_only_the_kinds_it_asked_for() {
+        let mut store = MemEventStore::new();
+        store
+            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .expect("the grant");
+        store.append(ev(1)).expect("noise");
+        store.append(ev(2)).expect("more noise");
+
+        let mut seen: Vec<String> = Vec::new();
+        let committed = store
+            .append_if(
+                Some(&[KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]),
+                &mut |events| {
+                    seen = events.iter().map(|e| kind_of(e).to_string()).collect();
+                    Some(obj(json!({ "kind": KIND_BUDGET_SPENT, "amount": 10 })))
+                },
+            )
+            .expect("append_if");
+        assert_eq!(seen, [KIND_BUDGET_GRANTED], "only the kinds asked for");
+        assert_eq!(
+            committed.map(|c| c.seq),
+            Some(4),
+            "the write is not filtered"
+        );
+
+        // The next decision sees what the last one wrote, since it is one of
+        // the kinds it asked for.
+        store
+            .append_if(
+                Some(&[KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]),
+                &mut |events| {
+                    seen = events.iter().map(|e| kind_of(e).to_string()).collect();
+                    None
+                },
+            )
+            .expect("append_if");
+        assert_eq!(seen, [KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]);
+    }
+
+    /// A batch is one write: the events land in order, and a batch with a
+    /// bad event in it lands nothing at all — the stream is as it was.
+    #[test]
+    fn append_many_records_the_batch_in_order_or_records_nothing() {
+        let mut store = MemEventStore::new();
+
+        let committed = store.append_many(vec![ev(1), ev(2)]).expect("the batch");
+        assert_eq!(
+            committed.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [1, 2],
+            "the batch lands in the order it was given"
+        );
+        let stored = store.read(0, usize::MAX).expect("read");
+        let kinds: Vec<&str> = stored.iter().map(kind_of).collect();
+        assert_eq!(kinds, ["e1", "e2"]);
+
+        // The second event is malformed, so neither is recorded: a batch that
+        // half-lands is the shape `append_many` exists to rule out.
+        store
+            .append_many(vec![ev(3), obj(json!({ "text": "no kind" }))])
+            .expect_err("kind is required");
+        assert_eq!(store.len().expect("len"), 2, "a failed batch wrote nothing");
+        assert_eq!(store.append(ev(4)).expect("append").seq, 3, "no seq burnt");
+    }
+
+    /// `read_kinds` selects by kind, pages by `from_seq` / `limit`, and reads
+    /// nothing at all for an empty selection.
+    #[test]
+    fn read_kinds_selects_by_kind_and_still_pages() {
+        let mut store = MemEventStore::new();
+        store
+            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .expect("grant");
+        store.append(ev(1)).expect("noise");
+        store
+            .append(obj(json!({ "kind": KIND_BUDGET_SPENT, "amount": 10 })))
+            .expect("spend");
+        store.append(ev(2)).expect("more noise");
+
+        let ledger = store
+            .read_kinds(
+                Some(&[KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]),
+                0,
+                usize::MAX,
+            )
+            .expect("read_kinds");
+        let kinds: Vec<&str> = ledger.iter().map(kind_of).collect();
+        assert_eq!(kinds, [KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]);
+        assert_eq!(
+            seq_of(&ledger[1]),
+            3,
+            "the seq is the stream's, not the fold's"
+        );
+
+        // `from_seq` and `limit` still apply, and the cap counts what came
+        // back rather than what was skipped.
+        assert_eq!(
+            store
+                .read_kinds(Some(&[KIND_BUDGET_GRANTED]), 2, usize::MAX)
+                .expect("read_kinds")
+                .len(),
+            0,
+            "the grant is before from_seq"
+        );
+        assert_eq!(
+            store
+                .read_kinds(Some(&[KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]), 0, 1)
+                .expect("read_kinds")
+                .len(),
+            1
+        );
+
+        // An empty selection selects nothing; `None` is the whole stream.
+        assert!(store
+            .read_kinds(Some(&[]), 0, usize::MAX)
+            .expect("read_kinds")
+            .is_empty());
+        assert_eq!(
+            store
+                .read_kinds(None, 0, usize::MAX)
+                .expect("read_kinds")
+                .len(),
+            4,
+            "read() is read_kinds(None, ..)"
+        );
+        assert_eq!(store.read(0, usize::MAX).expect("read").len(), 4);
     }
 
     #[test]
@@ -549,12 +957,12 @@ mod tests {
         assert_eq!(out[1]["trace"], json!(["first", "second"]));
     }
 
-    /// (Fix 4) `UpcastingEventStore` projects the chain on read while leaving
-    /// the write path untouched: an appended event is stored raw, and the
-    /// marker only appears in the read projection — it never accumulates, so
-    /// the stored bytes carry no upcaster field.
+    /// (Fix 4) `CurrentStore` projects the chain on read while leaving the
+    /// write path untouched: an appended event is stored raw, and the marker
+    /// only appears in the read projection — it never accumulates, so the
+    /// stored bytes carry no upcaster field.
     #[test]
-    fn upcasting_store_projects_on_read_and_leaves_writes_untouched() {
+    fn the_seam_projects_on_read_and_leaves_writes_untouched() {
         use std::sync::Arc;
 
         // Pushes a marker onto a `trace` array, so a value upcasted twice would
@@ -574,7 +982,7 @@ mod tests {
         }
 
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(Mark)];
-        let mut store = UpcastingEventStore::new(Box::new(MemEventStore::new()), chain);
+        let mut store = CurrentStore::new(Box::new(MemEventStore::new()), chain);
 
         // Write path passes through: coordinates and counters are the backend's.
         let a = store.append(ev(1)).expect("append e1");
@@ -604,33 +1012,91 @@ mod tests {
         assert_eq!(store.len().expect("len"), 2);
         let both = store.read(0, usize::MAX).expect("read both");
         assert_eq!(both.len(), 2);
-        assert_eq!(kind_of(&both[1]), "e2");
+        assert_eq!(both[1].kind(), "e2");
+        assert_eq!(both[1].seq(), 2, "a Current keeps its coordinates");
         assert_eq!(both[1]["trace"], json!(["mark"]));
     }
 
-    /// (Fix 4) An empty chain makes the decorator an identity over its backend:
+    /// (Fix 4) An empty chain makes the seam an identity over its backend:
     /// reads return the events unchanged, with no upcaster-added field, and the
     /// coordinates track the backend exactly.
     #[test]
-    fn upcasting_store_with_an_empty_chain_returns_events_unchanged() {
-        let mut store = UpcastingEventStore::new(Box::new(MemEventStore::new()), Vec::new());
+    fn the_seam_with_an_empty_chain_returns_events_unchanged() {
+        let mut store = CurrentStore::new(Box::new(MemEventStore::new()), Vec::new());
         assert!(store.is_empty().expect("is_empty"));
 
         store.append(ev(1)).expect("append");
         let read = store.read(0, usize::MAX).expect("read");
         assert_eq!(read.len(), 1);
-        assert_eq!(
-            kind_of(&read[0]),
-            "e1",
-            "the event passes through unchanged"
-        );
+        assert_eq!(read[0].kind(), "e1", "the event passes through unchanged");
         assert!(
             read[0].get("trace").is_none(),
-            "an empty chain adds nothing: {}",
+            "an empty chain adds nothing: {:?}",
             read[0]
         );
         assert_eq!(store.head().expect("head"), Some(1));
         assert_eq!(store.len().expect("len"), 1);
+    }
+
+    /// The kind filter selects on the kind that is *stored*; the chain runs
+    /// after it.  A step that renames a kind therefore has to be read for
+    /// under its old name — which is what the note on
+    /// [`EventStore::read_kinds`] obliges a future rename to do, and this
+    /// pins the behaviour so it cannot change silently.
+    #[test]
+    fn the_kind_filter_selects_on_the_stored_kind_and_the_chain_runs_after() {
+        /// Renames `old_spent` to the kind the kernel knows today.
+        struct RenameSpent;
+        impl Upcaster for RenameSpent {
+            fn upcast(&self, mut event: Value) -> Value {
+                let Some(map) = event.as_object_mut() else {
+                    return event;
+                };
+                if map.get(FIELD_KIND).and_then(Value::as_str) == Some("old_spent") {
+                    map.insert(FIELD_KIND.to_string(), Value::from(KIND_BUDGET_SPENT));
+                }
+                event
+            }
+        }
+
+        let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameSpent)];
+        let mut store = CurrentStore::new(Box::new(MemEventStore::new()), chain);
+        store
+            .append(obj(json!({ "kind": KIND_BUDGET_GRANTED, "amount": 100 })))
+            .expect("the grant");
+        store
+            .append(obj(json!({ "kind": "old_spent", "amount": 10 })))
+            .expect("a settlement under the older name");
+
+        // Asked for by the name it is stored under, it comes back projected.
+        let renamed = store
+            .read_kinds(Some(&["old_spent"]), 0, usize::MAX)
+            .expect("read_kinds");
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(
+            renamed[0].kind(),
+            KIND_BUDGET_SPENT,
+            "the chain ran after the selection"
+        );
+
+        // Asked for by the name it reads *as*, it is not selected at all.
+        assert!(
+            store
+                .read_kinds(Some(&[KIND_BUDGET_SPENT]), 0, usize::MAX)
+                .expect("read_kinds")
+                .is_empty(),
+            "the filter cannot see a kind the chain has not produced yet"
+        );
+
+        // The decision is handed the projected events either way.
+        let mut seen: Vec<String> = Vec::new();
+        store
+            .append_if(None, &mut |events: &[Current]| {
+                seen = events.iter().map(|e| e.kind().to_string()).collect();
+                None
+            })
+            .expect("append_if");
+        assert_eq!(seen, [KIND_BUDGET_GRANTED, KIND_BUDGET_SPENT]);
     }
 
     /// A test-local `1 → 2` step, standing in for a real one: it renames a

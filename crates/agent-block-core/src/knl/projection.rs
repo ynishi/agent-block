@@ -8,12 +8,14 @@
 //! of the history, and the cached value is always reproducible by
 //! [`usage_of`] from scratch.
 //!
-//! The folds consume an event *slice* (`&[Value]`), not a `History`, so the
+//! The folds consume an event *slice* (`&[Current]`), not a `History`, so the
 //! same arithmetic serves the in-memory store and the durable one: the
-//! caller reads the range it wants from an [`EventStore`](super::EventStore)
-//! and hands the events over.  For the incremental cache the caller reads
-//! only what is new (`read(folded_seq + 1, ..)`); for a from-scratch
-//! reference it reads the whole log.
+//! caller reads the range it wants through the seam
+//! ([`CurrentStore`](super::event_store::CurrentStore)) and hands the events
+//! over.  For the incremental cache the caller reads only what is new
+//! (`read(folded_seq + 1, ..)`); for a from-scratch reference it reads the
+//! whole log.  The slice is `Current`, so a projection cannot be taken over
+//! events that went round the upcaster chain.
 //!
 //! The vocabulary is closed on purpose — named folds live here rather
 //! than being handed to a caller-supplied callback, so the kernel never
@@ -53,7 +55,8 @@
 
 use serde_json::{Map, Value};
 
-use super::event::{kind_of, seq_of, FIELD_USAGE, KIND_LLM_RESPONSE};
+use super::event::{FIELD_USAGE, KIND_LLM_RESPONSE};
+use super::event_store::Current;
 use super::{KnlError, KnlResult};
 
 /// View name: usage totals.
@@ -104,12 +107,12 @@ impl UsageFold {
     /// a range that overlaps what was already folded does not double-count —
     /// reading twice without an append repeats the value rather than
     /// doubling it.
-    pub fn advance(&mut self, events: &[Value]) {
+    pub fn advance(&mut self, events: &[Current]) {
         for event in events {
-            if seq_of(event) <= self.folded_seq {
+            if event.seq() <= self.folded_seq {
                 continue;
             }
-            if kind_of(event) == KIND_LLM_RESPONSE {
+            if event.kind() == KIND_LLM_RESPONSE {
                 self.model_calls = self.model_calls.saturating_add(1);
                 let usage = event.get(FIELD_USAGE);
                 for (slot, counter) in self.totals.iter_mut().zip(USAGE_COUNTERS) {
@@ -117,7 +120,7 @@ impl UsageFold {
                     *slot = slot.saturating_add(value);
                 }
             }
-            self.folded_seq = seq_of(event);
+            self.folded_seq = event.seq();
         }
     }
 
@@ -166,7 +169,7 @@ impl Views {
     /// with `read(usage_folded_seq + 1, ..)`, so the fold is amortised in
     /// the number of new events, not the size of the history.  Passing a
     /// wider range is safe too: the fold skips anything it has already seen.
-    pub fn usage(&mut self, new_events: &[Value]) -> Value {
+    pub fn usage(&mut self, new_events: &[Current]) -> Value {
         self.usage.advance(new_events);
         self.usage.value()
     }
@@ -180,16 +183,25 @@ impl Views {
 
 /// The `usage` view computed from scratch over `events` (the cache's
 /// reference): a fresh fold folds them all, in `seq` order.
-pub fn usage_of(events: &[Value]) -> Value {
+pub fn usage_of(events: &[Current]) -> Value {
     let mut fold = UsageFold::default();
     fold.advance(events);
     fold.value()
 }
 
 /// The `tail` view: the last `n` of `events`, verbatim.
-pub fn tail_of(events: &[Value], n: usize) -> Value {
+///
+/// The events are copied back out as plain JSON objects — the view is a
+/// value handed to a reader, and `Current` is the kernel's own proof that a
+/// read went through the seam, not something a reader needs.
+pub fn tail_of(events: &[Current], n: usize) -> Value {
     let start = events.len().saturating_sub(n);
-    Value::Array(events[start..].to_vec())
+    Value::Array(
+        events[start..]
+            .iter()
+            .map(|event| Value::Object((**event).clone()))
+            .collect(),
+    )
 }
 
 /// Read `opts.n` for the `tail` view, defaulting to [`DEFAULT_TAIL_N`].
@@ -204,7 +216,7 @@ pub fn tail_count(opts: Option<&Map<String, Value>>) -> KnlResult<usize> {
         .as_f64()
         .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
         .ok_or_else(|| {
-            KnlError::new(format!(
+            KnlError::Validation(format!(
                 "n must be a non-negative whole number, got {}",
                 super::event::json_type_name(value)
             ))
@@ -215,7 +227,7 @@ pub fn tail_count(opts: Option<&Map<String, Value>>) -> KnlResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT};
+    use crate::knl::event::{kind_of, FIELD_CALL_ID, FIELD_CONTENT, FIELD_OK, FIELD_RESULT};
     use crate::knl::History;
     use serde_json::json;
 
@@ -225,6 +237,18 @@ mod tests {
             Value::Object(map) => map,
             other => panic!("test fixture must be an object, got {other}"),
         }
+    }
+
+    /// The events of `h` from `from` on, as the folds take them.
+    ///
+    /// These tests drive a [`History`] rather than a session, so there is no
+    /// seam to read through; the fixtures are written in today's shape by
+    /// construction and say so.
+    fn since(h: &History, from: u64) -> Vec<Current> {
+        h.since(from)
+            .into_iter()
+            .map(Current::assume_current)
+            .collect()
     }
 
     /// Append an event, panicking on a rejected fixture.  The one write
@@ -240,7 +264,7 @@ mod tests {
     /// past what the cache has already seen (`read(folded_seq + 1, ..)`).
     fn usage_cached(views: &mut Views, h: &History) -> Value {
         let from = views.usage_folded_seq().saturating_add(1);
-        views.usage(&h.since(from))
+        views.usage(&since(h, from))
     }
 
     /// A history covering every reserved kind plus an open one.
@@ -284,8 +308,8 @@ mod tests {
     /// fold shapes one for it.
     #[test]
     fn the_conversation_is_read_from_the_events_in_seq_order() {
-        let events = mixed_history().since(0);
-        let kinds: Vec<&str> = events.iter().map(kind_of).collect();
+        let events = since(&mixed_history(), 0);
+        let kinds: Vec<&str> = events.iter().map(Current::kind).collect();
         assert_eq!(
             kinds,
             [
@@ -328,14 +352,14 @@ mod tests {
         );
         append(&mut h, json!({ "kind": "msg_user", "content": "and now?" }));
 
-        let events = h.since(0);
+        let events = since(&h, 0);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(kind_of(&events[0]), KIND_LLM_RESPONSE);
+        assert_eq!(events[0].kind(), KIND_LLM_RESPONSE);
         assert_eq!(
             events[0][FIELD_CONTENT],
             json!([{ "type": "text", "text": "said last time" }])
         );
-        assert_eq!(kind_of(&events[1]), "msg_user");
+        assert_eq!(events[1].kind(), "msg_user");
     }
 
     /// `usage` counts every `llm_response` in the session — there is no
@@ -359,7 +383,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            usage_of(&h.since(0)),
+            usage_of(&since(&h, 0)),
             json!({
                 "input_tokens": 9,
                 "output_tokens": 2,
@@ -383,7 +407,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            usage_of(&h.since(0)),
+            usage_of(&since(&h, 0)),
             json!({
                 "input_tokens": 15,
                 "output_tokens": 3,
@@ -430,7 +454,7 @@ mod tests {
         assert_eq!(usage["model_calls"], json!(0), "{usage}");
 
         let at_seq = usage["at_seq"].as_u64().expect("a position");
-        assert!(h.since(at_seq + 1).is_empty(), "nothing is left to read");
+        assert!(since(&h, at_seq + 1).is_empty(), "nothing is left to read");
         append(
             &mut h,
             json!({
@@ -438,7 +462,7 @@ mod tests {
                 "usage": { "input_tokens": 4 }
             }),
         );
-        let rest = h.since(at_seq + 1);
+        let rest = since(&h, at_seq + 1);
         assert_eq!(rest.len(), 1, "{rest:?}");
         assert_eq!(usage_cached(&mut views, &h)["at_seq"], json!(3));
     }
@@ -449,7 +473,7 @@ mod tests {
         let mut views = Views::default();
 
         // Reading before anything is appended must not poison the cache.
-        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&since(&h, 0)));
 
         let script = [
             json!({ "kind": "session_opened" }),
@@ -484,14 +508,14 @@ mod tests {
             // the from-scratch one at each step, not only at the end.
             assert_eq!(
                 usage_cached(&mut views, &h),
-                usage_of(&h.since(0)),
+                usage_of(&since(&h, 0)),
                 "step {i}"
             );
         }
 
         // Reading twice without an append repeats the same value rather
         // than double-folding.
-        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&since(&h, 0)));
 
         // Every llm_response counts now: three calls, and the 9000-token
         // one is summed in with the rest.
@@ -506,12 +530,11 @@ mod tests {
             })
         );
 
-        let responses = h
-            .since(0)
+        let responses = since(&h, 0)
             .iter()
-            .filter(|e| kind_of(e) == KIND_LLM_RESPONSE)
+            .filter(|e| e.kind() == KIND_LLM_RESPONSE)
             .count();
-        assert_eq!(responses, 3, "{:?}", h.since(0));
+        assert_eq!(responses, 3, "{:?}", since(&h, 0));
     }
 
     #[test]
@@ -524,14 +547,14 @@ mod tests {
                 json!({ "kind": "msg_user", "content": format!("m{i}") }),
             );
         }
-        assert_eq!(usage_cached(&mut views, &h), usage_of(&h.since(0)));
+        assert_eq!(usage_cached(&mut views, &h), usage_of(&since(&h, 0)));
         assert_eq!(views.usage_folded_seq(), 10);
     }
 
     #[test]
     fn tail_returns_the_last_n_events_verbatim() {
         let h = mixed_history();
-        let events = h.since(0);
+        let events = since(&h, 0);
         let tail = tail_of(&events, 2);
         let tail = tail.as_array().expect("array");
         assert_eq!(tail.len(), 2);

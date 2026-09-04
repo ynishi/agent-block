@@ -22,6 +22,9 @@
 --   inv8 status comes from the backend (ok / refused / error round-trips)
 --   inv9 the device is frozen, with-derivation swaps policy for one beat,
 --        and every event of one beat carries the id that beat declared
+--  inv10 the bridge's declared surface and the Lua registry agree in both
+--        directions (§9-m) — methods, module functions and the error
+--        vocabulary — and a real raise reads back classified (§9-r)
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately (design §0.5).
@@ -213,7 +216,15 @@ do
         {},
         kernel.device({
             system = "SYS",
-            tools = { alpha = { description = "a", input_schema = { type = "object" } } },
+            tools = {
+                alpha = {
+                    description = "a",
+                    input_schema = { type = "object" },
+                    handler = function()
+                        return "a"
+                    end,
+                },
+            },
         })
     )
     assert(composed.system == "SYS")
@@ -576,6 +587,39 @@ do
     for name in pairs(kernel.shapes.module) do
         assert(declared_module[name], "stale module shape (bridge declares no such function): " .. name)
     end
+
+    -- The failure vocabulary is the same list on both sides (§9-r). The
+    -- kernel publishes it (`knl.api().errors`, built from KnlError::KINDS)
+    -- and the shell closes its `error` shape on its own declaration; a
+    -- class added to one and not the other goes red here, in both
+    -- directions, exactly like the two method registries above.
+    local declared_kinds, published_kinds = {}, {}
+    for _, kind in ipairs(kernel.shapes.error_kinds) do
+        declared_kinds[kind] = true
+    end
+    for _, kind in ipairs(api.errors) do
+        published_kinds[kind] = true
+        assert(declared_kinds[kind], "the kernel publishes an error class the shell does not declare: " .. kind)
+    end
+    for kind in pairs(declared_kinds) do
+        assert(published_kinds[kind], "the shell declares an error class the kernel does not publish: " .. kind)
+    end
+
+    -- And a real raise, read back: appending to a closed session is the
+    -- `closed` class, attributed to the method that refused, and not
+    -- something to ask again about. The table still renders as the message
+    -- it was read from, so code that only printed or searched the raise
+    -- reads exactly what it read before.
+    local ended = kernel.open({ owner = "test" })
+    ended:close("done")
+    local wrote, raised = pcall(ended.append, ended, { kind = "msg_user", content = "after" })
+    assert(not wrote, "an append after close must raise")
+    local read = knl.error(raised)
+    assert(read.kind == "closed", "kind: " .. tostring(read.kind))
+    assert(read.method == "append", "method: " .. tostring(read.method))
+    assert(read.retryable == false, "closed is not a class to retry")
+    assert(type(read.message) == "string" and #read.message > 0, "message: " .. tostring(read.message))
+    assert(tostring(read):find(tostring(raised), 1, true), "__tostring must give the original text back")
 
     -- the bracket records the body's error as the boundary's detail
     local s_ref

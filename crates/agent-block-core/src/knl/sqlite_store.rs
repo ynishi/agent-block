@@ -13,10 +13,18 @@
 //! same [`validate_event`] and [`stamp`] the in-memory store runs, and
 //! returns the coordinates inline.
 //!
+//! # Reads are indexed by kind
+//!
+//! The table carries a `(stream, kind, seq)` index beside its `(stream, seq)`
+//! primary key, so a kind-filtered read ([`EventStore::read_kinds`], and the
+//! decision input of [`EventStore::append_if`]) costs the size of the *fold*
+//! rather than the size of the stream: folding the balance reads the
+//! `budget_*` events, not every fact the session ever recorded.
+//!
 //! # Concurrency
 //!
-//! `append` and `append_if` read-then-write, so each runs in an `IMMEDIATE`
-//! transaction: the `RESERVED` lock is taken at `BEGIN` rather than promoted
+//! `append`, `append_many` and `append_if` read-then-write, so each runs in an
+//! `IMMEDIATE` transaction: the `RESERVED` lock is taken at `BEGIN` rather than promoted
 //! from `SHARED` on the first write, which is the point `busy_timeout`
 //! actually covers — a `DEFERRED` transaction can still hit `SQLITE_BUSY` on
 //! lock *promotion* even with a timeout set. On top of the timeout, a
@@ -28,19 +36,21 @@
 //!
 //! That is what makes the SPI's promise true here: appends to one stream are
 //! *serialized* — two handles both write and the log interleaves in arrival
-//! order — and a decision taken by `append_if` runs against the stream inside
-//! the same transaction that records its answer, so no concurrent writer can
-//! slip between the two.
+//! order — a batch is one transaction, so it lands whole or not at all, and a
+//! decision taken by `append_if` runs against the stream inside the same
+//! transaction that records its answer, so no concurrent writer can slip
+//! between the two.
 //!
 //! [`MemEventStore`]: super::event_store::MemEventStore
 
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, TransactionBehavior};
 use serde_json::{Map, Value};
 
-use super::event::{seq_of, stamp, validate_event, FIELD_KIND};
+use super::event::{stamp, validate_event, FIELD_KIND};
 use super::event_store::{
     stamp_schema_version, Committed, Decision, EventStore, CURRENT_SCHEMA_VERSION,
     SCHEMA_VERSION_FIELD,
@@ -94,7 +104,7 @@ impl SqliteEventStore {
     /// The `events` table is created if it does not exist, so opening a fresh
     /// file and reopening an existing one take the same path.
     pub fn open(path: &Path, stream: impl Into<String>) -> KnlResult<Self> {
-        let conn = Connection::open(path).map_err(sqlite_err)?;
+        let conn = Connection::open(path)?;
         Self::init(conn, stream.into())
     }
 
@@ -103,13 +113,20 @@ impl SqliteEventStore {
     /// Nothing persists past the returned value's lifetime — this is *not*
     /// the durable path, only a backend that behaves like the file one.
     pub fn open_in_memory(stream: impl Into<String>) -> KnlResult<Self> {
-        let conn = Connection::open_in_memory().map_err(sqlite_err)?;
+        let conn = Connection::open_in_memory()?;
         Self::init(conn, stream.into())
     }
 
-    /// Set the busy timeout and ensure the table, then wrap the connection.
+    /// Set the busy timeout and ensure the table and its index, then wrap the
+    /// connection.
+    ///
+    /// The `(stream, kind, seq)` index is what makes a kind-filtered read
+    /// ([`EventStore::read_kinds`]) cost the size of the fold rather than the
+    /// size of the stream, and it keeps the rows in `seq` order within a kind,
+    /// so the read needs no sort.  `IF NOT EXISTS` on both, so opening a fresh
+    /// file and reopening one written by an earlier build take the same path.
     fn init(conn: Connection, stream: String) -> KnlResult<Self> {
-        conn.busy_timeout(BUSY_TIMEOUT).map_err(sqlite_err)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events ( \
                  stream         TEXT    NOT NULL, \
@@ -119,9 +136,10 @@ impl SqliteEventStore {
                  schema_version INTEGER NOT NULL, \
                  payload        TEXT    NOT NULL, \
                  PRIMARY KEY (stream, seq) \
-             );",
-        )
-        .map_err(sqlite_err)?;
+             ); \
+             CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
+                 ON events (stream, kind, seq);",
+        )?;
         Ok(Self { conn, stream })
     }
 }
@@ -137,40 +155,61 @@ impl EventStore for SqliteEventStore {
         run_with_retry(|| append_attempt(&mut self.conn, &self.stream, &event))
     }
 
-    fn append_if(&mut self, decide: &mut Decision<'_>) -> KnlResult<Option<Committed>> {
+    fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Validate before the transaction is opened: a batch with a malformed
+        // event in it never takes the write lock at all.
+        for event in &events {
+            validate_event(event)?;
+        }
+        // One IMMEDIATE transaction for the whole batch, so the facts that
+        // belong together land together.  A contended attempt is retried
+        // whole; nothing outside the transaction has been changed by a failed
+        // one, so re-running it is the correct thing to do.
+        run_with_retry(|| append_many_attempt(&mut self.conn, &self.stream, &events))
+    }
+
+    fn append_if(
+        &mut self,
+        kinds: Option<&[&str]>,
+        decide: &mut Decision<'_>,
+    ) -> KnlResult<Option<Committed>> {
         // The read, the decision and the insert share one IMMEDIATE
         // transaction, so the invariant `decide` checks holds at the instant
         // the event lands.  A contended attempt is retried whole — `decide` is
         // a pure fold over the events it is handed, so running it again on the
         // freshly read stream is the correct thing to do.
-        run_with_retry(|| append_if_attempt(&mut self.conn, &self.stream, &mut *decide))
+        run_with_retry(|| append_if_attempt(&mut self.conn, &self.stream, kinds, &mut *decide))
     }
 
-    fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Value>> {
+    fn read_kinds(
+        &self,
+        kinds: Option<&[&str]>,
+        from_seq: u64,
+        limit: usize,
+    ) -> KnlResult<Vec<Value>> {
+        // An empty selection selects nothing — and `kind IN ()` is not SQL,
+        // so it is answered here rather than built into a statement.
+        if kinds.is_some_and(<[&str]>::is_empty) {
+            return Ok(Vec::new());
+        }
         // `usize::MAX` (an unbounded read) caps at i64::MAX, which SQLite
         // treats as "no limit"; `0` reads nothing.
         let capped = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT payload FROM events \
-                 WHERE stream = ?1 AND seq >= ?2 ORDER BY seq ASC LIMIT ?3",
-            )
-            .map_err(sqlite_err)?;
-        let rows = stmt
-            .query_map(params![self.stream, from_seq as i64, capped], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(sqlite_err)?;
+        let (sql, args) = read_query(&self.stream, kinds, from_seq, capped);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args.iter()), |row| row.get::<_, String>(0))?;
         // A read that cannot prepare/query is a fault, and a row whose payload
         // does not decode is corruption — both surface as an error rather than
         // being silently dropped, so a caller (resume) never re-folds a
         // truncated log into the wrong state.
         let mut events = Vec::new();
         for row in rows {
-            let payload = row.map_err(sqlite_err)?;
+            let payload = row?;
             let value = serde_json::from_str::<Value>(&payload)
-                .map_err(|e| KnlError::new(format!("sqlite: corrupt event payload: {e}")))?;
+                .map_err(|e| KnlError::Corruption(format!("sqlite: corrupt event payload: {e}")))?;
             events.push(value);
         }
         Ok(events)
@@ -180,7 +219,7 @@ impl EventStore for SqliteEventStore {
         // A transient busy read must surface, not read as "empty": a caller
         // deciding open-vs-resume (or a CAS) on a swallowed error would
         // treat a populated stream as fresh.  Same discipline as read().
-        head_in(&self.conn, &self.stream).map_err(sqlite_err)
+        head_in(&self.conn, &self.stream).map_err(KnlError::from)
     }
 
     fn len(&self) -> KnlResult<usize> {
@@ -191,7 +230,7 @@ impl EventStore for SqliteEventStore {
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n as usize)
-            .map_err(sqlite_err)
+            .map_err(KnlError::from)
     }
 }
 
@@ -209,7 +248,7 @@ where
             Err(TxError::Sqlite(error)) if is_retryable(&error) && tries < MAX_TX_ATTEMPTS => {
                 tries += 1;
             }
-            Err(TxError::Sqlite(error)) => return Err(sqlite_err(error)),
+            Err(TxError::Sqlite(error)) => return Err(error.into()),
             Err(TxError::Terminal(error)) => return Err(error),
         }
     }
@@ -234,23 +273,55 @@ fn append_attempt(
     Ok(Committed { seq, epoch_ms })
 }
 
+/// One `IMMEDIATE` batch append: take the reserved lock up front, number the
+/// events on from the live head, and insert them all before committing.
+///
+/// All or nothing: an event that will not encode, or a contended insert
+/// part-way through, drops the transaction and leaves the stream exactly as
+/// it was — which is what lets a caller write two facts that are one fact.
+fn append_many_attempt(
+    conn: &mut Connection,
+    stream: &str,
+    events: &[Map<String, Value>],
+) -> Result<Vec<Committed>, TxError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(TxError::Sqlite)?;
+    let mut seq = next_seq(&tx, stream).map_err(TxError::Sqlite)?;
+    let mut committed = Vec::with_capacity(events.len());
+    for event in events {
+        let epoch_ms = now_ms();
+        let mut row = event.clone();
+        stamp_schema_version(&mut row);
+        stamp(&mut row, seq, epoch_ms);
+        insert_row(&tx, stream, seq, epoch_ms, &row)?;
+        committed.push(Committed { seq, epoch_ms });
+        seq = seq.saturating_add(1);
+    }
+    tx.commit().map_err(TxError::Sqlite)?;
+    Ok(committed)
+}
+
 /// One `IMMEDIATE` decide-then-append: read the stream, ask `decide` what to
 /// record, and insert its answer in the same transaction.
 ///
-/// The whole stream is read to decide, which is acceptable while streams are
-/// small; the future optimisation is a snapshot plus the events after it.
+/// `kinds` narrows what the decision is shown, not where its answer lands:
+/// the new event's `seq` comes from the stream's live head, so a filtered
+/// decision numbers its write against everything, exactly as an ordinary
+/// append does.
 ///
 /// A `None` decision commits nothing — the transaction is dropped, so the
 /// stream is exactly as it was — and reports `Ok(None)`.
 fn append_if_attempt(
     conn: &mut Connection,
     stream: &str,
+    kinds: Option<&[&str]>,
     decide: &mut Decision<'_>,
 ) -> Result<Option<Committed>, TxError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(TxError::Sqlite)?;
-    let events = read_in(&tx, stream)?;
+    let events = read_in(&tx, stream, kinds)?;
     let Some(event) = decide(&events) else {
         // Nothing to write: the transaction is rolled back on drop.
         return Ok(None);
@@ -258,8 +329,9 @@ fn append_if_attempt(
     // The decision's event is validated like any other: a malformed one is
     // refused and the transaction goes no further.
     validate_event(&event).map_err(TxError::Terminal)?;
-    let head = events.last().map(seq_of);
-    let seq = head.unwrap_or(0).saturating_add(1);
+    // The head of the whole stream, not of the events the decision was shown:
+    // a filtered read says nothing about where the next event goes.
+    let seq = next_seq(&tx, stream).map_err(TxError::Sqlite)?;
     let epoch_ms = now_ms();
     let mut row = event.clone();
     stamp_schema_version(&mut row);
@@ -269,22 +341,55 @@ fn append_if_attempt(
     Ok(Some(Committed { seq, epoch_ms }))
 }
 
-/// Every event of `stream`, in `seq` order, read inside a transaction.
+/// The `SELECT payload` statement for a read, with its bound arguments.
 ///
-/// The in-transaction twin of [`EventStore::read`]: a decode failure is
+/// One builder for both read paths — the plain one and the in-transaction
+/// twin — so a filtered read and the input a decision is shown select the
+/// same rows by the same rule.  The kinds are bound as parameters rather than
+/// written into the SQL, so a kind is data here as it is everywhere else.
+fn read_query(
+    stream: &str,
+    kinds: Option<&[&str]>,
+    from_seq: u64,
+    limit: i64,
+) -> (String, Vec<SqlValue>) {
+    let mut sql = String::from("SELECT payload FROM events WHERE stream = ? AND seq >= ?");
+    let mut args = vec![
+        SqlValue::Text(stream.to_string()),
+        SqlValue::Integer(from_seq as i64),
+    ];
+    if let Some(kinds) = kinds {
+        let placeholders = vec!["?"; kinds.len()].join(", ");
+        sql.push_str(&format!(" AND kind IN ({placeholders})"));
+        args.extend(kinds.iter().map(|kind| SqlValue::Text((*kind).to_string())));
+    }
+    sql.push_str(" ORDER BY seq ASC LIMIT ?");
+    args.push(SqlValue::Integer(limit));
+    (sql, args)
+}
+
+/// The events of `stream` a decision is shown, in `seq` order, read inside a
+/// transaction.
+///
+/// The in-transaction twin of [`EventStore::read_kinds`]: a decode failure is
 /// corruption and terminal, a fault on the read itself is retryable.
-fn read_in(conn: &Connection, stream: &str) -> Result<Vec<Value>, TxError> {
-    let mut stmt = conn
-        .prepare("SELECT payload FROM events WHERE stream = ?1 ORDER BY seq ASC")
-        .map_err(TxError::Sqlite)?;
+fn read_in(conn: &Connection, stream: &str, kinds: Option<&[&str]>) -> Result<Vec<Value>, TxError> {
+    // An empty selection selects nothing, and `kind IN ()` is not SQL.
+    if kinds.is_some_and(<[&str]>::is_empty) {
+        return Ok(Vec::new());
+    }
+    let (sql, args) = read_query(stream, kinds, 0, i64::MAX);
+    let mut stmt = conn.prepare(&sql).map_err(TxError::Sqlite)?;
     let rows = stmt
-        .query_map(params![stream], |row| row.get::<_, String>(0))
+        .query_map(params_from_iter(args.iter()), |row| row.get::<_, String>(0))
         .map_err(TxError::Sqlite)?;
     let mut events = Vec::new();
     for row in rows {
         let payload = row.map_err(TxError::Sqlite)?;
         let value = serde_json::from_str::<Value>(&payload).map_err(|e| {
-            TxError::Terminal(KnlError::new(format!("sqlite: corrupt event payload: {e}")))
+            TxError::Terminal(KnlError::Corruption(format!(
+                "sqlite: corrupt event payload: {e}"
+            )))
         })?;
         events.push(value);
     }
@@ -330,8 +435,11 @@ fn insert_row(
         .get(SCHEMA_VERSION_FIELD)
         .and_then(Value::as_u64)
         .unwrap_or(CURRENT_SCHEMA_VERSION);
+    // An event that will not encode never reaches the disk, so this is the
+    // store failing to do the work rather than data that came back wrong —
+    // `Storage`, not `Corruption`.
     let payload = serde_json::to_string(&Value::Object(event.clone()))
-        .map_err(|e| TxError::Terminal(KnlError::new(format!("sqlite: encode event: {e}"))))?;
+        .map_err(|e| TxError::Terminal(KnlError::Storage(format!("sqlite: encode event: {e}"))))?;
     conn.execute(
         "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -348,21 +456,26 @@ fn insert_row(
     Ok(())
 }
 
-/// Render a rusqlite error as a [`KnlError`], noting the busy/locked codes.
+/// Classify a rusqlite error into the kernel's vocabulary.
 ///
-/// A full retryable-error taxonomy is out of scope here; the message flags a
-/// contended lock (the connection's `busy_timeout` already makes writes wait
-/// rather than fail) so a caller can tell it apart from a real fault.
-fn sqlite_err(error: rusqlite::Error) -> KnlError {
-    if let rusqlite::Error::SqliteFailure(inner, _) = &error {
-        if matches!(
-            inner.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        ) {
-            return KnlError::new(format!("sqlite: busy/locked (retryable): {error}"));
+/// This is the one place the backend's error language is translated, and the
+/// split is the one the caller can act on: a contended lock is
+/// [`KnlError::Busy`] — the same call may succeed if it is made again, which
+/// is exactly what [`run_with_retry`] does with it — and everything else is
+/// [`KnlError::Storage`], a fault the kernel cannot promise anything about.
+/// Matched on the SQLite error *code*, never the message text, so the
+/// classification does not drift with a library's wording.
+///
+/// Corruption is not produced here: a row that comes back and will not decode
+/// is a fault of the data rather than of the store, so it is raised where the
+/// decode happens.
+impl From<rusqlite::Error> for KnlError {
+    fn from(error: rusqlite::Error) -> Self {
+        if is_retryable(&error) {
+            return KnlError::Busy(format!("sqlite: busy/locked: {error}"));
         }
+        KnlError::Storage(format!("sqlite: {error}"))
     }
-    KnlError::new(format!("sqlite: {error}"))
 }
 
 #[cfg(test)]
@@ -427,7 +540,7 @@ mod tests {
 
         let mut seen_kinds: Vec<String> = Vec::new();
         let committed = store
-            .append_if(&mut |events| {
+            .append_if(None, &mut |events| {
                 seen_kinds = events.iter().map(|e| kind_of(e).to_string()).collect();
                 Some(ev(2))
             })
@@ -435,7 +548,7 @@ mod tests {
         assert_eq!(seen_kinds, ["e1"], "decide saw the durable stream");
         assert_eq!(committed.map(|c| c.seq), Some(2));
 
-        let nothing = store.append_if(&mut |_| None).expect("append_if");
+        let nothing = store.append_if(None, &mut |_| None).expect("append_if");
         assert_eq!(nothing, None);
         assert_eq!(store.len().expect("len"), 2, "a None commits nothing");
         assert_eq!(store.append(ev(3)).expect("append").seq, 3);
@@ -446,9 +559,120 @@ mod tests {
     fn append_if_validates_the_event_the_decision_returns() {
         let mut store = SqliteEventStore::open_in_memory("s").expect("open");
         store
-            .append_if(&mut |_| Some(obj(json!({ "text": "no kind" }))))
+            .append_if(None, &mut |_| Some(obj(json!({ "text": "no kind" }))))
             .expect_err("kind is required");
         assert_eq!(store.len().expect("len"), 0);
+    }
+
+    /// A batch is one transaction: the events land together, numbered on from
+    /// the live head — and a batch that fails part-way leaves the stream
+    /// exactly as it was, which is the whole reason it is one call.
+    #[test]
+    fn append_many_is_one_transaction_that_lands_whole_or_not_at_all() {
+        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        store.append(ev(1)).expect("seed");
+
+        let committed = store.append_many(vec![ev(2), ev(3)]).expect("the batch");
+        assert_eq!(
+            committed.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [2, 3],
+            "numbered on from the head that was there"
+        );
+        let stored = store.read(0, usize::MAX).expect("read");
+        let kinds: Vec<&str> = stored.iter().map(kind_of).collect();
+        assert_eq!(kinds, ["e1", "e2", "e3"]);
+
+        // A malformed event refuses the whole batch, and the one before it in
+        // the same call is not in the log either.
+        store
+            .append_many(vec![ev(4), obj(json!({ "text": "no kind" }))])
+            .expect_err("kind is required");
+        assert_eq!(store.len().expect("len"), 3, "a failed batch wrote nothing");
+        assert_eq!(store.append(ev(5)).expect("append").seq, 4, "no seq burnt");
+
+        // An empty batch is nothing to write, not an empty transaction.
+        assert!(store.append_many(Vec::new()).expect("empty").is_empty());
+        assert_eq!(store.len().expect("len"), 4);
+    }
+
+    /// A kind-filtered read is answered off the index: only the kinds asked
+    /// for come back, in `seq` order, still carrying the `seq` the stream gave
+    /// them.  `None` is the whole stream, an empty selection is nothing.
+    #[test]
+    fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
+        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        store
+            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
+            .expect("grant");
+        store.append(ev(1)).expect("noise");
+        store
+            .append(obj(json!({ "kind": "budget_spent", "amount": 10 })))
+            .expect("spend");
+        store.append(ev(2)).expect("more noise");
+
+        let ledger = store
+            .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, usize::MAX)
+            .expect("read_kinds");
+        let kinds: Vec<&str> = ledger.iter().map(kind_of).collect();
+        assert_eq!(kinds, ["budget_granted", "budget_spent"]);
+        assert_eq!(seq_of(&ledger[0]), 1);
+        assert_eq!(seq_of(&ledger[1]), 3, "the seq is the stream's");
+
+        // from_seq and limit still apply to the filtered set.
+        assert_eq!(
+            store
+                .read_kinds(Some(&["budget_granted"]), 2, usize::MAX)
+                .expect("read_kinds")
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, 1)
+                .expect("read_kinds")
+                .len(),
+            1
+        );
+
+        assert!(store
+            .read_kinds(Some(&[]), 0, usize::MAX)
+            .expect("read_kinds")
+            .is_empty());
+        assert_eq!(
+            store
+                .read_kinds(None, 0, usize::MAX)
+                .expect("read_kinds")
+                .len(),
+            4
+        );
+    }
+
+    /// A decision that names its kinds is shown those and nothing else, and
+    /// its write is still numbered against the whole stream — the filter is
+    /// what the decision *reads*, not where its answer goes.
+    #[test]
+    fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
+        let mut store = SqliteEventStore::open_in_memory("s").expect("open");
+        store
+            .append(obj(json!({ "kind": "budget_granted", "amount": 100 })))
+            .expect("grant");
+        store.append(ev(1)).expect("noise");
+        store.append(ev(2)).expect("more noise");
+
+        let mut seen: Vec<String> = Vec::new();
+        let committed = store
+            .append_if(Some(&["budget_granted"]), &mut |events| {
+                seen = events.iter().map(|e| kind_of(e).to_string()).collect();
+                Some(obj(json!({ "kind": "budget_spent", "amount": 10 })))
+            })
+            .expect("append_if");
+        assert_eq!(seen, ["budget_granted"], "only the kinds asked for");
+        assert_eq!(
+            committed.map(|c| c.seq),
+            Some(4),
+            "the write lands after everything, not after the filtered read"
+        );
+        assert_eq!(store.len().expect("len"), 4);
     }
 
     /// Two handles on one stream, one invariant: each decides inside its own
@@ -473,10 +697,10 @@ mod tests {
                 .then(|| obj(json!({ "kind": "marker" })))
         };
 
-        let first = a.append_if(&mut only_once_a).expect("a decides");
+        let first = a.append_if(None, &mut only_once_a).expect("a decides");
         assert_eq!(first.map(|c| c.seq), Some(1), "a wrote the marker");
 
-        let second = b.append_if(&mut only_once_b).expect("b decides");
+        let second = b.append_if(None, &mut only_once_b).expect("b decides");
         assert_eq!(second, None, "b saw a's marker and wrote nothing");
         assert_eq!(b.len().expect("len"), 1, "exactly one marker");
     }
@@ -617,6 +841,85 @@ mod tests {
             "{}",
             err.reason()
         );
+        // Corruption, not storage: the IO worked and the bytes came back, so
+        // what is wrong is the data — no retry and no reconnect changes it.
+        assert_eq!(err.kind(), KnlError::CORRUPTION);
+        assert!(!err.is_retryable());
+    }
+
+    /// The backend's error language is translated in exactly one place, and
+    /// the split is the one a caller can act on: a contended lock says "ask
+    /// again", every other fault says nothing of the kind.
+    #[test]
+    fn a_contended_lock_is_busy_and_every_other_fault_is_storage() {
+        /// A `rusqlite` failure carrying `code`.
+        fn failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                Some("under test".to_string()),
+            )
+        }
+
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+        ] {
+            let error = KnlError::from(failure(code));
+            assert_eq!(error.kind(), KnlError::BUSY, "{code:?}: {error}");
+            assert!(error.is_retryable(), "{code:?}: {error}");
+        }
+
+        for code in [
+            rusqlite::ErrorCode::DatabaseCorrupt,
+            rusqlite::ErrorCode::ReadOnly,
+            rusqlite::ErrorCode::DiskFull,
+        ] {
+            let error = KnlError::from(failure(code));
+            assert_eq!(error.kind(), KnlError::STORAGE, "{code:?}: {error}");
+            assert!(
+                !error.is_retryable(),
+                "the kernel does not promise a retry it cannot back: {error}"
+            );
+        }
+
+        // A non-SQLite rusqlite fault is storage too — it is the store
+        // failing to do the work, whatever the shape of the failure.
+        let error = KnlError::from(rusqlite::Error::QueryReturnedNoRows);
+        assert_eq!(error.kind(), KnlError::STORAGE, "{error}");
+    }
+
+    /// The busy classification is what a real contended write surfaces as,
+    /// not only what the translation function returns in isolation: a second
+    /// connection holds the write lock, so the retries are exhausted and the
+    /// error the caller gets says "ask again".
+    #[test]
+    fn a_write_that_stays_contended_surfaces_as_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+
+        let mut store = SqliteEventStore::open(&path, "s").expect("open");
+        store.append(ev(1)).expect("seed");
+
+        // A blocker holding an EXCLUSIVE transaction: every attempt this
+        // store makes finds the database locked, and the busy_timeout is cut
+        // to nothing so the test does not wait it out five times over.
+        let blocker = Connection::open(&path).expect("open blocker");
+        blocker
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("take the write lock");
+        store
+            .conn
+            .busy_timeout(Duration::from_millis(0))
+            .expect("no waiting");
+
+        let err = store
+            .append(ev(2))
+            .expect_err("a write against a held lock must not succeed");
+        assert_eq!(err.kind(), KnlError::BUSY, "{err}");
+        assert!(err.is_retryable(), "{err}");
     }
 
     /// Two handles on one stream both write: an append records a fact, so it

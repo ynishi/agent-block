@@ -403,6 +403,77 @@ local function post_with_retry(url, request_opts, max_retries)
     end
 end
 
+--- Send one built request and hand back the provider's decoded JSON.
+---
+--- The transport step on its own: encode the body, POST it with the retry
+--- policy this module owns, turn a non-200 into the classified error string,
+--- and decode what came back. Everything either side of it — which wire to
+--- build and how to read the decoded answer — belongs to the adapter.
+---
+--- It is exported because two callers need exactly this middle and differ at
+--- the ends: `M.backend` below (adapter build -> transport -> adapter parse),
+--- and `knl_adapter`'s LLMPort, whose `build` / `parse` are the Port's own
+--- methods and whose `classify` needs the FULL parse result. Before this
+--- existed the Port ran its own retry loop, its own non-200 message and its
+--- own decode beside these — three copies of a policy that has to be one.
+---
+--- Failure is `nil, err` for anything the provider answered; a transport
+--- failure RAISES, because that is what the host's `http.request` does and
+--- turning it into a return here would make the two callers' error contracts
+--- disagree. A caller that must not raise (the Port) pcalls this.
+---
+--- @param wire table  { url, headers, body } from an adapter's build
+--- @param opts table|nil  { max_retries?, timeout?, dump?, on_request?,
+---                          on_response? } — the two callbacks are
+---                          observability only and their return is not read
+--- @return table|nil raw  the decoded response JSON
+--- @return string|nil err
+--- @return table|nil meta  { status, latency_ms } on the success path
+function M.transport(wire, opts)
+    opts = opts or {}
+
+    local body_json = std.json.encode(wire.body)
+    if opts.on_request then
+        pcall(opts.on_request, {
+            url = wire.url,
+            headers = wire.headers,
+            body = wire.body,
+            body_json = body_json,
+        })
+    end
+
+    local started = std.time.now()
+    local resp = post_with_retry(wire.url, {
+        method = "POST",
+        headers = wire.headers,
+        body = body_json,
+        timeout = opts.timeout or DEFAULT_TIMEOUT,
+        dump = opts.dump,
+    }, tonumber(opts.max_retries) or DEFAULT_MAX_RETRIES)
+    local latency_ms = math.floor((std.time.now() - started) * 1000)
+
+    if opts.on_response then
+        pcall(opts.on_response, {
+            status = resp.status,
+            headers = resp.headers,
+            body = resp.body,
+            latency_ms = latency_ms,
+        })
+    end
+
+    if resp.status ~= 200 then
+        local classified = M.classify_error(resp.status, resp.body, resp.headers)
+        return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
+    end
+
+    local ok_decode, raw = pcall(std.json.decode, resp.body)
+    if not ok_decode then
+        return nil, "response JSON decode failed"
+    end
+
+    return raw, nil, { status = resp.status, latency_ms = latency_ms }
+end
+
 --- Marks a table as a JSON array, for the one case Lua cannot express: an
 --- empty table is an array and a mapping at once, and the host bridge reads
 --- an untagged one as a mapping.
@@ -503,43 +574,17 @@ function M.backend(conf)
             return nil, berr
         end
 
-        local body_json = std.json.encode(built.body)
-        if conf.on_request then
-            pcall(conf.on_request, {
-                url = built.url,
-                headers = built.headers,
-                body = built.body,
-                body_json = body_json,
-            })
-        end
-
-        local started = std.time.now()
-        local resp = post_with_retry(built.url, {
-            method = "POST",
-            headers = built.headers,
-            body = body_json,
-            timeout = conf.timeout or DEFAULT_TIMEOUT,
+        -- The middle is `M.transport`, shared with knl_adapter's Port: POST
+        -- with the retry policy, the classified non-200, the decode.
+        local raw, terr, meta = M.transport(built, {
+            max_retries = max_retries,
+            timeout = conf.timeout,
             dump = conf.dump,
-        }, max_retries)
-        local latency_ms = math.floor((std.time.now() - started) * 1000)
-
-        if conf.on_response then
-            pcall(conf.on_response, {
-                status = resp.status,
-                headers = resp.headers,
-                body = resp.body,
-                latency_ms = latency_ms,
-            })
-        end
-
-        if resp.status ~= 200 then
-            local classified = M.classify_error(resp.status, resp.body, resp.headers)
-            return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
-        end
-
-        local ok_decode, raw = pcall(std.json.decode, resp.body)
-        if not ok_decode then
-            return nil, "response JSON decode failed"
+            on_request = conf.on_request,
+            on_response = conf.on_response,
+        })
+        if not raw then
+            return nil, terr
         end
 
         local decoded, perr = adapter.parse(raw)
@@ -558,13 +603,68 @@ function M.backend(conf)
             -- that way, and a label nobody sent would be a fact this file
             -- made up.
             stop_reason = decoded.stop_reason,
-            status = resp.status,
-            latency_ms = latency_ms,
+            status = meta.status,
+            latency_ms = meta.latency_ms,
         }
     end,
         nil
 end
 
 M._response_blocks = response_blocks
+
+-- ============================================================
+-- MCP tools, in the neutral vocabulary
+-- ============================================================
+--
+-- Two callers bind an MCP server's tools onto a model request — the agent
+-- block's `connect_mcp_servers` and knl_adapter's `ToolPort.mcp` — and both
+-- were doing the same two translations by hand: MCP's declaration into the
+-- one a request carries, and an MCP call's content blocks into the text a
+-- tool_result carries. Two copies of a NAMESPACE is the dangerous kind of
+-- duplicate: the day they disagree, the same tool has two names and the
+-- model's call finds neither.
+--
+-- They live here rather than in a module of their own because a new
+-- `blocks/lib/*` has to be registered on the Rust side (host.rs
+-- EMBEDDED_LIBS) to be require-able in the host at all, and this round does
+-- not touch Rust. llm_proto is already required by both callers and already
+-- owns the neutral shapes that go on the wire, so it is the honest home
+-- until the registration can be made — at which point these two functions
+-- move to `mcp_tools` unchanged.
+
+--- One `tools/list` entry as the neutral tool declaration a request carries.
+---
+--- MCP's private vocabulary is closed here: the `<server>__<tool>` name that
+--- keeps two servers' tools apart, the camelCase `inputSchema` under the
+--- snake_case name every adapter build reads, an empty description rather
+--- than a missing one, and an empty object schema for a server that declared
+--- none (a provider will reject a tool with no schema at all).
+---
+--- @param server string  the connected server's name
+--- @param entry table  one item of `mcp.list_tools(server).tools`
+--- @return table decl  { name, description, input_schema }
+function M.mcp_tool_decl(server, entry)
+    return {
+        name = server .. "__" .. entry.name,
+        description = entry.description or "",
+        input_schema = entry.inputSchema or entry.input_schema or { type = "object", properties = {} },
+    }
+end
+
+--- An MCP call's content blocks as the text a tool_result carries: a single
+--- text block verbatim, no blocks the empty string, anything else (several
+--- blocks, or one that is not text) JSON-encoded so nothing is dropped.
+---
+--- @param blocks table|nil  `mcp.call(...).content`
+--- @return string text
+function M.mcp_result_text(blocks)
+    blocks = blocks or {}
+    if #blocks == 1 and blocks[1].type == "text" then
+        return blocks[1].text
+    elseif #blocks == 0 then
+        return ""
+    end
+    return std.json.encode(blocks)
+end
 
 return M

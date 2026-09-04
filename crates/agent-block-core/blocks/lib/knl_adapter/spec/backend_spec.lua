@@ -9,8 +9,9 @@
 -- Everything is tested with no network and no real provider:
 --   * a fake `llm_proto` is installed into package.loaded BEFORE
 --     require("knl_adapter"), so the module's load-time require("llm_proto")
---     and proto.adapter("anthropic") capture the fake; and its exported
---     classify_error / retry_delay drive the shim's retry loop.
+--     and proto.adapter("anthropic") capture the fake; and its `transport`
+--     is the seam the shim now delegates the whole middle of a call to
+--     (POST + retries + the classified non-200 + the decode).
 --   * fake `std` (json encode/decode, task.sleep) and `http` globals stub the
 --     device layer the shim's returned closure touches at call time.
 --
@@ -68,13 +69,20 @@ local fake_proto = {
             end,
         }
     end,
-    -- Non-retryable by default: a non-200 ends the loop at once and becomes an
-    -- error, which is the path the error case checks.
-    classify_error = function(_, _, _)
-        return { retryable = false, kind = "server" }
-    end,
-    retry_delay = function()
-        return 0
+    -- The seam the shim delegates the middle of a call to. The real one is
+    -- `llm_proto.transport`: POST with the retry policy, a classified non-200
+    -- as (nil, err), the JSON decode, and a RAISE on a transport failure —
+    -- which is what makes case 2d (the shim must not let that raise out) a
+    -- case about the shim. This fake reproduces those four behaviours and
+    -- nothing else; retries are the real transport's business, and the shim
+    -- has no loop left to test.
+    transport = function(wire, _opts)
+        assert(type(wire) == "table" and wire.url, "transport was handed no wire")
+        local resp = http.request(wire.url, {}) -- raises exactly as the host device does
+        if resp.status ~= 200 then
+            return nil, "API error " .. tostring(resp.status) .. " (server)"
+        end
+        return std.json.decode(resp.body), nil, { status = resp.status, latency_ms = 0 }
     end,
     -- The Mapper reuses llm_proto's content tagger; the real one marks an empty
     -- table as a JSON array (metatable { __jsontype = "array" }) and passes a

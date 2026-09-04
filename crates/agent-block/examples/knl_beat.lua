@@ -110,7 +110,18 @@ kernel.session({
             print("[E2E] refused: " .. tostring(o.reason))
         end,
         error = function(o)
-            print("[E2E] error(" .. tostring(o.kind) .. "): " .. tostring(o.detail))
+            -- A detail is a sentence, or a record with the sentence under
+            -- `message` — the kernel's reading of a syscall failure (kind /
+            -- retryable) for `state`, or a traced raise in dev mode. Read
+            -- it the one way that works for both.
+            local detail = o.detail
+            if type(detail) == "table" then
+                detail = tostring(detail.message)
+                if o.detail.kind ~= nil then
+                    detail = o.detail.kind .. ": " .. detail
+                end
+            end
+            print("[E2E] error(" .. tostring(o.kind) .. "): " .. tostring(detail))
         end,
         stopped = function(o)
             print("[E2E] stopped(" .. tostring(o.reason) .. "): grant " .. tostring(o.tag))

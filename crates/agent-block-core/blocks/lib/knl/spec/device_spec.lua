@@ -32,12 +32,20 @@
 --     kernel's per-kind event contracts are NOT among them: the Rust
 --     validator is their one source of truth, and all this layer adds is
 --     that a `beat` stamp is a string (§11 R7).
+--   9 a syscall failure is reported as the kernel's own reading of it
+--     (`Outcome.err("state").detail` = { kind?, method?, retryable,
+--     message }, §9-r) rather than as a sentence, and beat never acts on
+--     `retryable` itself. A raise out of the CALLER's code (fold, a filter,
+--     cost, the llm) is the other kind of failure: its detail is the
+--     message, plus a traceback in dev mode only.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so a
 -- faithful Lua fake stands in below (mirroring bridge/knl.rs facts: append
 -- records and charges nothing and does NOT number beats; `reserve` is the one
 -- decision point — it deducts or refuses with the grant's tag; new_beat_id
--- mints a fresh id per call; close takes a reason and is idempotent).
+-- mints a fresh id per call; close takes a reason and is idempotent; and
+-- `knl.error` reads an attributed raise — `knl: <method>: <kind>: <message>`
+-- — back into a table, since a Rust callback cannot raise one).
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -87,12 +95,14 @@ local function fake_session(opts)
         self._remaining = self._remaining - n
         return true
     end
+    -- The write IS the result: spend answers nothing, and the balance is
+    -- read with `remaining()` (the kernel's surface — the fake must not
+    -- promise a return the bridge does not make).
     function s:spend(n)
         if self._remaining == nil then
-            return nil
+            return
         end
         self._remaining = math.max(0, self._remaining - n)
-        return self._remaining
     end
     function s:exhausted()
         return self._remaining ~= nil and self._remaining <= 0
@@ -109,10 +119,53 @@ local function fake_session(opts)
     return s
 end
 
+-- The classes the kernel publishes (Rust `KnlError::KINDS`). Retyped here
+-- on purpose: this table stands in for the bridge, and a stand-in that
+-- borrowed the module's own list could not catch the module reading it
+-- wrong. The two are held against each other where a real bridge exists
+-- (tests/fixtures/knl_turn_test.lua, inv10).
+local FAKE_ERROR_KINDS = {
+    busy = true,
+    storage = true,
+    corruption = true,
+    closed = true,
+    validation = true,
+    unsupported = true,
+}
+
+--- `knl.error` as the bridge implements it (bridge/knl.rs `error_table`):
+--- the raise is text, `knl: <method>: <kind>: <message>`, because mlua
+--- cannot carry a table out of a Rust callback. Only a class the kernel
+--- publishes is read as one; anything else comes back whole and
+--- unclassified, and the table renders as the message it was read from.
+local function fake_read_error(raised)
+    local text = tostring(raised)
+    local out = { message = text, retryable = false }
+    for line in text:gmatch("[^\n]+") do
+        local attributed = line:match("knl: (.+)$")
+        if attributed then
+            -- Non-greedy: the first two separators only, like Rust's two
+            -- `split_once(": ")` — the message keeps its own colons.
+            local method, kind, message = attributed:match("^(.-): (.-): (.*)$")
+            if kind ~= nil and FAKE_ERROR_KINDS[kind] then
+                out.method, out.kind, out.message = method, kind, message
+                out.retryable = kind == "busy"
+            end
+            break
+        end
+    end
+    return setmetatable(out, {
+        __tostring = function()
+            return text
+        end,
+    })
+end
+
 knl = {
     open = function(o)
         return fake_session(o)
     end,
+    error = fake_read_error,
     resume = function(o)
         local s = fake_session(o)
         s.resumed_from = o and o.session
@@ -595,7 +648,7 @@ describe("knl.session — the canonical bracket", function()
     -- §9-f: the body's error is the winner. A close that fails on the way
     -- out is bookkeeping about a failure — it must not replace it, and it
     -- must not vanish either, so it goes to the host log when there is one.
-    it("a close that fails on the error path is warned, not raised", function()
+    it("a close that fails on the error path is warned as a record, not raised", function()
         local warned
         log = {
             warn = function(msg)
@@ -604,15 +657,54 @@ describe("knl.session — the canonical bracket", function()
         }
         local ok, err = pcall(K.session, { owner = "spec" }, function(s)
             s.close = function()
-                error("close blew up")
+                error("knl: close: storage: disk is gone")
             end
             error("body exploded")
         end)
         log = nil
         expect(ok).to.be(false)
+        -- The body error wins and propagates unchanged; the close failure
+        -- is the suppressed one, and it is structured so the loser is still
+        -- readable: which of the two this is, the winner as text, and the
+        -- kernel's own reading of the close.
         expect(tostring(err):find("body exploded", 1, true) ~= nil).to.be(true)
-        expect(tostring(warned):find("close failed after body error", 1, true) ~= nil).to.be(true)
-        expect(tostring(warned):find("close blew up", 1, true) ~= nil).to.be(true)
+        expect(type(warned)).to.be("table")
+        expect(warned.event).to.be("close_failed_after_body_error")
+        expect(warned.body:find("body exploded", 1, true) ~= nil).to.be(true)
+        expect(warned.close.kind).to.be("storage")
+        expect(warned.close.method).to.be("close")
+        expect(warned.close.retryable).to.be(false)
+        expect(warned.close.message).to.be("disk is gone")
+    end)
+
+    it("falls back to text for a log that only takes strings", function()
+        -- The host's `log.warn` is typed `msg: String` (bridge/log.rs), so
+        -- the record is offered first and a sentence carrying the same
+        -- three parts is what actually lands there. A warning about a
+        -- failure must not become a second failure, so both are guarded.
+        local seen = {}
+        log = {
+            warn = function(msg)
+                seen[#seen + 1] = msg
+                if type(msg) ~= "string" then
+                    error("log.warn: msg must be a string")
+                end
+            end,
+        }
+        local ok = pcall(K.session, { owner = "spec" }, function(s)
+            s.close = function()
+                error("knl: close: storage: disk is gone")
+            end
+            error("body exploded")
+        end)
+        log = nil
+        expect(ok).to.be(false)
+        expect(#seen).to.be(2)
+        expect(type(seen[1])).to.be("table")
+        expect(type(seen[2])).to.be("string")
+        expect(seen[2]:find("close_failed_after_body_error", 1, true) ~= nil).to.be(true)
+        expect(seen[2]:find("body exploded", 1, true) ~= nil).to.be(true)
+        expect(seen[2]:find("disk is gone", 1, true) ~= nil).to.be(true)
     end)
 
     it("a failing close needs no log global (it never raises)", function()
@@ -668,9 +760,65 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             "open_opts",
             "resume_opts",
             "budget_grant",
+            "error",
         }) do
             expect(K.shapes[name]).to.exist()
         end
+    end)
+
+    it("a syscall failure validates against the error shape, classified or not", function()
+        expect(shape.check({ kind = "busy", method = "reserve", retryable = true, message = "locked" }, K.shapes.error)).to.be(
+            true
+        )
+        -- The unattributed form: no class, no method, the whole text.
+        expect(shape.check({ retryable = false, message = "something else" }, K.shapes.error)).to.be(true)
+        -- A class outside the kernel's list is not one.
+        expect(shape.check({ kind = "nonsense", retryable = false, message = "x" }, K.shapes.error)).to.be(false)
+        -- `message` and `retryable` are what a reader can always count on.
+        expect(shape.check({ retryable = false }, K.shapes.error)).to.be(false)
+        expect(shape.check({ message = "x" }, K.shapes.error)).to.be(false)
+    end)
+
+    it("dev mode: a raise out of the caller's own code carries its traceback", function()
+        -- fold / filters / cost / the llm are the device's code, so a raise
+        -- there is a bug to locate, not a class of kernel failure. The
+        -- stack is a development aid: dev mode only, and prod's detail is
+        -- exactly the sentence it has always been.
+        local function beat_with_a_broken_fold()
+            local s = K.open({})
+            return K.beat(
+                s,
+                K.device({
+                    llm = stub_llm("x"),
+                    fold = function()
+                        error("fold blew up")
+                    end,
+                })
+            )
+        end
+
+        in_dev(function()
+            local o = beat_with_a_broken_fold()
+            expect(o.kind).to.be("conf")
+            expect(type(o.detail)).to.be("table")
+            expect(o.detail.message:find("fold blew up", 1, true) ~= nil).to.be(true)
+            -- The stack itself needs the `debug` library, which mlua's safe
+            -- stdlib leaves out; dev mode still means one thing (a
+            -- structured detail) and the field is simply unfillable there.
+            if type(debug) == "table" and type(debug.traceback) == "function" then
+                expect(type(o.detail.traceback)).to.be("string")
+                expect(o.detail.traceback:find("traceback", 1, true) ~= nil).to.be(true)
+            else
+                expect(o.detail.traceback).to.be(nil)
+            end
+        end)
+
+        in_prod(function()
+            local o = beat_with_a_broken_fold()
+            expect(o.kind).to.be("conf")
+            expect(type(o.detail)).to.be("string")
+            expect(o.detail:find("fold blew up", 1, true) ~= nil).to.be(true)
+        end)
     end)
 
     it("does not redefine the kernel's per-kind event contracts (one SoT)", function()
@@ -824,6 +972,38 @@ describe("beat contract hardening (review findings)", function()
         local o = K.beat(s, K.device({ llm = stub_llm("x") }))
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("state")
+        -- A raise with no attribution is reported whole: unclassified, not
+        -- retryable, the text verbatim. That is the shape a caller can
+        -- always count on — the bridge answers the same way, and so does
+        -- the module's fallback in a VM that has no bridge at all.
+        expect(type(o.detail)).to.be("table")
+        expect(o.detail.kind).to.be(nil)
+        expect(o.detail.retryable).to.be(false)
+        expect(o.detail.message:find("database is locked", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("a store that is busy comes back classified and retryable", function()
+        -- The bridge attributes what it raises — `knl: <method>: <kind>:
+        -- <message>` — and beat reads it back rather than passing the
+        -- sentence on. `busy` is the one class that says asking again could
+        -- work, and it is the caller's loop that gets to decide: beat
+        -- itself makes exactly one attempt.
+        local s = K.open({})
+        local reserved = 0
+        s.reserve = function()
+            reserved = reserved + 1
+            error("knl: reserve: busy: locked")
+        end
+        local o = K.beat(s, K.device({ llm = stub_llm("x") }))
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("state") -- the stage of the beat that failed…
+        expect(o.detail.kind).to.be("busy") -- …and what the failure was
+        expect(o.detail.method).to.be("reserve")
+        expect(o.detail.retryable).to.be(true)
+        expect(o.detail.message).to.be("locked")
+        expect(reserved).to.be(1) -- beat does not retry on its own
+        -- and the beat stopped there: no request recorded, no call made
+        expect(#s:events()).to.be(0)
     end)
 
     it("an append that fails is Error('state'), not a raw raise", function()
@@ -834,6 +1014,29 @@ describe("beat contract hardening (review findings)", function()
         local o = K.beat(s, K.device({ llm = stub_llm("x") }))
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("state")
+    end)
+
+    it("a call failure whose note cannot be recorded keeps the call's reason as cause", function()
+        local s = K.open({})
+        local real_append = s.append
+        s.append = function(self, ev)
+            if ev.kind == "llm_call_failed" then
+                error("knl: append: storage: the store is down")
+            end
+            return real_append(self, ev)
+        end
+        local d = K.device({
+            llm = function()
+                return nil, "network down"
+            end,
+        })
+        s:append({ kind = "msg_user", content = "q" })
+        local o = K.beat(s, d)
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("state") -- the winner: the record that did not land
+        expect(type(o.detail)).to.be("table")
+        expect(o.detail.message:find("the store is down", 1, true) ~= nil).to.be(true)
+        expect(o.detail.cause:find("network down", 1, true) ~= nil).to.be(true) -- the suppressed one
     end)
 
     it("a missing usage defaults to an empty count on the record", function()

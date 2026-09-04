@@ -59,9 +59,13 @@ local M = {}
 -- tool set from the registry and MCP, the token budget, and the dump.
 local tool_loop = require("tool_loop")
 
--- Re-exported through `M._test_helpers` only; the run path reaches llm_proto
--- through tool_loop.
-local proto_openai = require("llm_proto").adapter("openai")
+-- The run path reaches llm_proto's wire format through tool_loop; what this
+-- module calls directly is the MCP vocabulary it shares with knl_adapter
+-- (`mcp_tool_decl` / `mcp_result_text`).
+local proto = require("llm_proto")
+
+-- Re-exported through `M._test_helpers` only.
+local proto_openai = proto.adapter("openai")
 
 local lshape = require("lshape")
 local T = lshape.t
@@ -624,16 +628,17 @@ local function connect_mcp_servers(servers, opts)
 
         local tools = list_result.tools or {}
         for _, t in ipairs(tools) do
-            local ns_name = name .. "__" .. t.name
-            -- Convert inputSchema (camelCase) -> input_schema (snake_case) for Anthropic API
-            local input_schema = t.inputSchema or t.input_schema or { type = "object", properties = {} }
-            mcp_tool_map[ns_name] = {
+            -- The `<server>__<tool>` namespace and the camelCase inputSchema
+            -- conversion are llm_proto's, shared with knl_adapter's ToolPort:
+            -- one tool must not get two names depending on which loop bound it.
+            local decl = proto.mcp_tool_decl(name, t)
+            mcp_tool_map[decl.name] = {
                 server = name,
                 tool = t.name,
                 def = {
-                    name = ns_name,
-                    description = t.description or "",
-                    input_schema = input_schema,
+                    name = decl.name,
+                    description = decl.description,
+                    input_schema = decl.input_schema,
                     group = M._resolve_mcp_group(t, name),
                 },
             }
@@ -922,16 +927,10 @@ local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
             log.warn(string.format("mcp tool '%s.%s' returned isError=true", entry.server, entry.tool))
         end
 
-        -- Extract content from MCP result
-        local content_blocks = call_result.content or {}
-        if #content_blocks == 1 and content_blocks[1].type == "text" then
-            return content_blocks[1].text, is_error
-        elseif #content_blocks == 0 then
-            return "", is_error
-        else
-            -- Multiple blocks or non-text: encode as JSON
-            return std.json.encode(content_blocks), is_error
-        end
+        -- Extract content from the MCP result. The rendering (single text
+        -- block verbatim / none the empty string / anything else JSON) is
+        -- llm_proto's, shared with knl_adapter's ToolPort.
+        return proto.mcp_result_text(call_result.content), is_error
     end
 
     -- 2. extra_tools direct fallback (registry-independent; honours crux dispatch_tool wiring gap constraint)

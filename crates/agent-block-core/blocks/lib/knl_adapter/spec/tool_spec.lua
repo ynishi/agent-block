@@ -44,9 +44,8 @@ local function fake_session(opts)
     function s:reserve(_n)
         return true
     end
-    function s:spend(_n)
-        return nil
-    end
+    -- The write IS the result: spend answers nothing (the kernel's surface).
+    function s:spend(_n) end
     function s:remaining()
         return nil
     end

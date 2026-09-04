@@ -33,9 +33,10 @@
 use serde_json::Value;
 
 use super::event::{
-    kind_of, FIELD_AMOUNT, FIELD_DESC, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED,
+    FIELD_AMOUNT, FIELD_DESC, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED,
     KIND_BUDGET_SPENT,
 };
+use super::event_store::Current;
 use super::projection::whole;
 use super::{KnlError, KnlResult};
 
@@ -46,7 +47,7 @@ use super::{KnlError, KnlResult};
 /// is refused before anything — the balance or the log — is touched.
 pub(super) fn check_amount(amount: i64) -> KnlResult<()> {
     if amount < 0 {
-        return Err(KnlError::new(format!(
+        return Err(KnlError::Validation(format!(
             "amount must be a non-negative whole number, got {amount}"
         )));
     }
@@ -65,11 +66,17 @@ pub(super) fn check_amount(amount: i64) -> KnlResult<()> {
 /// had already forgiven.  `budget_refused` moves nothing, which is the point
 /// of recording it — the fact that a stop happened, with no effect on the
 /// balance.
-pub fn fold_balance(events: &[Value]) -> Option<i64> {
+///
+/// It folds [`Current`] events — ones that came through the upcaster seam —
+/// so a balance can only be taken over the shape the fold was written for.
+/// A caller may hand it the whole stream or only the `budget_*` kinds
+/// ([`super::EventStore::read_kinds`]); the arithmetic is the same, because
+/// every other kind moves nothing.
+pub fn fold_balance(events: &[Current]) -> Option<i64> {
     let mut balance: Option<i64> = None;
     for event in events {
         let amount = event.get(FIELD_AMOUNT).map_or(0, whole).max(0);
-        match kind_of(event) {
+        match event.kind() {
             KIND_BUDGET_GRANTED => {
                 balance = Some(balance.unwrap_or(0).saturating_add(amount));
             }
@@ -88,11 +95,11 @@ pub fn fold_balance(events: &[Value]) -> Option<i64> {
 /// a refusal reports), and — more than cosmetically — keeps *having* a
 /// budget: a session whose log says a quota was granted must go on
 /// recording its moves, whether or not the resuming caller granted again.
-pub fn last_grant(events: &[Value]) -> Option<BudgetGrant> {
+pub fn last_grant(events: &[Current]) -> Option<BudgetGrant> {
     events
         .iter()
         .rev()
-        .find(|event| kind_of(event) == KIND_BUDGET_GRANTED)
+        .find(|event| event.kind() == KIND_BUDGET_GRANTED)
         .map(|event| BudgetGrant {
             amount: event.get(FIELD_AMOUNT).map_or(0, whole).max(0),
             tag: string_field(event, FIELD_TAG),
@@ -101,7 +108,7 @@ pub fn last_grant(events: &[Value]) -> Option<BudgetGrant> {
 }
 
 /// An optional string payload field of a stored event.
-fn string_field(event: &Value, field: &str) -> Option<String> {
+fn string_field(event: &Current, field: &str) -> Option<String> {
     event.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
@@ -138,6 +145,15 @@ impl BudgetGrant {
 mod tests {
     use super::*;
 
+    /// A fixture log, as events that have been through the seam.
+    ///
+    /// The fold only takes [`Current`]s, and a literal written here is in
+    /// today's shape by construction, so the tests say so rather than
+    /// building a store to read one back through.
+    fn log(events: Vec<Value>) -> Vec<Current> {
+        events.into_iter().map(Current::assume_current).collect()
+    }
+
     /// A negative amount is a refund by another name, and is refused before
     /// anything is touched — whether or not there is a budget, because the
     /// rule is about the amount.
@@ -156,28 +172,34 @@ mod tests {
     fn the_fold_of_the_ledger_is_the_balance() {
         use serde_json::json;
 
-        let mut log = vec![json!({ "kind": "budget_granted", "amount": 100 })];
-        assert_eq!(fold_balance(&log), Some(100));
+        let mut ledger = log(vec![json!({ "kind": "budget_granted", "amount": 100 })]);
+        assert_eq!(fold_balance(&ledger), Some(100));
 
         // A reservation of 30 was decided in the store and recorded there.
-        log.push(json!({ "kind": "budget_reserved", "amount": 30 }));
-        assert_eq!(fold_balance(&log), Some(70), "after a reservation");
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_reserved", "amount": 30 }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(70), "after a reservation");
 
         // A refusal is recorded and moves nothing.
-        log.push(json!({ "kind": "budget_refused", "amount": 1000, "remaining": 70 }));
-        assert_eq!(fold_balance(&log), Some(70), "after a refusal");
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_refused", "amount": 1000, "remaining": 70 }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(70), "after a refusal");
 
-        log.push(json!({ "kind": "budget_spent", "amount": 20 }));
-        assert_eq!(fold_balance(&log), Some(50), "after a settlement");
+        ledger.extend(log(vec![json!({ "kind": "budget_spent", "amount": 20 })]));
+        assert_eq!(fold_balance(&ledger), Some(50), "after a settlement");
 
         // Overspending floors at zero rather than going into debt, and a
         // huge amount cannot wrap it…
-        log.push(json!({ "kind": "budget_spent", "amount": i64::MAX }));
-        assert_eq!(fold_balance(&log), Some(0), "at the floor");
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_spent", "amount": i64::MAX }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(0), "at the floor");
 
         // …so a later grant starts from zero, not from a forgiven debt.
-        log.push(json!({ "kind": "budget_granted", "amount": 10 }));
-        assert_eq!(fold_balance(&log), Some(10), "after a re-grant");
+        ledger.extend(log(vec![json!({ "kind": "budget_granted", "amount": 10 })]));
+        assert_eq!(fold_balance(&ledger), Some(10), "after a re-grant");
     }
 
     /// No grant in the log is no budget — which is not a balance of zero:
@@ -188,15 +210,15 @@ mod tests {
 
         assert_eq!(fold_balance(&[]), None);
         assert_eq!(
-            fold_balance(&[
+            fold_balance(&log(vec![
                 json!({ "kind": "session_opened" }),
                 json!({ "kind": "llm_response", "usage": { "input_tokens": 500 } }),
-            ]),
+            ])),
             None,
             "a provider response is not a budget move"
         );
         assert_eq!(
-            fold_balance(&[json!({ "kind": "budget_granted", "amount": 0 })]),
+            fold_balance(&log(vec![json!({ "kind": "budget_granted", "amount": 0 })])),
             Some(0),
             "a grant of zero is a budget, and an empty one"
         );
@@ -210,18 +232,18 @@ mod tests {
 
         assert_eq!(last_grant(&[]), None);
 
-        let log = vec![
+        let ledger = log(vec![
             json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens", "desc": "first" }),
             json!({ "kind": "budget_reserved", "amount": 10 }),
             json!({ "kind": "budget_granted", "amount": 50, "tag": "tokens", "desc": "second" }),
-        ];
-        let grant = last_grant(&log).expect("a grant was recorded");
+        ]);
+        let grant = last_grant(&ledger).expect("a grant was recorded");
         assert_eq!(grant.amount, 50, "the latest grant, not the first");
         assert_eq!(grant.tag.as_deref(), Some("tokens"));
         assert_eq!(grant.desc.as_deref(), Some("second"));
 
         // A grant with no words comes back with none invented.
-        let bare = last_grant(&[json!({ "kind": "budget_granted", "amount": 7 })])
+        let bare = last_grant(&log(vec![json!({ "kind": "budget_granted", "amount": 7 })]))
             .expect("a grant was recorded");
         assert_eq!(bare, BudgetGrant::new(7));
     }
