@@ -19,14 +19,22 @@
 //!   [`Session::owner`] — a real principal id, or the reserved
 //!   [`session::ANON`] / [`session::SYSTEM`] — total and read by the policy
 //!   layer above the kernel.  The accounting keys on the `kind`: the
-//!   `usage` view and the budget charge fold over every `model_response`,
-//!   because in a session's own log a `model_response` is a call it made.
-//!   Appending a `model_response` is that recorded, numbered, charged
-//!   call; appending a `run_finished` records a line without ending a run
-//!   that only [`Session::close`] can end.
-//! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative
-//!   amounts only and the balance can only decrease (floored at `0`).
-//!   There is no API to raise or reset it.
+//!   `usage` view folds over every `model_response`, because in a
+//!   session's own log a `model_response` is a call it made.  Appending
+//!   one records and numbers it; appending a `run_finished` records a line
+//!   without ending a run that only [`Session::close`] can end.
+//! - **I3 budget monotonicity.**  [`Budget`] accepts non-negative amounts
+//!   only, and within a run the balance can only decrease — it rises only
+//!   when an owner grants again, which a resumed run records like any
+//!   other fact.  It is a quota, not accounting: the decision is taken
+//!   *before* the spending ([`Session::reserve`], which refuses without
+//!   deducting) and settled after ([`Session::spend`]), by the layer that
+//!   knows what a call costs.  No `append` moves it, and the `usage` view
+//!   is the independent reading of what was consumed.
+//! - **The balance is a fold.**  Every move is a `budget_*` event first,
+//!   written by the kernel alone ([`is_kernel_only`]), so the counter is a
+//!   cache of the log and [`fold_balance`] recovers it — which is how
+//!   [`Session::resume`] restores a reopened run's remaining balance.
 //! - **I6 run scope.**  All state lives inside a [`Session`] value — no
 //!   statics — so two sessions are fully independent, and `close` ends
 //!   the run scope (later `append` / `spend` are errors).
@@ -43,7 +51,6 @@
 //! [`Session::events`].
 
 pub mod budget;
-pub mod call;
 pub mod event;
 pub mod event_store;
 pub mod history;
@@ -54,16 +61,18 @@ pub mod sqlite_store;
 
 use std::fmt;
 
-pub use budget::Budget;
-pub use call::charge_of;
-pub use event::{now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
+pub use budget::{fold_balance, Budget, BudgetGrant};
+pub use event::{is_kernel_only, now_ms, validate_event, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
 pub use event_store::{
-    apply_upcasters, Committed, EventStore, MemEventStore, UpcastingEventStore, Upcaster,
+    apply_upcasters, Committed, EventStore, MemEventStore, Upcaster, UpcastingEventStore,
     CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use projection::{UsageFold, Views};
-pub use session::{Session, ANON, SYSTEM};
+pub use session::{
+    Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
+    DEFAULT_CLOSE_REASON, SYSTEM,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite_store::SqliteEventStore;
 

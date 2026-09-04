@@ -165,9 +165,8 @@ impl EventStore for SqliteEventStore {
         let mut events = Vec::new();
         for row in rows {
             let payload = row.map_err(sqlite_err)?;
-            let value = serde_json::from_str::<Value>(&payload).map_err(|e| {
-                KnlError::new(format!("sqlite: corrupt event payload: {e}"))
-            })?;
+            let value = serde_json::from_str::<Value>(&payload)
+                .map_err(|e| KnlError::new(format!("sqlite: corrupt event payload: {e}")))?;
             events.push(value);
         }
         Ok(events)
@@ -304,9 +303,8 @@ fn insert_row(
         .get(SCHEMA_VERSION_FIELD)
         .and_then(Value::as_u64)
         .unwrap_or(CURRENT_SCHEMA_VERSION);
-    let payload = serde_json::to_string(&Value::Object(event.clone())).map_err(|e| {
-        TxError::Terminal(KnlError::new(format!("sqlite: encode event: {e}")))
-    })?;
+    let payload = serde_json::to_string(&Value::Object(event.clone()))
+        .map_err(|e| TxError::Terminal(KnlError::new(format!("sqlite: encode event: {e}"))))?;
     conn.execute(
         "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, payload) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -402,13 +400,15 @@ mod tests {
         assert_eq!(first.seq, 1);
 
         // The same "expect empty" now conflicts: the head is 1, not empty.
-        let err = store
-            .append_if_head(ev(2), 0)
-            .expect_err("no longer empty");
+        let err = store.append_if_head(ev(2), 0).expect_err("no longer empty");
         assert!(err.reason().contains("head conflict"), "{err}");
         assert!(err.reason().contains("expected 0"), "{err}");
         assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(store.len().expect("len"), 1, "the conflicting append did not happen");
+        assert_eq!(
+            store.len().expect("len"),
+            1,
+            "the conflicting append did not happen"
+        );
 
         // Matching the real head succeeds and advances it.
         let second = store.append_if_head(ev(2), 1).expect("head matches");
@@ -512,7 +512,8 @@ mod tests {
         let mut a = SqliteEventStore::open(&path, "stream-a").expect("open a");
         let mut b = SqliteEventStore::open(&path, "stream-b").expect("open b");
 
-        a.append(obj(json!({ "kind": "only_a" }))).expect("append a");
+        a.append(obj(json!({ "kind": "only_a" })))
+            .expect("append a");
         b.append(obj(json!({ "kind": "only_b1" })))
             .expect("append b1");
         b.append(obj(json!({ "kind": "only_b2" })))
@@ -580,7 +581,11 @@ mod tests {
             .append_if_head(ev(3), observed)
             .expect_err("b's CAS is stale");
         assert!(err.reason().contains("head conflict"), "{}", err.reason());
-        assert_eq!(b.head().expect("head"), Some(2), "the stale CAS wrote nothing");
+        assert_eq!(
+            b.head().expect("head"),
+            Some(2),
+            "the stale CAS wrote nothing"
+        );
         assert_eq!(b.read(0, usize::MAX).expect("read").len(), 2);
     }
 

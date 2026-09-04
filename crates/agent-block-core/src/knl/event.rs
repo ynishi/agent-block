@@ -22,8 +22,8 @@
 //!
 //! Because a session's log is exactly the calls it made, the accounting
 //! keys on the `kind` alone: [`super::projection::UsageFold`] counts every
-//! `model_response` in the session, and the budget charge sums the same
-//! usage.  A `model_response` in the history is one this run made.
+//! `model_response` in the session.  A `model_response` in the history is
+//! one this run made.
 //!
 //! # Two layers of `kind`
 //!
@@ -35,14 +35,33 @@
 //!   shape is the shell's business, which is why the kind vocabulary is
 //!   deliberately *not* closed in Rust.
 //!
-//! | reserved kind    | required fields                                      |
-//! |------------------|------------------------------------------------------|
-//! | `run_started`    | — (appended by the kernel when a session opens)        |
-//! | `run_finished`   | `reason: string` (appended by the kernel on close)    |
-//! | `msg_user`       | `content: string \| array`                            |
-//! | `model_response` | `content: array`, `usage: table` (`turn` is kernel-assigned) |
-//! | `tool_call`      | `turn: integer`, `call_id: string`, `name: string`, `args: table` |
-//! | `tool_result`    | `turn: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
+//! | reserved kind     | required fields                                      |
+//! |-------------------|------------------------------------------------------|
+//! | `run_started`     | — (appended by the kernel when a session opens)       |
+//! | `run_finished`    | `reason: string` (appended by the kernel on close)   |
+//! | `msg_user`        | `content: string \| array`                           |
+//! | `model_response`  | `content: array`, `usage: table` (`turn` is kernel-assigned) |
+//! | `tool_call`       | `turn: integer`, `call_id: string`, `name: string`, `args: table` |
+//! | `tool_result`     | `turn: integer`, `call_id: string`, `ok: boolean`, `result` (any) |
+//! | `budget_granted`  | `amount: integer` (`tag` / `desc` optional)          |
+//! | `budget_reserved` | `amount: integer` (`tag` optional)                   |
+//! | `budget_refused`  | `amount: integer`, `remaining: integer` (`tag` optional) |
+//! | `budget_spent`    | `amount: integer` (`tag` optional)                   |
+//!
+//! # Kernel-only kinds
+//!
+//! The four `budget_*` kinds are the ledger the budget counter is a fold
+//! of, so [`is_kernel_only`] marks them and [`super::Session::append`]
+//! refuses them: a caller that could write `budget_granted` could grant
+//! itself the quota its owner set, and one that could write
+//! `budget_reserved` could drain someone else's.  This is a stronger rule
+//! than the one the `run_*` kinds live under, and for a reason — a
+//! hand-written `run_finished` is a line in the history that changes no
+//! state (the run scope is the `closed` flag), while a hand-written
+//! `budget_granted` would change what every later read of the balance
+//! says.  They are written only by [`super::Session`], through the same
+//! append, so they carry the same `seq` / `epoch_ms` guarantees as
+//! everything else.
 //!
 //! `model_response` does not require a caller-supplied `turn`: the kernel
 //! numbers it from its own count of the responses recorded (like `seq`), so
@@ -79,9 +98,22 @@ pub const KIND_MODEL_RESPONSE: &str = "model_response";
 pub const KIND_TOOL_CALL: &str = "tool_call";
 /// Reserved kind: a tool result (failures are events too).
 pub const KIND_TOOL_RESULT: &str = "tool_result";
+/// Kernel-only kind: an owner granted the run a quota.
+pub const KIND_BUDGET_GRANTED: &str = "budget_granted";
+/// Kernel-only kind: a reservation was allowed, and the balance fell by it.
+pub const KIND_BUDGET_RESERVED: &str = "budget_reserved";
+/// Kernel-only kind: a reservation was refused; the balance did not move.
+pub const KIND_BUDGET_REFUSED: &str = "budget_refused";
+/// Kernel-only kind: a settlement after the fact, deducted from the balance.
+pub const KIND_BUDGET_SPENT: &str = "budget_spent";
 
 /// Payload field of `run_finished`.
 pub const FIELD_REASON: &str = "reason";
+/// Optional payload field of `run_finished`: free text about the close that
+/// wrote it — the message of the error that ended a scope, say.  It is kept
+/// out of [`FIELD_REASON`] on purpose: the reason is a small vocabulary a
+/// reader can fold on, and an error message is not part of it.
+pub const FIELD_DETAIL: &str = "detail";
 /// Payload field of `model_response` / `tool_call` / `tool_result`: which
 /// model call the fact belongs to.  On a `model_response` the kernel
 /// assigns it; on `tool_call` / `tool_result` the shell supplies it.
@@ -96,6 +128,17 @@ pub const FIELD_CALL_ID: &str = "call_id";
 pub const FIELD_OK: &str = "ok";
 /// Payload field of `tool_result`.
 pub const FIELD_RESULT: &str = "result";
+/// Payload field of every `budget_*` kind: how much, in the grant's unit.
+pub const FIELD_AMOUNT: &str = "amount";
+/// Payload field of `budget_*`: the grant's unit / identity, if it named
+/// one.  Optional and kernel-uninterpreted — it rides along so a log can
+/// be read without asking the shell what the numbers counted.
+pub const FIELD_TAG: &str = "tag";
+/// Payload field of `budget_granted`: the owner's free-text note.
+pub const FIELD_DESC: &str = "desc";
+/// Payload field of `budget_refused`: the balance at the moment of the
+/// refusal, which the refusal did not change.
+pub const FIELD_REMAINING: &str = "remaining";
 
 /// Expected JSON shape of a required field on a reserved kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +213,16 @@ const TOOL_RESULT_FIELDS: &[(&str, Shape)] = &[
 ];
 /// Required fields of `run_started` (none — the kernel appends it).
 const RUN_STARTED_FIELDS: &[(&str, Shape)] = &[];
+/// Required fields of `budget_granted` (`tag` / `desc` are optional).
+const BUDGET_GRANTED_FIELDS: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
+/// Required fields of `budget_reserved` / `budget_spent` (`tag` optional).
+const BUDGET_MOVE_FIELDS: &[(&str, Shape)] = &[(FIELD_AMOUNT, Shape::Integer)];
+/// Required fields of `budget_refused`: what was asked for, and what there
+/// was — the pair that makes the refusal readable without a fold.
+const BUDGET_REFUSED_FIELDS: &[(&str, Shape)] = &[
+    (FIELD_AMOUNT, Shape::Integer),
+    (FIELD_REMAINING, Shape::Integer),
+];
 
 /// The required fields of a reserved kind, or `None` for an open kind.
 fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
@@ -180,6 +233,9 @@ fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
         KIND_MODEL_RESPONSE => Some(MODEL_RESPONSE_FIELDS),
         KIND_TOOL_CALL => Some(TOOL_CALL_FIELDS),
         KIND_TOOL_RESULT => Some(TOOL_RESULT_FIELDS),
+        KIND_BUDGET_GRANTED => Some(BUDGET_GRANTED_FIELDS),
+        KIND_BUDGET_RESERVED | KIND_BUDGET_SPENT => Some(BUDGET_MOVE_FIELDS),
+        KIND_BUDGET_REFUSED => Some(BUDGET_REFUSED_FIELDS),
         _ => None,
     }
 }
@@ -187,6 +243,19 @@ fn required_fields(kind: &str) -> Option<&'static [(&'static str, Shape)]> {
 /// Whether `kind` is part of the reserved (kernel-checked) vocabulary.
 pub fn is_reserved(kind: &str) -> bool {
     required_fields(kind).is_some()
+}
+
+/// Whether `kind` is one only the kernel may write.
+///
+/// The `budget_*` kinds are the balance: it is a fold of them, so writing
+/// one *is* moving the account.  [`super::Session::append`] refuses them
+/// from a caller for that reason, and the kernel writes them on its own
+/// path — see the module docs.
+pub fn is_kernel_only(kind: &str) -> bool {
+    matches!(
+        kind,
+        KIND_BUDGET_GRANTED | KIND_BUDGET_RESERVED | KIND_BUDGET_REFUSED | KIND_BUDGET_SPENT
+    )
 }
 
 /// Whether `value` is a number without a fractional part.
@@ -469,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_vocabulary_is_exactly_the_six_kinds() {
+    fn reserved_vocabulary_is_exactly_the_ten_kinds() {
         for kind in [
             "run_started",
             "run_finished",
@@ -477,6 +546,10 @@ mod tests {
             "model_response",
             "tool_call",
             "tool_result",
+            "budget_granted",
+            "budget_reserved",
+            "budget_refused",
+            "budget_spent",
         ] {
             assert!(is_reserved(kind), "{kind} must be reserved");
         }
@@ -485,11 +558,68 @@ mod tests {
         }
     }
 
-    /// Validation is about shape only: the kinds the kernel writes for
-    /// itself are as acceptable from a caller as any other.  What keeps a
-    /// caller from moving the account is not the validator — it is that a
-    /// session holds only its own events, so the fold has nothing foreign
-    /// to count.
+    /// The budget ledger is the kernel's alone: writing one of these kinds
+    /// is moving the account, so no other kind — reserved or open — joins
+    /// them.
+    #[test]
+    fn only_the_budget_kinds_are_kernel_only() {
+        for kind in [
+            "budget_granted",
+            "budget_reserved",
+            "budget_refused",
+            "budget_spent",
+        ] {
+            assert!(is_kernel_only(kind), "{kind} must be kernel-only");
+            assert!(is_reserved(kind), "a kernel-only kind is reserved too");
+        }
+        for kind in [
+            "run_started",
+            "run_finished",
+            "msg_user",
+            "model_response",
+            "tool_call",
+            "tool_result",
+            "note",
+            "budget",
+            "",
+        ] {
+            assert!(!is_kernel_only(kind), "{kind} must not be kernel-only");
+        }
+    }
+
+    #[test]
+    fn budget_kinds_require_their_amounts() {
+        for event in [
+            json!({ "kind": "budget_granted", "amount": 100 }),
+            json!({ "kind": "budget_granted", "amount": 100, "tag": "tokens", "desc": "one run" }),
+            json!({ "kind": "budget_reserved", "amount": 12, "tag": "tokens" }),
+            json!({ "kind": "budget_spent", "amount": 3 }),
+            json!({ "kind": "budget_refused", "amount": 40, "remaining": 7 }),
+        ] {
+            validate_event(&obj(event.clone())).unwrap_or_else(|e| panic!("{event}: {e}"));
+        }
+
+        let err = validate_event(&obj(json!({ "kind": "budget_reserved" })))
+            .expect_err("amount is required");
+        assert!(err.reason().contains("amount"), "{err}");
+
+        // A refusal without the balance it refused against is half a fact.
+        let err = validate_event(&obj(json!({ "kind": "budget_refused", "amount": 5 })))
+            .expect_err("remaining is required");
+        assert!(err.reason().contains("remaining"), "{err}");
+
+        let err = validate_event(&obj(json!({ "kind": "budget_spent", "amount": "lots" })))
+            .expect_err("amount must be a number");
+        assert!(err.reason().contains("whole number"), "{err}");
+    }
+
+    /// Validation is about shape only: `run_*` and `model_response` are as
+    /// acceptable from a caller as from the kernel, because a hand-written
+    /// one moves no state — the run scope is the `closed` flag, and a
+    /// session holds only its own events, so the usage fold has nothing
+    /// foreign to count.  The `budget_*` kinds are the exception, and they
+    /// are stopped by [`is_kernel_only`] on the append path rather than
+    /// here: their shape is fine, it is the authorship that is not.
     #[test]
     fn the_kinds_the_kernel_writes_are_valid_from_either_side() {
         for event in [

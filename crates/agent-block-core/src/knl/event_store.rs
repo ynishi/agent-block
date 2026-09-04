@@ -348,22 +348,22 @@ mod tests {
         assert_eq!(first.seq, 1);
 
         // The same "expect empty" now conflicts: the head is 1, not empty.
-        let err = store
-            .append_if_head(ev(2), 0)
-            .expect_err("no longer empty");
+        let err = store.append_if_head(ev(2), 0).expect_err("no longer empty");
         assert!(err.reason().contains("head conflict"), "{err}");
         assert!(err.reason().contains("expected 0"), "{err}");
         assert!(err.reason().contains("actual Some(1)"), "{err}");
-        assert_eq!(store.len().expect("len"), 1, "the conflicting append did not happen");
+        assert_eq!(
+            store.len().expect("len"),
+            1,
+            "the conflicting append did not happen"
+        );
 
         // Matching the real head succeeds and advances it.
         let second = store.append_if_head(ev(2), 1).expect("head matches");
         assert_eq!(second.seq, 2);
 
         // A wrong (non-zero) expectation conflicts and reports both sides.
-        let err = store
-            .append_if_head(ev(3), 5)
-            .expect_err("stale head");
+        let err = store.append_if_head(ev(3), 5).expect_err("stale head");
         assert!(err.reason().contains("expected 5"), "{err}");
         assert!(err.reason().contains("actual Some(2)"), "{err}");
         assert_eq!(store.len().expect("len"), 2, "no append on conflict");
@@ -469,10 +469,7 @@ mod tests {
         }
 
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(Tag("first")), Arc::new(Tag("second"))];
-        let out = apply_upcasters(
-            &chain,
-            vec![json!({ "kind": "x" }), json!({ "kind": "y" })],
-        );
+        let out = apply_upcasters(&chain, vec![json!({ "kind": "x" }), json!({ "kind": "y" })]);
         assert_eq!(out[0]["trace"], json!(["first", "second"]));
         assert_eq!(out[1]["trace"], json!(["first", "second"]));
     }
@@ -547,7 +544,11 @@ mod tests {
         store.append(ev(1)).expect("append");
         let read = store.read(0, usize::MAX).expect("read");
         assert_eq!(read.len(), 1);
-        assert_eq!(kind_of(&read[0]), "e1", "the event passes through unchanged");
+        assert_eq!(
+            kind_of(&read[0]),
+            "e1",
+            "the event passes through unchanged"
+        );
         assert!(
             read[0].get("trace").is_none(),
             "an empty chain adds nothing: {}",

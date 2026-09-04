@@ -25,34 +25,49 @@
 //! - **Scope is the session.**  There is no per-event author.  The session
 //!   carries one `owner` (a principal id, or the reserved "anon" /
 //!   "system"), read with `s:owner()`, and holds only its own events — so
-//!   `view("usage")`, the budget charge and the turn numbering key on the
-//!   `kind`: they count every `model_response`.  Appending a
-//!   `model_response` *is* the recorded, numbered, charged call, and
-//!   appending a `run_finished` records a line without ending a run that
-//!   only `close` can end.
-//! - **I3 budget monotonicity.**  `spend(n)` accepts non-negative whole
-//!   amounts only and the balance can only decrease (floored at `0`).
-//!   There is no API to raise or reset it.
+//!   `view("usage")` and the turn numbering key on the `kind`: they count
+//!   every `model_response`.  Appending a `model_response` records and
+//!   numbers it, and appending a `run_finished` records a line without
+//!   ending a run that only `close` can end.
+//! - **I3 budget monotonicity.**  The budget is a quota an owner grants
+//!   the run, not a ledger of what it used.  `reserve(n)` asks *before*
+//!   spending — it deducts and returns `true`, or refuses with `false,
+//!   tag` and leaves the balance exactly as it was — and `spend(n)`
+//!   settles afterwards.  Both take non-negative whole amounts and the
+//!   balance can only decrease; there is no API to raise or reset it, and
+//!   no `append` moves it.  What a run actually consumed is
+//!   `view("usage")`, which is independent of the counter.
 //! - **I6 run scope.**  All state lives inside the userdata — no
 //!   module-level statics, no Lua globals — so two sessions are fully
-//!   independent.  `knl.open()` records `run_started` and
-//!   `close(reason?)` records `run_finished`, after which `append` /
-//!   `spend` are errors while reads keep working.
+//!   independent.  `knl.open()` records `run_started` — carrying the
+//!   grant, so the log says what was allowed — and the run is closed by
+//!   `run_finished`, after which `append` / `reserve` / `spend` are errors
+//!   while reads keep working.  Three paths reach that boundary and the
+//!   log never loses it: `close(reason?)` said explicitly; a
+//!   `local s <close> = knl.open{...}` scope ending, which records
+//!   `scope_exit` — or `error` with the message in `detail` when the block
+//!   raised; and the drop backstop, `dropped`, for a handle nobody closed.
+//!   Whichever runs first wins and the rest are no-ops, because `close`
+//!   is idempotent — so an explicit reason is never overwritten by the
+//!   scope or the collector that follows it.
 //! - **K2 model call.**  There is no composite call and the session keeps
-//!   no backend of its own.  The driver calls the backend itself and
-//!   appends the `model_response` directly; that one append is the
-//!   recorded, numbered and charged call.
+//!   no backend of its own.  The driver reserves what it estimates the
+//!   call will cost, calls the backend itself, appends the
+//!   `model_response`, and settles the difference with `spend`.
 //!
 //! ```lua
 //! local s = knl.open({
 //!     owner  = "user-42",              -- default: the reserved "anon"
-//!     budget = { tokens = 10000 },
+//!     budget = { amount = 10000, tag = "tokens" },
 //! })
 //! s:append({ kind = "msg_user", content = "hi" })
-//! -- Drive the beat yourself: call the backend, append the response,
-//! -- then read the kernel-assigned turn back.
+//! -- Drive the beat yourself: ask for the estimate first, call the
+//! -- backend, append the response, then settle what it really cost.
+//! local ok, tag = s:reserve(est)
+//! if not ok then return { budget_stopped = true, tag = tag } end
 //! s:append({ kind = "model_response", content = blocks, usage = u })
 //! local turn = s:turns()                 -- the kernel-assigned turn
+//! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
 //! local usage  = s:view("usage")         -- token totals + `at_seq`
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
@@ -101,12 +116,69 @@ impl Session {
         }
     }
 
-    /// Open a run for `owner` with an optional token budget, on the
+    /// Open a run for `owner` with an optional budget grant, on the
     /// in-memory store.
-    fn new(owner: String, budget_tokens: Option<i64>) -> LuaResult<Self> {
-        let state = knl::Session::new(owner, budget_tokens).map_err(|e| err("open", e))?;
+    fn new(owner: String, grant: Option<knl::BudgetGrant>) -> LuaResult<Self> {
+        let state = knl::Session::new(owner, grant).map_err(|e| err("open", e))?;
         Ok(Self::from_state(state))
     }
+}
+
+/// The backstop under `close` and `<close>`: a handle nobody ended still
+/// records the run's boundary, here, where the value dies.
+///
+/// A dropped handle is the one close path with no caller left to tell, so
+/// it cannot fail loudly the way the other two do: a failed append is a
+/// `warn!` and nothing else.  Panicking in `drop` would abort the process
+/// (a Lua collection cycle is not a place to unwind from), and a run
+/// already past its last reader is not worth that.  What the boundary
+/// costs is one line in the log; what it buys is a resumed or audited
+/// stream that is not silently open forever.
+impl Drop for Session {
+    fn drop(&mut self) {
+        // `try_borrow_mut`, not `borrow_mut`: a panic unwinding out of a
+        // method leaves the borrow live, and this runs during that unwind.
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            tracing::warn!("knl: session dropped while borrowed; run_finished was not recorded");
+            return;
+        };
+        if state.is_closed() {
+            return;
+        }
+        if let Err(e) = state.close(Some(knl::CLOSE_REASON_DROPPED)) {
+            tracing::warn!(
+                session = %state.id(),
+                error = %e,
+                "knl: dropped session could not record run_finished"
+            );
+        }
+    }
+}
+
+/// The longest `detail` a close records, in characters.
+///
+/// A `run_finished` says why a run ended, and an error message can be a
+/// whole traceback; the cap keeps one bad turn from putting a page into the
+/// log.  Counted in `chars` so the cut never lands inside one.
+const DETAIL_MAX_CHARS: usize = 200;
+
+/// The error a `<close>` scope was unwinding with, as `detail` text.
+///
+/// Read without re-entering Lua (no `__tostring` call): the value arrives
+/// while the VM is already unwinding, and a metamethod raising there would
+/// replace the error the log is trying to record.
+fn error_detail(error: &LuaValue) -> String {
+    let text = match error {
+        LuaValue::String(s) => s.to_string_lossy(),
+        LuaValue::Error(e) => e.to_string(),
+        LuaValue::Integer(i) => i.to_string(),
+        LuaValue::Number(n) => n.to_string(),
+        other => format!("<{}>", other.type_name()),
+    };
+    if text.chars().count() <= DETAIL_MAX_CHARS {
+        return text;
+    }
+    text.chars().take(DETAIL_MAX_CHARS).collect::<String>() + "..."
 }
 
 /// The `knl: <method>: <reason>` attribution, as text.
@@ -191,10 +263,11 @@ impl LuaUserData for Session {
         // s:append(event) -> seq
         //
         // K1: the only way to add to the history, and there is no way to
-        // change what is already in it.  A `model_response` is more than a
-        // record: appending one numbers it (the kernel's turn, overwriting
-        // any the caller supplied) and charges its usage against the
-        // budget.  Read the number back with `s:turns()`.
+        // change what is already in it.  Appending a `model_response`
+        // numbers it (the kernel's turn, overwriting any the caller
+        // supplied); read the number back with `s:turns()`.  No append
+        // touches the budget — that is `reserve` before the call and
+        // `spend` after it.
         methods.add_method("append", |lua, this, event: LuaValue| {
             let obj = table_to_object(lua, "append", "event", event)?;
             this.state
@@ -256,9 +329,39 @@ impl LuaUserData for Session {
             json_to_lua(lua, value)
         });
 
+        // s:reserve(n) -> true | false, tag
+        //
+        // K4, the decision point: ask before spending.  `true` means the
+        // amount was taken off the balance; `false` means it would not fit
+        // and *nothing* was taken, with the grant's `tag` as the second
+        // return so a caller can name the allowance that stopped it
+        // without reading the log.  Always `true` without a budget.
+        methods.add_method("reserve", |_, this, amount: LuaValue| {
+            let Some(amount) = as_whole(&amount) else {
+                return Err(err(
+                    "reserve",
+                    format!(
+                        "amount must be a non-negative whole number, got {}",
+                        lua_value_for_msg(&amount)
+                    ),
+                ));
+            };
+            let mut state = this.state.borrow_mut();
+            let granted = state.reserve(amount).map_err(|e| err("reserve", e))?;
+            // The tag rides along only on a refusal: it answers "which
+            // budget stopped you", which is a question only then.
+            let tag = if granted {
+                None
+            } else {
+                state.grant().and_then(|grant| grant.tag.clone())
+            };
+            Ok((granted, tag))
+        });
+
         // s:spend(n) -> remaining (nil when the session has no budget)
         //
-        // K4: non-negative amounts only, and the balance never rises.
+        // K4: the settlement after a reservation.  Non-negative amounts
+        // only, and the balance never rises.
         methods.add_method("spend", |_, this, amount: LuaValue| {
             let Some(amount) = as_whole(&amount) else {
                 return Err(err(
@@ -313,11 +416,69 @@ impl LuaUserData for Session {
                 .map_err(|e| err("close", e))?;
             Ok(())
         });
+
+        // __close(self, err) — the Lua 5.4 to-be-closed variable:
+        //
+        //     do
+        //         local s <close> = knl.open({ owner = "u" })
+        //         ...
+        //     end   -- the run's boundary is recorded here
+        //
+        // The reason says how the scope ended, not what went wrong: a clean
+        // exit is "scope_exit", an unwinding one "error", with the message
+        // in `detail`.  Folding the message into the reason would make every
+        // distinct failure its own reason and the vocabulary unreadable.
+        //
+        // An explicit `close` earlier in the block already ended the run, and
+        // this is a no-op then: the caller's reason is the one in the log.
+        // A failed append surfaces as an error, exactly as it does from
+        // `close` — Lua 5.4 propagates it out of the scope — because a close
+        // that reports success with no `run_finished` recorded is the one
+        // outcome the boundary exists to rule out.
+        methods.add_meta_method(LuaMetaMethod::Close, |_, this, error: LuaValue| {
+            if this.state.borrow().is_closed() {
+                return Ok(());
+            }
+            // Computed before the borrow: nothing about the error value is
+            // read while the session is held.
+            let (reason, detail) = match error {
+                LuaValue::Nil => (knl::CLOSE_REASON_SCOPE_EXIT, None),
+                error => (knl::CLOSE_REASON_ERROR, Some(error_detail(&error))),
+            };
+            this.state
+                .borrow_mut()
+                .close_with(Some(reason), detail.as_deref())
+                .map_err(|e| err("close", e))?;
+            Ok(())
+        });
     }
 }
 
-/// Read `opts.budget.tokens` into the initial balance.
-fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<i64>> {
+/// The fields a `budget` table may carry.  Anything else is a typo, and a
+/// typo in a quota must not be read as "no limit on that axis".
+const BUDGET_FIELDS: [&str; 3] = ["amount", "tag", "desc"];
+
+/// Read an optional string field of the `budget` table.
+fn budget_string(budget: &LuaTable, field: &str) -> LuaResult<Option<String>> {
+    let value: LuaValue = budget.get(field)?;
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(s) => Ok(Some(s.to_str()?.to_string())),
+        other => Err(err(
+            "session",
+            format!("budget.{field} must be a string, got {}", other.type_name()),
+        )),
+    }
+}
+
+/// Read `opts.budget` into the run's grant: `{ amount, tag?, desc? }`.
+///
+/// `amount` is the quota and the only field the kernel interprets; `tag`
+/// names its unit and `desc` records what was allowed and why, both of
+/// which ride onto `run_started` verbatim.  An unknown field is an error
+/// rather than a value quietly ignored: a misspelt cap that reads as
+/// "no cap" is exactly the failure a budget exists to prevent.
+fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> {
     let Some(opts) = opts else {
         return Ok(None);
     };
@@ -332,22 +493,46 @@ fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<i64>> {
             ));
         }
     };
-    let tokens: LuaValue = budget.get("tokens")?;
-    if matches!(tokens, LuaValue::Nil) {
+
+    for pair in budget.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let LuaValue::String(name) = &key else {
+            return Err(err(
+                "session",
+                format!("budget fields must be named, got a {}", key.type_name()),
+            ));
+        };
+        let name = name.to_str()?.to_string();
+        if !BUDGET_FIELDS.contains(&name.as_str()) {
+            return Err(err(
+                "session",
+                format!("unknown budget field {name:?} (expected amount / tag / desc)"),
+            ));
+        }
+    }
+
+    let amount: LuaValue = budget.get("amount")?;
+    if matches!(amount, LuaValue::Nil) {
         return Err(err(
             "session",
-            "budget.tokens is required (non-negative whole number)",
+            "budget.amount is required (non-negative whole number)",
         ));
     }
-    as_whole_non_negative(&tokens).map(Some).ok_or_else(|| {
-        err(
+    let Some(amount) = as_whole_non_negative(&amount) else {
+        return Err(err(
             "session",
             format!(
-                "budget.tokens must be a non-negative whole number, got {}",
-                lua_value_for_msg(&tokens)
+                "budget.amount must be a non-negative whole number, got {}",
+                lua_value_for_msg(&amount)
             ),
-        )
-    })
+        ));
+    };
+
+    Ok(Some(knl::BudgetGrant {
+        amount,
+        tag: budget_string(&budget, "tag")?,
+        desc: budget_string(&budget, "desc")?,
+    }))
 }
 
 /// Read `opts.owner`: the principal the session belongs to.
@@ -418,7 +603,10 @@ fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
                 )),
                 other => Err(err(
                     method,
-                    format!("store.sqlite must be a string path, got {}", other.type_name()),
+                    format!(
+                        "store.sqlite must be a string path, got {}",
+                        other.type_name()
+                    ),
                 )),
             }
         }
@@ -438,12 +626,12 @@ fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
 /// id `knl.open` reports (`s:id()`) is exactly the stream a later
 /// `knl.resume` reopens — the durable identity is one string, not two.
 #[cfg(feature = "sqlite")]
-fn open_sqlite(owner: String, budget_tokens: Option<i64>, path: &str) -> LuaResult<Session> {
+fn open_sqlite(owner: String, grant: Option<knl::BudgetGrant>, path: &str) -> LuaResult<Session> {
     let stream = uuid::Uuid::new_v4().to_string();
     let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone())
         .map_err(|e| err("open", e))?;
     let mut state =
-        knl::Session::open_on(owner, budget_tokens, Box::new(store)).map_err(|e| err("open", e))?;
+        knl::Session::open_on(owner, grant, Box::new(store)).map_err(|e| err("open", e))?;
     state.adopt_id(stream);
     Ok(Session::from_state(state))
 }
@@ -451,7 +639,11 @@ fn open_sqlite(owner: String, budget_tokens: Option<i64>, path: &str) -> LuaResu
 /// Without the `sqlite` feature a durable store cannot be built, so the
 /// request is a clear error rather than a silent fall back to memory.
 #[cfg(not(feature = "sqlite"))]
-fn open_sqlite(_owner: String, _budget_tokens: Option<i64>, _path: &str) -> LuaResult<Session> {
+fn open_sqlite(
+    _owner: String,
+    _grant: Option<knl::BudgetGrant>,
+    _path: &str,
+) -> LuaResult<Session> {
     Err(err(
         "open",
         "a sqlite store needs the 'sqlite' feature, which this build does not have",
@@ -463,10 +655,14 @@ fn open_sqlite(_owner: String, _budget_tokens: Option<i64>, _path: &str) -> LuaR
 /// `Session::resume` re-folds the persisted log; the reopened stream's id is
 /// adopted so `s:id()` matches the stream the caller named.
 #[cfg(feature = "sqlite")]
-fn resume_sqlite(budget_tokens: Option<i64>, path: &str, session_id: String) -> LuaResult<Session> {
+fn resume_sqlite(
+    grant: Option<knl::BudgetGrant>,
+    path: &str,
+    session_id: String,
+) -> LuaResult<Session> {
     let store = knl::SqliteEventStore::open(std::path::Path::new(path), session_id.clone())
         .map_err(|e| err("resume", e))?;
-    let mut state = knl::Session::resume(budget_tokens, Box::new(store)).map_err(|e| err("resume", e))?;
+    let mut state = knl::Session::resume(grant, Box::new(store)).map_err(|e| err("resume", e))?;
     // The open path refuses an untrusted caller claiming a reserved
     // principal (parse_owner); resume must hold the same line, or Lua could
     // reopen a SYSTEM-owned stream and write into the reserved namespace.
@@ -484,7 +680,11 @@ fn resume_sqlite(budget_tokens: Option<i64>, path: &str, session_id: String) -> 
 
 /// Without the `sqlite` feature there is no durable stream to resume.
 #[cfg(not(feature = "sqlite"))]
-fn resume_sqlite(_budget_tokens: Option<i64>, _path: &str, _session_id: String) -> LuaResult<Session> {
+fn resume_sqlite(
+    _grant: Option<knl::BudgetGrant>,
+    _path: &str,
+    _session_id: String,
+) -> LuaResult<Session> {
     Err(err(
         "resume",
         "a sqlite store needs the 'sqlite' feature, which this build does not have",
@@ -494,8 +694,9 @@ fn resume_sqlite(_budget_tokens: Option<i64>, _path: &str, _session_id: String) 
 /// Build a session userdata from `opts` — the body of `knl.open`.
 ///
 /// `opts.owner` is the principal (default the reserved anonymous id),
-/// `opts.budget` the token budget, and `opts.store` the backend (in-memory
-/// by default, or `{ sqlite = "<path>" }` for a durable stream).
+/// `opts.budget` the grant (`{ amount, tag?, desc? }`), and `opts.store`
+/// the backend (in-memory by default, or `{ sqlite = "<path>" }` for a
+/// durable stream).
 fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
         LuaValue::Nil => None,
@@ -508,10 +709,10 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
         }
     };
     let owner = parse_owner(opts.as_ref())?;
-    let budget_tokens = parse_budget(opts.as_ref())?;
+    let grant = parse_budget(opts.as_ref())?;
     let session = match parse_store("open", opts.as_ref())? {
-        StoreSpec::Mem => Session::new(owner, budget_tokens)?,
-        StoreSpec::Sqlite(path) => open_sqlite(owner, budget_tokens, &path)?,
+        StoreSpec::Mem => Session::new(owner, grant)?,
+        StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path)?,
     };
     lua.create_userdata(session)
 }
@@ -519,17 +720,16 @@ fn open_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
 /// Resume a persisted session — the body of `knl.resume`.
 ///
 /// Requires `opts.store = { sqlite = "<path>" }` and `opts.session =
-/// "<stream id>"`; `opts.budget` is an optional fresh cap on the resumed
-/// run.  The returned userdata is the same one `knl.open` returns, only
-/// pre-loaded with the recorded turn count and spent budget.
+/// "<stream id>"`.  `opts.budget` is optional and means the owner grants
+/// *again*: it is recorded and added to the balance the log already
+/// carries, rather than replacing it.  The returned userdata is the same
+/// one `knl.open` returns, only pre-loaded with the recorded turn count
+/// and the balance folded from the ledger.
 fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
     let opts = match opts {
         LuaValue::Table(t) => t,
         LuaValue::Nil => {
-            return Err(err(
-                "resume",
-                "opts must be a table with store and session",
-            ));
+            return Err(err("resume", "opts must be a table with store and session"));
         }
         other => {
             return Err(err(
@@ -538,7 +738,7 @@ fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
             ));
         }
     };
-    let budget_tokens = parse_budget(Some(&opts))?;
+    let grant = parse_budget(Some(&opts))?;
     let path = match parse_store("resume", Some(&opts))? {
         StoreSpec::Sqlite(path) => path,
         StoreSpec::Mem => {
@@ -564,7 +764,7 @@ fn resume_session(lua: &Lua, opts: LuaValue) -> LuaResult<LuaAnyUserData> {
             ));
         }
     };
-    let state = resume_sqlite(budget_tokens, &path, session_id)?;
+    let state = resume_sqlite(grant, &path, session_id)?;
     lua.create_userdata(state)
 }
 
@@ -781,7 +981,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { tokens = 100 } })
+            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
             s:spend(-1)
         "#,
         );
@@ -790,7 +990,7 @@ mod tests {
 
         lua.load(
             r#"
-            local s = knl.open({ budget = { tokens = 100 } })
+            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
             pcall(function() s:spend(-1) end)
             assert(s:remaining() == 100, "balance changed: " .. tostring(s:remaining()))
             -- A negative spend is rejected even without a budget.
@@ -813,7 +1013,7 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ budget = { tokens = 1000 } })
+            local s = knl.open({ budget = { amount = 1000, tag = "tokens" } })
             assert(s:remaining() == 1000)
             assert(s:exhausted() == false)
 
@@ -866,13 +1066,47 @@ mod tests {
     fn session_validates_budget_options() {
         let lua = vm();
 
-        let msg = expect_err(&lua, r#"knl.open({ budget = { tokens = -1 } })"#);
+        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = -1 } })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
-        assert!(msg.contains("budget.tokens"), "{msg}");
+        assert!(msg.contains("budget.amount"), "{msg}");
 
         let msg = expect_err(&lua, r#"knl.open({ budget = {} })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
         assert!(msg.contains("required"), "{msg}");
+
+        // A misspelt field is an error, not a silently ignored cap: the
+        // failure a budget exists to prevent is exactly "the limit I set
+        // was not read".
+        let msg = expect_err(&lua, r#"knl.open({ budget = { tokens = 100 } })"#);
+        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
+        assert!(msg.contains("unknown budget field"), "{msg}");
+        assert!(msg.contains("tokens"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = 10, tag = 7 } })"#);
+        assert!(msg.contains("budget.tag must be a string"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.open({ budget = { amount = 1.5 } })"#);
+        assert!(msg.contains("budget.amount"), "{msg}");
+
+        // The words are optional, and carried verbatim when given.
+        lua.load(
+            r#"
+            local s = knl.open({ budget = { amount = 42, tag = "tokens",
+                                            desc = "one nightly run" } })
+            assert(s:remaining() == 42, "remaining: " .. tostring(s:remaining()))
+            local granted = s:events()[2]
+            assert(granted.kind == "budget_granted", "kind: " .. tostring(granted.kind))
+            assert(granted.amount == 42 and granted.tag == "tokens")
+            assert(granted.desc == "one nightly run", "desc: " .. tostring(granted.desc))
+
+            local bare = knl.open({ budget = { amount = 7 } })
+            local g2 = bare:events()[2]
+            assert(g2.amount == 7 and g2.tag == nil and g2.desc == nil,
+                   "a grant with no words must invent none")
+        "#,
+        )
+        .exec()
+        .expect("grant options chunk");
 
         let msg = expect_err(&lua, r#"knl.open({ budget = 100 })"#);
         assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
@@ -890,8 +1124,8 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local a = knl.open({ budget = { tokens = 100 } })
-            local b = knl.open({ budget = { tokens = 100 } })
+            local a = knl.open({ budget = { amount = 100, tag = "tokens" } })
+            local b = knl.open({ budget = { amount = 100, tag = "tokens" } })
 
             assert(type(a:id()) == "string" and #a:id() > 0, "id must be a non-empty string")
             assert(a:id() ~= b:id(), "session ids must be unique")
@@ -899,13 +1133,15 @@ mod tests {
             a:append({ kind = "only_in_a" })
             a:spend(60)
 
-            assert(a:len() == 2 and b:len() == 1, "history leaked between sessions")
-            assert(#b:events(2) == 0, "b holds only its own run_started")
+            -- a: run_started, budget_granted, only_in_a, budget_spent.
+            -- b: run_started, budget_granted.
+            assert(a:len() == 4 and b:len() == 2, "history leaked between sessions")
+            assert(#b:events(3) == 0, "b holds only its own opening")
             assert(a:remaining() == 40 and b:remaining() == 100, "budget leaked between sessions")
 
             -- Closing one leaves the other usable.
             a:close()
-            assert(b:append({ kind = "still_open" }) == 2)
+            assert(b:append({ kind = "still_open" }) == 3)
         "#,
         )
         .exec()
@@ -932,7 +1168,7 @@ mod tests {
         let msg = expect_err(
             &lua,
             r#"
-            local s = knl.open({ budget = { tokens = 10 } })
+            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
             s:close()
             s:spend(1)
         "#,
@@ -940,17 +1176,30 @@ mod tests {
         assert!(msg.contains("knl: spend:"), "missing attribution: {msg}");
         assert!(msg.contains("session is closed"), "{msg}");
 
+        // A closed run cannot be granted more either.
+        let msg = expect_err(
+            &lua,
+            r#"
+            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            s:close()
+            s:reserve(1)
+        "#,
+        );
+        assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
+        assert!(msg.contains("session is closed"), "{msg}");
+
         lua.load(
             r#"
-            local s = knl.open({ budget = { tokens = 10 } })
+            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
             s:append({ kind = "before_close" })
             s:spend(4)
             s:close()
             s:close() -- idempotent
 
             -- Reads still work after the run scope ends.
-            assert(s:len() == 3, "run_started + before_close + run_finished")
-            assert(s:events()[2].kind == "before_close")
+            assert(s:len() == 5,
+                   "run_started + budget_granted + before_close + budget_spent + run_finished")
+            assert(s:events()[3].kind == "before_close")
             assert(s:remaining() == 6)
             assert(s:exhausted() == false)
             assert(type(s:id()) == "string")
@@ -1071,6 +1320,158 @@ mod tests {
         .expect("reserved kind chunk");
     }
 
+    /// The budget ledger is the kernel's: Lua can read those events but not
+    /// write them.  Appending one by hand would be granting yourself the
+    /// quota your owner set, so it is refused and the balance does not
+    /// move.
+    #[test]
+    fn lua_cannot_append_the_budget_kinds_by_hand() {
+        let lua = vm();
+
+        let msg = expect_err(
+            &lua,
+            r#"
+            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            s:append({ kind = "budget_reserved", amount = 5 })
+        "#,
+        );
+        assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
+        assert!(msg.contains("kernel only"), "{msg}");
+        assert!(msg.contains("budget_reserved"), "{msg}");
+
+        lua.load(
+            r#"
+            local s = knl.open({ budget = { amount = 10, tag = "tokens" } })
+            for _, ev in ipairs({
+                { kind = "budget_granted", amount = 1000000 },
+                { kind = "budget_reserved", amount = 5 },
+                { kind = "budget_refused", amount = 5, remaining = 0 },
+                { kind = "budget_spent", amount = 5 },
+            }) do
+                local ok = pcall(function() s:append(ev) end)
+                assert(not ok, "a caller wrote " .. ev.kind)
+            end
+
+            assert(s:len() == 2, "a rejected budget event was recorded: " .. tostring(s:len()))
+            assert(s:remaining() == 10, "a forged event moved the balance")
+
+            -- Reading them is fine: the kernel's own writes are in the log
+            -- like everything else.
+            s:reserve(4)
+            local evs = s:events()
+            assert(evs[3].kind == "budget_reserved" and evs[3].amount == 4,
+                   "the kernel's own reservation is readable")
+        "#,
+        )
+        .exec()
+        .expect("kernel-only kind chunk");
+    }
+
+    /// (K4) `reserve` is the decision point: it takes what fits, refuses
+    /// what does not without moving the balance, and names the grant when
+    /// it refuses.  Every answer is a fact in the log.
+    #[test]
+    fn reserve_grants_refuses_and_records_both() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
+
+            local ok, tag = s:reserve(30)
+            assert(ok == true, "a covered reservation must be granted")
+            assert(tag == nil, "a granted reservation names no budget")
+            assert(s:remaining() == 70, "remaining: " .. tostring(s:remaining()))
+
+            local ok2, tag2 = s:reserve(1000)
+            assert(ok2 == false, "an uncovered reservation must be refused")
+            assert(tag2 == "tokens", "a refusal must name the budget: " .. tostring(tag2))
+            assert(s:remaining() == 70, "a refusal must not deduct")
+            assert(s:exhausted() == false, "a refusal must not exhaust")
+
+            -- Both answers are in the log, with what was asked for.
+            local evs = s:events()
+            assert(evs[3].kind == "budget_reserved" and evs[3].amount == 30)
+            assert(evs[3].tag == "tokens")
+            assert(evs[4].kind == "budget_refused" and evs[4].amount == 1000)
+            assert(evs[4].remaining == 70, "the refusal records what there was")
+
+            -- Exactly the balance is coverable, and zero always is.
+            assert(s:reserve(70) == true)
+            assert(s:remaining() == 0 and s:exhausted() == true)
+            assert(s:reserve(0) == true, "zero fits even at zero")
+            assert(s:reserve(1) == false, "nothing fits past zero")
+        "#,
+        )
+        .exec()
+        .expect("reserve chunk");
+
+        // Without a budget every reservation is granted, and nothing is
+        // recorded: a run with no quota keeps no ledger.
+        lua.load(
+            r#"
+            local s = knl.open()
+            local ok, tag = s:reserve(999999)
+            assert(ok == true and tag == nil, "no budget must grant everything")
+            assert(s:len() == 1, "a run with no quota recorded a ledger event")
+        "#,
+        )
+        .exec()
+        .expect("no-budget reserve chunk");
+
+        let msg = expect_err(
+            &lua,
+            r#"knl.open({ budget = { amount = 10 } }):reserve(-1)"#,
+        );
+        assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
+        assert!(msg.contains("non-negative"), "{msg}");
+
+        let msg = expect_err(&lua, r#"knl.open():reserve("many")"#);
+        assert!(msg.contains("knl: reserve:"), "missing attribution: {msg}");
+    }
+
+    /// The counter is a cache of the log: folding `granted − reserved −
+    /// spent` over what Lua can read reproduces `remaining()` exactly.
+    #[test]
+    fn the_balance_lua_reads_is_the_fold_of_the_ledger() {
+        let lua = vm();
+        lua.load(
+            r#"
+            local function folded(s)
+                local balance = nil
+                for _, ev in ipairs(s:events()) do
+                    if ev.kind == "budget_granted" then
+                        balance = (balance or 0) + ev.amount
+                    elseif ev.kind == "budget_reserved" or ev.kind == "budget_spent" then
+                        balance = math.max(0, balance - ev.amount)
+                    end
+                end
+                return balance
+            end
+
+            local s = knl.open({ budget = { amount = 500, tag = "tokens" } })
+            assert(folded(s) == s:remaining())
+
+            s:reserve(120)
+            s:append({ kind = "model_response",
+                       content = { { type = "text", text = "hi" } },
+                       usage = { input_tokens = 100, output_tokens = 50 } })
+            s:spend(30)          -- the call overran its estimate
+            s:reserve(10000)     -- refused, and moves nothing
+            s:spend(0)
+
+            assert(s:remaining() == 350, "remaining: " .. tostring(s:remaining()))
+            assert(folded(s) == s:remaining(), "the fold and the counter disagree")
+
+            -- The usage view is the other, independent reading.
+            local u = s:view("usage")
+            assert(u.input_tokens == 100 and u.output_tokens == 50)
+            assert(u.model_calls == 1)
+        "#,
+        )
+        .exec()
+        .expect("fold chunk");
+    }
+
     /// The run scope is `close`, not an event: appending `run_finished`
     /// writes a line and leaves the session open.
     #[test]
@@ -1078,18 +1479,19 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ budget = { tokens = 100 } })
+            local s = knl.open({ budget = { amount = 100, tag = "tokens" } })
             s:append({ kind = "run_finished", reason = "carried over" })
 
             -- Still open: the writes a closed run refuses both go through.
-            assert(s:append({ kind = "note" }) == 3, "the appended event ended the run")
+            assert(s:append({ kind = "note" }) == 4, "the appended event ended the run")
             assert(s:spend(10) == 90)
 
             s:close("done")
             local evs = s:events()
-            assert(kinds_of(s) == "run_started,run_finished,note,run_finished",
+            assert(kinds_of(s) ==
+                   "run_started,budget_granted,run_finished,note,budget_spent,run_finished",
                    "recorded: " .. kinds_of(s))
-            assert(evs[2].reason == "carried over" and evs[4].reason == "done",
+            assert(evs[3].reason == "carried over" and evs[6].reason == "done",
                    "both run_finished events are recorded, the appended one and the close")
 
             local ok = pcall(function() s:append({ kind = "note" }) end)
@@ -1185,10 +1587,10 @@ mod tests {
         let lua = vm();
         lua.load(
             r#"
-            local s = knl.open({ store = "mem", owner = "x", budget = { tokens = 10 } })
-            assert(s:len() == 1, "mem store opens like the default")
+            local s = knl.open({ store = "mem", owner = "x", budget = { amount = 10, tag = "tokens" } })
+            assert(s:len() == 2, "mem store opens like the default: run_started + the grant")
             assert(s:owner() == "x")
-            assert(s:append({ kind = "note" }) == 2)
+            assert(s:append({ kind = "note" }) == 3)
         "#,
         )
         .exec()
@@ -1237,8 +1639,10 @@ mod tests {
 
     /// (durable) `knl.open({ store = { sqlite = path } })` writes to a
     /// persisted stream, and `knl.resume` reopens it and re-folds the
-    /// record: owner, turn count, spent budget and the usage view all come
-    /// back, and new turns number and charge on from there.
+    /// record: owner, turn count, the balance the budget ledger implies and
+    /// the usage view all come back, and the resumed run carries on from
+    /// there.  A `budget` on resume is the owner granting again: recorded,
+    /// and added to what was left.
     #[cfg(feature = "sqlite")]
     #[test]
     fn open_and_resume_a_durable_sqlite_session() {
@@ -1250,23 +1654,26 @@ mod tests {
         lua.load(format!(
             r#"
             local path = "{path}"
-            local s = knl.open({{ store = {{ sqlite = path }},
-                                  owner = "durable-user", budget = {{ tokens = 100 }} }})
+            local s = knl.open({{ store = {{ sqlite = path }}, owner = "durable-user",
+                                  budget = {{ amount = 100, tag = "tokens" }} }})
+            s:reserve(30)
             s:append({{ kind = "model_response",
                         content = {{ {{ type = "text", text = "a" }} }},
                         usage = {{ input_tokens = 30 }} }})
             s:append({{ kind = "msg_user", content = "more" }})
+            s:reserve(15)
             s:append({{ kind = "model_response",
                         content = {{ {{ type = "text", text = "b" }} }},
                         usage = {{ input_tokens = 20 }} }})
+            s:spend(5)  -- the second call overran its estimate
             assert(s:turns() == 2, "open turns: " .. tostring(s:turns()))
             assert(s:remaining() == 50, "open remaining: " .. tostring(s:remaining()))
             local id = s:id()
             s:close()
 
-            -- Reopen the same stream and continue where it left off.
-            local r = knl.resume({{ store = {{ sqlite = path }},
-                                    session = id, budget = {{ tokens = 100 }} }})
+            -- Reopen the same stream and continue where it left off.  No new
+            -- grant: the balance is what the ledger says was left.
+            local r = knl.resume({{ store = {{ sqlite = path }}, session = id }})
             assert(r:owner() == "durable-user", "resumed owner: " .. tostring(r:owner()))
             assert(r:turns() == 2, "resumed turns: " .. tostring(r:turns()))
             assert(r:remaining() == 50, "resumed remaining: " .. tostring(r:remaining()))
@@ -1275,12 +1682,28 @@ mod tests {
             assert(u.model_calls == 2, "resumed usage model_calls: " .. tostring(u.model_calls))
             assert(u.input_tokens == 50, "resumed usage input_tokens: " .. tostring(u.input_tokens))
 
-            -- Numbering and accounting continue on the resumed session.
+            -- The grant's words came back too: a refusal still names it.
+            local ok, tag = r:reserve(1000)
+            assert(ok == false and tag == "tokens", "refused tag: " .. tostring(tag))
+
+            -- Numbering and the ledger continue on the resumed session.
+            r:reserve(5)
             r:append({{ kind = "model_response",
                         content = {{ {{ type = "text", text = "c" }} }},
                         usage = {{ input_tokens = 5 }} }})
             assert(r:turns() == 3, "continued turns: " .. tostring(r:turns()))
             assert(r:remaining() == 45, "continued remaining: " .. tostring(r:remaining()))
+            r:close()
+
+            -- Granting again on resume adds to what is left, and is recorded.
+            local g = knl.resume({{ store = {{ sqlite = path }}, session = id,
+                                    budget = {{ amount = 100, tag = "tokens",
+                                                desc = "a second run" }} }})
+            assert(g:remaining() == 145, "re-granted remaining: " .. tostring(g:remaining()))
+            local evs = g:events()
+            local last = evs[#evs]
+            assert(last.kind == "budget_granted", "last event: " .. tostring(last.kind))
+            assert(last.amount == 100 and last.desc == "a second run")
         "#
         ))
         .exec()
@@ -1302,16 +1725,22 @@ mod tests {
         // The host side (Rust) legitimately opens a SYSTEM-owned stream.
         let stream = "system-stream".to_string();
         let store = crate::knl::SqliteEventStore::open(&path, stream.clone()).expect("open store");
-        let state = crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
-            .expect("open system session");
+        let state =
+            crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
+                .expect("open system session");
         drop(state);
 
         // Lua resuming it is refused, exactly as claiming SYSTEM at open is.
         let msg = expect_err(
             &lua,
-            &format!(r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}" }})"#),
+            &format!(
+                r#"knl.resume({{ store = {{ sqlite = "{path_str}" }}, session = "{stream}" }})"#
+            ),
         );
-        assert!(msg.contains("reserved"), "must name the reserved owner: {msg}");
+        assert!(
+            msg.contains("reserved"),
+            "must name the reserved owner: {msg}"
+        );
     }
 
     /// (attribution) resume needs a sqlite store and a session id; each
@@ -1331,5 +1760,158 @@ mod tests {
         let msg = expect_err(&lua, r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
         assert!(msg.contains("session is required"), "{msg}");
+    }
+
+    // -- run scope: `<close>` and the drop backstop ------------------------
+    //
+    // Every one of these reads the boundary back out of a *reopened* SQLite
+    // stream rather than off the handle that wrote it: the question is
+    // whether the record landed, and only the durable log answers that.
+
+    /// The persisted events of `stream`, read through a fresh connection.
+    #[cfg(feature = "sqlite")]
+    fn persisted(path: &std::path::Path, stream: &str) -> Vec<Value> {
+        use crate::knl::EventStore;
+
+        let store = crate::knl::SqliteEventStore::open(path, stream).expect("reopen the stream");
+        store.read(0, usize::MAX).expect("read the stream")
+    }
+
+    /// Run `chunk` in a fresh VM and return the session id it yields.
+    ///
+    /// The VM is dropped before the caller reads the stream, so anything the
+    /// collector still owed has been paid by the time the log is inspected.
+    #[cfg(feature = "sqlite")]
+    fn stream_id_from(chunk: String) -> String {
+        let lua = vm();
+        lua.load(chunk).eval::<String>().expect("run scope chunk")
+    }
+
+    /// (I6) A `<close>` scope that ends cleanly records the run's boundary
+    /// with `scope_exit`: the shell no longer has to remember to close.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_close_scope_records_the_boundary_on_the_way_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        let id = stream_id_from(format!(
+            r#"
+            local id
+            do
+                local s <close> = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})
+                id = s:id()
+                s:append({{ kind = "note" }})
+                assert(s:len() == 2, "inside the scope: run_started + note")
+            end
+            return id
+        "#
+        ));
+
+        let log = persisted(&path, &id);
+        let last = log.last().expect("the stream is not empty");
+        assert_eq!(last["kind"], Value::from("run_finished"), "{last}");
+        assert_eq!(last["reason"], Value::from("scope_exit"), "{last}");
+        assert_eq!(last.get("detail"), None, "a clean exit has nothing to say");
+        assert_eq!(log.len(), 3, "run_started + note + run_finished");
+    }
+
+    /// (I6) A block that raises closes its session too, with `error` as the
+    /// reason and the message as `detail` — so the log says the run ended
+    /// badly without the reason vocabulary growing a member per failure.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_close_scope_that_raises_records_the_error_and_its_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        let id = stream_id_from(format!(
+            r#"
+            local id
+            local ok, msg = pcall(function()
+                local s <close> = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})
+                id = s:id()
+                error("boom")
+            end)
+            assert(not ok, "the block was supposed to fail")
+            assert(tostring(msg):find("boom"), "the error is still the caller's: " .. tostring(msg))
+            return id
+        "#
+        ));
+
+        let log = persisted(&path, &id);
+        let last = log.last().expect("the stream is not empty");
+        assert_eq!(last["kind"], Value::from("run_finished"), "{last}");
+        assert_eq!(last["reason"], Value::from("error"), "{last}");
+        let detail = last["detail"].as_str().expect("detail text");
+        assert!(detail.contains("boom"), "detail: {detail}");
+    }
+
+    /// (I6) An explicit `close` wins: the scope exit that follows it is a
+    /// no-op, so the reason in the log is the caller's and there is exactly
+    /// one boundary.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn an_explicit_close_wins_over_the_scope_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        let id = stream_id_from(format!(
+            r#"
+            local id
+            do
+                local s <close> = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})
+                id = s:id()
+                s:close("done")
+            end
+            return id
+        "#
+        ));
+
+        let log = persisted(&path, &id);
+        let finished: Vec<&Value> = log.iter().filter(|e| e["kind"] == "run_finished").collect();
+        assert_eq!(finished.len(), 1, "exactly one boundary: {log:?}");
+        assert_eq!(finished[0]["reason"], Value::from("done"));
+    }
+
+    /// (I6) The backstop: a handle that goes out of scope with no `<close>`
+    /// and no explicit close still records the boundary when the collector
+    /// reclaims it.  A run that ends by being forgotten is still an ended
+    /// run, and a reader of the stream must not see it as open forever.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_collected_handle_records_the_boundary_as_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        let id = stream_id_from(format!(
+            r#"
+            -- Opened inside a function so the handle is unreachable the
+            -- moment it returns: nothing holds the userdata but the
+            -- collector.
+            local function run()
+                local s = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "t" }})
+                s:append({{ kind = "note" }})
+                return s:id()
+            end
+            local id = run()
+            collectgarbage("collect")
+            collectgarbage("collect")
+            return id
+        "#
+        ));
+
+        let log = persisted(&path, &id);
+        let last = log.last().expect("the stream is not empty");
+        assert_eq!(
+            last["kind"],
+            Value::from("run_finished"),
+            "the collector left the run open: {log:?}"
+        );
+        assert_eq!(last["reason"], Value::from("dropped"), "{last}");
     }
 }
