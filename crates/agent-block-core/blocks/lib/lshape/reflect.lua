@@ -109,8 +109,16 @@ function M.walk(schema, visitor)
             for i = 1, #variants do
                 visit(variants[i])
             end
+        elseif kind == "tuple" then
+            local items = rawget(node, "items")
+            for i = 1, #items do
+                visit(items[i])
+            end
+        elseif kind == "bounded" then
+            visit(rawget(node, "inner"))
         end
-        -- `ref` / `prim` / `any` / `one_of` / `pattern` are leaves: no descent.
+        -- `ref` / `prim` / `integer` / `any` / `one_of` / `pattern` are
+        -- leaves: no descent.
     end
     visit(schema)
 end

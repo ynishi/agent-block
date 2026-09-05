@@ -50,6 +50,16 @@ mlua-batteries.workspace = true
 # from the Isle's sync init closure.
 mlua-batteries-sqlite = { workspace = true, optional = true }
 mlua-pkg.workspace = true
+# The knl syscall surface, declared once. The Rust argument / return types in
+# `bridge/knl.rs` derive `SchemaBridge` and `schema-bridge-lshape` turns that
+# IR into the `knl_types` Lua module the host embeds at start. Both are
+# unconditional for the same reason `rusqlite` is: the kernel is in every
+# build. The lshape runtime the generated module loads under is the vendored
+# copy in `blocks/lib/lshape/` rather than the `mlua-lshape` crate — see the
+# workspace manifest for why.
+schema-bridge.workspace = true
+schema-bridge-lshape.workspace = true
+serde_path_to_error.workspace = true
 agent-mesh-core = { workspace = true, optional = true }
 agent-mesh-sdk = { workspace = true, optional = true }
 llm-extract.workspace = true

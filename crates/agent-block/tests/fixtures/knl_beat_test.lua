@@ -655,6 +655,69 @@ do
         assert(declared_module[name], "stale module shape (bridge declares no such function): " .. name)
     end
 
+    -- The names agreeing is the weaker half. The shapes are the other one,
+    -- and they are not two declarations any more: `knl_types` is generated at
+    -- host start from the Rust argument and return types in `bridge/knl.rs`,
+    -- and the registry above points at it. What is checked here is that the
+    -- pointing is complete in both directions —
+    --
+    --   (a) every shape in the registry is one the generated module hands
+    --       out, so a hand-written shape reappearing there goes red;
+    --   (b) every type the module generates is referenced by some entry, so a
+    --       type nobody declares goes red as well.
+    --
+    -- Identity, not equality: each generated type is a distinct table (a bare
+    -- primitive is named with `:describe`, so `SessionId` and `Owner` are two
+    -- values rather than one `T.string`).
+    local knl_types = require("knl_types")
+    local type_of, unused = {}, {}
+    for name, shape in pairs(knl_types) do
+        type_of[shape] = name
+        unused[name] = true
+    end
+    assert(next(unused) ~= nil, "the generated types module is empty")
+
+    local function is_shape(v)
+        return type(v) == "table" and rawget(v, "kind") ~= nil
+    end
+
+    local function account_for(where, value)
+        if not is_shape(value) then
+            -- Prose: the arguments and returns no schema can state (a live
+            -- session handle, a pair whose second value may be absent).
+            return
+        end
+        local name = type_of[value]
+        assert(name ~= nil, "hand-written shape in the bridge registry at " .. where)
+        unused[name] = nil
+    end
+
+    for _, registry in pairs({ kernel.shapes.session, kernel.shapes.module }) do
+        for name, entry in pairs(registry) do
+            if type(entry.args) == "table" then
+                for i, arg in ipairs(entry.args) do
+                    account_for(name .. ".args[" .. i .. "]", arg)
+                end
+            end
+            account_for(name .. ".returns", entry.returns)
+        end
+    end
+
+    local orphans = {}
+    for name in pairs(unused) do
+        orphans[#orphans + 1] = name
+    end
+    table.sort(orphans)
+    assert(#orphans == 0, "generated types nothing declares: " .. table.concat(orphans, ", "))
+
+    -- And the module the kernel publishes as text is the module that was
+    -- loaded, so a tool reading `knl.api().types` reads what is in force.
+    assert(type(api.types) == "string" and #api.types > 0, "knl.api() publishes no types module")
+    local rebuilt = assert(load(api.types, "knl_types(published)"))()
+    for name in pairs(knl_types) do
+        assert(rebuilt[name] ~= nil, "the published types text is missing " .. name)
+    end
+
     -- The failure vocabulary is the same list on both sides. The
     -- kernel publishes it (`knl.api().errors`, built from KnlError::KINDS)
     -- and the shell closes its `error` shape on its own declaration; a

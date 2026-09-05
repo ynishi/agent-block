@@ -86,9 +86,12 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "rusqlite-isle",
+ "schema-bridge",
+ "schema-bridge-lshape",
  "seccompiler",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "tempfile",
  "thiserror",
@@ -2551,6 +2554,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "schema-bridge"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11adc0f1445fbf542d13388cbf9fec7e90a9cde71af61910de475d1a4eaecb73"
+dependencies = [
+ "schema-bridge-core",
+ "schema-bridge-macro",
+ "serde",
+]
+
+[[package]]
+name = "schema-bridge-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "190c12851001ecbfc2541090961519946073e16ee019377c308252b6cc6a3aa4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schema-bridge-lshape"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c61aef9984cc4ad6bcbb8ae399a1ee4e835e36a191a1d2a45778d4b3830e5ed"
+dependencies = [
+ "schema-bridge-core",
+]
+
+[[package]]
+name = "schema-bridge-macro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54269d2ac695ed4f594d34bffc2b77fb71404559c5ffa9d68cd139ef9d93843b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2682,6 +2726,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

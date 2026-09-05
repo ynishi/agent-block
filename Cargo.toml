@@ -78,6 +78,27 @@ mlua-pkg     = "0.7"
 # opens for `std.sql` / `std.kv` and passes to the batteries.
 rusqlite      = { version = "0.37", features = ["bundled"] }
 rusqlite-isle = { version = "0.5", features = ["tokio"] }
+# The syscall surface's single source of truth. `schema-bridge` derives the
+# `Schema` IR off the Rust argument / return types of `bridge/knl.rs` and
+# `schema-bridge-lshape` renders that IR as an lshape Lua module. Not
+# optional: the kernel is in every build, and a surface whose declaration is
+# generated only sometimes is a surface that drifts.
+#
+# The third crate of that family, `mlua-lshape` (which vendors the lshape 0.3
+# runtime the generated module loads under), is deliberately NOT here. It
+# pins `mlua` with the `send` feature, and feature unification would turn
+# `send` on for `mlua-batteries`, which does not compile with it — the same
+# reason `lua-spec-runner` is excluded from the workspace above. The lshape
+# 0.3.0 Lua sources are vendored under `crates/agent-block-core/blocks/lib/
+# lshape/` instead, copied verbatim from that crate's `lua/lshape/`.
+schema-bridge        = "0.4"
+schema-bridge-lshape = "0.2"
+# What makes a serde refusal readable as a syscall refusal. serde reports a
+# type mismatch without saying which field it was reading, and
+# `budget.tag: invalid type: number, expected a string` is the whole
+# difference between a message a caller can act on and one they cannot. It
+# wraps the deserializer and records the path it was at when it failed.
+serde_path_to_error = "0.1"
 anyhow       = "1"
 # Content fingerprint for `std.fs.read_versioned` / `edit`'s optimistic
 # concurrency check. Already in the tree transitively.

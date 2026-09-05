@@ -25,14 +25,16 @@
 //!   one write: the child's opening and grant, and the parent's reservation.
 //!   A balance that will not cover it records a refusal on the parent and
 //!   raises `refused`, and no session is returned.
-//! - `knl.resume(opts) -> session` — `{ store, session, budget? }`: reopen a
-//!   stream and re-fold it.
+//! - `knl.resume(opts) -> session` — `{ session, store?, budget? }`: reopen a
+//!   stream and re-fold it.  An absent `store` means what it means on open,
+//!   the in-memory database.
 //! - `knl.new_beat_id() -> string` — a time-ordered, session-free id for the
 //!   caller to stamp on the events of one beat.
 //! - `knl.error(e) -> { kind, method, retryable, message }` — read a raised
 //!   failure back as data (see *Failures carry their class*).
-//! - `knl.api() -> { session, module, errors, schema }` — the declared
-//!   surface, the failure vocabulary, and the columns a query may name.
+//! - `knl.api() -> { session, module, errors, schema, types }` — the declared
+//!   surface, the failure vocabulary, the columns a query may name, and the
+//!   generated shapes of every argument and return (see *One declaration*).
 //!
 //! The session userdata answers `id`, `scope_id`, `owner`, `append`,
 //! `events`, `len`, `view`, `query`, `reserve`, `spend`, `remaining`,
@@ -234,6 +236,27 @@
 //! test holds `knl.api().schema` against the columns the store actually has.
 //! The Lua kernel runs the mirror image of both, so a syscall added on one
 //! side and not the other goes red rather than drifting.
+//!
+//! # One declaration: the Rust types
+//!
+//! The two tables above say what the methods are *called*; [`types`] says what
+//! each one takes and answers, and it is the only place either is written
+//! down.  Every argument is deserialized into one of those types
+//! ([`from_lua`]) and every table a syscall answers with is built from one
+//! ([`as_table`]), so the check runs on every call in both modes — including a
+//! direct `s:append(...)`, which never passes through the Lua kernel's own dev
+//! gate.
+//!
+//! The same types are rendered as lshape ([`lshape_module_source`], via
+//! `schema-bridge`) and embedded as the Lua module `knl_types` at host start.
+//! `knl.shapes.session` / `knl.shapes.module` point at that module rather than
+//! restating it, and `knl.api().types` hands the source text back for tooling.
+//! What this replaced was two declarations of one interface — these
+//! signatures, and a hand-written lshape table beside them — held together by
+//! a test that compared *names*, which is a test a renamed field walks
+//! straight past.  The generated module is built at start rather than checked
+//! in for the same reason: a generated file in the tree is one somebody can
+//! edit, and an edited one is the second declaration all over again.
 
 use mlua::prelude::*;
 use serde_json::{Map, Value};
@@ -357,6 +380,732 @@ pub const MODULE_API: &[(&str, &str)] = &[
     ),
 ];
 
+/// The declared surface as Rust types — the single source both sides read.
+///
+/// # Why the types are the declaration
+///
+/// [`SESSION_API`] and [`MODULE_API`] say what the methods are *called* and
+/// what each one is for; this module says what each one *takes and answers*.
+/// Every entry above has its argument and return types here, and they are the
+/// only place either is written down: the Lua kernel's own registry
+/// (`knl.shapes.session` / `knl.shapes.module`) is built by pointing at
+/// [`lshape_module_source`], which is generated from exactly these types at
+/// host start.  Before this there were two declarations of one interface —
+/// these signatures, and a hand-written lshape table beside them — and the
+/// test that held them together compared *names*.  A misspelt field on either
+/// side went unnoticed until a caller hit it.
+///
+/// # What that buys, beyond one declaration
+///
+/// The types are also the parser.  [`from_lua`] deserializes a caller's table
+/// into them, so the check runs on every call in both modes rather than only
+/// under the Lua dev gate, and a direct `s:append(...)` — which never passes
+/// through that gate — is checked exactly like a call the shell made.
+///
+/// # The three shapes serde cannot state, and why
+///
+/// - [`Json`] / [`Meta`] — `data`, and a query's parameters, are opaque to the
+///   kernel: their shape belongs to whoever writes the kind.  They map to
+///   lshape's `any` and to a map of labels.
+/// - [`StoreSpec`] / [`BudgetOpt`] — a string *or* a table, and two forms that
+///   exclude each other.  `#[derive(SchemaBridge)]` renders an enum as its
+///   variant names, which is right for [`ViewName`] and wrong for a union, so
+///   these carry the schema by hand and the derive stays where it is honest.
+/// - [`ViewName`] — the vocabulary is [`knl::VIEW_TAIL`] and stays the
+///   kernel's: the schema is built *from* that constant rather than repeating
+///   it, and an unknown name is still refused by the kernel, in its own words.
+pub mod types {
+    use schema_bridge::{Field, Schema, SchemaBridge};
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Map, Value};
+    use std::collections::BTreeMap;
+
+    /// Opaque JSON: what a kind's `data` is about, and what a query binds.
+    ///
+    /// `Any` rather than a shape, and deliberately — the kernel records
+    /// `data` as written and judges only its own six kinds, so a schema here
+    /// would be this layer inventing a contract it does not hold anyone to.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct Json(pub Value);
+
+    impl SchemaBridge for Json {
+        fn to_ts() -> String {
+            "unknown".to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Any
+        }
+    }
+
+    /// One label in an event's `meta`: a string, a number or a flag.
+    ///
+    /// The whole of the vocabulary.  `meta` is the half of the envelope a view
+    /// can read without ever being broken by a change to a kind, and a nested
+    /// value would make it a second `data` with none of that promise.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(
+        untagged,
+        expecting = "a label: meta is shallow (a string, a number or a boolean)"
+    )]
+    pub enum MetaValue {
+        /// A word.
+        Text(String),
+        /// A count or a measurement.
+        Number(f64),
+        /// A flag.
+        Flag(bool),
+    }
+
+    impl SchemaBridge for MetaValue {
+        fn to_ts() -> String {
+            "string | number | boolean".to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Union(vec![Schema::String, Schema::Number, Schema::Boolean])
+        }
+    }
+
+    /// An event's `meta`: labels, and only labels.
+    pub type Meta = BTreeMap<String, MetaValue>;
+
+    // -- scalars ------------------------------------------------------------
+    //
+    // A newtype rather than a bare `String` / `u64`, because the registry
+    // entry that names one is what makes the surface readable: `id()` answers
+    // a `SessionId`, not "a string".
+
+    /// The stream a session writes — what `knl.resume` reopens.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct SessionId(pub String);
+
+    /// The kernel-issued authority a stream is written under.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct ScopeId(pub String);
+
+    /// The principal a scope belongs to (a real id, or `anon` / `system`).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Owner(pub String);
+
+    /// A beat id: time-ordered, session-free, and opaque to the kernel.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct BeatId(pub String);
+
+    /// An event's position in its stream — assigned by the kernel, and the
+    /// `from` a read starts at.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Seq(pub u64);
+
+    /// How many events are recorded.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Count(pub u64);
+
+    /// What `reserve` / `spend` move: a whole number of budget units.
+    ///
+    /// Signed, so a caller's negative lands here as a value the kernel refuses
+    /// rather than as a deserializer's type error about `u64` — the amount is
+    /// a number the kernel has a rule about, and the rule is the kernel's.
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Amount(pub i64);
+
+    /// The balance, or nothing at all when the session was granted no budget.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Remaining(pub Option<i64>);
+
+    /// Whether the budget is used up (`false` without one).
+    #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Exhausted(pub bool);
+
+    /// The statement a read is written as: one `SELECT` or `WITH`.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct Sql(pub String);
+
+    /// Which kind of ending a close was — a short word a reader can fold on.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct CloseReason(pub String);
+
+    /// The sentence only this close can tell: the message of the error a
+    /// caller's own bracket caught, say.  Truncated before it is recorded.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct CloseDetail(pub String);
+
+    /// Whatever a raise handed over — the argument of `knl.error`, and what
+    /// `__close` is given when its block is unwinding.
+    ///
+    /// `any`, because it is: the bridge's own attributed message, a Lua-side
+    /// `error("...")`, or a value from somewhere else entirely.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct Raised;
+
+    impl SchemaBridge for Raised {
+        fn to_ts() -> String {
+            "unknown".to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Any
+        }
+    }
+
+    /// The one named fold: `tail`.
+    ///
+    /// The vocabulary is [`crate::knl::projection::VIEW_TAIL`] and the schema is built
+    /// from it, so there is no second list to keep in step.  A name that is
+    /// not in it reaches the kernel and is refused there, which is where the
+    /// vocabulary lives.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct ViewName(pub String);
+
+    impl SchemaBridge for ViewName {
+        fn to_ts() -> String {
+            format!("{:?}", crate::knl::projection::VIEW_TAIL)
+        }
+        fn to_schema() -> Schema {
+            Schema::Enum(vec![crate::knl::projection::VIEW_TAIL.to_string()])
+        }
+    }
+
+    /// What a named fold takes: `tail`'s `n`, and nothing else.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(deny_unknown_fields)]
+    pub struct ViewOpts {
+        /// How many events from the end.  Absent is the kernel's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub n: Option<u64>,
+    }
+
+    /// The backend a session's log lives in.
+    ///
+    /// `"mem"` is an in-memory database that lives as long as the session
+    /// does; `{ sqlite = "<path>" }` is a durable stream in a file.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(
+        untagged,
+        expecting = r#"a store: "mem", or a table { sqlite = <path> }"#
+    )]
+    pub enum StoreSpec {
+        /// A backend named by a word — `"mem"`, and nothing else.
+        Named(String),
+        /// A durable stream at a path.
+        File(SqliteStore),
+    }
+
+    impl SchemaBridge for StoreSpec {
+        fn to_ts() -> String {
+            r#""mem" | { sqlite: string }"#.to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Union(vec![
+                Schema::Enum(vec![MEM_STORE.to_string()]),
+                SqliteStore::to_schema(),
+            ])
+        }
+    }
+
+    /// The in-memory backend, by name.
+    pub const MEM_STORE: &str = "mem";
+
+    /// `{ sqlite = "<path>" }` — the durable half of [`StoreSpec`].
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(deny_unknown_fields)]
+    pub struct SqliteStore {
+        /// Where the database file is.
+        pub sqlite: String,
+    }
+
+    /// What `opts.budget` asked for.
+    ///
+    /// One table with both forms in it, because that is what a caller writes
+    /// and because the refusal for writing both has to name both.  Which of
+    /// the two a given table *is* — an owner's grant (`amount`) or an
+    /// allocation out of a parent's balance (`from_parent`) — is decided
+    /// after the parse, where the two can be named against each other.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct BudgetOpt {
+        /// What an owner allows this session, out of nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub amount: Option<i64>,
+        /// What the unit is called.  The kernel reads the number and this
+        /// rides onto `budget_granted` verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tag: Option<String>,
+        /// What was allowed and why.  A grant's alone: an allocation records
+        /// the parent it came from, which is the whole of what the kernel
+        /// knows about why it happened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub desc: Option<String>,
+        /// What the parent named in `opts.parent` hands over out of its own
+        /// balance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub from_parent: Option<i64>,
+    }
+
+    impl SchemaBridge for BudgetOpt {
+        fn to_ts() -> String {
+            format!("{} | {}", BudgetGrant::to_ts(), BudgetAllocation::to_ts())
+        }
+        /// The union the field really is, rather than the flat table it is
+        /// parsed as: a reader of the schema should see that the two forms
+        /// exclude each other, which the parse form cannot say.
+        fn to_schema() -> Schema {
+            Schema::Union(vec![
+                BudgetGrant::to_schema(),
+                BudgetAllocation::to_schema(),
+            ])
+        }
+    }
+
+    /// `{ amount, tag?, desc? }` — a balance appearing, which only an owner
+    /// may do.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct BudgetGrant {
+        /// A whole number of units.
+        pub amount: i64,
+        /// What the unit is called.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tag: Option<String>,
+        /// What was allowed and why.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub desc: Option<String>,
+    }
+
+    /// `{ from_parent, tag? }` — a balance changing hands: the parent's falls
+    /// by exactly what the child's rises by, in one write.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct BudgetAllocation {
+        /// A whole number of units, out of the parent's balance.
+        pub from_parent: i64,
+        /// What the unit is called (the parent's, when it is left out).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tag: Option<String>,
+    }
+
+    /// `knl.open(opts?)` — state only.  Policy has its own constructor.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenOpts {
+        /// The principal the session belongs to.  Absent is the reserved
+        /// anonymous id, so the layer above always has a real key to read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub owner: Option<String>,
+        /// The quota, and where it came from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub budget: Option<BudgetOpt>,
+        /// Where the log lives.  Absent is the in-memory database — except
+        /// for a child, which goes where its parent already is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub store: Option<StoreSpec>,
+        /// The session this one is opened *from*.
+        ///
+        /// Declared, never read here.  The value is the kernel's own
+        /// userdata — a live handle rather than data — so the key is taken
+        /// off the table before the rest is deserialized (`without_parent`)
+        /// and the handle itself is read directly (`parse_parent`).  The
+        /// field stays because the *shape* has to say that a parent is part
+        /// of `open`; it is `any` because no data schema can describe a
+        /// handle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent: Option<Json>,
+    }
+
+    /// `knl.resume(opts)` — reopen a stream and re-fold it.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(deny_unknown_fields)]
+    pub struct ResumeOpts {
+        /// Where the stream lives.  Absent means the same thing it does on
+        /// open — the in-memory database — which is resumable for exactly as
+        /// long as some handle is still holding it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub store: Option<StoreSpec>,
+        /// The stream to reopen.
+        pub session: String,
+        /// The owner granting *again*: recorded and added to the balance the
+        /// log already carries, rather than replacing it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub budget: Option<BudgetOpt>,
+    }
+
+    /// What `s:append` records: the envelope, and nothing beside it.
+    ///
+    /// Open, and deliberately: the kernel stamps `seq` / `epoch_ms` /
+    /// `_schema_version` on a stored event, so what comes back out of
+    /// `events()` carries more keys than what went in.  The closure — no
+    /// other top-level key — is the kernel's, enforced at the syscall where
+    /// the stamps are known.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct AppendEvent {
+        /// What happened.
+        pub kind: String,
+        /// The beat this event belongs to, when the caller declared one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub beat: Option<String>,
+        /// Shallow labels a view can group or filter on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub meta: Option<Meta>,
+        /// What the kind is about.  An empty table when none was written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data: Option<Json>,
+    }
+
+    /// One recorded event, as it comes back out.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct EventRow {
+        /// What happened.
+        pub kind: String,
+        /// Where in the stream, assigned by the kernel.
+        pub seq: u64,
+        /// When, assigned by the kernel.
+        pub epoch_ms: u64,
+        /// Which revision of the event vocabulary this was read through.
+        pub _schema_version: u64,
+        /// The beat this event belongs to, when one was declared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub beat: Option<String>,
+        /// The shallow labels it was written with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub meta: Option<Meta>,
+        /// What the kind is about, as written.
+        pub data: Json,
+    }
+
+    /// The record from a position on: what `s:events(from?)` answers.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(transparent)]
+    pub struct EventRows(pub Vec<EventRow>);
+
+    /// The values a statement binds.
+    ///
+    /// A list is the values for the `?` parameters, in order; a table with
+    /// names is the values for `:name` / `@name` / `$name`.  A statement is
+    /// written one way or the other and the two are not mixed.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(
+        untagged,
+        expecting = "the values a statement binds: a list for `?`, or a table of names"
+    )]
+    pub enum QueryParams {
+        /// Values for the anonymous `?` parameters.
+        Positional(Vec<Value>),
+        /// Values for the named ones.
+        Named(Map<String, Value>),
+    }
+
+    impl SchemaBridge for QueryParams {
+        fn to_ts() -> String {
+            "unknown[] | Record<string, unknown>".to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Union(vec![
+                Schema::Array(Box::new(Schema::Any)),
+                Schema::Record {
+                    key: Box::new(Schema::String),
+                    value: Box::new(Schema::Any),
+                },
+            ])
+        }
+    }
+
+    /// What a caller asks for beyond the SQL itself.
+    ///
+    /// Closed: an option the kernel does not know must not quietly do
+    /// nothing, which is exactly what a misspelt `limit` or `timeout_ms`
+    /// would do.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    #[serde(deny_unknown_fields)]
+    pub struct QueryOpts {
+        /// The streams `$sessions` expands to.  Omitted is this session's own
+        /// stream and nothing else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sessions: Option<Vec<String>>,
+        /// How long the read may run.  Absent is the kernel's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timeout_ms: Option<u64>,
+        /// How many rows before the rest are cut off.  Absent is the
+        /// kernel's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit: Option<u64>,
+    }
+
+    /// What `s:query` answers: the rows, and whether the cap cut any off.
+    ///
+    /// A pair rather than a table, because that is what the call returns —
+    /// two values, so a page can be told from a complete answer without
+    /// unwrapping anything.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct QueryResult(pub Vec<Json>, pub bool);
+
+    /// A raised kernel failure, read back as data (`knl.error(e)`).
+    ///
+    /// `kind` and `method` are optional because a raise that carried no
+    /// attribution is reported whole rather than rejected: `message` then
+    /// holds the entire text.  So `message` is the field a reader can always
+    /// count on, and `kind` is the one it must ask for.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct ErrorTable {
+        /// The class, when the raise carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<String>,
+        /// The method that raised, when the raise carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub method: Option<String>,
+        /// The kernel's own judgement, true for contention alone.
+        pub retryable: bool,
+        /// What went wrong, in prose.
+        pub message: String,
+    }
+
+    /// One entry of the declared surface: a name and the contract it holds.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct ApiEntry {
+        /// What Lua calls it.
+        pub name: String,
+        /// The contract, in a line.
+        pub doc: String,
+    }
+
+    /// One column of the table a query reads.
+    ///
+    /// The one type here whose schema is written out rather than derived.
+    /// `type` is a Rust keyword, so the field is `declared_type` and serde is
+    /// told to rename it — and `#[derive(SchemaBridge)]` reads
+    /// `serde(rename_all)` but not a per-field `serde(rename)`, so the derive
+    /// would declare `declared_type` while the value carries `type`.  That is
+    /// exactly the drift these types exist to remove, and the generated-shape
+    /// test caught it, so the schema says what serde does.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ApiColumn {
+        /// What SQL calls it.
+        pub name: String,
+        /// How SQLite declared it.
+        #[serde(rename = "type")]
+        pub declared_type: String,
+        /// Whether it is part of the primary key.
+        pub pk: bool,
+    }
+
+    impl SchemaBridge for ApiColumn {
+        fn to_ts() -> String {
+            "{ name: string; type: string; pk: boolean; }".to_string()
+        }
+        fn to_schema() -> Schema {
+            Schema::Object(vec![
+                Field::new("name", Schema::String),
+                Field::new("type", Schema::String),
+                Field::new("pk", Schema::Boolean),
+            ])
+        }
+    }
+
+    /// The read contract: the table a query names, and the columns it has.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct ApiSchema {
+        /// The table the events live in.
+        pub table: String,
+        /// Its columns, as SQLite reports them.
+        pub columns: Vec<ApiColumn>,
+    }
+
+    /// What `knl.api()` answers: the whole declared surface, as data.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct ApiReport {
+        /// Every method the session userdata answers to.
+        pub session: Vec<ApiEntry>,
+        /// Every function the `knl` global carries.
+        pub module: Vec<ApiEntry>,
+        /// The closed list of classes `knl.error(e).kind` can report.
+        pub errors: Vec<String>,
+        /// The columns a query may name.
+        pub schema: ApiSchema,
+        /// The generated `knl_types` module, as source text — the same one
+        /// the host embeds, for a tool that wants to read the surface
+        /// without loading it.
+        pub types: String,
+    }
+
+    /// Whether a stray key in a table is a violation or a pass-through.
+    ///
+    /// lshape's `T.shape` is open by default, which is right for the tables
+    /// a caller writes and wrong for the two that are contracts: an option
+    /// the kernel does not know must not quietly do nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Strict {
+        /// Extra keys pass (lshape's default).
+        Open,
+        /// Extra keys are a violation.
+        Closed,
+    }
+
+    /// Every type the syscall surface is declared in, with the name Lua sees.
+    ///
+    /// This list *is* the module `knl_types` — nothing is generated that is
+    /// not here, and a test holds every entry of it against a reference from
+    /// the Lua registry, so a type nobody declares and a declaration with no
+    /// type are both failures.
+    pub fn declared() -> Vec<(&'static str, Schema, Strict)> {
+        vec![
+            ("SessionId", SessionId::to_schema(), Strict::Open),
+            ("ScopeId", ScopeId::to_schema(), Strict::Open),
+            ("Owner", Owner::to_schema(), Strict::Open),
+            ("BeatId", BeatId::to_schema(), Strict::Open),
+            ("Seq", Seq::to_schema(), Strict::Open),
+            ("Count", Count::to_schema(), Strict::Open),
+            ("Amount", Amount::to_schema(), Strict::Open),
+            ("Remaining", Remaining::to_schema(), Strict::Open),
+            ("Exhausted", Exhausted::to_schema(), Strict::Open),
+            ("Sql", Sql::to_schema(), Strict::Open),
+            ("CloseReason", CloseReason::to_schema(), Strict::Open),
+            ("CloseDetail", CloseDetail::to_schema(), Strict::Open),
+            ("Raised", Raised::to_schema(), Strict::Open),
+            ("ViewName", ViewName::to_schema(), Strict::Open),
+            ("ViewOpts", ViewOpts::to_schema(), Strict::Closed),
+            ("OpenOpts", OpenOpts::to_schema(), Strict::Open),
+            ("ResumeOpts", ResumeOpts::to_schema(), Strict::Open),
+            ("AppendEvent", AppendEvent::to_schema(), Strict::Open),
+            ("EventRows", EventRows::to_schema(), Strict::Open),
+            ("QueryParams", QueryParams::to_schema(), Strict::Open),
+            ("QueryOpts", QueryOpts::to_schema(), Strict::Closed),
+            ("QueryResult", QueryResult::to_schema(), Strict::Open),
+            ("ErrorTable", ErrorTable::to_schema(), Strict::Open),
+            ("ApiReport", ApiReport::to_schema(), Strict::Open),
+        ]
+    }
+}
+
+/// The `knl_types` Lua module, as source text.
+///
+/// Generated from [`types::declared`] at every host start rather than checked
+/// in: a generated file in the tree is a file that can be edited, and one that
+/// has been edited is a second declaration wearing the first one's name.  The
+/// host adds it to the embedded module set ([`crate::host`]) so the Lua kernel
+/// can `require("knl_types")`, and `knl.api().types` hands back this same text
+/// for tooling that wants to read the surface without loading it.
+///
+/// `schema_bridge_lshape::generate_lshape_file` would do all of this in one
+/// call, except that it has no way to emit lshape's strict mode
+/// ([`types::Strict::Closed`]) — so the module is assembled here from that
+/// crate's per-schema renderer, in the same layout, and the two tables whose
+/// extra keys are violations get the option appended.
+pub fn lshape_module_source() -> String {
+    let mut out = String::from(
+        "-- Generated at host start by agent-block-core from the argument and\n\
+         -- return types of `bridge/knl.rs` (schema-bridge -> lshape). Not a file\n\
+         -- in the tree: there is nothing here to edit, and so nothing to drift.\n\
+         local T = require(\"lshape\").t\n\nlocal M = {}\n\n",
+    );
+    for (name, schema, strict) in types::declared() {
+        let body = schema_bridge_lshape::schema_to_lshape(&schema)
+            .unwrap_or_else(|e| unreachable!("knl_types {name} does not map to lshape: {e}"));
+        let body = match strict {
+            types::Strict::Open => body,
+            types::Strict::Closed => close_shape(name, body),
+        };
+        out.push_str(&format!("M.{name} = {}\n\n", named_scalar(name, body)));
+    }
+    out.push_str("return M\n");
+    out
+}
+
+/// A type whose schema is a bare primitive, given its name back.
+///
+/// `SessionId` and `Owner` are both strings, and lshape's `T.string` is one
+/// table: rendered as they stand, the two names would be the same value, and
+/// a registry that says `id() -> SessionId` and `owner() -> Owner` would be
+/// saying one thing twice — with no way left to tell a type nobody references
+/// from one that is referenced under another name.  `:describe` wraps the
+/// primitive in a node of its own carrying the name, which `check` passes
+/// straight through and `reflect` reads back, so the declaration keeps the
+/// distinction the Rust type made.
+///
+/// Only the bare case: anything with a combinator in it (`T.one_of({…})`,
+/// `T.shape({…})`, `T.integer:is_optional()`) is already a fresh table.
+fn named_scalar(name: &str, body: String) -> String {
+    let bare = body
+        .strip_prefix("T.")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_lowercase()));
+    if bare {
+        format!("{body}:describe({name:?})")
+    } else {
+        body
+    }
+}
+
+/// `T.shape({ … })` with lshape's strict mode turned on.
+///
+/// A text edit rather than a generator option because the generator has none
+/// (schema-bridge-lshape 0.2 renders `T.shape(fields)` and stops).  It is
+/// exact rather than approximate: the renderer's output for an object ends in
+/// `})` and in nothing else, so the tail is replaced rather than searched for,
+/// and a schema that did not render as a shape is a mistake in
+/// [`types::declared`] rather than something to paper over.
+fn close_shape(name: &str, body: String) -> String {
+    let Some(fields) = body.strip_suffix("})") else {
+        unreachable!("knl_types {name} is marked strict but did not render as a T.shape: {body}");
+    };
+    format!("{fields}}}, {{ open = false }})")
+}
+
+/// Read a Lua value as `T`, attributing a refusal to `method`.
+///
+/// The type is the check.  What a syscall accepts used to be a hand-written
+/// walk of the table — one per argument, each with its own idea of how to say
+/// "that is not a string" — and this is the whole of it now: the same types
+/// the surface is declared in are the ones a caller's table is read into, so
+/// the check and the declaration cannot disagree.
+///
+/// Three things make the refusal readable:
+///
+/// - `noun` names the argument (`opts`, `event`, `budget`), and
+///   `serde_path_to_error` adds the field the deserializer was at, so a caller
+///   gets `budget.tag: invalid type: number, expected a string` rather than
+///   the leaf message alone;
+/// - the class is [`knl::KnlError::VALIDATION`], the same one the kernel's own
+///   validator uses, so the shell sees one vocabulary either side of the
+///   boundary;
+/// - nothing is turned off.  A value serde has no representation for — a
+///   function where a string belonged — is refused rather than skipped, which
+///   is what `lua_to_json` has always done on the way to the store.  The one
+///   value that legitimately cannot cross is `opts.parent`, and it is lifted
+///   off the table before this runs ([`without_parent`]) rather than bought
+///   with a deserializer that ignores every other one too.
+fn from_lua<T: serde::de::DeserializeOwned>(
+    method: &str,
+    noun: &str,
+    value: LuaValue,
+) -> LuaResult<T> {
+    let de = mlua::serde::Deserializer::new(value);
+    serde_path_to_error::deserialize(de).map_err(|error| {
+        let path = error.path().to_string();
+        let at = if path.is_empty() || path == "." {
+            noun.to_string()
+        } else {
+            format!("{noun}.{path}")
+        };
+        // mlua renders every deserializer failure as `deserialize error: …`.
+        // The class is already the third field of the attribution, so the
+        // prefix would be the message saying twice what it is and once what
+        // went wrong.
+        let reason = error.into_inner().to_string();
+        let reason = reason
+            .strip_prefix("deserialize error: ")
+            .unwrap_or(&reason)
+            .to_string();
+        err(method, format!("{at}: {reason}"))
+    })
+}
+
 /// K5 session: the only handle the Lua side has on kernel state.
 struct Session {
     // A `tokio::sync::Mutex`, and not the `RefCell` this used to be.  Every
@@ -457,21 +1206,6 @@ fn error_detail(error: &LuaValue) -> String {
     truncated(&text)
 }
 
-/// An optional string argument of `close`: absent, or a string.
-///
-/// `field` names it (`reason` / `detail`) so the refusal says which of the
-/// two was wrong.
-fn close_text(field: &str, value: LuaValue) -> LuaResult<Option<String>> {
-    match value {
-        LuaValue::Nil => Ok(None),
-        LuaValue::String(text) => Ok(Some(text.to_str()?.to_string())),
-        other => Err(err(
-            "close",
-            format!("{field} must be a string, got {}", other.type_name()),
-        )),
-    }
-}
-
 /// The `knl: <method>: <kind>: <reason>` attribution, as text.
 ///
 /// Four fields in a fixed order, and the first three are a closed
@@ -505,30 +1239,6 @@ fn err(method: &str, reason: impl std::fmt::Display) -> LuaError {
 /// already said, and this only renders it.
 fn knl_err(method: &str, error: &knl::KnlError) -> LuaError {
     err_of(method, error.kind(), error.reason())
-}
-
-/// Interpret a Lua value as a whole number (any sign), or `None`.
-fn as_whole(value: &LuaValue) -> Option<i64> {
-    match value {
-        LuaValue::Integer(i) => Some(*i),
-        LuaValue::Number(n) => (n.is_finite() && n.fract() == 0.0).then_some(*n as i64),
-        _ => None,
-    }
-}
-
-/// Interpret a Lua value as a non-negative whole number, or `None`.
-fn as_whole_non_negative(value: &LuaValue) -> Option<i64> {
-    as_whole(value).filter(|n| *n >= 0)
-}
-
-/// Render a Lua value for an error message (value when numeric, else
-/// type).
-fn lua_value_for_msg(value: &LuaValue) -> String {
-    match value {
-        LuaValue::Integer(i) => i.to_string(),
-        LuaValue::Number(n) => n.to_string(),
-        other => other.type_name().to_string(),
-    }
 }
 
 /// Convert the Lua table `noun` into a JSON object for `method`.
@@ -616,7 +1326,20 @@ impl LuaUserData for Session {
         // call and `spend` after it — and the two `session_*` kinds are
         // refused here, since only `knl.open` / `close` write those.
         methods.add_async_method("append", |lua, this, event: LuaValue| async move {
-            // Converted before the session is reached, exactly as before:
+            // Two readings of one table, and they answer different questions.
+            //
+            // The first is the type: `kind` is a string, `beat` is a string,
+            // `meta` holds labels and nothing deeper — the contract
+            // `knl_types.AppendEvent` publishes, checked here on every call in
+            // both modes rather than only under the Lua dev gate, which a
+            // direct `s:append(...)` never passes through.
+            let _: types::AppendEvent = from_lua("append", "event", event.clone())?;
+            // The second is the object the kernel records.  It is the table
+            // itself rather than the parse above, because the envelope's
+            // closure is the kernel's rule and it is stated where the stamps
+            // are known: a stray top-level key is refused there, and `seq` /
+            // `epoch_ms` given by a caller are overwritten rather than
+            // rejected.  Both conversions run before the session is reached —
             // walking a Lua table can call back into Lua.
             let obj = table_to_object(&lua, "append", "event", event)?;
             this.state
@@ -673,25 +1396,11 @@ impl LuaUserData for Session {
         methods.add_async_method(
             "view",
             |lua, this, (name, opts): (LuaValue, LuaValue)| async move {
-                let LuaValue::String(name) = name else {
-                    return Err(err(
-                        "view",
-                        format!("name must be a string, got {}", name.type_name()),
-                    ));
-                };
-                let name = name.to_str()?.to_string();
-                let opts = match opts {
-                    LuaValue::Nil => None,
-                    table @ LuaValue::Table(_) => {
-                        Some(table_to_object(&lua, "view", "opts", table)?)
-                    }
-                    other => {
-                        return Err(err(
-                            "view",
-                            format!("opts must be a table, got {}", other.type_name()),
-                        ));
-                    }
-                };
+                // The name's *type* is settled here and its vocabulary is
+                // not: which folds exist is the kernel's, and an unknown one
+                // is refused there, in its own words.
+                let types::ViewName(name) = from_lua("view", "name", name)?;
+                let opts = view_opts(from_lua("view", "opts", opts)?);
                 let value = {
                     let mut state = this.state.lock().await;
                     state
@@ -718,17 +1427,11 @@ impl LuaUserData for Session {
         methods.add_async_method(
             "query",
             |lua, this, (sql, params, opts): (LuaValue, LuaValue, LuaValue)| async move {
-                let LuaValue::String(sql) = sql else {
-                    return Err(err(
-                        "query",
-                        format!("sql must be a string, got {}", sql.type_name()),
-                    ));
-                };
-                let sql = sql.to_str()?.to_string();
-                // Both conversions happen before the session is reached:
-                // walking a Lua table can re-enter Lua.
-                let params = query_params(&lua, params)?;
-                let opts = query_opts(&lua, opts)?;
+                // All three are read before the session is reached: walking a
+                // Lua table can re-enter Lua.
+                let types::Sql(sql) = from_lua("query", "sql", sql)?;
+                let params = query_params(from_lua("query", "params", params)?);
+                let opts = query_opts(from_lua("query", "opts", opts)?);
 
                 let found = {
                     let state = this.state.lock().await;
@@ -752,15 +1455,9 @@ impl LuaUserData for Session {
         // return so a caller can name the allowance that stopped it
         // without reading the log.  Always `true` without a budget.
         methods.add_async_method("reserve", |_, this, amount: LuaValue| async move {
-            let Some(amount) = as_whole(&amount) else {
-                return Err(err(
-                    "reserve",
-                    format!(
-                        "amount must be a non-negative whole number, got {}",
-                        lua_value_for_msg(&amount)
-                    ),
-                ));
-            };
+            // Whole is the type's business, non-negative is the kernel's:
+            // the balance rule belongs where the balance is.
+            let types::Amount(amount) = from_lua("reserve", "amount", amount)?;
             let mut state = this.state.lock().await;
             let granted = state
                 .reserve(amount)
@@ -787,15 +1484,7 @@ impl LuaUserData for Session {
         // was in the log.  Two questions, two calls: this one raises only if
         // the write itself failed, and `s:remaining()` answers the other.
         methods.add_async_method("spend", |_, this, amount: LuaValue| async move {
-            let Some(amount) = as_whole(&amount) else {
-                return Err(err(
-                    "spend",
-                    format!(
-                        "amount must be a non-negative whole number, got {}",
-                        lua_value_for_msg(&amount)
-                    ),
-                ));
-            };
+            let types::Amount(amount) = from_lua("spend", "amount", amount)?;
             this.state
                 .lock()
                 .await
@@ -846,8 +1535,10 @@ impl LuaUserData for Session {
         methods.add_async_method(
             "close",
             |_, this, (reason, detail): (LuaValue, LuaValue)| async move {
-                let reason = close_text("reason", reason)?;
-                let detail = close_text("detail", detail)?.map(|text| truncated(&text));
+                let reason: Option<types::CloseReason> = from_lua("close", "reason", reason)?;
+                let reason = reason.map(|types::CloseReason(text)| text);
+                let detail: Option<types::CloseDetail> = from_lua("close", "detail", detail)?;
+                let detail = detail.map(|types::CloseDetail(text)| truncated(&text));
                 // A close whose `session_closed` append fails (a database
                 // contended past its retries, a store that is gone) surfaces
                 // here: the session stays open and the caller knows the
@@ -922,20 +1613,16 @@ impl LuaUserData for Session {
     }
 }
 
-/// The fields a `budget` table may carry.  Anything else is a typo, and a
-/// typo in a quota must not be read as "no limit on that axis".
-const BUDGET_FIELDS: [&str; 4] = ["amount", "tag", "desc", "from_parent"];
-
-/// What `opts.budget` asked for.
+/// What `opts.budget` asked for, once the two forms have been told apart.
 ///
 /// Two things a caller can mean by "this session's budget", and they are not
 /// interchangeable: `amount` is an owner *granting* — a balance out of
 /// nothing the kernel can account for, which only an owner may do — while
 /// `from_parent` is an *allocation*, units moved out of the balance a parent
 /// session already holds.  One is a quota appearing, the other is a quota
-/// changing hands, so they are parsed apart here and refused together
-/// ([`parse_budget`]).
-enum BudgetOpt {
+/// changing hands, so they are separated here and refused together
+/// ([`budget_source`]).
+enum BudgetSource {
     /// `{ amount, tag?, desc? }` — what an owner allows this session.
     Grant(knl::BudgetGrant),
     /// `{ from_parent, tag? }` — what the parent named in `opts.parent`
@@ -943,121 +1630,78 @@ enum BudgetOpt {
     FromParent(knl::Allocation),
 }
 
-/// Read an optional string field of the `budget` table.
-fn budget_string(budget: &LuaTable, field: &str) -> LuaResult<Option<String>> {
-    let value: LuaValue = budget.get(field)?;
-    match value {
-        LuaValue::Nil => Ok(None),
-        LuaValue::String(s) => Ok(Some(s.to_str()?.to_string())),
-        other => Err(err(
-            "session",
-            format!("budget.{field} must be a string, got {}", other.type_name()),
-        )),
-    }
-}
-
-/// Read `opts.budget`: `{ amount, tag?, desc? }` (an owner's grant) or
-/// `{ from_parent, tag? }` (an allocation from `opts.parent`'s balance).
+/// Decide which of the two `budget` forms a caller wrote.
 ///
-/// `amount` / `from_parent` is the quota and the only field the kernel
-/// interprets; `tag` names its unit and `desc` records what was allowed and
-/// why, both of which ride onto `budget_granted` verbatim.  An unknown field
-/// is an error rather than a value quietly ignored: a misspelt cap that reads
-/// as "no cap" is exactly the failure a budget exists to prevent.
-///
-/// The two amounts are mutually exclusive, and naming both is refused rather
-/// than resolved by precedence: "the owner allows 100" and "the parent hands
-/// over 100" are different claims about where a balance came from, and a
-/// table that makes both says neither.  `desc` belongs to a grant alone — an
-/// allocation records the parent it came from, which is the whole of what the
-/// kernel knows about why it happened.
-fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<BudgetOpt>> {
-    let Some(opts) = opts else {
+/// The table's *shape* was settled by the deserializer ([`types::BudgetOpt`]),
+/// including the refusal of a misspelt field — a misspelt cap that reads as
+/// "no cap" is exactly the failure a budget exists to prevent.  What is left
+/// is the part no schema states: the two amounts exclude each other, and
+/// naming both is refused rather than resolved by precedence, because "the
+/// owner allows 100" and "the parent hands over 100" are different claims
+/// about where a balance came from and a table that makes both says neither.
+/// `desc` belongs to a grant alone — an allocation records the parent it came
+/// from, which is the whole of what the kernel knows about why it happened.
+fn budget_source(
+    method: &str,
+    budget: Option<types::BudgetOpt>,
+) -> LuaResult<Option<BudgetSource>> {
+    let Some(budget) = budget else {
         return Ok(None);
     };
-    let budget: LuaValue = opts.get("budget")?;
-    let budget = match budget {
-        LuaValue::Nil => return Ok(None),
-        LuaValue::Table(t) => t,
-        other => {
-            return Err(err(
-                "session",
-                format!("budget must be a table, got {}", other.type_name()),
-            ));
-        }
-    };
+    let types::BudgetOpt {
+        amount,
+        tag,
+        desc,
+        from_parent,
+    } = budget;
 
-    for pair in budget.clone().pairs::<LuaValue, LuaValue>() {
-        let (key, _) = pair?;
-        let LuaValue::String(name) = &key else {
+    if let Some(from_parent) = from_parent {
+        if amount.is_some() {
             return Err(err(
-                "session",
-                format!("budget fields must be named, got a {}", key.type_name()),
-            ));
-        };
-        let name = name.to_str()?.to_string();
-        if !BUDGET_FIELDS.contains(&name.as_str()) {
-            return Err(err(
-                "session",
-                format!(
-                    "unknown budget field {name:?} (expected amount / tag / desc / from_parent)"
-                ),
-            ));
-        }
-    }
-
-    let amount: LuaValue = budget.get("amount")?;
-    let from_parent: LuaValue = budget.get("from_parent")?;
-    let tag = budget_string(&budget, "tag")?;
-
-    if !matches!(from_parent, LuaValue::Nil) {
-        if !matches!(amount, LuaValue::Nil) {
-            return Err(err(
-                "session",
+                method,
                 "budget names both amount and from_parent: an owner's grant and an allocation \
                  out of a parent's balance are different claims about where the quota came from",
             ));
         }
-        if budget_string(&budget, "desc")?.is_some() {
+        if desc.is_some() {
             return Err(err(
-                "session",
+                method,
                 "budget.desc belongs to an owner's grant; an allocation records the parent it \
                  came from instead",
             ));
         }
-        let Some(amount) = as_whole_non_negative(&from_parent) else {
+        if from_parent < 0 {
             return Err(err(
-                "session",
+                method,
                 format!(
-                    "budget.from_parent must be a non-negative whole number, got {}",
-                    lua_value_for_msg(&from_parent)
+                    "budget.from_parent must be a non-negative whole number, got {from_parent}"
                 ),
             ));
-        };
-        return Ok(Some(BudgetOpt::FromParent(knl::Allocation { amount, tag })));
+        }
+        return Ok(Some(BudgetSource::FromParent(knl::Allocation {
+            amount: from_parent,
+            tag,
+        })));
     }
 
-    if matches!(amount, LuaValue::Nil) {
+    let Some(amount) = amount else {
         return Err(err(
-            "session",
+            method,
             "budget.amount is required (non-negative whole number), or budget.from_parent to \
              allocate out of a parent's balance",
         ));
-    }
-    let Some(amount) = as_whole_non_negative(&amount) else {
-        return Err(err(
-            "session",
-            format!(
-                "budget.amount must be a non-negative whole number, got {}",
-                lua_value_for_msg(&amount)
-            ),
-        ));
     };
+    if amount < 0 {
+        return Err(err(
+            method,
+            format!("budget.amount must be a non-negative whole number, got {amount}"),
+        ));
+    }
 
-    Ok(Some(BudgetOpt::Grant(knl::BudgetGrant {
+    Ok(Some(BudgetSource::Grant(knl::BudgetGrant {
         amount,
         tag,
-        desc: budget_string(&budget, "desc")?,
+        desc,
     })))
 }
 
@@ -1067,11 +1711,14 @@ fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<BudgetOpt>> {
 /// to allocate from and no child being opened: an allocation there is a
 /// caller reaching for the wrong call, and it is named as such rather than
 /// silently read as a grant of the same size.
-fn parse_grant(method: &str, opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> {
-    match parse_budget(opts)? {
+fn grant_only(
+    method: &str,
+    budget: Option<types::BudgetOpt>,
+) -> LuaResult<Option<knl::BudgetGrant>> {
+    match budget_source(method, budget)? {
         None => Ok(None),
-        Some(BudgetOpt::Grant(grant)) => Ok(Some(grant)),
-        Some(BudgetOpt::FromParent(_)) => Err(err(
+        Some(BudgetSource::Grant(grant)) => Ok(Some(grant)),
+        Some(BudgetSource::FromParent(_)) => Err(err(
             method,
             "budget.from_parent allocates from a parent's balance, which is what \
              open{ parent = … } does; this call takes an owner's grant (amount)",
@@ -1081,242 +1728,134 @@ fn parse_grant(method: &str, opts: Option<&LuaTable>) -> LuaResult<Option<knl::B
 
 /// Read `opts.owner`: the principal the session belongs to.
 ///
-/// Total: an absent owner is the reserved anonymous id rather than `nil`,
-/// so the policy layer above the kernel always has a real key to read.
-fn parse_owner(opts: Option<&LuaTable>) -> LuaResult<String> {
-    let Some(opts) = opts else {
+/// Total: an absent owner is the reserved anonymous id rather than `nil`, so
+/// the policy layer above the kernel always has a real key to read.  The
+/// reserved ids are the kernel's own namespace and an untrusted Lua caller
+/// must not claim one, or it could impersonate a reserved principal on
+/// `session_opened`.  Compared against the consts, not literal strings, so the
+/// guard tracks the kernel's definition.
+fn owner_of(owner: Option<String>) -> LuaResult<String> {
+    let Some(owner) = owner else {
         return Ok(knl::ANON.to_string());
     };
-    let value: LuaValue = opts.get("owner")?;
-    match value {
-        LuaValue::Nil => Ok(knl::ANON.to_string()),
-        LuaValue::String(owner) => {
-            let owner = owner.to_str()?.to_string();
-            // The reserved ids are the kernel's own namespace: an untrusted Lua
-            // caller must not claim ANON or SYSTEM, or it could impersonate a
-            // reserved principal on `session_opened`.  Compared against the consts,
-            // not literal strings, so the guard tracks the kernel's definition.
-            // Unspecified owner still defaults to the kernel-assigned ANON above.
-            if owner == knl::ANON || owner == knl::SYSTEM {
-                return Err(err("open", format!("owner {owner:?} is reserved")));
-            }
-            Ok(owner)
-        }
-        other => Err(err(
-            "session",
-            format!("owner must be a string, got {}", other.type_name()),
-        )),
+    if owner == knl::ANON || owner == knl::SYSTEM {
+        return Err(err("open", format!("owner {owner:?} is reserved")));
     }
+    Ok(owner)
 }
 
-/// The fields a `query` opts table may carry.  Anything else is a typo, and
-/// a misspelt `limit` or `timeout_ms` that reads as "no cap" / "no deadline"
-/// is exactly what those two exist to prevent.
-const QUERY_OPT_FIELDS: [&str; 3] = ["sessions", "timeout_ms", "limit"];
-
-/// Read the `params` argument of `s:query`.
+/// The `params` of `s:query`, in the kernel's terms.
 ///
 /// A list is the values for the `?` parameters, in order; a table with names
-/// is the values for `:name` / `@name` / `$name`.  An absent or empty table
-/// is neither: the statement is expected to have no parameters of its own.
-///
-/// Converted before the session is borrowed — walking a Lua table can call
-/// back into Lua.
-fn query_params(lua: &Lua, params: LuaValue) -> LuaResult<knl::QueryParams> {
+/// is the values for `:name` / `@name` / `$name`.  An absent or empty table is
+/// neither: the statement is expected to have no parameters of its own.
+fn query_params(params: Option<types::QueryParams>) -> knl::QueryParams {
     match params {
-        LuaValue::Nil => Ok(knl::QueryParams::None),
-        table @ LuaValue::Table(_) => match lua_to_json(lua, table).map_err(|e| err("query", e))? {
-            Value::Array(values) => Ok(knl::QueryParams::Positional(values)),
-            Value::Object(named) if named.is_empty() => Ok(knl::QueryParams::None),
-            Value::Object(named) => Ok(knl::QueryParams::Named(named)),
-            _ => Err(err("query", "params must be a table")),
-        },
-        other => Err(err(
-            "query",
-            format!(
-                "params must be a list or a table of names, got {}",
-                other.type_name()
-            ),
-        )),
+        None => knl::QueryParams::None,
+        Some(types::QueryParams::Positional(values)) if values.is_empty() => knl::QueryParams::None,
+        Some(types::QueryParams::Positional(values)) => knl::QueryParams::Positional(values),
+        Some(types::QueryParams::Named(named)) if named.is_empty() => knl::QueryParams::None,
+        Some(types::QueryParams::Named(named)) => knl::QueryParams::Named(named),
     }
 }
 
-/// Read the `opts` argument of `s:query`: `{ sessions?, timeout_ms?, limit? }`.
-fn query_opts(lua: &Lua, opts: LuaValue) -> LuaResult<knl::QueryOpts> {
-    let opts = match opts {
-        LuaValue::Nil => return Ok(knl::QueryOpts::default()),
-        LuaValue::Table(table) => table,
-        other => {
-            return Err(err(
-                "query",
-                format!("opts must be a table, got {}", other.type_name()),
-            ));
-        }
+/// The `opts` of `s:query`, in the kernel's terms.
+///
+/// An option the caller left out is the kernel's own default rather than a
+/// value this layer picks: the deadline and the row cap are the store's
+/// policy, and a second copy of either here would be a second thing to change.
+/// An empty `sessions` list is passed through as the empty set, which the
+/// kernel refuses in its own words rather than being read as "all of them".
+fn query_opts(opts: Option<types::QueryOpts>) -> knl::QueryOpts {
+    let Some(opts) = opts else {
+        return knl::QueryOpts::default();
     };
-
-    for pair in opts.clone().pairs::<LuaValue, LuaValue>() {
-        let (key, _) = pair?;
-        let LuaValue::String(name) = &key else {
-            return Err(err(
-                "query",
-                format!("opts fields must be named, got a {}", key.type_name()),
-            ));
-        };
-        let name = name.to_str()?.to_string();
-        if !QUERY_OPT_FIELDS.contains(&name.as_str()) {
-            return Err(err(
-                "query",
-                format!("unknown query option {name:?} (expected sessions / timeout_ms / limit)"),
-            ));
-        }
+    knl::QueryOpts {
+        sessions: opts.sessions,
+        timeout_ms: opts.timeout_ms.unwrap_or(knl::DEFAULT_TIMEOUT_MS),
+        limit: opts.limit.map_or(knl::DEFAULT_LIMIT, |n| n as usize),
     }
-
-    let sessions = match opts.get::<LuaValue>("sessions")? {
-        LuaValue::Nil => None,
-        table @ LuaValue::Table(_) => {
-            match lua_to_json(lua, table).map_err(|e| err("query", e))? {
-                Value::Array(ids) => Some(
-                    ids.into_iter()
-                        .map(|id| match id {
-                            Value::String(id) => Ok(id),
-                            other => Err(err(
-                                "query",
-                                format!("opts.sessions must be a list of session ids, got {other}"),
-                            )),
-                        })
-                        .collect::<LuaResult<Vec<String>>>()?,
-                ),
-                // An empty table is an empty set, which the kernel refuses
-                // with its own words rather than being read as "all of them".
-                Value::Object(named) if named.is_empty() => Some(Vec::new()),
-                _ => {
-                    return Err(err("query", "opts.sessions must be a list of session ids"));
-                }
-            }
-        }
-        other => {
-            return Err(err(
-                "query",
-                format!(
-                    "opts.sessions must be a list of session ids, got {}",
-                    other.type_name()
-                ),
-            ));
-        }
-    };
-
-    let timeout_ms = match opts.get::<LuaValue>("timeout_ms")? {
-        LuaValue::Nil => knl::DEFAULT_TIMEOUT_MS,
-        value => as_whole_non_negative(&value)
-            .map(|n| n as u64)
-            .ok_or_else(|| {
-                err(
-                    "query",
-                    format!(
-                        "opts.timeout_ms must be a non-negative whole number, got {}",
-                        lua_value_for_msg(&value)
-                    ),
-                )
-            })?,
-    };
-    let limit = match opts.get::<LuaValue>("limit")? {
-        LuaValue::Nil => knl::DEFAULT_LIMIT,
-        value => as_whole_non_negative(&value)
-            .map(|n| n as usize)
-            .ok_or_else(|| {
-                err(
-                    "query",
-                    format!(
-                        "opts.limit must be a non-negative whole number, got {}",
-                        lua_value_for_msg(&value)
-                    ),
-                )
-            })?,
-    };
-
-    Ok(knl::QueryOpts {
-        sessions,
-        timeout_ms,
-        limit,
-    })
 }
 
-/// The storage backend `opts.store` asks for.
-enum StoreSpec {
+/// The `opts` of `s:view`, as the object the kernel's projections read.
+///
+/// Built field by field rather than serialized, so the map holds exactly what
+/// the caller named: an absent `n` is absent, and `tail` falls back to its own
+/// default instead of being handed a null to interpret.
+fn view_opts(opts: Option<types::ViewOpts>) -> Option<Map<String, Value>> {
+    let opts = opts?;
+    let mut out = Map::new();
+    if let Some(n) = opts.n {
+        out.insert("n".to_string(), Value::from(n));
+    }
+    Some(out)
+}
+
+/// The storage backend a session's log goes in.
+enum StoreTarget {
     /// The in-memory store (the default): absent or `"mem"`.
     Mem,
     /// A durable SQLite stream at the given path.
     Sqlite(String),
 }
 
-/// Read `opts.store`: absent / `"mem"` → in-memory, `{ sqlite = "<path>" }`
-/// → durable.  `method` names the caller (`open` / `resume`) for attribution.
-fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
-    let Some(opts) = opts else {
-        return Ok(StoreSpec::Mem);
-    };
-    let store: LuaValue = opts.get("store")?;
-    match store {
-        LuaValue::Nil => Ok(StoreSpec::Mem),
-        LuaValue::String(name) => {
-            let name = name.to_str()?.to_string();
-            if name == "mem" {
-                Ok(StoreSpec::Mem)
-            } else {
-                Err(err(
-                    method,
-                    format!(r#"unknown store {name:?} (expected "mem" or {{ sqlite = <path> }})"#),
-                ))
-            }
-        }
-        LuaValue::Table(table) => {
-            let sqlite: LuaValue = table.get("sqlite")?;
-            match sqlite {
-                LuaValue::String(path) => Ok(StoreSpec::Sqlite(path.to_str()?.to_string())),
-                LuaValue::Nil => Err(err(
-                    method,
-                    "store table must carry a sqlite = <path> field",
-                )),
-                other => Err(err(
-                    method,
-                    format!(
-                        "store.sqlite must be a string path, got {}",
-                        other.type_name()
-                    ),
-                )),
-            }
-        }
-        other => Err(err(
-            method,
-            format!(
-                r#"store must be "mem" or a table {{ sqlite = <path> }}, got {}"#,
-                other.type_name()
-            ),
-        )),
-    }
-}
-
-/// Whether `opts` named a store at all.
+/// Read `opts.store`: `"mem"` → in-memory, `{ sqlite = "<path>" }` → durable.
 ///
-/// [`parse_store`] answers what an absent `store` *means* (the in-memory
-/// one), which is the right default for a session that stands on its own and
-/// the wrong one for a child: a child with no `store` goes where its parent
-/// is, and a child that asked for `"mem"` asked for a different database and
-/// is refused.  Telling the two apart needs the question asked separately.
-fn has_store(opts: Option<&LuaTable>) -> LuaResult<bool> {
-    let Some(opts) = opts else {
-        return Ok(false);
-    };
-    Ok(!matches!(opts.get::<LuaValue>("store")?, LuaValue::Nil))
+/// The two forms are the deserializer's ([`types::StoreSpec`]); what is left
+/// here is the one word the union cannot state — that the only *named* store
+/// is the in-memory one.  `method` names the caller (`open` / `resume`) for
+/// attribution.
+fn store_target(method: &str, spec: types::StoreSpec) -> LuaResult<StoreTarget> {
+    match spec {
+        types::StoreSpec::Named(name) if name == types::MEM_STORE => Ok(StoreTarget::Mem),
+        types::StoreSpec::Named(name) => Err(err(
+            method,
+            format!(r#"unknown store {name:?} (expected "mem" or {{ sqlite = <path> }})"#),
+        )),
+        types::StoreSpec::File(file) => Ok(StoreTarget::Sqlite(file.sqlite)),
+    }
 }
 
 /// Read `opts.parent`: the session this one is opened from, if any.
 ///
-/// Only its presence and its type are settled here.  Whether it really is a
-/// kernel session — and whether its balance covers what is being asked for —
-/// is answered where the allocation runs, with the parent borrowed.
-fn parse_parent(opts: Option<&LuaTable>) -> LuaResult<Option<LuaAnyUserData>> {
-    let Some(opts) = opts else {
+/// Taken off the table by hand, and before the rest of it is read as data: a
+/// parent is a live handle rather than a value, and serde has no
+/// representation for a userdata (the deserializer is told to drop it, which
+/// is what lets an otherwise closed `opts` carry one).  Only its presence and
+/// its type are settled here — whether it really is a kernel session, and
+/// whether its balance covers what is being asked for, is answered where the
+/// allocation runs, with the parent borrowed.
+/// `opts` with its `parent` taken out, so the rest can be read strictly.
+///
+/// The companion of [`parse_parent`], and the reason [`from_lua`] can leave
+/// the deserializer's defaults alone.  A parent is a live session userdata,
+/// which serde cannot carry; the way to let one through would be to tell the
+/// deserializer to skip every value it has no representation for, and that
+/// would skip a function a caller wrote where a string belonged as well.  So
+/// the one key that cannot cross is lifted out here — `parse_parent` already
+/// holds the real handle — and what is left is read with nothing turned off.
+///
+/// A shallow copy, because `parent` is a top-level key: everything nested is
+/// shared with the caller's table and read from it exactly as before.
+fn without_parent(lua: &Lua, opts: &LuaValue) -> LuaResult<LuaValue> {
+    let LuaValue::Table(table) = opts else {
+        return Ok(opts.clone());
+    };
+    let rest = lua.create_table()?;
+    for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair?;
+        if let LuaValue::String(name) = &key {
+            if name.to_str()? == "parent" {
+                continue;
+            }
+        }
+        rest.set(key, value)?;
+    }
+    Ok(LuaValue::Table(rest))
+}
+
+fn parse_parent(opts: &LuaValue) -> LuaResult<Option<LuaAnyUserData>> {
+    let LuaValue::Table(opts) = opts else {
         return Ok(None);
     };
     match opts.get::<LuaValue>("parent")? {
@@ -1404,7 +1943,7 @@ async fn resume_on(
 /// turns out to be a different database — the check belongs there, next to
 /// the transaction that would have to span both.
 async fn open_child_store(
-    named: Option<StoreSpec>,
+    named: Option<StoreTarget>,
     parent_db: &str,
     stream: &str,
     drivers: &knl::IsleDrivers,
@@ -1413,10 +1952,10 @@ async fn open_child_store(
         // The parent's database, addressed exactly as it was opened (a path,
         // or the in-memory database's shared-cache URI).
         None => knl::SqliteEventStore::open(std::path::Path::new(parent_db), stream, drivers).await,
-        Some(StoreSpec::Sqlite(path)) => {
+        Some(StoreTarget::Sqlite(path)) => {
             knl::SqliteEventStore::open(std::path::Path::new(&path), stream, drivers).await
         }
-        Some(StoreSpec::Mem) => knl::SqliteEventStore::open_memory(stream, drivers).await,
+        Some(StoreTarget::Mem) => knl::SqliteEventStore::open_memory(stream, drivers).await,
     };
     Ok(Box::new(store.map_err(|e| knl_err("open", &e))?))
 }
@@ -1432,7 +1971,7 @@ async fn open_child_session(
     parent: LuaAnyUserData,
     owner: String,
     allocation: knl::Allocation,
-    named_store: Option<StoreSpec>,
+    named_store: Option<StoreTarget>,
     drivers: knl::IsleDrivers,
 ) -> LuaResult<LuaAnyUserData> {
     let handle = parent.borrow::<Session>().map_err(|_| {
@@ -1485,31 +2024,33 @@ async fn open_session(
     opts: LuaValue,
     drivers: knl::IsleDrivers,
 ) -> LuaResult<LuaAnyUserData> {
-    let opts = match opts {
-        LuaValue::Nil => None,
-        LuaValue::Table(t) => Some(t),
-        other => {
-            return Err(err(
-                "session",
-                format!("opts must be a table, got {}", other.type_name()),
-            ));
-        }
+    // The parent comes off the table first and by hand: it is a live session
+    // handle, which serde cannot carry (see `parse_parent`).
+    let parent = parse_parent(&opts)?;
+    // Everything else is read as data, in one step, by the same types the
+    // surface is declared in.  The Lua value is consumed here and nothing of
+    // it survives into the awaits below, which is the rule a `LuaTable` held
+    // across a suspension point would break.
+    let opts: types::OpenOpts = match opts {
+        LuaValue::Nil => types::OpenOpts::default(),
+        value => from_lua("open", "opts", without_parent(&lua, &value)?)?,
     };
-    let owner = parse_owner(opts.as_ref())?;
-    let budget = parse_budget(opts.as_ref())?;
-    let spec = parse_store("open", opts.as_ref())?;
-    let named_store = has_store(opts.as_ref())?.then_some(spec);
-    let parent = parse_parent(opts.as_ref())?;
-    // The options are read out of Lua *before* the first await: `opts` is a
-    // `LuaTable`, which must not be held across a suspension point, and the
-    // parses above are the only things that touch it.
-    drop(opts);
+    let owner = owner_of(opts.owner)?;
+    let budget = budget_source("open", opts.budget)?;
+    // An absent `store` is *not* the in-memory one here: a child with no
+    // store goes where its parent already is, and a child that asked for
+    // "mem" asked for a different database and is refused.  Telling the two
+    // apart is why the question is asked as an Option.
+    let named_store = opts
+        .store
+        .map(|spec| store_target("open", spec))
+        .transpose()?;
 
     let Some(parent) = parent else {
         let grant = match budget {
             None => None,
-            Some(BudgetOpt::Grant(grant)) => Some(grant),
-            Some(BudgetOpt::FromParent(_)) => {
+            Some(BudgetSource::Grant(grant)) => Some(grant),
+            Some(BudgetSource::FromParent(_)) => {
                 return Err(err(
                     "open",
                     "budget.from_parent allocates out of a parent's balance, so it needs \
@@ -1517,15 +2058,15 @@ async fn open_session(
                 ));
             }
         };
-        let session = match named_store.unwrap_or(StoreSpec::Mem) {
-            StoreSpec::Mem => Session::new(owner, grant, &drivers).await?,
-            StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
+        let session = match named_store.unwrap_or(StoreTarget::Mem) {
+            StoreTarget::Mem => Session::new(owner, grant, &drivers).await?,
+            StoreTarget::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
         };
         return lua.create_userdata(session);
     };
 
     let allocation = match budget {
-        Some(BudgetOpt::FromParent(allocation)) => allocation,
+        Some(BudgetSource::FromParent(allocation)) => allocation,
         _ => {
             return Err(err(
                 "open",
@@ -1539,8 +2080,11 @@ async fn open_session(
 
 /// Resume a persisted session — the body of `knl.resume`.
 ///
-/// Requires `opts.store = { sqlite = "<path>" }` and `opts.session =
-/// "<stream id>"`.  `opts.budget` is optional and means the owner grants
+/// Requires `opts.session = "<stream id>"`.  `opts.store` says where the
+/// stream lives — `{ sqlite = "<path>" }` for a durable one — and means what
+/// it means on open when it is left out: the in-memory database, which is
+/// reopenable for exactly as long as some handle is still holding it.
+/// `opts.budget` is optional and means the owner grants
 /// *again*: it is recorded and added to the balance the log already
 /// carries, rather than replacing it.  The returned userdata is the same
 /// one `knl.open` returns, only pre-loaded with the balance folded from the
@@ -1550,41 +2094,20 @@ async fn resume_session(
     opts: LuaValue,
     drivers: knl::IsleDrivers,
 ) -> LuaResult<LuaAnyUserData> {
-    let opts = match opts {
-        LuaValue::Table(t) => t,
-        LuaValue::Nil => {
-            return Err(err("resume", "opts must be a table with store and session"));
-        }
-        other => {
-            return Err(err(
-                "resume",
-                format!("opts must be a table, got {}", other.type_name()),
-            ));
-        }
+    if matches!(opts, LuaValue::Nil) {
+        return Err(err("resume", "opts must be a table with store and session"));
+    }
+    // Read as data, in one step, and consumed here: nothing of the Lua table
+    // survives into the awaits below.
+    let opts: types::ResumeOpts = from_lua("resume", "opts", opts)?;
+    let grant = grant_only("resume", opts.budget)?;
+    let store = match opts.store {
+        None => StoreTarget::Mem,
+        Some(spec) => store_target("resume", spec)?,
     };
-    let grant = parse_grant("resume", Some(&opts))?;
-    let store = parse_store("resume", Some(&opts))?;
-    let session: LuaValue = opts.get("session")?;
-    let session_id = match session {
-        LuaValue::String(id) => id.to_str()?.to_string(),
-        LuaValue::Nil => {
-            return Err(err(
-                "resume",
-                "session is required (the stream id to reopen)",
-            ));
-        }
-        other => {
-            return Err(err(
-                "resume",
-                format!("session must be a string, got {}", other.type_name()),
-            ));
-        }
-    };
-    // Nothing more is read out of `opts` past this point, so the Lua table is
-    // released before the first suspension below.
-    drop(opts);
+    let session_id = opts.session;
     let store = match store {
-        StoreSpec::Sqlite(path) => {
+        StoreTarget::Sqlite(path) => {
             knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone(), &drivers)
                 .await
         }
@@ -1593,7 +2116,7 @@ async fn resume_session(
         // live one finds the same log.  It cannot outlive the process, and it
         // does not pretend to — a name nobody is holding open resumes as an
         // empty stream, which is refused for having no session in it.
-        StoreSpec::Mem => knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await,
+        StoreTarget::Mem => knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await,
     }
     .map_err(|e| knl_err("resume", &e))?;
     let state = resume_on(grant, store, session_id).await?;
@@ -1635,9 +2158,12 @@ fn error_table(lua: &Lua, raised: LuaValue) -> LuaResult<LuaTable> {
         other => other.to_string()?,
     };
 
-    let out = lua.create_table()?;
-    out.set("message", text.clone())?;
-    out.set("retryable", false)?;
+    let mut read = types::ErrorTable {
+        kind: None,
+        method: None,
+        retryable: false,
+        message: text.clone(),
+    };
 
     // `knl: <method>: <kind>: <message>` — read off the line that carries
     // it, since a raise that crossed a callback boundary arrives with a
@@ -1651,13 +2177,17 @@ fn error_table(lua: &Lua, raised: LuaValue) -> LuaResult<LuaTable> {
             // Only a kind the kernel actually publishes is taken as one, so
             // a message that merely looks like the shape is left as prose.
             if knl::KnlError::KINDS.contains(&kind) {
-                out.set("method", method)?;
-                out.set("kind", kind)?;
-                out.set("retryable", knl::KnlError::kind_is_retryable(kind))?;
-                out.set("message", message)?;
+                read.method = Some(method.to_string());
+                read.kind = Some(kind.to_string());
+                read.retryable = knl::KnlError::kind_is_retryable(kind);
+                read.message = message.to_string();
             }
         }
     }
+
+    // Built from the declared type rather than field by field, so the table a
+    // caller reads is the one `knl_types.ErrorTable` describes.
+    let out = as_table(lua, "error", &read)?;
 
     // The table renders as the message it was read from, so it can stand in
     // for the raised value wherever one was being printed or searched.
@@ -1683,63 +2213,78 @@ fn new_beat_id(_: &Lua, _: ()) -> LuaResult<String> {
     Ok(uuid::Uuid::now_v7().to_string())
 }
 
+/// Build a Lua table from a declared type.
+///
+/// The other half of [`from_lua`]: what a syscall answers is built by
+/// serializing the type the registry names, so a return cannot grow a field
+/// the declaration does not have.  A failure here is the bridge's own bug
+/// rather than the caller's, and it is attributed as `validation` all the same
+/// — the vocabulary is closed and there is no class for "the kernel could not
+/// describe itself".
+fn as_table<T: serde::Serialize>(lua: &Lua, method: &str, value: &T) -> LuaResult<LuaTable> {
+    match lua.to_value(value).map_err(|e| err(method, e))? {
+        LuaValue::Table(table) => Ok(table),
+        other => Err(err(
+            method,
+            format!(
+                "the answer did not serialize as a table, got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
 /// The declared surface as a Lua table — the body of `knl.api()`.
 ///
-/// `{ session = { { name = …, doc = … }, … }, module = { … }, errors = { … },
-/// schema = { table = …, columns = { { name, type, pk }, … } } }`, built from
-/// [`SESSION_API`], [`MODULE_API`], [`knl::KnlError::KINDS`] and the events
-/// table itself, so a caller reads what the kernel offers from the same
-/// tables the reflection test holds the registration to.
+/// [`types::ApiReport`], built from [`SESSION_API`], [`MODULE_API`],
+/// [`knl::KnlError::KINDS`], the events table itself and
+/// [`lshape_module_source`], so a caller reads what the kernel offers from the
+/// same places the reflection test holds the registration to.
 ///
 /// `errors` is the closed list of classes `knl.error(e).kind` can report.  It
 /// is published for the same reason the two method lists are: the shell keeps
 /// its own declaration of the vocabulary, and a declaration nobody can check
-/// is one that drifts.
+/// is one that drifts.  `types` is the generated `knl_types` module as source
+/// text — the same one the host embeds — so a tool can read the argument and
+/// return shapes without loading them.
 fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
     /// One `{ name, doc }` list, in declaration order.
-    fn listed(lua: &Lua, entries: &[(&str, &str)]) -> LuaResult<LuaTable> {
-        let list = lua.create_table()?;
-        for (index, (name, doc)) in entries.iter().enumerate() {
-            let entry = lua.create_table()?;
-            entry.set("name", *name)?;
-            entry.set("doc", *doc)?;
-            list.set(index + 1, entry)?;
-        }
-        Ok(list)
+    fn listed(entries: &[(&str, &str)]) -> Vec<types::ApiEntry> {
+        entries
+            .iter()
+            .map(|(name, doc)| types::ApiEntry {
+                name: (*name).to_string(),
+                doc: (*doc).to_string(),
+            })
+            .collect()
     }
-
-    let out = lua.create_table()?;
-    out.set("session", listed(lua, SESSION_API)?)?;
-    out.set("module", listed(lua, MODULE_API)?)?;
-
-    let errors = lua.create_table()?;
-    for (index, kind) in knl::KnlError::KINDS.iter().enumerate() {
-        errors.set(index + 1, *kind)?;
-    }
-    out.set("errors", errors)?;
 
     // The read contract: the table a query names and the columns it has.
     // Read off SQLite itself (`PRAGMA table_info`) rather than written out
     // here, so the published schema is the schema — a caller's SQL is written
     // against columns that exist, and the shell's own declaration of them can
     // be checked instead of trusted.
-    let schema = lua.create_table()?;
-    schema.set("table", knl::EVENTS_TABLE)?;
-    let columns = lua.create_table()?;
-    for (index, column) in knl::events_schema()
-        .map_err(|e| knl_err("api", &e))?
-        .into_iter()
-        .enumerate()
-    {
-        let entry = lua.create_table()?;
-        entry.set("name", column.name)?;
-        entry.set("type", column.declared_type)?;
-        entry.set("pk", column.pk)?;
-        columns.set(index + 1, entry)?;
-    }
-    schema.set("columns", columns)?;
-    out.set("schema", schema)?;
-    Ok(out)
+    let schema = types::ApiSchema {
+        table: knl::EVENTS_TABLE.to_string(),
+        columns: knl::events_schema()
+            .map_err(|e| knl_err("api", &e))?
+            .into_iter()
+            .map(|column| types::ApiColumn {
+                name: column.name,
+                declared_type: column.declared_type,
+                pk: column.pk,
+            })
+            .collect(),
+    };
+
+    let report = types::ApiReport {
+        session: listed(SESSION_API),
+        module: listed(MODULE_API),
+        errors: knl::KnlError::KINDS.iter().map(|k| k.to_string()).collect(),
+        schema,
+        types: lshape_module_source(),
+    };
+    as_table(lua, "api", &report)
 }
 
 /// Register the `knl` global.  No [`crate::host::HostContext`] is needed —
@@ -1804,6 +2349,332 @@ pub fn register(lua: &Lua, drivers: knl::IsleDrivers) -> LuaResult<()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The generated declaration, held against the types it was generated from.
+///
+/// The claim this round makes is that there is one declaration of the syscall
+/// surface and it is the Rust types.  These are the tests that make it a claim
+/// rather than an intention: the module has to *load* under the lshape the
+/// host ships, and a value built from each Rust type has to *pass* the shape
+/// generated for it.  A field renamed on one side and not the other cannot
+/// survive both.
+#[cfg(test)]
+mod generated_types {
+    use super::types::*;
+    use super::*;
+    use serde_json::json;
+
+    /// The vendored lshape, in dependency order: `luacats` needs `reflect`,
+    /// and the aggregate needs all four.  The same sources the host embeds.
+    const LSHAPE_PARTS: [(&str, &str); 4] = [
+        ("lshape.t", include_str!("../../blocks/lib/lshape/t.lua")),
+        (
+            "lshape.reflect",
+            include_str!("../../blocks/lib/lshape/reflect.lua"),
+        ),
+        (
+            "lshape.check",
+            include_str!("../../blocks/lib/lshape/check.lua"),
+        ),
+        (
+            "lshape.luacats",
+            include_str!("../../blocks/lib/lshape/luacats.lua"),
+        ),
+    ];
+
+    const LSHAPE_ROOT: &str = include_str!("../../blocks/lib/lshape/init.lua");
+
+    /// A VM with the vendored lshape on it and the generated module loaded,
+    /// arranged the way the host arranges them.
+    fn types_vm() -> (Lua, LuaTable, LuaFunction) {
+        let lua = Lua::new();
+        let package: LuaTable = lua.globals().get("package").expect("package");
+        let loaded: LuaTable = package.get("loaded").expect("package.loaded");
+        for (name, source) in LSHAPE_PARTS {
+            let module: LuaValue = lua
+                .load(source)
+                .set_name(name)
+                .eval()
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            loaded.set(name, module).expect("preload");
+        }
+        let root: LuaValue = lua
+            .load(LSHAPE_ROOT)
+            .set_name("lshape")
+            .eval()
+            .expect("lshape");
+        loaded.set("lshape", root.clone()).expect("preload lshape");
+
+        let module: LuaTable = lua
+            .load(lshape_module_source())
+            .set_name("knl_types")
+            .eval()
+            .expect("the generated module must load under the vendored lshape");
+        let check: LuaFunction = lua
+            .load(r#"return require("lshape").check.check"#)
+            .eval()
+            .expect("lshape.check.check");
+        (lua, module, check)
+    }
+
+    /// The declared types, each with a value built from the Rust type it was
+    /// generated from.
+    ///
+    /// One entry per name in [`types::declared`] — the test below holds the
+    /// two lists against each other, so a type added there without a sample
+    /// here is a failure rather than a gap nobody notices.
+    fn samples(lua: &Lua) -> Vec<(&'static str, LuaValue)> {
+        fn to(lua: &Lua, value: impl serde::Serialize) -> LuaValue {
+            lua.to_value(&value).expect("a declared type serializes")
+        }
+        vec![
+            ("SessionId", to(lua, SessionId("s-1".into()))),
+            ("ScopeId", to(lua, ScopeId("scope-1".into()))),
+            ("Owner", to(lua, Owner("user-42".into()))),
+            ("BeatId", to(lua, BeatId("beat-1".into()))),
+            ("Seq", to(lua, Seq(7))),
+            ("Count", to(lua, Count(3))),
+            ("Amount", to(lua, Amount(10))),
+            ("Remaining", to(lua, Remaining(Some(90)))),
+            ("Exhausted", to(lua, Exhausted(false))),
+            ("Sql", to(lua, Sql("SELECT 1".into()))),
+            ("CloseReason", to(lua, CloseReason("done".into()))),
+            (
+                "CloseDetail",
+                to(lua, CloseDetail("the block raised".into())),
+            ),
+            // `Raised` is whatever a raise handed over, so the sample is a
+            // value no other type would take.
+            ("Raised", to(lua, json!({ "anything": [1, "at", true] }))),
+            (
+                "ViewName",
+                to(lua, ViewName(crate::knl::projection::VIEW_TAIL.into())),
+            ),
+            ("ViewOpts", to(lua, ViewOpts { n: Some(5) })),
+            (
+                "OpenOpts",
+                to(
+                    lua,
+                    OpenOpts {
+                        owner: Some("user-42".into()),
+                        budget: Some(BudgetOpt {
+                            amount: Some(1000),
+                            tag: Some("tokens".into()),
+                            desc: Some("one nightly run".into()),
+                            from_parent: None,
+                        }),
+                        store: Some(StoreSpec::File(SqliteStore {
+                            sqlite: "/tmp/knl.db".into(),
+                        })),
+                        parent: None,
+                    },
+                ),
+            ),
+            (
+                "ResumeOpts",
+                to(
+                    lua,
+                    ResumeOpts {
+                        store: Some(StoreSpec::Named(MEM_STORE.into())),
+                        session: "s-1".into(),
+                        budget: Some(BudgetOpt {
+                            from_parent: Some(25),
+                            tag: Some("tokens".into()),
+                            amount: None,
+                            desc: None,
+                        }),
+                    },
+                ),
+            ),
+            (
+                "AppendEvent",
+                to(
+                    lua,
+                    AppendEvent {
+                        kind: "msg_user".into(),
+                        beat: Some("beat-1".into()),
+                        meta: Some(Meta::from([
+                            ("label".to_string(), MetaValue::Text("seed".into())),
+                            ("n".to_string(), MetaValue::Number(1.0)),
+                            ("on".to_string(), MetaValue::Flag(true)),
+                        ])),
+                        data: Some(Json(json!({ "content": "hi" }))),
+                    },
+                ),
+            ),
+            (
+                "EventRows",
+                to(
+                    lua,
+                    EventRows(vec![EventRow {
+                        kind: "msg_user".into(),
+                        seq: 2,
+                        epoch_ms: 1_700_000_000_000,
+                        _schema_version: 1,
+                        beat: None,
+                        meta: None,
+                        data: Json(json!({ "content": "hi" })),
+                    }]),
+                ),
+            ),
+            (
+                "QueryParams",
+                to(lua, QueryParams::Positional(vec![json!("note")])),
+            ),
+            (
+                "QueryOpts",
+                to(
+                    lua,
+                    QueryOpts {
+                        sessions: Some(vec!["s-1".into(), "s-2".into()]),
+                        timeout_ms: Some(250),
+                        limit: Some(10),
+                    },
+                ),
+            ),
+            (
+                "QueryResult",
+                to(
+                    lua,
+                    QueryResult(vec![Json(json!({ "kind": "msg_user" }))], true),
+                ),
+            ),
+            (
+                "ErrorTable",
+                to(
+                    lua,
+                    ErrorTable {
+                        kind: Some("closed".into()),
+                        method: Some("append".into()),
+                        retryable: false,
+                        message: "the session is closed".into(),
+                    },
+                ),
+            ),
+            (
+                "ApiReport",
+                to(
+                    lua,
+                    ApiReport {
+                        session: vec![ApiEntry {
+                            name: "append".into(),
+                            doc: "append(event) -> seq".into(),
+                        }],
+                        module: vec![ApiEntry {
+                            name: "open".into(),
+                            doc: "open(opts?) -> session".into(),
+                        }],
+                        errors: vec!["busy".into()],
+                        schema: ApiSchema {
+                            table: "events".into(),
+                            columns: vec![ApiColumn {
+                                name: "seq".into(),
+                                declared_type: "INTEGER".into(),
+                                pk: true,
+                            }],
+                        },
+                        types: "-- generated".into(),
+                    },
+                ),
+            ),
+        ]
+    }
+
+    /// (c) The module loads under the lshape the host ships, and exports one
+    /// shape per declared type and nothing else.
+    #[test]
+    fn the_generated_module_exports_exactly_the_declared_types() {
+        let (_lua, module, _check) = types_vm();
+
+        let mut exported: Vec<String> = module
+            .pairs::<String, LuaValue>()
+            .map(|pair| pair.expect("a module entry").0)
+            .collect();
+        exported.sort();
+
+        let mut expected: Vec<String> = declared()
+            .into_iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect();
+        expected.sort();
+
+        assert_eq!(exported, expected, "the generated module drifted");
+    }
+
+    /// (c) A value built from each Rust type passes the shape generated for
+    /// it.  This is the test that the two agree: `to_value` of the fixture is
+    /// what a syscall would hand Lua, and `check.check` is what the Lua
+    /// kernel's dev gate runs.
+    #[test]
+    fn every_declared_type_accepts_a_value_built_from_its_rust_type() {
+        let (lua, module, check) = types_vm();
+
+        let samples = samples(&lua);
+        let mut sampled: Vec<&str> = samples.iter().map(|(name, _)| *name).collect();
+        sampled.sort_unstable();
+        let mut expected: Vec<&str> = declared().into_iter().map(|(name, _, _)| name).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            sampled, expected,
+            "every declared type needs a sample built from it"
+        );
+
+        for (name, value) in samples {
+            let shape: LuaValue = module.get(name).expect("the shape of a declared type");
+            let (ok, why): (bool, Option<String>) = check
+                .call((value, shape))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(ok, "{name}: {}", why.unwrap_or_default());
+        }
+    }
+
+    /// (c) And the shapes refuse: a closed options table is closed on the Lua
+    /// side too, which is what makes the generated declaration worth running.
+    #[test]
+    fn the_generated_shapes_refuse_what_the_rust_types_refuse() {
+        let (lua, module, check) = types_vm();
+
+        let refused: [(&str, LuaValue); 3] = [
+            // An option the kernel does not know must not quietly do nothing.
+            (
+                "QueryOpts",
+                lua.to_value(&json!({ "rows": 10 })).expect("value"),
+            ),
+            // `n` counts events.
+            (
+                "ViewOpts",
+                lua.to_value(&json!({ "count": 2 })).expect("value"),
+            ),
+            // `meta` is shallow.
+            (
+                "AppendEvent",
+                lua.to_value(&json!({ "kind": "note", "meta": { "deep": { "no": 1 } } }))
+                    .expect("value"),
+            ),
+        ];
+
+        for (name, value) in refused {
+            let shape: LuaValue = module.get(name).expect("the shape of a declared type");
+            let (ok, _why): (bool, Option<String>) = check
+                .call((value, shape))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!ok, "{name} accepted a value its Rust type refuses");
+        }
+    }
+
+    /// (c) `knl.api().types` is the same text the host embeds, so a tool that
+    /// asks the kernel what it takes reads the module that is actually loaded.
+    #[test]
+    fn the_api_publishes_the_module_it_generated() {
+        let lua = Lua::new();
+        register(&lua, knl::IsleDrivers::new()).expect("register knl");
+        let published: String = lua
+            .load(r#"return knl.api().types"#)
+            .eval()
+            .expect("knl.api().types");
+        assert_eq!(published, lshape_module_source());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2040,15 +2911,17 @@ mod tests {
 
         let msg = vm.expect_err(r#"knl.open():append({ text = "no kind" })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("kind is required"), "{msg}");
+        assert!(msg.contains("missing field `kind`"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open():append({ kind = 42 })"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("kind must be a string"), "{msg}");
+        assert!(msg.contains("event.kind"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open():append("not a table")"#);
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
-        assert!(msg.contains("event must be a table"), "{msg}");
+        assert!(msg.contains("event:"), "{msg}");
+        assert!(msg.contains("expected table"), "{msg}");
 
         // A rejected append leaves no trace in the history.
         vm.exec(
@@ -2148,31 +3021,42 @@ mod tests {
 
     /// (attribution) Malformed `budget` options are rejected by
     /// `knl.open` itself.
+    ///
+    /// Two kinds of refusal meet here and the messages say which is which.
+    /// The *shape* is the declared type's ([`types::BudgetOpt`], read by
+    /// [`from_lua`]), so a misspelt field or a mistyped one names the path it
+    /// was at — `opts.budget.tag` — and the whole set of fields it could have
+    /// been.  The *rule* is the bridge's: a quota has to be there, it cannot
+    /// be negative, and the two forms exclude each other.  No schema states
+    /// any of those three, so they are checked after the parse and keep their
+    /// own words.
     #[test]
     fn session_validates_budget_options() {
         let vm = vm();
 
         let msg = vm.expect_err(r#"knl.open({ budget = { amount = -1 } })"#);
-        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("budget.amount"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open({ budget = {} })"#);
-        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("required"), "{msg}");
 
         // A misspelt field is an error, not a silently ignored cap: the
         // failure a budget exists to prevent is exactly "the limit I set
-        // was not read".
+        // was not read".  The refusal names the field and the set it is not
+        // in, which is the deserializer reading the declared type.
         let msg = vm.expect_err(r#"knl.open({ budget = { tokens = 100 } })"#);
-        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
-        assert!(msg.contains("unknown budget field"), "{msg}");
-        assert!(msg.contains("tokens"), "{msg}");
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("unknown field `tokens`"), "{msg}");
+        assert!(msg.contains("`amount`"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open({ budget = { amount = 10, tag = 7 } })"#);
-        assert!(msg.contains("budget.tag must be a string"), "{msg}");
+        assert!(msg.contains("opts.budget.tag"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open({ budget = { amount = 1.5 } })"#);
-        assert!(msg.contains("budget.amount"), "{msg}");
+        assert!(msg.contains("opts.budget.amount"), "{msg}");
 
         // The words are optional, and carried verbatim when given.
         vm.exec(
@@ -2195,12 +3079,14 @@ mod tests {
         .expect("grant options chunk");
 
         let msg = vm.expect_err(r#"knl.open({ budget = 100 })"#);
-        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
-        assert!(msg.contains("budget must be a table"), "{msg}");
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("opts.budget"), "{msg}");
+        assert!(msg.contains("expected table"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open("nope")"#);
-        assert!(msg.contains("knl: session:"), "missing attribution: {msg}");
-        assert!(msg.contains("opts must be a table"), "{msg}");
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("opts:"), "{msg}");
+        assert!(msg.contains("expected table"), "{msg}");
     }
 
     /// (I6) Two sessions share nothing: ids differ and history / budget
@@ -2348,7 +3234,8 @@ mod tests {
 
         let msg = vm.expect_err(r#"knl.open():close({ not_a = "string" })"#);
         assert!(msg.contains("knl: close:"), "missing attribution: {msg}");
-        assert!(msg.contains("reason must be a string"), "{msg}");
+        assert!(msg.contains("reason:"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
     }
 
     /// The kernel checks the *envelope* of every event — the closed set of
@@ -2661,9 +3548,18 @@ mod tests {
         )
         .expect("tail view chunk");
 
+        // `n` counts events, so a negative one is not a value the fold has to
+        // have an opinion about: the declared type says whole and unsigned
+        // and the refusal names the field it was reading.
         let msg = vm.expect_err(r#"knl.open():view("tail", { n = -1 })"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
-        assert!(msg.contains("non-negative"), "{msg}");
+        assert!(msg.contains("opts.n"), "{msg}");
+
+        // And an option `tail` does not have is a typo rather than a knob
+        // that quietly does nothing.
+        let msg = vm.expect_err(r#"knl.open():view("tail", { count = 2 })"#);
+        assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
+        assert!(msg.contains("unknown field `count`"), "{msg}");
     }
 
     /// (attribution) The view vocabulary is closed: an unknown name is an
@@ -2685,11 +3581,13 @@ mod tests {
 
         let msg = vm.expect_err(r#"knl.open():view(42)"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
-        assert!(msg.contains("name must be a string"), "{msg}");
+        assert!(msg.contains("name:"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
 
         let msg = vm.expect_err(r#"knl.open():view("tail", "n=2")"#);
         assert!(msg.contains("knl: view:"), "missing attribution: {msg}");
-        assert!(msg.contains("opts must be a table"), "{msg}");
+        assert!(msg.contains("opts:"), "{msg}");
+        assert!(msg.contains("expected table"), "{msg}");
     }
 
     /// (I1) A view is a fresh table every call: mutating it cannot reach
@@ -2739,9 +3637,47 @@ mod tests {
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
         assert!(msg.contains("unknown store"), "{msg}");
 
+        // A table that is not the durable form is refused with both forms
+        // named, which is the union the declared type states.
         let msg = vm.expect_err(r#"knl.open({ store = { redis = "x" } })"#);
         assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("opts.store"), "{msg}");
         assert!(msg.contains("sqlite"), "{msg}");
+    }
+
+    /// The parent is the one thing in `opts` that is a handle rather than a
+    /// value, and it is the *only* one: everything else is read as data, with
+    /// nothing turned off.
+    ///
+    /// The two halves are one decision.  Letting a userdata through by telling
+    /// the deserializer to skip what it cannot represent would also skip a
+    /// function written where a string belonged — the option would read as
+    /// absent and the session would open with the default.  So `parent` comes
+    /// off the table by hand and the rest is read strictly.
+    #[test]
+    fn the_parent_is_the_only_value_read_as_a_handle() {
+        let vm = vm();
+
+        vm.exec(
+            r#"
+            local p = knl.open({ owner = "p", budget = { amount = 10, tag = "beats" } })
+            local c = knl.open({ owner = "c", parent = p, budget = { from_parent = 4 } })
+            assert(c:remaining() == 4, "the child's balance: " .. tostring(c:remaining()))
+            assert(p:remaining() == 6, "the parent paid: " .. tostring(p:remaining()))
+        "#,
+        )
+        .expect("parent chunk");
+
+        // A function where a string belonged is refused, naming the field —
+        // not read as "no owner given".
+        let msg = vm.expect_err(r#"knl.open({ owner = function() end })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("opts.owner"), "{msg}");
+
+        // And `parent` is still only accepted as a session.
+        let msg = vm.expect_err(r#"knl.open({ parent = "s-1", budget = { from_parent = 1 } })"#);
+        assert!(msg.contains("knl: open:"), "missing attribution: {msg}");
+        assert!(msg.contains("must be a session"), "{msg}");
     }
 
     /// (Fix 6) The reserved owner ids are the kernel's own namespace: an
@@ -2988,7 +3924,7 @@ mod tests {
 
         let msg = vm.expect_err(r#"knl.resume({ store = { sqlite = "/tmp/x.db" } })"#);
         assert!(msg.contains("knl: resume:"), "missing attribution: {msg}");
-        assert!(msg.contains("session is required"), "{msg}");
+        assert!(msg.contains("missing field `session`"), "{msg}");
 
         // A name nobody is holding open is an empty stream, not a session:
         // an in-memory database exists only while a handle does, so resuming
@@ -3473,7 +4409,8 @@ mod tests {
         // And a non-string detail is refused, naming which argument it was.
         let msg = vm.expect_err(r#"knl.open({ owner = "t" }):close("error", 7)"#);
         assert!(msg.contains("knl: close:"), "missing attribution: {msg}");
-        assert!(msg.contains("detail must be a string"), "{msg}");
+        assert!(msg.contains("detail:"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
     }
 
     /// A long `detail` is cut to the cap, exactly as the `<close>` path cuts
@@ -3997,7 +4934,8 @@ mod tests {
             local e = failure(function() s:query("SELECT 1", nil, { rows = 10 }) end)
             assert(e.kind == "validation", "kind: " .. tostring(e.kind))
             local m = failure(function() s:query(42) end)
-            assert(m.message:find("sql must be a string", 1, true), m.message)
+            assert(m.message:find("sql:", 1, true), m.message)
+            assert(m.message:find("expected a string", 1, true), m.message)
         "#,
         )
         .expect("refusal chunk");

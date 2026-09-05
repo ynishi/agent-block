@@ -99,8 +99,22 @@ type_of = function(node, class_prefix)
     local kind = rawget(node, "kind")
     if kind == "prim" then
         return node.prim
+    elseif kind == "integer" then
+        return "integer"
     elseif kind == "any" then
         return "any"
+    elseif kind == "bounded" then
+        -- LuaLS has no value/length-bounded types. Render the inner type;
+        -- the bounds are enforced at runtime only (same stance as pattern).
+        return type_of(rawget(node, "inner"), class_prefix)
+    elseif kind == "tuple" then
+        -- LuaLS tuple type literal: [T1, T2, ...].
+        local items = rawget(node, "items")
+        local parts = {}
+        for i = 1, #items do
+            parts[i] = type_of(items[i], class_prefix)
+        end
+        return "[" .. table.concat(parts, ", ") .. "]"
     elseif kind == "optional" then
         return type_of(rawget(node, "inner"), class_prefix)
     elseif kind == "described" then

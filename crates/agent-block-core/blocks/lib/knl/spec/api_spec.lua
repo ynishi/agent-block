@@ -447,11 +447,72 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
     end)
 
     it("declares knl.error in the bridge registry, like every other syscall", function()
+        -- The bridge registry's shapes come from Rust now (`knl_types`,
+        -- generated at host start), so what is checked here is that the entry
+        -- exists and is declared — that its `returns` really is the reading
+        -- `K.shapes.error` describes is held where both halves exist, in
+        -- `tests/fixtures/knl_beat_test.lua` (inv10).
         local entry = K.shapes.module.error
         expect(entry).to.exist()
         expect(is_declaration(entry.args)).to.be(true)
         expect(is_declaration(entry.returns)).to.be(true)
-        expect(entry.returns).to.be(K.shapes.error)
+    end)
+
+    it("points every bridge entry at the generated types and at nothing else", function()
+        -- The whole point of the round: the shapes of the syscall surface are
+        -- the Rust types, resolved through `knl.shapes.rust`. A hand-written
+        -- shape reappearing in either registry is the drift this replaced, and
+        -- it is caught by identity — every arg and every shape-valued return
+        -- must be a value that table hands out.
+        local from_rust = {}
+        for _, name in ipairs({
+            "SessionId",
+            "ScopeId",
+            "Owner",
+            "BeatId",
+            "Seq",
+            "Count",
+            "Amount",
+            "Remaining",
+            "Exhausted",
+            "Sql",
+            "CloseReason",
+            "CloseDetail",
+            "Raised",
+            "ViewName",
+            "ViewOpts",
+            "OpenOpts",
+            "ResumeOpts",
+            "AppendEvent",
+            "EventRows",
+            "QueryParams",
+            "QueryOpts",
+            "QueryResult",
+            "ErrorTable",
+            "ApiReport",
+        }) do
+            from_rust[K.shapes.rust[name]] = name
+        end
+
+        local stray = {}
+        for _, registry in ipairs({ K.shapes.session, K.shapes.module }) do
+            for name, entry in pairs(registry) do
+                if type(entry.args) == "table" then
+                    for i, arg in ipairs(entry.args) do
+                        -- `__close`'s first argument is the userdata itself,
+                        -- which is a handle rather than a value: prose there
+                        -- is the honest declaration.
+                        if is_shape(arg) and from_rust[arg] == nil then
+                            stray[#stray + 1] = name .. ".args[" .. i .. "]"
+                        end
+                    end
+                end
+                if is_shape(entry.returns) and from_rust[entry.returns] == nil then
+                    stray[#stray + 1] = name .. ".returns"
+                end
+            end
+        end
+        expect(listed(stray)).to.be("")
     end)
 
     it("gives every declared syscall an args and a returns", function()
@@ -742,9 +803,18 @@ describe("knl.shapes.query_opts — what a read may ask for beyond the SQL", fun
         expect(check.check({ nonsense = true }, K.shapes.query_opts)).to.be(false)
     end)
 
-    it("is the shape session:query's third argument is declared with", function()
+    it("is the shape the views pass through to session:query", function()
+        -- The Lua side of the contract: every predefined view takes the same
+        -- options it forwards, so `sessions` / `timeout_ms` / `limit` mean one
+        -- thing wherever they are written.
+        for _, name in ipairs({ "beats", "tool_pairs", "ledger", "usage", "tree" }) do
+            expect(K.shapes.views[name].args[2].shape).to.be(K.shapes.query_opts)
+        end
+        -- The bridge's own third argument is `knl_types.QueryOpts`, generated
+        -- from the Rust type; that the two agree field for field is checked
+        -- where both exist (`tests/fixtures/knl_beat_test.lua`, inv10).
         expect(K.shapes.session.query).to.exist()
-        expect(K.shapes.session.query.args[3]).to.be(K.shapes.query_opts)
+        expect(K.shapes.session.query.args[3]).to.be(K.shapes.rust.QueryOpts)
     end)
 end)
 

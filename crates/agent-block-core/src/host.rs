@@ -1073,6 +1073,16 @@ fn build_isle_init(
         for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
             memory = memory.add(*name, *source);
         }
+        // `knl_types` is the one embedded module with no file behind it: the
+        // lshape declaration of the kernel's syscall surface, generated here
+        // from the Rust argument and return types in `bridge/knl.rs`. It is
+        // built at start rather than checked in because a generated file in
+        // the tree is a file that can be edited, and one that has been edited
+        // is a second declaration wearing the first one's name — which is
+        // exactly the drift the Lua kernel's registry stopped having when it
+        // started pointing at this. Same lowest priority as the rest: a
+        // filesystem `knl_types` would win, and would be the caller's own.
+        memory = memory.add("knl_types", crate::bridge::knl::lshape_module_source());
         registry.add(memory);
 
         registry
