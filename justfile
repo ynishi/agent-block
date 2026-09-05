@@ -50,6 +50,21 @@ lint:
     cargo clippy --workspace --no-deps -- -D warnings
 
 # [allow-agent]
+# Build the crates.io package of every publishable crate, locally, in publish
+# order. Nothing is uploaded. This is the one check that walks the files
+# `cargo publish` will archive — the git-tracked tree of each crate directory —
+# so it is what catches a tracked path that no build reads: the 0.36.0 publish
+# stopped at the binary crate on a dangling `blocks` symlink that every test,
+# lint and `cargo package --list` had walked past. Run it before a bump, after
+# `check`; sequential for the same reason `test` is.
+package-check:
+    cargo package -p agent-block-types
+    cargo package -p agent-block-mcp
+    cargo package -p agent-block-core
+    cargo package -p agent-block-testkit
+    cargo package -p agent-block
+
+# [allow-agent]
 # Run the correlation-id demo: the ab.obs http_request / http_response
 # lines carry the four ids below on every model call. Requires ANTHROPIC_API_KEY.
 demo-llm-meta:
