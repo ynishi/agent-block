@@ -67,14 +67,20 @@
 //! outside) and an authority boundary (whatever the model decides, the owner
 //! has bounded the run).
 //!
-//! **The decision comes before the spending.**  [`Session::reserve`] asks
-//! whether the balance covers `n` and refuses *without deducting* when it
-//! does not; [`Session::spend`] settles afterwards, from the layer that
-//! knows what a call actually cost.  No `append` moves the balance.
+//! **Two deductions, and neither holds anything for the other.**
+//! [`Session::reserve`] is a deduction that *asks*: it refuses, without
+//! deducting, when the balance will not cover `n`.  [`Session::spend`] is a
+//! deduction that does not ask: it takes `n` off (flooring at zero) and
+//! reports only that it was recorded.  There is no hold and no settlement
+//! between them — nothing is reserved *for* a later spend to release or
+//! reconcile — so **a beat that calls both deducts twice**, and which of the
+//! two a beat uses is the layer above's to decide.  A run that wants to be
+//! stopped before it spends asks with `reserve`; a run that only meters what
+//! already happened deducts with `spend`.  No `append` moves the balance.
 //!
 //! **Every move is an event, and the balance is a fold over them.**  A
-//! grant, a reservation, a refusal and a settlement are each a `budget_*`
-//! event ([`BUDGET_KINDS`]), written by the kernel alone, and
+//! grant, a reservation, a refusal and an unasked deduction are each a
+//! `budget_*` event ([`BUDGET_KINDS`]), written by the kernel alone, and
 //! [`fold_balance`] over those events *is* the balance — there is no counter
 //! beside them.  [`Session::remaining`] reads it back off the stream (cached
 //! against the store's head, refolded when the head moves), so two handles
@@ -90,9 +96,9 @@
 //! **Usage is not accounting.**  What the providers reported is a separate
 //! reading, taken off the recorded responses, and the kernel never folds it
 //! into the balance.  A budget denominated in tokens will — if the layer
-//! above settles honestly — end with `granted - remaining` equal to the
-//! usage total, because both are folds over the same log.  That is a
-//! consequence, not a requirement, and nothing here checks it.
+//! above deducts honestly, and deducts once — end with `granted - remaining`
+//! equal to the usage total, because both are folds over the same log.  That
+//! is a consequence, not a requirement, and nothing here checks it.
 //!
 //! **Allocation, not limit.**  A budget is an *allocation* axis: units are
 //! consumed and do not come back, and a child scope can only be given what
@@ -326,8 +332,9 @@ pub mod sqlite_store;
 
 pub use budget::{fold_balance, Allocation, BudgetGrant};
 pub use event::{
-    is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_CHILD, FIELD_EPOCH_MS, FIELD_KIND,
-    FIELD_OPEN_CHILDREN, FIELD_PARENT, FIELD_SEQ,
+    is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_CHILD, FIELD_DESC,
+    FIELD_DETAIL, FIELD_EPOCH_MS, FIELD_KIND, FIELD_OPEN_CHILDREN, FIELD_OWNER, FIELD_PARENT,
+    FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_SEQ, FIELD_TAG,
 };
 #[cfg(test)]
 pub use event_store::MemEventStore;

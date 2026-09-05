@@ -188,7 +188,7 @@ pub const KIND_BUDGET_GRANTED: &str = "budget_granted";
 pub const KIND_BUDGET_RESERVED: &str = "budget_reserved";
 /// Kernel-only kind: a reservation was refused; the balance did not move.
 pub const KIND_BUDGET_REFUSED: &str = "budget_refused";
-/// Kernel-only kind: a settlement after the fact, deducted from the balance.
+/// Kernel-only kind: a deduction that did not ask, taken off the balance.
 pub const KIND_BUDGET_SPENT: &str = "budget_spent";
 
 /// The four kinds the ledger is made of — everything

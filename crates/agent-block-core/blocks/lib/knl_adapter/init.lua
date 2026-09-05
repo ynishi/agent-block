@@ -62,6 +62,22 @@
 ---   kernel's, published by it; this module re-exports rather than redefines
 ---   them, so there is one copy to keep true.
 ---
+--- And the failure contract, in one more
+---   A call that did not come off answers `nil, <knl.shapes.call_error>`:
+---   `{ kind, retryable, retry_after?, message, status? }`, with `kind` one of
+---   `knl.shapes.call_error_kinds`. It used to answer `nil, "a sentence"`,
+---   which a person could read and a loop could not — `policy.retry` decides
+---   on `detail.kind` / `detail.retryable`, so the failure most worth asking
+---   again about (a rate limit, an overloaded provider, a dropped connection)
+---   was the one no policy could ever fire on.
+---
+---   The classification is the same kind of provider knowledge the refusal
+---   vocabulary is, and it is kept in the same place and the same way: ONE
+---   mapping table in this module reads an HTTP status, and everything else —
+---   the shim's own failure paths, beat, the `llm_call_failed` note, a
+---   caller's retry policy — speaks the kernel's seven words. The status
+---   rides along on the detail as a fact for a log, never as a branch.
+---
 --- Usage
 ---   local knl = require("knl")
 ---   local adapter = require("knl_adapter")
@@ -132,6 +148,107 @@ M.shapes = { llm_result = RESULT, llm_usage = kernel.shapes.llm_usage }
 local TOOL_USE_BLOCK = kernel.shapes.tool_use_block
 M.shapes.tool_use_block = TOOL_USE_BLOCK
 
+--- The classification a failed call is reported with, re-exported like the
+--- result shape: one copy, the kernel's.
+M.shapes.call_error = kernel.shapes.call_error
+M.shapes.call_error_kinds = kernel.shapes.call_error_kinds
+
+-- ============================================================
+-- Failure classification — the one place an HTTP status is read
+-- ============================================================
+--
+-- A failed call used to leave the Port as `nil, "some sentence"`, and a
+-- sentence is not something a loop can decide on: `policy.retry` reads
+-- `detail.kind` / `detail.retryable`, so no retry policy could fire on the
+-- failure most worth retrying — a rate limit, an overloaded provider, a
+-- connection that dropped. The classification below is that missing half.
+--
+-- It is PROVIDER-NEUTRAL, and the table is what makes that true rather than
+-- the intention. A status is one provider's word for several things, so it is
+-- read HERE and nowhere else: `STATUS_KIND` answers with one of
+-- `knl.shapes.call_error_kinds` and everything downstream — beat, the
+-- `llm_call_failed` note, a caller's retry policy — decides on that word. The
+-- number rides along on the detail as a fact for whoever reads the log, and
+-- nothing branches on it again.
+
+--- HTTP status → the kernel's call-error vocabulary.
+---
+--- The named codes are the ones whose meaning both providers agree on. What
+--- is not named falls through the two rules below rather than being guessed
+--- at: any other 5xx is `server` (the provider broke, and asking again can
+--- work), and anything else at all — including a 200 whose body would not
+--- decode — is `unknown`, which is not retryable. A word invented for a code
+--- nobody mapped would be a vocabulary this table does not own.
+---
+--- 408 and 504 are timeouts, which is a transport failure that happened to
+--- arrive with a status attached; 503 and 529 are the two spellings of "not
+--- now" (OpenAI's Service Unavailable, Anthropic's Overloaded).
+local STATUS_KIND = {
+    [400] = "invalid_request",
+    [401] = "auth",
+    [403] = "auth",
+    [404] = "invalid_request",
+    [408] = "transport",
+    [413] = "invalid_request",
+    [422] = "invalid_request",
+    [429] = "rate_limited",
+    [503] = "overloaded",
+    [504] = "transport",
+    [529] = "overloaded",
+}
+
+--- The kind a status maps to — the only reader of `STATUS_KIND`.
+local function kind_of_status(status)
+    if type(status) ~= "number" then
+        return "unknown"
+    end
+    local named = STATUS_KIND[status]
+    if named ~= nil then
+        return named
+    end
+    if status >= 500 then
+        return "server"
+    end
+    return "unknown"
+end
+
+--- The `retry-after` header as a number of seconds, or nil.
+---
+--- Case-insensitive, because a header name is: HTTP/2 lower-cases them and
+--- HTTP/1.1 does not promise anything. A value that is not a number of
+--- seconds (the RFC also allows a date) is left absent rather than turned
+--- into a zero a loop would read as "immediately".
+local function retry_after_of(headers)
+    for name, value in pairs(headers or {}) do
+        if tostring(name):lower() == "retry-after" then
+            return tonumber(value)
+        end
+    end
+    return nil
+end
+
+--- One `knl.shapes.call_error`: the kind, the kernel's own judgement about
+--- whether it is worth asking again, and what the transport saw.
+---
+--- `retryable` is read from the kernel's table rather than decided here —
+--- which kinds are worth a second call is the vocabulary's answer, and a
+--- second copy of it in the adapter is exactly the drift this layer exists to
+--- prevent.
+---
+--- @param kind string  one of `knl.shapes.call_error_kinds`
+--- @param message string  what to tell a person
+--- @param seen table  { status?, retry_after? } as the transport saw them
+--- @return table  a call_error
+local function call_error(kind, message, seen)
+    return {
+        kind = kind,
+        retryable = kernel.shapes.call_error_retryable[kind] == true,
+        retry_after = seen.retry_after,
+        message = message,
+        status = seen.status,
+    }
+end
+
 -- ============================================================
 -- LLMPort — the provider Port (interface)
 -- ============================================================
@@ -175,17 +292,30 @@ end
 ---                     (handed to `llm_proto.transport`, which owns their
 ---                     defaults): max_retries, timeout, dump.
 --- @return function llm  function(request) -> resp | nil, err, where resp is
----                       { status, content, usage, stop_reason, refusal? }
+---                       { status, content, usage, stop_reason, refusal? } and
+---                       err is a `knl.shapes.call_error`
 function LLMPort:open(conf)
     conf = conf or {}
     local port = self
 
     --- @param request table  knl.fold output: { messages, system?, tools? }.
     return function(request)
+        -- What the transport saw of the answer, for the classification. It is
+        -- filled by `on_response`, llm_proto's observability hook, which runs
+        -- once after the retry loop — so this is the status and the headers of
+        -- the answer that actually came back, not of an attempt on the way.
+        -- The hook is the shim's own: a caller's `conf.on_response` was never
+        -- forwarded here and still is not, because the callbacks are
+        -- `llm_proto.backend`'s vocabulary rather than the Port's.
+        local seen = {}
+
         -- build: neutral request -> provider wire { url, headers, body }.
         local wire, berr = port:build(request, conf)
         if not wire then
-            return nil, berr
+            -- Nothing was sent, and the same request cannot be sent: a
+            -- missing key, a model the adapter will not build for. The
+            -- request is what did not hold up.
+            return nil, call_error("invalid_request", tostring(berr), seen)
         end
 
         -- transport: POST with retries, the classified non-200, the decode —
@@ -197,15 +327,24 @@ function LLMPort:open(conf)
             max_retries = conf.max_retries,
             timeout = conf.timeout,
             dump = conf.dump,
+            on_response = function(answer)
+                if type(answer) == "table" then
+                    seen.status = answer.status
+                    seen.retry_after = retry_after_of(answer.headers)
+                end
+            end,
         })
         if not transported then
-            return nil, "http transport error: " .. tostring(raw)
+            -- The host's http device raised: connect refused, read cut,
+            -- deadline hit. No answer arrived, so no status was seen.
+            return nil, call_error("transport", "http transport error: " .. tostring(raw), seen)
         end
         -- A non-200 after retries, or a body that would not decode: the beat
         -- did not come off. beat records the (nil, err) as `llm_call_failed`
-        -- and reports Outcome.err("call").
+        -- and reports Outcome.err("call"). This is the one place the status
+        -- becomes a kind.
         if not raw then
-            return nil, terr
+            return nil, call_error(kind_of_status(seen.status), tostring(terr), seen)
         end
 
         -- parse: provider raw -> full neutral result (content, usage,
@@ -214,7 +353,10 @@ function LLMPort:open(conf)
         -- this end instead of taking proto.backend's reduced one.
         local result, perr = port:parse(raw)
         if not result then
-            return nil, perr
+            -- The provider answered and the adapter could not read it. That is
+            -- neither a transport failure nor one of the provider's own
+            -- classes, and asking again gets the same answer: `unknown`.
+            return nil, call_error("unknown", tostring(perr), seen)
         end
 
         -- Mapper (anti-corruption layer). The parse result is not handed across
@@ -227,7 +369,7 @@ function LLMPort:open(conf)
         -- failure of the same class as a transport or parse failure, mapped onto
         -- the closure's (nil, err) contract — not a shape violation to assert on.
         if type(result.content) ~= "table" then
-            return nil, "unreadable content: not an array"
+            return nil, call_error("unknown", "unreadable content: not an array", seen)
         end
         -- The Port's own judgement — status and the normalized refusal detail
         -- come from one method, so they cannot disagree. The shim adds no

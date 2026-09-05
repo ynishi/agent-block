@@ -51,11 +51,13 @@
 ---   [0.5] the beat names itself (`knl.new_beat_id`)
 ---   [1]   request = `device.fold(session:events(), device)`
 ---   [2]   the filter chain, each `fn(request) -> request`
----   [3]   `session:reserve(device.cost(request))` — a refusal stops here,
----         with nothing recorded and no call made
+---   [3]   `session:reserve(device.cost(request))` — the beat's whole
+---         deduction, taken before the call; a refusal stops here, with
+---         nothing recorded and no call made
 ---   [4]   append `llm_request`
 ---   [5]   `device.llm(request)`
----   [6]   append `llm_response` (or `llm_call_failed`), then settle
+---   [6]   append `llm_response`, or `llm_call_failed` with the failure's
+---         classification on it
 ---   [7]   the tools that response asked for: `tool_call` / `tool_result`
 ---
 --- Outcome — the four statuses
@@ -80,11 +82,20 @@
 ---   different questions. `kind` names the STAGE that failed — "conf" (the
 ---   device or a caller function it holds), "filter", "call" (the llm), or
 ---   "state" (a record that could not be laid down). What the failure WAS,
----   and whether asking again could work, is in `detail`: a "state" failure
----   carries the kernel's own reading, `detail.kind` one of
----   `knl.shapes.error_kinds` and `detail.retryable`. A loop deciding on a
----   retry reads `detail.retryable` and never the stage: "state" says
----   where, not whether.
+---   and whether asking again could work, is in `detail`, and the two stages
+---   that can answer that do:
+---
+---     "state"  the kernel's own reading — `detail.kind` one of
+---              `knl.shapes.error_kinds`, `detail.retryable`
+---     "call"   the call's classification — `detail.kind` one of
+---              `knl.shapes.call_error_kinds`, `detail.retryable`, and
+---              `detail.retry_after` when the provider named one
+---
+---   A loop deciding on a retry reads `detail.retryable` (or names
+---   `detail.kind`s) and never the stage: "state" and "call" say where, not
+---   whether. The two vocabularies are separate on purpose — a contended
+---   store and a rate-limited provider are not the same failure — and
+---   `detail.kind` is the field both answer in, so one predicate reads both.
 ---
 --- What a stored event looks like
 ---   One envelope, one place for structure. An event is `{ kind, beat?,
@@ -149,6 +160,14 @@
 ---   the number and nothing else, and token usage (`knl.views.usage`) is a
 ---   separate reading that beat never folds back into the budget.
 ---
+---   `reserve` is the WHOLE of a beat's deduction. The kernel's two moves are
+---   independent — `reserve(n)` deducts and refuses when the balance is
+---   short, `spend(n)` deducts without asking, and neither holds anything for
+---   the other to release — so a beat that called both would deduct twice for
+---   one call. beat calls `reserve` and nothing else; a caller that meters
+---   what a call really cost does it with `spend` from its own loop, knowing
+---   it is a second deduction.
+---
 --- Sessions opened from sessions
 ---   `knl.open{ parent = s, budget = { from_parent = n } }` opens a session
 ---   out of `s`'s balance: `s`'s ledger gains a reservation naming the child,
@@ -189,6 +208,10 @@
 ---       counts, and a "refused" answer names the refusal's `kind`. A
 ---       transport or provider failure is `nil, err` (or a raise), which
 ---       beat records as `llm_call_failed` and reports as `err("call")`.
+---       `err` is a `knl.shapes.call_error` when the port classified it —
+---       `{ kind, retryable, retry_after?, message, status? }`, which is what
+---       lets a retry policy decide — and anything else (a sentence, a raise)
+---       is carried as `unknown` and not retryable.
 ---     tool_policy(tool_use_block, out) -> decision, reason?
 ---       `nil` (no opinion — run), `"run"` or `"deny"`, and nothing else: a
 ---       fourth word is a device-contract violation, not a fourth meaning.
@@ -723,6 +746,77 @@ local EVENT_BASE = T.shape({
 --- (see the header) — and it is declared here with the rest so the form is
 --- published rather than remembered.
 ---
+--- The classification a model call that did not come off carries.
+---
+--- WHY IT IS A VOCABULARY AND NOT A STATUS. A beat reports a failed call as
+--- `Outcome.err("call", detail)`, and `kind` there names the STAGE — it says
+--- the llm is where the beat broke and nothing about what broke. So a loop
+--- had nothing to decide on: `policy.retry` reads `detail.kind` and
+--- `detail.retryable`, and a call failure carried neither, which meant no
+--- retry policy could ever fire on the one failure that is most often worth
+--- asking again about (a rate limit, an overloaded provider, a connection
+--- that dropped).
+---
+--- These seven words are that missing half, and they are provider-neutral by
+--- construction: an HTTP status is one provider's word for several things,
+--- and it is read in exactly one place — the adapter's mapping table
+--- (`knl_adapter`) — which answers with one of these. Nothing downstream
+--- reads a status or a status class; `status` rides along on the detail as a
+--- fact for a person reading a log, never as something to branch on.
+---
+---   transport        the call never got an answer: connect, read, timeout
+---   rate_limited     the provider said "too fast" (429)
+---   overloaded       the provider said "not now" (529 / 503)
+---   server           the provider broke (5xx)
+---   auth             the credentials were refused (401 / 403)
+---   invalid_request  the request itself was rejected (400 / 404 / 413 / 422)
+---   unknown          anything the mapping does not name — including an
+---                    adapter that broke its own contract, and a raise
+---
+--- `retryable` is true for exactly the first four. It is a separate field
+--- rather than a lookup because it is the judgement a loop acts on, and the
+--- table below is what the two are kept in step by.
+local CALL_ERROR_KINDS = { "transport", "rate_limited", "overloaded", "server", "auth", "invalid_request", "unknown" }
+
+--- Which of the kinds above says asking again could work.
+---
+--- Published beside the list so a caller (or a port) reads one answer rather
+--- than deciding for itself: a provider being busy is worth another call, a
+--- request the provider refused to read is not.
+local CALL_ERROR_RETRYABLE = {
+    transport = true,
+    rate_limited = true,
+    overloaded = true,
+    server = true,
+    auth = false,
+    invalid_request = false,
+    unknown = false,
+}
+
+--- The same list as a set, for the one reader that has to ask "is this word
+--- one of ours" about a value that came from somewhere else.
+local CALL_ERROR_IS_KIND = {}
+for _, kind in ipairs(CALL_ERROR_KINDS) do
+    CALL_ERROR_IS_KIND[kind] = true
+end
+
+--- What a failed call's `detail` carries — `Outcome.err("call", <this>)`.
+---
+--- Open, like `knl.shapes.error`: the dev-mode traceback of a caller's own
+--- raising llm rides here, and a port may attach what its own reader needs.
+--- What is closed is the vocabulary of `kind`.
+---
+--- `retry_after` is seconds, and it is present only when the provider named
+--- one (a `retry-after` header); `status` is the HTTP status the mapping read,
+--- carried for a reader and never for a decision.
+local CALL_ERROR = T.shape({
+    kind = T.one_of(CALL_ERROR_KINDS),
+    retryable = T.boolean,
+    retry_after = T.number:describe("seconds, as the provider named them"):is_optional(),
+    message = T.string,
+    status = T.number:describe("the HTTP status the mapping read; a fact, not a branch"):is_optional(),
+})
+
 --- Two kinds here are the KERNEL's, not this layer's: `session_opened` and
 --- `session_closed`. Nothing in Lua may write them (the kernel refuses a
 --- hand-written boundary) and their shape is checked on the other side of
@@ -758,8 +852,17 @@ local EVENT_DATA = {
         usage = T.table,
         stop_reason = T.string:is_optional(),
     }, { open = false }),
+    -- The note a call that did not come off leaves behind. `error` is the
+    -- sentence (a person reads it, and `policy.carry` puts it in front of the
+    -- next request); the rest is the same classification the Outcome carries,
+    -- recorded so the log answers "what kind of failure was that" without the
+    -- caller having kept the Outcome. Closed, like the rest.
     llm_call_failed = T.shape({
         error = T.string,
+        kind = T.one_of(CALL_ERROR_KINDS),
+        retryable = T.boolean,
+        retry_after = T.number:is_optional(),
+        status = T.number:is_optional(),
     }, { open = false }),
     tool_call = T.shape({
         call_id = T.string,
@@ -891,7 +994,8 @@ local TOOL_USE_BLOCK = T.shape({
 --- asserts against this very table). Two statuses and no more: a transport
 --- or provider failure is not a variant here, because that path answers
 --- `nil, err` (or raises), which beat records as `llm_call_failed` and
---- reports as `err("call")`.
+--- reports as `err("call")` — with `err` a `call_error` above when the port
+--- classified it.
 ---
 --- Discriminated on `status` rather than one shape with an optional
 --- `refusal`, because "present exactly on a refusal" is the contract and an
@@ -1034,6 +1138,13 @@ M.shapes = {
     -- The vocabulary as a list, next to the shape that closes on it: a
     -- caller enumerating the classes reads the same constant the shape does.
     error_kinds = ERROR_KINDS,
+    -- The same arrangement for a failed model call: the classification a
+    -- beat's `err("call")` carries, and the closed list its `kind` comes
+    -- from. An adapter maps its provider onto these words and a loop decides
+    -- on them; nobody downstream reads a status.
+    call_error = CALL_ERROR,
+    call_error_kinds = CALL_ERROR_KINDS,
+    call_error_retryable = CALL_ERROR_RETRYABLE,
     request = REQUEST,
     event_base = EVENT_BASE,
     event_meta = EVENT_META,
@@ -1375,6 +1486,57 @@ local function raised_detail(message, caught)
         return { message = message, traceback = caught.traceback }
     end
     return message
+end
+
+--- The classification a failed model call is reported with — the detail of
+--- `Outcome.err("call", …)` and the `data` of the `llm_call_failed` note.
+---
+--- One shape for every way a call does not come off, because a loop reading
+--- the Outcome cannot be asked to tell them apart:
+---
+---   * the port classified it — `nil, { kind, retryable, … }` — and that
+---     reading is carried through as it came. The adapter is where a
+---     provider's vocabulary is read, and this layer does not second-guess it;
+---   * anything else — a raise, an adapter that broke `llm_result`, a device
+---     whose `llm` is not a port at all and answered `nil, "..."` — is
+---     `unknown` and not retryable. That is the honest reading: beat was not
+---     told what kind of failure it was, and inventing one (a "transport" for
+---     every message with "timeout" in it, say) would be this layer guessing
+---     at the vocabulary it just refused to let the shim hold.
+---
+--- The dev-mode traceback of a caller's own raising `llm` rides along beside
+--- the classification, exactly as `raised_detail` carries it for the stages
+--- whose detail is a sentence.
+---
+--- @param err any  what the llm answered as its error, or the raised value
+--- @param caught table|nil  what `traced` handed back, when it raised
+--- @return table  `knl.shapes.call_error`
+local function call_error(err, caught)
+    local detail = {}
+    if type(err) == "table" then
+        for k, v in pairs(err) do
+            detail[k] = v
+        end
+    end
+    -- A word outside the published vocabulary is not adopted: `unknown` is
+    -- what the list says an unnamed failure is, and a beat that passed a
+    -- foreign word on would be handing a caller's retry policy a `kind` no
+    -- declaration covers. The port's own text still says what happened.
+    if not CALL_ERROR_IS_KIND[detail.kind] then
+        detail.kind = "unknown"
+    end
+    if type(detail.retryable) ~= "boolean" then
+        -- The port answers this itself; for everything else the vocabulary's
+        -- own table does, and `unknown` is not retryable.
+        detail.retryable = CALL_ERROR_RETRYABLE[detail.kind] == true
+    end
+    if type(detail.message) ~= "string" then
+        detail.message = tostring(err)
+    end
+    if type(caught) == "table" and caught.traced then
+        detail.traceback = caught.traceback
+    end
+    return detail
 end
 
 --- What a `traced` failure raised, as text.
@@ -1783,18 +1945,27 @@ end
 --- The session surface, as names: every method `knl.shapes.session`
 --- declares that a caller can reach (`__close` is the metamethod, reached by
 --- the language and not by a call).
-local SESSION_METHODS = {
-    "id",
-    "scope_id",
-    "owner",
-    "append",
-    "events",
-    "reserve",
-    "spend",
-    "remaining",
-    "exhausted",
-    "close",
-}
+---
+--- DERIVED from that registry rather than retyped beside it. The list used to
+--- be written out here and had drifted — `view` and `query` were syscalls the
+--- registry declared and this list did not name, so a stand-in that answered
+--- neither passed the gate and failed later, on a call a caller had every
+--- right to make. A copy of a list is a list that goes stale; reading the
+--- registry is what makes that impossible rather than caught.
+---
+--- The registry itself is held against the bridge's own `knl.api().session`
+--- in both directions where a bridge exists (`tests/fixtures/knl_beat_test.lua`,
+--- inv10), so the chain from this gate to the Rust `SESSION_API` is closed.
+local SESSION_METHODS = {}
+for name in pairs(M.shapes.session) do
+    -- `__close` is the language's, not a call: `local s <close> = ...` reaches
+    -- it, and a stand-in that answers every callable method is a session
+    -- whether or not it also carries the metamethod.
+    if name ~= "__close" then
+        SESSION_METHODS[#SESSION_METHODS + 1] = name
+    end
+end
+table.sort(SESSION_METHODS)
 
 --- Whether `s` is a session handle.
 ---
@@ -2185,10 +2356,23 @@ function M.beat(session, device)
         reason = llm_contract_violation(resp)
     end
     if reason ~= nil then
+        -- The failure, classified: what the port said if it said anything,
+        -- and `unknown` otherwise (`call_error`). One table, so a loop reading
+        -- `detail.kind` / `detail.retryable` gets an answer here for the same
+        -- reason it gets one from a "state" failure — and so the note in the
+        -- log says the same thing the Outcome does.
+        local classified = call_error(reason, raised)
+        shape.assert_dev(classified, CALL_ERROR, "knl_call_error")
         local noted_ok, note_err = pcall(record, session, {
             kind = "llm_call_failed",
             beat = beat_id,
-            data = { error = tostring(reason) },
+            data = {
+                error = classified.message,
+                kind = classified.kind,
+                retryable = classified.retryable,
+                retry_after = classified.retry_after,
+                status = classified.status,
+            },
         })
         if not noted_ok then
             -- Two failures, one Outcome. The state is the one reported:
@@ -2199,14 +2383,14 @@ function M.beat(session, device)
             -- reason — the note that did not land — rides along as `cause`
             -- (the suppressed failure, not the winner).
             local detail = read_error(note_err)
-            detail.cause = tostring(reason)
+            detail.cause = classified.message
             return emit(Outcome.err("state", detail))
         end
-        return emit(Outcome.err("call", raised_detail(tostring(reason), raised)))
+        return emit(Outcome.err("call", classified))
     end
     -- ok / refused: the model answered. Appending the llm_response is what
     -- records it, under this beat's id, and the budget does not move (the
-    -- quota was settled at [3]).  The counts go in as they came: the adapter
+    -- deduction was taken at [3]).  The counts go in as they came: the adapter
     -- normalized them to three numbers on its way out, so there is nothing
     -- here to default and nothing to invent.
     local resp_ok, resp_err = pcall(record, session, {

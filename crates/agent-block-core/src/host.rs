@@ -1644,9 +1644,20 @@ async fn drain_auto_serve(auto_serve_state: AutoServeState) {
 }
 
 /// Tear down host resources in order: disconnect MCP servers, shut down the
-/// main Isle driver (fatal on error), then the handler Isle driver, the
-/// kernel's per-session connection threads and the `ts` one (logged,
-/// non-fatal so a worker-thread panic does not poison the process exit).
+/// main Isle driver, then the handler Isle driver, the kernel's per-session
+/// connection threads and the `ts` one.
+///
+/// **Every step runs, whatever the step before it did.** A teardown is not a
+/// pipeline: each of these owns something that has to be let go of, and the
+/// drains at the end are where queued writes actually land — the kernel's
+/// connection threads hold the `session_closed` a dropped handle submitted
+/// without waiting for it ([`crate::knl::Session::close_detached`]), and a
+/// `?` on an earlier step used to skip them, so a failing MCP disconnect or a
+/// panicking main Isle silently cost the log its closing boundaries. So the
+/// failures are collected and the first one is returned once everything has
+/// been drained; the ones that are logged rather than returned stay logged,
+/// for the same reason as before — a worker-thread panic must not poison the
+/// process exit when the script's own result is what the caller asked for.
 ///
 /// The kernel's threads go *after* the Isles on purpose. Dropping a VM runs
 /// its collector, which is where a session nobody closed submits its
@@ -1662,17 +1673,31 @@ async fn shutdown(
 ) -> BlockResult<()> {
     let _shutdown_span = info_span!("shutdown");
 
-    mcp_manager.write().await.disconnect_all().await?;
+    // What the caller is told about, once the rest of the teardown has run.
+    // The first failure wins: it is the one nearest the cause, and the others
+    // are in the log with their own context.
+    let mut failure: Option<BlockError> = None;
+    let mut record = |e: BlockError| {
+        tracing::error!(error = %e, "shutdown step failed; the teardown continues");
+        if failure.is_none() {
+            failure = Some(e);
+        }
+    };
 
-    driver
-        .shutdown()
-        .await
-        .map_err(|e| BlockError::Runtime(format!("AsyncIsle shutdown failed: {e}")))?;
+    if let Err(e) = mcp_manager.write().await.disconnect_all().await {
+        record(e);
+    }
+
+    if let Err(e) = driver.shutdown().await {
+        record(BlockError::Runtime(format!(
+            "AsyncIsle shutdown failed: {e}"
+        )));
+    }
 
     // Handler Isle shutdown is independent of main shutdown: a failure
     // here (e.g. ThreadPanic on the handler thread) is logged but does
     // not poison the main process exit. The main Isle has already
-    // been stopped cleanly above.
+    // been stopped above.
     match handler_driver.shutdown().await {
         Ok(()) => info!(
             thread_name = "agent-block-handler-isle",
@@ -1720,7 +1745,10 @@ async fn shutdown(
         }
     }
 
-    Ok(())
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Primary SDK entry point: run one agent-block execution to completion.

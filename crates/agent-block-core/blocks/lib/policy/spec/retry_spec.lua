@@ -120,6 +120,35 @@ describe("policy.retry — what is retried", function()
         end
     end)
 
+    it("retries a call failure the adapter classified, and honours its retry_after", function()
+        -- The gap this round closed. A call that did not come off used to
+        -- carry a sentence, so `detail` was a string, so this predicate
+        -- answered false for every provider failure — the class of failure
+        -- most often worth asking again about. The adapter classifies it now
+        -- (`knl.shapes.call_error`: kind / retryable / retry_after), and what
+        -- it produces is read by the two fields this predicate has always
+        -- decided on. Nothing here reads a status; the 429 rides along on the
+        -- detail as a fact, and `rate_limited` is what is acted on.
+        local again = policy.retry({ max = 3 })
+        local ask, delay = again(
+            Outcome.err("call", {
+                kind = "rate_limited",
+                retryable = true,
+                retry_after = 30,
+                message = "API error 429 (rate_limit)",
+                status = 429,
+            }),
+            1
+        )
+        expect(ask).to.be(true)
+        expect(delay).to.be(30)
+
+        -- And one the adapter called not-retryable is still not retried.
+        local refused_credentials =
+            Outcome.err("call", { kind = "auth", retryable = false, message = "API error 401 (auth)", status = 401 })
+        expect(again(refused_credentials, 1)).to.be(false)
+    end)
+
     it("does not retry a failure whose detail is a sentence", function()
         -- `conf` / `filter` / `call` report a message, not a reading: there is
         -- no kind on them to decide from.

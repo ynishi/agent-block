@@ -375,8 +375,9 @@ pub const MODULE_API: &[(&str, &str)] = &[
     ),
     (
         "api",
-        "api() -> { session = …, module = …, errors = { kind }, schema = { table, columns } } — \
-         the declared surface, and the columns a query may name",
+        "api() -> { session = …, module = …, errors = { kind }, schema = { table, columns }, \
+         fields = { amount, tag, … } } — the declared surface, the columns a query may name, and \
+         the `data` paths a view reaches into",
     ),
 ];
 
@@ -918,6 +919,48 @@ pub mod types {
         pub columns: Vec<ApiColumn>,
     }
 
+    /// The `data` field names of the kinds the kernel writes itself.
+    ///
+    /// The columns are published above ([`ApiSchema`]) and they are only half
+    /// of what a view has to spell: everything a `budget_*` or `session_*`
+    /// event is *about* lives inside the `data` column, and a Lua view reaches
+    /// it with a `json_extract` path — `knl.views.ledger` reads `$.amount` and
+    /// `$.tag`, `knl.views.tree` reads `$.parent` and `$.open_children`.  Those
+    /// paths are the Rust `FIELD_*` constants spelled out in SQL, in another
+    /// language, in another file; nothing held them together, so a rename here
+    /// would have left the view answering NULL for every row.
+    ///
+    /// So the names are published from the constants themselves, and the view
+    /// is held against them where a store exists
+    /// (`tests/fixtures/knl_beat_test.lua`, inv11) — the same two-sided
+    /// arrangement the columns and the error classes already have.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct ApiFields {
+        /// `budget_*`: how much, in the grant's unit.
+        pub amount: String,
+        /// `budget_*`: the grant's unit, when it named one.
+        pub tag: String,
+        /// `budget_granted`: the owner's free-text note.
+        pub desc: String,
+        /// `budget_refused`: the balance the refusal was measured against.
+        pub remaining: String,
+        /// `session_opened` / `budget_*`: the authority it was written under.
+        pub scope_id: String,
+        /// `session_opened`: the principal the scope belongs to.
+        pub owner: String,
+        /// `session_opened` / `budget_granted`: the stream this was opened
+        /// from.
+        pub parent: String,
+        /// `budget_reserved` / `budget_refused`: the stream the units went to.
+        pub child: String,
+        /// `session_closed`: which kind of ending it was.
+        pub reason: String,
+        /// `session_closed`: the sentence only that close could tell.
+        pub detail: String,
+        /// `session_closed`: the children that had not ended when it did.
+        pub open_children: String,
+    }
+
     /// What `knl.api()` answers: the whole declared surface, as data.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
     pub struct ApiReport {
@@ -929,6 +972,8 @@ pub mod types {
         pub errors: Vec<String>,
         /// The columns a query may name.
         pub schema: ApiSchema,
+        /// The `data` paths a view reaches into, as the kernel spells them.
+        pub fields: ApiFields,
         /// The generated `knl_types` module, as source text — the same one
         /// the host embeds, for a tool that wants to read the surface
         /// without loading it.
@@ -1119,13 +1164,52 @@ struct Session {
     // hazard: a session's own calls are meant to be one at a time, and the
     // lock's whole job is to say so.
     state: Mutex<knl::Session>,
+    /// The three identity reads, copied out at construction.
+    ///
+    /// `id` / `scope_id` / `owner` are immutable once this userdata exists —
+    /// the stream is adopted before the value is built (`open_sqlite`,
+    /// `resume_on`, `Session::open_child`, and `knl::Session::new` inside
+    /// itself), and neither the scope id nor the owner has a setter at all —
+    /// so the answer is a field here rather than a read behind the lock.
+    ///
+    /// That is what makes those three methods *never raise*, which is what
+    /// [`SESSION_API`] says about them.  Behind the lock they could not:
+    /// a `try_lock` has an answer for "somebody is mid-call" and every answer
+    /// to that is wrong for an identity read — raising turns `s:id()` into a
+    /// call a caller has to handle, and waiting is the one thing a
+    /// synchronous method on the VM's thread must not do.
+    identity: Identity,
+}
+
+/// What a session answers about itself without touching the store.
+///
+/// Fixed at construction and never written again, so the reads are plain
+/// field reads and the lock stays for the calls that actually reach the log.
+struct Identity {
+    /// The stream this session writes (`s:id()`).
+    id: String,
+    /// The authority the stream is written under (`s:scope_id()`).
+    scope_id: String,
+    /// The principal the scope belongs to (`s:owner()`).
+    owner: String,
 }
 
 impl Session {
     /// Wrap a kernel session as the Lua userdata.
+    ///
+    /// The identity is read *here*, which is why every caller adopts the
+    /// stream id before handing the session over: after this line the three
+    /// values are the userdata's own, and the kernel session's copy of them
+    /// can no longer be reached from Lua.
     fn from_state(state: knl::Session) -> Self {
+        let identity = Identity {
+            id: state.id().to_string(),
+            scope_id: state.scope_id().to_string(),
+            owner: state.owner().to_string(),
+        };
         Self {
             state: Mutex::new(state),
+            identity,
         }
     }
 
@@ -1266,36 +1350,18 @@ fn table_to_object(
     }
 }
 
-/// The session behind the userdata, for a method that only reads its value.
-///
-/// `try_lock` rather than an await: the three identity reads are synchronous
-/// because they touch nothing that can wait, and the only thing that ever
-/// holds this lock is a store call that is suspended — at which point Lua is
-/// not running and cannot have called us.  So the refusal below is a
-/// contradiction being reported rather than a case to handle, and reporting it
-/// is still better than blocking the VM's one thread on a lock it is holding.
-fn borrowed<'a>(
-    session: &'a Session,
-    method: &str,
-) -> LuaResult<tokio::sync::MutexGuard<'a, knl::Session>> {
-    session
-        .state
-        .try_lock()
-        .map_err(|_| err(method, "the session is busy with another call"))
-}
-
 impl LuaUserData for Session {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // The three identity reads below are the only synchronous methods on
-        // the session: each answers out of the value itself, touching neither
-        // the store nor anything that can wait, which is the work a sync
-        // `add_method` is still for.  Everything after them reaches the store,
-        // so everything after them yields.
+        // the session: each answers out of a field of the userdata itself
+        // ([`Identity`]), touching neither the store nor the lock, which is
+        // the work a sync `add_method` is still for.  They cannot fail, and
+        // that is a property of where the value is kept rather than a promise
+        // made about a lock nobody was supposed to be holding.  Everything
+        // after them reaches the store, so everything after them yields.
 
         // s:id() -> string
-        methods.add_method("id", |_, this, ()| {
-            Ok(borrowed(this, "id")?.id().to_string())
-        });
+        methods.add_method("id", |_, this, ()| Ok(this.identity.id.clone()));
 
         // s:scope_id() -> string
         //
@@ -1303,17 +1369,13 @@ impl LuaUserData for Session {
         // as recorded on `session_opened` and on every `budget_*` event.
         // Not `s:id()`: that names the stream, this names the authority the
         // stream is written under, and neither is a caller's to choose.
-        methods.add_method("scope_id", |_, this, ()| {
-            Ok(borrowed(this, "scope_id")?.scope_id().to_string())
-        });
+        methods.add_method("scope_id", |_, this, ()| Ok(this.identity.scope_id.clone()));
 
         // s:owner() -> string
         //
         // The principal the scope belongs to (a real id, or the reserved
         // "anon" / "system").  Total — never nil.
-        methods.add_method("owner", |_, this, ()| {
-            Ok(borrowed(this, "owner")?.owner().to_string())
-        });
+        methods.add_method("owner", |_, this, ()| Ok(this.identity.owner.clone()));
 
         // s:append(event) -> seq
         //
@@ -2244,9 +2306,11 @@ fn as_table<T: serde::Serialize>(lua: &Lua, method: &str, value: &T) -> LuaResul
 /// `errors` is the closed list of classes `knl.error(e).kind` can report.  It
 /// is published for the same reason the two method lists are: the shell keeps
 /// its own declaration of the vocabulary, and a declaration nobody can check
-/// is one that drifts.  `types` is the generated `knl_types` module as source
-/// text — the same one the host embeds — so a tool can read the argument and
-/// return shapes without loading them.
+/// is one that drifts.  `fields` is the other half of the read contract: the
+/// `data` paths a Lua view spells in `json_extract`, taken from the kernel's
+/// own [`knl::FIELD_AMOUNT`] and friends.  `types` is the generated
+/// `knl_types` module as source text — the same one the host embeds — so a
+/// tool can read the argument and return shapes without loading them.
 fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
     /// One `{ name, doc }` list, in declaration order.
     fn listed(entries: &[(&str, &str)]) -> Vec<types::ApiEntry> {
@@ -2277,11 +2341,30 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
             .collect(),
     };
 
+    // The other half of the read contract: the `data` paths a view reaches
+    // into, taken from the constants the writers use rather than retyped, so
+    // a Lua `json_extract('$.amount')` can be held against the field the
+    // kernel actually wrote.
+    let fields = types::ApiFields {
+        amount: knl::FIELD_AMOUNT.to_string(),
+        tag: knl::FIELD_TAG.to_string(),
+        desc: knl::FIELD_DESC.to_string(),
+        remaining: knl::FIELD_REMAINING.to_string(),
+        scope_id: knl::FIELD_SCOPE_ID.to_string(),
+        owner: knl::FIELD_OWNER.to_string(),
+        parent: knl::FIELD_PARENT.to_string(),
+        child: knl::FIELD_CHILD.to_string(),
+        reason: knl::FIELD_REASON.to_string(),
+        detail: knl::FIELD_DETAIL.to_string(),
+        open_children: knl::FIELD_OPEN_CHILDREN.to_string(),
+    };
+
     let report = types::ApiReport {
         session: listed(SESSION_API),
         module: listed(MODULE_API),
         errors: knl::KnlError::KINDS.iter().map(|k| k.to_string()).collect(),
         schema,
+        fields,
         types: lshape_module_source(),
     };
     as_table(lua, "api", &report)
@@ -2572,6 +2655,19 @@ mod generated_types {
                                 declared_type: "INTEGER".into(),
                                 pk: true,
                             }],
+                        },
+                        fields: ApiFields {
+                            amount: "amount".into(),
+                            tag: "tag".into(),
+                            desc: "desc".into(),
+                            remaining: "remaining".into(),
+                            scope_id: "scope_id".into(),
+                            owner: "owner".into(),
+                            parent: "parent".into(),
+                            child: "child".into(),
+                            reason: "reason".into(),
+                            detail: "detail".into(),
+                            open_children: "open_children".into(),
                         },
                         types: "-- generated".into(),
                     },
@@ -5137,6 +5233,96 @@ mod tests {
         // And the write itself landed once the lock was released.
         vm.exec(r#"assert(kinds_of(session) == "session_opened,slow", kinds_of(session))"#)
             .expect("the slow append landed");
+    }
+
+    /// **An identity read never waits and never raises.**
+    ///
+    /// `id` / `scope_id` / `owner` are declared as methods that answer out of
+    /// the value, and [`SESSION_API`] lists no class for them.  They used to
+    /// reach the session behind a `try_lock`, which has exactly one answer for
+    /// "somebody else is mid-call" and it is a raise — so a second coroutine
+    /// asking a session its own id while the first was suspended inside
+    /// `s:append` got a `validation` failure instead of a string.  The three
+    /// values are copied into the userdata at construction now, and this is
+    /// the case that says so: same shape as the non-blocking write above, with
+    /// the identity read taking the ticker's place.
+    #[test]
+    fn an_identity_read_answers_while_another_coroutine_holds_the_session() {
+        use std::time::Duration;
+
+        /// How long the blocker holds the write lock — long enough that the
+        /// append below is certainly still suspended when the reader runs.
+        const HELD: Duration = Duration::from_millis(300);
+
+        let vm = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        // One yield for the reader, so it asks from inside the same suspension
+        // the writer is parked in rather than before the writer got there.
+        let pause = vm
+            .lua
+            .create_async_function(|_, ()| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            })
+            .expect("create pause");
+        vm.lua.globals().set("pause", pause).expect("set pause");
+
+        vm.exec(&format!(
+            r#"
+            session = knl.open({{ store = {{ sqlite = "{path_str}" }}, owner = "u-7" }})
+            -- What the reads must still answer while the session is held.
+            expected_id, expected_scope, expected_owner =
+                session:id(), session:scope_id(), session:owner()
+            "#
+        ))
+        .expect("open the durable session");
+
+        // A second connection holds the write lock, so the append below is
+        // parked inside the store with the session's own lock held.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker_path = path.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&blocker_path).expect("open the blocker");
+            conn.busy_timeout(HELD).expect("busy timeout");
+            conn.execute_batch("BEGIN EXCLUSIVE")
+                .expect("take the write lock");
+            locked_tx.send(()).expect("announce the lock");
+            std::thread::sleep(HELD);
+            conn.execute_batch("ROLLBACK").expect("release the lock");
+        });
+        locked_rx.recv().expect("the lock was taken");
+
+        let read: String = vm.block_on(async {
+            let writer = vm
+                .lua
+                .load(r#"session:append({ kind = "slow" })"#)
+                .exec_async();
+            // The reader yields once first, so the writer is inside the store
+            // — and therefore holding the session — before it asks.
+            let reader = vm
+                .lua
+                .load(
+                    r#"
+                    pause()
+                    local id, scope, owner = session:id(), session:scope_id(), session:owner()
+                    assert(id == expected_id, "id: " .. tostring(id))
+                    assert(scope == expected_scope, "scope_id: " .. tostring(scope))
+                    assert(owner == expected_owner, "owner: " .. tostring(owner))
+                    assert(owner == "u-7", "owner: " .. tostring(owner))
+                    return id
+                "#,
+                )
+                .eval_async::<String>();
+            let (written, read) = tokio::join!(writer, reader);
+            written.expect("the append eventually lands");
+            read.expect("an identity read must answer while the session is held")
+        });
+
+        blocker.join().expect("the blocker thread");
+        assert!(!read.is_empty(), "the read answered the stream's own id");
     }
 
     /// `knl.open{ parent = s, budget = { from_parent = n } }` opens a session

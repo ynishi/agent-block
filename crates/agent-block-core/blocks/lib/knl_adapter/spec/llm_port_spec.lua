@@ -76,9 +76,23 @@ local fake_proto = {
     -- case about the shim. This fake reproduces those four behaviours and
     -- nothing else; retries are the real transport's business, and the shim
     -- has no loop left to test.
-    transport = function(wire, _opts)
+    transport = function(wire, opts)
         assert(type(wire) == "table" and wire.url, "transport was handed no wire")
         local resp = http.request(wire.url, {}) -- raises exactly as the host device does
+        -- The real transport calls `on_response` once, after its retry loop,
+        -- with the answer that actually came back (init.lua:455). That hook is
+        -- how the shim sees the status and the `retry-after` header it
+        -- classifies a failure by, so the fake calls it too — and pcall'd,
+        -- exactly as the real one does: a hook must not turn an answer into a
+        -- raise.
+        if opts and opts.on_response then
+            pcall(opts.on_response, {
+                status = resp.status,
+                headers = resp.headers,
+                body = resp.body,
+                latency_ms = 0,
+            })
+        end
         if resp.status ~= 200 then
             return nil, "API error " .. tostring(resp.status) .. " (server)"
         end
@@ -101,6 +115,12 @@ package.loaded["llm_proto"] = fake_proto
 -- lshape resolves from blocks/lib (the search path). Used to assert the Port's
 -- result shape (M.shapes.llm_result) and to drive the dev-mode boundary check.
 local shape = require("lshape").check
+
+-- The kernel module, for the vocabularies it publishes: the failure
+-- classification's kinds and which of them are worth asking again about. Read
+-- from there rather than retyped here, so a case cannot pass against a list
+-- only this file believes in.
+local kernel = require("knl")
 
 -- The device layer the shim's closure reaches at call time. `http.request` is
 -- scripted per test through `http_script`: `resp` is the value it returns, and
@@ -229,7 +249,7 @@ describe("knl_adapter Port", function()
         expect(resp.stop_reason).to.equal("end_turn")
     end)
 
-    it("2b: shim error path — a non-200 returns (nil, err)", function()
+    it("2b: shim error path — a non-200 returns (nil, err), classified", function()
         local port = make_test_port({
             wire = { url = "http://example", headers = {}, body = {} },
             result = { content = {}, usage = {}, stop_reason = "end_turn" },
@@ -241,8 +261,14 @@ describe("knl_adapter Port", function()
         local resp, err = llm({ messages = {} })
 
         expect(resp).to.equal(nil)
-        expect(type(err)).to.equal("string")
-        expect(err:find("500", 1, true) ~= nil).to.equal(true)
+        -- The err is the kernel's `call_error` now, not a sentence: a loop
+        -- reads `kind` / `retryable` off it, which is what `policy.retry`
+        -- decides on.
+        expect(shape.check(err, knl_adapter.shapes.call_error)).to.equal(true)
+        expect(err.kind).to.equal("server")
+        expect(err.retryable).to.equal(true)
+        expect(err.status).to.equal(500)
+        expect(err.message:find("500", 1, true) ~= nil).to.equal(true)
     end)
 
     it("2c: shim build failure — (nil, err) short-circuits before any http", function()
@@ -263,7 +289,12 @@ describe("knl_adapter Port", function()
         local resp, err = llm({ messages = {} })
 
         expect(resp).to.equal(nil)
-        expect(err).to.equal("no api key")
+        -- Nothing was sent and the same request cannot be: the request is
+        -- what did not hold up, and no status was ever seen.
+        expect(err.kind).to.equal("invalid_request")
+        expect(err.retryable).to.equal(false)
+        expect(err.status).to.equal(nil)
+        expect(err.message).to.equal("no api key")
     end)
 
     it("2d: shim transport raise — a raising http.request becomes (nil, err), no escape", function()
@@ -284,8 +315,13 @@ describe("knl_adapter Port", function()
         -- the closure itself did NOT raise
         expect(ok).to.equal(true)
         expect(resp).to.equal(nil)
-        expect(type(err)).to.equal("string")
-        expect(err:find("http timeout after 120s", 1, true) ~= nil).to.equal(true)
+        -- No answer arrived, so there is no status to read and the kind is
+        -- the one that says so — and it is retryable, which is the whole
+        -- point of classifying it.
+        expect(err.kind).to.equal("transport")
+        expect(err.retryable).to.equal(true)
+        expect(err.status).to.equal(nil)
+        expect(err.message:find("http timeout after 120s", 1, true) ~= nil).to.equal(true)
     end)
 
     it("3: anthropic classify() maps the refusal vocabulary to kind=model, everything else ok", function()
@@ -504,8 +540,129 @@ describe("knl_adapter Port", function()
         local ok, resp, err = pcall(port:open({}), { messages = {} })
         expect(ok).to.equal(true) -- closure did not raise
         expect(resp).to.equal(nil)
-        expect(type(err)).to.equal("string")
-        expect(err:find("unreadable content", 1, true) ~= nil).to.equal(true)
+        -- The provider answered 200 and the adapter could not read it: not a
+        -- transport failure, not one of the provider's classes, and asking
+        -- again gets the same answer.
+        expect(err.kind).to.equal("unknown")
+        expect(err.retryable).to.equal(false)
+        expect(err.message:find("unreadable content", 1, true) ~= nil).to.equal(true)
+    end)
+
+    -- ─────────────────────────────────────────────────────────────────────
+    -- 13 — the failure classification: one mapping table, seven words
+    -- ─────────────────────────────────────────────────────────────────────
+
+    --- Drive one call whose HTTP answer the case scripts, and hand back the
+    --- classified failure.
+    local function failed_call(resp)
+        local port = make_test_port({
+            wire = { url = "http://example", headers = {}, body = {} },
+            result = { content = {}, usage = {}, stop_reason = "end_turn" },
+            verdict = "ok",
+        })
+        http_script.resp = resp
+        local answer, err = port:open({ model = "test" })({ messages = {} })
+        expect(answer).to.equal(nil)
+        return err
+    end
+
+    it("13: every status the table names maps to its kind, and retryable follows the kind", function()
+        -- The whole mapping, exercised through the shim rather than by
+        -- reading the table: what a caller sees is what is asserted.
+        -- `retryable` is the kernel's own answer per kind, so it is checked
+        -- against `knl.shapes.call_error_retryable` rather than retyped.
+        local retryable = kernel.shapes.call_error_retryable
+        local cases = {
+            { status = 400, kind = "invalid_request" },
+            { status = 401, kind = "auth" },
+            { status = 403, kind = "auth" },
+            { status = 404, kind = "invalid_request" },
+            { status = 408, kind = "transport" },
+            { status = 413, kind = "invalid_request" },
+            { status = 422, kind = "invalid_request" },
+            { status = 429, kind = "rate_limited" },
+            { status = 500, kind = "server" },
+            { status = 502, kind = "server" },
+            { status = 503, kind = "overloaded" },
+            { status = 504, kind = "transport" },
+            { status = 529, kind = "overloaded" },
+        }
+        for _, case in ipairs(cases) do
+            local err = failed_call({ status = case.status, body = "{}", headers = {} })
+            expect(err.kind).to.equal(case.kind)
+            expect(err.retryable).to.equal(retryable[case.kind])
+            expect(err.status).to.equal(case.status)
+            expect(shape.check(err, knl_adapter.shapes.call_error)).to.equal(true)
+        end
+    end)
+
+    it("13b: exactly transport / rate_limited / overloaded / server are worth asking again", function()
+        -- The claim the four retryable kinds are FOR, stated once against the
+        -- published vocabulary: a kind added to the list without an answer
+        -- here goes red rather than defaulting to "do not retry" quietly.
+        local expected = {
+            transport = true,
+            rate_limited = true,
+            overloaded = true,
+            server = true,
+            auth = false,
+            invalid_request = false,
+            unknown = false,
+        }
+        local named = {}
+        for _, kind in ipairs(kernel.shapes.call_error_kinds) do
+            named[kind] = true
+            expect(kernel.shapes.call_error_retryable[kind]).to.equal(expected[kind])
+        end
+        for kind in pairs(expected) do
+            expect(named[kind]).to.equal(true)
+        end
+    end)
+
+    it("13c: a status nobody mapped is unknown, not a word invented for it", function()
+        -- 418 is a 4xx the table does not name, and a 200 whose body would
+        -- not decode is not a status failure at all. Both are `unknown`, and
+        -- neither is retryable.
+        local teapot = failed_call({ status = 418, body = "{}", headers = {} })
+        expect(teapot.kind).to.equal("unknown")
+        expect(teapot.retryable).to.equal(false)
+        expect(teapot.status).to.equal(418)
+    end)
+
+    it("13d: retry_after comes off the header, in seconds, whatever its case", function()
+        local lower = failed_call({ status = 429, body = "{}", headers = { ["retry-after"] = "30" } })
+        expect(lower.kind).to.equal("rate_limited")
+        expect(lower.retry_after).to.equal(30)
+
+        local upper = failed_call({ status = 429, body = "{}", headers = { ["Retry-After"] = 12 } })
+        expect(upper.retry_after).to.equal(12)
+
+        -- Absent when the provider named none…
+        local none = failed_call({ status = 429, body = "{}", headers = {} })
+        expect(none.retry_after).to.equal(nil)
+        -- …and absent when it named something that is not a number of
+        -- seconds (the RFC also allows a date), rather than a zero a loop
+        -- would read as "immediately".
+        local dated = failed_call({
+            status = 429,
+            body = "{}",
+            headers = { ["retry-after"] = "Wed, 21 Oct 2026 07:28:00 GMT" },
+        })
+        expect(dated.retry_after).to.equal(nil)
+    end)
+
+    it("13e: a successful call carries no classification at all", function()
+        local port = make_test_port({
+            wire = { url = "http://example", headers = {}, body = {} },
+            result = { content = { { type = "text", text = "hi" } }, usage = {}, stop_reason = "end_turn" },
+            verdict = "ok",
+        })
+        http_script.resp = { status = 200, body = "{}", headers = { ["retry-after"] = "30" } }
+        local resp, err = port:open({ model = "test" })({ messages = {} })
+        expect(err).to.equal(nil)
+        expect(resp.status).to.equal("ok")
+        expect(resp.kind).to.equal(nil)
+        expect(resp.retry_after).to.equal(nil)
     end)
 
     it("5: openai classify() distinguishes model refusal (#4) from content_filter (#3), everything else ok", function()

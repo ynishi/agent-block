@@ -59,11 +59,15 @@
 //! is handed and writes only if the invariant holds, all under the same
 //! serialization.  Checking a cached value out here and appending
 //! afterwards is exactly the race that would let two handles reserve the
-//! same allowance twice.  The kernel has exactly one:
-//! [`Session::reserve`] writes only if the ledger covers what was asked.
-//! [`Session::spend`] is not one of them — a settlement has nothing to
-//! decide, so it is a plain append, and it reports nothing but that the
-//! write landed.  Neither asks whether the session ended — see below.
+//! same allowance twice.  Every move of the balance is one:
+//! [`Session::reserve`] writes a `budget_reserved` if the ledger covers what
+//! was asked and a `budget_refused` if it does not, [`Session::spend`] writes
+//! a `budget_spent` if there is a ledger at all, and
+//! [`Session::grant_on_resume`] writes a `budget_granted` only where one
+//! already is.  What all three decide first is the same question — *does this
+//! stream have a ledger* — and it is the log's answer, not the handle's: a
+//! grant this handle never saw still binds it.  None of them asks whether the
+//! session ended — see below.
 //!
 //! The one thing written as a *batch* is the session's own opening:
 //! [`Session::open_on`] records `session_opened` and the `budget_granted`
@@ -135,19 +139,22 @@
 //! chain has no way to reach one.
 //!
 //! An append does not charge.  It is a record of something that happened,
-//! and the budget is a permission asked for *before* something happens —
-//! [`Session::reserve`], which the layer that knows what a call costs
-//! calls, then settles with [`Session::spend`].  Folding the two together
-//! is what turned the budget into a flag that only stands up once the
-//! allowance is already gone; the balance and what a run actually consumed
-//! (a query view over the recorded `llm_response` payloads, on the Lua side)
-//! are independent readings and neither is the other's ledger.
+//! and the budget is a quota: [`Session::reserve`] is a deduction that
+//! refuses when the balance is short, [`Session::spend`] is a deduction that
+//! does not ask.  They are independent — nothing is held and nothing is
+//! released, so a beat that calls both deducts twice — and the layer that
+//! knows what a call costs picks.  Folding the budget into the append is what
+//! turned it into a flag that only stands up once the allowance is already
+//! gone; the balance and what a run actually consumed (a query view over the
+//! recorded `llm_response` payloads, on the Lua side) are independent
+//! readings and neither is the other's ledger.
 //!
 //! # The budget is in the log, and nowhere else
 //!
 //! Every move of the balance is an event — `budget_granted` when an owner
 //! allows, `budget_reserved` / `budget_refused` at the decision point,
-//! `budget_spent` at the settlement — written through the same append.  The
+//! `budget_spent` for a deduction that did not ask — written through the same
+//! store.  The
 //! balance is not session-local state that dies with the process, and it is
 //! not a number kept beside the log either: it *is*
 //! [`super::budget::fold_balance`] over the stream, which is why
@@ -736,18 +743,68 @@ impl Session {
         };
 
         // A fresh grant is the owner allowing more, so it is recorded like
-        // any other and *adds* to what was left.  Write-ahead: the event
-        // lands first, and a failed append leaves the restored balance
-        // exactly as the log describes it.
+        // any other and *adds* to what was left — and only on a stream that
+        // already keeps a ledger ([`Session::grant_on_resume`]).
         //
         // A caller that must vet the restored session *before* anything is
         // written for it — the Lua bridge, which refuses a reserved owner —
-        // resumes with no grant and calls [`Session::grant_more`] once the
-        // stream has passed.
+        // resumes with no grant and calls [`Session::grant_on_resume`] once
+        // the stream has passed.
         if let Some(grant) = grant {
-            session.grant_more(grant).await?;
+            session.grant_on_resume(grant).await?;
         }
         Ok(session)
+    }
+
+    /// The owner granting again *on a resume*: record `budget_granted`, but
+    /// only on a stream whose ledger already carries one.
+    ///
+    /// **One session, one budget.**  Whether a session has a quota is settled
+    /// when it opens: a stream that opened with a grant keeps a ledger for the
+    /// whole of its life, and a stream that opened without one has no ledger
+    /// and refuses nothing.  A resume may raise the first — that is the owner
+    /// allowing more — and may not create the second, because a session that
+    /// opened unbudgeted has handles that were told there is no quota, and a
+    /// ledger appearing underneath them turns "refuses nothing" into "refuses"
+    /// with nobody having asked for it.  So a `budget` on a resume of a stream
+    /// with no `budget_granted` is a [`KnlError::Validation`]: the caller
+    /// wanted [`Session::open_on`], and nothing is written.
+    ///
+    /// The question is decided **inside the transaction that would write the
+    /// grant** ([`EventStore::append_if`]), not read beforehand: two resumes
+    /// racing on one stream would otherwise both see an empty ledger and both
+    /// create one.
+    ///
+    /// [`Session::grant_more`] is the other door and keeps no such rule: it is
+    /// the owner acting through a handle it holds, on a session it opened,
+    /// rather than a second handle changing what a first one was told.
+    async fn grant_on_resume(&mut self, grant: BudgetGrant) -> KnlResult<()> {
+        // Before anything is decided: an amount the ledger cannot take is the
+        // caller's own bug, and the log should not carry the evidence twice.
+        budget::check_amount(grant.amount)?;
+        let scope_id = self.scope.id().to_string();
+        let recorded = grant.clone();
+
+        let committed = self
+            .store
+            .append_if(
+                Some(BUDGET_KINDS),
+                Box::new(move |events: Vec<Current>| {
+                    last_grant(&events)?;
+                    Some(granted_event(&recorded, &scope_id))
+                }),
+            )
+            .await?;
+
+        if committed.is_none() {
+            return Err(KnlError::Validation(
+                "this stream opened with no budget, and a resume does not give one: a session's \
+                 quota is settled when it opens (open a new session with the grant, or resume \
+                 without one)"
+                    .to_string(),
+            ));
+        }
+        self.scope.grant_more(grant)
     }
 
     /// The owner granting again: record `budget_granted` and raise the
@@ -757,6 +814,13 @@ impl Session {
     /// is a number in the counter — a failed append leaves the balance
     /// exactly as the ledger describes it.  Refused on a closed session, like
     /// every other write: a run that has ended cannot be granted more.
+    ///
+    /// This is the owner acting through a handle it holds, so it takes the
+    /// ledger as it finds it — including a stream that has none, which this
+    /// grant then starts.  [`Session::grant_on_resume`] is the other door and
+    /// refuses that case: a *resume* is a second handle arriving at a session
+    /// that already exists, and it does not get to give one a quota it opened
+    /// without.
     pub async fn grant_more(&mut self, grant: BudgetGrant) -> KnlResult<()> {
         let event = granted_event(&grant, self.scope.id());
         self.append_kernel(event).await?;
@@ -1008,11 +1072,11 @@ impl Session {
     /// stamped here and overwrite any caller-supplied value; nothing else
     /// is added, and a `beat` the caller declared is recorded as given.
     ///
-    /// No append moves the budget, this one included.  What a call may
-    /// consume is decided before it happens ([`Session::reserve`]) and
-    /// settled after ([`Session::spend`]) by the layer that knows what a
-    /// call costs; the history records what happened and says nothing about
-    /// what was allowed.
+    /// No append moves the budget, this one included.  A deduction is asked
+    /// for before a call ([`Session::reserve`]) or taken after it
+    /// ([`Session::spend`]) by the layer that knows what a call costs; the
+    /// history records what happened and says nothing about what was
+    /// allowed.
     ///
     /// The session's own boundaries are not appendable: `session_opened` and
     /// `session_closed` are written by [`Session::open_on`] and
@@ -1093,57 +1157,63 @@ impl Session {
         self.store.is_empty().await
     }
 
-    /// Ask the budget to allow `amount`: `true` when it was taken, `false`
+    /// Ask the budget to allow `amount`: `true` when it was deducted, `false`
     /// when the balance would not cover it (and nothing was deducted).
     ///
     /// The stop the budget exists for.  A caller asks before it spends, and
     /// a `false` is a planned halt with the balance untouched — not a
     /// failure, and not a state the run has to be rolled back out of.
     ///
-    /// Both answers are recorded: a `budget_reserved` when it was allowed,
-    /// a `budget_refused` (carrying what was asked for and what there was)
-    /// when it was not.  A refusal is where a run stops, which is the one
-    /// thing a log must not be silent about.
+    /// **Whether there is a budget at all is the log's answer, not this
+    /// handle's.**  The decision is shown the stream's `budget_*` events, and
+    /// a ledger with no `budget_granted` in it is a run with no quota: nothing
+    /// is decided, nothing is recorded, and the answer is `true`.  A grant the
+    /// log *does* carry is honoured even by a handle that was opened without
+    /// one — two handles on one stream cannot disagree about whether it has a
+    /// budget, because neither of them is asked.  The scope's cached grant is
+    /// a hint about the words (§ [`Session::grant`]) and never the authority.
     ///
-    /// This is the one *command with an invariant* the kernel has, so the
-    /// decision is taken inside the store ([`EventStore::append_if`]): the
-    /// backend hands the ledger to a fold of [`fold_balance`] and writes the
-    /// `budget_reserved` in the same serialized write, so two handles on one
-    /// stream cannot both reserve the same allowance.  Nothing is set
-    /// afterwards: the write moved the store's head, so the next read of
-    /// [`Session::remaining`] refolds the ledger the reservation is now part
-    /// of.  A refusal needs no such guard: it is a fact about a decision
-    /// already taken, so it is an ordinary append.
+    /// **Both answers are recorded, by the same decision.**  A
+    /// `budget_reserved` when the balance covered it, a `budget_refused`
+    /// (carrying what was asked for and what there was) when it did not —
+    /// whichever the decision built lands in the transaction that took it, so
+    /// exactly one of the two is in the log and this call's answer is which
+    /// one that was.  Recording the refusal afterwards, as a second append,
+    /// made a refusal that could not be written indistinguishable from a
+    /// storage failure with nothing decided.
     ///
-    /// Always `true`, and recorded nowhere, without a budget: a run with no
-    /// quota has no ledger to keep.  A handle that has closed refuses, like
-    /// [`Session::spend`]; another handle's close is nothing to this one —
-    /// the balance is the whole of the invariant.
+    /// This is a *command with an invariant*, so the decision is taken inside
+    /// the store ([`EventStore::append_if`]): the backend hands the ledger to
+    /// [`fold_balance`] and writes the decision's event in the same serialized
+    /// write, so two handles on one stream cannot both reserve the same
+    /// allowance.  Nothing is set afterwards: the write moved the store's
+    /// head, so the next read of [`Session::remaining`] refolds the ledger the
+    /// entry is now part of.
+    ///
+    /// A handle that has closed refuses, like [`Session::spend`]; another
+    /// handle's close is nothing to this one — the balance is the whole of the
+    /// invariant.
     pub async fn reserve(&mut self, amount: i64) -> KnlResult<bool> {
         if self.closed {
             return Err(KnlError::Closed(CLOSED.to_string()));
         }
         budget::check_amount(amount)?;
-        // No budget, no ledger: nothing to decide and nothing to record.
-        let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
-            return Ok(true);
-        };
         let scope_id = self.scope.id().to_string();
 
-        // The balance the decision saw, as the ledger read inside the store
-        // folds to.  Shared rather than captured by reference, because the
-        // decision now runs wherever the store serializes its writes — the
-        // connection's own thread — and a refusal has to be recorded against
-        // the number the decision actually measured, not against a second
-        // read that could see a different stream.
-        let seen = Arc::new(AtomicI64::new(0));
-        let measured = Arc::clone(&seen);
-        let decided_tag = tag.clone();
+        // Which of the two entries the decision built, carried back out of
+        // it: the decision runs wherever the store serializes its writes —
+        // the connection's own thread — so what it decided comes back through
+        // a cell rather than through the `Committed` it returns, exactly as
+        // [`Session::open_child`] carries its own refusal back.  It is set at
+        // the moment the refusal event is built, and that event is the one
+        // the transaction writes, so the flag *is* which kind landed.
+        let refused = Arc::new(AtomicBool::new(false));
+        let said_no = Arc::clone(&refused);
         let decided_scope = scope_id.clone();
-        // The whole of the decision: does the ledger cover what was asked.
-        // Whether the stream carries an ending is not part of it — a
-        // reservation past the boundary is a fact about a run that overran
-        // its own close, and the log is where facts go.
+        // The whole of the decision: is there a ledger, and does it cover
+        // what was asked.  Whether the stream carries an ending is not part
+        // of it — a reservation past the boundary is a fact about a run that
+        // overran its own close, and the log is where facts go.
         //
         // The decision names the kinds it folds, so the store hands it the
         // ledger and not the whole stream: the invariant is exact either way,
@@ -1153,68 +1223,96 @@ impl Session {
             .append_if(
                 Some(BUDGET_KINDS),
                 Box::new(move |events: Vec<Current>| {
+                    // No `budget_granted` in the log is no ledger to move, so
+                    // there is nothing to decide and nothing to record.  The
+                    // grant is also where the unit comes from: the tag is read
+                    // off the log's own last grant rather than off whatever
+                    // this handle happens to remember.
+                    let grant = last_grant(&events)?;
                     let balance = fold_balance(&events).unwrap_or(0);
-                    measured.store(balance, Ordering::Relaxed);
-                    (balance >= amount).then(|| {
-                        budget_move_event(
+                    if balance >= amount {
+                        return Some(budget_move_event(
                             KIND_BUDGET_RESERVED,
                             amount,
-                            decided_tag.as_deref(),
+                            grant.tag.as_deref(),
                             &decided_scope,
-                        )
-                    })
+                        ));
+                    }
+                    said_no.store(true, Ordering::Relaxed);
+                    Some(refused_event(
+                        amount,
+                        balance,
+                        grant.tag.as_deref(),
+                        &decided_scope,
+                    ))
                 }),
             )
             .await?;
 
-        if committed.is_none() {
-            // Refused: nothing was written by the decision, so the refusal is
-            // recorded here as the ordinary fact it is, carrying what was
-            // asked for and what there was.  It moves no balance, and a later
-            // read folds the ledger including it and finds the same number.
-            let balance = seen.load(Ordering::Relaxed);
-            let event = refused_event(amount, balance, tag.as_deref(), &scope_id);
-            self.append_kernel(event).await?;
-            return Ok(false);
+        // A refusal that landed is the only `false`.  Nothing committed means
+        // the log carries no ledger, which is the run with no quota: it is
+        // allowed, and there is nothing to write about it.
+        match (committed, refused.load(Ordering::Relaxed)) {
+            (Some(_), true) => Ok(false),
+            _ => Ok(true),
         }
-        Ok(true)
     }
 
-    /// Settle `amount` against the budget.
+    /// Deduct `amount` from the budget without asking.
     ///
-    /// The after-the-fact half of [`Session::reserve`]: what a call really
-    /// cost, beyond what was reserved for it.  It is recorded as a
-    /// `budget_spent`, which is the whole of the move — and recorded
-    /// nowhere, moving nothing, when there is no budget.
+    /// The other half of [`Session::reserve`], and an independent one: a
+    /// reserve is a deduction that *refuses* when the balance is short, a
+    /// spend is a deduction that does not ask — it floors at `0` rather than
+    /// refusing.  Neither holds anything for the other to release, so calling
+    /// both for one beat deducts twice; the layer above decides which of them
+    /// a beat uses.  It is recorded as a `budget_spent`, which is the whole of
+    /// the move.
     ///
-    /// A settlement has no invariant to hold — it floors at `0` rather than
-    /// refusing — so it is a plain serialized [`Session::append`], not a
-    /// command: there is nothing to decide inside the store.
+    /// **Whether there is a budget at all is the log's answer**, exactly as it
+    /// is for [`Session::reserve`]: the decision is shown the ledger, and a
+    /// stream with no `budget_granted` in it has no account to move, so
+    /// nothing is written.  That question is inside the same transaction as
+    /// the write for the same reason the balance is — a handle's memory of
+    /// what it opened with is not what the ledger says.
+    ///
+    /// There is no *balance* invariant to hold, so a spend is never refused
+    /// for what the account holds.  What the decision decides is only whether
+    /// there is an account.
     ///
     /// **The write is the result.**  It used to hand back the balance it read
     /// afterwards, which made a `spend` that landed and then failed its
     /// read-back indistinguishable from one that never landed: the caller got
-    /// an error either way and could not tell whether the settlement was in
-    /// the log.  Two questions, two calls — this one says the settlement was
+    /// an error either way and could not tell whether the deduction was in
+    /// the log.  Two questions, two calls — this one says the move was
     /// recorded, and [`Session::remaining`] says what is left, failing on its
     /// own terms.
     ///
-    /// It always writes.  A handle that has closed refuses before the store
-    /// is reached; another handle's close does not, and a settlement landing
-    /// after one is recorded as what it is.
+    /// A handle that has closed refuses before the store is reached; another
+    /// handle's close does not, and a deduction landing after one is recorded
+    /// as what it is.
     pub async fn spend(&mut self, amount: i64) -> KnlResult<()> {
         if self.closed {
             return Err(KnlError::Closed(CLOSED.to_string()));
         }
         budget::check_amount(amount)?;
-        let Some(tag) = self.scope.grant().map(|g| g.tag.clone()) else {
-            // No budget, no ledger: nothing to settle and nothing to record.
-            return Ok(());
-        };
         let scope_id = self.scope.id().to_string();
 
-        let event = budget_move_event(KIND_BUDGET_SPENT, amount, tag.as_deref(), &scope_id);
-        self.append_kernel(event).await?;
+        self.store
+            .append_if(
+                Some(BUDGET_KINDS),
+                Box::new(move |events: Vec<Current>| {
+                    // No `budget_granted` in the log is no ledger to move, and
+                    // the log's own last grant is where the unit comes from.
+                    let grant = last_grant(&events)?;
+                    Some(budget_move_event(
+                        KIND_BUDGET_SPENT,
+                        amount,
+                        grant.tag.as_deref(),
+                        &scope_id,
+                    ))
+                }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2492,6 +2590,157 @@ mod tests {
         assert_eq!(folded(&resumed).await, remaining(&resumed).await);
     }
 
+    /// One session, one budget: a resume raises a ledger that exists and
+    /// cannot start one that does not.
+    ///
+    /// The two-handle case this rules out: a session opens with no quota, so
+    /// its handle refuses nothing and its caller was told there is nothing to
+    /// refuse; a second handle resumes the same open stream with a grant, and
+    /// from the next reservation on the first handle is bounded by an
+    /// allowance nobody asked it about.  Whether a session has a budget is
+    /// settled when it opens.
+    #[tokio::test]
+    async fn a_resume_does_not_give_a_stream_the_budget_it_opened_without() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "ungranted-stream";
+        let drivers = IsleDrivers::new();
+
+        // Opened with no budget, and still open: the handle is held for the
+        // whole test, so nothing has written an ending.
+        let store = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open");
+        let first = Session::open_on("user-1".to_string(), None, Box::new(store))
+            .await
+            .expect("open");
+        assert_eq!(
+            first.len().await.expect("len"),
+            1,
+            "session_opened, and no grant beside it"
+        );
+
+        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
+        let err = Session::resume(Some(grant(100)), Box::new(reopened))
+            .await
+            .expect_err("a resume must not introduce a ledger");
+        assert_eq!(
+            err.kind(),
+            KnlError::VALIDATION,
+            "the caller's argument is what did not hold up: {err}"
+        );
+        assert!(
+            err.reason().contains("opened with no budget"),
+            "{}",
+            err.reason()
+        );
+
+        // Nothing was written for it: the refusal is decided in the same
+        // transaction that would have written the grant.
+        assert_eq!(
+            first.len().await.expect("len"),
+            1,
+            "the stream is untouched"
+        );
+        assert_eq!(remaining(&first).await, None, "and still has no ledger");
+
+        // Resuming it *without* a grant is what a second handle does.
+        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
+        let second = Session::resume(None, Box::new(reopened))
+            .await
+            .expect("a resume with no grant is the ordinary one");
+        assert_eq!(remaining(&second).await, None);
+        assert_eq!(second.len().await.expect("len"), 1);
+    }
+
+    /// Whether there is a budget is the *log's* answer, not the handle's.
+    ///
+    /// A handle opened without a grant used to short-circuit on its own
+    /// cached scope: `reserve` answered `true` whatever the ledger said and
+    /// `spend` wrote nothing, so a grant that reached the stream through
+    /// another handle was invisible to it and the quota bounded nobody.  The
+    /// question is inside the decision now, so the grant in the log binds
+    /// every handle on the stream.
+    #[tokio::test]
+    async fn a_handle_opened_without_a_grant_is_bound_by_the_grant_the_log_carries() {
+        use crate::knl::SqliteEventStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let stream = "late-grant-stream";
+        let drivers = IsleDrivers::new();
+
+        let store = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("open");
+        let mut opened_without = Session::open_on("user-1".to_string(), None, Box::new(store))
+            .await
+            .expect("open");
+
+        // The owner grants, through a handle it holds on the same stream.
+        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+            .await
+            .expect("reopen");
+        let mut owner_handle = Session::resume(None, Box::new(reopened))
+            .await
+            .expect("resume");
+        owner_handle
+            .grant_more(grant(100))
+            .await
+            .expect("the owner grants");
+
+        // The first handle's own scope still says there is no budget…
+        assert_eq!(
+            opened_without.grant(),
+            None,
+            "the cached grant is a hint, and this handle never got one"
+        );
+        // …and the ledger it is measured against is the log's.
+        assert_eq!(
+            opened_without.reserve(500).await,
+            Ok(false),
+            "500 does not fit in the 100 the log carries"
+        );
+        assert_eq!(opened_without.reserve(40).await, Ok(true));
+        assert_eq!(remaining(&opened_without).await, Some(60));
+        opened_without
+            .spend(60)
+            .await
+            .expect("a deduction on a ledger this handle did not open");
+        assert_eq!(remaining(&opened_without).await, Some(0));
+        assert_eq!(
+            folded(&opened_without).await,
+            remaining(&opened_without).await
+        );
+
+        // Every entry it wrote is tagged with the unit the *log's* grant
+        // named, not with the nothing this handle was opened with.
+        let moves = ledger(&opened_without).await;
+        assert_eq!(
+            kinds(&moves),
+            vec![
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_REFUSED,
+                KIND_BUDGET_RESERVED,
+                KIND_BUDGET_SPENT,
+            ],
+        );
+        for event in &moves {
+            assert_eq!(
+                field(event, FIELD_TAG).as_str(),
+                Some("tokens"),
+                "the unit comes off the log's grant: {event}"
+            );
+        }
+        assert_eq!(*field(&moves[1], FIELD_REMAINING), json!(100));
+    }
+
     /// Seed `stream` with a `session_opened` whose `data` is empty.
     ///
     /// The validator requires the scope on that kind, so this cannot be
@@ -2617,9 +2866,17 @@ mod tests {
         let store = SqliteEventStore::open(&path, stream, &IsleDrivers::new())
             .await
             .expect("reopen");
-        let resumed = Session::resume(Some(grant(50)), Box::new(store))
+        // Resumed with no grant, because a resume cannot give a stream one it
+        // opened without ([`Session::grant_on_resume`]); the owner grants
+        // through the handle below, which is what puts a `budget_granted` in
+        // the log for the scope id to be read off.
+        let mut resumed = Session::resume(None, Box::new(store))
             .await
             .expect("resume");
+        resumed
+            .grant_more(grant(50))
+            .await
+            .expect("the owner grants");
 
         // The fallback is visible from both sides: the log says nothing…
         let opened = resumed.events(0).await.expect("events").remove(0);
@@ -2810,6 +3067,119 @@ mod tests {
             Some(1000),
             "an append still charges nothing"
         );
+    }
+
+    /// A store that takes a decision's write and refuses a plain one, from
+    /// the moment the test arms it.
+    ///
+    /// The two paths a `budget_*` event could reach the log by, told apart:
+    /// what a decision returns goes in with the read it was decided against
+    /// ([`EventStore::append_if`]), and anything else is a second write. A
+    /// refusal that came out here as a plain append would fail on this store
+    /// while the decision that produced it had already succeeded — which is
+    /// precisely the state a caller cannot read back.
+    struct DecidedWritesOnlyStore {
+        inner: MemEventStore,
+        armed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for DecidedWritesOnlyStore {
+        async fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            if self.armed.load(Ordering::Relaxed) {
+                return Err(KnlError::Storage(
+                    "this store takes only what a decision wrote".to_string(),
+                ));
+            }
+            self.inner.append(event).await
+        }
+
+        async fn append_if(
+            &mut self,
+            kinds: Option<&[&str]>,
+            decide: crate::knl::Decision,
+        ) -> KnlResult<Option<crate::knl::Committed>> {
+            self.inner.append_if(kinds, decide).await
+        }
+
+        async fn read_kinds(
+            &self,
+            kinds: Option<&[&str]>,
+            from_seq: u64,
+            limit: usize,
+        ) -> KnlResult<Vec<Value>> {
+            self.inner.read_kinds(kinds, from_seq, limit).await
+        }
+
+        async fn head(&self) -> KnlResult<Option<u64>> {
+            self.inner.head().await
+        }
+
+        async fn len(&self) -> KnlResult<usize> {
+            self.inner.len().await
+        }
+    }
+
+    /// A refusal is written by the decision that refused, not by a second
+    /// append afterwards.
+    ///
+    /// It used to be the second append, and that made two different outcomes
+    /// look the same: if the write of the `budget_refused` failed, the caller
+    /// got a storage error with nothing in the log to say the reservation had
+    /// been decided at all — indistinguishable from a decision that never
+    /// happened. Now exactly one of `budget_reserved` / `budget_refused`
+    /// lands, in the transaction that took the decision, and the answer this
+    /// call gives is which of the two it was.
+    #[tokio::test]
+    async fn a_refusal_lands_in_the_transaction_that_decided_it() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let store = DecidedWritesOnlyStore {
+            inner: MemEventStore::new(),
+            armed: Arc::clone(&armed),
+        };
+        let mut s = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store))
+            .await
+            .expect("open");
+
+        // From here on, a plain append fails: only a decision may write.
+        armed.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            s.reserve(50).await,
+            Ok(false),
+            "the refusal is the decision's own write, so it lands"
+        );
+        assert_eq!(
+            s.reserve(4).await,
+            Ok(true),
+            "and so is the reservation that fits"
+        );
+
+        let moves = ledger(&s).await;
+        assert_eq!(
+            kinds(&moves),
+            vec![
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_REFUSED,
+                KIND_BUDGET_RESERVED
+            ],
+            "exactly one entry per decision"
+        );
+        assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(50), "what was asked");
+        assert_eq!(
+            *field(&moves[1], FIELD_REMAINING),
+            json!(10),
+            "and the balance the decision measured it against"
+        );
+        assert_eq!(remaining(&s).await, Some(6), "a refusal moved nothing");
+
+        // The store really is refusing plain appends: an ordinary record is
+        // the thing this session can no longer write.
+        let err = s
+            .append(obj(json!({ "kind": "note" })))
+            .await
+            .expect_err("a plain append");
+        assert_eq!(err.kind(), KnlError::STORAGE);
     }
 
     /// A store whose `head` read is down: appends land, but nothing can ask

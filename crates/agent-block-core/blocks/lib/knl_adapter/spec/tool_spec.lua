@@ -31,7 +31,15 @@ local function fake_session(opts)
     opts = opts or {}
     opened = opened + 1
     local id = string.format("sess-%06d", opened)
-    local s = { _events = {}, _seq = 0, _owner = opts.owner or "anon" }
+    local s = {
+        _events = {},
+        -- One entry per `query` call: { sql, params, opts }.
+        _queries = {},
+        -- What every `query` answers, until a case puts rows here.
+        _query_rows = {},
+        _seq = 0,
+        _owner = opts.owner or "anon",
+    }
     -- Identity: the three readings the kernel answers. They are here because
     -- `knl.beat` asks a value for the whole session surface before it treats
     -- it as a session — a fake that answered less would not be one.
@@ -54,6 +62,22 @@ local function fake_session(opts)
     end
     function s:events()
         return self._events
+    end
+    function s:len()
+        return #self._events
+    end
+    -- The one named fold. Nothing here folds anything — what `tail` answers
+    -- is the kernel's — and the method is carried because the surface has it.
+    function s:view(_name, _opts)
+        error("knl: view: validation: unknown view")
+    end
+    -- The SQL read. No SQLite stands behind this: the fake records the
+    -- statement and answers whatever a case queued, exactly as the sibling
+    -- fakes in `knl/spec` do. No case here reads the log with SQL; the method
+    -- is part of the surface, so the stand-in answers it.
+    function s:query(sql, params, opts)
+        self._queries[#self._queries + 1] = { sql = sql, params = params, opts = opts }
+        return self._query_rows, false
     end
     -- No grant here, so every reservation is allowed and nothing is
     -- recorded — the kernel's "no budget, no ledger" answer.

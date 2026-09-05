@@ -146,6 +146,17 @@ local function fake_session(opts)
         remaining = math.max(0, remaining - n)
     end
 
+    function s:len()
+        return #events
+    end
+
+    -- The one named fold. Nothing here folds anything — what `tail` answers
+    -- is the kernel's — and the method is carried because the surface has it:
+    -- a stand-in missing one is not a session.
+    function s:view(_name, _opts)
+        error("knl: view: validation: unknown view")
+    end
+
     function s:remaining()
         return remaining
     end

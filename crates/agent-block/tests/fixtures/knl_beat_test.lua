@@ -856,6 +856,43 @@ do
     assert(ledger_rows[2].amount == 1, "reserved: " .. tostring(ledger_rows[2].amount))
     assert(ledger_rows[1].tag == "beats", "tag: " .. tostring(ledger_rows[1].tag))
 
+    -- (b2) the ledger view's `data` paths are the kernel's own field names.
+    --
+    -- The columns are one half of the read contract and these are the other:
+    -- everything a `budget_*` event is ABOUT lives inside the `data` column,
+    -- and `LEDGER_SQL` reaches it with `json_extract(data, '$.amount')` —
+    -- the Rust `FIELD_AMOUNT` constant, spelled again in SQL, in another
+    -- language, in another file, with nothing holding the two together. A
+    -- rename on the Rust side would have left this view answering NULL for
+    -- every row and no test saying so.
+    --
+    -- `knl.api().fields` publishes those names from the constants
+    -- themselves, so the check is: read the row BY THE PUBLISHED NAME and
+    -- expect the value the grant was made with. It fails from either side —
+    -- rename the constant and the lookup misses the column, change the
+    -- `json_extract` path and the column is NULL.
+    local fields = knl.api().fields
+    assert(type(fields) == "table", "knl.api() publishes no data field names")
+    local granted_row = ledger_rows[1]
+    assert(
+        granted_row[fields.amount] == 100,
+        "the ledger's amount path is not the kernel's " .. tostring(fields.amount)
+    )
+    assert(granted_row[fields.tag] == "beats", "the ledger's tag path is not the kernel's " .. tostring(fields.tag))
+    -- The refusal's own extra path, on a reservation the balance cannot take.
+    local small = kernel.open({ owner = "test", budget = { amount = 1, tag = "beats" } })
+    assert(small:reserve(99) == false, "a reservation past the balance must be refused")
+    local refused_rows = kernel.views.ledger(small)
+    local refusal_row = refused_rows[#refused_rows]
+    assert(refusal_row.kind == "budget_refused", "last: " .. tostring(refusal_row.kind))
+    assert(refusal_row[fields.amount] == 99, "the refusal records what was asked for")
+    -- And the two the tree view reads, published beside them: a supervisor's
+    -- `json_extract(data, '$.parent')` is the same string the kernel writes.
+    for _, name in ipairs({ "parent", "open_children", "scope_id", "owner", "reason", "remaining" }) do
+        assert(type(fields[name]) == "string" and #fields[name] > 0, "no published name for data." .. name)
+    end
+    small:close("done")
+
     -- (c) a query reads. A write does not reach the store through it, and
     -- the refusal is the caller's class: the argument did not hold up.
     local wrote, raised = pcall(s.query, s, "INSERT INTO events (stream, seq) VALUES ('x', 1)")

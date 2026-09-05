@@ -105,6 +105,15 @@ local function fake_session(opts)
     function s:events()
         return self._events
     end
+    function s:len()
+        return #self._events
+    end
+    -- The one named fold. Nothing here folds anything: what `tail` answers is
+    -- the kernel's, and the fake carries the method because the surface has
+    -- it — a stand-in missing one is not a session.
+    function s:view(_name, _opts)
+        error("knl: view: validation: unknown view")
+    end
     -- The SQL read. No SQLite stands behind this: the
     -- fake records the call and answers whatever the case queued, which is
     -- what makes a view's CONTRACT testable here — that it runs one
@@ -993,6 +1002,11 @@ describe("Outcome — four statuses", function()
 end)
 
 describe("beat contract hardening (review findings)", function()
+    -- The `shape.check` this block's classification cases use. The other
+    -- suite in this file keeps its own local of the same name; a describe is
+    -- a closure, not a scope shared with the one above it.
+    local shape = require("lshape").check
+
     it("a raising llm is Error('call'), not a raw raise", function()
         local s = K.open({})
         local d = K.device({
@@ -1124,7 +1138,12 @@ describe("beat contract hardening (review findings)", function()
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("call")
-        expect(tostring(o.detail):find("usage", 1, true) ~= nil).to.be(true)
+        -- A `call` failure carries the classification now, not a sentence:
+        -- an adapter that broke its own contract is not a class of provider
+        -- failure, so it reads as `unknown` and is not worth asking again.
+        expect(o.detail.kind).to.be("unknown")
+        expect(o.detail.retryable).to.be(false)
+        expect(o.detail.message:find("usage", 1, true) ~= nil).to.be(true)
         -- nothing was recorded as a response; the failure is the note
         local last = s:events()[#s:events()]
         expect(last.kind).to.be("llm_call_failed")
@@ -1199,9 +1218,104 @@ describe("beat contract hardening (review findings)", function()
         local o = K.beat(s, d)
         expect(Outcome.is_error(o)).to.be(true)
         expect(o.kind).to.be("call")
-        expect(tostring(o.detail):find("refusal", 1, true) ~= nil).to.be(true)
+        expect(o.detail.kind).to.be("unknown")
+        expect(o.detail.message:find("refusal", 1, true) ~= nil).to.be(true)
         local last = s:events()[#s:events()]
         expect(last.kind).to.be("llm_call_failed")
+    end)
+
+    it("carries the port's classification out to the Outcome and into the note", function()
+        -- The finding this round closed: a call that did not come off left
+        -- beat as `err("call", "a sentence")`, and a sentence is not
+        -- something a loop can decide on — `policy.retry` reads
+        -- `detail.kind` / `detail.retryable`, so no policy could fire on the
+        -- failure most worth asking again about. The port classifies
+        -- (`knl_adapter`, the one place a status is read) and beat carries
+        -- that reading through, unchanged, to both places a caller looks:
+        -- the Outcome, and the note in the log.
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                return nil,
+                    {
+                        kind = "rate_limited",
+                        retryable = true,
+                        retry_after = 30,
+                        message = "API error 429 (rate_limit)",
+                        status = 429,
+                    }
+            end,
+        })
+        s:append({ kind = "msg_user", data = { content = "q" } })
+        local o = K.beat(s, d)
+
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("call")
+        expect(o.detail.kind).to.be("rate_limited")
+        expect(o.detail.retryable).to.be(true)
+        expect(o.detail.retry_after).to.be(30)
+        expect(o.detail.status).to.be(429)
+        expect(shape.check(o.detail, K.shapes.call_error)).to.be(true)
+
+        -- The same fields are in the log, so the classification survives the
+        -- Outcome being dropped. `error` stays the sentence a person reads
+        -- (and `policy.carry` puts in front of the next request).
+        local note = s:events()[#s:events()]
+        expect(note.kind).to.be("llm_call_failed")
+        expect(note.data.error).to.be("API error 429 (rate_limit)")
+        expect(note.data.kind).to.be("rate_limited")
+        expect(note.data.retryable).to.be(true)
+        expect(note.data.retry_after).to.be(30)
+        expect(note.data.status).to.be(429)
+        expect(shape.check(note.data, K.shapes.events.llm_call_failed)).to.be(true)
+    end)
+
+    it("does not adopt a word the vocabulary does not have", function()
+        -- A device whose llm answers with someone else's vocabulary (llm_proto's
+        -- own `rate_limit` / `quota` / `not_found`, say) is not passed through:
+        -- `unknown` is what the published list says an unnamed failure is, and
+        -- a `kind` no declaration covers is one a caller's policy cannot decide
+        -- on. The text still says what happened.
+        local s = K.open({})
+        local d = K.device({
+            llm = function()
+                return nil, { kind = "not_found", message = "no such model" }
+            end,
+        })
+        s:append({ kind = "msg_user", data = { content = "q" } })
+        local o = K.beat(s, d)
+
+        expect(o.detail.kind).to.be("unknown")
+        expect(o.detail.retryable).to.be(false)
+        expect(o.detail.message).to.be("no such model")
+        expect(shape.check(o.detail, K.shapes.call_error)).to.be(true)
+    end)
+
+    it("classifies a plain sentence and a raise as unknown, not retryable", function()
+        -- The two ways a device that is not a port fails: `nil, "..."` and a
+        -- raise. Neither says what kind of failure it was, so neither is
+        -- given one — but both come back in the same shape, which is what
+        -- lets one predicate read every `call` failure.
+        for _, llm in ipairs({
+            function()
+                return nil, "network down"
+            end,
+            function()
+                error("adapter exploded")
+            end,
+        }) do
+            local s = K.open({})
+            s:append({ kind = "msg_user", data = { content = "q" } })
+            local o = K.beat(s, K.device({ llm = llm }))
+            expect(o.kind).to.be("call")
+            expect(o.detail.kind).to.be("unknown")
+            expect(o.detail.retryable).to.be(false)
+            expect(type(o.detail.message)).to.be("string")
+            expect(shape.check(o.detail, K.shapes.call_error)).to.be(true)
+            local note = s:events()[#s:events()]
+            expect(note.data.kind).to.be("unknown")
+            expect(note.data.retryable).to.be(false)
+        end
     end)
 
     it("a raising tool_policy denies the call (fail-closed)", function()

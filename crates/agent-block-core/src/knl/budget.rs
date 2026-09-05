@@ -2,9 +2,11 @@
 //!
 //! The quota is what makes a run stop: termination is undecidable, so the
 //! owner injects a resource that only decreases and the run ends when it
-//! runs out (`ulimit` / cgroup semantics).  The decision is taken *before*
-//! the spending, by [`super::Session::reserve`] — asking whether `n` may be
-//! consumed — and [`super::Session::spend`] settles afterwards.
+//! runs out (`ulimit` / cgroup semantics).  It is drawn down two ways, and
+//! they are independent: [`super::Session::reserve`] asks whether `n` may be
+//! consumed and refuses when it may not, [`super::Session::spend`] deducts
+//! `n` without asking.  Neither holds anything for the other — there is no
+//! settlement — so a caller that uses both for one call deducts twice.
 //!
 //! # The balance is the ledger, and nothing else
 //!
@@ -241,7 +243,7 @@ mod tests {
         ledger.extend(log(vec![
             json!({ "kind": "budget_spent", "data": { "amount": 20 } }),
         ]));
-        assert_eq!(fold_balance(&ledger), Some(50), "after a settlement");
+        assert_eq!(fold_balance(&ledger), Some(50), "after a spend");
 
         // Overspending floors at zero rather than going into debt, and a
         // huge amount cannot wrap it…

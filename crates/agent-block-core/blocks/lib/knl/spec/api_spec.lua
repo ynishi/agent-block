@@ -533,6 +533,112 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
     end)
 end)
 
+describe("knl.shapes.call_error — what a failed model call is classified as", function()
+    -- The second failure vocabulary, and it answers a different question from
+    -- `error_kinds`. That one classifies a KERNEL failure (a contended store,
+    -- a closed session); this one classifies a CALL that did not come off,
+    -- which the kernel never sees — the adapter reads a provider's status in
+    -- one mapping table and answers with one of these words, and a caller's
+    -- retry policy decides on the word.
+    local function literals_of(schema)
+        while type(schema) == "table" and rawget(schema, "inner") ~= nil do
+            schema = rawget(schema, "inner")
+        end
+        return rawget(schema, "values")
+    end
+
+    it("publishes the shape and the closed list its kind comes from", function()
+        expect(is_shape(K.shapes.call_error)).to.be(true)
+        expect(type(K.shapes.call_error_kinds)).to.be("table")
+        local in_shape = literals_of(rawget(K.shapes.call_error, "fields").kind)
+        expect(listed({ table.unpack(in_shape) })).to.be(listed({ table.unpack(K.shapes.call_error_kinds) }))
+    end)
+
+    it("names the seven, and nothing else", function()
+        expect(listed({ table.unpack(K.shapes.call_error_kinds) })).to.be(
+            "auth,invalid_request,overloaded,rate_limited,server,transport,unknown"
+        )
+    end)
+
+    it("answers, for every kind, whether asking again could work", function()
+        -- The judgement a loop acts on, published beside the list rather than
+        -- decided by each adapter: a provider being busy is worth another
+        -- call, a request it refused to read is not. Every kind has an
+        -- answer, and only these four are true.
+        local retryable = K.shapes.call_error_retryable
+        local yes = {}
+        for _, kind in ipairs(K.shapes.call_error_kinds) do
+            expect(type(retryable[kind])).to.be("boolean")
+            if retryable[kind] then
+                yes[#yes + 1] = kind
+            end
+        end
+        expect(listed(yes)).to.be("overloaded,rate_limited,server,transport")
+    end)
+
+    it("takes the classification an adapter produces, and refuses a foreign word", function()
+        local rate_limited = {
+            kind = "rate_limited",
+            retryable = true,
+            retry_after = 30,
+            message = "API error 429 (rate_limit)",
+            status = 429,
+        }
+        expect(check.check(rate_limited, K.shapes.call_error)).to.be(true)
+        -- The two optional halves are optional…
+        expect(check.check({ kind = "unknown", retryable = false, message = "…" }, K.shapes.call_error)).to.be(true)
+        -- …`kind` and the judgement are not…
+        expect(check.check({ retryable = false, message = "…" }, K.shapes.call_error)).to.be(false)
+        expect(check.check({ kind = "unknown", message = "…" }, K.shapes.call_error)).to.be(false)
+        -- …a word from another vocabulary is not one of these…
+        expect(check.check({ kind = "rate_limit", retryable = true, message = "…" }, K.shapes.call_error)).to.be(
+            false
+        )
+        expect(check.check({ kind = "busy", retryable = true, message = "…" }, K.shapes.call_error)).to.be(false)
+        -- …and `retry_after` is a number of seconds, not the header's text.
+        expect(
+            check.check(
+                { kind = "rate_limited", retryable = true, message = "…", retry_after = "30" },
+                K.shapes.call_error
+            )
+        ).to.be(false)
+    end)
+
+    it("is open, so a reading may carry more than the kernel named", function()
+        -- The dev-mode traceback of a caller's own raising `llm` rides here,
+        -- exactly as it does on the stages whose detail is a sentence.
+        expect(rawget(K.shapes.call_error, "open") == false).to.be(false)
+        expect(
+            check.check(
+                { kind = "unknown", retryable = false, message = "boom", traceback = "stack traceback:" },
+                K.shapes.call_error
+            )
+        ).to.be(true)
+    end)
+
+    it("is the same vocabulary the llm_call_failed note records", function()
+        -- One classification, in two places: the Outcome a caller holds and
+        -- the note the log keeps. The note's `error` is the sentence a person
+        -- reads; the rest is the reading.
+        local note = K.shapes.events.llm_call_failed
+        expect(is_shape(note)).to.be(true)
+        expect(rawget(note, "open")).to.be(false)
+        local in_note = literals_of(rawget(note, "fields").kind)
+        expect(listed({ table.unpack(in_note) })).to.be(listed({ table.unpack(K.shapes.call_error_kinds) }))
+        expect(check.check({
+            error = "API error 429 (rate_limit)",
+            kind = "rate_limited",
+            retryable = true,
+            retry_after = 30,
+            status = 429,
+        }, note)).to.be(true)
+        -- The sentence and the reading are both required: a note that said
+        -- only what happened would be the string this round replaced.
+        expect(check.check({ error = "boom" }, note)).to.be(false)
+        expect(check.check({ kind = "unknown", retryable = false }, note)).to.be(false)
+    end)
+end)
+
 describe("knl.views — every predefined query view is declared", function()
     -- The same rule as the module registry, on the read side: a view is a
     -- named function that runs one SELECT, and the name has to be declared
@@ -815,6 +921,89 @@ describe("knl.shapes.query_opts — what a read may ask for beyond the SQL", fun
         -- where both exist (`tests/fixtures/knl_beat_test.lua`, inv10).
         expect(K.shapes.session.query).to.exist()
         expect(K.shapes.session.query.args[3]).to.be(K.shapes.rust.QueryOpts)
+    end)
+end)
+
+describe("knl.beat's session gate — the WHOLE declared surface, not the part a beat calls", function()
+    -- `is_session` duck-types, because the real handle is Rust userdata whose
+    -- metatable mlua protects: there is no name to compare against from Lua,
+    -- so the value is asked what it can do. WHICH methods it is asked for is
+    -- the point of these cases. The list used to be written out beside the
+    -- gate and had fallen behind the registry — `view` and `query` were
+    -- declared syscalls it did not name — so a stand-in answering neither got
+    -- through and failed further in, on a call a caller had every right to
+    -- make. It is derived from `knl.shapes.session` now, and that registry is
+    -- held against the bridge's own `knl.api().session` where a bridge exists
+    -- (`tests/fixtures/knl_beat_test.lua`, inv10). These cases close the near
+    -- end of that chain: the gate asks for exactly what the registry declares.
+    local GATE_MESSAGE = "beat takes a knl session first"
+
+    --- The declared method names, `__close` aside (the metamethod is reached
+    --- by the language, not by a call).
+    local function declared_methods()
+        local names = {}
+        for name in pairs(K.shapes.session) do
+            if name ~= "__close" then
+                names[#names + 1] = name
+            end
+        end
+        table.sort(names)
+        return names
+    end
+
+    --- A stand-in answering every declared method except `omit` (or all of
+    --- them when `omit` is nil).
+    local function stand_in(omit)
+        local s = {}
+        for _, name in ipairs(declared_methods()) do
+            if name ~= omit then
+                s[name] = function() end
+            end
+        end
+        return s
+    end
+
+    local function beat_with(session)
+        return K.beat(session, K.device({ llm = function() end }))
+    end
+
+    local function refused_as_no_session(outcome)
+        return outcome.status == "error"
+            and outcome.kind == "conf"
+            and tostring(outcome.detail):find(GATE_MESSAGE, 1, true) ~= nil
+    end
+
+    it("declares more than the three identity reads (the list is not a stub)", function()
+        local names = declared_methods()
+        expect(#names >= 10).to.be(true)
+        local has = {}
+        for _, name in ipairs(names) do
+            has[name] = true
+        end
+        -- The two the old hand-written list had lost, named here so their
+        -- absence is a failure rather than a shorter loop below.
+        expect(has.view).to.be(true)
+        expect(has.query).to.be(true)
+    end)
+
+    it("takes a stand-in that answers every declared method", function()
+        -- It does not get far — there is no bridge in this VM, so the beat
+        -- id cannot be minted — but it gets PAST the session gate, which is
+        -- the whole claim.
+        local outcome = beat_with(stand_in(nil))
+        expect(refused_as_no_session(outcome)).to.be(false)
+    end)
+
+    it("refuses a stand-in that is missing any one of them", function()
+        local passed = {}
+        for _, name in ipairs(declared_methods()) do
+            if not refused_as_no_session(beat_with(stand_in(name))) then
+                passed[#passed + 1] = name
+            end
+        end
+        -- A method the gate does not ask for is a method a stand-in can be
+        -- missing while beat treats it as a session.
+        expect(listed(passed)).to.be("")
     end)
 end)
 
