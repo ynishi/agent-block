@@ -33,24 +33,19 @@ local t6 = { name = "corge", _meta = { other = "value" } }
 local g6 = agent._resolve_mcp_group(t6, "myserver")
 print("case6.no_group_key_fallback=" .. tostring(g6 == "myserver"))
 
--- Case 7: _meta.group is a valid string; verify it also wires into the def
--- that build_tools eventually returns (integration sanity).
--- Simulate a mcp_tool_map entry as connect_mcp_servers would produce it.
-local mcp_tool_map_meta = {
-    meta__tool = {
-        server = "meta",
-        tool = "tool",
-        def = {
-            name = "meta__tool",
-            description = "tool with meta group",
-            input_schema = { type = "object", properties = {} },
-            group = agent._resolve_mcp_group({ name = "tool", _meta = { group = "custom" } }, "meta"),
-        },
+-- Case 7: _meta.group is a valid string; verify it also wires into the tools
+-- map build_tools eventually returns (integration sanity).
+-- Simulate the candidate connect_mcp_servers would produce for that tool.
+local candidate = {
+    group = agent._resolve_mcp_group({ name = "tool", _meta = { group = "custom" } }, "meta"),
+    bind = {
+        name = "meta__tool",
+        description = "tool with meta group",
+        input_schema = { type = "object", properties = {} },
+        handler = function()
+            return ""
+        end,
     },
 }
-local built = agent._build_tools(mcp_tool_map_meta, nil, { "custom" })
-local found_custom = false
-for _, t in ipairs(built) do
-    if t.name == "meta__tool" then found_custom = true end
-end
-print("case7.meta_group_used_for_filtering=" .. tostring(found_custom))
+local built = agent._build_tools({ candidate }, { "custom" })
+print("case7.meta_group_used_for_filtering=" .. tostring(built["meta__tool"] ~= nil))
