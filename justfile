@@ -56,13 +56,17 @@ lint:
 # so it is what catches a tracked path that no build reads: the 0.36.0 publish
 # stopped at the binary crate on a dangling `blocks` symlink that every test,
 # lint and `cargo package --list` had walked past. Run it before a bump, after
-# `check`; sequential for the same reason `test` is.
+# `check`.
+#
+# One invocation, not one per crate: cargo resolves the crates named together
+# against their local copies, so a crate that uses a sibling's API works before
+# that sibling is on crates.io. One `-p` at a time resolves the sibling from the
+# registry instead — the 0.37.0 bump failed both ways round (the published
+# 0.36.0 core lacked the new symbol before the bump; `^0.37.0` did not exist on
+# the registry after it). Verification still runs one crate at a time, in
+# dependency order.
 package-check:
-    cargo package -p agent-block-types
-    cargo package -p agent-block-mcp
-    cargo package -p agent-block-core
-    cargo package -p agent-block-testkit
-    cargo package -p agent-block
+    cargo package -p agent-block-types -p agent-block-mcp -p agent-block-core -p agent-block-testkit -p agent-block
 
 # [allow-agent]
 # Run the correlation-id demo: the ab.obs http_request / http_response
