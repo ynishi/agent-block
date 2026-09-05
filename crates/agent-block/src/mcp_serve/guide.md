@@ -50,13 +50,24 @@ tool description and in `agent-block://blocks`.
 
 ## What counts as a block
 
-Any `.lua` file directly inside a registered block directory (`--block-dir`,
-repeatable). The file stem is the block name. Nothing else is callable: the
-`block` argument is an enum of the registered names, so a path that was never
-registered cannot be reached through this surface.
+A `<name>.lua` file or a `<name>/init.lua` directory directly inside a block
+root. The roots are `<project>/blocks/` and `$AGENT_BLOCK_HOME/blocks/`
+(default `~/.agent-block/blocks/`), whenever they exist, plus any `--block-dir`
+the server was started with. The project root wins a name clash. Nothing else
+is callable: the `block` argument is an enum of the registered names, so a path
+that was never registered cannot be reached through this surface.
 
-Blocks are re-scanned per request. Dropping a new `.lua` file into the
-directory makes it callable without restarting the server.
+Blocks are re-scanned per request. Dropping a new file into a root makes it
+callable without restarting the server.
+
+## Where a block's helpers go
+
+`blocks/` is for entry points only and is never on the `require` path. A
+module a block needs goes in `lib/` beside it — `<project>/lib/` or
+`$AGENT_BLOCK_HOME/lib/` — and is reached with `require("<name>")`. The two
+directories do not cross: a file in `lib/` is never served as a block, and a
+file in `blocks/` cannot be required. A module that proves useful in another
+project moves from the project `lib/` to the user `lib/` unchanged.
 
 ## Failure
 

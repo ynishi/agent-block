@@ -4,8 +4,8 @@
 -- separated stdout/stderr (no "__EXIT__=$?" marker). This fixture drives it via
 -- coding_agent._test_helpers() because register_tool() only returns a tool name.
 --
--- Requires the repository root as CWD so `require("coding_agent")` resolves
--- from project_root/blocks/, and RUNNER_SCRATCH_DIR pointing at a per-run
+-- `require("coding_agent")` resolves to the embedded facade. Requires the
+-- repository root as CWD, and RUNNER_SCRATCH_DIR pointing at a per-run
 -- tempdir for the scratch files (see tests/e2e_coding_agent.rs). Fixed /tmp
 -- paths would race concurrent runs and collide with other users' files on a
 -- shared machine.

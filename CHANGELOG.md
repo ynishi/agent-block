@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`blocks/` and `lib/` are two directories with two jobs.** `blocks/` holds
+  entry points — scripts run by name — and `lib/` holds modules reached with
+  `require`. Each exists at two tiers, the project root and `$AGENT_BLOCK_HOME`
+  (default `~/.agent-block/`), with the project winning a name clash. The two
+  never cross: a file in `blocks/` cannot be `require`d, a file in `lib/` is
+  never run by name. Until now one `blocks/` did both jobs and the only thing
+  separating a helper from a callable block was whether it sat at the top of
+  the directory.
+  - `require` searches `script_dir` → `<project>/lib/` → `$AGENT_BLOCK_HOME/lib/`
+    → embedded. `<project>/blocks/` and `exe_dir/blocks/` are no longer on the
+    path; a project that shadows an embedded module (`lib/agent/init.lua`) or
+    keeps a shared helper moves it from `blocks/` to `lib/`. The seal, the
+    `embedded.<name>` alias and copy-on-write are unchanged, just under `lib/`.
+  - A module that proves useful across projects moves from `<project>/lib/`
+    to `~/.agent-block/lib/` unchanged, and from there upstream. This is the
+    tier that used to be missing: the workaround was `--project <some other
+    repo>`, which also moved `.env`, the sandbox write root and the kernel's
+    database to that repo.
+- **`agent-block mcp` serves the tiers by default.** `<project>/blocks/` and
+  `$AGENT_BLOCK_HOME/blocks/` are served whenever they exist; `--block-dir` is
+  now optional and adds directories rather than being the only source. An MCP
+  client entry needs `mcp` and `--project`, no absolute block path.
+- **A block may be a directory.** `<name>/init.lua` registers under `<name>`
+  next to `<name>.lua`, so the shape the CLI has always run (`-s
+  blocks/<name>/init.lua`) is callable from MCP without being renamed.
+
+### Added
+
+- `agent-block --block <name>` (`-b`) runs a registered block by name through
+  the same registry the MCP server uses, so `--block summarize` here and
+  `run_block` with `block = "summarize"` there run the same file. An unknown
+  name lists what is registered.
+
 ## [0.36.0] - 2026-09-05
 
 ### Added

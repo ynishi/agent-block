@@ -2,8 +2,9 @@
 //! what it may not, and how a replacement reaches the module it replaced.
 //!
 //! Each test builds a project root in a tempdir, because that is the thing
-//! under test — `blocks/` in the project root is the highest-priority place
-//! `require` looks, and a checked-in one would apply to every other fixture.
+//! under test — `lib/` in the project root is the highest-priority place
+//! `require` looks after the script's own directory, and a checked-in one
+//! would apply to every other fixture.
 
 mod common;
 
@@ -11,9 +12,9 @@ use predicates::prelude::*;
 use std::path::Path;
 use tempfile::tempdir;
 
-/// Write `<project>/blocks/<rel>` (creating the directories) and return it.
+/// Write `<project>/lib/<rel>` (creating the directories) and return it.
 fn write_project_block(project: &Path, rel: &str, source: &str) -> std::path::PathBuf {
-    let path = project.join("blocks").join(rel);
+    let path = project.join("lib").join(rel);
     std::fs::create_dir_all(path.parent().expect("block path has a parent")).expect("mkdir");
     std::fs::write(&path, source).expect("write block");
     path

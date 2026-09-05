@@ -8,9 +8,8 @@ use tempfile::tempdir;
 /// the "lua" runner via `coding_agent._test_helpers()` and asserts the
 /// `{ok, stdout, stderr, exit_code}` contract compile_loop depends on.
 ///
-/// CWD is the repository root so `require("coding_agent")` resolves from
-/// `project_root/blocks/` — the facade lives in the top-level `blocks/` dir and
-/// is not one of the embedded blocks.
+/// `require("coding_agent")` resolves to the embedded facade; CWD is the
+/// repository root only so the runner's relative scratch paths line up.
 ///
 /// The fixture needs a standalone `lua` interpreter for the pass/fail cases.
 /// Where none is installed it prints `SKIP_NO_LUA` and asserts only the

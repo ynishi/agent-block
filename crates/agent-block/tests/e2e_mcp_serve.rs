@@ -35,7 +35,10 @@ async fn connect(dir: &Path) -> McpManager {
         ],
         false,
         Some(dir),
-        &[],
+        // The user tier is served too; pinning it to the tempdir (which has
+        // no `blocks/`) keeps the developer's own `~/.agent-block/blocks/`
+        // out of the registry under test.
+        &[("AGENT_BLOCK_HOME".to_string(), dir.display().to_string())],
     )
     .await
     .expect("connect to agent-block mcp");

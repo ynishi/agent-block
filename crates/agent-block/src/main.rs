@@ -3,6 +3,7 @@
 //! Parses command-line arguments, optionally enters the sandbox, and launches
 //! the Host. The binary is intentionally thin — all logic lives in Lua scripts.
 
+mod blocks;
 mod mcp_serve;
 
 use anyhow::Context as _;
@@ -26,9 +27,18 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Lua script path. Required unless a subcommand is given.
-    #[arg(short = 's', long)]
+    /// Lua script path. Required unless `--block` or a subcommand is given.
+    #[arg(short = 's', long, conflicts_with = "block")]
     script: Option<PathBuf>,
+
+    /// Run a registered block by name instead of a script by path.
+    ///
+    /// Resolved against `<project>/blocks/` then `$AGENT_BLOCK_HOME/blocks/`
+    /// (`<name>.lua` or `<name>/init.lua`), the same registry `agent-block
+    /// mcp` serves — so `--block summarize` here and `run_block` with
+    /// `block = "summarize"` there run the same file.
+    #[arg(short = 'b', long, value_name = "NAME")]
+    block: Option<String>,
 
     /// Relay URL (optional; mesh features disabled if not set)
     #[arg(short = 'r', long)]
@@ -92,12 +102,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Serve registered `.lua` blocks to an MCP client over stdio.
+    /// Serve the registered blocks to an MCP client over stdio.
     ///
-    /// Register it with an MCP client the way any stdio server is registered:
+    /// Register it with an MCP client the way any stdio server is registered.
+    /// `<project>/blocks/` and `$AGENT_BLOCK_HOME/blocks/` are served when
+    /// they exist; `--block-dir` adds more:
     ///
     /// ```json
-    /// { "command": "agent-block", "args": ["mcp", "--block-dir", "/path/to/blocks"] }
+    /// { "command": "agent-block", "args": ["mcp", "--project", "/path/to/project"] }
     /// ```
     Mcp(mcp_serve::McpArgs),
 }
@@ -175,12 +187,32 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         return mcp_serve::serve(args, &cli.project, mcp_rpc_timeout).await;
     }
 
-    // clap cannot mark `script` required now that a subcommand can stand in for
-    // it, so the check moves here. The message names both spellings because it
-    // replaces clap's own missing-argument error, which named `--script`.
-    let script = cli
-        .script
-        .context("no script given: pass -s/--script <PATH>, or use a subcommand (see --help)")?;
+    // clap cannot mark `script` required now that `--block` or a subcommand
+    // can stand in for it, so the check moves here. The message names the
+    // spellings because it replaces clap's own missing-argument error, which
+    // named `--script`.
+    let script = match (cli.script, cli.block) {
+        (Some(path), None) => path,
+        (None, Some(name)) => {
+            let registered = blocks::scan(&blocks::dirs(&cli.project, &[]));
+            blocks::find(&registered, &name)
+                .map(|b| b.path.clone())
+                .with_context(|| {
+                    format!(
+                        "unknown block '{name}'; registered: [{}] (looked in <project>/blocks/ \
+                         and $AGENT_BLOCK_HOME/blocks/)",
+                        blocks::names(&registered)
+                    )
+                })?
+        }
+        (Some(_), Some(_)) => {
+            // clap's `conflicts_with` should make this unreachable.
+            anyhow::bail!("--script and --block are mutually exclusive");
+        }
+        (None, None) => anyhow::bail!(
+            "no script given: pass -s/--script <PATH>, -b/--block <NAME>, or use a subcommand (see --help)"
+        ),
+    };
 
     // Map the CLI argument shapes to the SDK `Source` enums. File-backed
     // variants are read eagerly here so the error message carries the

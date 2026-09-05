@@ -1,7 +1,7 @@
 -- hello_stream.lua — Anthropic Messages API with SSE streaming
 --
 -- Usage:
---   ANTHROPIC_API_KEY=sk-... agent-block -s scripts/hello_stream.lua
+--   ANTHROPIC_API_KEY=sk-... agent-block -s crates/agent-block/examples/hello_stream.lua
 
 local api_key = std.env.get("ANTHROPIC_API_KEY")
 if not api_key then

@@ -2,7 +2,7 @@
 --
 -- Reading the kernel is fine; replacing it is what the seal refuses. The
 -- alias is also the assertion that `embedded.` resolves from memory only:
--- one of the tests puts a decoy at `<project>/blocks/embedded/knl.lua`, and
+-- one of the tests puts a decoy at `<project>/lib/embedded/knl.lua`, and
 -- `SENTINEL` must still be nil.
 local kernel = require("embedded.knl")
 

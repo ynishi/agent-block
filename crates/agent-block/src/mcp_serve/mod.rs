@@ -22,6 +22,14 @@
 //! | resource | `agent-block://blocks` | the registry, as JSON |
 //! | resource | `agent-block://blocks/<name>` | one block's source |
 //!
+//! # Where the blocks come from
+//!
+//! The same registry the CLI's `--block <name>` uses (see [`crate::blocks`]):
+//! `<project>/blocks/` and `$AGENT_BLOCK_HOME/blocks/` whenever they exist,
+//! plus any `--block-dir`. So an MCP client configured with just `mcp` and
+//! `--project` serves the project's blocks and the user's, with nothing
+//! spelled out per block and no absolute path in the client config.
+//!
 //! # stdout
 //!
 //! stdio transport owns stdout, so this mode routes tracing to stderr. MCP
@@ -33,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::blocks::{self, Block};
 use agent_block_core::host::{PromptSource, ScriptSource};
 use agent_block_core::{run_capture, BlockConfig};
 use clap::Args;
@@ -64,104 +73,12 @@ const BLOCK_MIME: &str = "text/x-lua";
 /// `agent-block mcp` arguments.
 #[derive(Debug, Args)]
 pub struct McpArgs {
-    /// Directory of `.lua` blocks to expose. Repeatable. Only `.lua` files
-    /// directly inside these directories are callable.
-    #[arg(long = "block-dir", value_name = "DIR", required = true)]
+    /// Extra directory of blocks to expose, on top of `<project>/blocks/` and
+    /// `$AGENT_BLOCK_HOME/blocks/`, which are served whenever they exist.
+    /// Repeatable. A block is `<name>.lua` or `<name>/init.lua` directly
+    /// inside the directory.
+    #[arg(long = "block-dir", value_name = "DIR")]
     pub block_dirs: Vec<PathBuf>,
-}
-
-/// One callable block: a `.lua` file in a registered directory.
-#[derive(Debug, Clone)]
-struct Block {
-    /// File stem. The value the caller passes as `block`.
-    name: String,
-    path: PathBuf,
-    /// The script's leading `--` comment lines, which is what the author wrote
-    /// to describe it. Empty when the file opens with code.
-    doc: String,
-}
-
-/// Scan the registered directories for blocks.
-///
-/// Called per request rather than once at startup so that dropping a `.lua`
-/// file into a block directory makes it callable without a restart — the same
-/// immediacy the CLI has, where a new script is simply a new `-s` argument.
-///
-/// Later directories do not shadow earlier ones: a duplicate name is skipped
-/// and logged, because silently preferring one of two files that share a name
-/// is the kind of thing that is only noticed once it has already run the wrong
-/// one.
-fn scan_blocks(dirs: &[PathBuf]) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
-
-    for dir in dirs {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "block dir unreadable; skipped");
-                continue;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("lua") {
-                continue;
-            }
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-
-            if let Some(existing) = blocks.iter().find(|b| b.name == name) {
-                tracing::warn!(
-                    block = name,
-                    kept = %existing.path.display(),
-                    skipped = %path.display(),
-                    "duplicate block name; later directory ignored"
-                );
-                continue;
-            }
-
-            let doc = std::fs::read_to_string(&path)
-                .map(|src| leading_doc(&src))
-                .unwrap_or_default();
-
-            blocks.push(Block {
-                name: name.to_string(),
-                path,
-                doc,
-            });
-        }
-    }
-
-    blocks.sort_by(|a, b| a.name.cmp(&b.name));
-    blocks
-}
-
-/// The leading `--` comment block of a Lua source, with the markers stripped.
-///
-/// This is the block author's own description, and it is the only thing the
-/// caller sees before deciding to run it — so it is lifted into the tool
-/// description rather than asking authors to repeat themselves in a manifest.
-fn leading_doc(src: &str) -> String {
-    let mut lines: Vec<&str> = Vec::new();
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() && lines.is_empty() {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix("--") else {
-            break;
-        };
-        lines.push(rest.trim_start_matches('-').trim());
-    }
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
 }
 
 /// Description shown for the `run_block` tool, listing what is registered.
@@ -195,14 +112,21 @@ fn run_block_description(blocks: &[Block]) -> String {
 
 #[derive(Clone)]
 struct BlockServer {
-    block_dirs: Arc<Vec<PathBuf>>,
+    /// `--block-dir` additions. The project and user tiers are not stored:
+    /// they are resolved on every scan, so a `blocks/` directory created after
+    /// the server started is served as soon as it exists.
+    extra_dirs: Arc<Vec<PathBuf>>,
     project_root: PathBuf,
     mcp_rpc_timeout: Duration,
 }
 
 impl BlockServer {
+    fn dirs(&self) -> Vec<PathBuf> {
+        blocks::dirs(&self.project_root, &self.extra_dirs)
+    }
+
     fn blocks(&self) -> Vec<Block> {
-        scan_blocks(&self.block_dirs)
+        blocks::scan(&self.dirs())
     }
 
     /// Run one block to completion and hand back what it returned.
@@ -223,10 +147,12 @@ impl BlockServer {
             .ok_or_else(|| McpError::invalid_params("`block` is required", None))?;
 
         let blocks = self.blocks();
-        let block = blocks.iter().find(|b| b.name == name).ok_or_else(|| {
-            let known: Vec<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
+        let block = blocks::find(&blocks, name).ok_or_else(|| {
             McpError::invalid_params(
-                format!("unknown block '{name}'; registered: [{}]", known.join(", ")),
+                format!(
+                    "unknown block '{name}'; registered: [{}]",
+                    blocks::names(&blocks)
+                ),
                 None,
             )
         })?;
@@ -435,24 +361,27 @@ pub async fn serve(
     project_root: &Path,
     mcp_rpc_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let block_dirs: Vec<PathBuf> = args.block_dirs;
+    let extra_dirs: Vec<PathBuf> = args.block_dirs;
 
-    for dir in &block_dirs {
+    // Only the explicit additions are checked: the project and user tiers are
+    // optional by design, an explicit path that does not exist is a typo.
+    for dir in &extra_dirs {
         if !dir.is_dir() {
             anyhow::bail!("--block-dir '{}' is not a directory", dir.display());
         }
     }
 
     let server = BlockServer {
-        block_dirs: Arc::new(block_dirs),
+        extra_dirs: Arc::new(extra_dirs),
         project_root: project_root.to_path_buf(),
         mcp_rpc_timeout,
     };
 
     let found = server.blocks();
     tracing::info!(
+        dirs = %server.dirs().iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(","),
         blocks = found.len(),
-        names = %found.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(","),
+        names = %blocks::names(&found),
         "agent-block mcp: serving on stdio"
     );
 
@@ -475,52 +404,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leading_doc_takes_the_header_comment_and_stops_at_code() {
-        let src = "-- Summarize a document.\n--\n-- Returns { ok, text }.\nlocal agent = require(\"agent\")\n-- not part of the header\n";
-        assert_eq!(
-            leading_doc(src),
-            "Summarize a document.\n\nReturns { ok, text }."
-        );
-    }
-
-    #[test]
-    fn leading_doc_is_empty_when_the_file_opens_with_code() {
-        assert_eq!(leading_doc("local x = 1\n-- later\n"), "");
-    }
-
-    #[test]
-    fn scan_finds_lua_files_and_ignores_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("b.lua"), "-- second\nreturn \"\"").unwrap();
-        std::fs::write(dir.path().join("a.lua"), "-- first\nreturn \"\"").unwrap();
-        std::fs::write(dir.path().join("notes.md"), "not a block").unwrap();
-
-        let blocks = scan_blocks(&[dir.path().to_path_buf()]);
-
-        let names: Vec<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, ["a", "b"]);
-        assert_eq!(blocks[0].doc, "first");
-    }
-
-    #[test]
-    fn a_duplicate_name_keeps_the_first_directory() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        std::fs::write(first.path().join("dup.lua"), "-- kept\nreturn \"\"").unwrap();
-        std::fs::write(second.path().join("dup.lua"), "-- shadowed\nreturn \"\"").unwrap();
-
-        let blocks = scan_blocks(&[first.path().to_path_buf(), second.path().to_path_buf()]);
-
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].doc, "kept");
-    }
-
-    #[test]
     fn unknown_uris_are_rejected_rather_than_resolved_against_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("real.lua"), "-- real\nreturn \"\"").unwrap();
         let server = BlockServer {
-            block_dirs: Arc::new(vec![dir.path().to_path_buf()]),
+            extra_dirs: Arc::new(vec![dir.path().to_path_buf()]),
             project_root: dir.path().to_path_buf(),
             mcp_rpc_timeout: Duration::from_secs(30),
         };
@@ -540,7 +428,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("real.lua"), "-- real\nreturn \"\"").unwrap();
         let server = BlockServer {
-            block_dirs: Arc::new(vec![dir.path().to_path_buf()]),
+            extra_dirs: Arc::new(vec![dir.path().to_path_buf()]),
             project_root: dir.path().to_path_buf(),
             mcp_rpc_timeout: Duration::from_secs(30),
         };
