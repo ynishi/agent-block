@@ -49,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `enforced_spend_limit_reached`, `insufficient_quota`, …) is not.
 - `usage.thinking_tokens` is accumulated in the budget tracker and emitted in
   the `ab.llm` summary dump.
+- `embedded.<name>` — every embedded module is `require`-able a second time
+  under that prefix, resolving from memory and only from memory (the alias
+  resolver sits ahead of the filesystem roots, so a `blocks/embedded/`
+  directory cannot stand in for it). A project block that shadows a module can
+  now reach the one it replaced: `local base = require("embedded.agent")`,
+  then change the one function that differs. Shadowing was previously
+  all-or-nothing, because the name a replacement needed was the name it had
+  taken.
+- The sealed-module check, run at start over the same filesystem roots
+  `require` searches. `knl`, `knl_adapter`, `knl_types` and the vendored
+  `lshape` (sub-modules included) are not a project's to replace: the kernel is
+  one thing across Rust and Lua, and the declaration tests that hold the two
+  halves together pass just as happily against a Lua-side substitute that means
+  something else. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning,
+  for work on the kernel itself.
 
 ### Fixed
 
@@ -83,6 +98,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A project `blocks/knl/` (or `knl_adapter` / `knl_types` / `lshape` and its
+  sub-modules) now fails the run, naming the module and the file, instead of
+  silently becoming the kernel the rest of the process is declared against.
+  Consumers, shell packs and utilities are unaffected — shadowing those is
+  still how you change them.
 - **`compile_loop` runs on the kernel.** One iteration is now one `knl.beat` —
   one model call plus the tools that call asked for — inside a `knl.session`
   whose grant is `max_iters`, so the iteration ceiling is the budget and the

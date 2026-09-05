@@ -14,6 +14,16 @@
 //! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | all      |
 //! | `AGENT_BLOCK_BUS_CAPACITY`         | `64`                     | EventBus |
 //! | `AGENT_BLOCK_TASK_GRACE_MS`        | `1000`                   | task/bus |
+//! | `AGENT_BLOCK_UNSEAL`               | unset                    | blocks   |
+//!
+//! `AGENT_BLOCK_UNSEAL=1` is the one knob here that is not a path or a bound:
+//! it downgrades the sealed-module refusal (a project `blocks/knl/`,
+//! `knl_adapter`, `knl_types` or `lshape` shadowing the embedded kernel —
+//! `host::SEALED`) from an error that ends the run to a `warn!`. It exists for
+//! development **on the kernel itself**, where the Lua half is the thing being
+//! edited; a project that sets it is running against a kernel the Rust side
+//! was not declared against. Any other value, including unset, leaves the
+//! refusal in place.
 //!
 //! `std.kv`, `std.sql`, and `std.ts` are backed by separate SQLite database
 //! files so that agent-internal KV state, explicit user SQL data, and
