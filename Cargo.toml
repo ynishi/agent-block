@@ -35,7 +35,7 @@ serde_json   = "1"
 tokio        = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "signal"] }
 tokio-util   = { version = "0.7", features = ["rt"] }
 reqwest      = { version = "0.12", features = ["json"] }
-uuid         = { version = "1", features = ["v4"] }
+uuid         = { version = "1", features = ["v4", "v7"] }
 tracing      = "0.1"
 async-trait  = "0.1"
 # HTTP-transport features (client-side-sse / transport-streamable-http-client*)
@@ -44,14 +44,61 @@ async-trait  = "0.1"
 rmcp         = { version = "3.0.1", features = ["client", "transport-child-process"] }
 mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
 mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
-# `sql` / `kv` features are NOT declared here so they can be gated behind the
-# agent-block-core `sqlite` feature (they pull in rusqlite/bundled).
-mlua-batteries = { version = "0.3.1", features = ["json", "fs", "env", "path", "time", "task"] }
+# `std.sql` / `std.kv` no longer live here: as of 0.5 they are their own crate
+# (`mlua-batteries-sqlite`, below), so this dependency carries no SQLite weight
+# at all and needs no feature gating. 0.5.1 adds `async_overrides`, the opt-in
+# layer that replaces the blocking `std.time.sleep` / `std.proc.pipeline` /
+# `std.http.*` / `std.fs.*` entries with async ones so a script cannot park the
+# VM thread; the host installs it right after `register_all` (see `host.rs`).
+# It lives behind the `task` feature, which is in the list below.
+mlua-batteries = { version = "0.5.1", features = ["json", "fs", "env", "path", "time", "task"] }
+# The `std.sql` / `std.kv` batteries, split out of mlua-batteries at 0.5. Kept
+# out of the workspace-wide default set and pulled in only under the
+# agent-block-core `sqlite` feature, which is what that feature has always
+# gated: the Lua-facing SQL surface, not SQLite itself.
+#
+# 0.6 puts those two back on a host-owned `rusqlite::Connection` shared through
+# `Arc<Mutex<_>>`, with every statement in `tokio::task::spawn_blocking` and an
+# `InterruptHandle` for cancellation — so the VM thread still never waits on
+# SQLite, and registration is synchronous again (no `block_on` to drive an
+# async `kv::register`).
+mlua-batteries-sqlite = "0.6"
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
 mlua-pkg     = "0.7"
-rusqlite     = { version = "0.31", features = ["bundled"] }
+# The kernel's own SQLite, taken from the same cluster mlua-batteries-sqlite
+# builds on (that crate depends on rusqlite 0.37 directly since its 0.6, and
+# rusqlite-isle 0.5 is on the same 0.37 → libsqlite3-sys 0.35 line), so the
+# graph holds exactly one libsqlite3-sys however the `sqlite` feature is set.
+# `rusqlite-isle` is what the kernel's event store and `std.ts` actually talk
+# to — the connection lives on its own thread — and plain `rusqlite` is here
+# for the types (`Connection`, `Error`, `OpenFlags`, …) that appear in the
+# closures handed to it, and for the `Connection` / `InterruptHandle` the host
+# opens for `std.sql` / `std.kv` and passes to the batteries.
+rusqlite      = { version = "0.37", features = ["bundled"] }
+rusqlite-isle = { version = "0.5", features = ["tokio"] }
+# The syscall surface's single source of truth. `schema-bridge` derives the
+# `Schema` IR off the Rust argument / return types of `bridge/knl.rs` and
+# `schema-bridge-lshape` renders that IR as an lshape Lua module. Not
+# optional: the kernel is in every build, and a surface whose declaration is
+# generated only sometimes is a surface that drifts.
+#
+# The third crate of that family, `mlua-lshape` (which vendors the lshape 0.3
+# runtime the generated module loads under), is deliberately NOT here. It
+# pins `mlua` with the `send` feature, and feature unification would turn
+# `send` on for `mlua-batteries`, which does not compile with it — the same
+# reason `lua-spec-runner` is excluded from the workspace above. The lshape
+# 0.3.0 Lua sources are vendored under `crates/agent-block-core/blocks/lib/
+# lshape/` instead, copied verbatim from that crate's `lua/lshape/`.
+schema-bridge        = "0.4"
+schema-bridge-lshape = "0.2"
+# What makes a serde refusal readable as a syscall refusal. serde reports a
+# type mismatch without saying which field it was reading, and
+# `budget.tag: invalid type: number, expected a string` is the whole
+# difference between a message a caller can act on and one they cannot. It
+# wraps the deserializer and records the path it was at when it failed.
+serde_path_to_error = "0.1"
 anyhow       = "1"
 # Content fingerprint for `std.fs.read_versioned` / `edit`'s optimistic
 # concurrency check. Already in the tree transitively.

@@ -5,13 +5,14 @@
 --   just test-lua                          # every spec fixture
 --
 -- `llm_proto.backend` is the whole model call as one closure: build the wire
--- request, post it with the retries worth taking, parse the answer. It is what
--- a kernel session runs (`knl.session { backend = ... }` / `s:call(req)`) and
--- what a loop with no session calls directly, so both sides get the same
--- transport and neither carries provider knowledge.
+-- request, post it with the retries worth taking, parse the answer. `tool_loop`
+-- and the agent block call it directly, and `knl_adapter`'s Port reuses the
+-- same pieces behind a device's `llm`, so every side gets the same transport
+-- and none of them carries provider knowledge.
 --
 -- What is pinned here is the closure's end of that arrangement:
---   1. the result satisfies the contract `knl.call` checks
+--   1. the result satisfies the contract its callers read (content / usage /
+--      stop_reason, or nil and an error)
 --   2. the conf and the request meet on the wire, request first
 --   3. api_key / model resolution, including the failure before the request
 --   4. which failures are retried and which are answered as they are
@@ -117,7 +118,6 @@ if not http then
                 body_json = opts.body,
                 method = opts.method,
                 timeout = opts.timeout,
-                dump = opts.dump,
             })
             local entry = table.remove(queue, 1)
             if not entry then
@@ -243,17 +243,17 @@ describe("what the backend returns", function()
 
     it("passes the model's blocks through untouched", function()
         local blocks = { { type = "thinking", thinking = "..." }, { type = "text", text = "hi" } }
-        expect(proto._response_blocks(blocks)).to.equal(blocks)
+        expect(proto.response_blocks(blocks)).to.equal(blocks)
 
         -- No blocks: an empty array, said in the one way an empty Lua table
         -- can say it.
-        local empty = proto._response_blocks({})
+        local empty = proto.response_blocks({})
         expect(#empty).to.equal(0)
         expect(getmetatable(empty).__jsontype).to.equal("array")
 
         -- Not blocks at all: handed on as it came, for the kernel to refuse.
         for _, odd in ipairs({ "not a table", 42 }) do
-            expect(proto._response_blocks(odd)).to.equal(odd)
+            expect(proto.response_blocks(odd)).to.equal(odd)
         end
     end)
 
@@ -339,10 +339,9 @@ describe("the request the backend builds", function()
     it("carries the transport knobs the conf sets", function()
         reset()
         queue_ok(text_response())
-        ask(anthropic_backend({ timeout = 7, dump = "full" }))
+        ask(anthropic_backend({ timeout = 7 }))
 
         expect(requests[1].timeout).to.equal(7)
-        expect(requests[1].dump).to.equal("full")
     end)
 
     it("refuses a provider this build does not speak", function()

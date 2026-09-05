@@ -403,6 +403,76 @@ local function post_with_retry(url, request_opts, max_retries)
     end
 end
 
+--- Send one built request and hand back the provider's decoded JSON.
+---
+--- The transport step on its own: encode the body, POST it with the retry
+--- policy this module owns, turn a non-200 into the classified error string,
+--- and decode what came back. Everything either side of it — which wire to
+--- build and how to read the decoded answer — belongs to the adapter.
+---
+--- It is exported because two callers need exactly this middle and differ at
+--- the ends: `M.backend` below (adapter build -> transport -> adapter parse),
+--- and `knl_adapter`'s LLMPort, whose `build` / `parse` are the Port's own
+--- methods and whose `classify` needs the FULL parse result. Before this
+--- existed the Port ran its own retry loop, its own non-200 message and its
+--- own decode beside these — three copies of a policy that has to be one.
+---
+--- Failure is `nil, err` for anything the provider answered; a transport
+--- failure RAISES, because that is what the host's `http.request` does and
+--- turning it into a return here would make the two callers' error contracts
+--- disagree. A caller that must not raise (the Port) pcalls this.
+---
+--- @param wire table  { url, headers, body } from an adapter's build
+--- @param opts table|nil  { max_retries?, timeout?, on_request?,
+---                          on_response? } — the two callbacks are
+---                          observability only and their return is not read
+--- @return table|nil raw  the decoded response JSON
+--- @return string|nil err
+--- @return table|nil meta  { status, latency_ms } on the success path
+function M.transport(wire, opts)
+    opts = opts or {}
+
+    local body_json = std.json.encode(wire.body)
+    if opts.on_request then
+        pcall(opts.on_request, {
+            url = wire.url,
+            headers = wire.headers,
+            body = wire.body,
+            body_json = body_json,
+        })
+    end
+
+    local started = std.time.now()
+    local resp = post_with_retry(wire.url, {
+        method = "POST",
+        headers = wire.headers,
+        body = body_json,
+        timeout = opts.timeout or DEFAULT_TIMEOUT,
+    }, tonumber(opts.max_retries) or DEFAULT_MAX_RETRIES)
+    local latency_ms = math.floor((std.time.now() - started) * 1000)
+
+    if opts.on_response then
+        pcall(opts.on_response, {
+            status = resp.status,
+            headers = resp.headers,
+            body = resp.body,
+            latency_ms = latency_ms,
+        })
+    end
+
+    if resp.status ~= 200 then
+        local classified = M.classify_error(resp.status, resp.body, resp.headers)
+        return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
+    end
+
+    local ok_decode, raw = pcall(std.json.decode, resp.body)
+    if not ok_decode then
+        return nil, "response JSON decode failed"
+    end
+
+    return raw, nil, { status = resp.status, latency_ms = latency_ms }
+end
+
 --- Marks a table as a JSON array, for the one case Lua cannot express: an
 --- empty table is an array and a mapping at once, and the host bridge reads
 --- an untagged one as a mapping.
@@ -436,24 +506,25 @@ end
 ---
 --- This is the whole transport in one value — wire format, retries, parse —
 --- so a caller that wants a model call holds a function rather than a
---- provider. Two of them use it:
+--- provider. Two kinds of caller use it:
 ---
----   * the kernel, when a session is opened with `backend = ...`: `s:call(req)`
----     runs it and records what it returns
----   * a loop with no session, which calls it directly
+---   * `tool_loop` and the agent block, which call it directly
+---   * `knl_adapter`, whose Port reuses the same pieces (build / parse /
+---     classify_error / retry_delay) and hands the result to a knl device as
+---     its `llm` — what `knl.beat(session, device)` then calls
 ---
---- so there is one implementation of "ask the model" and neither side carries
+--- so there is one implementation of "ask the model" and no side of it carries
 --- provider knowledge.
 ---
---- The closure answers `result | nil, err`, which is the contract `knl.call`
---- checks: `content` is an array of blocks (empty when the model sent none),
---- `usage` a table, and `stop_reason` a string when the provider named one.
---- `status` and `latency_ms` ride along for callers that want them; the
---- kernel drops anything beyond the three.
+--- The closure answers `result | nil, err`: `content` is an array of blocks
+--- (empty when the model sent none), `usage` a table, and `stop_reason` a
+--- string when the provider named one. `status` and `latency_ms` ride along
+--- for callers that want them; the kernel's own boundary shape
+--- (`knl.shapes.llm_result`) keeps only what a beat reads.
 ---
 --- @param conf table {
 ---   provider, model, api_key, api_key_env, base_url, headers, max_tokens,
----   timeout, dump, thinking, tool_choice, ... — forwarded to the adapter,
+---   timeout, thinking, tool_choice, ... — forwarded to the adapter,
 ---   max_retries  (default 2) transient API failures only
 ---   on_request   function({ url, headers, body, body_json }) before the POST
 ---   on_response  function({ status, headers, body, latency_ms }) after it
@@ -502,43 +573,16 @@ function M.backend(conf)
             return nil, berr
         end
 
-        local body_json = std.json.encode(built.body)
-        if conf.on_request then
-            pcall(conf.on_request, {
-                url = built.url,
-                headers = built.headers,
-                body = built.body,
-                body_json = body_json,
-            })
-        end
-
-        local started = std.time.now()
-        local resp = post_with_retry(built.url, {
-            method = "POST",
-            headers = built.headers,
-            body = body_json,
-            timeout = conf.timeout or DEFAULT_TIMEOUT,
-            dump = conf.dump,
-        }, max_retries)
-        local latency_ms = math.floor((std.time.now() - started) * 1000)
-
-        if conf.on_response then
-            pcall(conf.on_response, {
-                status = resp.status,
-                headers = resp.headers,
-                body = resp.body,
-                latency_ms = latency_ms,
-            })
-        end
-
-        if resp.status ~= 200 then
-            local classified = M.classify_error(resp.status, resp.body, resp.headers)
-            return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
-        end
-
-        local ok_decode, raw = pcall(std.json.decode, resp.body)
-        if not ok_decode then
-            return nil, "response JSON decode failed"
+        -- The middle is `M.transport`, shared with knl_adapter's Port: POST
+        -- with the retry policy, the classified non-200, the decode.
+        local raw, terr, meta = M.transport(built, {
+            max_retries = max_retries,
+            timeout = conf.timeout,
+            on_request = conf.on_request,
+            on_response = conf.on_response,
+        })
+        if not raw then
+            return nil, terr
         end
 
         local decoded, perr = adapter.parse(raw)
@@ -557,13 +601,17 @@ function M.backend(conf)
             -- that way, and a label nobody sent would be a fact this file
             -- made up.
             stop_reason = decoded.stop_reason,
-            status = resp.status,
-            latency_ms = latency_ms,
+            status = meta.status,
+            latency_ms = meta.latency_ms,
         }
     end,
         nil
 end
 
-M._response_blocks = response_blocks
+--- The empty-array tagging above, as an export: an adapter that builds a
+--- response outside `M.backend` — knl_adapter's Port Mapper is the one in
+--- tree — has the same empty content to say, and a second copy of the
+--- metatable convention is a second thing to keep in step.
+M.response_blocks = response_blocks
 
 return M

@@ -24,22 +24,19 @@
 ---   no-op turns, widen a group once a file has been read, add a tool that
 ---   only makes sense after the first result).
 ---
---- Kernel session (optional)
----   Pass `session` and the model call goes through it: `s:call` records the
----   response and charges its tokens before it returns, so there is no
----   arrangement of this loop's code in which a call happened and the history
----   does not say so. The loop records the facts around it — the prompt, every
----   tool call and its result — and keeps no budget of its own: it asks the
----   session whether anything is left before opening another turn, and stops
----   with `stop_reason = "budget_exhausted"` when there is not. Without a
----   session none of this happens and the result is what it always was.
+--- No kernel session
+---   This loop keeps its own messages and its own turn cap and records
+---   nothing durable. An earlier version took a `session` option and routed
+---   the call through `s:call`, but that surface never existed on the bridge,
+---   so the option could only fail on first use. Running a loop over a
+---   recorded session is the kernel's own arrangement now — `knl.beat(session,
+---   device)` with the loop written by the caller (see the `knl` module doc)
+---   — and there is one way to do it rather than two.
 ---
 --- The model call
 ---   Whatever the wire needs — the provider dialect, the retries, the parse —
 ---   belongs to `llm_proto.backend`, and this loop holds one of those closures
----   rather than any provider knowledge. A session that was opened with a
----   backend of its own uses that one instead; one that was not is handed this
----   loop's, per call, so a caller that has not been rewired keeps working.
+---   rather than any provider knowledge.
 ---
 --- Usage
 ---   local loop = require("tool_loop")
@@ -166,30 +163,6 @@ local function text_of(content)
     return table.concat(parts, "\n")
 end
 
---- Record `event` in the session, or do nothing when there is none.
----
---- Every call site records before the loop's own state moves past the fact, so
---- a run that dies mid-turn leaves a history that says how far it got rather
---- than one that trails it. A session that refuses the write — a closed run, an
---- event the kernel does not accept — ends the run with that reason: continuing
---- would leave a hole in the record that nothing downstream could see.
----
---- @param session table|nil
---- @param event table
---- @return string|nil  error message, or nil when the write landed
-local function record(session, event)
-    if not session then
-        return nil
-    end
-    local ok, err = pcall(function()
-        session:append(event)
-    end)
-    if ok then
-        return nil
-    end
-    return "session append failed: " .. tostring(err)
-end
-
 -- ============================================================
 -- Public
 -- ============================================================
@@ -207,14 +180,6 @@ end
 ---   messages (optional) prior turns to continue from
 ---   max_turns   (optional, default 16)
 ---   max_retries (optional, default 2) transient API failures only
----   session  (optional) kernel session (`knl.session`). When given, the model
----            call goes through `s:call`, which records `model_response` and
----            charges its tokens before it returns; the loop records
----            `msg_user` / `tool_call` / `tool_result` around it, each before
----            it advances past the fact, with the turn the kernel stamped. A
----            run that exhausts the budget stops before the next turn with
----            `ok = true, stop_reason = "budget_exhausted"`; a session that
----            refuses a write ends the run with `ok = false`.
 ---   state    (optional) caller value handed to the tools function and on_turn
 ---   on_turn  (optional) function({ turn, content, tool_calls, usage, decoded,
 ---            state }), fired once per model call including paused ones.
@@ -225,9 +190,7 @@ end
 ---            fired before the call; `body` is the table, `body_json` the wire bytes
 ---   on_response (optional) function({ turn, status, body, headers, latency_ms })
 ---            Observability only — the loop does not read what they return.
----            Both are the backend's hooks with this loop's turn added, so a
----            session that brought a backend of its own fires neither: the
----            wire it talks is that backend's business, and its hooks are too.
+---            Both are the backend's hooks with this loop's turn added.
 ---   llm      (optional) { provider, model, base_url, api_key, api_key_env,
 ---                         max_tokens, temperature, thinking, tool_choice,
 ---                         dialect, timeout, ... } — the conf of the backend
@@ -254,7 +217,6 @@ function M._run_impl(opts)
     local max_turns = tonumber(opts.max_turns) or DEFAULT_MAX_TURNS
     local max_retries = tonumber(opts.max_retries) or DEFAULT_MAX_RETRIES
     local state = opts.state
-    local session = opts.session
 
     -- The turn the observability hooks report, and the reply the backend
     -- parsed. Both are written once per turn, just before the call, and read
@@ -288,32 +250,11 @@ function M._run_impl(opts)
         parsed = decoded
     end
 
-    -- Built even when the session brings its own: an unusable provider is a
-    -- refusal to start rather than a failure five turns in.
+    -- Built before the first turn: an unusable provider is a refusal to start
+    -- rather than a failure five turns in.
     local backend, berr = proto.backend(backend_conf)
     if not backend then
         return { ok = false, error = berr, turns = 0, tool_calls = {}, messages = {} }
-    end
-
-    --- Ask the model: through the session when there is one, so the answer is
-    --- recorded and charged before it comes back here.
-    ---
-    --- Which backend makes the call is the session's answer, not a guess: a
-    --- session opened with one of its own uses it, and one that was not is
-    --- handed this loop's, per call. Asked once per turn rather than
-    --- remembered, because the answer cannot change and there is nothing to
-    --- gain from caching it.
-    ---
-    --- @param req table  provider-neutral request
-    --- @return table|nil out, string|nil err
-    local function ask(req)
-        if not session then
-            return backend(req)
-        end
-        if session:has_backend() then
-            return session:call(req)
-        end
-        return session:call(req, { backend = backend })
     end
 
     local messages = {}
@@ -327,9 +268,8 @@ function M._run_impl(opts)
     local last_stop_reason = nil
     local last_tool_calls = {}
 
-    --- The result for a run that cannot go on — a session that refused a
-    --- write, a model call that produced no answer. Named because the run can
-    --- hit it at five points and they all report the same thing.
+    --- The result for a run that cannot go on — a model call that produced no
+    --- answer. Named because more than one point reports the same thing.
     local function stopped(reason, turns_done)
         return {
             ok = false,
@@ -341,30 +281,9 @@ function M._run_impl(opts)
         }
     end
 
-    -- Recorded before the prompt becomes part of the conversation.
-    local prompt_err = record(session, { kind = "msg_user", content = opts.prompt })
-    if prompt_err then
-        return stopped(prompt_err, 0)
-    end
     table.insert(messages, { role = "user", content = opts.prompt })
 
     for turn = 1, max_turns do
-        -- The budget is charged as each response is recorded, so a run that
-        -- has used it up stops here rather than opening another turn. `ok` is
-        -- true because nothing failed: the allowance ran out, and the history
-        -- says exactly where, which is what makes the run resumable.
-        if session and session:exhausted() then
-            return {
-                ok = true,
-                content = last_content,
-                turns = turn - 1,
-                tool_calls = all_tool_calls,
-                usage = usage,
-                messages = messages,
-                stop_reason = "budget_exhausted",
-            }
-        end
-
         local specs, by_name = resolve_tools(opts.tools or {}, {
             turn = turn,
             last_tool_calls = last_tool_calls,
@@ -372,35 +291,27 @@ function M._run_impl(opts)
         })
 
         -- Provider-neutral: what to ask, not how to ask it. The backend turns
-        -- this into a request, and a session that brought its own turns it
-        -- into whatever that one speaks.
+        -- this into a request.
         current_turn = turn
         parsed = nil
-        local out, ask_err = ask({
+        local out, ask_err = backend({
             messages = messages,
             system = opts.system,
             tools = wire_tools(specs),
         })
 
         -- One shape for every way a call can produce nothing: the transport
-        -- failed, the provider refused the request, the session would not
-        -- record the answer. The run ends either way, and the message says
-        -- which it was.
+        -- failed, or the provider refused the request. The run ends either
+        -- way, and the message says which it was.
         if not out then
             return stopped(ask_err, turn - 1)
         end
 
         -- The answer as the backend parsed it, which carries what the neutral
         -- result does not: `stop_details`, and the provider extras `on_turn`
-        -- hands on. A session that brought its own backend leaves only the
-        -- kernel's checked copy — three fields, and no way to reach behind
-        -- them, which is the price of not knowing whose wire it was.
+        -- hands on.
         local answer = parsed or out
         local u = answer.usage or {}
-        -- The kernel owns the numbering once there is a session, so the facts
-        -- around the response are filed under the turn it stamped rather than
-        -- under this loop's count, which restarts every run.
-        local model_turn = out.turn or turn
 
         -- Appended verbatim: Anthropic requires thinking blocks to come back
         -- unmodified during tool use, so the content is never filtered here.
@@ -497,32 +408,9 @@ function M._run_impl(opts)
 
         local results = {}
         for _, block in ipairs(calls) do
-            local call_id = tostring(block.id or "")
-            local call_err = record(session, {
-                kind = "tool_call",
-                turn = model_turn,
-                call_id = call_id,
-                name = tostring(block.name or ""),
-                args = block.input or {},
-            })
-            if call_err then
-                return stopped(call_err, turn)
-            end
-
+            -- A failure is answered rather than raised: the model is told
+            -- about it and gets to pick another move.
             local text, is_error = dispatch(by_name, block)
-
-            -- Failures are recorded too: the model is told about them quietly,
-            -- and the record is the only place that says one happened.
-            local result_err = record(session, {
-                kind = "tool_result",
-                turn = model_turn,
-                call_id = call_id,
-                ok = not is_error,
-                result = text,
-            })
-            if result_err then
-                return stopped(result_err, turn)
-            end
 
             table.insert(results, {
                 type = "tool_result",

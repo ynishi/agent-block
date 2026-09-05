@@ -51,6 +51,37 @@
 //! this via `Function::info().what` and returns a clear error rather than
 //! silently installing a non-callable handler.
 //!
+//! # Which runtime `bus.serve` actually runs on
+//!
+//! There are two dispatcher loops in this codebase and they land on
+//! different runtimes. Worth writing down, because "the dispatcher" reads
+//! like one thing.
+//!
+//! **Script-driven (`bus.serve()`).** Each Isle owns an OS thread running a
+//! `new_current_thread` tokio runtime that blocks on a `LocalSet`
+//! (`mlua-isle-0.4.1/src/async_isle.rs:392` and `:788`). The user script is
+//! submitted as a coroutine — `host.rs:1500`, `isle.spawn_coroutine_eval` —
+//! which the Isle's receive loop `spawn_local`s onto that LocalSet
+//! (`async_isle.rs:770`). `bus.serve` is a `create_async_function` on the
+//! main Isle, so its future is polled *inside* that coroutine. Everything
+//! below it therefore runs on the **main Isle's VM current_thread runtime**:
+//! `run_with_grace` → `EventBus::run` (`bus/dispatcher.rs:152`) →
+//! `dispatch` (`:178`) → the `tokio::spawn` at `:203`, which, having no
+//! other runtime in scope, spawns onto the VM's runtime too.
+//!
+//! **Host-driven (auto-serve).** When `BlockConfig::auto_serve_bus` is on
+//! and host handlers are registered, `host.rs:1207` takes the `EventBus` and
+//! `tokio::spawn`s `bus.run` before the script starts — that copy runs on
+//! the **host runtime**, not on any VM thread.
+//!
+//! In both cases the Lua handler body runs somewhere else again: on the
+//! **handler Isle's** VM thread, reached by `LuaHandler::call` through
+//! `spawn_coroutine_call` (line ~122 below). So the awaiting side — VM
+//! runtime or host runtime — is never the side executing Lua, and a handler
+//! that awaits `std.task.sleep`, `std.sql`, `std.ts` or a `knl` session
+//! method suspends only its own coroutine. `handler_await_leaves_the_isle_running`
+//! in the tests below measures that.
+//!
 //! # wf-sim verdict doc comments
 //!
 //! The doc comments on `bus.on` and `bus.on_any` (below) encode the wf-sim
@@ -805,6 +836,76 @@ mod tests {
             .unwrap();
         let got: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(got, json!({"got": 7, "kind": "mesh"}));
+    }
+
+    /// A bus handler that awaits an async battery suspends its own coroutine
+    /// and nothing else: the Isle keeps driving its other coroutines while
+    /// the handler is parked.
+    ///
+    /// Dispatch goes through `spawn_coroutine_call(BUS_DISPATCH_FN, …)` —
+    /// the exact call `LuaHandler::call` makes — against a real `AsyncIsle`,
+    /// so what is measured is the handler Isle's own runtime, the one the
+    /// module doc attributes the handler body to.
+    ///
+    /// `during` is read inside the handler, on either side of a
+    /// `std.task.sleep`: it counts the ticks a sibling coroutine landed while
+    /// the handler was waiting. Zero would mean the VM had stopped.
+    #[tokio::test]
+    async fn handler_await_leaves_the_isle_running() {
+        /// How long the handler parks itself for.
+        const HANDLER_SLEEP_MS: u64 = 150;
+        /// Sibling tick period; 30 of these fit inside the handler's sleep.
+        const TICK_MS: u64 = 5;
+        /// Generous floor — the point is "not zero", not a precise count.
+        const AT_LEAST: i64 = 5;
+
+        let (isle, driver) = AsyncIsle::spawn(|lua: &Lua| {
+            mlua_batteries::register_all(lua, "std")?;
+            crate::bridge::task::register(lua)?;
+            install_bus_dispatcher_on_handler_isle(lua)?;
+            lua.load(format!(
+                r#"
+                __ticks = 0
+
+                __bus_handlers["slow"] = function(ev)
+                    local before = __ticks
+                    std.task.sleep({HANDLER_SLEEP_MS})
+                    return {{ during = __ticks - before }}
+                end
+
+                function __tick_loop()
+                    for _ = 1, 30 do
+                        std.task.sleep({TICK_MS})
+                        __ticks = __ticks + 1
+                    end
+                    return __ticks
+                end
+            "#
+            ))
+            .set_name("@bus_interleave_fixture")
+            .exec()?;
+            Ok(())
+        })
+        .await
+        .expect("spawn the isle");
+
+        // Both submitted before either is awaited, so the Isle's receive loop
+        // spawn_locals them onto the same LocalSet and they interleave.
+        let handler = isle.spawn_coroutine_call(BUS_DISPATCH_FN, &["slow", "e1", "{}", "{}"]);
+        let ticker = isle.spawn_coroutine_call("__tick_loop", &[]);
+        let (handled, ticked) = tokio::join!(handler, ticker);
+
+        ticked.expect("the ticker coroutine ran to completion");
+        let out = handled.expect("the handler coroutine ran to completion");
+        let got: Value = serde_json::from_str(&out).expect("handler returned JSON");
+        let during = got["during"].as_i64().expect("during is a number");
+
+        assert!(
+            during >= AT_LEAST,
+            "the isle stopped while the handler awaited: only {during} tick(s) ran"
+        );
+
+        driver.shutdown().await.expect("shutdown");
     }
 
     /// `Function::info().what` distinguishes Lua-defined closures (dumpable)

@@ -59,9 +59,16 @@ local M = {}
 -- tool set from the registry and MCP, the token budget, and the dump.
 local tool_loop = require("tool_loop")
 
--- Re-exported through `M._test_helpers` only; the run path reaches llm_proto
--- through tool_loop.
-local proto_openai = require("llm_proto").adapter("openai")
+-- The run path reaches llm_proto's wire format through tool_loop; this
+-- module only reaches for llm_proto directly to re-export an adapter below.
+local proto = require("llm_proto")
+
+-- MCP's tool vocabulary — the `<server>__<tool>` namespace and the content
+-- block extraction — shared with knl_adapter's ToolPort.
+local mcp_tools = require("mcp_tools")
+
+-- Re-exported through `M._test_helpers` only.
+local proto_openai = proto.adapter("openai")
 
 local lshape = require("lshape")
 local T = lshape.t
@@ -245,10 +252,10 @@ end
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
--- Keep this list in sync with the other two copies: blocks/tools/compile_loop/init.lua
--- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
--- site is a superset: these exact names plus the ab.obs substring policy
--- (token / secret / password / api_key / access_key / private_key / ...).
+-- Keep this list in sync with the other copy in
+-- blocks/tools/compile_loop/init.lua (sanitize_headers_for_dump); the test
+-- redaction_list_is_mirrored_in_both_lua_blocks in src/bridge/http.rs fails
+-- when the two drift apart.
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
@@ -624,16 +631,17 @@ local function connect_mcp_servers(servers, opts)
 
         local tools = list_result.tools or {}
         for _, t in ipairs(tools) do
-            local ns_name = name .. "__" .. t.name
-            -- Convert inputSchema (camelCase) -> input_schema (snake_case) for Anthropic API
-            local input_schema = t.inputSchema or t.input_schema or { type = "object", properties = {} }
-            mcp_tool_map[ns_name] = {
+            -- The `<server>__<tool>` namespace and the camelCase inputSchema
+            -- conversion are mcp_tools', shared with knl_adapter's ToolPort:
+            -- one tool must not get two names depending on which loop bound it.
+            local decl = mcp_tools.tool_decl(name, t)
+            mcp_tool_map[decl.name] = {
                 server = name,
                 tool = t.name,
                 def = {
-                    name = ns_name,
-                    description = t.description or "",
-                    input_schema = input_schema,
+                    name = decl.name,
+                    description = decl.description,
+                    input_schema = decl.input_schema,
                     group = M._resolve_mcp_group(t, name),
                 },
             }
@@ -922,16 +930,10 @@ local function dispatch_tool(name, input, mcp_tool_map, extra_tools_map)
             log.warn(string.format("mcp tool '%s.%s' returned isError=true", entry.server, entry.tool))
         end
 
-        -- Extract content from MCP result
-        local content_blocks = call_result.content or {}
-        if #content_blocks == 1 and content_blocks[1].type == "text" then
-            return content_blocks[1].text, is_error
-        elseif #content_blocks == 0 then
-            return "", is_error
-        else
-            -- Multiple blocks or non-text: encode as JSON
-            return std.json.encode(content_blocks), is_error
-        end
+        -- Extract content from the MCP result. The rendering (single text
+        -- block verbatim / none the empty string / anything else JSON) is
+        -- mcp_tools', shared with knl_adapter's ToolPort.
+        return mcp_tools.result_text(call_result.content), is_error
     end
 
     -- 2. extra_tools direct fallback (registry-independent; honours crux dispatch_tool wiring gap constraint)
@@ -1153,8 +1155,6 @@ function M._run_impl(opts)
         api_key = opts.api_key,
         api_key_env = opts.api_key_env,
         cache_control = opts.cache_control,
-        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-        dump = (resolve_dump_mode_cached() == "full") and "full" or nil,
     }
     local log_meta = build_log_meta(opts)
 

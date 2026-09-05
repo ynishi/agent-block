@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use crate::host::HostContext;
 use agent_block_mcp::handler::{
-    MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS, MCP_USER_PROMPTS_LIST_CHANGED_CBS,
-    MCP_USER_RESOURCES_LIST_CHANGED_CBS, MCP_USER_RESOURCE_UPDATE_CBS,
-    MCP_USER_TOOLS_LIST_CHANGED_CBS,
+    install_mcp_notify_dispatcher_on_main_isle, MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS,
+    MCP_USER_PROMPTS_LIST_CHANGED_CBS, MCP_USER_RESOURCES_LIST_CHANGED_CBS,
+    MCP_USER_RESOURCE_UPDATE_CBS, MCP_USER_TOOLS_LIST_CHANGED_CBS,
 };
 use agent_block_types::obs;
 
@@ -85,6 +85,12 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         lua.globals()
             .set(MCP_USER_PROMPTS_LIST_CHANGED_CBS, lua.create_table()?)?;
     }
+    // The Lua side of the notification path. The rmcp task reaches these
+    // callbacks through `AsyncIsle::coroutine_call("__mcp_dispatch_notify", …)`
+    // rather than a Rust closure, so a callback that awaits `knl`, `std.sql`,
+    // `std.kv`, `std.ts` or `std.task.sleep` has only Lua frames between its
+    // yield and the coroutine that catches it.
+    install_mcp_notify_dispatcher_on_main_isle(lua)?;
     let script_name: String = lua
         .globals()
         .get::<Option<String>>("_SCRIPT_NAME")?

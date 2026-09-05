@@ -17,6 +17,20 @@ Think of it like Envoy for agents: the process itself is simple, but the communi
 - **Runtime owns the protocol** — Mesh, MCP, and HTTP are provided by the runtime. Lua code never deals with connection management or wire formats
 - **Lua for logic, Rust for plumbing** — Domain logic in Lua. VM, networking, and protocol handling in Rust
 
+### Design documentation lives in the code
+
+Settled design is written into the code's own documentation and nowhere else:
+Rust crate and module docs (`//!`) plus item docs, and the `---` module headers of
+the embedded Lua libraries. There is no separate design document tree — a document
+beside the code drifts and goes unread, a module doc is compiled, linted and read
+with the code it describes.
+
+The entry points for the kernel are the module docs of
+`crates/agent-block-core/src/knl/mod.rs` (the kernel's invariants),
+`crates/agent-block-core/src/bridge/knl.rs` (the syscall surface Lua sees) and
+`crates/agent-block-core/blocks/lib/knl/init.lua` (the Lua kernel: session, device,
+beat, Outcome, shapes). `cargo doc --open` renders the Rust side.
+
 ## Architecture
 
 The repository is a Cargo workspace with 4 crates (strict one-way
@@ -628,8 +642,6 @@ Key behaviours:
   - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
   - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
 
-`AGENT_BLOCK_LLM_DUMP_DIR=<dir>` adds a JSONL audit sink at the HTTP primitive, for CI runs that need a byte-exact trail without parsing stdout. Each process appends to a single file `<dir>/<UTC yyyymmddThhmmssZ>-<id>-p<pid>.jsonl` (`<id>` = `AGENT_BLOCK_RUN_ID`, else `AGENT_BLOCK_TRACE_ID`, else the process-scoped agent id; the pid keeps concurrent processes that share a run id in separate files), one JSON object per line: a `http_request` record before the send and a `http_response` record with the status and body. `headers` is an array of `[name, value]` pairs in wire order, so repeated names (several `set-cookie` lines) are preserved. `url` is sanitized like the obs log lines (userinfo, query and fragment stripped), and a header value is replaced with `***REDACTED***` when the name is `x-api-key`, `authorization`, `set-cookie`, `cookie` or `proxy-authorization`, or when it matches the `ab.obs` substring policy (`token`, `secret`, `password`, `api_key`, `access_key`, `private_key`, ...). Only requests that a block flags are written — today that means LLM calls made while `AGENT_BLOCK_LLM_DUMP=full` is in effect (the blocks own the policy; the primitive owns the file). SSE streaming calls record the request plus a response record carrying `body_skipped: "sse_stream"` — streamed bodies are not dumped. Sink failures are logged once and disable dumping for the rest of the process; they never fail the HTTP request. Under `--sandbox`, the directory must fall inside the writable allowlist (project root, `AGENT_BLOCK_HOME`, `/tmp`, or a path added via `AGENT_BLOCK_SANDBOX_FS_RW`).
-
 ### compile_loop (Filesystem block — `require("compile_loop")`)
 
 Tool factory for the autonomous compile-and-fix loop. The primary surface is
@@ -902,6 +914,57 @@ local User = T.shape({ name = T.string, age = T.number })
 local ok, why = lshape.check.check({ name = "Ada", age = 36 }, User)
 assert(ok, why)
 ```
+
+### Lua kernel (knl — `require("knl")`)
+
+`knl` is the Lua half of a kernel/shell split. Rust owns the **session**: an
+append-only event log, a budget the owner granted it, and a scope it is written
+under. Lua owns the **beat** — one model call plus the tools that call asks for
+— and the **device** it runs against, a frozen bundle of policy (`llm`, `tools`,
+`tool_policy`, `fold`, `filters`, `system`, `cost`). `knl.beat(session, device)`
+takes the two separately because they differ in owner, lifetime and mutability.
+There is no run loop: a caller writes the loop, which is why the primitive is
+one beat.
+
+```lua
+local kernel  = require("knl")
+local adapter = require("knl_adapter")
+
+local device = kernel.device({
+    llm   = adapter.anthropic:open({ model = "claude-haiku-4-5-20251001", max_tokens = 1024 }),
+    tools = adapter.tools({ ... }),        -- flat specs or ToolPorts
+})
+
+kernel.session({ owner = "u", budget = { amount = 8, tag = "beats" } }, function(s)
+    s:append({ kind = "msg_user", data = { content = "..." } })
+
+    local out                                -- the loop is yours to write
+    for _ = 1, 8 do
+        out = kernel.beat(s, device)         -- ok | refused | error | stopped
+        if not kernel.Outcome.is_ok(out) then break end
+        if #out.out.tools == 0 then break end -- nothing left to answer
+    end
+
+    local rows = kernel.views.usage(s)       -- one SELECT over the log
+    for _, row in ipairs(rows) do
+        print(row.calls, row.input_tokens, row.output_tokens)
+    end
+end)                                         -- the bracket closes either way
+```
+
+Views come in two tiers. A **built-in view** is a kernel read reached with
+`s:view(name, opts?)`, and there are exactly two fixed reads —
+`s:events(from)` and `view("tail", { n })`. Everything else is a **query
+view**: a named Lua function running one `SELECT` through `s:query(sql,
+params?, opts?)` over the published event table. `knl.views.beats` /
+`tool_pairs` / `ledger` / `usage` are the four shipped, and a consumer's own
+view is a function of the same form — nothing about the four is privileged.
+
+The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
+(the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the
+syscall surface Lua sees) and
+`crates/agent-block-core/blocks/lib/knl/init.lua` (this half: beat, device,
+Outcome, shapes, views).
 
 ### log.*
 - `log.info/warn/error/debug(msg)`

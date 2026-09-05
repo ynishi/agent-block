@@ -3,6 +3,31 @@
 //! Subtask 1: structural skeleton.
 //! Subtask 2: `on_progress` wired to `handler_isle` bytecode forwarding.
 //! Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
+//!
+//! # The VM thread never waits, and the host never drives it synchronously
+//!
+//! Every callback here — the six notifications, sampling, roots, elicitation —
+//! ends in *user* Lua, and user Lua is allowed to await: a `knl` session
+//! method, `std.sql`, `std.kv`, `std.ts`, `std.task.sleep`. Those are
+//! `create_async_function`s, so they yield.
+//!
+//! A yield only has somewhere to go if every frame between it and the Isle's
+//! coroutine is Lua. `AsyncIsle::exec` hands the VM a *Rust* closure, so a
+//! callback invoked from inside one is separated from its coroutine by a
+//! C-call boundary and the yield dies there — "attempt to yield across a
+//! C-call boundary". That is what these paths used to do.
+//!
+//! So the host calls named Lua functions through
+//! [`AsyncIsle::coroutine_call`] instead. That channel carries `&[&str]` in
+//! and one `String` out, which is why the dispatchers the host calls are the
+//! `_json` wrappers: they do the encode/decode on the Lua side of the
+//! boundary, around the user callback rather than through it. The JSON
+//! helpers themselves ([`MCP_JSON_ENCODE`], [`MCP_JSON_DECODE`]) are still
+//! Rust functions — they are fine, because neither one is on the stack while
+//! the user callback runs.
+//!
+//! Registration (installing dispatchers, storing a handler in a table) runs
+//! no user Lua and stays on `exec`.
 
 // Sampling / Roots / Logging are deprecated upstream (SEP-2577, protocol revision
 // 2026-07-28) but remain part of agent-block's Lua-facing handler surface for the
@@ -33,6 +58,13 @@ pub(crate) const MCP_SAMPLING_HANDLERS: &str = "__mcp_sampling_handlers";
 /// Constant name of the Lua dispatcher function called for sampling/createMessage.
 const MCP_DISPATCH_SAMPLING: &str = "__mcp_dispatch_sampling";
 
+/// JSON-returning wrapper around [`MCP_DISPATCH_SAMPLING`].
+///
+/// The host calls *this* one, never the inner dispatcher, because
+/// [`AsyncIsle::coroutine_call`] carries strings in and a string out. See
+/// the module-level "Why the host calls the `_json` wrappers" note.
+const MCP_DISPATCH_SAMPLING_JSON: &str = "__mcp_dispatch_sampling_json";
+
 /// Constant name of the Lua global table used to store per-server roots handlers
 /// on the handler Isle.
 pub(crate) const MCP_ROOTS_HANDLERS: &str = "__mcp_roots_handlers";
@@ -40,12 +72,44 @@ pub(crate) const MCP_ROOTS_HANDLERS: &str = "__mcp_roots_handlers";
 /// Constant name of the Lua dispatcher function called for roots/list requests.
 const MCP_DISPATCH_ROOTS: &str = "__mcp_dispatch_roots";
 
+/// JSON-returning wrapper around [`MCP_DISPATCH_ROOTS`].
+const MCP_DISPATCH_ROOTS_JSON: &str = "__mcp_dispatch_roots_json";
+
 /// Constant name of the Lua global table used to store per-server elicitation handlers
 /// on the handler Isle.
 pub(crate) const MCP_ELICITATION_HANDLERS: &str = "__mcp_elicitation_handlers";
 
 /// Constant name of the Lua dispatcher function called for elicitation/create requests.
 const MCP_DISPATCH_ELICITATION: &str = "__mcp_dispatch_elicitation";
+
+/// JSON-returning wrapper around [`MCP_DISPATCH_ELICITATION`].
+const MCP_DISPATCH_ELICITATION_JSON: &str = "__mcp_dispatch_elicitation_json";
+
+/// Name of the Rust-backed `value -> json string` helper installed on the
+/// **handler Isle** next to the `_json` wrappers.
+///
+/// It is a C function, but it only runs *after* the user callback has
+/// returned, so it never sits between a yield and the coroutine that would
+/// catch it.
+const MCP_JSON_ENCODE: &str = "__mcp_json_encode";
+
+/// Name of the Rust-backed `json string -> value` helper installed on the
+/// **main Isle** next to [`MCP_DISPATCH_NOTIFY`].
+///
+/// Same reasoning as [`MCP_JSON_ENCODE`], mirrored: it runs *before* the
+/// user callback is entered.
+const MCP_JSON_DECODE: &str = "__mcp_json_decode";
+
+/// Name of the Lua dispatcher that delivers one notification to a user
+/// callback on the **main Isle**.
+///
+/// Written in Lua rather than as a Rust closure so that a callback which
+/// awaits an async battery (`knl` session methods, `std.sql`, `std.kv`,
+/// `std.ts`, `std.task.sleep`) yields through pure Lua frames into the
+/// coroutine the Isle created for it. A Rust closure invoked through
+/// `AsyncIsle::exec` would put a C-call boundary in that path and the yield
+/// would fail with "attempt to yield across a C-call boundary".
+const MCP_DISPATCH_NOTIFY: &str = "__mcp_dispatch_notify";
 
 /// Global table that holds user-provided progress callbacks stored by server name
 /// on the **main Isle**.
@@ -92,19 +156,22 @@ pub const MCP_USER_PROMPTS_LIST_CHANGED_CBS: &str = "__mcp_user_prompts_list_cha
 /// rather than growing memory without bound.
 const NOTIFY_CHANNEL_CAPACITY: usize = 128;
 
-/// Type alias for the event-builder closure used in `NotificationItem`.
-type BuildEvFn = Box<dyn FnOnce(&mlua::Lua, &str) -> mlua::Result<mlua::Table> + Send + 'static>;
-
 /// A single notification item routed through the bounded dispatch channel.
 ///
 /// Carries everything the dispatch task needs to call the user Lua callback
-/// on the main Isle: the server name, the callback table key, the event builder
-/// closure, and a label for log messages.
+/// on the main Isle: the server name, the callback table key, the event as a
+/// JSON string, and a label for log messages.
+///
+/// The event travels as JSON rather than as a closure that builds an
+/// `mlua::Table`, because the dispatch task now reaches Lua through
+/// [`AsyncIsle::coroutine_call`] — a `&[&str]`-in, `String`-out channel. The
+/// table is built on the Lua side, by [`MCP_DISPATCH_NOTIFY`], where it is no
+/// longer between the user callback and its coroutine.
 pub(crate) struct NotificationItem {
     pub(crate) isle: Arc<AsyncIsle>,
     pub(crate) server_name: String,
     pub(crate) cbs_table: &'static str,
-    pub(crate) build_ev: BuildEvFn,
+    pub(crate) ev_json: String,
     pub(crate) caller: &'static str,
 }
 
@@ -233,42 +300,34 @@ impl AgentBlockClientHandler {
         let (tx, mut rx) = mpsc::channel::<NotificationItem>(NOTIFY_CHANNEL_CAPACITY);
         self.notify_tx = Some(tx);
         // Spawn the single dispatch task.  It runs for the lifetime of the channel.
+        //
+        // One item at a time, awaited to completion before the next is taken
+        // off the channel: that is the ordering guarantee a server's
+        // notifications had under the old sequential `exec` loop, and it is
+        // kept here deliberately. What changed is only *how* Lua is entered —
+        // `coroutine_call` instead of `exec` — so a callback that awaits an
+        // async battery suspends its own coroutine and lets the rest of the
+        // VM run, instead of failing to yield.
         tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
-                let sn = item.server_name.clone();
                 let result = item
                     .isle
-                    .exec(move |lua| {
-                        use mlua::prelude::*;
-                        let cbs: LuaTable = match lua.globals().get(item.cbs_table) {
-                            Ok(t) => t,
-                            Err(_) => return Ok(String::new()),
-                        };
-                        let cb: LuaFunction = match cbs.get(item.server_name.as_str()) {
-                            Ok(f) => f,
-                            Err(_) => return Ok(String::new()),
-                        };
-                        let ev = (item.build_ev)(lua, item.server_name.as_str()).map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!("{}: build_ev: {e}", item.caller))
-                        })?;
-                        if let Err(e) = cb.call::<()>(ev) {
-                            tracing::warn!(
-                                target: "mcp_client",
-                                server = %item.server_name,
-                                caller = %item.caller,
-                                error = %e,
-                                "user callback returned error"
-                            );
-                        }
-                        Ok(String::new())
-                    })
+                    .coroutine_call(
+                        MCP_DISPATCH_NOTIFY,
+                        &[
+                            item.cbs_table,
+                            item.server_name.as_str(),
+                            item.ev_json.as_str(),
+                        ],
+                    )
                     .await;
                 if let Err(e) = result {
                     tracing::warn!(
                         target: "mcp_client",
-                        server = %sn,
+                        server = %item.server_name,
+                        caller = %item.caller,
                         error = %e,
-                        "notification dispatch: main isle exec failed"
+                        "notification dispatch: main isle coroutine call failed"
                     );
                 }
             }
@@ -487,70 +546,169 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
     lua.globals()
         .set(MCP_DISPATCH_ELICITATION, dispatch_elicitation)?;
 
+    // ── JSON wrappers (what the host actually calls) ───────────────────────────
+    //
+    // `coroutine_call` returns whatever the function returned, stringified by
+    // the Isle — and a table stringifies to `table: 0x…`. So the encode has to
+    // happen in Lua, after the handler returns and outside the frames it might
+    // yield from. `lua_json::lua_to_json` stays the encoder, reached through
+    // `__mcp_json_encode`, so the wire shape is byte-for-byte what the previous
+    // `exec`-side conversion produced.
+    let encode = lua.create_function(|lua, val: LuaValue| {
+        let json = crate::lua_json::lua_to_json(lua, val)?;
+        serde_json::to_string(&json).map_err(mlua::Error::external)
+    })?;
+    lua.globals().set(MCP_JSON_ENCODE, encode)?;
+
+    // `nil` -> "" is the "no handler registered" signal the callers already
+    // read; anything that is neither nil nor a table is the handler breaking
+    // its contract and is raised as a Lua error.
+    let wrappers = [
+        (
+            MCP_DISPATCH_SAMPLING_JSON,
+            MCP_DISPATCH_SAMPLING,
+            "create_message",
+            2usize,
+        ),
+        (MCP_DISPATCH_ROOTS_JSON, MCP_DISPATCH_ROOTS, "list_roots", 1),
+        (
+            MCP_DISPATCH_ELICITATION_JSON,
+            MCP_DISPATCH_ELICITATION,
+            "create_elicitation",
+            3,
+        ),
+    ];
+    for (wrapper_name, inner_name, caller, arity) in wrappers {
+        let params = match arity {
+            1 => "a",
+            2 => "a, b",
+            _ => "a, b, c",
+        };
+        let src = format!(
+            r#"
+            local INNER = "{inner_name}"
+            local ENCODE = "{MCP_JSON_ENCODE}"
+            return function({params})
+                local r = _G[INNER]({params})
+                if r == nil then
+                    return ""
+                end
+                if type(r) ~= "table" then
+                    error("{caller}: handler must return table or nil, got: " .. type(r))
+                end
+                return _G[ENCODE](r)
+            end
+        "#
+        );
+        let wrapper: LuaFunction = lua
+            .load(&src)
+            .set_name(format!("@agent_block:{wrapper_name}"))
+            .eval()?;
+        lua.globals().set(wrapper_name, wrapper)?;
+    }
+
     Ok(())
+}
+
+/// Install the notification dispatcher on the **main Isle**.
+///
+/// Companion to [`install_mcp_dispatcher_on_handler_isle`], for the other
+/// half of the surface: the six `on_*` notifications, whose user callbacks
+/// live in the `MCP_USER_*_CBS` tables on the main Isle (stored as closures,
+/// so their upvalues survive).
+///
+/// Installs [`MCP_JSON_DECODE`] (Rust) and [`MCP_DISPATCH_NOTIFY`] (Lua). The
+/// dispatch task calls the latter through
+/// [`AsyncIsle::coroutine_call`]; see the module doc for why it is Lua.
+///
+/// Must be called during bridge registration, from inside an
+/// `AsyncIsle::exec`. Idempotent.
+///
+/// The caller (`bridge::mcp::register`) runs on both Isles, so the handler
+/// Isle gets a copy too. It is inert there — nothing dispatches
+/// notifications against the handler Isle — and it is cheaper to leave it
+/// than to thread a "which Isle am I" flag through for two globals.
+pub fn install_mcp_notify_dispatcher_on_main_isle(lua: &mlua::Lua) -> mlua::Result<()> {
+    use mlua::prelude::*;
+
+    let decode = lua.create_function(|lua, s: String| {
+        let json: serde_json::Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
+        crate::lua_json::json_to_lua(lua, json)
+    })?;
+    lua.globals().set(MCP_JSON_DECODE, decode)?;
+
+    // A missing table or a missing callback is not an error: the notification
+    // simply has nowhere to go (the server was never wired, or the script
+    // unregistered). Returning "" matches what the old `exec` closure did.
+    //
+    // A callback that raises is *not* swallowed here. The error travels out
+    // as `IsleError::Lua` and the dispatch task logs it — same warn, one
+    // frame further out — and the loop goes on to the next notification.
+    let src = format!(
+        r#"
+        local DECODE = "{MCP_JSON_DECODE}"
+        return function(cbs_name, server_name, ev_json)
+            local cbs = _G[cbs_name]
+            if type(cbs) ~= "table" then
+                return ""
+            end
+            local cb = cbs[server_name]
+            if type(cb) ~= "function" then
+                return ""
+            end
+            cb(_G[DECODE](ev_json))
+            return ""
+        end
+    "#
+    );
+    let dispatch_notify: LuaFunction = lua
+        .load(&src)
+        .set_name("@agent_block:__mcp_dispatch_notify")
+        .eval()?;
+    lua.globals().set(MCP_DISPATCH_NOTIFY, dispatch_notify)?;
+
+    Ok(())
+}
+
+/// Build the event JSON for the three `*_list_changed` notifications, which
+/// carry nothing but their own type and the server they came from.
+fn list_changed_ev_json(ev_type: &str, server_name: &str) -> String {
+    let mut ev = serde_json::Map::new();
+    ev.insert("type".into(), ev_type.into());
+    ev.insert("server".into(), server_name.into());
+    serde_json::Value::Object(ev).to_string()
 }
 
 /// Dispatch a notification to the Lua callback stored under `cbs_table[server_name]`
 /// on the provided main Isle.
 ///
-/// This helper encapsulates the common "look up cb in globals table → build ev →
-/// spawn → isle.exec → pcall → log error" pattern shared by `on_progress` and
-/// `on_logging_message`. Extracting it here mechanically prevents the H-1-style
-/// divergence where independently-edited methods drift apart.
+/// The fallback path, used when no bounded dispatch channel has been started
+/// (unit-test mode). Shares [`MCP_DISPATCH_NOTIFY`] with the channel path so
+/// the two cannot drift: same lookup, same decode, same yield-capable frames.
 ///
-/// `build_ev` receives the Lua state and the server name (already moved into the
-/// closure) and must return the event table to pass to the callback. The callback
-/// is invoked with pcall semantics: a Lua error inside the callback is logged at
-/// warn level but does not propagate into the main Isle runtime.
-///
-/// `create_message` is intentionally kept out of scope — it has a different
-/// shape (it returns a value rather than being fire-and-forget).
-fn isle_dispatch<F>(
+/// Fire-and-forget — the spawned task is detached and an error is logged, not
+/// returned. `create_message` and friends are intentionally out of scope: they
+/// have a result the caller waits for.
+fn isle_dispatch(
     isle: Arc<AsyncIsle>,
     server_name: String,
     cbs_table: &'static str,
-    build_ev: F,
+    ev_json: String,
     caller: &'static str,
-) where
-    F: FnOnce(&mlua::Lua, &str) -> mlua::Result<mlua::Table> + Send + 'static,
-{
+) {
     tokio::spawn(async move {
-        let sn = server_name.clone();
         let result = isle
-            .exec(move |lua| {
-                use mlua::prelude::*;
-                // Look up the per-server callback table on the main Isle.
-                let cbs: LuaTable = match lua.globals().get(cbs_table) {
-                    Ok(t) => t,
-                    Err(_) => return Ok(String::new()), // table not yet initialised
-                };
-                let cb: LuaFunction = match cbs.get(server_name.as_str()) {
-                    Ok(f) => f,
-                    Err(_) => return Ok(String::new()), // no handler for this server
-                };
-                // Build the event table and invoke the user callback.
-                // pcall semantics: absorb errors so a user callback crash
-                // does not propagate into the main Isle runtime.
-                let ev = build_ev(lua, server_name.as_str())
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("{caller}: build_ev: {e}")))?;
-                if let Err(e) = cb.call::<()>(ev) {
-                    tracing::warn!(
-                        target: "mcp_client",
-                        server = %server_name,
-                        caller = %caller,
-                        error = %e,
-                        "user callback returned error"
-                    );
-                }
-                Ok(String::new())
-            })
+            .coroutine_call(
+                MCP_DISPATCH_NOTIFY,
+                &[cbs_table, server_name.as_str(), ev_json.as_str()],
+            )
             .await;
         if let Err(e) = result {
             tracing::warn!(
                 target: "mcp_client",
-                server = %sn,
+                server = %server_name,
                 error = %e,
-                "{}: main isle exec failed",
+                "{}: main isle coroutine call failed",
                 caller
             );
         }
@@ -605,6 +763,19 @@ impl ClientHandler for AgentBlockClientHandler {
             let total_opt: Option<f64> = params.total;
             let message_opt: Option<String> = params.message;
 
+            let mut ev = serde_json::Map::new();
+            ev.insert("type".into(), "progress".into());
+            ev.insert("server".into(), server_name.as_str().into());
+            ev.insert("token".into(), token_str.into());
+            ev.insert("progress".into(), serde_json::Value::from(progress_f64));
+            if let Some(t) = total_opt {
+                ev.insert("total".into(), serde_json::Value::from(t));
+            }
+            if let Some(m) = message_opt {
+                ev.insert("message".into(), m.into());
+            }
+            let ev_json = serde_json::Value::Object(ev).to_string();
+
             // Route through the bounded channel when available; fall back to the
             // legacy direct-spawn path (unit-test mode, no channel started yet).
             if let Some(tx) = notify_tx {
@@ -612,20 +783,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     isle: main_isle,
                     server_name,
                     cbs_table: MCP_USER_PROGRESS_CBS,
-                    build_ev: Box::new(move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "progress")?;
-                        ev.set("server", server_for_task)?;
-                        ev.set("token", token_str.as_str())?;
-                        ev.set("progress", progress_f64)?;
-                        if let Some(t) = total_opt {
-                            ev.set("total", t)?;
-                        }
-                        if let Some(ref m) = message_opt {
-                            ev.set("message", m.as_str())?;
-                        }
-                        Ok(ev)
-                    }),
+                    ev_json,
                     caller: "on_progress",
                 };
                 if let Err(e) = tx.try_send(item) {
@@ -643,20 +801,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     main_isle,
                     server_name,
                     MCP_USER_PROGRESS_CBS,
-                    move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "progress")?;
-                        ev.set("server", server_for_task)?;
-                        ev.set("token", token_str.as_str())?;
-                        ev.set("progress", progress_f64)?;
-                        if let Some(t) = total_opt {
-                            ev.set("total", t)?;
-                        }
-                        if let Some(ref m) = message_opt {
-                            ev.set("message", m.as_str())?;
-                        }
-                        Ok(ev)
-                    },
+                    ev_json,
                     "on_progress",
                 );
             }
@@ -714,24 +859,20 @@ impl ClientHandler for AgentBlockClientHandler {
 
             if has_lua_handler {
                 if let (Some(isle), Some(sn)) = (main_isle, server_name) {
-                    let level_task = level_str.clone();
-                    let logger_task = logger.clone();
-                    let data_task = data_str.clone();
+                    let mut ev = serde_json::Map::new();
+                    ev.insert("type".into(), "log".into());
+                    ev.insert("server".into(), sn.as_str().into());
+                    ev.insert("level".into(), level_str.as_str().into());
+                    ev.insert("logger".into(), logger.as_str().into());
+                    ev.insert("data".into(), data_str.as_str().into());
+                    let ev_json = serde_json::Value::Object(ev).to_string();
 
                     if let Some(tx) = notify_tx {
                         let item = NotificationItem {
                             isle,
                             server_name: sn,
                             cbs_table: MCP_USER_LOG_CBS,
-                            build_ev: Box::new(move |lua, server_for_task| {
-                                let ev = lua.create_table()?;
-                                ev.set("type", "log")?;
-                                ev.set("server", server_for_task)?;
-                                ev.set("level", level_task.as_str())?;
-                                ev.set("logger", logger_task.as_str())?;
-                                ev.set("data", data_task.as_str())?;
-                                Ok(ev)
-                            }),
+                            ev_json,
                             caller: "on_logging_message",
                         };
                         if let Err(e) = tx.try_send(item) {
@@ -743,21 +884,7 @@ impl ClientHandler for AgentBlockClientHandler {
                         }
                     } else {
                         // Fallback: legacy unbounded spawn (unit-test mode / no channel).
-                        isle_dispatch(
-                            isle,
-                            sn,
-                            MCP_USER_LOG_CBS,
-                            move |lua, server_for_task| {
-                                let ev = lua.create_table()?;
-                                ev.set("type", "log")?;
-                                ev.set("server", server_for_task)?;
-                                ev.set("level", level_task.as_str())?;
-                                ev.set("logger", logger_task.as_str())?;
-                                ev.set("data", data_task.as_str())?;
-                                Ok(ev)
-                            },
-                            "on_logging_message",
-                        );
+                        isle_dispatch(isle, sn, MCP_USER_LOG_CBS, ev_json, "on_logging_message");
                     }
                     return;
                 }
@@ -845,18 +972,18 @@ impl ClientHandler for AgentBlockClientHandler {
 
             let uri = params.uri.clone();
 
+            let mut ev = serde_json::Map::new();
+            ev.insert("type".into(), "resource_update".into());
+            ev.insert("server".into(), server_name.as_str().into());
+            ev.insert("uri".into(), uri.into());
+            let ev_json = serde_json::Value::Object(ev).to_string();
+
             if let Some(tx) = notify_tx {
                 let item = NotificationItem {
                     isle: main_isle,
                     server_name,
                     cbs_table: MCP_USER_RESOURCE_UPDATE_CBS,
-                    build_ev: Box::new(move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "resource_update")?;
-                        ev.set("server", server_for_task)?;
-                        ev.set("uri", uri.as_str())?;
-                        Ok(ev)
-                    }),
+                    ev_json,
                     caller: "on_resource_updated",
                 };
                 if let Err(e) = tx.try_send(item) {
@@ -872,13 +999,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     main_isle,
                     server_name,
                     MCP_USER_RESOURCE_UPDATE_CBS,
-                    move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "resource_update")?;
-                        ev.set("server", server_for_task)?;
-                        ev.set("uri", uri.as_str())?;
-                        Ok(ev)
-                    },
+                    ev_json,
                     "on_resource_updated",
                 );
             }
@@ -914,17 +1035,14 @@ impl ClientHandler for AgentBlockClientHandler {
                 return;
             }
 
+            let ev_json = list_changed_ev_json("resources_list_changed", &server_name);
+
             if let Some(tx) = notify_tx {
                 let item = NotificationItem {
                     isle: main_isle,
                     server_name,
                     cbs_table: MCP_USER_RESOURCES_LIST_CHANGED_CBS,
-                    build_ev: Box::new(move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "resources_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    }),
+                    ev_json,
                     caller: "on_resource_list_changed",
                 };
                 if let Err(e) = tx.try_send(item) {
@@ -939,12 +1057,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     main_isle,
                     server_name,
                     MCP_USER_RESOURCES_LIST_CHANGED_CBS,
-                    move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "resources_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    },
+                    ev_json,
                     "on_resource_list_changed",
                 );
             }
@@ -980,17 +1093,14 @@ impl ClientHandler for AgentBlockClientHandler {
                 return;
             }
 
+            let ev_json = list_changed_ev_json("tools_list_changed", &server_name);
+
             if let Some(tx) = notify_tx {
                 let item = NotificationItem {
                     isle: main_isle,
                     server_name,
                     cbs_table: MCP_USER_TOOLS_LIST_CHANGED_CBS,
-                    build_ev: Box::new(move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "tools_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    }),
+                    ev_json,
                     caller: "on_tool_list_changed",
                 };
                 if let Err(e) = tx.try_send(item) {
@@ -1005,12 +1115,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     main_isle,
                     server_name,
                     MCP_USER_TOOLS_LIST_CHANGED_CBS,
-                    move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "tools_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    },
+                    ev_json,
                     "on_tool_list_changed",
                 );
             }
@@ -1046,17 +1151,14 @@ impl ClientHandler for AgentBlockClientHandler {
                 return;
             }
 
+            let ev_json = list_changed_ev_json("prompts_list_changed", &server_name);
+
             if let Some(tx) = notify_tx {
                 let item = NotificationItem {
                     isle: main_isle,
                     server_name,
                     cbs_table: MCP_USER_PROMPTS_LIST_CHANGED_CBS,
-                    build_ev: Box::new(move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "prompts_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    }),
+                    ev_json,
                     caller: "on_prompt_list_changed",
                 };
                 if let Err(e) = tx.try_send(item) {
@@ -1071,12 +1173,7 @@ impl ClientHandler for AgentBlockClientHandler {
                     main_isle,
                     server_name,
                     MCP_USER_PROMPTS_LIST_CHANGED_CBS,
-                    move |lua, server_for_task| {
-                        let ev = lua.create_table()?;
-                        ev.set("type", "prompts_list_changed")?;
-                        ev.set("server", server_for_task)?;
-                        Ok(ev)
-                    },
+                    ev_json,
                     "on_prompt_list_changed",
                 );
             }
@@ -1141,45 +1238,16 @@ impl ClientHandler for AgentBlockClientHandler {
                 }
             };
 
-            // Dispatch to Lua sampling handler and await result JSON.
-            let sn_task = sn.clone();
-            let params_task = params_json.clone();
+            // Dispatch to the Lua sampling handler and await its result JSON.
+            //
+            // `coroutine_call`, not `exec`: the handler is user Lua and may
+            // await an async battery, which only works if there is no C-call
+            // boundary between it and the coroutine (module doc).
             let result_json = isle
-                .exec(move |lua| {
-                    use mlua::prelude::*;
-                    let dispatch: LuaFunction =
-                        lua.globals().get(MCP_DISPATCH_SAMPLING).map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!(
-                                "create_message: get dispatcher: {e}"
-                            ))
-                        })?;
-                    let result: LuaValue = dispatch
-                        .call((sn_task.as_str(), params_task.as_str()))
-                        .map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!("create_message: dispatch: {e}"))
-                        })?;
-
-                    // Lua handler must return a table or nil.
-                    match result {
-                        LuaValue::Nil => Ok(String::new()),
-                        LuaValue::Table(tbl) => {
-                            // Serialize the table to JSON string.
-                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
-                                .map_err(|e| {
-                                    mlua_isle::IsleError::Lua(format!(
-                                        "create_message: lua_to_json: {e}"
-                                    ))
-                                })?;
-                            serde_json::to_string(&json_val).map_err(|e| {
-                                mlua_isle::IsleError::Lua(format!("create_message: to_string: {e}"))
-                            })
-                        }
-                        other => Err(mlua_isle::IsleError::Lua(format!(
-                            "create_message: handler must return table or nil, got: {:?}",
-                            other.type_name()
-                        ))),
-                    }
-                })
+                .coroutine_call(
+                    MCP_DISPATCH_SAMPLING_JSON,
+                    &[sn.as_str(), params_json.as_str()],
+                )
                 .await;
 
             match result_json {
@@ -1299,40 +1367,10 @@ impl ClientHandler for AgentBlockClientHandler {
                 }
             };
 
-            // Dispatch to Lua roots handler and await result.
-            let sn_task = sn.clone();
+            // Dispatch to the Lua roots handler and await its result (see
+            // `create_message` for why this is a coroutine call).
             let result_val = isle
-                .exec(move |lua| {
-                    use mlua::prelude::*;
-                    let dispatch: LuaFunction =
-                        lua.globals().get(MCP_DISPATCH_ROOTS).map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!("list_roots: get dispatcher: {e}"))
-                        })?;
-                    let result: LuaValue = dispatch.call(sn_task.as_str()).map_err(|e| {
-                        mlua_isle::IsleError::Lua(format!("list_roots: dispatch: {e}"))
-                    })?;
-
-                    // Lua handler must return a table or nil.
-                    match result {
-                        LuaValue::Nil => Ok(String::new()),
-                        LuaValue::Table(tbl) => {
-                            // Serialize the table to JSON string.
-                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
-                                .map_err(|e| {
-                                    mlua_isle::IsleError::Lua(format!(
-                                        "list_roots: lua_to_json: {e}"
-                                    ))
-                                })?;
-                            serde_json::to_string(&json_val).map_err(|e| {
-                                mlua_isle::IsleError::Lua(format!("list_roots: to_string: {e}"))
-                            })
-                        }
-                        other => Err(mlua_isle::IsleError::Lua(format!(
-                            "list_roots: handler must return table or nil, got: {:?}",
-                            other.type_name()
-                        ))),
-                    }
-                })
+                .coroutine_call(MCP_DISPATCH_ROOTS_JSON, &[sn.as_str()])
                 .await;
 
             match result_val {
@@ -1463,51 +1501,13 @@ impl ClientHandler for AgentBlockClientHandler {
                 McpError::internal_error(format!("create_elicitation: schema serialize: {e}"), None)
             })?;
 
-            // Dispatch to Lua elicitation handler and await result.
-            let sn_task = sn.clone();
-            let message_task = message.clone();
+            // Dispatch to the Lua elicitation handler and await its result (see
+            // `create_message` for why this is a coroutine call).
             let result_val = isle
-                .exec(move |lua| {
-                    use mlua::prelude::*;
-                    let dispatch: LuaFunction =
-                        lua.globals().get(MCP_DISPATCH_ELICITATION).map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!(
-                                "create_elicitation: get dispatcher: {e}"
-                            ))
-                        })?;
-                    let result: LuaValue = dispatch
-                        .call((
-                            sn_task.as_str(),
-                            message_task.as_str(),
-                            schema_json.as_str(),
-                        ))
-                        .map_err(|e| {
-                            mlua_isle::IsleError::Lua(format!("create_elicitation: dispatch: {e}"))
-                        })?;
-
-                    // Lua handler must return a table or nil.
-                    match result {
-                        LuaValue::Nil => Ok(String::new()),
-                        LuaValue::Table(tbl) => {
-                            // Serialize the table to JSON string.
-                            let json_val = crate::lua_json::lua_to_json(lua, LuaValue::Table(tbl))
-                                .map_err(|e| {
-                                    mlua_isle::IsleError::Lua(format!(
-                                        "create_elicitation: lua_to_json: {e}"
-                                    ))
-                                })?;
-                            serde_json::to_string(&json_val).map_err(|e| {
-                                mlua_isle::IsleError::Lua(format!(
-                                    "create_elicitation: to_string: {e}"
-                                ))
-                            })
-                        }
-                        other => Err(mlua_isle::IsleError::Lua(format!(
-                            "create_elicitation: handler must return table or nil, got: {:?}",
-                            other.type_name()
-                        ))),
-                    }
-                })
+                .coroutine_call(
+                    MCP_DISPATCH_ELICITATION_JSON,
+                    &[sn.as_str(), message.as_str(), schema_json.as_str()],
+                )
                 .await;
 
             match result_val {
@@ -1846,6 +1846,178 @@ mod tests {
         assert_eq!(hits, 3, "upvalue counter must reach 3");
 
         driver.shutdown().await.expect("shutdown");
+    }
+
+    /// The boundary this module is built around, pinned from both sides.
+    ///
+    /// `park()` stands in for any async battery a user callback may reach for
+    /// — a `knl` session method, `std.sql`, `std.ts`, `std.task.sleep`. All of
+    /// them are `create_async_function`s, all of them yield.
+    ///
+    /// Through `exec` the callback is called from a Rust frame and the yield
+    /// has nowhere to go. Through `coroutine_call` every frame down to the
+    /// callback is Lua and the same callback completes. If someone puts an
+    /// `exec` back on the notification path, the second half of this test is
+    /// what stops them.
+    #[tokio::test]
+    async fn a_yielding_callback_needs_the_coroutine_path() {
+        use mlua::prelude::*;
+        use mlua_isle::AsyncIsle;
+
+        let (isle, driver) = AsyncIsle::spawn(|lua: &mlua::Lua| {
+            install_mcp_notify_dispatcher_on_main_isle(lua)?;
+            let park = lua.create_async_function(|_, ()| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                Ok(())
+            })?;
+            lua.globals().set("park", park)?;
+            lua.load(
+                r#"
+                __mcp_user_progress_cbs = {}
+                hits = 0
+                seen_type = nil
+                __mcp_user_progress_cbs["srv"] = function(ev)
+                    park()
+                    hits = hits + 1
+                    seen_type = ev.type
+                end
+            "#,
+            )
+            .set_name("@yield_boundary_fixture")
+            .exec()?;
+            Ok(())
+        })
+        .await
+        .expect("spawn the isle");
+
+        // (1) exec — a Rust frame between the callback and the coroutine.
+        let via_exec = isle
+            .exec(|lua| {
+                let cbs: LuaTable = lua
+                    .globals()
+                    .get(MCP_USER_PROGRESS_CBS)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cbs: {e}")))?;
+                let cb: LuaFunction = cbs
+                    .get("srv")
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cb: {e}")))?;
+                let ev = lua
+                    .create_table()
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create ev: {e}")))?;
+                cb.call::<()>(ev)
+                    .map_err(|e| mlua_isle::IsleError::Lua(format!("call: {e}")))?;
+                Ok(String::new())
+            })
+            .await;
+        let err = via_exec.expect_err("a yield inside an exec closure must fail");
+        assert!(
+            err.to_string().contains("yield"),
+            "expected a yield-boundary error, got: {err}"
+        );
+
+        // (2) coroutine_call — only Lua frames, so the same callback lands.
+        isle.coroutine_call(
+            MCP_DISPATCH_NOTIFY,
+            &[
+                MCP_USER_PROGRESS_CBS,
+                "srv",
+                r#"{"type":"progress","server":"srv"}"#,
+            ],
+        )
+        .await
+        .expect("the callback must run to completion through the coroutine path");
+
+        let hits = isle
+            .eval("return tostring(hits) .. ':' .. tostring(seen_type)")
+            .await
+            .expect("read back");
+        assert_eq!(hits, "1:progress");
+
+        driver.shutdown().await.expect("shutdown");
+    }
+
+    /// A notification for a server with no registered callback is not an
+    /// error — the dispatcher returns the empty string and the dispatch task
+    /// moves on.
+    #[tokio::test]
+    async fn notify_dispatcher_is_silent_when_no_callback_is_registered() {
+        use mlua_isle::AsyncIsle;
+
+        let (isle, driver) = AsyncIsle::spawn(|lua: &mlua::Lua| {
+            install_mcp_notify_dispatcher_on_main_isle(lua)?;
+            Ok(())
+        })
+        .await
+        .expect("spawn the isle");
+
+        // Table absent entirely.
+        let out = isle
+            .coroutine_call(
+                MCP_DISPATCH_NOTIFY,
+                &[MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#],
+            )
+            .await
+            .expect("a missing table is not an error");
+        assert_eq!(out, "");
+
+        // Table present, server absent.
+        isle.exec(|lua| {
+            let t = lua
+                .create_table()
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("create: {e}")))?;
+            lua.globals()
+                .set(MCP_USER_LOG_CBS, t)
+                .map_err(|e| mlua_isle::IsleError::Lua(format!("set: {e}")))?;
+            Ok(String::new())
+        })
+        .await
+        .expect("install the table");
+
+        let out = isle
+            .coroutine_call(
+                MCP_DISPATCH_NOTIFY,
+                &[MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#],
+            )
+            .await
+            .expect("a missing callback is not an error");
+        assert_eq!(out, "");
+
+        driver.shutdown().await.expect("shutdown");
+    }
+
+    /// The `_json` wrapper the host calls returns the encoded handler result,
+    /// `""` for "no handler", and raises when the handler breaks its contract.
+    #[test]
+    fn sampling_json_wrapper_encodes_nil_table_and_rejects_the_rest() {
+        let lua = mlua::Lua::new();
+        install_mcp_dispatcher_on_handler_isle(&lua).unwrap();
+
+        let wrapper: mlua::Function = lua.globals().get(MCP_DISPATCH_SAMPLING_JSON).unwrap();
+
+        // No handler registered -> "" (what the caller reads as method_not_found).
+        let out: String = wrapper.call(("no-srv", "{}")).unwrap();
+        assert_eq!(out, "");
+
+        lua.load(
+            r#"
+            __mcp_sampling_handlers["srv"] = function(sn, params_json)
+                return { model = "test-model", content = "hello" }
+            end
+            __mcp_sampling_handlers["bad"] = function() return "not a table" end
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        let out: String = wrapper.call(("srv", "{}")).unwrap();
+        let got: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(got["model"], "test-model");
+        assert_eq!(got["content"], "hello");
+
+        let err = wrapper.call::<String>(("bad", "{}")).unwrap_err();
+        assert!(
+            err.to_string().contains("must return table or nil"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

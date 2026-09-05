@@ -94,6 +94,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   became global arguments, so they may be written on either side of a
   subcommand. `agent-block -s <script> …` is unchanged.
 
+### Removed
+
+- `AGENT_BLOCK_LLM_DUMP_DIR` and the per-call JSONL dump it wrote at the HTTP
+  primitive, along with the `dump = "full"` request flag that opted into it.
+  The kernel's session log already records every model call — `llm_request`,
+  `llm_response` and `llm_call_failed`, read with `session:query` or
+  `knl.views` — so the file-based copy carried the same records a second time,
+  and writing it was the last place where the VM thread did synchronous file
+  I/O. The `ab.obs` `http_request` / `http_response` log events are unchanged.
+
 ## [0.35.1] - 2026-08-31
 
 ### Changed

@@ -79,14 +79,19 @@ dependencies = [
  "llm-extract",
  "mlua",
  "mlua-batteries",
+ "mlua-batteries-sqlite",
  "mlua-isle",
  "mlua-pkg",
  "nix 0.29.0",
  "reqwest 0.12.28",
  "rusqlite",
+ "rusqlite-isle",
+ "schema-bridge",
+ "schema-bridge-lshape",
  "seccompiler",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "tempfile",
  "thiserror",
@@ -169,18 +174,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
 ]
 
 [[package]]
@@ -1102,15 +1095,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-dependencies = [
- "ahash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -1126,11 +1110,11 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -1579,9 +1563,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.28.0"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1745,17 +1729,30 @@ dependencies = [
 
 [[package]]
 name = "mlua-batteries"
-version = "0.3.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8a336afd2367e3e2fe6512c946502c23f5d82594fe83ee7a60419752ac2b141"
+checksum = "6b6ff2b7e7d0e98caf1954704daf2e3f2288777548e7e0fad0a639dac7ef2d95"
 dependencies = [
  "globset",
  "mlua",
- "rusqlite",
  "serde_json",
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "mlua-batteries-sqlite"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edfd74fc399f22d84d78f31f989248394ddb1ddf82fbb9a8269ce9b7fff45d1b"
+dependencies = [
+ "mlua",
+ "mlua-batteries",
+ "rusqlite",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2402,9 +2399,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.31.0"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
 dependencies = [
  "bitflags",
  "fallible-iterator",
@@ -2412,6 +2409,17 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+]
+
+[[package]]
+name = "rusqlite-isle"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eef1d3bd1b3acb14b1c9f52a2c4ef8823d3a976e942745f183b4b8c1b1eb3fc8"
+dependencies = [
+ "rusqlite",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2546,6 +2554,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "schema-bridge"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11adc0f1445fbf542d13388cbf9fec7e90a9cde71af61910de475d1a4eaecb73"
+dependencies = [
+ "schema-bridge-core",
+ "schema-bridge-macro",
+ "serde",
+]
+
+[[package]]
+name = "schema-bridge-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "190c12851001ecbfc2541090961519946073e16ee019377c308252b6cc6a3aa4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schema-bridge-lshape"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c61aef9984cc4ad6bcbb8ae399a1ee4e835e36a191a1d2a45778d4b3830e5ed"
+dependencies = [
+ "schema-bridge-core",
+]
+
+[[package]]
+name = "schema-bridge-macro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54269d2ac695ed4f594d34bffc2b77fb71404559c5ffa9d68cd139ef9d93843b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2677,6 +2726,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

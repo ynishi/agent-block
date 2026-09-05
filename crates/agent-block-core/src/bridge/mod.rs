@@ -70,13 +70,13 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     mcp::register(lua, ctx)?;
     http::register(lua, ctx)?;
     llm::register(lua)?;
-    knl::register(lua)?;
+    knl::register(lua, ctx.knl_drivers.clone(), ctx.knl_store.clone())?;
     #[cfg(feature = "sqlite")]
     kv::register(lua, ctx)?;
     #[cfg(feature = "sqlite")]
     sql::register(lua, ctx)?;
     #[cfg(feature = "sqlite")]
-    ts::register(lua, ctx)?;
+    ts::register(lua, ctx.ts_isle.clone())?;
     task::register(lua)?;
     Ok(())
 }

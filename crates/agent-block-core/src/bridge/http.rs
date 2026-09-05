@@ -10,17 +10,6 @@
 //! Events.  Each `data:` line is passed to the `on_data(data_string)`
 //! Lua callback.  The `[DONE]` sentinel terminates the stream.
 //!
-//! # Dump sink (`AGENT_BLOCK_LLM_DUMP_DIR`)
-//!
-//! A request may opt into a byte-level audit trail by passing
-//! `dump = "full"` in the opts table.  Which calls are dump-worthy is
-//! decided by the calling block (policy); this bridge only provides the
-//! mechanics (file naming, redaction, IO).  When `AGENT_BLOCK_LLM_DUMP_DIR`
-//! is set, flagged requests append one JSON object per line to a
-//! process-scoped `<UTC>-<id>-p<pid>.jsonl` file in that directory.  The sink
-//! is best-effort: any failure is logged once and disables dumping for the
-//! rest of the process — it never fails the HTTP request.
-//!
 //! # Security
 //!
 //! No URL restrictions during development.  The trust boundary is
@@ -29,11 +18,7 @@
 
 use mlua::prelude::*;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::Write as _;
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::host::HostContext;
 use agent_block_types::obs;
@@ -87,21 +72,6 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     None
                 };
 
-                // Per-request dump opt-in.  The caller (Lua block) owns the
-                // policy; only the literal "full" activates the JSONL sink, and
-                // the sink itself is inert unless AGENT_BLOCK_LLM_DUMP_DIR is set.
-                let dump_full: bool = opts
-                    .as_ref()
-                    .and_then(|t| t.get::<Option<String>>("dump").ok().flatten())
-                    .is_some_and(|v| v == "full");
-                // The captures below (header vecs, request body clone) are only
-                // worth taking when a sink actually exists; with
-                // AGENT_BLOCK_LLM_DUMP_DIR unset they would be built and then
-                // discarded. `dump_sink()` is a cached `OnceLock`, and `&&`
-                // short-circuits, so an unflagged request still never resolves
-                // it.
-                let dump_active: bool = dump_full && dump_sink().is_some();
-
                 // ── Build request ─────────────────────────────────
                 let reqwest_method = method.parse::<reqwest::Method>().map_err(|e| {
                     LuaError::external(format!("invalid HTTP method '{method}': {e}"))
@@ -111,19 +81,12 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .request(reqwest_method, &url)
                     .timeout(Duration::from_secs(timeout_secs));
 
-                // Effective outbound header set, captured for the dump record:
-                // user-provided headers plus the auto-propagated trace family.
-                let mut dump_req_headers: Vec<(String, String)> = Vec::new();
-
                 let mut explicit_headers = HashSet::<String>::new();
                 if let Some(ref opts_tbl) = opts {
                     if let Some(headers_tbl) = opts_tbl.get::<Option<LuaTable>>("headers")? {
                         for pair in headers_tbl.pairs::<String, String>() {
                             let (k, v) = pair?;
                             explicit_headers.insert(k.to_ascii_lowercase());
-                            if dump_active {
-                                dump_req_headers.push((k.clone(), v.clone()));
-                            }
                             req = req.header(&k, &v);
                         }
                     }
@@ -148,16 +111,10 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     }
                     if let Some(v) = val_opt {
                         if !v.is_empty() {
-                            if dump_active {
-                                dump_req_headers.push((name.to_string(), v.clone()));
-                            }
                             req = req.header(name, v);
                         }
                     }
                 }
-
-                // Capture the request body before it is moved into the builder.
-                let dump_req_body = if dump_active { body.clone() } else { None };
 
                 if let Some(b) = body {
                     req = req.body(b);
@@ -175,18 +132,6 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                         &[("method", method.as_str()), ("url", url.as_str())],
                     )
                 );
-                // `dump_sink()` is only resolved for flagged requests, so an
-                // unset AGENT_BLOCK_LLM_DUMP_DIR never touches the filesystem.
-                if let Some(sink) = dump_active.then(dump_sink).flatten() {
-                    let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
-                    sink.write_record(dump_request_record(
-                        &obs_ctx,
-                        &method,
-                        &url,
-                        &dump_req_headers,
-                        dump_req_body.as_deref(),
-                    ));
-                }
                 let resp = req.send().await.map_err(|e| {
                     if e.is_timeout() {
                         LuaError::external(format!("http timeout after {timeout_secs}s: {e}"))
@@ -211,35 +156,15 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     )
                 );
 
-                let mut dump_resp_headers: Vec<(String, String)> = Vec::new();
                 let resp_headers = lua.create_table()?;
                 for (k, v) in resp.headers() {
                     if let Ok(vs) = v.to_str() {
-                        if dump_active {
-                            dump_resp_headers.push((k.as_str().to_string(), vs.to_string()));
-                        }
                         resp_headers.set(k.as_str(), vs.to_string())?;
                     }
                 }
 
                 if stream_mode {
                     // ── SSE streaming mode ────────────────────────
-                    // Streamed bodies are not dumped: the chunks are consumed by
-                    // the Lua callback, so the record carries `body_skipped`
-                    // instead of a body.  Written before the stream is read so a
-                    // mid-stream error still leaves the response record behind.
-                    if let Some(sink) = dump_active.then(dump_sink).flatten() {
-                        let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
-                        sink.write_record(dump_response_record(
-                            &obs_ctx,
-                            &method,
-                            &url,
-                            status,
-                            &dump_resp_headers,
-                            None,
-                            Some("sse_stream"),
-                        ));
-                    }
                     read_sse(resp, &on_data).await?;
 
                     let result = lua.create_table()?;
@@ -248,36 +173,12 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     Ok(result)
                 } else {
                     // ── Buffered mode ─────────────────────────────
-                    // Both failure paths below return early. Like the SSE branch
-                    // they still emit a response record — with `body_skipped`
-                    // instead of a body — so a dump never ends up holding a
-                    // request whose response silently went missing. Status and
-                    // headers are already known at this point.
-                    let write_skipped_response = |reason: &str| {
-                        if let Some(sink) = dump_active.then(dump_sink).flatten() {
-                            let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
-                            sink.write_record(dump_response_record(
-                                &obs_ctx,
-                                &method,
-                                &url,
-                                status,
-                                &dump_resp_headers,
-                                None,
-                                Some(reason),
-                            ));
-                        }
-                    };
-
-                    let body_bytes = match resp.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            write_skipped_response("read_error");
-                            return Err(LuaError::external(format!("http read body error: {e}")));
-                        }
-                    };
+                    let body_bytes = resp
+                        .bytes()
+                        .await
+                        .map_err(|e| LuaError::external(format!("http read body error: {e}")))?;
 
                     if body_bytes.len() > MAX_BODY_SIZE {
-                        write_skipped_response("max_body_size");
                         return Err(LuaError::external(format!(
                             "response body too large: {} bytes (max {MAX_BODY_SIZE})",
                             body_bytes.len()
@@ -285,21 +186,6 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     }
 
                     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
-
-                    // Dump the exact text handed to Lua below — the body is read
-                    // once (`resp.bytes()` above) and borrowed here, not re-read.
-                    if let Some(sink) = dump_active.then(dump_sink).flatten() {
-                        let obs_ctx = obs::obs_context(fallback_agent_id.as_deref());
-                        sink.write_record(dump_response_record(
-                            &obs_ctx,
-                            &method,
-                            &url,
-                            status,
-                            &dump_resp_headers,
-                            Some(body_str.as_str()),
-                            None,
-                        ));
-                    }
 
                     let result = lua.create_table()?;
                     result.set("status", status)?;
@@ -372,388 +258,24 @@ async fn read_sse(mut resp: reqwest::Response, on_data: &Option<LuaFunction>) ->
     Ok(())
 }
 
-// ── JSONL dump sink ───────────────────────────────────────────────────
-//
-// Mechanics only: the decision of *which* requests are dumped is made by the
-// caller (`dump = "full"` in the opts table).  This half owns file naming,
-// header redaction and the append-only IO, and is guaranteed never to fail a
-// request: every error path warns once and disables the sink.
-
-/// Exact header names (compared case-insensitively) whose values never reach
-/// the sink. See [`is_redacted_header`]: the sink also applies the `ab.obs`
-/// substring policy on top of this list.
-///
-/// Keep these five entries in sync with the other two copies:
-/// `blocks/agent/init.lua` and `blocks/tools/compile_loop/init.lua`
-/// (`sanitize_headers_for_dump`), which carry the exact names only.
-const REDACTED_HEADERS: [&str; 5] = [
-    "x-api-key",
-    "authorization",
-    "set-cookie",
-    "cookie",
-    "proxy-authorization",
-];
-
-/// Replacement written in place of a redacted header value.
-const REDACTED_VALUE: &str = "***REDACTED***";
-
-/// Process-wide append-only JSONL sink.
-///
-/// `file` is `None` once the sink is poisoned — the first write failure
-/// disables dumping for the remaining lifetime of the process.
-struct DumpSink {
-    path: PathBuf,
-    file: Mutex<Option<File>>,
-}
-
-impl DumpSink {
-    /// Append one JSON record as a single line, flushing immediately.
-    ///
-    /// Never panics and never propagates an error: a failing sink is closed
-    /// and subsequent records are dropped.
-    fn write_record(&self, record: serde_json::Value) {
-        // Record and newline are emitted by a single `write_all`: splitting them
-        // would let a concurrent appender interleave between the two writes.
-        let mut line = match serde_json::to_string(&record) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(target: "lua", "llm dump sink: record serialization failed: {e}");
-                return;
-            }
-        };
-        line.push('\n');
-        // A poisoned mutex still carries a usable handle; a panic elsewhere
-        // must not take the HTTP path down with it.
-        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(file) = guard.as_mut() else {
-            return; // already disabled
-        };
-        let written = file.write_all(line.as_bytes()).and_then(|()| file.flush());
-        if let Err(e) = written {
-            tracing::warn!(
-                target: "lua",
-                "llm dump sink disabled: write to {} failed: {e}",
-                self.path.display()
-            );
-            *guard = None;
-        }
-    }
-}
-
-/// Resolve the process-wide sink, opening the file on first use.
-///
-/// Returns `None` when `AGENT_BLOCK_LLM_DUMP_DIR` is unset/empty or when the
-/// directory or file could not be opened (warned once at resolve time).
-fn dump_sink() -> Option<&'static DumpSink> {
-    static SINK: OnceLock<Option<DumpSink>> = OnceLock::new();
-    SINK.get_or_init(open_dump_sink).as_ref()
-}
-
-fn open_dump_sink() -> Option<DumpSink> {
-    let dir = std::env::var("AGENT_BLOCK_LLM_DUMP_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())?;
-    let dir = PathBuf::from(dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(
-            target: "lua",
-            "llm dump sink disabled: cannot create {}: {e}",
-            dir.display()
-        );
-        return None;
-    }
-
-    // Correlation ID: run id → trace id → process-scoped agent id.
-    let id = ["AGENT_BLOCK_RUN_ID", "AGENT_BLOCK_TRACE_ID"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-        .unwrap_or_else(|| obs::process_agent_id().to_string());
-
-    // The pid keeps the file name unique: the timestamp has second precision, so
-    // two processes started in the same second under a shared AGENT_BLOCK_RUN_ID
-    // would otherwise open — and interleave into — the same file.
-    let path = dir.join(format!(
-        "{}-{}-p{}.jsonl",
-        utc_stamp(now_millis() / 1000),
-        sanitize_id(&id),
-        std::process::id()
-    ));
-    match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => Some(DumpSink {
-            path,
-            file: Mutex::new(Some(f)),
-        }),
-        Err(e) => {
-            tracing::warn!(
-                target: "lua",
-                "llm dump sink disabled: cannot open {}: {e}",
-                path.display()
-            );
-            None
-        }
-    }
-}
-
-/// Milliseconds since the Unix epoch (0 if the clock is before the epoch).
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Format epoch seconds as `yyyymmddThhmmssZ` (UTC).
-///
-/// Uses the civil-from-days conversion so no date crate is required.
-fn utc_stamp(epoch_secs: u64) -> String {
-    let days = (epoch_secs / 86_400) as i64;
-    let rem = epoch_secs % 86_400;
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-
-    format!("{year:04}{month:02}{day:02}T{hh:02}{mm:02}{ss:02}Z")
-}
-
-/// Keep the sink file name a single, safe path component.
-fn sanitize_id(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// True when a header value must be masked before it reaches the sink.
-///
-/// Union of two policies: the exact header names in [`REDACTED_HEADERS`] (which
-/// the hyphenated HTTP spelling of `x-api-key` would otherwise slip past) and
-/// the `ab.obs` substring policy (`token` / `secret` / `password` / `api_key` /
-/// `access_key` / `private_key` / ...), so the sink is never laxer than the logs.
-fn is_redacted_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    REDACTED_HEADERS.contains(&lower.as_str()) || obs::is_sensitive_key(&lower)
-}
-
-/// Render header pairs as an ordered JSON array of `[name, value]` pairs,
-/// masking sensitive values.
-///
-/// An array rather than an object: HTTP allows repeated names (several
-/// `set-cookie` lines are the common case) and an object would silently collapse
-/// them. Wire order is preserved.
-fn redact_headers(pairs: &[(String, String)]) -> serde_json::Value {
-    serde_json::Value::Array(
-        pairs
-            .iter()
-            .map(|(k, v)| {
-                let value = if is_redacted_header(k) {
-                    REDACTED_VALUE
-                } else {
-                    v.as_str()
-                };
-                serde_json::json!([k, value])
-            })
-            .collect(),
-    )
-}
-
-fn dump_request_record(
-    ctx: &(String, String, String, String),
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
-) -> serde_json::Value {
-    let mut rec = serde_json::json!({
-        "ts": now_millis(),
-        "kind": "http_request",
-        "trace_id": ctx.0,
-        "run_id": ctx.1,
-        "agent_id": ctx.2,
-        "agent_name": ctx.3,
-        "method": method,
-        // Same sanitization the obs log lines use: userinfo / query / fragment
-        // are stripped, so a credential in the URL never reaches the sink.
-        "url": obs::sanitize_url(url),
-        "headers": redact_headers(headers),
-    });
-    if let Some(b) = body {
-        rec["body"] = serde_json::Value::String(b.to_string());
-    }
-    rec
-}
-
-fn dump_response_record(
-    ctx: &(String, String, String, String),
-    method: &str,
-    url: &str,
-    status: u16,
-    headers: &[(String, String)],
-    body: Option<&str>,
-    body_skipped: Option<&str>,
-) -> serde_json::Value {
-    let mut rec = serde_json::json!({
-        "ts": now_millis(),
-        "kind": "http_response",
-        "trace_id": ctx.0,
-        "run_id": ctx.1,
-        "agent_id": ctx.2,
-        "agent_name": ctx.3,
-        "method": method,
-        // Same sanitization the obs log lines use: userinfo / query / fragment
-        // are stripped, so a credential in the URL never reaches the sink.
-        "url": obs::sanitize_url(url),
-        "status": status,
-        "headers": redact_headers(headers),
-    });
-    if let Some(b) = body {
-        rec["body"] = serde_json::Value::String(b.to_string());
-    }
-    if let Some(reason) = body_skipped {
-        rec["body_skipped"] = serde_json::Value::String(reason.to_string());
-    }
-    rec
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// Collect the values recorded for `name` from the `[name, value]` array.
-    fn values_for(rendered: &serde_json::Value, name: &str) -> Vec<String> {
-        rendered
-            .as_array()
-            .expect("headers must be an array")
-            .iter()
-            .filter(|pair| pair[0] == name)
-            .map(|pair| {
-                pair[1]
-                    .as_str()
-                    .expect("value must be a string")
-                    .to_string()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn redact_headers_masks_sensitive_keys_case_insensitively() {
-        let pairs = vec![
-            ("X-Api-Key".to_string(), "secret-key".to_string()),
-            ("Authorization".to_string(), "Bearer tok".to_string()),
-            ("set-cookie".to_string(), "sid=abc".to_string()),
-            ("Cookie".to_string(), "session=xyz".to_string()),
-            ("Proxy-Authorization".to_string(), "Basic pxy".to_string()),
-            // Not in the exact list — caught by the ab.obs substring policy.
-            ("X-Session-Token".to_string(), "tok-substring".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ];
-        let got = redact_headers(&pairs);
-        assert_eq!(values_for(&got, "X-Api-Key"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "Authorization"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "set-cookie"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "Cookie"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "Proxy-Authorization"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "X-Session-Token"), [REDACTED_VALUE]);
-        assert_eq!(values_for(&got, "content-type"), ["application/json"]);
-        let rendered = got.to_string();
-        assert!(!rendered.contains("secret-key"), "leaked: {rendered}");
-        assert!(!rendered.contains("Bearer tok"), "leaked: {rendered}");
-        assert!(!rendered.contains("sid=abc"), "leaked: {rendered}");
-        assert!(!rendered.contains("session=xyz"), "leaked: {rendered}");
-        assert!(!rendered.contains("Basic pxy"), "leaked: {rendered}");
-        assert!(!rendered.contains("tok-substring"), "leaked: {rendered}");
-    }
-
-    #[test]
-    fn redact_headers_keeps_repeated_names_and_order() {
-        let pairs = vec![
-            ("set-cookie".to_string(), "a=1".to_string()),
-            ("set-cookie".to_string(), "b=2".to_string()),
-            ("x-order".to_string(), "first".to_string()),
-            ("x-order".to_string(), "second".to_string()),
-        ];
-        let got = redact_headers(&pairs);
-        assert_eq!(got.as_array().expect("array").len(), 4);
-        // Both cookies survive as separate entries (an object would collapse them).
-        assert_eq!(
-            values_for(&got, "set-cookie"),
-            [REDACTED_VALUE, REDACTED_VALUE]
-        );
-        assert_eq!(values_for(&got, "x-order"), ["first", "second"]);
-    }
-
-    #[test]
-    fn records_sanitize_the_url() {
-        let ctx = ("t".into(), "r".into(), "a".into(), "n".into());
-        let raw = "https://user:pass@api.example.com/v1/messages?token=SECRET";
-        let req = dump_request_record(&ctx, "POST", raw, &[], None);
-        let resp = dump_response_record(&ctx, "POST", raw, 200, &[], None, None);
-        for rec in [&req, &resp] {
-            assert_eq!(rec["url"], "https://api.example.com/v1/messages");
-            let rendered = rec.to_string();
-            assert!(!rendered.contains("SECRET"), "leaked: {rendered}");
-            assert!(!rendered.contains("pass"), "leaked: {rendered}");
-        }
-    }
-
-    #[test]
-    fn utc_stamp_formats_known_instants() {
-        assert_eq!(utc_stamp(0), "19700101T000000Z");
-        // 2021-01-01T00:00:00Z
-        assert_eq!(utc_stamp(1_609_459_200), "20210101T000000Z");
-        // 2024-02-29T23:59:59Z (leap day)
-        assert_eq!(utc_stamp(1_709_251_199), "20240229T235959Z");
-    }
-
-    #[test]
-    fn sanitize_id_keeps_file_name_single_component() {
-        // Separators are neutralised, so the result can never escape the dir.
-        assert_eq!(sanitize_id("run/../id"), "run_.._id");
-        assert_eq!(sanitize_id("a b:c"), "a_b_c");
-        assert_eq!(sanitize_id("run-1_a.b"), "run-1_a.b");
-    }
-
-    #[test]
-    fn request_record_omits_body_when_absent() {
-        let ctx = ("t".into(), "r".into(), "a".into(), "n".into());
-        let rec = dump_request_record(&ctx, "GET", "https://example.com", &[], None);
-        assert_eq!(rec["kind"], "http_request");
-        assert!(rec.get("body").is_none());
-    }
-
-    #[test]
-    fn response_record_carries_skip_reason_for_streams() {
-        let ctx = (String::new(), String::new(), String::new(), String::new());
-        let rec = dump_response_record(
-            &ctx,
-            "POST",
-            "https://example.com",
-            200,
-            &[],
-            None,
-            Some("sse_stream"),
-        );
-        assert_eq!(rec["body_skipped"], "sse_stream");
-        assert!(rec.get("body").is_none());
-    }
+    /// Credential-bearing header names the `ab.obs` full-mode log events must
+    /// mask. The redaction itself lives in the two Lua blocks; this list is the
+    /// reference the guard below compares them against.
+    const REDACTED_HEADERS: [&str; 5] = [
+        "x-api-key",
+        "authorization",
+        "set-cookie",
+        "cookie",
+        "proxy-authorization",
+    ];
 
     /// Sync guard for the deliberately-duplicated 写経 copies of the redaction
-    /// list. Consolidating the three sites is out of scope on purpose, so this
-    /// test — not a comment — is what fails when [`REDACTED_HEADERS`] gains or
-    /// renames an entry and the two Lua `sanitize_headers_for_dump` copies are
-    /// not updated with it.
+    /// list. Consolidating the two sites is out of scope on purpose, so this
+    /// test — not a comment — is what fails when one Lua
+    /// `sanitize_headers_for_dump` copy gains or renames an entry and the other
+    /// is not updated with it.
     #[test]
     fn redaction_list_is_mirrored_in_both_lua_blocks() {
         /// Text of the `sanitize_headers_for_dump` body, so a name that merely

@@ -1,58 +1,194 @@
-//! K4 — the budget counter.
+//! K4 — the budget: a quota an owner grants a scope.
 //!
-//! v1 is single-axis (`tokens`).  Multiple axes (turns / cost / time) fit
-//! later as a map of named counters — `spend(n)` gaining a `spend(axis,
-//! n)` form — so nothing here needs to be taken back to get there.  The
-//! axis question is deferred until usage actually flows through the
-//! kernel, rather than guessed now.
+//! The quota is what makes a run stop: termination is undecidable, so the
+//! owner injects a resource that only decreases and the run ends when it
+//! runs out (`ulimit` / cgroup semantics).  It is drawn down two ways, and
+//! they are independent: [`super::Session::reserve`] asks whether `n` may be
+//! consumed and refuses when it may not, [`super::Session::spend`] deducts
+//! `n` without asking.  Neither holds anything for the other — there is no
+//! settlement — so a caller that uses both for one call deducts twice.
+//!
+//! # The balance is the ledger, and nothing else
+//!
+//! There is no counter.  Every move of the balance is an event first — a
+//! `budget_granted` / `budget_reserved` / `budget_spent`
+//! ([`super::event`]) — and the balance *is* [`fold_balance`] over them.
+//! A reservation is a command with an invariant, so it is decided inside
+//! the store against the ledger as it stands there
+//! ([`super::EventStore::append_if`]); a *read* of the balance
+//! ([`super::Session::remaining`]) folds that same ledger.  A number kept
+//! beside the log would be a second answer to one question, and on a stream
+//! two handles write to it would be the wrong one.
+//!
+//! It is not accounting.  What a run actually consumed is the `usage`
+//! projection over the fact-log ([`super::projection`]); the two are
+//! independent, and an estimate that missed does not make either wrong.
+//!
+//! The fold knows only numbers.  It has no idea what an `llm_response` is,
+//! what a beat is, or what unit the amount is in — the unit lives in the
+//! grant's `tag` ([`BudgetGrant`]), for whoever reads the log.
+//!
+//! v1 is single-axis.  Multiple axes (turns / cost / time) fit later as a
+//! map of named balances — `reserve(n)` / `spend(n)` gaining an `(axis, n)`
+//! form — so nothing here needs to be taken back to get there.
 
+use serde_json::Value;
+
+use super::event::{
+    data_field, FIELD_AMOUNT, FIELD_DESC, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED,
+    KIND_BUDGET_SPENT,
+};
+use super::event_store::Current;
 use super::{KnlError, KnlResult};
 
-/// A monotonically decreasing balance, or no budget at all.
-#[derive(Debug, Clone, Default)]
-pub struct Budget {
-    /// Remaining balance; `None` when the session was created without one.
-    remaining: Option<i64>,
+/// A stored number as a whole one (`0` when absent or not numeric).
+///
+/// The reading the ledger fold takes its amounts through: a `data` field is
+/// whatever was written, and a fold over the log must total what is there
+/// rather than stop at what is not.
+fn whole(value: &Value) -> i64 {
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|f| f.trunc() as i64))
+        .unwrap_or(0)
 }
 
-impl Budget {
-    /// A budget with `tokens` remaining, or an unlimited one for `None`.
-    ///
-    /// A negative starting balance is floored at `0`: the balance is
-    /// defined to be non-negative, and callers validate their own input
-    /// before it reaches here.
-    pub fn new(tokens: Option<i64>) -> Self {
+/// Reject an amount the counter cannot take.
+///
+/// One rule for `reserve`, `spend` and a grant: the balance moves by whole
+/// non-negative steps, so a negative amount is a refund by another name and
+/// is refused before anything — the balance or the log — is touched.
+pub(super) fn check_amount(amount: i64) -> KnlResult<()> {
+    if amount < 0 {
+        return Err(KnlError::Validation(format!(
+            "amount must be a non-negative whole number, got {amount}"
+        )));
+    }
+    Ok(())
+}
+
+/// The balance a log implies: `granted − reserved − spent`, in seq order.
+///
+/// The balance itself, and the only definition of one.  `None` means no
+/// grant was ever recorded, which is not the same as a balance of zero: a
+/// run with no budget refuses nothing, a run whose balance reached zero
+/// refuses everything.
+///
+/// Applied in order, floored at zero at each step: a run that overspent past
+/// zero and was granted again starts from zero, not from a debt the floor
+/// had already forgiven.  `budget_refused` moves nothing, which is the point
+/// of recording it — the fact that a stop happened, with no effect on the
+/// balance.
+///
+/// It folds [`Current`] events — ones that came through the upcaster seam —
+/// so a balance can only be taken over the shape the fold was written for.
+/// A caller may hand it the whole stream or only the `budget_*` kinds
+/// ([`super::EventStore::read_kinds`]); the arithmetic is the same, because
+/// every other kind moves nothing.
+///
+/// The amounts are read from the event's `data`, where a kind's own fields
+/// live ([`super::event`]) — the envelope carries the log's vocabulary, not
+/// the ledger's.
+pub fn fold_balance(events: &[Current]) -> Option<i64> {
+    let mut balance: Option<i64> = None;
+    for event in events {
+        let amount = data_field(event, FIELD_AMOUNT).map_or(0, whole).max(0);
+        match event.kind() {
+            KIND_BUDGET_GRANTED => {
+                balance = Some(balance.unwrap_or(0).saturating_add(amount));
+            }
+            KIND_BUDGET_RESERVED | KIND_BUDGET_SPENT => {
+                balance = balance.map(|b| b.saturating_sub(amount).max(0));
+            }
+            _ => {}
+        }
+    }
+    balance
+}
+
+/// Recover the grant a log records, from its last `budget_granted`.
+///
+/// A resumed run keeps the words of the grant it is continuing (the `tag`
+/// a refusal reports), and — more than cosmetically — keeps *having* a
+/// budget: a session whose log says a quota was granted must go on
+/// recording its moves, whether or not the resuming caller granted again.
+pub fn last_grant(events: &[Current]) -> Option<BudgetGrant> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind() == KIND_BUDGET_GRANTED)
+        .map(|event| BudgetGrant {
+            amount: data_field(event, FIELD_AMOUNT).map_or(0, whole).max(0),
+            tag: string_field(event, FIELD_TAG),
+            desc: string_field(event, FIELD_DESC),
+        })
+}
+
+/// An optional string `data` field of a stored event.
+fn string_field(event: &Current, field: &str) -> Option<String> {
+    data_field(event, field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// What an owner grants a scope: an amount, and the words for what it is.
+///
+/// The kernel reads `amount` and nothing else.  `tag` names the unit (the
+/// shell writes `"tokens"`), and `desc` says who allowed what and why;
+/// both ride onto the `budget_granted` event verbatim, so a log can be
+/// audited without asking the shell what it meant.  `tag` comes back with
+/// a refused [`super::Session::reserve`] at the call site, so a caller can
+/// say which allowance stopped it without reading the log at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetGrant {
+    /// The quota, in whatever unit `tag` names.  Non-negative.
+    pub amount: i64,
+    /// The unit / identity of the grant, kernel-uninterpreted.
+    pub tag: Option<String>,
+    /// Free-text audit note, kernel-uninterpreted.
+    pub desc: Option<String>,
+}
+
+impl BudgetGrant {
+    /// A grant of `amount` with no tag or description.
+    pub fn new(amount: i64) -> Self {
         Self {
-            remaining: tokens.map(|t| t.max(0)),
+            amount,
+            tag: None,
+            desc: None,
         }
     }
+}
 
-    /// Deduct `amount`, returning the new balance (`None` without a
-    /// budget).
-    ///
-    /// The balance never rises and is floored at `0`; a negative amount
-    /// is an error and leaves the balance untouched.
-    pub fn spend(&mut self, amount: i64) -> KnlResult<Option<i64>> {
-        if amount < 0 {
-            return Err(KnlError::new(format!(
-                "amount must be a non-negative whole number, got {amount}"
-            )));
-        }
-        let Some(remaining) = self.remaining.as_mut() else {
-            return Ok(None);
-        };
-        *remaining = remaining.saturating_sub(amount).max(0);
-        Ok(Some(*remaining))
-    }
+/// What a parent hands to a child: an amount out of its own balance, and
+/// optionally the unit the child's ledger names it by.
+///
+/// Not a [`BudgetGrant`], and the difference is where the units come from.  A
+/// grant is an owner *allowing* — it raises a balance out of nothing the
+/// kernel can see, and only an owner may write one.  An allocation moves
+/// units that already exist: the parent's balance falls by exactly what the
+/// child's rises by, in one transaction ([`super::Session::open_child`]), so
+/// no total is created and none is lost.
+///
+/// There is no `desc`.  What an allocation is *for* is a supervisor's
+/// vocabulary, and the two events it writes already say the whole of what the
+/// kernel knows: which parent, which child, how much.
+///
+/// `tag` defaults to the parent's — the units come out of that ledger, so
+/// they are counted in that unit unless the caller renames them for the
+/// child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allocation {
+    /// How much of the parent's balance to move.  Non-negative.
+    pub amount: i64,
+    /// The unit the child's ledger names, or the parent's when absent.
+    pub tag: Option<String>,
+}
 
-    /// The remaining balance (`None` without a budget).
-    pub fn remaining(&self) -> Option<i64> {
-        self.remaining
-    }
-
-    /// Whether the budget is used up (never true without a budget).
-    pub fn exhausted(&self) -> bool {
-        matches!(self.remaining, Some(r) if r <= 0)
+impl Allocation {
+    /// An allocation of `amount`, counted in the parent's own unit.
+    pub fn new(amount: i64) -> Self {
+        Self { amount, tag: None }
     }
 }
 
@@ -60,56 +196,156 @@ impl Budget {
 mod tests {
     use super::*;
 
-    #[test]
-    fn spend_is_monotonic_and_floors_at_zero() {
-        let mut b = Budget::new(Some(1000));
-        assert_eq!(b.remaining(), Some(1000));
-        assert!(!b.exhausted());
-
-        let mut prev = 1000;
-        for amount in [120, 0, 300, 80] {
-            let now = b.spend(amount).expect("spend").expect("has a budget");
-            assert!(now <= prev, "balance rose: {prev} -> {now}");
-            prev = now;
-        }
-        assert_eq!(b.remaining(), Some(500));
-
-        assert_eq!(b.spend(9999), Ok(Some(0)), "overspending floors at zero");
-        assert!(b.exhausted());
-        assert_eq!(b.spend(1), Ok(Some(0)), "spending past zero stays at zero");
+    /// A fixture log, as events that have been through the seam.
+    ///
+    /// The fold only takes [`Current`]s, and a literal written here is in
+    /// today's shape by construction, so the tests say so rather than
+    /// building a store to read one back through.
+    fn log(events: Vec<Value>) -> Vec<Current> {
+        events.into_iter().map(Current::assume_current).collect()
     }
 
+    /// A negative amount is a refund by another name, and is refused before
+    /// anything is touched — whether or not there is a budget, because the
+    /// rule is about the amount.
     #[test]
-    fn a_negative_amount_is_rejected_and_changes_nothing() {
-        let mut b = Budget::new(Some(100));
-        let err = b.spend(-1).expect_err("negative spend");
+    fn a_negative_amount_is_refused() {
+        let err = check_amount(-1).expect_err("a negative amount");
         assert!(err.reason().contains("non-negative"), "{err}");
-        assert_eq!(b.remaining(), Some(100));
-
-        // Rejected without a budget too — the rule is about the amount.
-        let mut none = Budget::new(None);
-        none.spend(-1).expect_err("negative spend without a budget");
+        assert_eq!(check_amount(0), Ok(()));
+        assert_eq!(check_amount(i64::MAX), Ok(()));
     }
 
+    /// The fold is the balance, and the only definition of one: every kind
+    /// of move applied in order, floored at zero, with a refusal moving
+    /// nothing.
     #[test]
-    fn without_a_budget_everything_is_nil_and_never_exhausted() {
-        let mut b = Budget::new(None);
-        assert_eq!(b.remaining(), None);
-        assert_eq!(b.spend(50), Ok(None));
-        assert!(!b.exhausted());
+    fn the_fold_of_the_ledger_is_the_balance() {
+        use serde_json::json;
+
+        let mut ledger = log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 100 } }),
+        ]);
+        assert_eq!(fold_balance(&ledger), Some(100));
+
+        // A reservation of 30 was decided in the store and recorded there.
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_reserved", "data": { "amount": 30 } }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(70), "after a reservation");
+
+        // A refusal is recorded and moves nothing.
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_refused", "data": { "amount": 1000, "remaining": 70 } }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(70), "after a refusal");
+
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_spent", "data": { "amount": 20 } }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(50), "after a spend");
+
+        // Overspending floors at zero rather than going into debt, and a
+        // huge amount cannot wrap it…
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_spent", "data": { "amount": i64::MAX } }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(0), "at the floor");
+
+        // …so a later grant starts from zero, not from a forgiven debt.
+        ledger.extend(log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 10 } }),
+        ]));
+        assert_eq!(fold_balance(&ledger), Some(10), "after a re-grant");
     }
 
+    /// The amounts are read from `data` and nowhere else: a number left at
+    /// the top level is not a ledger entry, which is what stops the envelope
+    /// and a kind's own fields from being read as one namespace.
     #[test]
-    fn a_negative_starting_balance_is_floored() {
-        let b = Budget::new(Some(-5));
-        assert_eq!(b.remaining(), Some(0));
-        assert!(b.exhausted());
+    fn an_amount_outside_data_is_not_folded() {
+        use serde_json::json;
+
+        assert_eq!(
+            fold_balance(&log(vec![
+                json!({ "kind": "budget_granted", "amount": 100 })
+            ])),
+            Some(0),
+            "a grant whose amount is not under data grants nothing"
+        );
     }
 
+    /// No grant in the log is no budget — which is not a balance of zero:
+    /// one refuses nothing, the other refuses everything.
     #[test]
-    fn a_huge_amount_cannot_wrap_the_balance() {
-        let mut b = Budget::new(Some(10));
-        assert_eq!(b.spend(i64::MAX), Ok(Some(0)));
-        assert_eq!(b.remaining(), Some(0));
+    fn a_log_without_a_grant_folds_to_no_budget() {
+        use serde_json::json;
+
+        assert_eq!(fold_balance(&[]), None);
+        assert_eq!(
+            fold_balance(&log(vec![
+                json!({ "kind": "session_opened", "data": { "scope_id": "s", "owner": "anon" } }),
+                json!({ "kind": "llm_response", "data": { "usage": { "input_tokens": 500 } } }),
+            ])),
+            None,
+            "a provider response is not a budget move"
+        );
+        assert_eq!(
+            fold_balance(&log(vec![
+                json!({ "kind": "budget_granted", "data": { "amount": 0 } }),
+            ])),
+            Some(0),
+            "a grant of zero is a budget, and an empty one"
+        );
+    }
+
+    /// The tag a refusal reports survives a resume: it is read back off the
+    /// last grant the log recorded.
+    #[test]
+    fn the_last_grant_is_recovered_from_the_log() {
+        use serde_json::json;
+
+        assert_eq!(last_grant(&[]), None);
+
+        let ledger = log(vec![
+            json!({
+                "kind": "budget_granted",
+                "data": { "amount": 100, "tag": "tokens", "desc": "first" }
+            }),
+            json!({ "kind": "budget_reserved", "data": { "amount": 10 } }),
+            json!({
+                "kind": "budget_granted",
+                "data": { "amount": 50, "tag": "tokens", "desc": "second" }
+            }),
+        ]);
+        let grant = last_grant(&ledger).expect("a grant was recorded");
+        assert_eq!(grant.amount, 50, "the latest grant, not the first");
+        assert_eq!(grant.tag.as_deref(), Some("tokens"));
+        assert_eq!(grant.desc.as_deref(), Some("second"));
+
+        // A grant with no words comes back with none invented.
+        let bare = last_grant(&log(vec![
+            json!({ "kind": "budget_granted", "data": { "amount": 7 } }),
+        ]))
+        .expect("a grant was recorded");
+        assert_eq!(bare, BudgetGrant::new(7));
+    }
+
+    /// A grant is an amount plus words the kernel does not read.
+    #[test]
+    fn a_grant_carries_the_amount_and_its_words() {
+        let plain = BudgetGrant::new(100);
+        assert_eq!(plain.amount, 100);
+        assert_eq!(plain.tag, None);
+        assert_eq!(plain.desc, None);
+
+        let tagged = BudgetGrant {
+            amount: 10,
+            tag: Some("tokens".to_string()),
+            desc: Some("one turn's worth".to_string()),
+        };
+        assert_eq!(tagged.amount, 10);
+        assert_eq!(tagged.tag.as_deref(), Some("tokens"));
+        assert_eq!(tagged.desc.as_deref(), Some("one turn's worth"));
     }
 }

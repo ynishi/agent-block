@@ -82,6 +82,20 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "lshape.luacats",
         include_str!("../blocks/lib/lshape/luacats.lua"),
     ),
+    (
+        "mcp_tools",
+        include_str!("../blocks/lib/mcp_tools/init.lua"),
+    ),
+    ("knl", include_str!("../blocks/lib/knl/init.lua")),
+    (
+        "knl_adapter",
+        include_str!("../blocks/lib/knl_adapter/init.lua"),
+    ),
+    ("policy", include_str!("../blocks/lib/policy/init.lua")),
+    (
+        "supervisor",
+        include_str!("../blocks/lib/supervisor/init.lua"),
+    ),
 ];
 
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
@@ -724,6 +738,23 @@ impl BlockConfigBuilder {
     }
 }
 
+/// A host-owned SQLite connection, in the shape `mlua-batteries-sqlite` takes.
+///
+/// The pair travels together everywhere: the mutex is what a statement locks
+/// (inside the blocking closure, never across an `.await`), and the interrupt
+/// handle is how a cancelled task or an expired query timeout gets the
+/// blocking thread to return and release it. Cloning shares one connection —
+/// there is exactly one per database.
+#[cfg(feature = "sqlite")]
+#[derive(Clone)]
+pub struct SqliteConn {
+    /// The connection itself. Locked inside `spawn_blocking`, so the VM
+    /// thread never holds the guard.
+    pub conn: Arc<Mutex<rusqlite::Connection>>,
+    /// `sqlite3_interrupt` for the statement currently running on `conn`.
+    pub interrupt: Arc<rusqlite::InterruptHandle>,
+}
+
 /// Shared context passed into Lua bridge functions.
 #[derive(Clone)]
 pub struct HostContext {
@@ -735,30 +766,30 @@ pub struct HostContext {
     pub mcp_manager: Arc<RwLock<McpManager>>,
     /// Shared async HTTP client for `http.*` bridge.
     pub http_client: reqwest::Client,
-    /// Shared SQLite connection for `sql.*` bridge (user tables).
+    /// The connection behind the `sql.*` bridge (user tables).
+    ///
+    /// Opened by the host and handed to `mlua-batteries-sqlite`, which runs
+    /// every statement inside `tokio::task::spawn_blocking` and takes the
+    /// mutex *there*, not on the VM thread — so no lock guard and no blocking
+    /// call crosses an `.await`, and the Lua VM yields while SQLite works.
     #[cfg(feature = "sqlite")]
-    pub sql_conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Interrupt handle for the sql connection.
-    /// Used to cancel in-flight queries on timeout (see `bridge/sql.rs`).
+    pub sql_conn: SqliteConn,
+    /// The connection behind the `kv.*` bridge (`__kv` table only).
+    ///
+    /// A separate database from `sql_conn`, so KV scratch state and user SQL
+    /// data do not share WAL, page cache, or backup lifecycle.
     #[cfg(feature = "sqlite")]
-    pub sql_interrupt: Arc<rusqlite::InterruptHandle>,
-    /// Shared SQLite connection for `kv.*` bridge (`__kv` table only).
-    /// Separate from sql_conn so KV scratch state and user SQL data don't
-    /// share WAL, page cache, or backup lifecycle.
+    pub kv_conn: SqliteConn,
+    /// Handle to the SQLite connection thread behind the `ts.*` bridge (TSDB —
+    /// time-series table).
+    ///
+    /// A third database, on a file of its own, so the TSDB's WAL shares
+    /// neither page cache nor backup lifecycle with kv/sql. Unlike the two
+    /// beside it, this connection is not shared but confined: it lives on that
+    /// thread, and `std.ts` sends statements to it and awaits them. Different
+    /// route, same rule — the Lua VM never waits on SQLite.
     #[cfg(feature = "sqlite")]
-    pub kv_conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Interrupt handle for the kv connection.
-    #[cfg(feature = "sqlite")]
-    pub kv_interrupt: Arc<rusqlite::InterruptHandle>,
-    /// Shared SQLite connection for `ts.*` bridge (TSDB — time-series table).
-    /// Separate DB file so TSDB WAL does not share page cache with kv/sql.
-    #[cfg(feature = "sqlite")]
-    pub ts_conn: Arc<Mutex<rusqlite::Connection>>,
-    /// Interrupt handle for the ts connection.
-    /// Used by `bridge::ts` to cancel in-flight queries on timeout (Subtask 2).
-    #[allow(dead_code)]
-    #[cfg(feature = "sqlite")]
-    pub ts_interrupt: Arc<rusqlite::InterruptHandle>,
+    pub ts_isle: rusqlite_isle::AsyncIsle,
     /// Async handle to the main Isle Lua VM that runs the user script via
     /// `coroutine_eval`. After Subtask 2, `bridge::bus` no longer dispatches
     /// handlers against this Isle; handlers live on `handler_isle` instead.
@@ -793,6 +824,36 @@ pub struct HostContext {
     /// edit, which is what a build-and-fix loop needs when it decides an
     /// iteration made things worse.
     pub fs_snapshots: crate::bridge::fs::SnapshotStore,
+    /// The connection threads every `knl` session's event log lives on.
+    ///
+    /// A kernel session opens its own SQLite thread (and a second, read-only
+    /// one the first time it is queried), and hands the *driver* — the only
+    /// thing that can drain and join that thread — here rather than keeping
+    /// it. That is what lets the drop backstop work: a handle nobody closed
+    /// submits its `session_closed` from `Drop`, without waiting, and the
+    /// thread is still there to run it because its lifetime is the host's
+    /// rather than the session's.
+    ///
+    /// Cloneable and shared, like the isle handles beside it; the run loop
+    /// drains it once, in [`shutdown`], after the Lua VM is gone.
+    pub knl_drivers: crate::knl::IsleDrivers,
+    /// The database a `knl` session opened without a `store` lands in.
+    ///
+    /// `{base_dir}/projects/<slug>/knl.sqlite`, resolved by
+    /// [`crate::bridge::config::knl_path`] from the project root above, or
+    /// whatever `AGENT_BLOCK_KNL_PATH` names. The host owns it for the same
+    /// reason it owns the `sql` / `kv` / `ts` files: where a script's state
+    /// goes is the host's answer, not the script's.
+    ///
+    /// One file per project, so every default session is a stream in it —
+    /// which is what lets a tree opened from a default parent exist at all
+    /// (a child is opened on its parent's database, and the in-memory one
+    /// locks per table under its shared cache). `store = "mem"` remains the
+    /// explicit way to ask for the process-local database instead.
+    ///
+    /// The directory is created at start, beside the other three; the file
+    /// itself is SQLite's to create, on the first session that needs it.
+    pub knl_store: PathBuf,
 }
 
 impl HostContext {
@@ -814,20 +875,12 @@ impl HostContext {
     }
 }
 
-/// Open a SQLite connection at `path` (or `:memory:`) and apply the shared
-/// pragmas driven by ENV (`journal_mode`, `busy_timeout`). Returns the
-/// connection wrapped in Arc<Mutex<_>> together with its interrupt handle.
+/// Create the parent directory of a database file, unless the path names an
+/// in-memory database (which has no parent to create).
 ///
-/// `label` is used only for the init log line (`sql` / `kv`) so that the two
-/// databases are distinguishable in tracing output.
+/// `label` names the database in the error (`sql` / `kv` / `ts`).
 #[cfg(feature = "sqlite")]
-fn open_sqlite(
-    path: &Path,
-    label: &'static str,
-) -> BlockResult<(
-    Arc<Mutex<rusqlite::Connection>>,
-    Arc<rusqlite::InterruptHandle>,
-)> {
+fn prepare_sqlite_dir(path: &Path, label: &'static str) -> BlockResult<bool> {
     let is_memory = crate::bridge::config::is_memory_sql(path);
     if !is_memory {
         if let Some(parent) = path.parent() {
@@ -835,20 +888,114 @@ fn open_sqlite(
                 .map_err(|e| BlockError::Runtime(format!("{label} dir create: {e}")))?;
         }
     }
-    let conn = rusqlite::Connection::open(path)
+    Ok(is_memory)
+}
+
+/// Create the directory the kernel's database goes in.
+///
+/// The same step [`prepare_sqlite_dir`] does for `sql` / `kv` / `ts`, and a
+/// function of its own for two reasons: it is not gated behind the `sqlite`
+/// feature (the kernel is in every build), and the kernel's default path has a
+/// directory *per project* under the base dir, so there is a level to create
+/// that the other three never needed.
+///
+/// A path with no parent — `AGENT_BLOCK_KNL_PATH=":memory:"`, or a bare file
+/// name — has no directory to make, and asking for one would be a create of
+/// the empty path.
+fn prepare_knl_dir(path: &Path) -> BlockResult<()> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|e| BlockError::Runtime(format!("knl dir create {}: {e}", parent.display())))
+}
+
+/// Open the SQLite database at `path` (or `:memory:`) on a connection thread
+/// of its own, and return the handle plus the driver that shuts it down.
+///
+/// The ENV-driven pragmas are applied where they cost the caller nothing — the
+/// busy timeout through the builder (which sets it before anything else runs)
+/// and `journal_mode` in the init closure, which runs on the connection thread
+/// before any job does. `init` runs there too, immediately after, which is
+/// where a bridge's own schema DDL belongs: it waits on SQLite, and waiting is
+/// the connection thread's business rather than the Lua VM's. The isle owns
+/// the connection, so `std.ts` — its only caller now that `std.sql` /
+/// `std.kv` are on [`open_sqlite_conn`] — never takes a lock and never blocks
+/// the Lua runtime waiting for SQLite.
+///
+/// The caller must keep the returned [`rusqlite_isle::AsyncIsleDriver`] and
+/// shut it down; dropping it alone does not stop the thread.
+#[cfg(feature = "sqlite")]
+async fn open_sqlite_isle<F>(
+    path: &Path,
+    label: &'static str,
+    init: F,
+) -> BlockResult<(rusqlite_isle::AsyncIsle, rusqlite_isle::AsyncIsleDriver)>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> Result<(), rusqlite::Error> + Send + 'static,
+{
+    let is_memory = prepare_sqlite_dir(path, label)?;
+    let busy = crate::bridge::config::sql_busy_timeout();
+    let journal = crate::bridge::config::sql_journal_mode();
+    let (isle, driver) = rusqlite_isle::AsyncIsle::builder()
+        .thread_name(label)
+        .busy_timeout(busy)
+        .spawn(path, move |conn| {
+            if !is_memory {
+                conn.pragma_update(None, "journal_mode", &journal)?;
+            }
+            init(conn)
+        })
+        .await
         .map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", path.display())))?;
-    if !is_memory {
-        let journal = crate::bridge::config::sql_journal_mode();
-        conn.pragma_update(None, "journal_mode", &journal)
-            .map_err(|e| BlockError::Runtime(format!("journal_mode={journal}: {e}")))?;
-    }
-    let busy_ms = crate::bridge::config::sql_busy_timeout().as_millis() as i64;
-    conn.pragma_update(None, "busy_timeout", busy_ms)
-        .map_err(|e| BlockError::Runtime(format!("busy_timeout pragma: {e}")))?;
-    info!(label, path = %path.display(), busy_ms, "sqlite initialized");
+    info!(label, path = %path.display(), busy_ms = busy.as_millis() as i64, "sqlite initialized");
+    Ok((isle, driver))
+}
+
+/// Open the SQLite database at `path` (or `:memory:`) as a connection the host
+/// owns and shares, for the bridges that take one that way.
+///
+/// This is the other half of the same rule the isle keeps: `std.sql` /
+/// `std.kv` run their statements inside `tokio::task::spawn_blocking` and lock
+/// the mutex there, so the VM thread hands the work off and yields instead of
+/// waiting on SQLite. What it does *not* have is a thread of its own, which is
+/// why there is no driver to shut down — the connection closes when the last
+/// clone of the [`SqliteConn`] goes.
+///
+/// The setup mirrors [`open_sqlite_isle`] step for step, because these two
+/// databases used to be opened by it: the parent directory is created,
+/// `busy_timeout` is applied first, `synchronous` is set to the isle's `NORMAL`
+/// preset, and the configured `journal_mode` (`WAL` unless overridden) is
+/// applied to file-backed databases — an in-memory one has no journal to set.
+/// `init` runs last, on this thread, before the VM exists.
+#[cfg(feature = "sqlite")]
+fn open_sqlite_conn<F>(path: &Path, label: &'static str, init: F) -> BlockResult<SqliteConn>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
+{
+    let is_memory = prepare_sqlite_dir(path, label)?;
+    let busy = crate::bridge::config::sql_busy_timeout();
+    let journal = crate::bridge::config::sql_journal_mode();
+
+    let open = || -> Result<rusqlite::Connection, rusqlite::Error> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.busy_timeout(busy)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if !is_memory {
+            conn.pragma_update(None, "journal_mode", &journal)?;
+        }
+        init(&conn)?;
+        Ok(conn)
+    };
+    let conn =
+        open().map_err(|e| BlockError::Runtime(format!("sqlite open {}: {e}", path.display())))?;
+
     let interrupt = Arc::new(conn.get_interrupt_handle());
-    let conn = Arc::new(Mutex::new(conn));
-    Ok((conn, interrupt))
+    info!(label, path = %path.display(), busy_ms = busy.as_millis() as i64, "sqlite initialized");
+    Ok(SqliteConn {
+        conn: Arc::new(Mutex::new(conn)),
+        interrupt,
+    })
 }
 
 /// Build the init closure shared between the main Isle and the handler
@@ -879,6 +1026,29 @@ fn build_isle_init(
         }
 
         mlua_batteries::register_all(lua, "std")?;
+
+        // ── async overrides ───────────────────────────────────────────
+        // `register_all` gives a `std` that needs no runtime, which means
+        // its `time.sleep`, `proc.pipeline`, `http.*` and `fs.*` entries
+        // park the VM thread — and with it every sibling coroutine — for as
+        // long as the OS takes. This replaces them in place with async ones:
+        // `tokio::time::sleep` for the sleep, the blocking pool for the
+        // rest. Lua-side names, arguments, returns and error messages are
+        // unchanged; what changes is that the VM goes on running.
+        //
+        // Both Isles are built from this closure, so one call covers the
+        // main VM and the handler VM. It has to come after `register_all`
+        // (there is nothing to override before it); `std.task`, whose
+        // cancel token `time.sleep` now races, is registered later with the
+        // other bridges — the overrides read the token from a thread-local
+        // at call time, not at registration, so the order between them does
+        // not matter.
+        //
+        // The one thing a script must not do is pass a function that calls
+        // an overridden entry to `std.time.measure`, which calls its
+        // argument synchronously: the yield would cross a Rust call
+        // boundary. No block or fixture in this repo does.
+        mlua_batteries::async_overrides::register_by_name(lua, "std")?;
 
         // ── extra_globals from BlockConfig ──────────────────────────
         // Inject SDK-supplied parameterisation values into the Lua
@@ -943,6 +1113,16 @@ fn build_isle_init(
         for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
             memory = memory.add(*name, *source);
         }
+        // `knl_types` is the one embedded module with no file behind it: the
+        // lshape declaration of the kernel's syscall surface, generated here
+        // from the Rust argument and return types in `bridge/knl.rs`. It is
+        // built at start rather than checked in because a generated file in
+        // the tree is a file that can be edited, and one that has been edited
+        // is a second declaration wearing the first one's name — which is
+        // exactly the drift the Lua kernel's registry stopped having when it
+        // started pointing at this. Same lowest priority as the rest: a
+        // filesystem `knl_types` would win, and would be the caller's own.
+        memory = memory.add("knl_types", crate::bridge::knl::lshape_module_source());
         registry.add(memory);
 
         registry
@@ -1214,47 +1394,68 @@ async fn connect_mesh(
     Ok(Some(Arc::new(agent)))
 }
 
-/// The three SQLite connections (with interrupt handles) backing the
-/// `sql.*`, `kv.*`, and `ts.*` Lua bridges.
+/// The three SQLite databases backing the `sql.*`, `kv.*`, and `ts.*` Lua
+/// bridges.
+///
+/// Two shapes, one rule. `sql` and `kv` are connections the host owns and
+/// shares, whose statements go to the blocking pool; `ts` is a connection
+/// thread the statements are sent to. Either way the VM thread hands the work
+/// off and yields — it never waits on SQLite itself.
 #[cfg(feature = "sqlite")]
 struct SqliteConns {
-    sql_conn: Arc<Mutex<rusqlite::Connection>>,
-    sql_interrupt: Arc<rusqlite::InterruptHandle>,
-    kv_conn: Arc<Mutex<rusqlite::Connection>>,
-    kv_interrupt: Arc<rusqlite::InterruptHandle>,
-    ts_conn: Arc<Mutex<rusqlite::Connection>>,
-    ts_interrupt: Arc<rusqlite::InterruptHandle>,
+    sql: SqliteConn,
+    kv: SqliteConn,
+    ts_isle: rusqlite_isle::AsyncIsle,
+    drivers: SqliteDrivers,
+}
+
+/// The lifecycle owner of the `ts` connection thread.
+///
+/// Kept out of [`HostContext`] (which is cloned into every bridge) because a
+/// driver is not clonable by design: there is exactly one, held by the run
+/// loop until [`shutdown`] joins the thread. `sql` and `kv` have no entry
+/// here — a shared connection closes with its last [`SqliteConn`] clone,
+/// which is when the Lua VMs holding them are gone.
+#[cfg(feature = "sqlite")]
+struct SqliteDrivers {
+    ts: rusqlite_isle::AsyncIsleDriver,
 }
 
 /// Open the sql / kv / ts SQLite databases, honoring the [`BlockConfig`]
 /// path overrides and otherwise falling back to the env-driven resolution.
 #[cfg(feature = "sqlite")]
-fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
+async fn init_sqlite(config: &BlockConfig) -> BlockResult<SqliteConns> {
     let sql_path = match &config.sql_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::sql_path().map_err(BlockError::Runtime)?,
     };
-    let (sql_conn, sql_interrupt) = open_sqlite(&sql_path, "sql")?;
+    let sql = open_sqlite_conn(&sql_path, "sql", |_| Ok(()))?;
 
     let kv_path = match &config.kv_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::kv_path().map_err(BlockError::Runtime)?,
     };
-    let (kv_conn, kv_interrupt) = open_sqlite(&kv_path, "kv")?;
+    // The `__kv` table is ensured here, while the connection is still the
+    // host's alone — so `bridge::kv::register` has nothing left to do but
+    // hand the connection over, and the Lua VM never runs DDL.
+    let kv = open_sqlite_conn(&kv_path, "kv", mlua_batteries_sqlite::kv::init_schema)?;
 
     let ts_path = match &config.ts_path {
         Some(p) => p.clone(),
         None => crate::bridge::config::ts_path().map_err(BlockError::Runtime)?,
     };
-    let (ts_conn, ts_interrupt) = open_sqlite(&ts_path, "ts")?;
+    // Same for `ts`, on the connection thread, before the isle takes its
+    // first job.
+    let (ts_isle, ts_driver) = open_sqlite_isle(&ts_path, "ts", |conn| {
+        conn.execute_batch(crate::bridge::ts::SCHEMA_DDL)
+    })
+    .await?;
 
     Ok(SqliteConns {
-        sql_conn,
-        sql_interrupt,
-        kv_conn,
-        kv_interrupt,
-        ts_conn,
-        ts_interrupt,
+        sql,
+        kv,
+        ts_isle,
+        drivers: SqliteDrivers { ts: ts_driver },
     })
 }
 
@@ -1483,26 +1684,60 @@ async fn drain_auto_serve(auto_serve_state: AutoServeState) {
 }
 
 /// Tear down host resources in order: disconnect MCP servers, shut down the
-/// main Isle driver (fatal on error), then the handler Isle driver (logged,
-/// non-fatal so a handler-thread panic does not poison the process exit).
+/// main Isle driver, then the handler Isle driver, the kernel's per-session
+/// connection threads and the `ts` one.
+///
+/// **Every step runs, whatever the step before it did.** A teardown is not a
+/// pipeline: each of these owns something that has to be let go of, and the
+/// drains at the end are where queued writes actually land — the kernel's
+/// connection threads hold the `session_closed` a dropped handle submitted
+/// without waiting for it ([`crate::knl::Session::close_detached`]), and a
+/// `?` on an earlier step used to skip them, so a failing MCP disconnect or a
+/// panicking main Isle silently cost the log its closing boundaries. So the
+/// failures are collected and the first one is returned once everything has
+/// been drained; the ones that are logged rather than returned stay logged,
+/// for the same reason as before — a worker-thread panic must not poison the
+/// process exit when the script's own result is what the caller asked for.
+///
+/// The kernel's threads go *after* the Isles on purpose. Dropping a VM runs
+/// its collector, which is where a session nobody closed submits its
+/// `session_closed` without waiting for it — so those threads have to be
+/// alive to take that write, and drained only once nothing can still be
+/// handed to them.
 async fn shutdown(
     mcp_manager: &Arc<RwLock<McpManager>>,
     driver: AsyncIsleDriver,
     handler_driver: AsyncIsleDriver,
+    knl_drivers: crate::knl::IsleDrivers,
+    #[cfg(feature = "sqlite")] sqlite_drivers: SqliteDrivers,
 ) -> BlockResult<()> {
     let _shutdown_span = info_span!("shutdown");
 
-    mcp_manager.write().await.disconnect_all().await?;
+    // What the caller is told about, once the rest of the teardown has run.
+    // The first failure wins: it is the one nearest the cause, and the others
+    // are in the log with their own context.
+    let mut failure: Option<BlockError> = None;
+    let mut record = |e: BlockError| {
+        tracing::error!(error = %e, "shutdown step failed; the teardown continues");
+        if failure.is_none() {
+            failure = Some(e);
+        }
+    };
 
-    driver
-        .shutdown()
-        .await
-        .map_err(|e| BlockError::Runtime(format!("AsyncIsle shutdown failed: {e}")))?;
+    if let Err(e) = mcp_manager.write().await.disconnect_all().await {
+        record(e);
+    }
+
+    if let Err(e) = driver.shutdown().await {
+        record(BlockError::Runtime(format!(
+            "AsyncIsle shutdown failed: {e}"
+        )));
+    }
 
     // Handler Isle shutdown is independent of main shutdown: a failure
     // here (e.g. ThreadPanic on the handler thread) is logged but does
     // not poison the main process exit. The main Isle has already
-    // been stopped cleanly above.
+    // been stopped above.
     match handler_driver.shutdown().await {
         Ok(()) => info!(
             thread_name = "agent-block-handler-isle",
@@ -1515,7 +1750,45 @@ async fn shutdown(
         ),
     }
 
-    Ok(())
+    // The kernel's session threads. Both Isles are gone by now, so every Lua
+    // session userdata has been collected and every drop backstop has
+    // submitted its boundary; a graceful shutdown is what runs those queued
+    // writes before the threads exit.
+    {
+        let count = knl_drivers.len();
+        let failures = knl_drivers.shutdown().await;
+        if failures.is_empty() {
+            if count > 0 {
+                info!(count, "knl session connection threads shut down");
+            }
+        } else {
+            for e in &failures {
+                tracing::error!(error = %e, "knl session connection thread shutdown failed");
+            }
+        }
+    }
+
+    // The `ts` connection thread: a graceful shutdown drains whatever the
+    // script left queued before the thread exits. Logged rather than fatal,
+    // for the same reason as the handler Isle above — the script has already
+    // run, and its result is what the caller asked for. The `sql` / `kv`
+    // connections need nothing here: they have no thread, and the last
+    // reference to each went with the VMs shut down above.
+    #[cfg(feature = "sqlite")]
+    {
+        let SqliteDrivers { ts } = sqlite_drivers;
+        match ts.shutdown().await {
+            Ok(()) => info!(label = "ts", "sqlite connection thread shut down"),
+            Err(e) => {
+                tracing::error!(error = %e, label = "ts", "sqlite shutdown failed")
+            }
+        }
+    }
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Primary SDK entry point: run one agent-block execution to completion.
@@ -1635,13 +1908,18 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // (which remain present for API stability) are ignored.
     #[cfg(feature = "sqlite")]
     let SqliteConns {
-        sql_conn,
-        sql_interrupt,
-        kv_conn,
-        kv_interrupt,
-        ts_conn,
-        ts_interrupt,
-    } = init_sqlite(&config)?;
+        sql: sql_conn,
+        kv: kv_conn,
+        ts_isle,
+        drivers: sqlite_drivers,
+    } = init_sqlite(&config).await?;
+
+    // ── the kernel's database ─────────────────────────────────────────
+    // Per project, and resolved here rather than in the bridge: a session
+    // opened without a `store` is the host's to place, exactly as the three
+    // above are. Not gated behind `sqlite` — the kernel is in every build.
+    let knl_store = crate::bridge::config::knl_path(&project_root).map_err(BlockError::Runtime)?;
+    prepare_knl_dir(&knl_store)?;
 
     // Use the script dir derived from the resolved `ScriptSource` for
     // `package.path` lookups. For inline / default-agent variants the dir
@@ -1699,21 +1977,20 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         #[cfg(feature = "sqlite")]
         sql_conn,
         #[cfg(feature = "sqlite")]
-        sql_interrupt,
-        #[cfg(feature = "sqlite")]
         kv_conn,
         #[cfg(feature = "sqlite")]
-        kv_interrupt,
-        #[cfg(feature = "sqlite")]
-        ts_conn,
-        #[cfg(feature = "sqlite")]
-        ts_interrupt,
+        ts_isle,
         isle: Arc::clone(&isle),
         handler_isle: Arc::clone(&handler_isle),
         bus_tx: bus_tx.clone(),
         event_bus: Arc::clone(&event_bus),
         fs_snapshots: Default::default(),
+        knl_drivers: crate::knl::IsleDrivers::new(),
+        knl_store,
     };
+    // Kept out of the context clone the bridges get: the run loop needs its
+    // own reference to drain the threads after the VM has gone.
+    let knl_drivers = ctx.knl_drivers.clone();
 
     register_bridges(&ctx, &isle, &handler_isle).await?;
 
@@ -1744,7 +2021,15 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     drain_auto_serve(auto_serve_state).await;
 
     // ── Shutdown ──────────────────────────────────────────────────
-    shutdown(&mcp_manager, driver, handler_driver).await?;
+    shutdown(
+        &mcp_manager,
+        driver,
+        handler_driver,
+        knl_drivers,
+        #[cfg(feature = "sqlite")]
+        sqlite_drivers,
+    )
+    .await?;
 
     script_result
 }

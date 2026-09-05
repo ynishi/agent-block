@@ -91,6 +91,98 @@ handlers.prim = function(value, schema, path)
     return true
 end
 
+handlers.integer = function(value, _schema, path)
+    if type(value) ~= "number" then
+        return false, string.format("shape violation at %s: expected integer, got %s", path, type(value))
+    end
+    -- `% 1` is portable across 5.1-5.4 / LuaJIT; NaN and ±inf both
+    -- yield NaN here, which compares ~= 0 and is rejected.
+    if value % 1 ~= 0 then
+        return false, string.format("shape violation at %s: expected integer, got %s", path, tostring(value))
+    end
+    return true
+end
+
+handlers.tuple = function(value, schema, path, ctx)
+    if type(value) ~= "table" then
+        return false, string.format("shape violation at %s: expected table (tuple), got %s", path, type(value))
+    end
+    local items = schema.items
+    local n = #items
+    for i = 1, n do
+        local sub_path = path .. "[" .. i .. "]"
+        if value[i] == nil then
+            return false,
+                string.format("shape violation at %s: missing tuple element (expected %d elements)", sub_path, n)
+        end
+        local ok, reason = check_node(value[i], items[i], sub_path, ctx)
+        if not ok then
+            return false, reason
+        end
+    end
+    if value[n + 1] ~= nil then
+        return false, string.format("shape violation at %s: tuple has more than %d elements", path, n)
+    end
+    return true
+end
+
+-- Bounds apply AFTER the inner schema passes. Applicability is strict:
+-- min/max demand a number, min_len/max_len demand a string or table —
+-- a bound that cannot apply is a violation, not a silent no-op (a
+-- silently-ignored bound is under-validation wearing a passing face).
+-- A nil value that the inner schema admitted (bounded-over-optional,
+-- reachable via persistence round-trips) passes: bounds constrain
+-- present values only.
+handlers.bounded = function(value, schema, path, ctx)
+    local ok, reason = check_node(value, schema.inner, path, ctx)
+    if not ok then
+        return false, reason
+    end
+    if value == nil then
+        return true
+    end
+    -- rawget is load-bearing here: the bound field names collide with
+    -- the combinator method names (`:min()` etc. on schema_mt.__index),
+    -- so plain `schema.min` on a schema WITHOUT that bound would resolve
+    -- to the method function instead of nil.
+    local min = rawget(schema, "min")
+    local max = rawget(schema, "max")
+    local min_len = rawget(schema, "min_len")
+    local max_len = rawget(schema, "max_len")
+    local t = type(value)
+    if min ~= nil or max ~= nil then
+        if t ~= "number" then
+            return false, string.format("shape violation at %s: min/max bound applies to number, got %s", path, t)
+        end
+        if min ~= nil and value < min then
+            return false,
+                string.format("shape violation at %s: %s is below min %s", path, tostring(value), tostring(min))
+        end
+        if max ~= nil and value > max then
+            return false,
+                string.format("shape violation at %s: %s is above max %s", path, tostring(value), tostring(max))
+        end
+    end
+    if min_len ~= nil or max_len ~= nil then
+        if t ~= "string" and t ~= "table" then
+            return false,
+                string.format(
+                    "shape violation at %s: min_len/max_len bound applies to string or table, got %s",
+                    path,
+                    t
+                )
+        end
+        local len = #value
+        if min_len ~= nil and len < min_len then
+            return false, string.format("shape violation at %s: length %d is below min_len %d", path, len, min_len)
+        end
+        if max_len ~= nil and len > max_len then
+            return false, string.format("shape violation at %s: length %d is above max_len %d", path, len, max_len)
+        end
+    end
+    return true
+end
+
 handlers.optional = function(value, schema, path, ctx)
     if value == nil then
         return true

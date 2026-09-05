@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value};
 
-use super::event::{seq_of, stamp, validate_event, Author};
+use super::event::{seq_of, stamp, validate_event};
 use super::KnlResult;
 
 /// First sequence number handed out by a fresh history.
@@ -30,41 +30,20 @@ impl History {
         }
     }
 
-    /// Validate and append a caller-authored event, returning its `seq`.
+    /// Validate and append an event, returning its `seq`.
     ///
     /// A rejected event leaves no trace and does not consume a sequence
-    /// number.  Whatever it says, it is stamped
-    /// [`Author::Caller`](super::event::Author::Caller): this is the
-    /// caller's entry point, and the entry point is what the stamp
-    /// records.
-    pub fn append(&mut self, obj: Map<String, Value>) -> KnlResult<u64> {
+    /// number.  This is the one way in: there is no separate "kernel" path
+    /// and no per-event author to record, because a session holds only its
+    /// own events and owns them at the session level (see
+    /// [`super::Session`]).
+    pub fn append(&mut self, mut obj: Map<String, Value>) -> KnlResult<u64> {
         validate_event(&obj)?;
-        Ok(self.push(obj, Author::Caller))
-    }
-
-    /// Append a kernel-authored event (`run_started` / `run_finished` /
-    /// `model_response` / `model_call_failed`), stamped
-    /// [`Author::Kernel`](super::event::Author::Kernel).
-    ///
-    /// Validation is skipped because the payload is built inside this
-    /// module from the reserved vocabulary itself — re-checking it would
-    /// only add a failure path that cannot be reached.  A caller reaches
-    /// the history through [`History::append`] instead, and the two paths
-    /// are told apart afterwards by the stamp rather than beforehand by
-    /// the kind: what a caller writes is recorded and shown, and simply
-    /// does not appear in the folds that must only count the kernel's own
-    /// work (the `usage` view, the charge it agrees with, the turn count).
-    pub(super) fn append_kernel(&mut self, obj: Map<String, Value>) -> u64 {
-        self.push(obj, Author::Kernel)
-    }
-
-    /// Stamp the envelope and record the event.
-    fn push(&mut self, mut obj: Map<String, Value>, author: Author) -> u64 {
         let seq = self.next_seq;
-        stamp(&mut obj, seq, super::now_ms(), author);
+        stamp(&mut obj, seq, super::now_ms());
         self.events.push(Value::Object(obj));
         self.next_seq = seq.saturating_add(1);
-        seq
+        Ok(seq)
     }
 
     /// Number of recorded events.
@@ -113,10 +92,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{
-        author_of, is_kernel_authored, AUTHOR_CALLER, AUTHOR_KERNEL, FIELD_EPOCH_MS, FIELD_KIND,
-        FIELD_SEQ,
-    };
+    use crate::knl::event::{FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ};
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -150,31 +126,17 @@ mod tests {
     }
 
     #[test]
-    fn append_stamps_the_envelope_and_keeps_the_payload() {
+    fn append_stamps_the_envelope_and_keeps_the_data() {
         let mut h = History::new();
-        h.append(obj(json!({ "kind": "note", "text": "hi", "seq": 999 })))
-            .expect("append");
+        h.append(obj(json!({
+            "kind": "note", "data": { "text": "hi" }, "seq": 999
+        })))
+        .expect("append");
         let event = &h.events()[0];
         assert_eq!(event.get(FIELD_KIND).and_then(Value::as_str), Some("note"));
-        assert_eq!(event.get("text").and_then(Value::as_str), Some("hi"));
+        assert_eq!(event["data"], json!({ "text": "hi" }));
         assert_eq!(event.get(FIELD_SEQ).and_then(Value::as_u64), Some(1));
         assert!(event.get(FIELD_EPOCH_MS).and_then(Value::as_u64).is_some());
-    }
-
-    /// The two entry points are what the `author` stamp records, and a
-    /// caller cannot reach the kernel's one by writing the field itself.
-    #[test]
-    fn the_entry_point_decides_the_author() {
-        let mut h = History::new();
-        h.append(obj(json!({ "kind": "note", "author": "kernel" })))
-            .expect("append");
-        h.append_kernel(obj(json!({ "kind": "run_started" })));
-
-        let events = h.events();
-        assert_eq!(author_of(&events[0]), AUTHOR_CALLER, "{}", events[0]);
-        assert!(!is_kernel_authored(&events[0]));
-        assert_eq!(author_of(&events[1]), AUTHOR_KERNEL, "{}", events[1]);
-        assert!(is_kernel_authored(&events[1]));
     }
 
     #[test]

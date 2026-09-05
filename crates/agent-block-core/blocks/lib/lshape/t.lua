@@ -7,7 +7,7 @@
 ---   * Every schema is a plain Lua table whose state is held in
 ---     `rawget`-readable fields: `kind`, `prim`, `inner`, `elem`,
 ---     `values`, `fields`, `open`, `doc`, `name`, `key`, `val`,
----     `variants`, `tag`.
+---     `variants`, `tag`, `items`, `min`, `max`, `min_len`, `max_len`.
 ---   * Metatables carry combinator sugar only (`:is_optional()`,
 ---     `:describe(doc)`). Stripping the metatable must not change
 ---     validation behaviour — this is what makes schemas persistable.
@@ -36,11 +36,72 @@ function combinators:describe(doc)
     return setmetatable({ kind = "described", inner = self, doc = doc }, schema_mt)
 end
 
+--- Bounds combinators — `:min(n)` / `:max(n)` (numeric value bounds,
+--- inclusive) and `:min_len(n)` / `:max_len(n)` (length bounds via `#`,
+--- for strings and dense arrays). All four fold into a single
+--- `kind="bounded"` wrapper: chaining merges bounds into one node
+--- (returning a fresh table — schemas are never mutated in place), so
+--- `T.number:min(0):max(150)` persists as
+--- `{ kind = "bounded", inner = <number>, min = 0, max = 150 }`.
+--- Bound applicability is enforced at check time: min/max on a
+--- non-number value and min_len/max_len on a non-string/table value are
+--- violations, not silent no-ops.
+local BOUND_KEYS = { "min", "max", "min_len", "max_len" }
+
+local function with_bound(self, key, n)
+    if type(n) ~= "number" then
+        error("lshape.t: " .. key .. " expects number, got " .. type(n), 3)
+    end
+    if (key == "min_len" or key == "max_len") and (n < 0 or n % 1 ~= 0) then
+        error("lshape.t: " .. key .. " expects a non-negative integer", 3)
+    end
+    local out
+    if rawget(self, "kind") == "bounded" then
+        out = { kind = "bounded", inner = rawget(self, "inner") }
+        for i = 1, #BOUND_KEYS do
+            out[BOUND_KEYS[i]] = rawget(self, BOUND_KEYS[i])
+        end
+    else
+        out = { kind = "bounded", inner = self }
+    end
+    out[key] = n
+    if out.min ~= nil and out.max ~= nil and out.min > out.max then
+        error(string.format("lshape.t: min (%s) must be <= max (%s)", tostring(out.min), tostring(out.max)), 3)
+    end
+    if out.min_len ~= nil and out.max_len ~= nil and out.min_len > out.max_len then
+        error(string.format("lshape.t: min_len (%d) must be <= max_len (%d)", out.min_len, out.max_len), 3)
+    end
+    return setmetatable(out, schema_mt)
+end
+
+function combinators:min(n)
+    return with_bound(self, "min", n)
+end
+
+function combinators:max(n)
+    return with_bound(self, "max", n)
+end
+
+function combinators:min_len(n)
+    return with_bound(self, "min_len", n)
+end
+
+function combinators:max_len(n)
+    return with_bound(self, "max_len", n)
+end
+
 M.string = setmetatable({ kind = "prim", prim = "string" }, schema_mt)
 M.number = setmetatable({ kind = "prim", prim = "number" }, schema_mt)
 M.boolean = setmetatable({ kind = "prim", prim = "boolean" }, schema_mt)
 M.table = setmetatable({ kind = "prim", prim = "table" }, schema_mt)
+M.fn = setmetatable({ kind = "prim", prim = "function" }, schema_mt)
 M.any = setmetatable({ kind = "any" }, schema_mt)
+
+--- T.integer — number with no fractional part. Portable across Lua
+--- 5.1-5.4 / LuaJIT: the check is `v % 1 == 0` (not `math.type`), so
+--- `2.0` passes while `2.5`, NaN and ±inf fail (`inf % 1` and `nan % 1`
+--- are both NaN).
+M.integer = setmetatable({ kind = "integer" }, schema_mt)
 
 --- T.shape(fields, opts) — named key set.
 ---
@@ -294,6 +355,51 @@ function M.any_of(variants)
         copy[i] = v
     end
     return setmetatable({ kind = "any_of", variants = copy }, schema_mt)
+end
+
+--- T.tuple(items) — fixed-length positional array. Each position has
+--- its own schema; the value must be a dense 1-based array of exactly
+--- `#items` elements (a `#items + 1`-th element is a violation).
+--- Optional elements are rejected at construction for the same C1
+--- rationale as `array_of`: a nil hole at position i is
+--- indistinguishable from a short tuple. Model nil-admission at the
+--- enclosing field instead (e.g. `T.tuple({...}):is_optional()`).
+function M.tuple(items)
+    if type(items) ~= "table" then
+        error("lshape.t: tuple expects an items table as argument", 2)
+    end
+    local n = 0
+    for _ in pairs(items) do
+        n = n + 1
+    end
+    if n == 0 then
+        error("lshape.t: tuple expects at least one item", 2)
+    end
+    local copy = {}
+    for i = 1, n do
+        local v = items[i]
+        if v == nil then
+            error("lshape.t: tuple expects a 1-based dense array of schemas", 2)
+        end
+        if not is_schema(v) then
+            error(string.format("lshape.t: tuple item at index %d must be a schema", i), 2)
+        end
+        local probe = v
+        while rawget(probe, "kind") == "described" do
+            probe = rawget(probe, "inner")
+        end
+        if rawget(probe, "kind") == "optional" then
+            error(
+                "lshape.t: tuple(optional(T)) is not allowed — a nil hole at "
+                    .. "a tuple position is indistinguishable from a short tuple. "
+                    .. "Model the nil-admission at the enclosing field "
+                    .. "(e.g. T.tuple({...}):is_optional()).",
+                2
+            )
+        end
+        copy[i] = v
+    end
+    return setmetatable({ kind = "tuple", items = copy }, schema_mt)
 end
 
 function M.map_of(key, val)
