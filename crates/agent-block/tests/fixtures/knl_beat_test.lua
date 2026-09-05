@@ -40,6 +40,11 @@
 --  inv14 a session opened from a session: the allocation moves units out of
 --        the parent's balance in one write, the child beats on its own, and
 --        `knl.views.tree` reads the edge back out of the log
+--  inv15 `supervisor.parallel`: two children of one parent run AT ONCE on
+--        `std.task` (the nursery the pure spec runner does not have), the
+--        results come back aligned by index, one sibling raising leaves the
+--        other's untouched, both edges close, and the parent's ledger carries
+--        both allocations
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately: the Lua kernel is the
@@ -1129,6 +1134,192 @@ do
     parent:close("done")
 
     mark("inv14_session_tree")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv15 — supervisor.parallel: siblings at once in one nursery, and what one
+-- sibling's failure does to the rest
+-- ---------------------------------------------------------------------------
+
+do
+    -- Reachable by name in the full host (EMBEDDED_LIBS), like `policy` in
+    -- inv13 — and unlike `policy`, this one cannot be exercised anywhere else:
+    -- `parallel` runs on `std.task`, which the pure spec runner has no
+    -- registration for at all. Its pack spec covers the shapes and the calls it
+    -- refuses; the concurrency is here.
+    local supervisor = require("supervisor")
+
+    -- One stubbed device for every child below: the beat is not what this
+    -- invariant is about, and a queue would run out.
+    local device = kernel.device({
+        llm = function()
+            return response("ok")
+        end,
+    })
+
+    -- What a child reports back about its beat: the status, or the whole
+    -- reading when it was not "ok". A slot that only said "error" would make a
+    -- failure here a puzzle rather than a report.
+    local function verdict(o)
+        if o.status ~= "error" then
+            return o.status
+        end
+        local detail = o.detail
+        if type(detail) == "table" then
+            detail = tostring(detail.kind) .. ": " .. tostring(detail.message)
+        end
+        return "error(" .. tostring(o.kind) .. "): " .. tostring(detail)
+    end
+
+    -- A FILE STORE, and not for durability. Siblings write to ONE database —
+    -- their parent's — and the two stores differ in what simultaneous writers
+    -- meet there [実測: 2026-09-05, this fixture]. The in-memory database is
+    -- addressed by a shared-cache URI (`file:knl-<stream>?mode=memory&
+    -- cache=shared`), and shared cache locks per TABLE: a second connection
+    -- writing while the first holds that lock gets SQLITE_LOCKED at once, which
+    -- `busy_timeout` does not wait out, so a child's beat comes back
+    -- `err("state")` with `detail.kind == "busy"` — nondeterministically,
+    -- depending on which write lands first. A file database has no shared
+    -- cache, so the same contention is SQLITE_BUSY and the 5 s busy timeout
+    -- waits it out.
+    --
+    -- That is the store's property and not the supervisor's, and `busy` is the
+    -- one class the kernel calls retryable — asking again is the caller's
+    -- loop's decision (`policy.retry`), which is why nothing here retries. What
+    -- this invariant is about is what `parallel` promises, so it runs where the
+    -- promise is not drowned out by the lock.
+    local path = os.tmpname()
+    local store = { sqlite = path }
+
+    -- (a) AT ONCE, not one after the other. The first child sleeps at a cancel
+    -- checkpoint and the second runs straight through; if the two were run in
+    -- sequence the second could not possibly finish first.
+    local at_once = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" }, store = store })
+    local trace = {}
+    local function step(label)
+        trace[#trace + 1] = label
+    end
+    local function at(label)
+        for i, seen in ipairs(trace) do
+            if seen == label then
+                return i
+            end
+        end
+        return nil
+    end
+
+    local results = supervisor.parallel(at_once, {
+        {
+            opts = { budget = { amount = 5 } },
+            fn = function(child)
+                step("slow:start")
+                std.task.sleep(20)
+                child:append({ kind = "msg_user", data = { content = "slow" } })
+                local o = kernel.beat(child, device)
+                step("slow:end")
+                return child:id(), verdict(o)
+            end,
+        },
+        {
+            opts = { budget = { amount = 5 } },
+            fn = function(child)
+                step("quick:start")
+                child:append({ kind = "msg_user", data = { content = "quick" } })
+                local o = kernel.beat(child, device)
+                step("quick:end")
+                return child:id(), verdict(o)
+            end,
+        },
+    })
+
+    local order = table.concat(trace, ",")
+    assert(at("quick:end") < at("slow:end"), "the quick child must finish first: " .. order)
+    assert(at("slow:start") < at("quick:end"), "the two must overlap: " .. order)
+
+    -- Aligned by index, and every value the body returned is in the slot.
+    assert(#results == 2, "one slot per child, got " .. #results)
+    assert(results[1].ok and results[2].ok, "both children came off: " .. order)
+    assert(results[1].values.n == 2, "two values, got " .. tostring(results[1].values.n))
+    assert(results[1].values[2] == "ok", "the slow child's beat: " .. tostring(results[1].values[2]))
+    assert(results[2].values[2] == "ok", "the quick child's beat: " .. tostring(results[2].values[2]))
+    assert(results[1].values[1] ~= results[2].values[1], "two children, two streams")
+    at_once:close("done")
+
+    -- (b) ISOLATE is the default: one sibling raising is that sibling's, and
+    -- the other runs to completion.
+    local isolate = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" }, store = store })
+    local ids = {}
+    local mixed = supervisor.parallel(isolate, {
+        {
+            opts = { budget = { amount = 3 } },
+            fn = function(child)
+                ids[1] = child:id()
+                child:append({ kind = "msg_user", data = { content = "go" } })
+                return verdict(kernel.beat(child, device))
+            end,
+        },
+        {
+            opts = { budget = { amount = 4 } },
+            fn = function(child)
+                ids[2] = child:id()
+                error("the second child went wrong", 0)
+            end,
+        },
+    })
+
+    local function slot_text(slot)
+        if slot.ok then
+            return "ok(" .. tostring(slot.values[1]) .. ")"
+        end
+        local err = slot.err
+        if type(err) == "table" then
+            err = tostring(err.kind) .. ": " .. tostring(err.message)
+        end
+        return "failed(" .. tostring(err) .. ", cancelled=" .. tostring(slot.cancelled) .. ")"
+    end
+
+    assert(mixed[1].ok, "the first child was untouched by the second: " .. slot_text(mixed[1]))
+    assert(mixed[1].values[1] == "ok", "its beat: " .. tostring(mixed[1].values[1]))
+    assert(not mixed[2].ok, "the second child failed")
+    assert(
+        tostring(mixed[2].err):find("the second child went wrong", 1, true) ~= nil,
+        "the raise is kept verbatim: " .. tostring(mixed[2].err)
+    )
+    assert(mixed[2].cancelled == nil, "nothing cancelled it — isolate is the default")
+
+    -- The parent paid for both, out of one balance: 20 - 3 - 4.
+    assert(isolate:remaining() == 13, "the parent's balance: " .. tostring(isolate:remaining()))
+    local reserved, total = 0, 0
+    for _, row in ipairs(kernel.views.ledger(isolate)) do
+        if row.kind == "budget_reserved" then
+            reserved = reserved + 1
+            total = total + row.amount
+        end
+    end
+    assert(reserved == 2, "two allocations on the ledger, got " .. reserved)
+    assert(total == 7, "and they add up to what left the balance: " .. total)
+
+    -- Both edges are in the tree and both are closed — the bracket ended each
+    -- child before this call returned, the raising one included.
+    local rows = kernel.views.tree(isolate)
+    assert(#rows == 3, "the parent and its two children, got " .. #rows)
+    local closed = 0
+    for _, row in ipairs(rows) do
+        if row.session ~= isolate:id() then
+            assert(row.parent == isolate:id(), "the edge names the parent: " .. tostring(row.parent))
+            assert(row.closed_epoch_ms ~= nil, "the child closed: " .. tostring(row.session))
+            closed = closed + 1
+        else
+            assert(row.open_children == nil, "the parent has not closed yet")
+        end
+    end
+    assert(closed == 2, "both children closed, got " .. closed)
+    assert(ids[1] ~= nil and ids[2] ~= nil, "both bodies ran")
+
+    isolate:close("done")
+    os.remove(path)
+
+    mark("inv15_supervisor_parallel")
 end
 
 print("[KNL] all_ok")

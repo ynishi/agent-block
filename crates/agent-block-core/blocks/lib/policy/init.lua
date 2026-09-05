@@ -411,14 +411,38 @@ local STAGNATION_OPTS, STAGNATION_ARG = opts_contract({
     signature = FUNCTION:is_optional(),
 })
 
---- What `policy.retry` is configured with.
+--- The two failure vocabularies a retry decides on, as one list.
 ---
---- `kinds` closes on the kernel's own failure vocabulary
---- (`knl.shapes.error_kinds`), read from there rather than retyped: a class
---- the kernel never raises is a typo, and a class added to the kernel is
---- available here the moment it lands.
+--- `knl.shapes.error_kinds` classifies a KERNEL failure (a contended store, a
+--- closed session) and `knl.shapes.call_error_kinds` classifies a MODEL CALL
+--- that did not come off (a rate limit, an overloaded provider, a connection
+--- that dropped). They are separate on purpose — a busy store and a busy
+--- provider are not the same failure — but they meet in one field: both ride
+--- in `detail.kind`, which is what lets one predicate read both.
+---
+--- So `kinds` closes on the union rather than on either half. Naming
+--- `rate_limited` used to be a construction error, which meant no retry policy
+--- could be written for the class of failure most often worth asking again
+--- about.
+---
+--- Both lists are read from `knl` rather than retyped: a class added on either
+--- side is available here the moment it lands.
+local RETRY_KINDS = {}
+do
+    local seen = {}
+    for _, list in ipairs({ kernel.shapes.error_kinds, kernel.shapes.call_error_kinds }) do
+        for _, kind in ipairs(list) do
+            if not seen[kind] then
+                seen[kind] = true
+                RETRY_KINDS[#RETRY_KINDS + 1] = kind
+            end
+        end
+    end
+end
+
+--- What `policy.retry` is configured with.
 local RETRY_OPTS, RETRY_ARG = opts_contract({
-    kinds = T.array_of(T.one_of(kernel.shapes.error_kinds)):is_optional(),
+    kinds = T.array_of(T.one_of(RETRY_KINDS)):is_optional(),
     max = T.number:describe("attempts in total, the first included; a whole number >= 1"):is_optional(),
 })
 
@@ -873,19 +897,27 @@ end
 ---     local ask, delay = again(outcome, attempt)
 ---
 --- What it decides on is the KIND of failure, read out of the Outcome's
---- detail — `detail.kind`, one of `knl.shapes.error_kinds`, and
---- `detail.retryable`, the kernel's own judgement about it. It does not read
---- an HTTP status, a status class, or any number a provider attached: a 503
---- is not a class of failure, it is one provider's word for several, and a
---- policy that retried on it would be retrying on the provider's vocabulary
---- instead of the kernel's.
+--- detail — `detail.kind`, and `detail.retryable`, the judgement that came
+--- with it. It does not read an HTTP status, a status class, or any number a
+--- provider attached: a 503 is not a class of failure, it is one provider's
+--- word for several, and a policy that retried on it would be retrying on the
+--- provider's vocabulary instead of the kernel's.
+---
+--- TWO VOCABULARIES ANSWER IN THAT ONE FIELD and `kinds` takes either. A
+--- `state` failure carries one of `knl.shapes.error_kinds` (the kernel's own:
+--- `busy`, `storage`, …) and a `call` failure one of
+--- `knl.shapes.call_error_kinds` (the adapter's classification of a call that
+--- did not come off: `rate_limited`, `overloaded`, …). They stay separate
+--- vocabularies — a contended store is not a busy provider — and a caller
+--- names from whichever it means.
 ---
 ---   * no `kinds` — retry exactly when `detail.retryable` is true, which is
----     the kernel's answer and the right default;
+---     the judgement that came with the failure and the right default;
 ---   * `kinds` given — retry when `detail.kind` is one of them, and that
 ---     naming is the whole answer. It is how a caller says "I will also ask
----     again about a storage failure", which is a judgement the kernel does
----     not make for anyone.
+---     again about a storage failure", or "of the retryable ones I want only
+---     the rate limit" — judgements neither the kernel nor the adapter makes
+---     for anyone.
 ---
 --- `max` is attempts IN TOTAL, the first one included, so `attempt` — the
 --- caller's own count of attempts already made, 1 on the first — is retried
@@ -902,7 +934,7 @@ end
 --- not an answer to that; `stopped` is the budget, and a retry past it would
 --- be a loop spending an allowance the owner did not give.
 ---
---- @param opts table  { kinds? = { <error kind>... }, max? = <whole number >= 1> }
+--- @param opts table  { kinds? = { <error kind | call error kind>... }, max? = <whole number >= 1> }
 --- @return function predicate  fn(outcome, attempt) -> boolean, number?
 function M.retry(opts)
     opts = opts or {}
@@ -919,13 +951,13 @@ function M.retry(opts)
             error("policy.retry: kinds must be an array of knl error kinds", 2)
         end
         local known = {}
-        for _, kind in ipairs(kernel.shapes.error_kinds) do
+        for _, kind in ipairs(RETRY_KINDS) do
             known[kind] = true
         end
         named = {}
         for i, kind in ipairs(opts.kinds) do
             if not known[kind] then
-                error("policy.retry: kinds[" .. i .. "] is not a knl error kind: " .. tostring(kind), 2)
+                error("policy.retry: kinds[" .. i .. "] is not a knl failure kind: " .. tostring(kind), 2)
             end
             named[kind] = true
         end

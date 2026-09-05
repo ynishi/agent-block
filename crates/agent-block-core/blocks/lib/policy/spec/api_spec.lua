@@ -242,13 +242,23 @@ describe("policy.shapes — the contracts are published as data", function()
         expect(check.check({ id = "b-1", events = {}, extra = 1 }, policy.shapes.beat_record)).to.be(false)
     end)
 
-    it("reads the kernel's failure vocabulary rather than retyping it", function()
-        -- `retry`'s `kinds` closes on `knl.shapes.error_kinds`. One list, and
-        -- a class added to the kernel is available here the moment it lands.
+    it("reads the kernel's two failure vocabularies rather than retyping them", function()
+        -- `retry`'s `kinds` closes on the UNION of `knl.shapes.error_kinds` (a
+        -- kernel failure) and `knl.shapes.call_error_kinds` (a model call that
+        -- did not come off). Both are read from knl, so a class added on
+        -- either side is available here the moment it lands — and neither list
+        -- is retyped, which is what would let the two drift apart.
         local kinds = rawget(rawget(policy.shapes.retry_opts, "fields").kinds, "inner")
         local elem = rawget(kinds, "elem")
         local values = rawget(elem, "values")
-        expect(listed({ table.unpack(values) })).to.be(listed({ table.unpack(kernel.shapes.error_kinds) }))
+
+        local union = {}
+        for _, list in ipairs({ kernel.shapes.error_kinds, kernel.shapes.call_error_kinds }) do
+            for _, kind in ipairs(list) do
+                union[#union + 1] = kind
+            end
+        end
+        expect(listed({ table.unpack(values) })).to.be(listed(union))
     end)
 end)
 
@@ -403,7 +413,11 @@ describe("policy.shapes.api — the registry is absent in prod", function()
             PROD.stagnation({ same = 1 })
         end).to.fail()
         expect(function()
-            PROD.retry({ kinds = { "rate_limited" } })
+            -- A word from neither vocabulary. `rate_limited` was this case
+            -- once and is a declared kind now: the adapter classifies a call
+            -- that did not come off, and a retry policy may name what it
+            -- produces.
+            PROD.retry({ kinds = { "throttled" } })
         end).to.fail()
         expect(function()
             PROD.escalate({})

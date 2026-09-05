@@ -17,18 +17,24 @@
 -- answer. The run is then read back with `knl.views.beats` — one SELECT over
 -- the log, one row per beat. The script prints `[E2E] all_ok` at the end.
 --
--- Two sections, and the difference between them is the point:
+-- Three sections, and the difference between them is the point:
 --   [1] the plain kernel — a device with an llm, tools and a system line, and
 --       a loop that stops on a beat with no tool call;
 --   [2] the same run with `policy` plugged in — a windowed fold, a filter that
 --       carries a failure forward, and two questions the loop asks between
 --       beats. Nothing in the kernel changes to make the second one work:
 --       every policy is a value in a seam the device already had, or a
---       predicate the loop calls itself.
+--       predicate the loop calls itself;
+--   [3] the same again with `supervisor` — one session split into two children
+--       that run at once, each on units moved out of the parent's balance, and
+--       their histories read back into one request for a final beat. Again
+--       nothing in the kernel changes: a child is `knl.open{ parent = s }`, and
+--       the merge is a `fold` like any other.
 
 local kernel = require("knl")
 local adapter = require("knl_adapter")
 local policy = require("policy")
+local supervisor = require("supervisor")
 local Outcome = kernel.Outcome
 
 -- The provider backend: Port + shim, conf is llm_proto vocabulary.
@@ -316,5 +322,176 @@ kernel.session({
         )
     )
 end)
+
+-- ===========================================================================
+-- [3] one session split into two, and read back into one
+-- ===========================================================================
+--
+-- The kernel records a session tree and runs none of it: a child's opening
+-- names its parent, its quota is moved out of the parent's balance in one
+-- write, and `knl.views.tree` reads the edges back. `supervisor` is the shell
+-- layer that RUNS that structure, and it is two calls here:
+--
+--   parallel  two children of this session, opened and closed around a body
+--             each, run at once on `std.task`. The results come back aligned
+--             by index — a slot per child, whatever happened to it — and the
+--             default is isolate: one child failing does not cancel the other.
+--   merge     a `fold` for the final beat that reads the children's histories
+--             and this session's own into ONE request, in the order given.
+--             Nothing is appended to any child: the histories are read.
+--
+-- The budget is the whole stopping guarantee, as everywhere else: the grant
+-- below covers both allocations and leaves the parent enough for the beat that
+-- puts the answers together.
+
+local function settle(session, beat_device, cap)
+    -- The same loop as [1], run inside a child: beat until the model stops
+    -- asking for tools, or the caller's cap says enough.
+    local last
+    for _ = 1, cap do
+        last = kernel.beat(session, beat_device)
+        if not Outcome.is_ok(last) or not has_tool_use(last.out) then
+            break
+        end
+    end
+    return last
+end
+
+-- A file store, and not for durability: siblings write to their parent's
+-- database at the same time, and the in-memory one is addressed by a
+-- shared-cache URI whose locks are per table — a second writer meets
+-- SQLITE_LOCKED at once, which no busy timeout waits out, and a child's beat
+-- comes back `err("state")` with `detail.kind == "busy"`. A file database has
+-- no shared cache and the kernel's busy timeout covers the same contention.
+-- `supervisor.parallel`'s own doc says the same; nothing retries it here,
+-- because asking again is the loop's decision (`policy.retry`).
+local shared_db = os.tmpname()
+
+kernel.session({
+    owner = "beat-e2e-supervisor",
+    budget = { amount = 12, tag = "beats", desc = "one unit per beat, children included" },
+    store = { sqlite = shared_db },
+}, function(s)
+    local questions = {
+        "What is 1918 + 77? Use the add tool, then answer with just the number.",
+        "What is 250 + 6? Use the add tool, then answer with just the number.",
+    }
+
+    local children = {}
+    for i, question in ipairs(questions) do
+        children[i] = {
+            -- Units MOVED, not granted: the parent's balance falls by 4 the
+            -- moment this child opens, and nothing comes back when it closes.
+            opts = { budget = { amount = 4 } },
+            fn = function(child)
+                child:append({
+                    kind = "msg_user",
+                    meta = { label = "seed" },
+                    data = { content = question },
+                })
+                local out = settle(child, device, 3)
+                -- The id is what the merge below reads: by then the child is
+                -- closed, and a closed session's history is still its history.
+                return child:id(), out.status
+            end,
+        }
+    end
+
+    local results = supervisor.parallel(s, children, { timeout_ms = 120000 })
+
+    local read = {}
+    for i, slot in ipairs(results) do
+        if slot.ok then
+            read[#read + 1] = slot.values[1]
+            print(string.format("[SUPERVISOR] child %d: %s", i, tostring(slot.values[2])))
+        else
+            -- A failed slot keeps its error rather than going nil, which is
+            -- what lets this loop report it by position.
+            local err = slot.err
+            print(
+                string.format(
+                    "[SUPERVISOR] child %d failed: %s",
+                    i,
+                    tostring(type(err) == "table" and err.message or err)
+                )
+            )
+        end
+    end
+
+    print(
+        string.format(
+            "[SUPERVISOR] children=%d read=%d remaining=%s tree=%d",
+            #results,
+            #read,
+            tostring(s:remaining()),
+            #kernel.views.tree(s)
+        )
+    )
+
+    if #read == 0 then
+        print("[SUPERVISOR] nothing to merge")
+        return
+    end
+
+    -- The merge is a device seam. `fold` is the only thing that changes: the
+    -- llm, the tools and the system line are the same values [1] used.
+    local merged = kernel.device({
+        llm = llm,
+        tools = tools,
+        system = "You are a terse assistant. Use the add tool for any arithmetic.",
+        fold = supervisor.merge(s, read),
+    })
+
+    s:append({
+        kind = "msg_user",
+        data = { content = "Add the two numbers the workers reported, and answer with just the sum." },
+    })
+
+    local final = settle(s, merged, 3)
+    Outcome.match(final, {
+        ok = function(o)
+            local text = {}
+            for _, block in ipairs(o.out.content or {}) do
+                if block.type == "text" then
+                    text[#text + 1] = block.text
+                end
+            end
+            print("[SUPERVISOR] final answer: " .. table.concat(text, " "))
+        end,
+        refused = function(o)
+            print("[SUPERVISOR] refused: " .. tostring(o.reason))
+        end,
+        error = function(o)
+            local detail = o.detail
+            if type(detail) == "table" then
+                detail = tostring(detail.message)
+            end
+            print("[SUPERVISOR] error(" .. tostring(o.kind) .. "): " .. tostring(detail))
+        end,
+        stopped = function(o)
+            print("[SUPERVISOR] stopped(" .. tostring(o.reason) .. "): grant " .. tostring(o.tag))
+        end,
+    })
+
+    -- What the merged request actually carried, out of the durable record: the
+    -- children's messages in the order they were listed, then this session's
+    -- own, then the beat that answered.
+    local requests = {}
+    for _, ev in ipairs(s:events()) do
+        if ev.kind == "llm_request" then
+            requests[#requests + 1] = ev.data.request
+        end
+    end
+    local last_request = requests[#requests]
+    print(
+        string.format(
+            "[SUPERVISOR] merged messages=%d usage_rows=%d",
+            last_request and #last_request.messages or 0,
+            #kernel.views.usage(s, { sessions = read })
+        )
+    )
+end)
+
+os.remove(shared_db)
 
 print("[E2E] all_ok")

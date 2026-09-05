@@ -92,6 +92,10 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
         include_str!("../blocks/lib/knl_adapter/init.lua"),
     ),
     ("policy", include_str!("../blocks/lib/policy/init.lua")),
+    (
+        "supervisor",
+        include_str!("../blocks/lib/supervisor/init.lua"),
+    ),
 ];
 
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].

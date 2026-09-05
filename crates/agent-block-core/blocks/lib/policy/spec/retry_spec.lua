@@ -7,9 +7,10 @@
 --
 -- What this proves:
 --   1 THE DECISION IS ON A KIND, NEVER ON A STATUS CLASS. A detail carrying a
---     503 / 429 / "5xx" and nothing the kernel classified is not retried, and
---     no naming of kinds can make it one — the vocabulary is closed on
---     `knl.shapes.error_kinds`;
+--     503 / 429 / "5xx" and nothing that was classified is not retried, and no
+--     naming of kinds can make it one — the vocabulary is closed on the two
+--     lists knl publishes (`error_kinds` for a kernel failure,
+--     `call_error_kinds` for a call that did not come off) and on nothing else;
 --   2 `retry_after` in the detail rides back as the delay, and its absence is
 --     an absent delay rather than a zero;
 --   3 `max` counts attempts in total, the first one included;
@@ -57,18 +58,25 @@ describe("policy.retry — construction", function()
         expect(type(policy.retry({}))).to.be("function")
     end)
 
-    it("closes `kinds` on the kernel's own vocabulary", function()
-        -- One list, published by knl and read from there. A class the kernel
-        -- never raises is a typo, and a typo that silently never matched would
-        -- be a retry policy that never retries.
+    it("closes `kinds` on the two vocabularies a failure can carry", function()
+        -- Both lists are published by knl and read from there: the kernel's own
+        -- classes and the adapter's classification of a call that did not come
+        -- off. A word from neither is a typo, and a typo that silently never
+        -- matched would be a retry policy that never retries.
         expect(function()
             policy.retry({ kinds = { "busy", "storage" } })
         end).to_not.fail()
         expect(function()
-            policy.retry({ kinds = { "rate_limited" } })
-        end).to.fail()
+            policy.retry({ kinds = { "rate_limited", "overloaded" } })
+        end).to_not.fail()
+        expect(function()
+            policy.retry({ kinds = { "busy", "transport" } })
+        end).to_not.fail()
         expect(function()
             policy.retry({ kinds = { "429" } })
+        end).to.fail()
+        expect(function()
+            policy.retry({ kinds = { "throttled" } })
         end).to.fail()
         expect(function()
             policy.retry({ kinds = "busy" })
@@ -147,6 +155,31 @@ describe("policy.retry — what is retried", function()
         local refused_credentials =
             Outcome.err("call", { kind = "auth", retryable = false, message = "API error 401 (auth)", status = 401 })
         expect(again(refused_credentials, 1)).to.be(false)
+    end)
+
+    it("fires on a call-error kind a caller named, and only on that one", function()
+        -- Naming is the whole answer in both vocabularies alike: `transport` is
+        -- retryable by the adapter's own judgement, and a caller that asked for
+        -- the rate limit and nothing else gets exactly that.
+        local only_rate = policy.retry({ kinds = { "rate_limited" }, max = 3 })
+        local limited = Outcome.err("call", {
+            kind = "rate_limited",
+            retryable = true,
+            retry_after = 12,
+            message = "API error 429 (rate_limit)",
+            status = 429,
+        })
+        local dropped =
+            Outcome.err("call", { kind = "transport", retryable = true, message = "connection reset by peer" })
+
+        local ask, delay = only_rate(limited, 1)
+        expect(ask).to.be(true)
+        expect(delay).to.be(12)
+        expect(only_rate(dropped, 1)).to.be(false)
+
+        -- And a policy that named both asks again about either.
+        local either = policy.retry({ kinds = { "rate_limited", "transport" }, max = 3 })
+        expect(either(dropped, 1)).to.be(true)
     end)
 
     it("does not retry a failure whose detail is a sentence", function()
