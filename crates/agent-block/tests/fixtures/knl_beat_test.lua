@@ -49,6 +49,10 @@
 --        column as JSON text (a syscall read decodes, a SELECT does not), and
 --        the merged request carries the child's decoded content — the string
 --        as a string, the blocks as tables — in the documented order
+--  inv17 the module re-exports the bridge's two readers: `require("knl")`
+--        answers `error` (a real raise, read back classified) and `api` (the
+--        declared surface, the error classes, the schema and the types text),
+--        and both are declared in the api registry
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately: the Lua kernel is the
@@ -1390,6 +1394,50 @@ do
     parent:close("done")
 
     mark("inv16_supervisor_merge")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv17 — the module re-exports the bridge's two readers, so `require("knl")`
+-- is the one surface a script needs
+-- ---------------------------------------------------------------------------
+
+do
+    -- Two tables answer to the name `knl` and only one of them used to carry
+    -- these: a script whose `local knl = require("knl")` shadowed the global
+    -- could not call either. `kernel` here IS that local (line 56), so this
+    -- case is written the way the failure was met.
+    local ended = kernel.open({ owner = "test" })
+    ended:close("done")
+    local wrote, raised = pcall(ended.append, ended, { kind = "msg_user", data = { content = "after" } })
+    assert(not wrote, "an append after close must raise")
+
+    local read = kernel.error(raised)
+    assert(type(read) == "table", "kernel.error must read the raise back as a table")
+    assert(read.kind == "closed", "kind: " .. tostring(read.kind))
+    assert(read.method == "append", "method: " .. tostring(read.method))
+    assert(read.retryable == false, "closed is not a class to retry")
+    assert(type(read.message) == "string" and #read.message > 0, "message: " .. tostring(read.message))
+
+    -- The same reading the global answers: one function, two names for it.
+    local through_global = knl.error(raised)
+    assert(through_global.kind == read.kind and through_global.message == read.message, "the two readers differ")
+
+    local api = kernel.api()
+    assert(type(api) == "table", "kernel.api must answer a table")
+    for _, field in ipairs({ "session", "module", "errors", "schema", "types" }) do
+        assert(api[field] ~= nil, "kernel.api() answers no " .. field)
+    end
+    assert(#api.session > 0 and #api.module > 0, "api() must list both halves")
+    assert(#api.errors > 0, "api() must publish the error classes")
+    assert(api.schema.table == "events", "schema table: " .. tostring(api.schema.table))
+    assert(type(api.types) == "string" and #api.types > 0, "api() must publish the types module as text")
+
+    -- And the module declares both, so the dev gate covers them like every
+    -- other export (`knl/spec/api_spec.lua` holds the registry complete).
+    assert(kernel.shapes.api.error ~= nil, "knl.error is undeclared in the api registry")
+    assert(kernel.shapes.api.api ~= nil, "knl.api is undeclared in the api registry")
+
+    mark("inv17_module_reexports_bridge_readers")
 end
 
 print("[KNL] all_ok")

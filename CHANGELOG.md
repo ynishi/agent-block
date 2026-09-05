@@ -66,6 +66,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   halves together pass just as happily against a Lua-side substitute that means
   something else. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning,
   for work on the kernel itself.
+- **The kernel (`knl`).** A session log that is the only source of truth, a
+  budget that is a quota rather than a tally of what was used, and one beat —
+  a model call plus the tools that call asks for — over both. It is written in
+  two halves: the Rust core with its syscall bridge, and the Lua kernel library
+  that drives them. A project cannot replace either (the sealed-module check
+  above; in Changed, the run that now fails).
+  - `knl.open{ owner?, budget?, store?, parent? }` opens a session and
+    `knl.resume{ session, store?, budget? }` reopens one and re-folds it.
+    `knl.session(opts, fn)` is the canonical bracket — the kernel opens, runs
+    the body and closes, so an error escaping the body still records the
+    boundary — and it resumes instead of opening when the opts name a session.
+    `local s <close> = knl.open{...}` is the alternative, and a handle nobody
+    closed is closed by a drop backstop. A session is disposable: a stream whose
+    `session_closed` is already in the log is not resumed.
+  - The session answers `id` / `scope_id` / `owner` / `append` / `events(from)`
+    / `len` / `view("tail", { n })` / `query` / `reserve` / `spend` /
+    `remaining` / `exhausted` / `close`. `events` and `query` are bounded and
+    answer `rows, truncated`, so a page can be told from a complete answer and
+    the rest is read by paging on `from`.
+  - `query(sql, params?, opts?)` reads the log with one read-only `SELECT` /
+    `WITH` over the event table whose columns `knl.api().schema` publishes.
+    Values are bound, never pasted; `$stream` binds to this session and
+    `$sessions` to `opts.sessions`, so reading across a tree is one statement.
+    `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `tree` are five
+    views written that way, and a consumer's own view is a function of exactly
+    the same form.
+  - `reserve(n)` is the deduction that asks — it refuses without deducting when
+    the balance is short — and `spend(n)` the one that does not. Neither holds
+    anything for the other, so a beat that calls both is charged twice. Every
+    move is an event and the balance is a fold over them, which is why two
+    handles on one stream cannot hold two different answers.
+  - Six kinds are the kernel's alone to write — `session_opened`,
+    `session_closed`, `budget_granted`, `budget_reserved`, `budget_refused`,
+    `budget_spent` — so a lifecycle or a ledger entry cannot be forged by
+    appending one.
+  - `knl.open{ parent = s, budget = { from_parent = n } }` opens a child on the
+    parent's database: the child's opening names its parent and the allocation
+    is one transaction on the parent's ledger, or a refusal and no child at all.
+    Nothing comes back when the child closes, and a close is never refused for
+    children still running — it records them
+    (`session_closed.data.open_children`).
+  - A stored event is `{ kind, beat?, meta?, data? }` and nothing else at the
+    top level: `meta` is shallow (string, number or boolean) so it can be
+    grouped and filtered on without knowing the kind, and structured JSON is
+    confined to `data`, whose shape belongs to whoever writes the kind. `beat`
+    is an id the caller mints with `knl.new_beat_id()` and stamps on the events
+    that belong together; the kernel stores it and never numbers one.
+  - `knl.beat(session, device)` runs one beat against a device built by
+    `knl.device{ llm, tools?, tool_policy?, fold?, filters?, system?, cost? }`
+    (frozen at construction; `device:with{ llm = other }` derives another) and
+    answers an `Outcome` — `ok`, `refused`, `error` or `stopped`, the last being
+    the planned stop when the quota would not cover the call, with nothing
+    recorded and no call made. `Outcome.match` requires all four arms. There is
+    no loop in the kernel: a caller composes beats on the spot.
+  - A kernel failure is raised as `knl: <method>: <kind>: <reason>` and read
+    back with `knl.error(e)` as `{ kind, method, retryable, message }`. The
+    classes are `busy`, `storage`, `corruption`, `closed`, `validation`,
+    `unsupported`, `timeout` and `refused`, and `retryable` is true for `busy`
+    alone.
+  - `knl.api()` publishes the declared surface, the error classes and the
+    columns a query may name. The Lua shapes of that surface are `knl_types`,
+    generated at host start from the Rust argument and return types, so the
+    interface is declared once instead of twice; `knl.shapes` declares this
+    layer's own contracts and, in dev mode, gates every declared export against
+    its entry. Both readers are on the Lua module as well — `require("knl")`
+    answers `error` and `api` too, so a script that took the module under that
+    name is not left reaching past it for the global.
+  - Full doc: the module headers of `crates/agent-block-core/src/knl/mod.rs`
+    (the design), `crates/agent-block-core/src/bridge/knl.rs` (the Lua surface)
+    and `blocks/lib/knl/init.lua` (the beat, Outcome, the views).
+    `crates/agent-block/examples/knl_beat.lua` is the place to start — a real
+    run against the API in three sections: the plain kernel, the same run with
+    `policy`, and the same again with `supervisor`.
+- **Kernel adapter (`knl_adapter`).** The Ports a device is built from: what
+  turns a provider, or a source of tools, into the two values `knl.beat` reads.
+  - `adapter.anthropic:open(conf)` and `adapter.openai:open(conf)` answer the
+    `llm` closure a device takes. `conf` is `llm_proto` vocabulary (`model`,
+    `api_key`, `max_tokens`, `thinking`, `tool_choice`, …) and is forwarded
+    verbatim; the wire format, request building, parsing and retry are
+    `llm_proto`'s and are not reimplemented here.
+  - A call that did not come off answers `nil, { kind, retryable, retry_after?,
+    message, status? }`, with `kind` one of `knl.shapes.call_error_kinds` — the
+    classification `policy.retry` decides on. A provider's private vocabulary
+    (how it says it refused, what its statuses mean) stays inside that
+    provider's Port.
+  - `adapter.tool(port)` and `adapter.tools(list)` build the tools map a device
+    takes, keyed by the declared name with a collision a loud error, from flat
+    specs or from `ToolPort`s (`declare()` / `invoke(args)`).
+    `adapter.mcp_tools(server, opts?)` binds a connected MCP server's tools
+    under the same `<server>__<tool>` namespace the agent block uses.
+  - Full doc: `blocks/lib/knl_adapter/init.lua`.
+- **Policy pack (`policy`).** Five values that plug into a device seam or into
+  the caller's loop. Each is opt-in one at a time, none holds state, and the
+  ones that need history read the log — so two drivers reach the same verdict
+  and a resumed session is judged on its whole run.
+  - `policy.window{ tail }` — a `fold` over the last `tail` beats, which then
+    calls the kernel's own fold rather than assembling a second one.
+  - `policy.carry{ max_bytes?, failed? }` — a binder (`policy.carry{...}(session)`)
+    answering a `filter` that puts one bounded note about the beat that failed
+    in front of the next request. `failed` is the caller's predicate over a tool
+    pair, for tools that report a failure by returning one rather than raising.
+  - `policy.stagnation{ same?, no_progress?, signature? }` — the predicate a
+    loop asks between beats, answering `nil`, `"repeated"` or `"no_progress"`.
+    What to do about it stays in the loop.
+  - `policy.retry{ kinds?, max? }` — `fn(outcome, attempt) -> boolean,
+    retry_after?`, over an `error` Outcome only, deciding on `detail.retryable`
+    or on the kinds named and never on an HTTP status.
+  - `policy.escalate{ strong, when? }` — `fn(outcome, device) -> device`: the
+    device that came in, or one derived with the stronger llm. It changes the
+    tool, it does not hand the work to anyone.
+  - Full doc: `blocks/lib/policy/init.lua`.
+- **Supervisor pack (`supervisor`).** The shell layer that runs the session
+  structure the kernel only records. It holds no state and no loop.
+  - `supervisor.child(parent, { budget = { amount, tag? } }, fn)` opens a child
+    inside the kernel's own bracket, so a child closes before its parent. A
+    parent balance that would not cover the allocation is `nil, err` with
+    `err.kind == "refused"`; a body that raised is re-raised.
+  - `supervisor.parallel(parent, children, opts?)` runs siblings at once in one
+    `std.task` scope — `joiner = "isolate" | "cancel_on_error"`, `timeout_ms?` —
+    and answers one result slot per entry, aligned by index.
+  - `supervisor.merge(parent, sessions, opts?)` is a `fold` that reads several
+    sessions into one request, in the order they were given.
+  - Full doc: `blocks/lib/supervisor/init.lua`.
+- **Kernel storage: a real session is a file.** A session opened without a
+  `store` writes to the database the host owns, one per project —
+  `{base_dir}/projects/<slug>/knl.sqlite` — so every session a project's scripts
+  open is a stream in that one file, a tree opened from a default parent is a
+  tree in one database, and `knl.resume{ session = id }` reopens a stream by id
+  alone.
+  - `AGENT_BLOCK_KNL_PATH` replaces that path whole.
+  - `store = "mem"` has to be asked for by name and is for tests and mocks: one
+    session, one process, nothing shared. It is not a lighter version of the
+    default — shared-cache locking is per table there, so a second writer meets
+    `SQLITE_LOCKED` at once and opening a child on a `mem` parent is refused
+    rather than made to wait. `store = { sqlite = "<path>" }` is a file the
+    caller picked.
+  - Full doc: the ENV table in `crates/agent-block-core/src/bridge/config.rs`
+    and the *Storage backend* section of
+    `crates/agent-block-core/src/bridge/knl.rs`.
+- **The async rule: the VM thread never waits on the OS.** The Lua VM's thread
+  is the only worker of its own runtime — it drives every coroutine that VM
+  owns, their timers and their cancellation — so anything that parked it stopped
+  all of them.
+  - Kernel syscalls yield: `knl.open` / `knl.resume` and every session method
+    that touches the log are async, so `s:append(...)` suspends the coroutine
+    instead of the VM. Nothing about the Lua changes — `pcall`, a `<close>`
+    scope ending and a `for` over beats all yield in Lua 5.4. `id` / `scope_id`
+    / `owner`, `knl.new_beat_id`, `knl.error` and `knl.api` answer out of the
+    value and stay synchronous.
+  - `std.ts` sits on its own connection thread, like the kernel's store, and
+    `std.sql` / `std.kv` run each statement on the blocking pool with the lock
+    taken there. Either way the statement leaves the VM thread.
+  - A host task reaching user Lua — a bus or mesh handler, an injected host
+    tool, `tool.call` — goes through a coroutine rather than a synchronous call,
+    so a handler may await `std.task.sleep`, `std.sql`, `std.ts` or a session
+    method and suspend only itself.
+  - The batteries' blocking entries (`std.time.sleep`, `std.proc.pipeline`,
+    `std.http.*`, `std.fs.*`) are replaced at start with async ones; Lua-side
+    names, arguments, returns and error messages are unchanged. The one thing
+    that does not work is handing a function that calls one of them to
+    `std.time.measure`, which calls its argument synchronously.
+  - With the per-call JSONL dump gone (see Removed), nothing on the VM thread
+    does synchronous file I/O.
 
 ### Fixed
 

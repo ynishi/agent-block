@@ -150,11 +150,13 @@ end
 --- Read a raised kernel failure back as data — `{ kind?, method?, retryable,
 --- message }`, `knl.shapes.error`.
 ---
---- The reader is the BRIDGE's (`knl.error`), not the Lua module's: a Rust
---- callback cannot raise a table, so it raises the attributed text `knl:
---- <method>: <kind>: <message>` and publishes the reading beside it. The
---- lookup is lazy for the same reason knl's own is — a spec that installs a
---- bridge after this module loaded still reaches it.
+--- The reader is the BRIDGE's (`knl.error`), which the Lua module re-exports
+--- under the same name: a Rust callback cannot raise a table, so it raises the
+--- attributed text `knl: <method>: <kind>: <message>` and publishes the reading
+--- beside it. This pack goes to the global rather than through the module
+--- because it is the same one function either way and the global is one lookup
+--- fewer. The lookup is lazy for the same reason knl's own is — a spec that
+--- installs a bridge after this module loaded still reaches it.
 ---
 --- A VM with no bridge gets the same fields with nothing read out of them, so
 --- a caller's `err.message` is always there and `err.kind` is the field it has

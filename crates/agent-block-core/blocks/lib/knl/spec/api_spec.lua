@@ -222,6 +222,12 @@ describe("knl.shapes.api — every export is declared", function()
             "beat",
             "fold",
             "new_beat_id",
+            -- The bridge's two readers, re-exported: two tables answer to the
+            -- name `knl`, and a script whose `local knl = require("knl")`
+            -- shadowed the global could reach neither. Named here so losing
+            -- them again is a failure rather than a shorter walk above.
+            "error",
+            "api",
             "Outcome",
             "views",
             "shapes",
@@ -229,6 +235,31 @@ describe("knl.shapes.api — every export is declared", function()
             expect(K[name]).to.exist()
             expect(api[name]).to.exist()
         end
+    end)
+
+    it("re-exports the bridge's readers, and says so rather than indexing nil", function()
+        -- This VM has no bridge on purpose, so what is checked is the lookup:
+        -- both are functions on the module, and both report the absence — the
+        -- same answer `new_beat_id` gives, and not an error about a nil value.
+        for _, name in ipairs({ "error", "api" }) do
+            expect(type(K[name])).to.be("function")
+            local ok, err = pcall(K[name], "knl: append: closed: gone")
+            expect(ok).to.be(false)
+            expect(tostring(err):find("the knl syscall bridge is not available", 1, true) ~= nil).to.be(true)
+        end
+    end)
+
+    it("declares them with the bridge's own types, and an executable arg", function()
+        -- `returns` points at the generated type the syscall is declared with
+        -- (a shape where the host loaded `knl_types`, the sentence naming it
+        -- here) — the same value `knl.shapes.module` holds. `args` cannot: the
+        -- gate RUNS it, so it carries a shape in every VM this file runs in.
+        expect(api.error.returns).to.be(K.shapes.module.error.returns)
+        expect(api.api.returns).to.be(K.shapes.module.api.returns)
+        expect(is_arg_list(api.error.args)).to.be(true)
+        expect(#api.error.args).to.be(1)
+        expect(is_arg_list(api.api.args)).to.be(true)
+        expect(#api.api.args).to.be(0)
     end)
 end)
 
