@@ -483,6 +483,48 @@ index change is required.
 
 Storage: `AGENT_BLOCK_HOME/ts.sqlite` (override via `AGENT_BLOCK_TS_PATH`; `:memory:` supported).
 
+### Embedded blocks: four layers
+
+The `blocks/` directory is baked into the binary, so `require("agent")` works after
+`cargo install` with no path configuration. A filesystem copy of a module normally wins
+over the embedded one — but the four layers below differ in whether that is the intended
+way to change them.
+
+| layer | modules | how to change it |
+|---|---|---|
+| kernel + declaration | `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | **Sealed** — a filesystem copy fails the run rather than replacing the module. The kernel is one thing across Rust and Lua, held together by declaration tests a Lua-side replacement would pass while meaning something else. Change it upstream. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning, for work on the kernel itself and not for shipping. |
+| shell packs | `policy`, `supervisor` | Do not shadow: a pack is a value you hand to `knl.device` or consult in your own loop, not a registry the host reads. Write your own pack beside them and pass that. For a partial change, delegate through `embedded.<name>`. |
+| consumers | `agent`, `compile_loop`, `coding_agent` | Copy-on-write is the intended way — drop your own `blocks/agent/init.lua` in the project root and it is the `agent` your scripts get. For a partial change, delegate through `embedded.<name>`. |
+| utilities | `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Shadowing works, but `knl_adapter` requires `llm_proto` and `mcp_tools`, so replacing either replaces a sealed module's dependency. Prefer delegation. |
+
+Resolution order, highest priority first: the script's own directory →
+`project_root/blocks/` → `exe_dir/blocks/` → embedded. The seal is checked once at start
+over those filesystem roots, before the script runs; the error names the module and the
+file that would have replaced it.
+
+Delegation — a shadowing module reaching the one it replaced:
+
+```lua
+-- project_root/blocks/agent/init.lua
+local base = require("embedded.agent")
+local M = setmetatable({}, { __index = base })
+function M.run(opts) print("OVERRIDE"); return base.run(opts) end
+return M
+```
+
+`embedded.<name>` resolves from memory and only from memory: every embedded module is
+registered a second time under that prefix, ahead of the filesystem roots, so a
+`blocks/embedded/` directory cannot stand in for it. The alias evaluates the embedded
+source under its own name, which means `require("agent")` (yours) and
+`require("embedded.agent")` (the base) are two tables — exactly the pair the idiom needs.
+It exists for sealed modules too: `require("embedded.knl")` reads the kernel, which is
+fine; replacing it is what the seal refuses.
+
+Promotion runs the other way. A block that starts as `project_root/blocks/<name>/init.lua`
+and proves general becomes an embedded lib by a change upstream — the same file, moved
+under `crates/agent-block-core/blocks/` and listed in `EMBEDDED_LIBS`. Projects still
+carrying their own copy keep resolving to it until they delete it.
+
 ### agent (StdPkg — `require("agent")`)
 
 Built-in ReAct loop module. Available without any path configuration after `cargo install`.
@@ -631,10 +673,10 @@ Key behaviours:
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
-- The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
+- `agent` is a consumer block: a local `blocks/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 - No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
-### compile_loop (Filesystem block — `require("compile_loop")`)
+### compile_loop (StdPkg — `require("compile_loop")`)
 
 Tool factory for the autonomous compile-and-fix loop. The primary surface is
 `compile_loop.make(conf)`, which returns a `tool_def` consumable directly by `agent.run`.
@@ -648,8 +690,8 @@ the model can decline to call cannot carry "it compiles".
 `max_iters` is the session's grant, so the iteration ceiling is the budget: the beat
 past it stops with nothing called.
 
-Place `blocks/tools/compile_loop/init.lua` in the project root (resolved via the filesystem
-`blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
+Embedded, and a consumer block: `blocks/compile_loop/init.lua` in the project root replaces
+it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 
 ```lua
 local compile_loop = require("compile_loop")
@@ -800,12 +842,13 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 | `crates/agent-block/examples/test_anthropic_compile_loop_multi.lua` | inline lua (multi-file) | Anthropic |
 | `tests/fixtures/compile_loop_range_mock.lua` | e2e fixture (oversized file, range read) | Anthropic |
 
-### coding_agent (Filesystem block — `require("coding_agent")`, thin facade)
+### coding_agent (StdPkg — `require("coding_agent")`, thin facade)
 
 Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
 new code. `coding_agent` is retained for existing callers.
 
-Place `blocks/tools/coding_agent/init.lua` in the project root.
+Embedded, and a consumer block: `blocks/coding_agent/init.lua` in the project root replaces
+it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 
 **`coding_agent.run(opts)`** — run the loop directly from Lua (facade over `compile_loop`).
 

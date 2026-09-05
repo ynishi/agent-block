@@ -94,6 +94,59 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Embedded modules a filesystem copy may not replace.
+///
+/// The rule: **a module is sealed when replacing it would break something the
+/// host, not the caller, is answerable for.** That is the kernel and its
+/// declaration layer — `knl` (the Lua half of the kernel/shell split),
+/// `knl_adapter` (the ports it runs against) and `knl_types` (the lshape
+/// declaration of the Rust syscall surface, generated at start) — plus the
+/// vendored `lshape` those three are written in, sub-modules included. The
+/// kernel is one thing across Rust and Lua and the two halves are held
+/// together by declaration tests; a Lua-side replacement passes those tests
+/// while meaning something else. Everything else in [`EMBEDDED_BLOCKS`] and
+/// [`EMBEDDED_LIBS`] stays shadowable.
+///
+/// Checked by [`check_sealed_modules`] at host start, against the same
+/// filesystem roots [`build_blocks_roots`] hands to the require registry. A
+/// sealed name found there fails the run; `AGENT_BLOCK_UNSEAL=1` downgrades
+/// the refusal to a `warn!` for work on the kernel itself. Reading a sealed
+/// module is not shadowing it: `require("embedded.knl")` always resolves to
+/// the embedded source (see [`EMBEDDED_ALIAS_PREFIX`]).
+///
+/// The README section "Embedded blocks: four layers" names this same set;
+/// `sealed_list_matches_the_readme` in this module's tests is the assertion
+/// that keeps the two from drifting.
+const SEALED: &[&str] = &[
+    "knl",
+    "knl_adapter",
+    "knl_types",
+    "lshape",
+    "lshape.t",
+    "lshape.check",
+    "lshape.reflect",
+    "lshape.luacats",
+];
+
+/// Prefix under which every embedded module is `require`-able a second time.
+///
+/// `require("embedded.agent")` is the embedded `agent` whatever
+/// `project_root/blocks/agent/init.lua` says, which is what lets a project
+/// block shadow a module and still delegate to the one it replaced:
+///
+/// ```lua
+/// local base = require("embedded.agent")
+/// local M = setmetatable({}, { __index = base })
+/// function M.run(opts) return base.run(opts) end
+/// return M
+/// ```
+///
+/// The alias evaluates the embedded source under its own name, so a module
+/// required both ways yields two tables. For the shadow-and-delegate case
+/// that is exactly one of each: `require("agent")` is the project's,
+/// `require("embedded.agent")` is the base it wraps.
+const EMBEDDED_ALIAS_PREFIX: &str = "embedded.";
+
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
 ///
 /// Runs the StdPkg `agent` module with `_PROMPT` / `_CONTEXT` injected and
@@ -337,6 +390,66 @@ fn build_blocks_roots(project_root: &Path) -> Vec<PathBuf> {
     }
 
     out
+}
+
+/// The two filesystem paths that would resolve `name` under `root`.
+///
+/// Mirrors `mlua_pkg::resolvers::FsResolver`: the module separator becomes a
+/// path separator, then `{name}.lua` is tried before `{name}/init.lua`.
+fn require_candidates(root: &Path, name: &str) -> [PathBuf; 2] {
+    let relative = name.replace('.', "/");
+    [
+        root.join(format!("{relative}.lua")),
+        root.join(format!("{relative}/init.lua")),
+    ]
+}
+
+/// Refuse the run when a filesystem root would shadow a [sealed](SEALED)
+/// module.
+///
+/// Runs once at host start, before any Isle exists, over exactly the roots the
+/// require registry is about to search — so a `blocks/knl/init.lua` stops the
+/// run rather than quietly becoming the kernel. `AGENT_BLOCK_UNSEAL=1` turns
+/// the refusal into a `warn!`; it exists for work on the kernel itself and is
+/// documented as such.
+fn check_sealed_modules(roots: &[PathBuf]) -> BlockResult<()> {
+    let unsealed = std::env::var("AGENT_BLOCK_UNSEAL").is_ok_and(|v| v == "1");
+
+    for root in roots {
+        for name in SEALED {
+            for path in require_candidates(root, name) {
+                if !path.is_file() {
+                    continue;
+                }
+                if unsealed {
+                    warn!(
+                        module = %name,
+                        path = %path.display(),
+                        "AGENT_BLOCK_UNSEAL=1: a sealed module is being replaced by a filesystem copy"
+                    );
+                    continue;
+                }
+                return Err(BlockError::Runtime(sealed_refusal(name, &path)));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The refusal text: which module, which file, and why this one is not
+/// yours to replace.
+fn sealed_refusal(name: &str, path: &Path) -> String {
+    format!(
+        "sealed module `{name}` cannot be shadowed: {} would replace the embedded one. \
+         The kernel is one thing across Rust and Lua — `knl` / `knl_adapter` / `knl_types` \
+         and the `lshape` they are declared in are held together by declaration tests, and a \
+         Lua-side replacement passes those tests while meaning something else. Change it \
+         upstream. To read the embedded module (wrapping it is fine, replacing it is not), \
+         `require(\"{EMBEDDED_ALIAS_PREFIX}{name}\")`. Set AGENT_BLOCK_UNSEAL=1 to downgrade \
+         this refusal to a warning — for work on the kernel itself, not for shipping.",
+        path.display()
+    )
 }
 
 /// Full configuration for a single [`run`] execution.
@@ -1071,6 +1184,9 @@ fn build_isle_init(
         //
         //   script_dir/  >  project_root/blocks/  >  exe_dir/blocks/  >  embedded
         //
+        // with one name space held out of it: `embedded.<name>` resolves from
+        // memory and only from memory (see below).
+        //
         // which is exactly the order `package.path` + the old trailing
         // searcher produced. The Registry hook installs at the FRONT of
         // `package.searchers`, so the filesystem resolvers must be listed
@@ -1080,6 +1196,25 @@ fn build_isle_init(
         // files that predate the Registry and anything a script requires
         // relative to itself.
         let mut registry = mlua_pkg::Registry::new();
+
+        // `embedded.<name>` — the escape hatch out of the priority chain, and
+        // the reason it is registered FIRST. Registration order is priority
+        // order (`mlua_pkg::Registry::add`), so a resolver ahead of the
+        // filesystem ones is the only way to say "this name comes from memory,
+        // whatever is on disk": a project that happens to have an
+        // `blocks/embedded/agent.lua` cannot make `require("embedded.agent")`
+        // mean something else, which would turn the delegation idiom into a
+        // second override. Every key here carries the prefix, so no
+        // unprefixed name is affected by the position.
+        let mut aliases = mlua_pkg::resolvers::MemoryResolver::new();
+        for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
+            aliases = aliases.add(format!("{EMBEDDED_ALIAS_PREFIX}{name}"), *source);
+        }
+        aliases = aliases.add(
+            format!("{EMBEDDED_ALIAS_PREFIX}knl_types"),
+            crate::bridge::knl::lshape_module_source(),
+        );
+        registry.add(aliases);
 
         let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
         fs_roots.extend(blocks_roots.iter().cloned());
@@ -1929,6 +2064,17 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // second pass via `isle.exec` below.
     let blocks_paths = build_blocks_path(&project_root);
     let blocks_roots = build_blocks_roots(&project_root);
+
+    // The seal, checked here because here is where the roots are known and
+    // still before an Isle exists: a project that would replace the kernel is
+    // told so instead of running with a kernel that is not the one the Rust
+    // side was declared against. Same roots, same order, as the require
+    // registry the init closure builds below.
+    let require_roots: Vec<PathBuf> = std::iter::once(script_dir_pathbuf.clone())
+        .chain(blocks_roots.iter().cloned())
+        .collect();
+    check_sealed_modules(&require_roots)?;
+
     let prompt = prompt_resolved.clone();
     let context = context_resolved.clone();
 
@@ -2104,5 +2250,128 @@ impl agent_mesh_sdk::RequestHandler for BusRelayHandler {
                 serde_json::json!({"error": "handler timeout"})
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sealed set is a promise made in prose as well as in code: README
+    /// section "Embedded blocks: four layers" names the kernel triple plus
+    /// `lshape` and its four sub-modules as the layer a project cannot
+    /// replace. Adding a name here without saying so there leaves a caller
+    /// reading a document that no longer describes the binary.
+    #[test]
+    fn sealed_list_matches_the_readme() {
+        assert_eq!(
+            SEALED,
+            [
+                "knl",
+                "knl_adapter",
+                "knl_types",
+                "lshape",
+                "lshape.t",
+                "lshape.check",
+                "lshape.reflect",
+                "lshape.luacats",
+            ]
+            .as_slice()
+        );
+    }
+
+    /// A sealed name that names nothing seals nothing. Every entry must be a
+    /// module the binary actually carries — `knl_types` is the generated one
+    /// with no file behind it, hence the extra arm.
+    #[test]
+    fn every_sealed_name_is_an_embedded_module() {
+        for name in SEALED {
+            let embedded = *name == "knl_types"
+                || EMBEDDED_BLOCKS
+                    .iter()
+                    .chain(EMBEDDED_LIBS.iter())
+                    .any(|(n, _)| n == name);
+            assert!(embedded, "sealed name `{name}` is not an embedded module");
+        }
+    }
+
+    /// The probe has to look where `FsResolver` looks, or it guards paths
+    /// nobody loads from.
+    #[test]
+    fn require_candidates_match_the_fs_resolver_layout() {
+        let root = Path::new("/p/blocks");
+
+        assert_eq!(
+            require_candidates(root, "knl"),
+            [
+                PathBuf::from("/p/blocks/knl.lua"),
+                PathBuf::from("/p/blocks/knl/init.lua"),
+            ]
+        );
+        // A dotted name is a path, the same way `require` reads it.
+        assert_eq!(
+            require_candidates(root, "lshape.t"),
+            [
+                PathBuf::from("/p/blocks/lshape/t.lua"),
+                PathBuf::from("/p/blocks/lshape/t/init.lua"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_root_is_not_a_shadow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        check_sealed_modules(&[tmp.path().to_path_buf()]).expect("nothing to seal against");
+    }
+
+    #[test]
+    fn a_shadowing_file_is_refused_by_name_and_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let knl = tmp.path().join("knl");
+        std::fs::create_dir_all(&knl).expect("mkdir");
+        std::fs::write(knl.join("init.lua"), "return {}").expect("write");
+
+        let err = check_sealed_modules(&[tmp.path().to_path_buf()])
+            .expect_err("a sealed module was shadowed");
+        let msg = err.to_string();
+
+        assert!(msg.contains("knl"), "the module is not named: {msg}");
+        assert!(
+            msg.contains(&knl.join("init.lua").display().to_string()),
+            "the file is not named: {msg}"
+        );
+        assert!(
+            msg.contains("AGENT_BLOCK_UNSEAL"),
+            "the escape hatch is not mentioned: {msg}"
+        );
+    }
+
+    /// The flat form (`lshape/t.lua`) is as much a replacement as the
+    /// directory form, and sub-modules are sealed individually.
+    #[test]
+    fn a_shadowing_sub_module_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lshape = tmp.path().join("lshape");
+        std::fs::create_dir_all(&lshape).expect("mkdir");
+        std::fs::write(lshape.join("t.lua"), "return {}").expect("write");
+
+        let err = check_sealed_modules(&[tmp.path().to_path_buf()])
+            .expect_err("a sealed sub-module was shadowed");
+        assert!(
+            err.to_string().contains("lshape.t"),
+            "the sub-module is not named: {err}"
+        );
+    }
+
+    /// Shadowing an unsealed block is the supported way to change one, so it
+    /// must survive the probe untouched.
+    #[test]
+    fn shadowing_an_unsealed_block_is_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).expect("mkdir");
+        std::fs::write(agent.join("init.lua"), "return {}").expect("write");
+
+        check_sealed_modules(&[tmp.path().to_path_buf()]).expect("`agent` is not sealed");
     }
 }
