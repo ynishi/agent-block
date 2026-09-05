@@ -671,7 +671,6 @@ local AGENT_OPTS = {
     on_turn = true,
     max_iterations = true,
     max_tokens_budget = true,
-    log_meta = true,
     sampling = true,
     on_progress = true,
     progress_to_log = true,
@@ -764,6 +763,42 @@ local function seed_message(session, message)
     end
 end
 
+--- The four correlation ids, as the env var each is read from and the `meta`
+--- key it becomes. These are the same variables `obs::obs_context` reads for
+--- the `ab.obs` http_request / http_response lines the http bridge writes, so
+--- a run's log events and its model calls carry one set of ids rather than
+--- two.
+local CORRELATION_ENV = {
+    { key = "trace_id", var = "AGENT_BLOCK_TRACE_ID" },
+    { key = "run_id", var = "AGENT_BLOCK_RUN_ID" },
+    { key = "agent_id", var = "AGENT_BLOCK_AGENT_ID" },
+    { key = "agent_name", var = "AGENT_BLOCK_AGENT_NAME" },
+}
+
+--- The seed event's labels: `label = "prompt"`, plus whichever correlation ids
+--- the environment set.
+---
+--- Only the keys that are set — an unset one, and an empty one, is absent
+--- rather than an empty string, so `json_extract(meta, '$.run_id')` answers
+--- NULL for a run that had none instead of matching every other run that also
+--- had none. Strings only, and flat: `meta` is the kernel's shallow label map
+--- (`knl.shapes.event_meta`).
+---
+--- `agent_id` is the one that can be absent while the obs lines still carry
+--- it: the http bridge falls back to a per-process id (`obs::process_agent_id`)
+--- that Lua is not given a reader for. Set `AGENT_BLOCK_AGENT_ID` and both
+--- sides say the same thing.
+local function prompt_meta()
+    local meta = { label = "prompt" }
+    for _, entry in ipairs(CORRELATION_ENV) do
+        local value = std.env.get(entry.var)
+        if value ~= nil and value ~= "" then
+            meta[entry.key] = value
+        end
+    end
+    return meta
+end
+
 --- The caller's prior thread, then the prompt. History is a durable record
 --- here rather than an argument: what `blocks/lib/session` saved is what this
 --- lays back down, and the fold reads the two the same way.
@@ -771,7 +806,7 @@ local function seed(session, opts)
     for _, message in ipairs(opts.history or {}) do
         seed_message(session, message)
     end
-    session:append({ kind = "msg_user", meta = { label = "prompt" }, data = { content = opts.prompt } })
+    session:append({ kind = "msg_user", meta = prompt_meta(), data = { content = opts.prompt } })
 end
 
 -- ============================================================
@@ -979,10 +1014,6 @@ end
 ---   on_turn         (optional) Callback function(turn_info). turn_info has
 ---                   keys: turn_number, content, tool_calls, usage.
 ---                   Returning false stops the run.
----   log_meta        (optional) External correlation ids. Accepted and not
----                   read: a run is named by its session id and a call by its
----                   beat id, and the four `ab.obs` ids the http bridge stamps
----                   come off the environment rather than off this table.
 ---   history         (optional) Prior messages array (e.g. from session.load).
 ---                   Laid down as the events they are made of before the new
 ---                   prompt, so the fold sees the full thread.
@@ -1010,6 +1041,16 @@ end
 ---   error      string  (when ok=false)
 ---   messages   table   (the thread, folded back out of the log)
 --- }
+---
+--- There is no correlation-id option. The run's seed event is stamped with
+--- `AGENT_BLOCK_TRACE_ID` / `_RUN_ID` / `_AGENT_ID` / `_AGENT_NAME` as `meta`
+--- labels — the same four the http bridge puts on its `ab.obs` lines — so a
+--- run's events are selected the way its model calls are grepped:
+---
+---     session:query("SELECT * FROM events WHERE json_extract(meta, '$.run_id') = ?",
+---                   { std.env.get("AGENT_BLOCK_RUN_ID") })
+---
+--- Only the variables that are set become labels; see `prompt_meta`.
 ---
 --- The contract is checked on the way out in dev mode (LSHAPE_CHECK=1); see
 --- `M.shapes.run_result`. Wrapped rather than asserted at each `return` because

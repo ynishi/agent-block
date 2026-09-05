@@ -139,6 +139,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MemoryResolver`), replacing the hand-rolled `package.searchers` hook. The
   priority chain is unchanged: script dir, then `project_root/blocks`, then
   `exe_dir/blocks`, then the embedded sources.
+- `agent.run`'s seed event carries the correlation ids. `AGENT_BLOCK_TRACE_ID`,
+  `AGENT_BLOCK_RUN_ID`, `AGENT_BLOCK_AGENT_ID` and `AGENT_BLOCK_AGENT_NAME` —
+  the four the HTTP bridge already stamps on its `ab.obs` lines — are read off
+  the environment and become `meta` labels on the `msg_user` the run seeds,
+  beside `label = "prompt"`. Only the ones that are set: an unset variable is
+  an absent label rather than an empty string, so
+  `json_extract(meta, '$.run_id')` answers NULL for a run that had none instead
+  of matching every other run that had none. `agent_id` is the one that can be
+  absent while the obs lines still carry it — the per-process id they fall back
+  to has no Lua reader. A run's events are now selected by the same id its
+  model calls are grepped by.
 - `-s / --script` is no longer required by clap, because a subcommand can now
   stand in for it; omitting both is still an error, raised by the CLI with a
   message naming both ways forward. `-p / --project` and `--mcp-timeout-secs`
@@ -171,8 +182,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent._llm_ctx_top` / `agent._log_meta` and `agent.shapes.log_meta`, the
   shims `compile_loop` reached for while it still ran its own loop and resolved
   its own correlation ids. Under the kernel a run is named by its session id and
-  a call by its beat id. `agent.run`'s `log_meta` option is still accepted and
-  still not read by the loop.
+  a call by its beat id.
+- **`agent.run`'s `log_meta` option.** It was accepted and never read — a table
+  a caller filled in and nothing consumed, which is worse than no option at
+  all. The ids it carried reach the log from the environment instead (see
+  Changed).
 - `on_turn`'s `info.context_management`. The payload the loop fires carries
   four keys — `turn_number`, `content`, `tool_calls`, `usage` — and the raw
   `response.context_management` Anthropic sends is no longer among them. The

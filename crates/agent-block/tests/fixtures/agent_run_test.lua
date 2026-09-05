@@ -66,6 +66,9 @@ local beats = {}
 local usage_rows = { { input_tokens = 1, output_tokens = 2, thinking_tokens = 0 } }
 -- What the bracket was opened with, so a case can read the grant.
 local opened_with = nil
+-- The session the last run wrote into, so a case can read what was appended
+-- rather than only what the fold made of it.
+local last_session = nil
 
 -- Whether the fake session reports its reads the way the kernel does when the
 -- row cap cut one short. A read answers `rows, truncated`, and the run's
@@ -89,7 +92,8 @@ end
 
 kernel.session = function(opts, fn)
     opened_with = opts
-    return fn(new_session())
+    last_session = new_session()
+    return fn(last_session)
 end
 
 kernel.beat = function(_s, _d)
@@ -323,5 +327,79 @@ describe("agent.run result contract", function()
         expect(res.messages[3].content[1].tool_use_id).to.equal("t1")
         expect(res.messages[3].content[1].content).to.equal("42")
         expect(res.messages[4].content).to.equal("and now?")
+    end)
+end)
+
+-- The ids are read from the environment rather than taken as an option, so the
+-- environment is what a case sets. `std.env.get` is the seam: swapped for the
+-- call and put back after, because the module reads it for the API key too.
+local function with_env(vars, fn)
+    local real_get = std.env.get
+    std.env.get = function(name)
+        return vars[name]
+    end
+    local ok, err = pcall(fn)
+    std.env.get = real_get
+    if not ok then
+        error(err, 0)
+    end
+end
+
+--- The `meta` of the event the run seeded its prompt with.
+local function seed_meta()
+    local events = last_session:events()
+    for _, ev in ipairs(events) do
+        if ev.kind == "msg_user" and ev.meta ~= nil and ev.meta.label == "prompt" then
+            return ev.meta
+        end
+    end
+    return nil
+end
+
+local function key_count(t)
+    local n = 0
+    for _ in pairs(t) do
+        n = n + 1
+    end
+    return n
+end
+
+describe("agent.run correlation ids", function()
+    -- The four the http bridge stamps on its own `ab.obs` lines. Reaching the
+    -- seed event as well is what lets a run's events be selected by the id its
+    -- model calls are grepped by.
+    it("labels the seed event with the ids the environment set", function()
+        beats = { answered("done") }
+        with_env({
+            AGENT_BLOCK_TRACE_ID = "t-1",
+            AGENT_BLOCK_RUN_ID = "r-1",
+            AGENT_BLOCK_AGENT_ID = "a-1",
+            AGENT_BLOCK_AGENT_NAME = "planner",
+        }, function()
+            expect(agent.run({ prompt = "ask" }).ok).to.equal(true)
+        end)
+
+        local meta = seed_meta()
+        expect(meta.label).to.equal("prompt")
+        expect(meta.trace_id).to.equal("t-1")
+        expect(meta.run_id).to.equal("r-1")
+        expect(meta.agent_id).to.equal("a-1")
+        expect(meta.agent_name).to.equal("planner")
+        -- Shallow, strings, and nothing else: `meta` is the kernel's label map.
+        expect(key_count(meta)).to.equal(5)
+        expect(check.check(meta, kernel.shapes.event_meta)).to.equal(true)
+    end)
+
+    -- Unset and empty are the same thing here. An empty label would match every
+    -- other run that also had none, which is worse than answering NULL.
+    it("carries only the label when none of them is set", function()
+        beats = { answered("done") }
+        with_env({ AGENT_BLOCK_RUN_ID = "", AGENT_BLOCK_AGENT_NAME = "" }, function()
+            expect(agent.run({ prompt = "ask" }).ok).to.equal(true)
+        end)
+
+        local meta = seed_meta()
+        expect(meta.label).to.equal("prompt")
+        expect(key_count(meta)).to.equal(1)
     end)
 end)

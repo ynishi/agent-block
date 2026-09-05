@@ -572,8 +572,6 @@ local result = agent.run({
     store       = "mem",                                -- optional; where the session log goes.
                                                         -- Omitted = the host's own database;
                                                         -- "mem" or { sqlite = <path> } otherwise.
-    log_meta    = { ... },                              -- accepted and not read: a run is named by
-                                                        -- its session id and a call by its beat id
 })
 
 if result.ok then
@@ -583,6 +581,17 @@ else
 end
 -- result fields: ok, content, usage{input_tokens,output_tokens,total_tokens}, num_turns, error, messages
 ```
+
+**Correlation ids**
+
+There is no option for them. `agent.run` reads `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_RUN_ID`, `AGENT_BLOCK_AGENT_ID` and `AGENT_BLOCK_AGENT_NAME` off the environment and stamps whichever are set onto the run's seed event as `meta` labels — the same four the HTTP bridge puts on its `ab.obs` `http_request` / `http_response` lines. So the session log is selected by the id the log lines are grepped by:
+
+```lua
+session:query("SELECT * FROM events WHERE json_extract(meta, '$.run_id') = ?",
+              { std.env.get("AGENT_BLOCK_RUN_ID") })
+```
+
+With `AGENT_BLOCK_AGENT_ID` unset the obs lines still carry a per-process id the host makes up, and the seed event carries no `agent_id`; set it and both sides agree.
 
 **Provider Switching**
 

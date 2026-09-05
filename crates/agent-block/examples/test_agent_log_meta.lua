@@ -1,9 +1,25 @@
--- test_agent_log_meta.lua — correlation ids on the model-call log lines.
+-- test_agent_log_meta.lua — correlation ids, from the environment to both
+-- places a run leaves a trace.
 --
--- Every model call the agent makes is logged as an `ab.obs` http_request /
--- http_response line carrying trace_id / agent_id / agent_name / run_id from
--- the environment (RUST_LOG=info makes them visible). The call itself is also
--- recorded in the session log (`llm_request` / `llm_response`).
+-- There is no option to pass them. `agent.run` reads AGENT_BLOCK_TRACE_ID /
+-- _RUN_ID / _AGENT_ID / _AGENT_NAME off the environment, and they land in two
+-- places from there:
+--
+--   * every model call is an `ab.obs` http_request / http_response line
+--     carrying the four as `trace_id=` / `run_id=` / `agent_id=` /
+--     `agent_name=` (RUST_LOG=info makes them visible);
+--   * the run's seed event carries the same four as `meta` labels beside
+--     `label = "prompt"`, so the session log is selected by the id the log
+--     lines are grepped by:
+--
+--       session:query(
+--           "SELECT * FROM events WHERE json_extract(meta, '$.run_id') = ?",
+--           { std.env.get("AGENT_BLOCK_RUN_ID") })
+--
+-- Only the variables that are set become labels. `agent_id` is the one that
+-- can differ: with AGENT_BLOCK_AGENT_ID unset the obs lines still carry a
+-- per-process id the Rust side makes up, and the seed event carries no
+-- `agent_id` at all — set it and both sides say the same thing.
 --
 -- Requires ANTHROPIC_API_KEY.
 -- Suggested run:
@@ -31,13 +47,6 @@ local result = agent.run({
     system = "You are concise and use tools when available.",
     max_tokens = 256,
     max_iterations = 4,
-    log_meta = {
-        -- Override explicitly, but keep env defaults easy to inject.
-        trace_id = std.env.get_or("AGENT_BLOCK_TRACE_ID", "demo-trace-id"),
-        agent_id = std.env.get_or("AGENT_BLOCK_AGENT_ID", "demo-agent-id"),
-        agent_name = std.env.get_or("AGENT_BLOCK_AGENT_NAME", "demo-agent-name"),
-        run_id = std.env.get_or("AGENT_BLOCK_RUN_ID", "demo-run-id"),
-    },
     on_turn = function(info)
         log.info(
             string.format(
