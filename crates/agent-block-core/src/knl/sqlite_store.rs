@@ -758,6 +758,17 @@ impl EventStore for SqliteEventStore {
             .map_err(KnlError::from)?
     }
 
+    async fn read_last(&self, n: usize) -> KnlResult<Vec<Value>> {
+        // `usize::MAX` caps at i64::MAX, which SQLite treats as "no limit";
+        // `0` reads nothing.  Same convention as `read_kinds` above.
+        let capped = i64::try_from(n).unwrap_or(i64::MAX);
+        let stream = self.stream.clone();
+        self.writer
+            .call(move |conn| finish(read_last_in(conn, &stream, capped)))
+            .await
+            .map_err(KnlError::from)?
+    }
+
     async fn head(&self) -> KnlResult<Option<u64>> {
         // A transient busy read must surface, not read as "empty": a caller
         // deciding open-vs-resume (or a CAS) on a swallowed error would
@@ -1433,6 +1444,41 @@ fn read_query(
     sql.push_str(" ORDER BY seq ASC LIMIT ?");
     args.push(SqlValue::Integer(limit));
     (sql, args)
+}
+
+/// The statement for the *last* `n` events of a stream, with its bound
+/// arguments.
+///
+/// `ORDER BY seq DESC LIMIT ?` — the index on `(stream, seq)` walks backwards
+/// and stops at `n`, so a `tail` of five over a log of a million reads five
+/// rows.  The rows come back newest-first and are reversed by the caller
+/// ([`read_last_in`]), because the SPI hands events over in `seq` order
+/// whichever end they were read from.
+fn read_last_query(stream: &str, n: i64) -> (String, Vec<SqlValue>) {
+    (
+        format!("SELECT {READ_COLUMNS} FROM events WHERE stream = ? ORDER BY seq DESC LIMIT ?"),
+        vec![SqlValue::Text(stream.to_string()), SqlValue::Integer(n)],
+    )
+}
+
+/// The last `n` events of `stream`, in `seq` order, read on the isle's thread.
+///
+/// Decodes exactly as [`read_in`] does — a row that will not decode is
+/// corruption and terminal — and reverses what SQLite handed back, so the
+/// caller sees the same ordering a range read gives.
+fn read_last_in(conn: &Connection, stream: &str, n: i64) -> Result<Vec<Value>, JobError> {
+    let (sql, args) = read_last_query(stream, n);
+    let mut stmt = conn.prepare(&sql).map_err(JobError::Sqlite)?;
+    let rows = stmt
+        .query_map(params_from_iter(args.iter()), read_row)
+        .map_err(JobError::Sqlite)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let row = row.map_err(JobError::Sqlite)?;
+        events.push(event_of(row).map_err(JobError::Terminal)?);
+    }
+    events.reverse();
+    Ok(events)
 }
 
 /// The events of `stream`, in `seq` order, read on the isle's thread.
@@ -2251,6 +2297,38 @@ mod tests {
 
         // A zero limit returns nothing even when events match.
         assert!(store.read(0, 0).await.expect("read").is_empty());
+    }
+
+    /// The last `n` come back in `seq` order, and the statement that fetched
+    /// them asked SQLite for `n` rows rather than for the stream.
+    ///
+    /// The query plan is the half that matters: `ORDER BY seq DESC LIMIT ?`
+    /// walks the `(stream, seq)` index backwards and stops, so the cost of a
+    /// `tail` is `n` and not the length of the log.  Reading the SQL here is
+    /// how that is held — the row count alone would pass just as well for a
+    /// backend that read everything and threw most of it away.
+    #[tokio::test]
+    async fn read_last_takes_the_end_of_the_stream_in_seq_order() {
+        let (sql, args) = read_last_query("s-1", 5);
+        assert!(
+            sql.contains("ORDER BY seq DESC LIMIT ?"),
+            "the read must stop at n rows: {sql}"
+        );
+        assert_eq!(args.len(), 2, "the stream and the cap are bound: {sql}");
+
+        let (mut store, _drivers) = mem_store().await;
+        for i in 1..=200 {
+            store.append(ev(i)).await.expect("append");
+        }
+
+        let tail = store.read_last(5).await.expect("read_last");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(kind_of(&tail[0]), "e196", "oldest of the five first");
+        assert_eq!(kind_of(&tail[4]), "e200", "the head last");
+
+        // The two edges: more than there is, and none at all.
+        assert_eq!(store.read_last(usize::MAX).await.expect("all").len(), 200);
+        assert!(store.read_last(0).await.expect("none").is_empty());
     }
 
     #[tokio::test]

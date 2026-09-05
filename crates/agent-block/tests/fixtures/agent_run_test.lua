@@ -67,6 +67,11 @@ local usage_rows = { { input_tokens = 1, output_tokens = 2, thinking_tokens = 0 
 -- What the bracket was opened with, so a case can read the grant.
 local opened_with = nil
 
+-- Whether the fake session reports its reads the way the kernel does when the
+-- row cap cut one short. A read answers `rows, truncated`, and the run's
+-- readback of its own thread is the one place in `agent.run` that flag reaches.
+local truncate_reads = false
+
 --- A session that records what is appended and hands it back verbatim: enough
 --- for `seed` to write into and for the real fold to read out of.
 local function new_session()
@@ -77,7 +82,7 @@ local function new_session()
             return #events
         end,
         events = function(_self)
-            return events
+            return events, truncate_reads
         end,
     }
 end
@@ -151,6 +156,29 @@ describe("agent.run result contract", function()
         expect(res.content).to.equal("the answer")
         expect(res.num_turns).to.equal(2)
         expect(res.usage.total_tokens).to.equal(3)
+        expect(check.check(res, agent.shapes.run_result)).to.equal(true)
+    end)
+
+    it("refuses to hand back a history it could not read whole", function()
+        -- The run's own thread is rebuilt from the log at the end, and the
+        -- read is bounded. A run can cross the cap on its last beat — the beat
+        -- read the log before writing its request, response and tool pairs —
+        -- so this is where it surfaces. `messages` is what a caller feeds back
+        -- as `history`, and a prefix missing the newest turns would seed the
+        -- next run with a conversation that stops in the middle. So the run
+        -- says so and carries none, rather than answering ok with a hole.
+        beats = { answered("the answer") }
+        truncate_reads = true
+        local res = agent.run({ prompt = "ask" })
+        truncate_reads = false
+
+        expect(res.ok).to.equal(false)
+        expect(res.error:find("longer than one read", 1, true) ~= nil).to.equal(true)
+        expect(res.error:find("history cannot be rebuilt whole", 1, true) ~= nil).to.equal(true)
+        expect(#res.messages).to.equal(0)
+        expect(res.num_turns).to.equal(1)
+        -- Still the declared failure shape: `ok = false` with an `error` and no
+        -- `content`, which is what a caller branches on.
         expect(check.check(res, agent.shapes.run_result)).to.equal(true)
     end)
 

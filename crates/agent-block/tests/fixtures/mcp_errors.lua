@@ -4,7 +4,7 @@
 
 -- Case 1: `connect` must surface a BlockError::Timeout when the
 -- child never completes the initialize handshake.
-local ok, err = pcall(mcp.connect, "stuck", "sleep", {"60"})
+local ok, err = pcall(mcp.connect, "stuck", "sleep", { "60" })
 if ok then
     error("expected connect to fail on sleep child")
 end

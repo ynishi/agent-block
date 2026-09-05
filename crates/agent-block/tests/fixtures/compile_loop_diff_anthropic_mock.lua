@@ -32,27 +32,27 @@ local function mock_runner(path)
     -- Execute the file and check for "world" in output.
     local p = io.popen("lua " .. path .. " 2>&1", "r")
     if not p then
-        return {ok=false, stderr="popen failed", stdout="", exit_code=-1}
+        return { ok = false, stderr = "popen failed", stdout = "", exit_code = -1 }
     end
     local out = p:read("*a") or ""
     p:close()
     local passed = out:find("world", 1, true) ~= nil
-    return {ok=passed, stdout=out, stderr="", exit_code=passed and 0 or 1}
+    return { ok = passed, stdout = out, stderr = "", exit_code = passed and 0 or 1 }
 end
 
 local td = compile_loop.make({
-    runner    = mock_runner,
+    runner = mock_runner,
     edit_mode = "diff",
     llm = {
         provider = "anthropic",
         base_url = base_url,
-        api_key  = "dummy",
-        model    = "claude-haiku-mock",
+        api_key = "dummy",
+        model = "claude-haiku-mock",
     },
 })
 
 local result_json = td.handler({
-    spec        = "change print(\"hello\") to print(\"world\")",
+    spec = 'change print("hello") to print("world")',
     target_file = target_file,
 })
 

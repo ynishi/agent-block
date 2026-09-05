@@ -316,9 +316,10 @@ pub const SESSION_API: &[(&str, &str)] = &[
     ),
     (
         "events",
-        "events(from?) -> array — the record from `from` on, as fresh tables in the shape it was \
-         written in (kind / beat / meta / data, plus the kernel's stamps) \
-         [raises: busy, storage, corruption]",
+        "events(from?) -> rows, truncated — the record from `from` on, as fresh tables in the \
+         shape it was written in (kind / beat / meta / data, plus the kernel's stamps), capped at \
+         the kernel's row limit; `truncated` says the cap cut the read short, and the rest is read \
+         by paging on `from` [raises: busy, storage, corruption]",
     ),
     (
         "len",
@@ -809,10 +810,21 @@ pub mod types {
         pub data: Json,
     }
 
-    /// The record from a position on: what `s:events(from?)` answers.
+    /// The record from a position on, as far as one read goes.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
     #[serde(transparent)]
     pub struct EventRows(pub Vec<EventRow>);
+
+    /// What `s:events(from?)` answers: the rows, and whether the row cap cut
+    /// the read short.
+    ///
+    /// A pair for the same reason [`QueryResult`] is one — that is what the
+    /// call returns, two values — and it carries the same second value for the
+    /// same reason: a read that stopped at the cap and a read that reached the
+    /// end of the stream are different facts, and a caller folding a request
+    /// out of the rows has to be able to tell them apart.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SchemaBridge)]
+    pub struct EventsResult(pub EventRows, pub bool);
 
     /// The values a statement binds.
     ///
@@ -1046,7 +1058,7 @@ pub mod types {
             ("OpenOpts", OpenOpts::to_schema(), Strict::Open),
             ("ResumeOpts", ResumeOpts::to_schema(), Strict::Open),
             ("AppendEvent", AppendEvent::to_schema(), Strict::Open),
-            ("EventRows", EventRows::to_schema(), Strict::Open),
+            ("EventsResult", EventsResult::to_schema(), Strict::Open),
             ("QueryParams", QueryParams::to_schema(), Strict::Open),
             ("QueryOpts", QueryOpts::to_schema(), Strict::Closed),
             ("QueryResult", QueryResult::to_schema(), Strict::Open),
@@ -1070,7 +1082,22 @@ pub mod types {
 /// ([`types::Strict::Closed`]) — so the module is assembled here from that
 /// crate's per-schema renderer, in the same layout, and the two tables whose
 /// extra keys are violations get the option appended.
+///
+/// **Built once per process.**  It is a pure function of types that are fixed
+/// at compile time, so the text it answers can only be one text; rendering
+/// every declared schema again on each call — the host's start, every
+/// `knl.api()` — was work whose result was known.  The `OnceLock` holds it and
+/// the call hands back a copy, which keeps the signature (and the caller that
+/// hands the source to `Lua::load`) exactly as it was.
 pub fn lshape_module_source() -> String {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(build_lshape_module_source).clone()
+}
+
+/// The body of [`lshape_module_source`], run once behind its `OnceLock`.
+fn build_lshape_module_source() -> String {
+    #[cfg(test)]
+    TYPES_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut out = String::from(
         "-- Generated at host start by agent-block-core from the argument and\n\
          -- return types of `bridge/knl.rs` (schema-bridge -> lshape). Not a file\n\
@@ -1439,29 +1466,44 @@ impl LuaUserData for Session {
                 .map_err(|e| knl_err("append", &e))
         });
 
-        // s:events(from?) -> array of event tables (deep copy)
+        // s:events(from?) -> rows, truncated
         //
         // K1: the returned tables are freshly built from the stored JSON
         // on every call, so mutating them cannot reach kernel state.
+        //
+        // Bounded, and it says when it cut.  A stream grows without bound and
+        // every row of a read is decoded, upcasted and built into a Lua table
+        // on the VM's own thread, so "the whole log" is not a size this call
+        // can promise.  It reads at most [`knl::DEFAULT_LIMIT`] rows — the
+        // same knob `query` caps on — and answers the pair `query` answers:
+        // the rows, and whether there were more.  A caller that wants the rest
+        // pages with `from`, and one that folds a request refuses a `true`
+        // rather than folding a history whose newest events are missing (the
+        // Lua kernel's `beat` does exactly that).
         methods.add_async_method("events", |lua, this, from: Option<u64>| async move {
             let selected = {
                 let state = this.state.lock().await;
+                // One more than the cap, so "there were more" is something the
+                // read answered rather than something a round count implies.
                 state
-                    .events(from.unwrap_or(0))
+                    .events(from.unwrap_or(0), knl::DEFAULT_LIMIT.saturating_add(1))
                     .await
                     .map_err(|e| knl_err("events", &e))?
                 // The guard is released here, before the conversion below.
             };
+            let truncated = selected.len() > knl::DEFAULT_LIMIT;
             // The events come out of the kernel as `Current` — the proof that
             // they were read through the upcaster seam — and that proof stops
             // at this boundary: what Lua gets is a table, so the objects are
             // taken back out here, at the one place they leave the kernel.
             let selected: Vec<Value> = selected
                 .into_iter()
+                .take(knl::DEFAULT_LIMIT)
                 .map(|event| Value::Object(event.into_inner()))
                 .collect();
             // The session is released above: json_to_lua re-enters Lua.
-            json_to_lua(&lua, Value::Array(selected))
+            let rows = json_to_lua(&lua, Value::Array(selected))?;
+            Ok((rows, truncated))
         });
 
         // s:len() -> number of recorded events
@@ -2374,6 +2416,49 @@ fn as_table<T: serde::Serialize>(lua: &Lua, method: &str, value: &T) -> LuaResul
 /// `knl_types` module as source text — the same one the host embeds — so a
 /// tool can read the argument and return shapes without loading them.
 fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
+    // Built once per process, like the types module it carries: every field of
+    // it is a pure function of compile-time constants — two `&'static` lists,
+    // the error vocabulary, the kernel's field names — and `schema` is a
+    // `PRAGMA table_info` against a private in-memory database created from a
+    // `const` DDL, so the answer cannot differ between two calls.  What was
+    // paid on each call was a SQLite open + CREATE TABLE + pragma and a full
+    // re-render of the types module.
+    //
+    // Only the *value* is cached.  A Lua table belongs to one VM, so the
+    // conversion below still runs per call — and it must, since a caller may
+    // mutate what it is handed.
+    //
+    // A failure is not cached: `events_schema` is fallible, and a store that
+    // could not be opened once is not a permanent answer about the surface.
+    let report = match API_REPORT.get() {
+        Some(report) => report,
+        None => {
+            let built = build_api_report()?;
+            API_REPORT.get_or_init(|| built)
+        }
+    };
+    as_table(lua, "api", report)
+}
+
+/// The declared surface, built once and held by [`api`].
+static API_REPORT: std::sync::OnceLock<types::ApiReport> = std::sync::OnceLock::new();
+
+/// How many times [`build_api_report`] actually ran, so a test can hold the
+/// cache to its promise rather than to a stopwatch.
+#[cfg(test)]
+static API_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times [`build_lshape_module_source`] actually ran, for the same
+/// reason.
+#[cfg(test)]
+static TYPES_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Build [`types::ApiReport`] from the places the reflection test holds the
+/// registration to.
+fn build_api_report() -> LuaResult<types::ApiReport> {
+    #[cfg(test)]
+    API_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     /// One `{ name, doc }` list, in declaration order.
     fn listed(entries: &[(&str, &str)]) -> Vec<types::ApiEntry> {
         entries
@@ -2421,15 +2506,14 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
         open_children: knl::FIELD_OPEN_CHILDREN.to_string(),
     };
 
-    let report = types::ApiReport {
+    Ok(types::ApiReport {
         session: listed(SESSION_API),
         module: listed(MODULE_API),
         errors: knl::KnlError::KINDS.iter().map(|k| k.to_string()).collect(),
         schema,
         fields,
         types: lshape_module_source(),
-    };
-    as_table(lua, "api", &report)
+    })
 }
 
 /// Register the `knl` global.  Two things come from the host and nothing else
@@ -2664,18 +2748,21 @@ mod generated_types {
                 ),
             ),
             (
-                "EventRows",
+                "EventsResult",
                 to(
                     lua,
-                    EventRows(vec![EventRow {
-                        kind: "msg_user".into(),
-                        seq: 2,
-                        epoch_ms: 1_700_000_000_000,
-                        _schema_version: 1,
-                        beat: None,
-                        meta: None,
-                        data: Json(json!({ "content": "hi" })),
-                    }]),
+                    EventsResult(
+                        EventRows(vec![EventRow {
+                            kind: "msg_user".into(),
+                            seq: 2,
+                            epoch_ms: 1_700_000_000_000,
+                            _schema_version: 1,
+                            beat: None,
+                            meta: None,
+                            data: Json(json!({ "content": "hi" })),
+                        }]),
+                        false,
+                    ),
                 ),
             ),
             (
@@ -3107,9 +3194,53 @@ mod tests {
             assert(tail[1].seq == 3 and tail[2].seq == 4)
             assert(#s:events(5) == 0, "past-the-end filter must be empty")
             assert(#s:events(0) == 4, "from=0 must return everything")
+
+            -- A read that reached the end of the stream says so.
+            local rows, truncated = s:events()
+            assert(#rows == 4 and truncated == false, "nothing was cut off")
         "#,
         )
         .expect("events(from) chunk");
+    }
+
+    /// `events` is bounded, and it says when the bound bit.
+    ///
+    /// The regression this pins: the read used to be `usize::MAX` — every
+    /// event of a stream decoded, upcasted and built into a Lua table on the
+    /// VM's own thread, with nothing but the caller's discretion between a
+    /// long-running session and the whole of its log in memory at once.  It
+    /// now stops at the kernel's row cap and answers the pair `query`
+    /// answers, so "there is more" is a fact the read reported rather than one
+    /// a caller has to infer from a suspiciously round count.
+    #[test]
+    fn events_stops_at_the_row_cap_and_says_it_cut() {
+        let vm = vm();
+        // The cap is the kernel's, so the chunk is written against it rather
+        // than against a number typed in twice.
+        let chunk = format!(
+            r#"
+            local cap = {cap}
+            -- An in-memory database on purpose: this seeds a thousand events
+            -- and the default store is a file, whose every commit is an fsync.
+            local s = knl.open({{ store = "mem" }})
+            -- The opening is already an event, so this is one past the cap.
+            for i = 1, cap do s:append({{ kind = "e" .. i }}) end
+            assert(s:len() == cap + 1, "seeded: " .. tostring(s:len()))
+
+            local rows, truncated = s:events()
+            assert(#rows == cap, "the read is capped: " .. tostring(#rows))
+            assert(truncated == true, "and it says the cap cut the read short")
+            assert(rows[1].seq == 1 and rows[cap].seq == cap, "the page is the front of the log")
+
+            -- The rest is read by paging on `from`, and that page is whole.
+            local rest, more = s:events(cap + 1)
+            assert(#rest == 1, "the remainder: " .. tostring(#rest))
+            assert(more == false, "and nothing is left after it")
+            assert(rest[1].seq == cap + 1, "seq: " .. tostring(rest[1].seq))
+        "#,
+            cap = knl::DEFAULT_LIMIT,
+        );
+        vm.exec(&chunk).expect("events cap chunk");
     }
 
     /// (attribution) `append` rejects a missing / non-string `kind` and a
@@ -5028,6 +5159,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The declared surface is built once and answered from there.
+    ///
+    /// `knl.api()` used to open an in-memory SQLite database, create the
+    /// events table in it, run `PRAGMA table_info` and re-render every
+    /// declared type into Lua source — on every call, for an answer that is a
+    /// pure function of types fixed at compile time.  What a caller gets must
+    /// still be its own table (a Lua value belongs to one VM, and a caller may
+    /// write to what it is handed), so this holds two things: the values are
+    /// equal, and the second call did not rebuild.
+    ///
+    /// Counted rather than timed, and read *after* a first call rather than
+    /// from zero: these statics are per-process, so another test in this
+    /// binary may have primed them already.
+    #[test]
+    fn the_declared_surface_is_built_once_and_the_table_is_fresh() {
+        use std::sync::atomic::Ordering;
+
+        let vm = vm();
+        let first: Vec<String> = vm
+            .eval(r#"local a = knl.api() return { a.types, a.schema.table }"#)
+            .expect("the first api() call");
+        let (api_builds, type_builds) = (
+            API_BUILDS.load(Ordering::Relaxed),
+            TYPES_BUILDS.load(Ordering::Relaxed),
+        );
+
+        let second: Vec<String> = vm
+            .eval(r#"local a = knl.api() return { a.types, a.schema.table }"#)
+            .expect("the second api() call");
+        assert_eq!(first, second, "two calls answer the same surface");
+        assert_eq!(
+            API_BUILDS.load(Ordering::Relaxed),
+            api_builds,
+            "the report was rebuilt on the second call"
+        );
+        assert_eq!(
+            TYPES_BUILDS.load(Ordering::Relaxed),
+            type_builds,
+            "the types module was re-rendered on the second call"
+        );
+        assert!(
+            !first[0].is_empty() && first[1] == knl::EVENTS_TABLE,
+            "and the answer is the real one: {first:?}"
+        );
+
+        // A caller writing to what it was handed does not reach the next
+        // caller: the cache is the value, and the table is made per call.
+        vm.exec(
+            r#"
+            local a = knl.api()
+            a.schema.table = "scribbled"
+            assert(knl.api().schema.table ~= "scribbled", "api() handed out a shared table")
+        "#,
+        )
+        .expect("api table freshness chunk");
     }
 
     /// A backend that is down surfaces as `storage`, not as the caller

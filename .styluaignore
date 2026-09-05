@@ -1,1 +1,2 @@
-tests/fixtures/
+# Deliberately unparseable: the fixture the syntax-error e2e loads.
+crates/agent-block/tests/fixtures/error_syntax.lua

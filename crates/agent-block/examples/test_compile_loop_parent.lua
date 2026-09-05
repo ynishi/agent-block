@@ -7,7 +7,7 @@
 -- Acceptance criteria verified here:
 --   - compile_loop tool is callable by the parent via tool_use
 --   - handler returns a JSON string with ok/iters/summary
---   - handler output does NOT contain "code" or "history" keys (Counter WF-A)
+--   - handler output does NOT contain "code" or "history" keys (the output filter)
 --
 -- Run:
 --   ANTHROPIC_API_KEY=sk-ant-... \
@@ -55,7 +55,7 @@ end
 -- ── Create compile_loop tool_def ──────────────────────────────────────────────
 -- opts are fixed at make time (provider / model / runner / max_iters).
 -- tool input (spec / target_file / lang) is merged at handler call time.
--- K-96: all LLM tuning fields are explicitly listed in the llm table.
+-- All LLM tuning fields are explicitly listed in the llm table.
 local td = compile_loop.make({
     runner = lua_runner,
     llm = {
@@ -170,15 +170,9 @@ assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
 assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
--- Acceptance #10 (Counter WF-A): code and history must NOT appear in tool output
-assert(
-    tool_output.code == nil,
-    "FAIL: tool_output.code is present — Counter WF-A defence breach (code leaked to Caller)"
-)
-assert(
-    tool_output.history == nil,
-    "FAIL: tool_output.history is present — Counter WF-A defence breach (history leaked to Caller)"
-)
+-- code and history must NOT appear in tool output
+assert(tool_output.code == nil, "FAIL: tool_output.code is present — code leaked to the caller")
+assert(tool_output.history == nil, "FAIL: tool_output.history is present — history leaked to the caller")
 
 log.info(
     "compile_loop result: ok="

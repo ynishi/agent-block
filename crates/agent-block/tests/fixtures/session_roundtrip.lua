@@ -10,9 +10,9 @@ print("first_count=" .. tostring(#first))
 
 -- 2. Save a 3-turn synthetic messages array and load it back.
 local synthetic = {
-    { role = "user",      content = "hello" },
+    { role = "user", content = "hello" },
     { role = "assistant", content = "hi there" },
-    { role = "user",      content = "how are you?" },
+    { role = "user", content = "how are you?" },
 }
 session.save(id, synthetic)
 

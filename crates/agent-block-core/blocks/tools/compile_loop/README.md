@@ -20,7 +20,7 @@ reasons are in the module doc at the head of `init.lua`; this file is the API su
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `runner` | `function` | yes | — | See §Runner signature |
-| `llm` | `table` | no | inherited | `{provider, base_url, api_key, api_key_env, model, max_tokens, temperature, disable_thinking, timeout}` |
+| `llm` | `table` | no | `{}` | Forwarded to the provider Port verbatim; nothing is inherited from a calling agent. `{provider, base_url, api_key, api_key_env, model, max_tokens, temperature, disable_thinking, timeout, …}` — every other key reaches `llm_proto` untouched, and an omitted `api_key` falls through to its env resolution |
 | `max_iters` | `int` | no | `5` | Maximum iterations before giving up |
 | `lang` | `string` | no | `"lua"` | Language hint for the LLM |
 | `name` | `string` | no | `"compile_loop"` | The returned def's name. Nothing is registered under it |
@@ -52,11 +52,12 @@ callers that supply only `target_file` continue to work unchanged.
 Classic behaviour: one target file, any `edit_mode`.
 
 ```lua
-local compile_loop = require("blocks/tools/compile_loop")
+local compile_loop = require("compile_loop")
+local agent = require("agent")
 
 local LUA_TIMEOUT = 60
 
-local tool = compile_loop.make({
+local td = compile_loop.make({
     edit_mode = "diff",
     runner = function(path)
         -- path is an absolute string
@@ -70,13 +71,10 @@ local tool = compile_loop.make({
 })
 
 local result = agent.run({
-    provider = "anthropic",
-    model    = "claude-haiku-4-5",
-    extra_tools = { tool },
-    messages = {{
-        role    = "user",
-        content = "Fix the script so it runs without errors.",
-    }},
+    provider    = "anthropic",
+    model       = "claude-haiku-4-5",
+    extra_tools = { td },
+    prompt      = "Fix the script so it runs without errors.",
 })
 ```
 
@@ -85,12 +83,12 @@ local result = agent.run({
 Multiple target files edited in a single loop. Requires `edit_mode = "diff"`.
 
 ```lua
--- pseudo (requires subtask-1 implementation)
-local compile_loop = require("blocks/tools/compile_loop")
+local compile_loop = require("compile_loop")
+local agent = require("agent")
 
 local CARGO_TIMEOUT = 300
 
-local tool = compile_loop.make({
+local td = compile_loop.make({
     edit_mode = "diff",
     runner = function(paths)
         -- paths is a list<string> of absolute paths
@@ -104,15 +102,13 @@ local tool = compile_loop.make({
 })
 
 local result = agent.run({
-    provider = "anthropic",
-    model    = "claude-haiku-4-5",
-    extra_tools = { tool },
-    messages = {{
-        role    = "user",
-        content = "Fix the failing tests across both files.",
-    }},
+    provider    = "anthropic",
+    model       = "claude-haiku-4-5",
+    extra_tools = { td },
+    prompt      = "Fix the failing tests across both files.",
 })
--- result.modified_files contains the list of absolute paths that were written
+-- The tool's own JSON carries modified_files: the absolute paths an edit
+-- landed in. `result` above is the parent agent's, not the loop's.
 ```
 
 ### How `diff` mode edits
@@ -205,10 +201,14 @@ end
 | `summary` | `string` | always |
 | `artifact_path` | `string\|nil` | single-file only (absolute path of the edited file) |
 | `modified_files` | `list<string>\|nil` | diff mode (absolute paths of every file an edit landed in, on every ending) |
-| `failure_reason` | `string\|nil` | on failure (`"max_iters"`, `"stagnation"`, `"no_edits_applied"`, `"llm_call"`, `"open_target_file"`) |
+| `failure_reason` | `string\|nil` | on failure (`"max_iters"`, `"stagnation"`, `"no_edits_applied"`, `"llm_call"`, `"open_target_file"`, `"stopped"`) |
 | `last_error` | `string\|nil` | on failure (bounded; the untruncated text is in the session log) |
 
 In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
+
+`"max_iters"` is the session's grant running out. `"stopped"` is the kernel
+stopping a beat for any other reason, which a caller should not normally see —
+`last_error` carries the kernel's word for it when it happens.
 
 The shape is closed (`compile_loop.shapes.tool_output`), which is how the run's
 transcript is kept out of the caller's context: there is no field for it, so

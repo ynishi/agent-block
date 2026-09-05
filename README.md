@@ -562,16 +562,18 @@ local result = agent.run({
         },
     },
     on_turn = function(info)                            -- optional per-turn callback
+        -- info keys: turn_number, content, tool_calls, usage. Returning false
+        -- stops the run.
         print("turn", info.turn_number, "#tools", #info.tool_calls)
-        -- info.context_management is present only on turns where the server fired
-        -- an edit; nil-guard before indexing applied_edits.
-        if info.context_management and info.context_management.applied_edits then
-            for _, edit in ipairs(info.context_management.applied_edits) do
-                print("  edit:", edit.type, "cleared", edit.cleared_tool_uses, "tool_uses")
-            end
-        end
     end,
     extra_tools = {},                                   -- optional extra Anthropic tool defs
+    tool_groups = { "outline" },                        -- optional; nil = every tool
+    history     = prior,                                -- optional prior messages (e.g. session.load)
+    store       = "mem",                                -- optional; where the session log goes.
+                                                        -- Omitted = the host's own database;
+                                                        -- "mem" or { sqlite = <path> } otherwise.
+    log_meta    = { ... },                              -- accepted and not read: a run is named by
+                                                        -- its session id and a call by its beat id
 })
 
 if result.ok then
@@ -672,7 +674,7 @@ Key behaviours:
 - Tool dispatch: MCP tools via `mcp.call()`, registered Lua tools via `tool.call()`.
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
-- `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
+- `on_turn(info)` is handed exactly four keys — `turn_number`, `content`, `tool_calls`, `usage` — and returning `false` from it stops the run. What the server did with context editing is not among them; the response that carried it is in the session log as `llm_response`.
 - `agent` is a consumer block: a local `blocks/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 - No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
@@ -788,16 +790,20 @@ diff/Edit-tool workflows and keeps the feedback loop simple and fast. For the la
 Sonnet/Opus with native edit-tool support, a diff-based block is a future consideration
 (separate issue; out of scope here).
 
-**Tool output JSON** (never contains `code` or `history` — Counter WF-A defence):
+**Tool output JSON** (never contains `code` or `history`: the run's transcript is the
+session log, and handing a caller one contaminates its context. The shape is closed, so
+there is no field a transcript could leave by):
 
 ```
 { ok, iters, summary, failure_reason?, last_error?, artifact_path }
 ```
 
 `failure_reason` values: `"llm_call"` | `"open_target_file"` | `"stagnation"` |
-`"no_edits_applied"` | `"max_iters"`. `modified_files` is present in diff mode (the paths
-whose edits landed, on every ending, including a give-up); `artifact_path` is the single
-path in single-file mode.
+`"no_edits_applied"` | `"max_iters"` | `"stopped"` (the kernel stopping a beat for a
+reason other than the grant, which a caller should not normally see; `last_error` carries
+the kernel's word for it). `modified_files` is present in diff mode (the paths whose edits
+landed, on every ending, including a give-up); `artifact_path` is the single path in
+single-file mode.
 
 **LLM resolution**: `conf.llm` is forwarded to the provider Port verbatim, and nothing is
 inherited from a calling agent — a device is passed, not discovered. An omitted `api_key`
@@ -847,6 +853,12 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
 new code. `coding_agent` is retained for existing callers.
 
+It is three things and nothing else: the two built-in runners below, one call to
+`compile_loop.make`, and the `tool.register` that `make` deliberately does not do. There
+is no loop here — iterations, the verify, the give-up gates and the result shape are all
+`compile_loop`'s. `edit_mode`, `tool_mode` and `extra_tools` are not on the facade's opts;
+a caller who wants them calls `compile_loop.make` directly.
+
 Embedded, and a consumer block: `blocks/coding_agent/init.lua` in the project root replaces
 it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 
@@ -879,7 +891,7 @@ local res = coding.run({
 --   artifact_path  string      absolute path of the target file
 --   iters          int
 --   summary        string      "PASS in N iters" or "give-up: <reason>"
---   failure_reason string?     "llm_call"|"open_target_file"|"stagnation"|"max_iters"
+--   failure_reason string?     see the compile_loop section above for the full set
 --   last_error     string?     last runner stderr (trimmed to 800 chars) on failure
 --
 -- NOTE: "code" and "history" fields are no longer returned (removed in this release).

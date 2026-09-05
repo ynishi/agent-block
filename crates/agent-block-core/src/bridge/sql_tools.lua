@@ -15,7 +15,7 @@ std.sql.register_tools = function(opts)
     local base_schema = {
         type = "object",
         properties = {
-            sql    = { type = "string" },
+            sql = { type = "string" },
             params = {
                 type = "array",
                 description = "Positional parameter values for ? placeholders.",

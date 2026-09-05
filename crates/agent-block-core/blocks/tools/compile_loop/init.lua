@@ -38,6 +38,12 @@
 --   verify's stderr (the same error three times), and a count kept here of
 --   iterations that applied no edit.
 --
+--   The loop's decisions are all in `run_loop` and nowhere else: the four
+--   `Outcome.match` arms (what ends a run before the verify), the verify's own
+--   verdict, the two give-up counters, and the message that goes back when it
+--   failed. `make` prepares its arguments and validates what a caller got
+--   wrong; `filter_for_tool_output` reads its result.
+--
 -- Two modes, and what each one is for
 --   `edit_mode = "full"` is a whole-file rewrite: no tools, one completion an
 --   iteration, the fenced block written to the target. It is the path for
@@ -65,9 +71,10 @@
 --   * No registration. `make` returns the tool_def; putting it in the global
 --     registry is the caller's call (`coding_agent.register_tool` does it).
 --
--- Counter WF-A defence: the handler's JSON never contains `code` or `history`.
+-- The context defence: the handler's JSON never contains `code` or `history`.
 -- The loop's transcript is the session log, and handing a caller a transcript
--- of every iteration contaminates its context.
+-- of every iteration contaminates its context. `TOOL_OUTPUT` is where that is
+-- enforced — it is closed, so there is no field a transcript could leave by.
 
 local M = {}
 
@@ -117,9 +124,9 @@ local RUNNER_RESULT = T.shape({
 --- What the tool handler gives back to whoever called it.
 ---
 --- Closed, and that is the point: the run carries a whole transcript in its
---- session log, and handing a caller one contaminates its context — the
---- Counter WF-A defence. Stated as a comment, that invariant holds until
---- someone adds a field; stated as a closed shape, adding one fails.
+--- session log, and handing a caller one contaminates its context. Stated as a
+--- comment, that invariant holds until someone adds a field; stated as a closed
+--- shape, adding one fails.
 ---
 --- `artifact_path` and `modified_files` are each other's alternative rather than
 --- both optional in spirit: single-file mode sets the first, multi-file the
@@ -254,6 +261,10 @@ local function make_summary(ok, iters, max_iters, reason)
         return string.format("give-up: llm_call failed at iter %d/%d", iters, max_iters)
     elseif reason == "open_target_file" then
         return string.format("give-up: open_target_file failed at iter %d/%d", iters, max_iters)
+    elseif reason == "log_truncated" then
+        -- The read that counts a beat's edits hit the kernel's row cap, so the
+        -- loop stopped rather than reading "no edits" off a partial log.
+        return string.format("give-up: the session log outgrew one read at iter %d/%d", iters, max_iters)
     end
     return string.format("give-up: %s", tostring(reason))
 end
@@ -285,6 +296,13 @@ end
 
 --- The text blocks of a response, joined. The kernel keeps blocks because the
 --- provider does; full mode wants one string to look for a fence in.
+---
+--- This, `error_text` and `refusal_text` below are the same functions
+--- `blocks/agent` carries, character for character: reading an Outcome is
+--- consumer plumbing and both consumers read it the same way. They are
+--- duplicated rather than shared because a shared module would have to be an
+--- embedded lib, and the two copies agree — a change to one belongs in the
+--- other on the same commit.
 local function text_of(content)
     local parts = {}
     for _, block in ipairs(content or {}) do
@@ -324,7 +342,7 @@ local function write_file(path, content)
     return true
 end
 
---- The failure-feedback user turn for full mode.
+--- The failure-feedback user message for full mode.
 ---
 --- Only the spec and the build's output: no tool names, no JSON schema, no
 --- tool_use vocabulary. Full mode's whole action space is a fenced block.
@@ -338,7 +356,7 @@ local function build_failure_msg(lang, rr)
     )
 end
 
---- The failure-feedback user turn for diff mode.
+--- The failure-feedback user message for diff mode.
 local function build_verify_msg(rr)
     return string.format(
         "The build FAILED after your edits. Fix it with more edits.\n\n=== stdout ===\n%s\n\n=== stderr ===\n%s\n\n=== exit_code ===\n%s",
@@ -349,7 +367,7 @@ local function build_verify_msg(rr)
 end
 
 --- The result, filtered for the tool boundary: `code` and the transcript are
---- not in the shape, so they cannot leave through it.
+--- not in `TOOL_OUTPUT`, so they cannot leave through it.
 local function filter_for_tool_output(res)
     return shape.assert_dev({
         ok = res.ok,
@@ -490,6 +508,11 @@ end
 --- callers have always written. A flat entry passes through; a flat entry that
 --- spells the schema field `schema` reaches `knl_adapter`'s loud error rather
 --- than the provider with no schema.
+---
+--- `blocks/agent`'s `extra_candidates` does the same normalization with one
+--- deliberate difference: there, an entry with no handler is a DECLARATION that
+--- dispatches through the Lua registry. Here `make` has already refused it —
+--- this loop's device carries the tools it built and no registry behind them.
 local function extra_spec(t)
     if t.schema ~= nil then
         return {
@@ -566,15 +589,35 @@ end
 --- in the recorded result. What an edit MEANT to this loop is the loop's, and
 --- the log is where it reads it from.
 ---
+--- A READ THAT WAS CUT SHORT IS NOT AN ANSWER OF ZERO. `session:events()` is
+--- bounded and reports it (knl's header), and the cap counts forward from the
+--- start of the log — so what a truncated read is missing is the END, which is
+--- exactly the beat this is looking for. Folding it would report "no edits
+--- applied" for a beat that edited every target, and the loop would give up
+--- (or count a stagnation) over a hole in the read. A bounded tail read is no
+--- way out either: the bound is in EVENTS and a beat writes one pair per tool
+--- call, so a window can begin in the middle of this beat and lose the
+--- `tool_call` half of a pair whose `tool_result` it kept — the same wrong
+--- count, arrived at more quietly. So it answers `nil, <why>` and the loop
+--- ends the run with it.
+---
 --- @param session userdata|table  a knl session
 --- @param beat_id string  the beat whose pairs to read
 --- @param edit_name string  the edit tool's name
 --- @param modified table  path set, added to
---- @return number  how many edits applied
+--- @return number|nil  how many edits applied, or nil when the log did not fit
+--- @return string|nil  why, when the count could not be taken
 local function beat_edits(session, beat_id, edit_name, modified)
     local edited_by_call = {}
     local applied = 0
-    for _, ev in ipairs(session:events()) do
+    local events, truncated = session:events()
+    if truncated then
+        return nil,
+            "the session log is longer than one read of it ("
+                .. #events
+                .. " events, the kernel's row cap), so this beat's edits cannot be counted"
+    end
+    for _, ev in ipairs(events) do
         if ev.beat == beat_id then
             local data = type(ev.data) == "table" and ev.data or {}
             -- A pair is looked up by its call id, so a record that carries none
@@ -695,7 +738,7 @@ end
 -- The loop
 -- ============================================================
 
---- The first user turn: the spec, plus what the mode needs beside it.
+--- The first user message: the spec, plus what the mode needs beside it.
 local function seed_content(conf, targets, diff, lang)
     if diff then
         local lines = {}
@@ -821,7 +864,15 @@ local function run_loop(conf)
             local code, applied = nil, 0
 
             if diff then
-                applied = beat_edits(s, answer.beat, edit_name, modified)
+                local unread
+                applied, unread = beat_edits(s, answer.beat, edit_name, modified)
+                if applied == nil then
+                    -- Not "no edits": the count could not be taken at all, so
+                    -- the run ends here rather than giving up over a hole.
+                    failure_reason = "log_truncated"
+                    last_error = tail(unread, LAST_ERROR_MAX)
+                    break
+                end
             else
                 -- A response cut off at max_tokens is half a file. Writing it
                 -- would hand the runner code the model never finished, and the
@@ -890,7 +941,7 @@ local function run_loop(conf)
                 break
             end
 
-            -- The failure goes back as the next user turn. The verify is a
+            -- The failure goes back as the next user message. The verify is a
             -- caller's kind, which the fold skips — a record of what happened
             -- rather than a message — so what the model is told is said here.
             local feedback
@@ -1103,6 +1154,10 @@ function M._test_helpers()
         pair_failed = pair_failed,
         verify_signature = verify_signature,
         port_conf = port_conf,
+        -- Reads a session, but only through `events()`, so a table answering
+        -- that one method is a whole stand-in — no kernel needed to hold it to
+        -- what it counts, or to what it refuses to count.
+        beat_edits = beat_edits,
     }
 end
 

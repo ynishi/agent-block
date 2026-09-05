@@ -64,7 +64,8 @@
 ---   [0]   the gate: a knl session first, a knl device second, an `llm` on
 ---         the device — any of the three missing is `Outcome.err("conf")`
 ---   [0.5] the beat names itself (`knl.new_beat_id`)
----   [1]   request = `device.fold(session:events(), device)`
+---   [1]   request = `device.fold(session:events(), device)` — a read that
+---         hit the row cap is refused here rather than folded
 ---   [2]   the filter chain, each `fn(request) -> request`
 ---   [3]   `session:reserve(device.cost(request))` — the beat's whole
 ---         deduction, taken before the call; a refusal stops here, with
@@ -145,6 +146,14 @@
 ---   do not grow: the record from a position on, and `tail` (the last `n`
 ---   events, verbatim). A fold whose consumer is not fixed in kernel terms
 ---   never becomes a name here.
+---
+---   BOTH ARE BOUNDED. `tail` reads `n` rows from the end, and `events`
+---   answers `rows, truncated` — at most the kernel's row cap, the same one
+---   `query` uses — because a stream grows and every row of a read is decoded
+---   and built into a Lua table on the VM's thread. `truncated` is the fact a
+---   caller cannot infer: it says the cap cut the read short and the rest is
+---   further on, read by paging `from`. `knl.beat` refuses one rather than
+---   folding a record whose newest events are missing.
 ---
 ---   QUERY VIEW — a named Lua function that runs ONE `SELECT`. The log is a
 ---   SQLite table whose columns the kernel publishes (`knl.shapes.schema`),
@@ -522,6 +531,22 @@ end
 ---   their own dialect: `llm_proto`'s adapters normalise them into these
 ---   blocks on the way in and render them back to the provider's wire on the
 ---   way out, so fold never sees a provider-specific shape.
+---
+--- What it is handed, and what it does not check
+---   `events` is a WHOLE record, and this function takes that on trust: it is
+---   an array, and an array carries no mark saying a read of it stopped early.
+---   Whoever read the log knows — `session:events()` answers `truncated`
+---   beside the rows — and that is where the refusal is (`knl.beat` [1]),
+---   because the callers that hand arrays in are not all reading a session:
+---   `supervisor.merge` folds query rows, and a caller's own fold may build
+---   the list itself.
+---
+---   It does not repair content either, beyond closing a dangling `tool_use`.
+---   An `llm_response` recorded with an empty `content` array folds to an
+---   assistant message whose content is `[]`, verbatim — see the pinned shape
+---   in `knl/spec/device_spec.lua`. Nothing here decides whether a provider
+---   will take that; a filter that means to drop or fill such a turn is a
+---   filter, and it has the request to work on.
 ---
 --- @param events table  array of stored events (from `session:events()`)
 --- @param device table  a knl device (any table carrying system / tools)
@@ -1064,6 +1089,17 @@ local LLM_RESULT = T.discriminated("status", {
 --- parent's balance covered, the refusal is in the log, and nothing is
 --- wrong — so it is not retryable either, because the same balance answers
 --- the same way until an owner grants more.
+---
+--- `unsupported` is the one class NOTHING REACHABLE FROM HERE RAISES. It is
+--- the store SPI's own: a backend that keeps no queryable table, or keeps one
+--- stream and so cannot write two in a transaction, answers with it — and the
+--- only backend the host has does both. The two cases a caller might expect it
+--- for come back as `validation` instead, with a message that says which
+--- argument was wrong: a child asked for on a `"mem"` parent, and an unknown
+--- `view` name. It is declared here because the kernel publishes it
+--- (`knl.api().errors`, held against this list in `knl_beat_test.lua` inv10)
+--- and because a store may still return it; it is not a branch a shell needs
+--- to write today.
 local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported", "timeout", "refused" }
 
 --- A raised kernel failure, read back as data (`knl.error(e)`).
@@ -1252,7 +1288,11 @@ M.shapes.session = {
     scope_id = { args = "none", returns = RUST.ScopeId },
     owner = { args = "none", returns = RUST.Owner },
     append = { args = { RUST.AppendEvent }, returns = RUST.Seq },
-    events = { args = { RUST.Seq }, returns = RUST.EventRows },
+    -- The record from a position on, and whether the read stopped at the
+    -- kernel's row cap. The pair is `query`'s, for the same reason: a page and
+    -- a whole answer are different facts, and a fold over the first is a
+    -- request missing its newest turns.
+    events = { args = { RUST.Seq }, returns = RUST.EventsResult },
     len = { args = "none", returns = RUST.Count },
     -- The one built-in fold beside `events`: the last `n` records, verbatim.
     -- Token usage used to be the second name here and is not one any more —
@@ -2264,13 +2304,34 @@ function M.beat(session, device)
     -- pcall'd separately from the fold so the two failures keep their own
     -- kinds — the state that could not be read, or the policy that could
     -- not fold it.
-    local read_ok, events = pcall(session.events, session)
+    local read_ok, events, truncated = pcall(session.events, session)
     if not read_ok then
         -- The kernel's own reading of its own failure: `events` holds the
         -- raise on this path, and what a caller needs off it (which class,
         -- whether asking again is worth anything) is in the table, not in
         -- a sentence somebody would have to parse.
         return emit(Outcome.err("state", read_error(events)))
+    end
+    -- A read that stopped at the kernel's row cap is not this history. The
+    -- cap counts FORWARD from `from`, so what a truncated read is missing is
+    -- the END — the most recent turns, the ones a request is mostly about —
+    -- and folding it would send the model a conversation that stops in the
+    -- middle and looks, from the other side, exactly like a conversation that
+    -- ended there. So the beat refuses instead, here at the read, which is
+    -- the only place the fact is known: `fold` is a pure function of an event
+    -- array (a caller's own fold, and `supervisor.merge`, hand it arrays that
+    -- never came from this call at all) and has nothing to read the flag off.
+    --
+    -- Unattributed, like any raise the bridge did not classify: this is not
+    -- one of the kernel's error classes, it is the shell declining to build a
+    -- request out of a partial record.
+    if truncated then
+        return emit(Outcome.err("state", {
+            retryable = false,
+            message = "knl.beat: the history is longer than one read of it, and a fold over a "
+                .. "truncated record would leave out the most recent events; page it with "
+                .. "session:events(from) or fold a window (policy.window)",
+        }))
     end
     -- The fold is the caller's code, so its failures are traced (dev mode).
     local folded_ok, request = xpcall(device.fold, traced, events, device)

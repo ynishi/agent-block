@@ -45,6 +45,12 @@
 --           end
 --       end)
 --
+--   The loop's decisions are all in `run_loop`, in the four `Outcome.match`
+--   arms and nowhere else: what ends a run (a settled answer, an exhausted
+--   grant, a failed or refused beat, a caller's `on_turn` answering false),
+--   and what the token budget does when it is crossed. Everything above
+--   `run_loop` prepares its arguments; everything below reads its result.
+--
 --   The vocabulary below is the kernel's — session, device, beat, Outcome,
 --   budget. "Turn" survives in one place only: the keys of the `on_turn`
 --   payload, which callers read.
@@ -161,6 +167,13 @@ local MCP_CALL_RESULT = T.shape({
 -- ============================================================
 -- Reading an answer
 -- ============================================================
+--
+-- `text_of` here and `error_text` / `refusal_text` below are the same functions
+-- `blocks/tools/compile_loop` carries, character for character: reading an
+-- Outcome is consumer plumbing and both consumers read it the same way. They
+-- are duplicated rather than shared because a shared module would have to be
+-- an embedded lib, and the two copies agree — a change to one belongs in the
+-- other on the same commit.
 
 --- The `tool_use` blocks of a response, in block order. This is what
 --- `on_turn` has always been handed as `tool_calls`, and what the loop counts
@@ -917,7 +930,30 @@ local function run_loop(opts, provider, candidates, max_iter)
         -- The thread, rebuilt from the log by the same fold the requests were
         -- built with, so what a caller saves and hands back as `history` is
         -- what this run actually sent.
-        local messages = kernel.fold(s:events(), device).messages
+        --
+        -- The read is bounded and says when it cut (knl's header). A run can
+        -- cross the cap on its last beat — the beat itself read the log before
+        -- writing its request, response and tool pairs — so this readback is
+        -- where it shows up. There is no half-history worth handing over:
+        -- `messages` is what a caller feeds back as `history`, and a prefix
+        -- missing the newest turns would seed the next run with a conversation
+        -- that stops in the middle. So the run reports it and carries none.
+        local recorded, truncated = s:events()
+        if truncated then
+            local cut = "the session log is longer than one read of it ("
+                .. #recorded
+                .. " events, the kernel's row cap), so this run's history cannot be rebuilt whole"
+            return {
+                ok = false,
+                -- A failure that already ended the loop is what the caller
+                -- needs first; this is why there are no messages beside it.
+                error = failure ~= nil and (failure .. "; " .. cut) or cut,
+                usage = usage,
+                num_turns = turns,
+                messages = {},
+            }
+        end
+        local messages = kernel.fold(recorded, device).messages
         if failure ~= nil then
             return { ok = false, error = failure, usage = usage, num_turns = turns, messages = messages }
         end
@@ -1037,10 +1073,13 @@ end
 -- Internals exposed for the specs
 -- ============================================================
 
-M._build_tools = build_tools -- internal: for tests only
-M._registry_candidates = registry_candidates -- internal: for tests only
-M._extra_candidates = extra_candidates -- internal: for tests only
-M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
+-- The tool-set builders, for tests only. One surface, not two: they used to be
+-- reachable both here and through `M._test_helpers()`, and the fixtures only
+-- ever reached for these.
+M._build_tools = build_tools
+M._registry_candidates = registry_candidates
+M._extra_candidates = extra_candidates
+M._resolve_mcp_group = resolve_mcp_group
 
 --- The contracts this module holds itself to, as data.
 ---
@@ -1055,6 +1094,12 @@ M.shapes = {
 
 --- Pure internal helpers, for unit tests only. No side effects beyond the
 --- std/log globals they read.
+---
+--- The three `proto_openai` entries are re-exports, not this module's code:
+--- they are the only coverage `llm_proto`'s OpenAI finish-reason mapping and
+--- message conversion have, and they are reached through here because that is
+--- where the spec that covers them already runs. The tool-set builders are NOT
+--- here — `M._build_tools` and friends above are their one surface.
 function M._test_helpers()
     return {
         map_finish_reason = proto_openai.map_finish_reason,
@@ -1062,10 +1107,6 @@ function M._test_helpers()
         convert_messages_to_openai = proto_openai.convert_messages,
         tool_use_blocks = tool_use_blocks,
         text_of = text_of,
-        build_tools = build_tools,
-        registry_candidates = registry_candidates,
-        extra_candidates = extra_candidates,
-        resolve_mcp_group = resolve_mcp_group,
     }
 end
 

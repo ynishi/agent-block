@@ -1062,6 +1062,46 @@ describe("beat contract hardening (review findings)", function()
         expect(o.detail.message:find("database is locked", 1, true) ~= nil).to.be(true)
     end)
 
+    it("a read that hit the row cap is Error('state') and nothing is called", function()
+        -- `session:events()` is bounded and answers `rows, truncated`. The cap
+        -- counts forward from `from`, so a truncated read is missing the END
+        -- of the history — the most recent turns — and folding it would send
+        -- the model a conversation that stops in the middle and looks, from
+        -- the other side, like a conversation that ended there. The beat
+        -- refuses at the read instead: no reservation, no request, no call.
+        local s = K.open({ budget = { amount = 10, tag = "beats" } })
+        s:append({ kind = "msg_user", data = { content = "q" } })
+        local rows = s._events
+        s.events = function()
+            return rows, true
+        end
+
+        local called = 0
+        local o = K.beat(
+            s,
+            K.device({
+                llm = function()
+                    called = called + 1
+                    return stub_llm("x")()
+                end,
+            })
+        )
+
+        expect(Outcome.is_error(o)).to.be(true)
+        expect(o.kind).to.be("state")
+        expect(called).to.be(0)
+        -- Nothing was reserved and nothing was recorded: the log holds the
+        -- seed and no more.
+        expect(s:remaining()).to.be(10)
+        expect(#rows).to.be(1)
+        -- Unclassified, like any raise the bridge did not attribute — this is
+        -- the shell declining to build a request, not a kernel error class.
+        expect(type(o.detail)).to.be("table")
+        expect(o.detail.kind).to.be(nil)
+        expect(o.detail.retryable).to.be(false)
+        expect(o.detail.message:find("truncated record", 1, true) ~= nil).to.be(true)
+    end)
+
     it("a store that is busy comes back classified and retryable", function()
         -- The bridge attributes what it raises — `knl: <method>: <kind>:
         -- <message>` — and beat reads it back rather than passing the
@@ -1494,6 +1534,51 @@ describe("fold hardening (review findings)", function()
         expect(closing[1].tool_use_id).to.be("c1")
         expect(closing[2].tool_use_id).to.be("c2")
         expect(closing[2].is_error).to.be(true)
+    end)
+
+    -- What an assistant turn that said nothing folds to.
+    --
+    -- An `llm_response` can be recorded with an empty `content`: the adapter
+    -- tags the empty array so it crosses the JSON boundary as `[]`, and the
+    -- kernel stores what it is given. This pins the request that comes back
+    -- out of it, exactly, so "would a provider take this?" is a question with
+    -- a concrete input to try by hand rather than a guess about the fold.
+    --
+    -- Nothing here decides whether that request is acceptable. If it turns out
+    -- a provider rejects an assistant message with no content, THIS is the
+    -- shape a repair filter would have to change — drop the message, or put a
+    -- placeholder block in it — and it would be a filter, in the device, not a
+    -- rule inside `fold`: the fold reads the record and the record says the
+    -- turn happened and was empty.
+    it("an assistant turn recorded with no content folds to an empty content array", function()
+        local events = {
+            { kind = "msg_user", data = { content = "go" }, seq = 1 },
+            {
+                kind = "llm_response",
+                beat = "b1",
+                data = { content = {}, usage = { input_tokens = 1, output_tokens = 0 } },
+                seq = 2,
+            },
+        }
+        local req = K.fold(events, {})
+
+        -- Two messages: the seed, and the empty assistant turn — the turn is
+        -- kept, not skipped. A fold that dropped it would be inventing a
+        -- history in which the model was never asked.
+        expect(#req.messages).to.be(2)
+        expect(req.messages[1].role).to.be("user")
+        expect(req.messages[2].role).to.be("assistant")
+
+        -- And its content is the empty array verbatim: same table, no
+        -- placeholder block, nothing added.
+        expect(req.messages[2].content).to.be(events[2].data.content)
+        expect(#req.messages[2].content).to.be(0)
+
+        -- The whole request, spelled out, so the shape is pinned and not
+        -- merely counted: no system, no tools, and two messages.
+        expect(req.system).to.be(nil)
+        expect(req.tools).to.be(nil)
+        expect(req.messages[1].content).to.be("go")
     end)
 
     it("an answered tool pair needs no repair (no synthetic results)", function()

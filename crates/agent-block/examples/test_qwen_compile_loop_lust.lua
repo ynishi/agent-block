@@ -90,7 +90,7 @@ Output ONLY the file contents in a single ```lua ... ``` block.]]
 
 log.info("compile_loop + mlua-probe lust runner. Target: " .. TARGET)
 
--- K-96: all LLM tuning fields are explicitly listed in the llm table.
+-- All LLM tuning fields are explicitly listed in the llm table.
 local td = compile_loop.make({
     runner = lust_runner,
     llm = {
@@ -166,9 +166,9 @@ assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
 assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
--- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
-assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
+-- code / history must NOT appear in tool output
+assert(tool_output.code == nil, "code leaked to caller")
+assert(tool_output.history == nil, "history leaked to caller")
 
 log.info(string.format("ok=%s iters=%s", tostring(tool_output.ok), tostring(tool_output.iters)))
 if tool_output.failure_reason then

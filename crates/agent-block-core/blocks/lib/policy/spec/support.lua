@@ -195,6 +195,22 @@ function M.seed(session, text)
     return session
 end
 
+--- Make `session` answer its reads the way the kernel does when the row cap
+--- cut one short: the rows it holds, and `true` beside them.
+---
+--- The fake answers a single value, like every read that reached the end of a
+--- stream, so this is how a spec puts the other case in front of a policy. The
+--- rows are the ones already recorded — a truncated read is a real prefix of a
+--- real log, not an empty one, which is exactly what makes it dangerous to
+--- fold.
+function M.truncate(session)
+    local rows = session._events
+    session.events = function()
+        return rows, true
+    end
+    return session
+end
+
 --- The recorded kinds in seq order, as one comparable string.
 function M.kinds(session)
     local names = {}

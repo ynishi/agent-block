@@ -53,9 +53,6 @@ end
 
 assert(callback_done, "the on_progress callback never finished")
 print(string.format("TICKS_DURING_CALLBACK=%d", during))
-assert(
-    during >= 3,
-    "the VM stopped while the callback awaited: " .. tostring(during) .. " tick(s)"
-)
+assert(during >= 3, "the VM stopped while the callback awaited: " .. tostring(during) .. " tick(s)")
 
 print("FIXTURE_DONE")

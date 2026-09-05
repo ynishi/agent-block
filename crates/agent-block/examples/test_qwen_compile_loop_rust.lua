@@ -52,8 +52,8 @@ Output ONLY the file contents in a single ```rust ... ``` block.]]
 
 log.info("Running compile_loop Rust task: " .. PROJ)
 
--- K-96: all LLM tuning fields are explicitly listed in the llm table.
--- timeout is placed inside the llm table per K-96 (subtask-2.md §Constraints).
+-- All LLM tuning fields are explicitly listed in the llm table.
+-- timeout is placed inside the llm table.
 local td = compile_loop.make({
     runner = cargo_runner,
     llm = {
@@ -128,9 +128,9 @@ assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
 assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
--- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
-assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
+-- code / history must NOT appear in tool output
+assert(tool_output.code == nil, "code leaked to caller")
+assert(tool_output.history == nil, "history leaked to caller")
 
 log.info(string.format("ok=%s iters=%s", tostring(tool_output.ok), tostring(tool_output.iters)))
 if tool_output.failure_reason then

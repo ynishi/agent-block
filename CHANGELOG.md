@@ -47,8 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classification rather than status class: rate limits, overload, and 5xx are
   retried with `retry-after` honoured, while exhausted spend / quota (HTTP 429
   with `enforced_spend_limit_reached`, `insufficient_quota`, …) is not.
-- `usage.thinking_tokens` is accumulated in the budget tracker and emitted in
-  the `ab.llm` summary dump.
+- `usage.thinking_tokens` is normalized on both provider paths and recorded on
+  every `llm_response`, so `knl.views.usage` totals it and `agent.run`'s
+  `usage` carries it. (The budget tracker and the `ab.llm` summary dump this
+  entry originally named are both gone — see Removed.)
 - `embedded.<name>` — every embedded module is `require`-able a second time
   under that prefix, resolving from memory and only from memory (the alias
   resolver sits ahead of the filesystem roots, so a `blocks/embedded/`
@@ -171,6 +173,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own correlation ids. Under the kernel a run is named by its session id and
   a call by its beat id. `agent.run`'s `log_meta` option is still accepted and
   still not read by the loop.
+- `on_turn`'s `info.context_management`. The payload the loop fires carries
+  four keys — `turn_number`, `content`, `tool_calls`, `usage` — and the raw
+  `response.context_management` Anthropic sends is no longer among them. The
+  response it rode on is recorded whole as `llm_response` in the session log,
+  which is where a caller that needs it reads it. The `context_management` /
+  `context_management_config` REQUEST options are unaffected.
+- `agent._test_helpers()`'s `build_tools` / `registry_candidates` /
+  `extra_candidates` / `resolve_mcp_group`. The same four functions were
+  reachable as `agent._build_tools` and friends, which is what every fixture
+  used; two accessors for one set of internals meant a spec could be written
+  against the surface nobody else was watching. The `agent._*` names are the
+  surviving surface. `_test_helpers()` keeps the helpers that have no other name:
+  `tool_use_blocks`, `text_of`, and the three `llm_proto` OpenAI re-exports.
+- `coding_agent.run`'s `name = "compile_loop"` on the conf it built. The def it
+  makes is called, never registered, so the name never reached anything.
 - `AGENT_BLOCK_LLM_DUMP_DIR` and the per-call JSONL dump it wrote at the HTTP
   primitive, along with the `dump = "full"` request flag that opted into it.
   The kernel's session log already records every model call — `llm_request`,
@@ -1015,7 +1032,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     time when omitted (Crux #2: `_AGENT_LLM_CTX` stack resolution).
   - **Tool input** (`spec`, `target_file`, `lang?`) is supplied by the calling LLM at tool-call
     time; factory `conf` fixes the runner and LLM policy at registration time.
-  - **Counter WF-A defence**: handler output JSON never contains `code` or `history` fields
+  - **Output filter**: handler output JSON never contains `code` or `history` fields
     to prevent caller context contamination.
   - **Stagnation detection**: when `STAGNATION_WINDOW = 3` consecutive iterations produce
     identical runner `stderr`, the loop gives up immediately (`failure_reason = "stagnation"`).
@@ -1023,7 +1040,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `failure_reason = "max_iters"` when the iteration ceiling is reached.
   - **Structured result**: `{ ok, iters, summary, failure_reason?, last_error?, artifact_path }`.
   - **Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
-    etc.) are both fully implemented with the same K-96 field set
+    etc.) are both fully implemented with the same field set
     (`provider`, `base_url`, `api_key`, `api_key_env`, `model`, `max_tokens`, `temperature`,
     `disable_thinking`, `timeout`).
   - **Side-effect**: `tool.register(name, schema, handler)` is called by `make()` so the

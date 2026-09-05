@@ -1,8 +1,13 @@
--- test_agent_log_meta.lua — structured LLM dump + external metadata example.
+-- test_agent_log_meta.lua — correlation ids on the model-call log lines.
+--
+-- Every model call the agent makes is logged as an `ab.obs` http_request /
+-- http_response line carrying trace_id / agent_id / agent_name / run_id from
+-- the environment (RUST_LOG=info makes them visible). The call itself is also
+-- recorded in the session log (`llm_request` / `llm_response`).
 --
 -- Requires ANTHROPIC_API_KEY.
 -- Suggested run:
---   AGENT_BLOCK_LLM_DUMP=meta \
+--   RUST_LOG=info \
 --   AGENT_BLOCK_TRACE_ID=trace-xyz \
 --   AGENT_BLOCK_AGENT_ID=agent-42 \
 --   AGENT_BLOCK_AGENT_NAME=planner \
