@@ -417,9 +417,21 @@ describe("retries", function()
         local res, err = ask(anthropic_backend())
 
         expect(res).to.equal(nil)
-        expect(err).to.equal("API error 400 (invalid_request)")
+        expect(err).to.equal("API error 400 (invalid_request): HTTP 400")
         expect(#requests).to.equal(1)
         expect(sleeps).to.equal(0)
+    end)
+
+    it("carries the server's own explanation on a 400", function()
+        reset()
+        -- vLLM answers with a top-level `message`, not the OpenAI-nested
+        -- `error.message`; both must reach the caller's error string.
+        table.insert(queue, { status = 400, response = { message = "maximum context length exceeded" } })
+
+        local res, err = ask(anthropic_backend())
+
+        expect(res).to.equal(nil)
+        expect(err).to.equal("API error 400 (invalid_request): maximum context length exceeded")
     end)
 
     it("gives up after max_retries and reports the last status", function()
@@ -430,7 +442,7 @@ describe("retries", function()
         local res, err = ask(anthropic_backend({ max_retries = 1 }))
 
         expect(res).to.equal(nil)
-        expect(err).to.equal("API error 429 (rate_limit)")
+        expect(err).to.equal("API error 429 (rate_limit): HTTP 429")
         expect(#requests).to.equal(2)
         expect(sleeps).to.equal(1)
     end)

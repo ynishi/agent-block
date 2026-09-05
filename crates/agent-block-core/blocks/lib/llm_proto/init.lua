@@ -221,7 +221,9 @@ function M.classify_error(status, body, headers)
     if not code and type(err.details) == "table" then
         code = err.details.error_code
     end
-    local message = err.message or ("HTTP " .. tostring(status))
+    -- OpenAI-compat nests the explanation under `error.message`; vLLM answers
+    -- with a top-level `message`. Either is the server saying what went wrong.
+    local message = err.message or decoded.message or ("HTTP " .. tostring(status))
 
     local retry_after
     for k, v in pairs(headers or {}) do
@@ -462,7 +464,11 @@ function M.transport(wire, opts)
 
     if resp.status ~= 200 then
         local classified = M.classify_error(resp.status, resp.body, resp.headers)
-        return nil, "API error " .. tostring(resp.status) .. " (" .. classified.kind .. ")"
+        -- The server's own explanation rides along: a 400 that only says
+        -- "invalid_request" leaves the caller with no way to tell a context
+        -- overflow from a malformed body.
+        return nil,
+            "API error " .. tostring(resp.status) .. " (" .. classified.kind .. "): " .. tostring(classified.message)
     end
 
     local ok_decode, raw = pcall(std.json.decode, resp.body)
