@@ -533,6 +533,45 @@ async fn on_progress_callback_receives_envelope() {
     ct.cancel();
 }
 
+/// Case (a2): an `on_progress` callback may await an async battery.
+///
+/// The callback in `mcp_on_progress_async_battery.lua` calls
+/// `std.task.sleep`, which yields. While notifications were delivered by a
+/// Rust closure through `AsyncIsle::exec` there was a C-call boundary between
+/// the callback and its coroutine, and this fixture would fail with
+/// "attempt to yield across a C-call boundary". Dispatch now goes through
+/// `coroutine_call("__mcp_dispatch_notify", …)`.
+///
+/// `TICKS_DURING_CALLBACK` is the second half: the main script ticks in its
+/// own coroutine while the callback is parked, so a non-zero count is the VM
+/// still running rather than blocked behind the callback.
+#[tokio::test]
+async fn on_progress_callback_may_await_an_async_battery() {
+    let (url, ct) = spawn_progress_http_server().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url_clone = url.clone();
+    tokio::task::spawn_blocking(move || {
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("mcp_on_progress_async_battery.lua")])
+            .env("MCP_HTTP_URL", &url_clone)
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CONNECT_HTTP_OK"))
+            .stdout(predicate::str::contains("CALL_OK"))
+            // The line after `std.task.sleep` inside the callback was reached.
+            .stdout(predicate::str::contains("PROGRESS_ASYNC_OK"))
+            // Sibling coroutine made progress while the callback was parked.
+            .stdout(predicate::str::is_match(r"TICKS_DURING_CALLBACK=[1-9][0-9]*").unwrap())
+            .stdout(predicate::str::contains("FIXTURE_DONE"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    ct.cancel();
+}
+
 /// Case (b): `mcp.on_log` callback is registered and the envelope is dispatched
 /// when a server with logging capability sends a log notification.
 ///
