@@ -252,10 +252,10 @@ end
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
--- Keep this list in sync with the other two copies: blocks/tools/compile_loop/init.lua
--- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
--- site is a superset: these exact names plus the ab.obs substring policy
--- (token / secret / password / api_key / access_key / private_key / ...).
+-- Keep this list in sync with the other copy in
+-- blocks/tools/compile_loop/init.lua (sanitize_headers_for_dump); the test
+-- redaction_list_is_mirrored_in_both_lua_blocks in src/bridge/http.rs fails
+-- when the two drift apart.
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
@@ -1155,8 +1155,6 @@ function M._run_impl(opts)
         api_key = opts.api_key,
         api_key_env = opts.api_key_env,
         cache_control = opts.cache_control,
-        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-        dump = (resolve_dump_mode_cached() == "full") and "full" or nil,
     }
     local log_meta = build_log_meta(opts)
 

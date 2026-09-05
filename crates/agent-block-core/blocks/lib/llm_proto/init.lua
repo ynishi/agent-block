@@ -423,7 +423,7 @@ end
 --- disagree. A caller that must not raise (the Port) pcalls this.
 ---
 --- @param wire table  { url, headers, body } from an adapter's build
---- @param opts table|nil  { max_retries?, timeout?, dump?, on_request?,
+--- @param opts table|nil  { max_retries?, timeout?, on_request?,
 ---                          on_response? } — the two callbacks are
 ---                          observability only and their return is not read
 --- @return table|nil raw  the decoded response JSON
@@ -448,7 +448,6 @@ function M.transport(wire, opts)
         headers = wire.headers,
         body = body_json,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
-        dump = opts.dump,
     }, tonumber(opts.max_retries) or DEFAULT_MAX_RETRIES)
     local latency_ms = math.floor((std.time.now() - started) * 1000)
 
@@ -525,7 +524,7 @@ end
 ---
 --- @param conf table {
 ---   provider, model, api_key, api_key_env, base_url, headers, max_tokens,
----   timeout, dump, thinking, tool_choice, ... — forwarded to the adapter,
+---   timeout, thinking, tool_choice, ... — forwarded to the adapter,
 ---   max_retries  (default 2) transient API failures only
 ---   on_request   function({ url, headers, body, body_json }) before the POST
 ---   on_response  function({ status, headers, body, latency_ms }) after it
@@ -579,7 +578,6 @@ function M.backend(conf)
         local raw, terr, meta = M.transport(built, {
             max_retries = max_retries,
             timeout = conf.timeout,
-            dump = conf.dump,
             on_request = conf.on_request,
             on_response = conf.on_response,
         })

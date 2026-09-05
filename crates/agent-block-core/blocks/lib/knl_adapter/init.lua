@@ -290,7 +290,7 @@ end
 --- @param conf table  Forwarded verbatim to the Port's build (model, api_key,
 ---                     max_tokens, thinking, tool_choice, ...). Shim-level keys
 ---                     (handed to `llm_proto.transport`, which owns their
----                     defaults): max_retries, timeout, dump.
+---                     defaults): max_retries, timeout.
 --- @return function llm  function(request) -> resp | nil, err, where resp is
 ---                       { status, content, usage, stop_reason, refusal? } and
 ---                       err is a `knl.shapes.call_error`
@@ -326,7 +326,6 @@ function LLMPort:open(conf)
         local transported, raw, terr = pcall(proto.transport, wire, {
             max_retries = conf.max_retries,
             timeout = conf.timeout,
-            dump = conf.dump,
             on_response = function(answer)
                 if type(answer) == "table" then
                     seen.status = answer.status

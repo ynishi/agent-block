@@ -15,8 +15,7 @@ const REDACTED: &str = "[REDACTED]";
 /// daemon vs. per-request).
 ///
 /// Also used as the last-resort correlation ID for process-scoped artifacts
-/// (e.g. the HTTP bridge JSONL dump sink file name) when neither
-/// `AGENT_BLOCK_RUN_ID` nor `AGENT_BLOCK_TRACE_ID` is set.
+/// when neither `AGENT_BLOCK_RUN_ID` nor `AGENT_BLOCK_TRACE_ID` is set.
 pub fn process_agent_id() -> &'static str {
     static AGENT_ID: OnceLock<String> = OnceLock::new();
     AGENT_ID.get_or_init(|| Uuid::new_v4().to_string())
@@ -97,9 +96,7 @@ fn sanitize_value<'a>(key: &str, value: &'a str) -> Cow<'a, str> {
 /// True when a key name looks credential-bearing under the `ab.obs` policy.
 ///
 /// Substring match on the lowercased key, so `x-auth-token` / `apikey_v2` and
-/// similar variants are covered. Also used by the HTTP bridge JSONL dump sink,
-/// which redacts a header when this matches *or* when the name is one of its
-/// exact header names.
+/// similar variants are covered.
 pub fn is_sensitive_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
     [

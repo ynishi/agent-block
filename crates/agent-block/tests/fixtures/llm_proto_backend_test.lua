@@ -118,7 +118,6 @@ if not http then
                 body_json = opts.body,
                 method = opts.method,
                 timeout = opts.timeout,
-                dump = opts.dump,
             })
             local entry = table.remove(queue, 1)
             if not entry then
@@ -340,10 +339,9 @@ describe("the request the backend builds", function()
     it("carries the transport knobs the conf sets", function()
         reset()
         queue_ok(text_response())
-        ask(anthropic_backend({ timeout = 7, dump = "full" }))
+        ask(anthropic_backend({ timeout = 7 }))
 
         expect(requests[1].timeout).to.equal(7)
-        expect(requests[1].dump).to.equal("full")
     end)
 
     it("refuses a provider this build does not speak", function()

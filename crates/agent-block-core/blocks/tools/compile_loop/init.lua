@@ -195,10 +195,10 @@ end
 -- Redact credential-bearing headers before they are emitted in full mode.
 -- Applied to both request headers (api key / bearer token) and response
 -- headers (proxy stacks can return Set-Cookie session tokens).
--- Keep this list in sync with the other two copies: blocks/agent/init.lua
--- sanitize_headers_for_dump and REDACTED_HEADERS in src/bridge/http.rs. The Rust
--- site is a superset: these exact names plus the ab.obs substring policy
--- (token / secret / password / api_key / access_key / private_key / ...).
+-- Keep this list in sync with the other copy in blocks/agent/init.lua
+-- (sanitize_headers_for_dump); the test
+-- redaction_list_is_mirrored_in_both_lua_blocks in src/bridge/http.rs fails
+-- when the two drift apart.
 local function sanitize_headers_for_dump(headers)
     local out = {}
     for k, v in pairs(headers or {}) do
@@ -669,8 +669,6 @@ local function llm_call(opts, messages)
             headers = headers,
             body = body_json,
             timeout = opts.timeout or 120,
-            -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-            dump = (mode == "full") and "full" or nil,
         })
         if mode == "full" then
             local resp_headers = sanitize_headers_for_dump(resp.headers)
@@ -797,8 +795,6 @@ local function llm_call(opts, messages)
         headers = headers,
         body = body_json,
         timeout = opts.timeout or 120,
-        -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-        dump = (mode == "full") and "full" or nil,
     })
     if mode == "full" then
         local resp_headers = sanitize_headers_for_dump(resp.headers)
@@ -1961,8 +1957,6 @@ local function run_loop(conf)
             -- file back every iteration, so the markers would only add bytes.
             cache_control = conf.cache_control or false,
             timeout = conf.timeout,
-            -- Policy flag for the host JSONL dump sink (AGENT_BLOCK_LLM_DUMP_DIR).
-            dump = (mode == "full") and "full" or nil,
         }
 
         if provider ~= "anthropic" then
