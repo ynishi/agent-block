@@ -1422,6 +1422,25 @@ M.shapes.api = {
         args = {},
         returns = "string (time-ordered, session-free)",
     },
+    -- The two the bridge owns and this module re-exports. Their contract is
+    -- the bridge's, so `returns` points at the generated type the syscall
+    -- itself is declared with (`knl.shapes.module.error` / `.api` name the
+    -- same two) rather than restating it here.
+    --
+    -- `args` cannot point there as well, and the reason is the fallback: a VM
+    -- with no bridge has no `knl_types`, so `RUST.Raised` is the sentence that
+    -- names the type it would have been. `returns` may be a sentence — nothing
+    -- executes it — but an `args` entry is RUN by the gate below, so it carries
+    -- the widest shape that is still true of a raised value, and the type it
+    -- stands for is named beside it.
+    error = {
+        args = { arg_of(T.any, "raised (knl_types.Raised — whatever a syscall handed over)") },
+        returns = RUST.ErrorTable,
+    },
+    api = {
+        args = {},
+        returns = RUST.ApiReport,
+    },
     Outcome = {
         -- A namespace table, not a function: nothing to hold, and the
         -- members below are what the gate reaches.
@@ -2000,6 +2019,32 @@ end
 --- @return string beat_id
 function M.new_beat_id()
     return bridge("new_beat_id")()
+end
+
+--- Read a raised kernel failure back as data — the BRIDGE's reader, reached
+--- through this module so `require("knl")` is the one surface a script needs.
+---
+--- Two tables answer to the name `knl`: the syscall bridge the host installs
+--- as a global, and this module. A script that wrote `local knl =
+--- require("knl")` had shadowed the first, and the reader the docs name is on
+--- it — so these two are re-exported here rather than left to a caller
+--- reaching past its own local for `rawget(_G, "knl")`. Nothing is
+--- reimplemented: the lookup is the same lazy `bridge()` one `new_beat_id`
+--- uses, so a spec that installs a fake bridge after this module loaded still
+--- reaches it, and a VM with no bridge at all says so rather than indexing nil.
+---
+--- @param e any  the value a pcall'd syscall raised
+--- @return table  `knl.shapes.error` — { kind?, method?, retryable, message }
+function M.error(e)
+    return bridge("error")(e)
+end
+
+--- The bridge's declared surface, as data — the bridge's reader, read back
+--- through the module for the same reason `M.error` is (see above).
+---
+--- @return table  { session, module, errors, schema, types }
+function M.api()
+    return bridge("api")()
 end
 
 -- ============================================================
