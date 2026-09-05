@@ -16,9 +16,19 @@
 -- history under that beat's id, and the final beat settles on a plain
 -- answer. The run is then read back with `knl.views.beats` — one SELECT over
 -- the log, one row per beat. The script prints `[E2E] all_ok` at the end.
+--
+-- Two sections, and the difference between them is the point:
+--   [1] the plain kernel — a device with an llm, tools and a system line, and
+--       a loop that stops on a beat with no tool call;
+--   [2] the same run with `policy` plugged in — a windowed fold, a filter that
+--       carries a failure forward, and two questions the loop asks between
+--       beats. Nothing in the kernel changes to make the second one work:
+--       every policy is a value in a seam the device already had, or a
+--       predicate the loop calls itself.
 
 local kernel = require("knl")
 local adapter = require("knl_adapter")
+local policy = require("policy")
 local Outcome = kernel.Outcome
 
 -- The provider backend: Port + shim, conf is llm_proto vocabulary.
@@ -59,6 +69,10 @@ local device = kernel.device({
 -- rather than on the quota; a run that did hit the grant would come back
 -- `stopped`, which the match below prints.
 local MAX_BEATS = 4
+
+-- ===========================================================================
+-- [1] the plain kernel
+-- ===========================================================================
 
 local function has_tool_use(out)
     for _, block in ipairs(out.content or {}) do
@@ -174,6 +188,133 @@ kernel.session({
             )
         )
     end
+end)
+
+-- ===========================================================================
+-- [2] the same run, with policies plugged in
+-- ===========================================================================
+--
+-- Four policies, and each one goes exactly where the kernel already had a
+-- seam:
+--
+--   window      the device's `fold`. The request carries the last 3 beats and
+--               nothing earlier, sliced by beat so a tool pair is never split.
+--   carry       one of the device's `filters`. If the beat before ended in a
+--               tool error or a call that did not come off, one bounded note
+--               goes in front of the request saying so — which is the only
+--               way the model hears about a failed CALL at all, since the
+--               fold skips `llm_call_failed`.
+--   stagnation  the loop's own. Two counters over the log: the same tool call
+--               three beats running, or two beats that wrote nothing.
+--   escalate    the loop's own. After a refusal or a failure that asking again
+--               would not fix, the next beat runs on the stronger model —
+--               changing the tool, not handing the work to a supervisor.
+--
+-- `carry` is the one that has to be bound, and it is bound INSIDE the bracket:
+-- its opts are policy and the session is an argument, so the policy is built
+-- wherever and the binding happens where the session exists.
+
+local strong = adapter.anthropic:open({
+    model = "claude-sonnet-4-5-20250929",
+    max_tokens = 1024,
+})
+
+-- Session-free: both are values, held out here and reused for any run.
+local stalled = policy.stagnation({ same = 3, no_progress = 2 })
+local escalate = policy.escalate({ strong = strong })
+
+kernel.session({
+    owner = "beat-e2e-policy",
+    budget = { amount = 8, tag = "beats", desc = "one unit per beat" },
+}, function(s)
+    s:append({
+        kind = "msg_user",
+        meta = { label = "seed" },
+        data = { content = "What is 1918 + 77, and then that plus 5? Use the add tool for each step." },
+    })
+
+    local policied = kernel.device({
+        llm = llm,
+        tools = tools,
+        system = "You are a terse assistant. Use the add tool for any arithmetic.",
+        fold = policy.window({ tail = 3 }),
+        filters = { policy.carry({ max_bytes = 400 })(s) },
+    })
+
+    -- The device for the NEXT beat is a value the loop carries, which is what
+    -- lets `escalate` answer it without anything being mutated: the original
+    -- device stays exactly as it was built.
+    local current = policied
+    local beats, last, why = 0, nil, nil
+    while beats < MAX_BEATS do
+        last = kernel.beat(s, current)
+        beats = beats + 1
+        print(string.format("[POLICY BEAT %d] status=%s", beats, tostring(last.status)))
+
+        current = escalate(last, current)
+        if current ~= policied then
+            print("[POLICY] escalated: the next beat runs on the stronger model")
+        end
+
+        if not Outcome.is_ok(last) then
+            break
+        end
+        if not has_tool_use(last.out) then
+            break
+        end
+
+        why = stalled(s)
+        if why ~= nil then
+            print("[POLICY] stagnation: " .. why)
+            break
+        end
+    end
+
+    Outcome.match(last, {
+        ok = function(o)
+            local text = {}
+            for _, block in ipairs(o.out.content or {}) do
+                if block.type == "text" then
+                    text[#text + 1] = block.text
+                end
+            end
+            print("[POLICY] final answer: " .. table.concat(text, " "))
+        end,
+        refused = function(o)
+            print("[POLICY] refused: " .. tostring(o.reason))
+        end,
+        error = function(o)
+            local detail = o.detail
+            if type(detail) == "table" then
+                detail = tostring(detail.message)
+            end
+            print("[POLICY] error(" .. tostring(o.kind) .. "): " .. tostring(detail))
+        end,
+        stopped = function(o)
+            print("[POLICY] stopped(" .. tostring(o.reason) .. "): grant " .. tostring(o.tag))
+        end,
+    })
+
+    -- What the request the last beat sent actually carried, read out of the
+    -- durable record: the window is visible as a message count that stops
+    -- growing, and a carried note as the first message.
+    local requests = {}
+    for _, ev in ipairs(s:events()) do
+        if ev.kind == "llm_request" then
+            requests[#requests + 1] = ev.data.request
+        end
+    end
+    local last_request = requests[#requests]
+    print(
+        string.format(
+            "[POLICY] beats=%d declared=%d messages_sent_last=%d stagnation=%s escalated=%s",
+            beats,
+            #kernel.views.beats(s),
+            last_request and #last_request.messages or 0,
+            tostring(why),
+            tostring(current ~= policied)
+        )
+    )
 end)
 
 print("[E2E] all_ok")

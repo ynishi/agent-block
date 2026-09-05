@@ -34,6 +34,9 @@
 --        (a stray top-level key is refused as "validation"), `meta` is
 --        shallow (a nested one is refused the same way), and a label given
 --        in `meta` comes back verbatim
+--  inv13 `policy` is reachable as an embedded lib, its `window` fold bounds
+--        what a beat sends, and its `stagnation` predicate stops a caller's
+--        loop that would otherwise run to the budget
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately: the Lua kernel is the
@@ -883,6 +886,83 @@ do
     s:close("done")
 
     mark("inv12_stored_shape")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv13 — the `policy` lib, embedded: a windowed fold in the device and a
+-- stagnation predicate in the loop
+-- ---------------------------------------------------------------------------
+
+do
+    -- Reachable by name in the full host, which is the half of this that only
+    -- a host can prove: the module is baked into the binary (EMBEDDED_LIBS),
+    -- not found on a search path a spec runner set up.
+    local policy = require("policy")
+    for _, name in ipairs({ "window", "carry", "stagnation", "retry", "escalate", "shapes" }) do
+        assert(policy[name] ~= nil, "the embedded policy lib is missing " .. name)
+    end
+
+    local s = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    s:append({ kind = "msg_user", data = { content = "go" } })
+
+    -- A model that never stops making the same call: without the predicate
+    -- this loop runs until the caller's cap or the grant stops it.
+    local at = 0
+    local d = kernel.device({
+        llm = function(_req)
+            at = at + 1
+            return response("ok", { tool_use("c" .. at, "search", { q = "same" }) }, nil, "tool_use")
+        end,
+        tools = {
+            search = {
+                handler = function()
+                    return "no results"
+                end,
+            },
+        },
+        fold = policy.window({ tail = 2 }),
+    })
+    local stalled = policy.stagnation({ same = 2 })
+
+    local CAP = 10
+    local beats, why = 0, nil
+    while beats < CAP do
+        local o = kernel.beat(s, d)
+        assert(Outcome.is_ok(o), "the stubbed beat must come off")
+        beats = beats + 1
+        why = stalled(s)
+        if why ~= nil then
+            break
+        end
+    end
+
+    -- The predicate stopped it, and it stopped it at the second beat — not the
+    -- cap, and nowhere near the grant.
+    assert(why == "repeated", "stagnation reason: " .. tostring(why))
+    assert(beats == 2, "the predicate must stop the loop at two beats, not " .. beats)
+    assert(s:remaining() == 98, "remaining: " .. tostring(s:remaining()))
+
+    -- And the window is doing its work in the same device. Two more beats by
+    -- hand, so the fourth folds a log holding three beats: `tail = 2` keeps the
+    -- last two of them and the seed falls outside the window entirely.
+    assert(Outcome.is_ok(kernel.beat(s, d)))
+    assert(Outcome.is_ok(kernel.beat(s, d)))
+    local sent = {}
+    for _, e in ipairs(s:events()) do
+        if e.kind == "llm_request" then
+            sent[#sent + 1] = e.data.request
+        end
+    end
+    assert(#sent == 4, "four beats, " .. #sent .. " requests")
+    local windowed = sent[4]
+    assert(#windowed.messages == 4, "two beats fold to four messages, got " .. #windowed.messages)
+    assert(windowed.messages[1].role == "assistant", "the seed is outside the window")
+    -- the unwindowed request the first beat sent still had it
+    assert(sent[1].messages[1].content == "go", "the first beat saw the whole log")
+
+    s:close("done")
+
+    mark("inv13_policy_embedded")
 end
 
 print("[KNL] all_ok")
