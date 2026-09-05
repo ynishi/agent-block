@@ -1,52 +1,97 @@
--- blocks/tools/compile_loop/init.lua — Tool factory for the autonomous compile-and-fix loop.
+-- blocks/tools/compile_loop/init.lua — the compile-and-fix loop, over `knl`.
 --
--- Primary surface: compile_loop.make(conf) → tool_def
+-- Primary surface: `compile_loop.make(conf) -> tool_def`
 --
--- conf = {
---     runner    = function(path) → {ok, stdout, stderr, exit_code},  -- required (single-file)
---               | function(paths) → {ok, stdout, stderr, exit_code}, -- required (multi-file)
---     llm       = { provider, base_url, api_key, api_key_env, model,
---                   max_tokens, temperature, disable_thinking, timeout }, -- optional
---     max_iters = int?,    -- default 5
---     lang      = string?, -- default "lua"
---     name      = string?, -- default "compile_loop"
---     system    = string?,
---     edit_mode = "full"|"diff"?, -- default "full"; "diff" edits through tools
--- }
+--   local td = compile_loop.make({
+--       runner    = function(path) return { ok = ..., stdout = ..., stderr = ..., exit_code = ... } end,
+--       max_iters = 5,
+--       edit_mode = "diff",   -- "full" (default) | "diff"
+--       llm       = { provider = "anthropic", model = "...", api_key = "..." },
+--   })
+--   local json = td.handler({ spec = "...", target_file = "/abs/path.lua" })
 --
--- target_file (string) XOR target_files (list<string>): mutually exclusive.
--- target_file dual role: read on entry if already present (content embedded in
--- the initial user message), then written in full on each iteration.
--- Absent or empty → spec-only message (synthesis use case, backward-compatible).
--- target_files: multi-file mode, requires edit_mode="diff".
+-- What this module is
+--   A CONSUMER of the kernel, like `blocks/agent`. `knl` provides one beat — a
+--   model call plus the tools that call asked for — and holds no loop; this
+--   module writes the loop, and the one thing it adds to it is the guarantee it
+--   sells: THE VERIFY IS NOT A TOOL. `conf.runner` runs after every beat,
+--   whatever the model asked for and whatever it answered, and its verdict is
+--   the loop's. A tool the model can decline to call cannot carry "it compiles".
 --
--- Returns tool_def = { name = string, schema = table, handler = function }
--- Side-effect: tool.register(name, schema, handler) is called so the registry
---   and the returned tool_def share the same handler identity.
+--   One iteration is one beat:
 --
--- LLM resolution order (per field, at call time):
---   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil (llm_proto env fallback)
+--       knl.session({ budget = { amount = max_iters } }, function(s)
+--           s:append{ kind = "msg_user", ... }          -- the spec
+--           while true do
+--               local out = knl.beat(s, device)         -- the model, and its tools
+--               ... Outcome.match ...
+--               local rr = conf.runner(...)             -- the verify, always
+--               s:append{ kind = "verify", beat = out.beat, data = { ... } }
+--               if rr.ok then return end                -- green
+--               s:append{ kind = "msg_user", ... }      -- the failure, back
+--           end
+--       end)
 --
--- Counter WF-A defence: handler output JSON never contains "code" or "history".
+--   `max_iters` is the session's grant, so the iteration ceiling is the budget
+--   and the beat past it comes back `stopped` with nothing called. The two
+--   verdicts a run gives up on are the shell's: `policy.stagnation` over the
+--   verify's stderr (the same error three times), and a count kept here of
+--   iterations that applied no edit.
+--
+-- Two modes, and what each one is for
+--   `edit_mode = "full"` is a whole-file rewrite: no tools, one completion an
+--   iteration, the fenced block written to the target. It is the path for
+--   models that cannot call tools.
+--   `edit_mode = "diff"` edits through `std.fs`' path-locked tools. The target
+--   files must exist: diff needs something to diff against, and a mode that
+--   silently became another mode was worse than an error.
+--
+-- What it deliberately does not do
+--   * No dump. `AGENT_BLOCK_LLM_DUMP`, the `ab.obs` iteration trail and the
+--     header redaction that went with it are gone: every call is already a
+--     durable fact in the session log (`llm_request` / `llm_response` /
+--     `llm_call_failed`), every tool call is a recorded pair, and this loop's
+--     own control flow is the `verify` events it appends. A second, lossier
+--     copy on stdout was a transcription of the record rather than a reading.
+--   * No transport of its own. The provider Port (`knl_adapter.anthropic` /
+--     `.openai`) is the whole of it, and `conf.llm` is forwarded verbatim —
+--     a whitelist here would silently strip every knob added upstream.
+--   * No implicit context. There is no `_AGENT_LLM_CTX` to inherit a parent's
+--     provider / model / key from: nothing is injected behind a caller's back,
+--     so `conf.llm` and then the environment is the whole resolution.
+--   * No distillation. A file over the size threshold answers with its length
+--     and a pointer to `read_file_range` rather than an LLM-summarised digest,
+--     and there is no digest cache to keep true across iterations.
+--   * No registration. `make` returns the tool_def; putting it in the global
+--     registry is the caller's call (`coding_agent.register_tool` does it).
+--
+-- Counter WF-A defence: the handler's JSON never contains `code` or `history`.
+-- The loop's transcript is the session log, and handing a caller a transcript
+-- of every iteration contaminates its context.
 
 local M = {}
 
--- Provider wire format (request building, tool_choice / thinking translation,
--- response normalization) is shared with blocks/agent via the `llm_proto`
--- package. This module owns the compile-and-fix loop, not the protocol.
-local proto = require("llm_proto")
-local proto_anthropic = proto.adapter("anthropic")
-local proto_openai = proto.adapter("openai")
+--- The kernel. Named `kernel` because the bare `knl` is the syscall bridge
+--- global in a host VM and shadowing it here would read as the wrong one.
+local kernel = require("knl")
+local Outcome = kernel.Outcome
 
--- The ReAct mechanics of one iteration: call, dispatch the tools we handed
--- it, repeat. The build stays out here.
-local tool_loop = require("tool_loop")
+--- The Ports a device is built from: the `llm` closure and the tools map.
+local adapter = require("knl_adapter")
 
-local agent = require("agent") -- for _llm_ctx_top() and _log_meta()
+--- The two values this loop plugs into the device / consults between beats.
+local policy = require("policy")
 
 local lshape = require("lshape")
 local T = lshape.t
 local shape = lshape.check
+
+--- The provider Ports, by the name `conf.llm.provider` uses. The Port is
+--- chosen here and nowhere else.
+local PORTS = {
+    anthropic = adapter.anthropic,
+    openai = adapter.openai,
+}
 
 -- ============================================================
 -- Boundary contracts
@@ -71,11 +116,10 @@ local RUNNER_RESULT = T.shape({
 
 --- What the tool handler gives back to whoever called it.
 ---
---- Closed, and that is the point: the loop's own result carries `code` and
---- `history`, and the reason they are stripped here is that handing a caller a
---- transcript of every iteration contaminates its context — the Counter WF-A
---- defence. Stated as a comment, that invariant holds until someone adds a
---- field; stated as a closed shape, adding one fails.
+--- Closed, and that is the point: the run carries a whole transcript in its
+--- session log, and handing a caller one contaminates its context — the
+--- Counter WF-A defence. Stated as a comment, that invariant holds until
+--- someone adds a field; stated as a closed shape, adding one fails.
 ---
 --- `artifact_path` and `modified_files` are each other's alternative rather than
 --- both optional in spirit: single-file mode sets the first, multi-file the
@@ -95,235 +139,39 @@ local TOOL_OUTPUT = T.shape({
 -- Internal constants
 -- ============================================================
 
--- Stagnation detection window: give-up when the last N consecutive runner stderr
--- outputs are identical. Hard structural check, not a prompt heuristic.
+--- How many iterations in a row have to say the same thing before the loop
+--- gives up: three identical verify failures, or three iterations that applied
+--- no edit. Two is a retry; three is a pattern. The first is
+--- `policy.stagnation`'s `same`, the second is counted here.
 local STAGNATION_WINDOW = 3
 
+--- Iterations a run gets when the caller names no ceiling. It is the session's
+--- grant, so it bounds the beats and nothing else has to.
+local DEFAULT_MAX_ITERS = 5
+
+--- Bytes of file content the read tool will hand over whole. Above it the
+--- answer is the file's length and a pointer to `read_file_range`: a model that
+--- asked for a 400KB file did not mean to spend its context on one.
+local READ_FILE_FULL_THRESHOLD = 10000
+
+--- Lines a single `read_file_range` call may take.
+local READ_FILE_RANGE_MAX_LINES = 500
+
+--- Bytes of `last_error` the result carries. What the caller gets back is
+--- bounded; the untruncated text is in the log.
+local LAST_ERROR_MAX = 800
+
+--- Bytes of verify output the next iteration's prompt carries. A failing
+--- iteration must not push the spec out of the request.
+local FEEDBACK_MAX = 2000
+
+--- Bytes of `policy.carry`'s note — one rejected edit's reason and a sentence
+--- around it.
+local CARRY_MAX_BYTES = 512
+
 -- ============================================================
--- Observability helpers (inline mirror from blocks/agent/init.lua:90-181)
--- Gated by AGENT_BLOCK_LLM_DUMP env (off/meta/full).
+-- The built-in prompts
 -- ============================================================
-
-local function env_true(name)
-    local v = std.env.get(name)
-    if not v then
-        return false
-    end
-    v = string.lower(tostring(v))
-    return v == "1" or v == "true" or v == "yes" or v == "on"
-end
-
--- Module-level override for test monkey-patching of std.env.get (set via M._test_set_env_get).
--- Declared here so resolve_temperature() can close over it as an upvalue.
-local _env_get_override = nil
-
---- resolve_temperature() — infallible, returns a number.
---- Priority: caller (opts.temperature) > COMPILE_LOOP_LLM_TEMPERATURE env > 0.0 default.
---- This function returns only the env/default tier; caller tier is applied at the call site.
-local function resolve_temperature()
-    local s
-    if _env_get_override then
-        s = _env_get_override("COMPILE_LOOP_LLM_TEMPERATURE")
-    else
-        s = std.env.get("COMPILE_LOOP_LLM_TEMPERATURE")
-    end
-    if s == nil then
-        return 0.0
-    end
-    local n = tonumber(s)
-    if n == nil then
-        log.warn(
-            "compile_loop: COMPILE_LOOP_LLM_TEMPERATURE="
-                .. tostring(s)
-                .. " is not a valid number; falling back to 0.0"
-        )
-        return 0.0
-    end
-    return n
-end
-
-local function normalize_dump_mode(v)
-    if not v or v == "" then
-        return nil
-    end
-    v = string.lower(tostring(v))
-    if v == "off" or v == "none" then
-        return "off"
-    end
-    if v == "meta" then
-        return "meta"
-    end
-    if v == "full" then
-        return "full"
-    end
-    return "off"
-end
-
-local function resolve_dump_mode()
-    local mode = normalize_dump_mode(std.env.get("AGENT_BLOCK_LLM_DUMP"))
-    if not mode then
-        local rust_log = string.lower(std.env.get_or("RUST_LOG", ""))
-        if rust_log:find("trace", 1, true) or rust_log:find("debug", 1, true) then
-            mode = "meta"
-        else
-            mode = "off"
-        end
-    end
-    if mode == "full" then
-        local env_name = string.lower(std.env.get_or("AGENT_BLOCK_ENV", ""))
-        local is_prod = env_name == "prod" or env_name == "production"
-        if is_prod and not env_true("AGENT_BLOCK_LLM_DUMP_ALLOW_PROD") then
-            log.warn("compile_loop: AGENT_BLOCK_LLM_DUMP=full blocked in production env; downgraded to meta")
-            mode = "meta"
-        end
-    end
-    return mode
-end
-
--- Process-lifetime cache for the dump mode. llm_call fires per iteration, per
--- tool-loop turn and per distill chunk; env vars do not change mid-process, so
--- resolving once avoids re-reading env and repeating the prod-downgrade warn.
-local _dump_mode_cache = nil
-
-local function resolve_dump_mode_cached()
-    if _dump_mode_cache == nil then
-        _dump_mode_cache = resolve_dump_mode()
-    end
-    return _dump_mode_cache
-end
-
--- Redact credential-bearing headers before they are emitted in full mode.
--- Applied to both request headers (api key / bearer token) and response
--- headers (proxy stacks can return Set-Cookie session tokens).
--- Keep this list in sync with the other copy in blocks/agent/init.lua
--- (sanitize_headers_for_dump); the test
--- redaction_list_is_mirrored_in_both_lua_blocks in src/bridge/http.rs fails
--- when the two drift apart.
-local function sanitize_headers_for_dump(headers)
-    local out = {}
-    for k, v in pairs(headers or {}) do
-        local lk = string.lower(tostring(k))
-        if
-            lk == "x-api-key"
-            or lk == "authorization"
-            or lk == "set-cookie"
-            or lk == "cookie"
-            or lk == "proxy-authorization"
-        then
-            out[k] = "***REDACTED***"
-        else
-            out[k] = v
-        end
-    end
-    return out
-end
-
-local LLM_DUMP_PREFIX = "ab.obs"
-
-local function kv_escape(v)
-    if v == nil then
-        return "nil"
-    end
-    if type(v) == "boolean" or type(v) == "number" then
-        return tostring(v)
-    end
-    local s = tostring(v)
-    if s == "" then
-        return '""'
-    end
-    if s:find("[%s=]") then
-        return std.json.encode(s)
-    end
-    return s
-end
-
-local function format_kv(parts)
-    local out = {}
-    for i, pair in ipairs(parts) do
-        out[i] = tostring(pair[1]) .. "=" .. kv_escape(pair[2])
-    end
-    return table.concat(out, " ")
-end
-
--- Process-lifetime cache for the ab.obs correlation fields. They come from the
--- environment, which does not change mid-process, and obs_event fires per
--- iteration and per tool call.
-local _log_meta_cache = nil
-
-local function resolve_log_meta_cached()
-    if _log_meta_cache == nil then
-        _log_meta_cache = agent._log_meta(nil)
-    end
-    return _log_meta_cache
-end
-
-local function obs_event(mode, event_name, fields)
-    if mode == "off" then
-        return
-    end
-    local entries = {
-        { "prefix", LLM_DUMP_PREFIX },
-        { "event", event_name },
-        { "component", "compile_loop" },
-    }
-    for _, f in ipairs(fields or {}) do
-        table.insert(entries, f)
-    end
-    -- Without these, two runs' lines are indistinguishable once they share a
-    -- log, so nothing can be counted per run or compared between runs — which
-    -- is the whole point of emitting them. Resolved through the agent block so
-    -- both components read the environment the same way.
-    --
-    -- Appended rather than placed after `component`, where the Rust obs_line
-    -- puts them: parsers and tests already match on the
-    -- `component=compile_loop iter=N` prefix, and a run is selected by
-    -- `run_id=` wherever on the line it sits.
-    local meta = resolve_log_meta_cached()
-    table.insert(entries, { "trace_id", meta.trace_id })
-    table.insert(entries, { "run_id", meta.run_id })
-    table.insert(entries, { "agent_id", meta.agent_id })
-    table.insert(entries, { "agent_name", meta.agent_name })
-    log.info(format_kv(entries))
-end
-
--- Summarize an fs_edit `edits` array for the observability line.
---
--- Where an edit landed exists only in the call that made it: `modified_set`
--- keeps which files changed, not which lines. Dropping that leaves the two
--- questions worth asking about a fix — did it touch the lines it was pointed
--- at, and how far did it move beyond them — answerable only by argument.
--- Recording it costs nothing here because edits are addressed by line: a
--- search-and-replace protocol would have to reconstruct the position after the
--- fact, if it could at all.
---
--- Positions and magnitudes only. `expect` and `replace` are source text and do
--- not belong in a log line.
---
--- @param edits table|nil  Array of { start_line, end_line, expect, replace }
--- @return string  Addressed ranges, "12-15,40-40" ("" when there are none)
--- @return integer Lines the edits replace
--- @return integer Lines they put back
-local function summarize_edits(edits)
-    local ranges, removed, added = {}, 0, 0
-    for _, e in ipairs(edits or {}) do
-        local first, last = tonumber(e.start_line), tonumber(e.end_line)
-        -- An entry without an address is not an edit, so it contributes
-        -- nothing rather than inflating the magnitudes with a phantom range.
-        if first and last then
-            table.insert(ranges, first .. "-" .. last)
-            removed = removed + (last - first + 1)
-            -- An empty replacement deletes the range, so it adds no lines.
-            if type(e.replace) == "string" and e.replace ~= "" then
-                local n = 1
-                for _ in e.replace:gmatch("\n") do
-                    n = n + 1
-                end
-                added = added + n
-            end
-        end
-    end
-    return table.concat(ranges, ","), removed, added
-end
 
 local DEFAULT_SYSTEM = [[You are an expert programmer.
 You will be given a spec and asked to write code that runs and passes its self-checks.
@@ -334,22 +182,23 @@ On retry, output the WHOLE corrected file (not a diff). Keep changes minimal.]]
 local DIFF_SYSTEM = [[You are an expert programmer editing an existing file.
 
 Edit through the tools, not by printing code:
-- read_file / read_file_range to see the current content. Their output is
-  line-numbered, and those line numbers are what fs_edit addresses.
+- fs_read to see the current content, read_file_range for a numbered slice of a
+  large one. Line numbers are 1-based and are what fs_edit addresses.
 - fs_edit to change it: give start_line, end_line and the expected current text
   of those lines. expect must be exact. A rejected edit tells you what is
   actually at those lines — correct it from that.
 - Make the SMALLEST changes that satisfy the spec.
 
-When every edit has been applied, reply with the single word DONE.]]
+The build runs after every one of your turns, whether or not you ask for it,
+and its output comes back to you. Keep editing until it passes.]]
 
 -- Multi-file differs only in that a path is named on every call; the editing
 -- contract is the same, so the two prompts stay parallel.
 local DIFF_SYSTEM_MULTI = [[You are an expert programmer editing several existing files.
 
 Edit through the tools, not by printing code:
-- read_file / read_file_range to see a file's current content. Their output is
-  line-numbered, and those line numbers are what fs_edit addresses.
+- fs_read to see a file's current content, read_file_range for a numbered slice
+  of a large one. Line numbers are 1-based and are what fs_edit addresses.
 - fs_edit to change it: pass the path, plus edits giving start_line, end_line
   and the expected current text of those lines. expect must be exact. A
   rejected edit tells you what is actually at those lines — correct it from
@@ -357,13 +206,15 @@ Edit through the tools, not by printing code:
 - Every path must be one of the target files you were given.
 - Make the SMALLEST changes that satisfy the spec.
 
-When every edit has been applied, reply with the single word DONE.]]
+The build runs after every one of your turns, whether or not you ask for it,
+and its output comes back to you. Keep editing until it passes.]]
 
 -- ============================================================
--- Internal helpers (moved from coding_agent/init.lua)
+-- Small pure helpers
 -- ============================================================
 
--- Resolve path to absolute. If already absolute, return as-is.
+--- Resolve a path to absolute. Relative ones come from a tool call, so the
+--- working directory is the only thing there is to resolve them against.
 local function to_abs(path)
     if path:sub(1, 1) == "/" then
         return path
@@ -371,17 +222,31 @@ local function to_abs(path)
     return (os.getenv("PWD") or ".") .. "/" .. path
 end
 
--- Build a human-readable summary string for all exit paths.
+--- The last `n` bytes of `text` — what a bounded field carries when the whole
+--- of it does not fit. The tail rather than the head: a compiler says what went
+--- wrong at the end.
+local function tail(text, n)
+    return tostring(text or ""):sub(-n)
+end
+
+--- A human sentence for whichever way the run ended.
 local function make_summary(ok, iters, max_iters, reason)
     if ok then
         return string.format("PASS in %d iters", iters)
     end
     if reason == "stagnation" then
         return string.format(
-            "give-up: stagnation at iter %d/%d (stderr identical %dx)",
+            "give-up: stagnation at iter %d/%d (the verify said the same thing %dx)",
             iters,
             max_iters,
             STAGNATION_WINDOW
+        )
+    elseif reason == "no_edits_applied" then
+        return string.format(
+            "give-up: no edits applied in %d consecutive iters (%d/%d)",
+            STAGNATION_WINDOW,
+            iters,
+            max_iters
         )
     elseif reason == "max_iters" then
         return string.format("give-up: max_iters reached (%d)", max_iters)
@@ -389,95 +254,11 @@ local function make_summary(ok, iters, max_iters, reason)
         return string.format("give-up: llm_call failed at iter %d/%d", iters, max_iters)
     elseif reason == "open_target_file" then
         return string.format("give-up: open_target_file failed at iter %d/%d", iters, max_iters)
-    else
-        return string.format("give-up: %s", tostring(reason))
     end
+    return string.format("give-up: %s", tostring(reason))
 end
 
--- Stagnation detection: check if the last STAGNATION_WINDOW entries in history
--- all have identical runner stderr. Independent of iter count.
-local function is_stagnant(history)
-    if #history < STAGNATION_WINDOW then
-        return false
-    end
-    local ref = (history[#history].result or {}).stderr or ""
-    for i = #history - STAGNATION_WINDOW + 1, #history do
-        if ((history[i].result or {}).stderr or "") ~= ref then
-            return false
-        end
-    end
-    return true
-end
-
--- FNV-1a 32-bit hash (inline fallback; no external dependency required).
--- Returns a decimal string representation of the 32-bit hash value.
-local function fnv1a_hash(s)
-    s = s or ""
-    local hash = 2166136261 -- FNV offset basis (32-bit)
-    for i = 1, #s do
-        local byte = string.byte(s, i)
-        -- XOR with byte then multiply by FNV prime (16777619), truncated to 32-bit.
-        hash = (hash ~ byte) * 16777619
-        -- Keep only lower 32 bits to prevent integer overflow accumulation.
-        hash = hash & 0xFFFFFFFF
-    end
-    return tostring(hash)
-end
-
--- Compute a stable hash for an iteration's edit signature.
--- Normalises whitespace before hashing to avoid collisions due to trivial formatting differences.
-local function compute_sr_hash(sr_text)
-    local text = tostring(sr_text or "")
-    -- Normalise: collapse all whitespace runs to single space, strip leading/trailing.
-    text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    return fnv1a_hash(text)
-end
-
--- Stagnation detection for multi-file branch (independent of messages[] reset).
--- Uses state.sr_history (list of sr_hash strings) rather than history[].result.stderr.
---
--- Conditions (all must hold):
---   (1) #state.sr_history >= STAGNATION_WINDOW (= 3)
---   (2) Among the last STAGNATION_WINDOW entries, all STAGNATION_WINDOW share the same sr_hash
---       (full-window identical-hash requirement; partial matches do not trigger stagnation)
---   (3) The most recent verify outcome is failure (caller passes last_verify_failed = true)
---
--- Returns: boolean
-local function is_stagnant_v2(state, last_verify_failed)
-    assert(type(state) == "table", "state required")
-    assert(type(state.sr_history) == "table", "state.sr_history must be initialized as table")
-
-    if #state.sr_history < STAGNATION_WINDOW then
-        return false
-    end
-    if not last_verify_failed then
-        return false
-    end
-
-    -- Collect the last STAGNATION_WINDOW entries.
-    local recent = {}
-    for i = #state.sr_history - STAGNATION_WINDOW + 1, #state.sr_history do
-        recent[#recent + 1] = state.sr_history[i]
-    end
-
-    -- Count occurrences of each hash within the recent window.
-    -- Stagnation requires ALL window entries to share the same hash (c >= STAGNATION_WINDOW).
-    -- A 2-of-3 partial match is not sufficient; LLM must have fully converged to one output.
-    local counts = {}
-    for _, h in ipairs(recent) do
-        counts[h] = (counts[h] or 0) + 1
-    end
-    for _, c in pairs(counts) do
-        if c >= STAGNATION_WINDOW then
-            return true
-        end
-    end
-    return false
-end
-
--- Convert a modified_set (path → true map) to a sorted list of path strings.
--- Used to populate the modified_files field on every return path in the SR block.
--- pure function, no errors.
+--- A path set as the sorted list the result carries.
 local function collect_modified_paths(set)
     local paths = {}
     for path in pairs(set) do
@@ -487,361 +268,36 @@ local function collect_modified_paths(set)
     return paths
 end
 
--- Update mf_state fields with optional trim policies (single write point — DRY).
---   opts.last_err:         trim to <= 2000 chars (tail)
---   opts.sr_digest_prev:   trim to <= 500 chars (head)
---   opts.sr_hash_append:   append to sr_history
---   opts.iter:             set state.iter
-local function update_state(state, opts)
-    if opts.last_err ~= nil then
-        local s = tostring(opts.last_err)
-        state.last_err = s:sub(-2000)
-    end
-    if opts.sr_digest_prev ~= nil then
-        local s = tostring(opts.sr_digest_prev)
-        state.sr_digest_prev = s:sub(1, 500)
-    end
-    if opts.sr_hash_append ~= nil then
-        table.insert(state.sr_history, opts.sr_hash_append)
-    end
-    if opts.iter ~= nil then
-        state.iter = opts.iter
-    end
-end
-
--- Extract the FIRST fenced code block matching the lang label, falling back to any fence.
+--- Extract the FIRST fenced code block matching the lang label, falling back to
+--- any fence and then to the raw text (a model that forgot the fences).
 local function extract_code(text, lang)
     lang = lang or "lua"
-    -- Try language-specific fence first
     local m = text:match("```" .. lang .. "%s*\n(.-)\n```")
     if m then
         return m
     end
-    -- Fallback: any fence
     m = text:match("```%w*%s*\n(.-)\n```")
     if m then
         return m
     end
-    -- Last resort: raw text (LLM forgot fences)
     return text
 end
 
--- Minimal OpenAI-compatible chat call. Mirrors agent/init.lua llm_call_openai
--- but extended for tool_use (multi-file lazy-load path).
---
--- opts fields (K-96 full set):
---   provider, base_url, api_key, api_key_env, model,
---   max_tokens, temperature, disable_thinking, timeout,
---   tools (optional: list of tool spec tables for anthropic tool_use)
---
--- Return shape:
---   success (text-only): { choices = { { message = { content = joined_text } } } }
---   success (tool_use):  { choices = { { message = {
---                            content        = joined_text,   -- may be ""
---                            tool_use_blocks = { {id, name, input}, ... },
---                            stop_reason    = "tool_use"|"end_turn"|"max_tokens",
---                          } } } }
---   failure: nil, error_string
-
--- ============================================================
--- Internal: OpenAI tool-use helpers
--- ============================================================
-
---- Normalize a raw OpenAI chat completion response into compile_loop internal shape.
---- Internal shape (tools path):
----   { choices = { { message = { content = joined_text,
----                               tool_use_blocks = [{id, name, input}],
----                               stop_reason = string } } } }
---- @param raw table  Parsed OpenAI JSON response
---- @return table|nil  compile_loop-shape table on success
---- @return string|nil Error string on failure
-local function cl_oai_normalize(raw)
-    local decoded, perr = proto_openai.parse(raw)
-    if not decoded then
-        return nil, perr
-    end
-
-    local text_parts = {}
-    local tool_use_blocks = {}
-    for _, block in ipairs(decoded.content) do
-        if block.type == "text" then
-            table.insert(text_parts, block.text or "")
-        elseif block.type == "tool_use" then
-            -- `thinking` blocks are intentionally skipped: reasoning text must
-            -- not leak into the content that becomes a patch / answer.
-            table.insert(tool_use_blocks, {
-                id = block.id,
-                name = block.name or "",
-                input = block.input or {},
-                is_error_hint = block.is_error_hint,
-            })
+--- The text blocks of a response, joined. The kernel keeps blocks because the
+--- provider does; full mode wants one string to look for a fence in.
+local function text_of(content)
+    local parts = {}
+    for _, block in ipairs(content or {}) do
+        if block.type == "text" and block.text then
+            parts[#parts + 1] = block.text
         end
     end
-
-    return {
-        choices = {
-            {
-                message = {
-                    content = table.concat(text_parts, "\n"),
-                    tool_use_blocks = tool_use_blocks,
-                    stop_reason = decoded.stop_reason,
-                },
-            },
-        },
-    },
-        nil
+    return table.concat(parts, "\n")
 end
 
--- Module-level override for test monkey-patching (set via M._test_set_llm_call).
-local _llm_call_override = nil
-
--- The block's own transport. Its remaining caller is the distill subloop; the
--- iteration branches both go through `tool_loop` (diff since it was written,
--- full since the two paths were merged — see `call_tool_loop` below).
-local function llm_call(opts, messages)
-    -- Allow test monkey-patch to intercept all calls.
-    if _llm_call_override then
-        return _llm_call_override(opts, messages)
-    end
-
-    -- Resolved once per process; only "full" emits prompt/response bodies below.
-    local mode = resolve_dump_mode_cached()
-
-    local provider = opts.provider or "openai"
-    if provider == "anthropic" then
-        -- 1. Resolve api_key: opts.api_key → ANTHROPIC_API_KEY env → error
-        local api_key = opts.api_key
-        if not api_key or api_key == "" then
-            api_key = std.env.get(opts.api_key_env or "ANTHROPIC_API_KEY")
-        end
-        if not api_key or api_key == "" then
-            return nil, "no api_key (opts.api_key or ANTHROPIC_API_KEY env)"
-        end
-
-        -- 2. Model
-        local model = opts.model or std.env.get_or("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-
-        -- 3. Extract system role from messages → body.system.
-        --    User messages whose content is already a table (tool_result blocks) are
-        --    passed through as-is; only string content needs no transformation.
-        local sys_text = nil
-        local body_messages = {}
-        for _, msg in ipairs(messages) do
-            if msg.role == "system" and sys_text == nil then
-                sys_text = msg.content
-            else
-                -- Transparent pass-through: content may be a string or a table
-                -- (e.g. [{type="tool_result", tool_use_id=..., content=...}]).
-                table.insert(body_messages, msg)
-            end
-        end
-
-        -- 4-5. Body + headers via the shared protocol layer (llm_proto.anthropic).
-        --      cache_control defaults OFF here: compile_loop sends a fresh
-        --      prompt per iteration, so the markers would only add bytes.
-        local req, build_err = proto_anthropic.build({
-            model = model,
-            messages = body_messages,
-            system = sys_text,
-            tools = opts.tools,
-            max_tokens = opts.max_tokens or 4096,
-            tool_choice = opts.tool_choice,
-            parallel_tool_calls = opts.parallel_tool_calls,
-            thinking = opts.thinking,
-            cache_control = opts.cache_control or false,
-            api_key = api_key,
-            base_url = opts.base_url,
-        })
-        if not req then
-            return nil, build_err
-        end
-        local headers = req.headers
-
-        -- 6. HTTP call
-        -- Encoded once so the dumped payload is byte-identical to the wire body.
-        local body_json = std.json.encode(req.body)
-        if mode == "full" then
-            obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
-            obs_event(mode, "request_body", { { "payload", body_json } })
-        end
-        local resp = http.request(req.url, {
-            method = "POST",
-            headers = headers,
-            body = body_json,
-            timeout = opts.timeout or 120,
-        })
-        if mode == "full" then
-            local resp_headers = sanitize_headers_for_dump(resp.headers)
-            obs_event(mode, "response_headers", { { "payload", std.json.encode(resp_headers) } })
-            obs_event(mode, "response_body", { { "payload", tostring(resp.body or "") } })
-        end
-
-        -- 7. Status check
-        if resp.status ~= 200 then
-            return nil, "API error " .. tostring(resp.status) .. " body=" .. tostring(resp.body or "")
-        end
-
-        -- 8. pcall decode
-        local ok, decoded = pcall(std.json.decode, resp.body)
-        if not ok or type(decoded) ~= "table" then
-            return nil, "decode failed: " .. tostring(decoded)
-        end
-
-        -- 9. Walk content blocks: separate text blocks and tool_use blocks.
-        if type(decoded.content) ~= "table" or #decoded.content == 0 then
-            return nil, "anthropic response missing content blocks"
-        end
-        local parsed, perr = proto_anthropic.parse(decoded)
-        if not parsed then
-            return nil, perr
-        end
-        local text_parts = {}
-        local tool_use_blocks = {}
-        -- `thinking` / `redacted_thinking` blocks fall through both branches:
-        -- reasoning text must not become part of a patch, and compile_loop
-        -- rebuilds its prompt each iteration so nothing needs echoing back.
-        for _, block in ipairs(parsed.content) do
-            if block.type == "text" then
-                table.insert(text_parts, block.text or "")
-            elseif block.type == "tool_use" then
-                -- Collect tool_use blocks for run_loop dispatch.
-                table.insert(tool_use_blocks, {
-                    id = block.id,
-                    name = block.name,
-                    input = block.input or {},
-                })
-            end
-        end
-        local joined = table.concat(text_parts, "\n")
-        local stop_reason = parsed.stop_reason -- "end_turn" | "tool_use" | "max_tokens"
-
-        -- If there are no text blocks AND no tool_use blocks, the response is empty.
-        if joined == "" and #tool_use_blocks == 0 then
-            return nil, "anthropic response missing content blocks"
-        end
-
-        -- 10. Build return shape.
-        --     tool_use_blocks field is always present when tools were requested, to
-        --     allow run_loop to branch on #tool_use_blocks > 0 without checking stop_reason.
-        local msg_shape = { content = joined }
-        if opts.tools ~= nil then
-            msg_shape.tool_use_blocks = tool_use_blocks
-            msg_shape.stop_reason = stop_reason
-        end
-        return { choices = { { message = msg_shape } } }
-    elseif provider ~= "openai" then
-        return nil, "provider " .. provider .. " not yet supported in compile_loop"
-    end
-
-    -- OpenAI-compatible path.
-
-    local api_key = opts.api_key
-    if not api_key or api_key == "" then
-        api_key = std.env.get(opts.api_key_env or "OPENAI_API_KEY")
-    end
-    if not api_key or api_key == "" then
-        return nil, "no api_key (opts.api_key or OPENAI_API_KEY env)"
-    end
-
-    -- Extract system role from messages (mirrors anthropic branch L:348-358).
-    local sys_text = nil
-    local body_messages_raw = {}
-    for _, msg in ipairs(messages) do
-        if msg.role == "system" and sys_text == nil then
-            sys_text = msg.content
-        else
-            table.insert(body_messages_raw, msg)
-        end
-    end
-
-    -- Message / tool conversion and the reasoning dialect split live in
-    -- llm_proto.openai. `disable_thinking` (Qwen) maps onto the shared
-    -- `thinking` spec; an explicit opts.thinking wins when both are set.
-    local thinking_spec = opts.thinking
-    if thinking_spec == nil and opts.disable_thinking then
-        thinking_spec = { enabled = false }
-    end
-
-    -- Model default stays literal (no OPENAI_MODEL env fallback) to keep the
-    -- resolution order compile_loop callers already rely on.
-    local req, build_err = proto_openai.build({
-        model = opts.model or "gpt-4o-mini",
-        messages = body_messages_raw,
-        system = sys_text,
-        tools = opts.tools,
-        max_tokens = opts.max_tokens or 4096,
-        temperature = opts.temperature or resolve_temperature(),
-        tool_choice = opts.tool_choice,
-        parallel_tool_calls = opts.parallel_tool_calls,
-        thinking = thinking_spec,
-        dialect = opts.dialect,
-        api_key = api_key,
-        base_url = opts.base_url,
-    })
-    if not req then
-        return nil, build_err
-    end
-    local headers = req.headers
-    headers["User-Agent"] = "Mozilla/5.0" -- RunPod proxy / Cloudflare gate
-
-    -- Encoded once so the dumped payload is byte-identical to the wire body.
-    local body_json = std.json.encode(req.body)
-    if mode == "full" then
-        obs_event(mode, "request_headers", { { "payload", std.json.encode(sanitize_headers_for_dump(headers)) } })
-        obs_event(mode, "request_body", { { "payload", body_json } })
-    end
-    local resp = http.request(req.url, {
-        method = "POST",
-        headers = headers,
-        body = body_json,
-        timeout = opts.timeout or 120,
-    })
-    if mode == "full" then
-        local resp_headers = sanitize_headers_for_dump(resp.headers)
-        obs_event(mode, "response_headers", { { "payload", std.json.encode(resp_headers) } })
-        obs_event(mode, "response_body", { { "payload", tostring(resp.body or "") } })
-    end
-    if resp.status ~= 200 then
-        return nil, "API error " .. tostring(resp.status) .. " body=" .. tostring(resp.body or "")
-    end
-    local ok, decoded = pcall(std.json.decode, resp.body)
-    if not ok or type(decoded) ~= "table" then
-        return nil, "decode failed: " .. tostring(decoded)
-    end
-
-    return cl_oai_normalize(decoded)
-end
-
--- ============================================================
--- Internal: the completion full mode asks for
--- ============================================================
-
--- Module-level override for test monkey-patching (set via M._test_set_tool_loop_run).
-local _tool_loop_run_override = nil
-
---- The model call the full-mode branch makes.
----
---- Handed no tools, `tool_loop.run` is a completion: it calls once, finds
---- nothing to dispatch, and hands back the text. Going through it rather than
---- through `llm_call` is what gives full mode the transient retry, the refusal
---- check and the verbatim thinking blocks that the tool-using path already had
---- — one implementation of "call the model" instead of two that drifted.
----
---- @param opts table  `tool_loop.run` options
---- @return table  `tool_loop.run` result
-local function call_tool_loop(opts)
-    if _tool_loop_run_override then
-        return _tool_loop_run_override(opts)
-    end
-    return tool_loop.run(opts)
-end
-
--- Read target file if it already exists and is non-empty.
--- Returns file content as a string, or nil when the file is absent, empty, or unreadable.
--- Uses to_abs so that relative paths are resolved before io.open.
+--- File content, or nil when the file is absent, empty or unreadable.
 local function read_target_if_exists(path)
-    local abs_path = to_abs(path)
-    local f, _ = io.open(abs_path, "r")
+    local f = io.open(to_abs(path), "r")
     if not f then
         return nil
     end
@@ -853,10 +309,8 @@ local function read_target_if_exists(path)
     return content
 end
 
--- Write content to path, checking both the open and the write result.
--- Shared by the single-file write paths, iterate_files, and the
--- fs_edit tool handler so error shaping stays consistent.
--- Returns true on success, or (false, err_string) on failure.
+--- Write `content` to `path`, checking the open and the write. Returns true, or
+--- false and the reason.
 local function write_file(path, content)
     local f, oerr = io.open(path, "w")
     if not f then
@@ -870,556 +324,98 @@ local function write_file(path, content)
     return true
 end
 
--- Build the failure-feedback user message.
--- NOTE: This message contains ONLY spec and build feedback — no tool names,
--- no JSON schema, no tool_use vocabulary. Child LLM action space is confined
--- to emitting a corrected file in a single fenced code block.
+--- The failure-feedback user turn for full mode.
+---
+--- Only the spec and the build's output: no tool names, no JSON schema, no
+--- tool_use vocabulary. Full mode's whole action space is a fenced block.
 local function build_failure_msg(lang, rr)
     return string.format(
         "Run FAILED. Fix the code and re-output the WHOLE corrected file in a single ```%s ... ``` block.\n\n=== stdout ===\n%s\n\n=== stderr ===\n%s\n\n=== exit_code ===\n%s",
         lang,
-        tostring(rr.stdout or ""),
-        tostring(rr.stderr or ""),
+        tail(rr.stdout, FEEDBACK_MAX),
+        tail(rr.stderr, FEEDBACK_MAX),
         tostring(rr.exit_code or "unknown")
     )
 end
 
--- Filter run_loop result for tool output: remove code and history to prevent
--- caller context contamination (Counter WF-A defence).
--- For single-file mode: artifact_path is the absolute path, modified_files is nil.
--- For multi-file mode: artifact_path is nil, modified_files is list<path>.
+--- The failure-feedback user turn for diff mode.
+local function build_verify_msg(rr)
+    return string.format(
+        "The build FAILED after your edits. Fix it with more edits.\n\n=== stdout ===\n%s\n\n=== stderr ===\n%s\n\n=== exit_code ===\n%s",
+        tail(rr.stdout, FEEDBACK_MAX),
+        tail(rr.stderr, FEEDBACK_MAX),
+        tostring(rr.exit_code or "unknown")
+    )
+end
+
+--- The result, filtered for the tool boundary: `code` and the transcript are
+--- not in the shape, so they cannot leave through it.
 local function filter_for_tool_output(res)
     return shape.assert_dev({
         ok = res.ok,
-        artifact_path = res.artifact_path, -- single-file: abs path; multi-file: nil
-        modified_files = res.modified_files, -- multi-file: list<path>; single-file: nil
+        artifact_path = res.artifact_path,
+        modified_files = res.modified_files,
         iters = res.iters,
         summary = res.summary,
         failure_reason = res.failure_reason,
         last_error = res.last_error,
-        -- code:    excluded (Counter WF-A defence)
-        -- history: excluded (circular-ref risk + context contamination)
     }, TOOL_OUTPUT, "compile_loop tool output")
 end
 
+--- Prefix each line with its 1-based number.
+---
+--- `fs_edit` addresses lines, so a read that feeds it has to say which line is
+--- which. Only ever applied to verbatim content.
+local function with_line_numbers(text, first_line)
+    local out = {}
+    local n = (first_line or 1) - 1
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        n = n + 1
+        table.insert(out, string.format("%d\t%s", n, line))
+    end
+    -- gmatch on text .. "\n" yields one trailing empty element for text that
+    -- already ended in a newline; drop it so no phantom line is numbered.
+    if #out > 0 and out[#out]:match("^%d+\t$") and text:sub(-1) == "\n" then
+        table.remove(out)
+    end
+    return table.concat(out, "\n")
+end
+
 -- ============================================================
--- Multi-file lazy-load: tool spec + handler
+-- The tools diff mode hands the model
 -- ============================================================
 
--- Maximum number of tool calls (read_file / read_file_range / fs_edit)
--- allowed within a single iteration.
--- Prevents infinite tool-use loops when the child LLM re-requests the same file.
--- Raised from 8 when the write tool joined the tool set: write calls consume
--- budget too (one call per edit), so an agentic model needs headroom for
--- read → edit × N → done within one iter.
-local MAX_TOOL_CALLS_PER_ITER = 16
-
--- ── Distill / cache constants (added ST1) ───────────────────────────────────
--- Files with content length >= this threshold trigger the distill subloop (ST2-3).
--- Below threshold: full content returned verbatim (unchanged behaviour).
-local READ_FILE_FULL_THRESHOLD = 10000 -- chars
-
--- Lines per chunk fed to the distill LLM in one call.
-local DISTILL_CHUNK_LINES = 200
-
--- Maximum chars for the aggregate digest returned by read_file after distillation.
-local DISTILL_DIGEST_MAX_CHARS = 4000
-
--- Maximum chars for a single chunk's contribution to the aggregate digest.
-local DISTILL_CHUNK_DIGEST_MAX_CHARS = 400
-
--- TTL seconds for file_digest cache entries in "auto" refresh mode.
-local CACHE_AUTO_TTL_SEC = 10
-
--- Maximum line span allowed in a single read_file_range call.
-local READ_FILE_RANGE_MAX_LINES = 500
--- ── end distill / cache constants ───────────────────────────────────────────
-
--- Tool spec for the child LLM (multi-file branch only).
--- Passed as opts.tools in llm_call; never exposed to the parent agent layer.
-local READ_FILE_TOOL = {
-    name = "read_file",
-    description = "Read the current content of a target file. "
-        .. "For files <= READ_FILE_FULL_THRESHOLD bytes, returns full content. "
-        .. "For larger files, returns a distilled digest with line index hints; "
-        .. "use read_file_range to fetch verbatim ranges as needed.",
-    input_schema = {
-        type = "object",
-        required = { "path" },
-        properties = {
-            path = {
-                type = "string",
-                description = "Absolute path. Must be one of the target_files paths provided in the spec.",
-            },
-        },
-    },
-}
-
--- Tool spec for verbatim line-range retrieval (multi-file branch only).
--- Allows the child LLM to fetch exact source lines after read_file returns a digest.
-local READ_FILE_RANGE_TOOL = {
+--- The verbatim range read.
+---
+--- `std.fs`' own read takes a range too, and this one exists beside it for the
+--- case that one refuses: a file over the threshold. It never consults a
+--- digest, a cache or a summary — a range is the file, or it is nothing.
+local RANGE_TOOL = {
     name = "read_file_range",
-    description = "Read a verbatim line range of a target file. "
-        .. "Use this after read_file returned a distilled digest, to fetch a specific section. "
-        .. "1-indexed, inclusive; line_end - line_start + 1 must be <= READ_FILE_RANGE_MAX_LINES.",
+    description = "Read a verbatim, line-numbered range of a target file. "
+        .. "Use it when fs_read answers that the file is too large. "
+        .. "1-indexed and inclusive; line_end - line_start + 1 must be at most "
+        .. tostring(READ_FILE_RANGE_MAX_LINES)
+        .. ".",
     input_schema = {
         type = "object",
         required = { "path", "line_start", "line_end" },
         properties = {
-            path = {
-                type = "string",
-                description = "Absolute path. Must be in target_files.",
-            },
-            line_start = {
-                type = "integer",
-                description = "1-indexed start line, inclusive.",
-            },
-            line_end = {
-                type = "integer",
-                description = "1-indexed end line, inclusive.",
-            },
+            path = { type = "string", description = "Absolute path. Must be one of the target files." },
+            line_start = { type = "integer", description = "1-indexed start line, inclusive." },
+            line_end = { type = "integer", description = "1-indexed end line, inclusive." },
         },
     },
 }
 
--- ── ST2: cache lifecycle helpers ────────────────────────────────────────────
-
--- Return the mtime of a file as a number.
--- Tries std.fs.metadata(path).modified first (mlua-batteries fs feature).
--- Falls back to os.time() if the metadata call is unavailable or returns nil.
--- Fallback behaviour: within the same iter every call returns os.time() which is
--- nearly identical (same-second), so cache will hit for repeated reads within an
--- iter; across iter boundaries the TTL-based "auto" mode governs expiry.
-local function file_mtime(path)
-    local ok, meta = pcall(function()
-        return std.fs.metadata(path)
-    end)
-    if ok and meta and meta.modified then
-        return meta.modified
+--- Read `[line_start, line_end]` of `path`, verbatim.
+---
+--- Returns `{ ok = true, content, first_line }` or `{ ok = false, error }`; a
+--- refusal is data the model can correct from rather than a raise.
+local function read_file_range_handler(path, line_start, line_end, allowed)
+    if not allowed[path] then
+        return { ok = false, error = "path '" .. tostring(path) .. "' is not one of the target files" }
     end
-    -- Fallback: os.time() — same-iter reads get near-identical timestamps,
-    -- so auto-mode cache will hit within a single iter. Across iters the TTL
-    -- (CACHE_AUTO_TTL_SEC) governs whether the cache is considered fresh.
-    return os.time()
-end
-
--- Determine whether the cached digest for a path is still valid.
--- cached:        mf_state.file_digest[path] entry (or nil if not yet cached)
--- cur_mtime:     current file mtime (number from file_mtime)
--- refresh_mode:  "auto" | "always" | "files" | "manual"
---
--- Returns true  → use cache (no distill call needed)
---         false → cache miss or forced refresh (call distill_subloop)
-local function should_use_cache(cached, cur_mtime, refresh_mode)
-    if cached == nil then
-        return false
-    end
-    if refresh_mode == "always" then
-        return false
-    end
-    if refresh_mode == "manual" then
-        return true
-    end -- mtime ignored
-    local mtime_match = (cached.mtime == cur_mtime)
-    if refresh_mode == "files" then
-        return mtime_match
-    end
-    -- "auto": mtime match AND within TTL window
-    return mtime_match and (os.time() - cached.cached_at) < CACHE_AUTO_TTL_SEC
-end
-
--- Format a cached digest entry into an LLM-readable text block.
--- cached: { digest=string, line_index=string, mtime=number, cached_at=number }
--- Returns a formatted string combining the digest and the line index.
-local function format_digest_response(cached)
-    local parts = {}
-    table.insert(parts, "[Distilled digest]\n" .. tostring(cached.digest or ""))
-    if cached.line_index and cached.line_index ~= "" then
-        table.insert(parts, "\n[Line index]\n" .. tostring(cached.line_index))
-    end
-    table.insert(parts, "\n[Use read_file_range to fetch verbatim line ranges.]")
-    return table.concat(parts, "")
-end
-
--- Return the first READ_FILE_FULL_THRESHOLD chars of content with a warning suffix.
--- Used as a fallback when distill_subloop fails — compile_loop continues rather than
--- aborting (Phase 3b error design: handler returns content, never {ok=false}).
--- err: optional error string from distill_subloop (may be nil)
-local function truncate_with_warning(content, err)
-    local head = content:sub(1, READ_FILE_FULL_THRESHOLD)
-    local warn = "\n\n[WARNING: file exceeded size threshold; content truncated"
-    if err and err ~= "" then
-        warn = warn .. " (distill error: " .. tostring(err) .. ")"
-    end
-    warn = warn .. "]"
-    return head .. warn
-end
-
--- ── ST3: distill subloop helpers ────────────────────────────────────────────
-
--- Prompt template for the distill LLM call.
--- Placeholder order (8 args, AC#8): path, chunk_start, chunk_end, total_lines,
---   last_err, target_func, chunk_text, DISTILL_CHUNK_DIGEST_MAX_CHARS
-local DISTILL_CHUNK_PROMPT = "You are summarizing a chunk of a source code file for a coding assistant.\n"
-    .. "Your summary will be used as a digest that lets the assistant understand the code\n"
-    .. "without seeing the full file.\n\n"
-    .. "File: %s\n"
-    .. "Chunk: lines %d-%d (of %d total)\n"
-    .. "Recent build error (if any): %s\n"
-    .. "Target function (if any): %s\n\n"
-    .. "Code chunk:\n"
-    .. "```\n%s\n```\n\n"
-    .. "Instructions:\n"
-    .. "- Write a concise technical summary of what this chunk defines and does.\n"
-    .. "- Emphasize any definitions, exports, or logic relevant to the build error or target function.\n"
-    .. "- Include key function/class/variable names so the assistant can ask for specific lines.\n"
-    .. "- Keep the summary under %d characters.\n"
-    .. "- Output ONLY the summary text, no preamble."
-
--- Split a string into a list of lines (no trailing newline in each entry).
--- Returns a table of strings, 1-indexed.
-local function split_lines(content)
-    local lines = {}
-    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-        table.insert(lines, line)
-    end
-    return lines
-end
-
--- Split lines into chunks of at most chunk_size lines.
--- Applies boundary adjustment: after computing the natural chunk end, scans up to
--- +20 lines ahead for a line matching a function-definition prefix
--- (^function / ^local function / ^def / ^fn ).  If found at index i, the chunk
--- is extended to i-1 (just before the definition) to avoid mid-function splits.
---
--- Returns: { {start=N, end_=M, total_lines=T, text="..."}, ... }
---   - start / end_ are 1-indexed, inclusive
---   - total_lines is #lines (same for every chunk; used as prompt context)
-local function chunk_by_lines(lines, chunk_size)
-    local chunks = {}
-    local total = #lines
-    local i = 1
-    while i <= total do
-        local natural_end = math.min(i + chunk_size - 1, total)
-        local adjusted_end = natural_end
-        -- Boundary adjustment: scan up to +20 lines ahead for a function start.
-        if natural_end < total then
-            local scan_limit = math.min(natural_end + 20, total)
-            for j = natural_end + 1, scan_limit do
-                local line = lines[j]
-                if
-                    line:match("^function ")
-                    or line:match("^local function ")
-                    or line:match("^def ")
-                    or line:match("^fn ")
-                then
-                    -- Extend chunk to end just before this definition line.
-                    adjusted_end = j - 1
-                    break
-                end
-            end
-        end
-        -- Build chunk text.
-        local chunk_lines = {}
-        for k = i, adjusted_end do
-            table.insert(chunk_lines, lines[k])
-        end
-        table.insert(chunks, {
-            start = i,
-            end_ = adjusted_end,
-            total_lines = total,
-            text = table.concat(chunk_lines, "\n"),
-        })
-        i = adjusted_end + 1
-    end
-    return chunks
-end
-
--- Extract the text content from an llm_call response.
--- Both providers land on the same internal shape, so this reads one place.
--- Returns the content string or nil on any access failure.
-local function extract_text(resp)
-    if not resp then
-        return nil
-    end
-    local choices = resp.choices
-    if not choices or not choices[1] then
-        return nil
-    end
-    local msg = choices[1].message
-    if not msg then
-        return nil
-    end
-    return msg.content -- string for both providers when tools=nil
-end
-
--- Call the distill LLM for a single chunk.
--- Uses conf.provider (provider-agnostic — crux-card §2 must_not_simplify).
--- Never passes tools → raw text response (no tool_use schema in distill path).
--- Returns digest_string on success, nil on any failure (caller handles fallback).
-local function call_distill_llm(path, chunk, mf_state, conf)
-    -- Build distill conf — inherit provider/model/base_url/api_key from outer conf.
-    -- No 'tools' key → llm_call treats tools as nil → raw text response.
-    local distill_conf = {
-        provider = conf.provider,
-        model = conf.model,
-        base_url = conf.base_url,
-        api_key = conf.api_key,
-        api_key_env = conf.api_key_env,
-        -- Same endpoint settings as the main loop. Without these the distill
-        -- call silently ran at the provider defaults — thinking back on, the
-        -- env temperature, and the 120s timeout.
-        max_tokens = conf.max_tokens,
-        temperature = conf.temperature,
-        timeout = conf.timeout,
-        disable_thinking = conf.disable_thinking,
-        thinking = conf.thinking,
-        dialect = conf.dialect,
-    }
-
-    -- Resolve target_func with type guard (subtask-3.md Constraint / Risk).
-    local target_func_str = "(none)"
-    if conf.target_func and type(conf.target_func) == "string" then
-        target_func_str = conf.target_func
-    end
-
-    local prompt = string.format(
-        DISTILL_CHUNK_PROMPT,
-        path,
-        chunk.start,
-        chunk.end_,
-        chunk.total_lines,
-        mf_state.last_err or "(none)",
-        target_func_str,
-        chunk.text,
-        DISTILL_CHUNK_DIGEST_MAX_CHARS
-    )
-
-    local messages = {
-        { role = "user", content = prompt },
-    }
-
-    local resp, call_err = llm_call(distill_conf, messages) -- luacheck: ignore call_err
-    if not resp then
-        return nil
-    end
-
-    local text = extract_text(resp)
-    return text -- may be nil if response shape is unexpected
-end
-
--- Pack chunk digests into a single string that fits within max_chars.
--- chunk_digests: list of { start=N, end_=M, digest=string }  (already priority-sorted)
--- max_chars:     upper bound (DISTILL_DIGEST_MAX_CHARS)
--- tolerance:     allowed undershoot fraction (Aider repomap.py:568-591, default 0.15)
---
--- Algorithm:
---   1. If total length ≤ max_chars → include all (no binary search needed).
---   2. Otherwise binary-search for the largest K such that
---      sum(digests[1..K]) ≤ max_chars.
---      (tolerance is used to check whether we are in the acceptable window
---       max_chars*(1-tolerance) ≤ sum ≤ max_chars; if the best K already
---       satisfies this we stop early.)
---   3. Restore original order (sort by .start) before concatenating.
--- Returns: concatenated digest string (may be "" if every individual chunk
---          exceeds max_chars — caller's truncate_with_warning handles this).
-local function binary_search_pack(chunk_digests, max_chars, tolerance)
-    tolerance = tolerance or 0.15
-    if #chunk_digests == 0 then
-        return ""
-    end
-
-    -- Compute cumulative lengths.
-    local total_len = 0
-    for _, cd in ipairs(chunk_digests) do
-        total_len = total_len + #(cd.digest or "")
-    end
-
-    local selected
-    if total_len <= max_chars then
-        -- All fit — take everything.
-        selected = {}
-        for _, cd in ipairs(chunk_digests) do
-            table.insert(selected, cd)
-        end
-    else
-        -- Binary search for largest K that fits.
-        local lo, hi = 0, #chunk_digests
-        local best_k = 0
-        local lower_bound = max_chars * (1 - tolerance)
-        while lo <= hi do
-            local mid = math.floor((lo + hi) / 2)
-            local sum = 0
-            for k = 1, mid do
-                sum = sum + #(chunk_digests[k].digest or "")
-            end
-            if sum <= max_chars then
-                best_k = mid
-                if sum >= lower_bound then
-                    -- Within acceptable window — stop early (Aider tolerance logic).
-                    break
-                end
-                lo = mid + 1
-            else
-                hi = mid - 1
-            end
-        end
-        -- Collect top-K.
-        selected = {}
-        for k = 1, best_k do
-            table.insert(selected, chunk_digests[k])
-        end
-    end
-
-    -- Restore original order (sort by .start ascending).
-    table.sort(selected, function(a, b)
-        return a.start < b.start
-    end)
-
-    -- Concatenate digests.
-    local parts = {}
-    for _, cd in ipairs(selected) do
-        table.insert(parts, cd.digest or "")
-    end
-    return table.concat(parts, "\n")
-end
-
--- Build a line-index string from a list of chunk digest entries.
--- Each entry: { start=N, end_=M, digest=string }
--- Format: "L1-50: <first non-empty line of digest, max 80 chars>\n..."
-local function build_line_index(chunk_digests)
-    local lines = {}
-    for _, cd in ipairs(chunk_digests) do
-        -- First non-empty line of the digest.
-        local first_line = ""
-        for line in (tostring(cd.digest or "") .. "\n"):gmatch("([^\n]*)\n") do
-            if line ~= "" then
-                first_line = line
-                break
-            end
-        end
-        if #first_line > 80 then
-            first_line = first_line:sub(1, 80)
-        end
-        table.insert(lines, "L" .. cd.start .. "-" .. cd.end_ .. ": " .. first_line)
-    end
-    return table.concat(lines, "\n")
-end
-
--- Distill subloop — real implementation (ST3).
--- Replaces the ST2 stub.
---
--- Signature: path, content, mf_state, conf → digest, line_index, err_string
---   err_string non-nil means failure; caller should invoke truncate_with_warning.
---
--- Steps:
---   1. Split content into chunks (chunk_by_lines).
---   2. For each chunk, call call_distill_llm → collect {start, end_, digest}.
---      Chunk with no digest (LLM failure) is skipped; if ALL fail → err_string.
---   3. Priority-sort chunk_digests for binary_search_pack:
---      (1) chunks whose range overlaps last_err line (if any)
---      (2) chunks containing conf.target_func string (if non-nil string)
---      (3) original order
---   4. binary_search_pack → digest string.
---   5. build_line_index → line_index string.
---
--- Module-level override for test injection (M._test_set_distill_subloop).
-local _distill_subloop_override = nil
-
-local function distill_subloop(path, content, mf_state, conf)
-    if _distill_subloop_override then
-        return _distill_subloop_override(path, content, mf_state, conf)
-    end
-
-    -- 1. Split and chunk.
-    local lines = split_lines(content)
-    local chunks = chunk_by_lines(lines, DISTILL_CHUNK_LINES)
-
-    -- 2. Distill each chunk via LLM.
-    local chunk_digests = {}
-    for _, chunk in ipairs(chunks) do
-        local digest = call_distill_llm(path, chunk, mf_state, conf)
-        if digest then
-            table.insert(chunk_digests, {
-                start = chunk.start,
-                end_ = chunk.end_,
-                digest = digest,
-            })
-        end
-        -- Chunks with nil digest are silently skipped; if all fail we handle below.
-    end
-
-    if #chunk_digests == 0 then
-        return nil, nil, "distill_subloop: all chunks failed (no LLM response)"
-    end
-
-    -- 3. Priority-sort for binary_search_pack.
-    -- Extract the error line number from mf_state.last_err (path:line or path:line:col).
-    local err_line = nil
-    if mf_state.last_err then
-        local m = mf_state.last_err:match(":(%d+)")
-        if m then
-            err_line = tonumber(m)
-        end
-    end
-
-    local target_func = nil
-    if conf and conf.target_func and type(conf.target_func) == "string" then
-        target_func = conf.target_func
-    end
-
-    -- Assign priority to each chunk digest.
-    local function chunk_priority(cd)
-        -- Priority 1: overlaps err_line.
-        if err_line and cd.start <= err_line and err_line <= cd.end_ then
-            return 1
-        end
-        -- Priority 2: contains target_func string.
-        if target_func and cd.digest:find(target_func, 1, true) then
-            return 2
-        end
-        -- Priority 3: original order (handled by stable secondary sort below).
-        return 3
-    end
-
-    -- Stable sort: primary = priority, secondary = original index (position in table).
-    local indexed = {}
-    for idx, cd in ipairs(chunk_digests) do
-        table.insert(indexed, { cd = cd, prio = chunk_priority(cd), orig = idx })
-    end
-    table.sort(indexed, function(a, b)
-        if a.prio ~= b.prio then
-            return a.prio < b.prio
-        end
-        return a.orig < b.orig
-    end)
-
-    -- Rebuild sorted list for binary_search_pack.
-    local sorted_digests = {}
-    for _, entry in ipairs(indexed) do
-        table.insert(sorted_digests, entry.cd)
-    end
-
-    -- 4. Pack into budget.
-    local digest = binary_search_pack(sorted_digests, DISTILL_DIGEST_MAX_CHARS, 0.15)
-
-    -- 5. Build line index (using original order for readability).
-    local line_index = build_line_index(chunk_digests)
-
-    return digest, line_index, nil
-end
-
--- Handle a read_file_range tool call from the child LLM.
--- Returns verbatim lines [line_start, line_end] (1-indexed, inclusive) from path.
--- NEVER passes through distillation — verbatim access is guaranteed regardless of
--- file size (crux-card §3 must_not_simplify: verbatim range access after distill).
--- Returns {ok=true, content=string} or {ok=false, error=string}.
-local function read_file_range_tool_handler(path, line_start, line_end, target_files_set)
-    -- Allowlist check
-    if not target_files_set[path] then
-        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
-    end
-    -- Type and range validation
     if
         type(line_start) ~= "number"
         or type(line_end) ~= "number"
@@ -1428,23 +424,15 @@ local function read_file_range_tool_handler(path, line_start, line_end, target_f
     then
         return { ok = false, error = "line_start and line_end must be integers" }
     end
-    line_start = math.floor(line_start)
-    line_end = math.floor(line_end)
     if line_start < 1 or line_end < line_start then
         return { ok = false, error = "invalid range: require 1 <= line_start <= line_end" }
     end
     if (line_end - line_start + 1) > READ_FILE_RANGE_MAX_LINES then
         return {
             ok = false,
-            error = string.format(
-                "range %d-%d exceeds READ_FILE_RANGE_MAX_LINES=%d",
-                line_start,
-                line_end,
-                READ_FILE_RANGE_MAX_LINES
-            ),
+            error = string.format("range %d-%d is more than %d lines", line_start, line_end, READ_FILE_RANGE_MAX_LINES),
         }
     end
-    -- Verbatim line read (no distillation)
     local f, open_err = io.open(path, "r")
     if not f then
         return { ok = false, error = "cannot open: " .. tostring(open_err) }
@@ -1462,966 +450,519 @@ local function read_file_range_tool_handler(path, line_start, line_end, target_f
     end
     f:close()
     if cur < line_start then
-        return {
-            ok = false,
-            error = string.format("file has %d lines; line_start=%d out of range", cur, line_start),
-        }
+        return { ok = false, error = string.format("file has %d lines; line_start=%d is past the end", cur, line_start) }
     end
     return { ok = true, content = table.concat(lines, "\n"), first_line = line_start }
 end
 
--- Prefix each line with its 1-based number.
---
--- fs_edit addresses lines, so the reads that feed it have to say which line
--- is which. Only ever applied to verbatim content on its way to the child LLM
--- (never to the cached copy, and never to a distilled digest, where the
--- numbers would not correspond to the file).
-local function with_line_numbers(text, first_line)
-    local out = {}
-    local n = (first_line or 1) - 1
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        n = n + 1
-        table.insert(out, string.format("%d\t%s", n, line))
+--- `std.fs`' read, with the one branch this loop adds: a whole-file read of
+--- something over the threshold answers with its length instead of its content.
+---
+--- The answer names the tool that will still work, so a model that meets this
+--- has somewhere to go. A ranged read passes through untouched — that is the
+--- request this branch is pointing at.
+local function sized_read(handler)
+    return function(input)
+        input = input or {}
+        local res = handler(input)
+        if input.start_line ~= nil or type(res) ~= "table" or type(res.content) ~= "string" then
+            return res
+        end
+        if #res.content <= READ_FILE_FULL_THRESHOLD then
+            return res
+        end
+        return {
+            ok = false,
+            reason = "too_large",
+            error = string.format(
+                "too large: %d lines. Read a range instead — fs_read with start_line / end_line, or %s.",
+                res.lines or 0,
+                RANGE_TOOL.name
+            ),
+        }
     end
-    -- gmatch on text .. "\n" yields one trailing empty element for text that
-    -- already ended in a newline; drop it so no phantom line is numbered.
-    if #out > 0 and out[#out]:match("^%d+\t$") and text:sub(-1) == "\n" then
-        table.remove(out)
-    end
-    return table.concat(out, "\n")
-end
--- ── end ST2: cache lifecycle helpers ────────────────────────────────────────
-
--- Handle a read_file tool call from the child LLM.
--- Returns {ok=true, content=string} or {ok=false, error=string}.
--- Never raises; errors are propagated as tool_result content so the child LLM
--- can recover (per-iter reset keeps the loop safe).
---
--- ST2: signature extended to (path, target_files_set, mf_state, conf).
--- mf_state and conf may be nil when called from paths that do not yet pass them
--- (guards below ensure backward-safe behaviour).
--- Size branch:
---   content <= READ_FILE_FULL_THRESHOLD → return full content (unchanged behaviour)
---   content >  READ_FILE_FULL_THRESHOLD → run distill_subloop (stub in ST2)
---     cache hit  → return format_digest_response(cached)  [no LLM call]
---     cache miss → call distill_subloop → cache result → format_digest_response
---     distill failure → truncate_with_warning (loop continues)
-local function read_file_tool_handler(path, target_files_set, mf_state, conf)
-    -- Error messages below are kept verbatim from the original (BC2 regression guard).
-    if not target_files_set[path] then
-        return { ok = false, error = "path '" .. tostring(path) .. "' not in target_files allowlist" }
-    end
-    local f, err = io.open(path, "r")
-    if not f then
-        return { ok = false, error = "cannot open: " .. tostring(err) }
-    end
-    local content = f:read("*a")
-    f:close()
-    content = content or ""
-
-    -- Below-threshold: return full content unchanged (AC #2, backward-compat).
-    if #content <= READ_FILE_FULL_THRESHOLD then
-        return { ok = true, content = content, verbatim = true }
-    end
-
-    -- Above-threshold: use distill / cache path.
-    -- mf_state guard: if caller did not supply mf_state (legacy path), fall back to truncate.
-    if not mf_state or type(mf_state.file_digest) ~= "table" then
-        return { ok = true, content = truncate_with_warning(content, nil) }
-    end
-
-    local refresh_mode = mf_state.file_digest_refresh or "auto"
-    local cur_mtime = file_mtime(path)
-    local cached = mf_state.file_digest[path]
-
-    if should_use_cache(cached, cur_mtime, refresh_mode) then
-        -- Cache hit: return digest without calling distill_subloop (AC #3).
-        return { ok = true, content = format_digest_response(cached) }
-    end
-
-    -- Cache miss or forced refresh: call distill_subloop (stub in ST2).
-    local digest, line_index, distill_err = distill_subloop(path, content, mf_state, conf)
-    if distill_err then
-        -- Distill failure: return truncated content with warning; do not abort loop (AC #5).
-        return { ok = true, content = truncate_with_warning(content, distill_err) }
-    end
-
-    -- Store result in cache (AC #4).
-    mf_state.file_digest[path] = {
-        digest = digest,
-        line_index = line_index,
-        mtime = cur_mtime,
-        cached_at = os.time(),
-    }
-
-    return { ok = true, content = format_digest_response(mf_state.file_digest[path]) }
 end
 
--- ============================================================
--- Internal loop body (non-public; called only via make().handler)
--- ============================================================
-
--- run_loop(conf) executes the structural compile-and-fix loop.
--- conf fields (K-96 full set, all resolved before entry):
---   runner, lang, target_files (list<abs_path>), multi_file (bool), spec,
---   max_iters, system, edit_mode, tool_mode ("auto"|"read_only"|"none"),
---   provider, base_url, api_key, api_key_env, model,
---   max_tokens, temperature, disable_thinking, timeout,
---   on_iter (optional callback)
---
--- For backward compatibility, single-file callers pass conf.target_files = {abs_path}
--- and conf.multi_file = false. The handler normalizes before calling run_loop.
-local function run_loop(conf)
-    assert(type(conf) == "table", "conf table required")
-    assert(conf.target_files and #conf.target_files > 0, "conf.target_files (non-empty list) required")
-    assert(conf.spec, "conf.spec required")
-    assert(type(conf.runner) == "function", "conf.runner (function) required")
-
-    local lang = conf.lang or "lua"
-    local max_iters = conf.max_iters or 5
-    local multi_file = conf.multi_file or false
-    -- tool_mode governs which tools diff mode declares:
-    --   "auto" (default): read_file + read_file_range + fs_edit
-    --   "read_only":      reads only — can inspect, cannot converge
-    --
-    -- "none" and "adaptive" are gone with the SEARCH/REPLACE text channel they
-    -- depended on: "none" meant "no tools, edit through text", and "adaptive"
-    -- meant "fall back to that text channel when the tools stall". Without a
-    -- text channel there is nothing to fall back to, and a diff run with no
-    -- edit tool cannot change a file at all. Callers that need a no-tools path
-    -- want edit_mode = "full".
-    local tool_mode = conf.tool_mode or "auto"
-    local active_tool_mode = tool_mode
-    -- Cached: the dump mode is a single process-wide fact, and the cache also
-    -- keeps the prod-downgrade warn to at most one line per process.
-    local mode = resolve_dump_mode_cached()
-
-    -- In single-file mode, artifact_path is the single absolute path (backward compat).
-    -- In multi-file mode, artifact_path is nil; modified_files carries the list.
-    local artifact_path = (not multi_file) and conf.target_files[1] or nil
-
-    -- Build a set for fast path-header validation in parse_search_replace.
-    local target_files_set = {}
-    for _, p in ipairs(conf.target_files) do
-        target_files_set[p] = true
-    end
-
-    -- Write channel: std.fs owns the edit semantics, scoped to this run's
-    -- target files. `tool_specs` rather than `register_tools` — the registry is
-    -- global and this lock is per-invocation.
-    -- Resolve edit_mode.
-    -- For single-file: "diff" requires a non-empty target file; fallback to "full".
-    -- For multi-file: edit_mode="diff" is required (enforced in handler, but guard here too).
-    local edit_mode = conf.edit_mode or "full"
-
-    -- For multi-file lazy-load, do NOT pre-read file contents into initial message.
-    -- existing_map starts empty; it is populated on-demand per-iter before apply.
-    -- For single-file mode, pre-read as before (existing_map used for initial message + apply base).
-    local existing_map = {}
-    if not multi_file then
-        for _, p in ipairs(conf.target_files) do
-            existing_map[p] = read_target_if_exists(p)
-        end
-    end
-
-    -- Single-file edit_mode fallback (multi-file must use diff — already asserted in handler).
-    if not multi_file and edit_mode == "diff" and not existing_map[conf.target_files[1]] then
-        log.warn("compile_loop: edit_mode=diff requires an existing non-empty target_file; falling back to full")
-        edit_mode = "full"
-    end
-
-    -- Select system prompt based on edit_mode and multi_file flag.
-    local system
-    if edit_mode == "diff" then
-        if multi_file then
-            system = conf.system or DIFF_SYSTEM_MULTI
-        else
-            system = conf.system or DIFF_SYSTEM
-        end
-    else
-        system = conf.system or DEFAULT_SYSTEM
-    end
-
-    -- Path list shown to the model each iteration; diff mode assembles the rest
-    -- of its prompt per iteration from the last verify error.
-    local path_lines = {}
-    for _, p in ipairs(conf.target_files) do
-        table.insert(path_lines, "  " .. p)
-    end
-
-    -- Full mode embeds the file and asks for the whole thing back.
-    local single_initial_user_content
-    if edit_mode == "full" then
-        local existing = existing_map[conf.target_files[1]]
-        if existing then
-            single_initial_user_content = conf.spec
-                .. "\n\n=== Current file content ===\n```"
-                .. lang
-                .. "\n"
-                .. existing
-                .. "\n```"
-        else
-            single_initial_user_content = conf.spec
-        end
-    end
-
-    -- ── Per-iter state for multi-file lazy-load ─────────────────────────────────
-    -- messages[] is rebuilt each iter from state; not accumulated across iters.
-    -- sr_history is reserved for subtask 2 (stagnation_v2); initialized empty here.
-    local mf_state = {
-        iter = 0,
-        last_err = nil, -- most recent verify failure stderr (≤2,000 chars)
-        sr_digest_prev = nil, -- digest of last SR block (≤500 chars)
-        sr_history = {}, -- populated in subtask 2
-        -- ST1: per-iter-reset-surviving file digest cache (crux-card §1).
-        -- Keyed by absolute path; each entry: { digest, line_index, mtime, cached_at }.
-        -- Must NOT be cleared or overwritten in the per-iter rebuild path (L1149-1170).
-        file_digest = {},
-        -- Refresh policy for file_digest cache ("auto" uses CACHE_AUTO_TTL_SEC).
-        file_digest_refresh = "auto",
-        -- Accumulates paths that were successfully written by iterate_files across iters.
-        -- Used to populate modified_files on every return path (crux §3).
-        modified_set = {},
-    }
-    assert(type(mf_state.sr_history) == "table", "mf_state.sr_history must be initialized")
-    assert(type(mf_state.file_digest) == "table", "mf_state.file_digest must be initialized")
-    assert(mf_state.file_digest_refresh == "auto", "mf_state.file_digest_refresh must default to 'auto'")
-    assert(type(mf_state.modified_set) == "table", "mf_state.modified_set must be initialized")
-
-    -- ── Tool set handed to tool_loop ────────────────────────────────────────
-    --
-    -- std.fs owns the edit; this wrapper owns what an edit means to the loop
-    -- (which files changed, which caches are now stale, whether the iteration
-    -- made progress). The build is deliberately not among these: a tool the
-    -- model can decline to call cannot carry the "it compiles" guarantee.
-    -- Which cached reads are the file verbatim (vs a distilled digest);
-    -- only the verbatim ones may be line-numbered for fs_edit.
-    local verbatim_reads = {}
-    local edit_count = 0
-    local iter_edit_sigs = {}
-    local iter_edit_errors = {}
-
-    -- Run totals, carried on whichever event ends the run. Per-edit lines say
-    -- where each change landed; these say what the run came to, so two runs can
-    -- be set against each other without folding their logs back together.
-    local run_lines_removed = 0
-    local run_lines_added = 0
-
-    local function run_summary_fields(leading)
-        local fields = {}
-        for _, f in ipairs(leading or {}) do
-            fields[#fields + 1] = f
-        end
-        fields[#fields + 1] = { "edits", edit_count }
-        fields[#fields + 1] = { "files", #collect_modified_paths(mf_state.modified_set) }
-        fields[#fields + 1] = { "lines_removed", run_lines_removed }
-        fields[#fields + 1] = { "lines_added", run_lines_added }
-        return fields
-    end
-
-    -- The tool set is built once, but its calls belong to an iteration. The
-    -- loop below advances this cursor so each obs line can say which one —
-    -- without it, a run with max_iters > 1 logs reads and edits that cannot be
-    -- attributed to the iteration that made them. Iterations are sequential,
-    -- so a single cursor is exact.
-    local current_iter = 0
-
-    local fs_edit_spec = std.fs.tool_specs({ allowed = { "edit" }, path_lock = conf.target_files })[1]
-    local raw_fs_edit = fs_edit_spec.handler
-
-    local function on_edit(input)
-        local path = input.path or ""
-        local res = raw_fs_edit(input)
-        if res.ok then
-            edit_count = edit_count + 1
-            mf_state.modified_set[path] = true
-            -- Both views of the file predate the write.
-            existing_map[path] = nil
-            mf_state.file_digest[path] = nil
-            -- Signature by resulting version: two different edits that land on
-            -- the same content are the same lack of progress.
-            table.insert(iter_edit_sigs, path .. "\1" .. tostring(res.version))
-            local ranges, removed, added = summarize_edits(input.edits)
-            run_lines_removed = run_lines_removed + removed
-            run_lines_added = run_lines_added + added
-            obs_event(mode, "tool_use", {
-                { "iter", current_iter },
-                { "path", path },
-                { "tool", "fs_edit" },
-                { "ok", true },
-                { "ranges", ranges },
-                { "lines_removed", removed },
-                { "lines_added", added },
-            })
-            return "applied " .. tostring(res.applied) .. " edit(s) to " .. path
-        end
-
-        local detail = res.reason or "edit rejected"
-        if res.reason == "expect_mismatch" then
-            detail = "expect did not match lines "
-                .. tostring(res.start_line)
-                .. "-"
-                .. tostring(res.end_line)
-                .. "; those lines currently contain:\n"
-                .. tostring(res.actual)
-        elseif res.reason == "stale_base" then
-            detail = path .. " changed since you read it; re-read and retry"
-        elseif res.reason == "out_of_range" then
-            detail = "line "
-                .. tostring(res.end_line)
-                .. " is past the end of the file ("
-                .. tostring(res.file_lines)
-                .. " lines)"
-        elseif res.reason == "path_not_allowed" then
-            detail = "path '" .. path .. "' is not one of the target files"
-        end
-        table.insert(iter_edit_errors, detail)
-        -- A rejected batch changes nothing, so there are no magnitudes to
-        -- report — but where it aimed is what separates an edit that was
-        -- refused from one that landed somewhere other than the lines meant.
-        local attempted = summarize_edits(input.edits)
-        obs_event(mode, "tool_use_fail", {
-            { "iter", current_iter },
-            { "path", path },
-            { "tool", "fs_edit" },
-            { "err", res.reason },
-            { "ranges", attempted },
-        })
-        return "ERROR: " .. detail
-    end
-
-    -- read_file keeps compile_loop's own handler: it is not a plain read but
-    -- the loop's context management (size branch, digest cache, distill).
-    local function on_read(input)
-        local path = input.path or ""
-        local cached = existing_map[path]
-        local res
-        if cached ~= nil then
-            res = { ok = true, content = cached, verbatim = verbatim_reads[path] }
-        else
-            res = read_file_tool_handler(path, target_files_set, mf_state, conf)
-            if res.ok then
-                existing_map[path] = res.content
-                verbatim_reads[path] = res.verbatim
-            end
-        end
-        if not res.ok then
-            obs_event(
-                mode,
-                "tool_use_fail",
-                { { "iter", current_iter }, { "path", path }, { "tool", READ_FILE_TOOL.name }, { "err", res.error } }
-            )
-            return "ERROR: " .. tostring(res.error)
-        end
-        obs_event(mode, "tool_use", {
-            { "iter", current_iter },
-            { "path", path },
-            { "tool", READ_FILE_TOOL.name },
-            { "ok", true },
-            -- Served from this iteration's cache rather than re-read from disk.
-            { "cached", cached ~= nil },
-        })
-        -- Numbered only when it is the file itself; a digest has no line
-        -- correspondence, and numbering it would invite edits to nowhere.
-        if res.verbatim then
-            return with_line_numbers(res.content, 1)
-        end
-        return res.content
-    end
-
-    local function on_read_range(input)
-        local path = input.path or ""
-        local res = read_file_range_tool_handler(path, input.line_start, input.line_end, target_files_set)
-        if not res.ok then
-            obs_event(
-                mode,
-                "tool_use_fail",
-                {
-                    { "iter", current_iter },
-                    { "path", path },
-                    { "tool", READ_FILE_RANGE_TOOL.name },
-                    { "err", res.error },
-                }
-            )
-            return "ERROR: " .. tostring(res.error)
-        end
-        obs_event(mode, "tool_use", {
-            { "iter", current_iter },
-            { "path", path },
-            { "tool", READ_FILE_RANGE_TOOL.name },
-            { "ok", true },
-        })
-        return with_line_numbers(res.content, res.first_line)
-    end
-
-    local edit_tools = {
-        {
-            name = READ_FILE_TOOL.name,
-            description = READ_FILE_TOOL.description,
-            input_schema = READ_FILE_TOOL.input_schema,
-            handler = on_read,
-        },
-        {
-            name = READ_FILE_RANGE_TOOL.name,
-            description = READ_FILE_RANGE_TOOL.description,
-            input_schema = READ_FILE_RANGE_TOOL.input_schema,
-            handler = on_read_range,
-        },
-        {
-            name = fs_edit_spec.name,
-            description = fs_edit_spec.description,
-            input_schema = fs_edit_spec.input_schema,
-            handler = on_edit,
-        },
-    }
-
-    -- read_only withholds the write tool. It cannot converge on its own, so it
-    -- is for inspecting what the model would do, not for fixing.
-    local read_only_tools = { edit_tools[1], edit_tools[2] }
-
-    -- Caller-registered tools ride along with both sets: they are declared
-    -- whenever any tool is. Their calls never count as edits — by contract they
-    -- are read-like, and counting them would let a loop that only queried the
-    -- caller's tool look like it was making progress.
-    for _, t in ipairs(conf.extra_tools or {}) do
-        local schema = t.schema or {}
-        local spec = {
+--- One `conf.extra_tools` entry as the flat spec `knl_adapter.tools` binds.
+---
+--- Two accepted shapes, because the agent layer's nested one
+--- (`{ name, schema = { description, input_schema }, handler }`) is what
+--- callers have always written. A flat entry passes through; a flat entry that
+--- spells the schema field `schema` reaches `knl_adapter`'s loud error rather
+--- than the provider with no schema.
+local function extra_spec(t)
+    if t.schema ~= nil then
+        return {
             name = t.name,
-            description = schema.description or "",
-            input_schema = schema.input_schema or { type = "object", properties = {} },
+            description = t.schema.description,
+            input_schema = t.schema.input_schema,
+            handler = t.handler,
+        }
+    end
+    return {
+        name = t.name,
+        description = t.description,
+        input_schema = t.input_schema,
+        handler = t.handler,
+    }
+end
+
+--- The tools map for diff mode: `std.fs`' path-locked read and edit, the range
+--- read, and whatever the caller added.
+---
+--- `tool_specs` rather than `register_tools` — the registry is global and this
+--- lock is per-invocation. `read_only` withholds the edit tool: it can inspect
+--- and it cannot converge, so it is a dry run rather than a fix.
+---
+--- A name claimed twice raises out of `knl_adapter.tools`, which is what makes
+--- a caller's `get_hint` colliding with `fs_edit` a wiring error rather than a
+--- silent winner.
+---
+--- @return table tools  the device's tools map
+--- @return string edit_name  the name applied edits are counted under
+local function build_tools(conf, targets, allowed)
+    local read_spec = std.fs.tool_specs({ allowed = { "read" }, path_lock = targets })[1]
+    local edit_spec = std.fs.tool_specs({ allowed = { "edit" }, path_lock = targets })[1]
+
+    local specs = {
+        {
+            name = read_spec.name,
+            description = read_spec.description,
+            input_schema = read_spec.input_schema,
+            handler = sized_read(read_spec.handler),
+        },
+        {
+            name = RANGE_TOOL.name,
+            description = RANGE_TOOL.description,
+            input_schema = RANGE_TOOL.input_schema,
             handler = function(input)
-                local ok, res = pcall(t.handler, input or {})
-                if not ok then
-                    obs_event(
-                        mode,
-                        "tool_use_fail",
-                        { { "iter", current_iter }, { "tool", t.name }, { "err", tostring(res) } }
-                    )
-                    return "ERROR: " .. tostring(res)
+                input = input or {}
+                local res = read_file_range_handler(input.path or "", input.line_start, input.line_end, allowed)
+                if not res.ok then
+                    return res
                 end
-                obs_event(
-                    mode,
-                    "tool_use",
-                    { { "iter", current_iter }, { "tool", t.name }, { "ok", true }, { "extra", true } }
-                )
-                return res
+                return with_line_numbers(res.content, res.first_line)
             end,
-        }
-        table.insert(edit_tools, spec)
-        table.insert(read_only_tools, spec)
+        },
+    }
+    if conf.tool_mode ~= "read_only" then
+        specs[#specs + 1] = edit_spec
     end
-
-    -- Full mode accumulates one conversation across iters; diff mode's turns
-    -- live inside tool_loop and do not survive the iteration.
-    --
-    -- The system prompt is not part of that conversation: it rides beside the
-    -- messages (`opts.system`) instead of being the first of them, so the
-    -- transcript holds what was said and the wire form is the adapter's
-    -- business. `next_prompt` is the user turn the coming iteration opens with;
-    -- everything before it is history.
-    --
-    -- `full_llm` is what those iterations hand tool_loop; it is resolved here
-    -- because none of it changes between them.
-    local messages
-    local next_prompt
-    local full_llm
-    if edit_mode == "full" then
-        messages = {}
-        next_prompt = single_initial_user_content
-
-        -- Defaulted here rather than left to llm_proto, whose default is
-        -- anthropic: full mode has always resolved an unset provider to
-        -- openai, and a caller that set neither would otherwise find itself
-        -- talking to a different endpoint after this refactor.
-        local provider = conf.provider or "openai"
-
-        -- Qwen's switch, said in the shared vocabulary. An explicit
-        -- conf.thinking wins when both are set.
-        local thinking = conf.thinking
-        if thinking == nil and conf.disable_thinking then
-            thinking = { enabled = false }
-        end
-
-        full_llm = {
-            provider = provider,
-            base_url = conf.base_url,
-            api_key = conf.api_key,
-            api_key_env = conf.api_key_env,
-            model = conf.model,
-            max_tokens = conf.max_tokens,
-            thinking = thinking,
-            dialect = conf.dialect,
-            tool_choice = conf.tool_choice,
-            parallel_tool_calls = conf.parallel_tool_calls,
-            -- cache_control defaults OFF here: compile_loop sends the whole
-            -- file back every iteration, so the markers would only add bytes.
-            cache_control = conf.cache_control or false,
-            timeout = conf.timeout,
-        }
-
-        if provider ~= "anthropic" then
-            -- compile_loop's own temperature tier (caller →
-            -- COMPILE_LOOP_LLM_TEMPERATURE → 0.0) has only ever been sent on
-            -- the OpenAI path; Anthropic full-mode requests carried no
-            -- temperature at all. Sending one there now would change every
-            -- existing run rather than unify anything.
-            full_llm.temperature = conf.temperature or resolve_temperature()
-            -- RunPod's proxy and Cloudflare's gate answer an unfamiliar
-            -- User-Agent with a challenge page instead of the model, so the
-            -- OpenAI-compatible request has always carried a browser one. It is
-            -- a transport quirk rather than a protocol field: llm_proto merges
-            -- it onto the request and reads nothing from it.
-            full_llm.headers = { ["User-Agent"] = "Mozilla/5.0" }
-        end
+    for _, t in ipairs(conf.extra_tools or {}) do
+        specs[#specs + 1] = extra_spec(t)
     end
+    return adapter.tools(specs), edit_spec.name
+end
 
-    -- Full mode's request/response trail. tool_loop owns the HTTP call now, so
-    -- the bodies are observed through its hooks; the event names are the ones
-    -- the dump consumers already match on. Built only under full dump mode —
-    -- obs_event would drop them anyway, and the encoding is not free.
-    local on_request, on_response
-    if edit_mode == "full" and mode == "full" then
-        on_request = function(ev)
-            obs_event(mode, "request_headers", {
-                { "payload", std.json.encode(sanitize_headers_for_dump(ev.headers)) },
-            })
-            -- The bytes that went on the wire, not a re-encoding of them.
-            obs_event(mode, "request_body", { { "payload", ev.body_json } })
-        end
-        on_response = function(ev)
-            obs_event(mode, "response_headers", {
-                { "payload", std.json.encode(sanitize_headers_for_dump(ev.headers)) },
-            })
-            obs_event(mode, "response_body", { { "payload", tostring(ev.body or "") } })
-        end
-    end
+-- ============================================================
+-- Reading the run back
+-- ============================================================
 
-    local history = {}
-    -- bad_stagnation_count: counts consecutive iters where the LLM produced zero successful edits.
-    -- Reset to 0 whenever at least one edit applies (good iter). When it reaches STAGNATION_WINDOW,
-    -- the loop terminates with failure_reason = "no_edits_applied".
-    local bad_stagnation_count = 0
-
-    for iter = 1, max_iters do
-        current_iter = iter
-        local obs_target = artifact_path or table.concat(conf.target_files, ",")
-        obs_event(mode, "iter_start", { { "iter", iter }, { "target_file", obs_target } })
-
-        -- ── diff mode ──────────────────────────────────────────────────────────
-        --
-        -- tool_loop does the read/edit turns with exactly the tools above; the
-        -- build is this loop's own step. That split is the guarantee
-        -- compile_loop sells: "it compiles" has to be something the loop
-        -- verified, so the runner is never a tool the model can skip.
-        if edit_mode == "diff" then
-            local edits_before = edit_count
-            iter_edit_sigs = {}
-            iter_edit_errors = {}
-            -- The per-iter read cache: files change under it between iters.
-            existing_map = {}
-            verbatim_reads = {}
-            mf_state.iter = iter
-
-            local prompt_parts = { conf.spec, "\n\nFiles:\n" .. table.concat(path_lines, "\n") }
-            if mf_state.last_err and mf_state.last_err ~= "" then
-                table.insert(prompt_parts, "\n\n=== Last verify error (trimmed) ===\n" .. mf_state.last_err)
-            end
-
-            local tl = tool_loop.run({
-                prompt = table.concat(prompt_parts, ""),
-                system = system,
-                tools = active_tool_mode == "read_only" and read_only_tools or edit_tools,
-                max_turns = MAX_TOOL_CALLS_PER_ITER,
-                llm = {
-                    provider = conf.provider,
-                    base_url = conf.base_url,
-                    api_key = conf.api_key,
-                    api_key_env = conf.api_key_env,
-                    model = conf.model,
-                    max_tokens = conf.max_tokens,
-                    temperature = conf.temperature,
-                    thinking = conf.thinking,
-                    dialect = conf.dialect,
-                    tool_choice = conf.tool_choice,
-                    timeout = conf.timeout,
-                },
-            })
-
-            local iter_edits_applied = edit_count - edits_before
-            local content = tl.content or ""
-
-            -- A transport / protocol failure is not the model failing to edit;
-            -- it ends the run rather than counting as a stagnant iteration.
-            if
-                not tl.ok
-                and iter_edits_applied == 0
-                and tl.error
-                and not tostring(tl.error):find("max_turns", 1, true)
-            then
-                return {
-                    ok = false,
-                    failure_reason = "llm_call",
-                    last_error = tostring(tl.error):sub(-800),
-                    iters = iter - 1,
-                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
-                    artifact_path = artifact_path,
-                    modified_files = collect_modified_paths(mf_state.modified_set),
-                    history = history,
-                }
-            end
-
-            -- Nothing reached disk: the build would report what it already
-            -- reported, so feed the tool errors back instead of re-running it.
-            if iter_edits_applied == 0 then
-                bad_stagnation_count = bad_stagnation_count + 1
-                local zero_msg = "No edits were applied."
-                if #iter_edit_errors > 0 then
-                    zero_msg = zero_msg .. " Every fs_edit call was rejected:\n" .. table.concat(iter_edit_errors, "\n")
-                end
-                zero_msg = zero_msg
-                    .. "\nRe-read the file (read_file output is line-numbered) and retry with an exact expect."
-                local entry = {
-                    iter = iter,
-                    code = nil,
-                    result = { ok = false, stderr = zero_msg, stdout = "", exit_code = -1 },
-                    raw = content,
-                }
-                table.insert(history, entry)
-                obs_event(mode, "iter_result", {
-                    { "iter", iter },
-                    { "ok", false },
-                    { "exit_code", -1 },
-                    { "stderr_len", #zero_msg },
-                })
-                if conf.on_iter then
-                    local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                    if not cb_ok then
-                        log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
+--- The edits one beat landed, and the paths they landed in.
+---
+--- Read off the log rather than counted in a wrapper: `std.fs` reports a
+--- rejected edit by RETURNING `{ ok = false, reason = ... }`, so the kernel
+--- closes the pair `ok = true` (nothing raised) and the tool's own verdict is
+--- in the recorded result. What an edit MEANT to this loop is the loop's, and
+--- the log is where it reads it from.
+---
+--- @param session userdata|table  a knl session
+--- @param beat_id string  the beat whose pairs to read
+--- @param edit_name string  the edit tool's name
+--- @param modified table  path set, added to
+--- @return number  how many edits applied
+local function beat_edits(session, beat_id, edit_name, modified)
+    local edited_by_call = {}
+    local applied = 0
+    for _, ev in ipairs(session:events()) do
+        if ev.beat == beat_id then
+            local data = type(ev.data) == "table" and ev.data or {}
+            -- A pair is looked up by its call id, so a record that carries none
+            -- is skipped rather than indexed: a nil key is a raise, and a
+            -- provider that named no id is the kernel's problem to report, not
+            -- this loop's to crash on.
+            if ev.kind == "tool_call" and data.name == edit_name and data.call_id ~= nil then
+                local args = type(data.args) == "table" and data.args or {}
+                edited_by_call[data.call_id] = args.path or ""
+            elseif ev.kind == "tool_result" and data.call_id ~= nil then
+                local path = edited_by_call[data.call_id]
+                if path ~= nil and type(data.result) == "table" and data.result.ok == true then
+                    applied = applied + 1
+                    if path ~= "" then
+                        modified[path] = true
                     end
                 end
-                update_state(mf_state, {
-                    last_err = zero_msg,
-                    sr_hash_append = compute_sr_hash("<no_edits:" .. tostring(iter) .. ">"),
-                })
-                if bad_stagnation_count >= STAGNATION_WINDOW then
-                    obs_event(
-                        mode,
-                        "bad_stagnation_blocked",
-                        run_summary_fields({ { "iter", iter }, { "reason", "no_edits_applied" } })
-                    )
-                    return {
-                        ok = false,
-                        failure_reason = "no_edits_applied",
-                        last_error = mf_state.last_err or "",
-                        iters = iter,
-                        summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                        artifact_path = artifact_path,
-                        modified_files = collect_modified_paths(mf_state.modified_set),
-                        history = history,
-                    }
-                end
-                goto iter_continue
-            end
-
-            bad_stagnation_count = 0
-
-            -- Verify. The loop's step, not the model's.
-            local rr = shape.assert_dev(
-                conf.runner(multi_file and conf.target_files or conf.target_files[1]),
-                RUNNER_RESULT,
-                "compile_loop conf.runner result (multi-file)"
-            ) or {}
-            local entry = { iter = iter, code = nil, result = rr, raw = content }
-            table.insert(history, entry)
-            obs_event(mode, "iter_result", {
-                { "iter", iter },
-                { "ok", rr.ok and true or false },
-                { "exit_code", rr.exit_code },
-                { "stderr_len", #(tostring(rr.stderr or "")) },
-            })
-            if conf.on_iter then
-                local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                if not cb_ok then
-                    log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                end
-            end
-
-            local iter_sig = table.concat(iter_edit_sigs, "\1")
-            if rr.ok then
-                update_state(mf_state, { sr_hash_append = compute_sr_hash(iter_sig) })
-                obs_event(mode, "converged", run_summary_fields({ { "iters", iter } }))
-                return {
-                    ok = true,
-                    artifact_path = artifact_path,
-                    modified_files = collect_modified_paths(mf_state.modified_set),
-                    iters = iter,
-                    summary = make_summary(true, iter, max_iters, nil),
-                    history = history,
-                }
-            end
-
-            update_state(mf_state, {
-                last_err = tostring(rr.stderr or ""),
-                sr_digest_prev = iter_sig,
-                sr_hash_append = compute_sr_hash(iter_sig),
-            })
-            -- The same edits producing the same failure twice: the model is
-            -- circling rather than converging.
-            if is_stagnant_v2(mf_state, true) then
-                obs_event(
-                    mode,
-                    "stagnation_v2",
-                    run_summary_fields({ { "iter", iter }, { "reason", "sr_history_repeat" } })
-                )
-                return {
-                    ok = false,
-                    failure_reason = "stagnation",
-                    last_error = mf_state.last_err or "",
-                    iters = iter,
-                    summary = make_summary(false, iter, max_iters, "stagnation"),
-                    artifact_path = artifact_path,
-                    modified_files = collect_modified_paths(mf_state.modified_set),
-                    history = history,
-                }
-            end
-
-        -- ── full mode (default) ────────────────────────────────────────────────
-        --
-        -- Single-file whole-file rewrite: no tools, one completion per iter.
-        -- This is the path for models that cannot call tools at all — which is
-        -- a tool set of size zero, not a reason to call the provider by hand.
-        else
-            local single_path = conf.target_files[1]
-            local iter_edits_applied = 0
-
-            local tl = call_tool_loop({
-                prompt = next_prompt,
-                system = system,
-                messages = messages,
-                -- One completion per iteration: with no tools there is nothing
-                -- a second turn could do, and the loop that verifies is out here.
-                max_turns = 1,
-                llm = full_llm,
-                on_request = on_request,
-                on_response = on_response,
-            })
-
-            -- A transport failure, a refusal, a response the adapter could not
-            -- parse: none of them are a model that failed to write code, so
-            -- they end the run instead of counting as a stagnant iteration.
-            if not tl.ok then
-                return {
-                    ok = false,
-                    failure_reason = "llm_call",
-                    last_error = tostring(tl.error):sub(-800),
-                    iters = iter - 1,
-                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
-                    artifact_path = artifact_path,
-                    history = history,
-                }
-            end
-
-            -- A response cut off at max_tokens is half a file. Writing it would
-            -- hand the runner code the model never finished — and the runner
-            -- would then blame the model for a syntax error the transport
-            -- caused — so the truncation ends the run.
-            if tl.stop_reason == "max_tokens" then
-                return {
-                    ok = false,
-                    failure_reason = "llm_call",
-                    last_error = "response truncated at max_tokens; nothing written (raise llm.max_tokens)",
-                    iters = iter - 1,
-                    summary = make_summary(false, iter - 1, max_iters, "llm_call"),
-                    artifact_path = artifact_path,
-                    history = history,
-                }
-            end
-
-            local content = tl.content or ""
-            -- The turn that just happened becomes the history the next
-            -- iteration continues from: the prompt that was sent and the
-            -- assistant blocks verbatim, thinking included (Anthropic requires
-            -- them back unmodified, and `content` above already holds only the
-            -- text ones, so no reasoning reaches the file).
-            messages = tl.messages
-
-            -- A model that answered with no blocks at all would go back as an
-            -- assistant turn carrying nothing, which the providers reject — and
-            -- the next iteration is exactly the one that has to tell it so. The
-            -- turn is kept as the empty text it amounts to, which is the shape
-            -- this loop sent before the two call paths were merged.
-            --
-            -- This edits the request, not the record: what the model said is
-            -- already in the history as the empty answer it was, and the empty
-            -- text below exists only because the next HTTP call needs a turn
-            -- with something in it. The two layers disagree on purpose.
-            local last_msg = messages[#messages]
-            if last_msg and last_msg.role == "assistant" and #(last_msg.content or {}) == 0 then
-                last_msg.content = { { type = "text", text = "" } }
-            end
-
-            local code = extract_code(content, lang)
-
-            -- Full mode: empty code means the LLM produced zero usable edits (bad stagnation).
-            -- Non-empty code is always an edit (full-file replace).
-            if #code > 0 then
-                iter_edits_applied = iter_edits_applied + 1
-                bad_stagnation_count = 0
-            end
-
-            -- Write target file (full-file replace — next_full_file action)
-            local wok, werr = write_file(single_path, code)
-            if not wok then
-                return {
-                    ok = false,
-                    failure_reason = "open_target_file",
-                    last_error = werr,
-                    iters = iter,
-                    summary = make_summary(false, iter, max_iters, "open_target_file"),
-                    artifact_path = artifact_path,
-                    history = history,
-                }
-            end
-
-            -- Single-file runner call with single string path (Crux #3).
-            local rr = shape.assert_dev(
-                conf.runner(single_path),
-                RUNNER_RESULT,
-                "compile_loop conf.runner result (single-file)"
-            ) or {}
-            local entry = { iter = iter, code = code, result = rr, raw = content }
-            table.insert(history, entry)
-            obs_event(mode, "iter_result", {
-                { "iter", iter },
-                { "ok", rr.ok and true or false },
-                { "exit_code", rr.exit_code },
-                { "stderr_len", #(tostring(rr.stderr or "")) },
-            })
-
-            if conf.on_iter then
-                local cb_ok, cb_err = pcall(conf.on_iter, entry)
-                if not cb_ok then
-                    log.warn("compile_loop: on_iter callback error: " .. tostring(cb_err))
-                end
-            end
-
-            if rr.ok then
-                obs_event(mode, "converged", run_summary_fields({ { "iters", iter } }))
-                return {
-                    ok = true,
-                    code = code,
-                    artifact_path = artifact_path,
-                    iters = iter,
-                    summary = make_summary(true, iter, max_iters, nil),
-                    history = history,
-                }
-            end
-
-            -- Stagnation detection: bad stagnation (empty code = zero edits) takes priority.
-            if iter_edits_applied == 0 then
-                bad_stagnation_count = bad_stagnation_count + 1
-                if bad_stagnation_count >= STAGNATION_WINDOW then
-                    local last_stderr = tostring(rr.stderr or ""):sub(-800)
-                    obs_event(
-                        mode,
-                        "bad_stagnation_blocked",
-                        run_summary_fields({ { "iter", iter }, { "reason", "no_edits_applied" } })
-                    )
-                    return {
-                        ok = false,
-                        failure_reason = "no_edits_applied",
-                        last_error = last_stderr,
-                        code = code,
-                        iters = iter,
-                        summary = make_summary(false, iter, max_iters, "no_edits_applied"),
-                        artifact_path = artifact_path,
-                        history = history,
-                    }
-                end
-                -- Inject explicit retry feedback so the LLM knows it must emit edits.
-                -- The assistant turn is already in `messages`; this is the user
-                -- turn the next iteration opens with.
-                next_prompt = "Your previous attempt produced no usable code."
-                    .. " Output the whole corrected file in a single fenced code block."
-            elseif is_stagnant(history) then
-                local last_stderr = tostring(rr.stderr or ""):sub(-800)
-                obs_event(mode, "stagnation", run_summary_fields({ { "iters", iter } }))
-                return {
-                    ok = false,
-                    failure_reason = "stagnation",
-                    last_error = last_stderr,
-                    code = code,
-                    iters = iter,
-                    summary = make_summary(false, iter, max_iters, "stagnation"),
-                    artifact_path = artifact_path,
-                    history = history,
-                }
-            else
-                -- The assistant turn is already in `messages`; the failure
-                -- feedback is the user turn the next iteration opens with.
-                next_prompt = build_failure_msg(lang, rr)
             end
         end
-        -- ── end of edit_mode branch ────────────────────────────────────────────
-        ::iter_continue::
+    end
+    return applied
+end
+
+--- What a tool pair says about itself, for `policy.carry`.
+---
+--- The kernel's `ok` flag catches a handler that RAISED; `std.fs` rejects an
+--- edit by returning one, which is the failure this loop most needs carried
+--- forward — asking the same wrong thing again is what the note is for.
+local function pair_failed(pair)
+    if pair.ok == false then
+        return true
+    end
+    return type(pair.result) == "table" and pair.result.ok == false
+end
+
+--- The verify's stderr, as the signature `policy.stagnation` compares beats by.
+---
+--- The verify is part of its beat (the loop stamps the beat id on it), so the
+--- question "did the build say the same thing three times" is one the policy
+--- can answer off the log. A beat with no verify has no signature and cannot be
+--- part of a repetition.
+local function verify_signature(beat)
+    for _, ev in ipairs(beat.events) do
+        if ev.kind == "verify" then
+            local data = type(ev.data) == "table" and ev.data or {}
+            return tostring(data.stderr or "")
+        end
+    end
+    return nil
+end
+
+--- A failed beat as one sentence: the stage, the classification the port or the
+--- kernel put on it, and the message.
+local function error_text(o)
+    local detail = o.detail
+    if type(detail) ~= "table" then
+        return tostring(o.kind) .. ": " .. tostring(detail)
+    end
+    local message = tostring(detail.message or "unknown failure")
+    if detail.kind ~= nil then
+        return tostring(o.kind) .. ": " .. tostring(detail.kind) .. ": " .. message
+    end
+    return tostring(o.kind) .. ": " .. message
+end
+
+--- A refusal names its class: the adapter's provider-neutral classification,
+--- plus what the provider said when it said anything.
+local function refusal_text(o)
+    local text = "model refused to respond (kind=" .. tostring(o.reason) .. ")"
+    local detail = o.detail
+    local said = type(detail) == "table" and type(detail.refusal) == "table" and detail.refusal.detail or nil
+    if type(said) == "string" and said ~= "" then
+        text = text .. ": " .. said
+    end
+    return text
+end
+
+--- The caller's per-iteration hook. A broken callback must not take the run
+--- down with it.
+local function fire_on_iter(on_iter, entry)
+    if not on_iter then
+        return
+    end
+    local ok, err = pcall(on_iter, entry)
+    if not ok then
+        log.warn("compile_loop: on_iter callback error: " .. tostring(err))
+    end
+end
+
+-- ============================================================
+-- The port conf
+-- ============================================================
+
+--- Everything the Port is opened with: `conf.llm` verbatim, with one
+--- translation.
+---
+--- `disable_thinking` is this block's own word for Qwen's switch and predates
+--- the shared vocabulary; it becomes `thinking = { enabled = false }`, which is
+--- what `llm_proto` reads. An explicit `thinking` wins. Everything else is
+--- forwarded untouched — a whitelist here would silently strip every knob added
+--- to `llm_proto` upstream, and the key resolution (`api_key` / `api_key_env`,
+--- then the environment) is `llm_proto`'s and not restated here.
+local function port_conf(llm)
+    llm = llm or {}
+    local conf = {}
+    for key, value in pairs(llm) do
+        if key ~= "disable_thinking" then
+            conf[key] = value
+        end
+    end
+    if conf.thinking == nil and llm.disable_thinking then
+        conf.thinking = { enabled = false }
+    end
+    return conf
+end
+
+-- ============================================================
+-- The loop
+-- ============================================================
+
+--- The first user turn: the spec, plus what the mode needs beside it.
+local function seed_content(conf, targets, diff, lang)
+    if diff then
+        local lines = {}
+        for _, p in ipairs(targets) do
+            lines[#lines + 1] = "  " .. p
+        end
+        return conf.spec .. "\n\nFiles:\n" .. table.concat(lines, "\n")
+    end
+    local existing = read_target_if_exists(targets[1])
+    if existing then
+        return conf.spec .. "\n\n=== Current file content ===\n```" .. lang .. "\n" .. existing .. "\n```"
+    end
+    return conf.spec
+end
+
+--- Run the loop. Returns the internal result (the filtered one is the
+--- handler's); raises only for what a caller got wrong — a runner that answered
+--- the wrong shape, a duplicate tool name, a store that would not take the log.
+---
+--- conf, all resolved before entry: runner, spec, target_files (list of
+--- absolute paths), multi_file, lang, max_iters, system, edit_mode, tool_mode,
+--- extra_tools, on_iter, llm.
+local function run_loop(conf)
+    local lang = conf.lang or "lua"
+    local max_iters = conf.max_iters or DEFAULT_MAX_ITERS
+    local targets = conf.target_files
+    local multi = conf.multi_file or false
+    local diff = conf.edit_mode == "diff"
+    local artifact_path = (not multi) and targets[1] or nil
+
+    local allowed = {}
+    for _, p in ipairs(targets) do
+        allowed[p] = true
     end
 
-    -- max_iters reached without PASS
-    local last = history[#history] or {}
-    local last_stderr = tostring((last.result or {}).stderr or ""):sub(-800)
-    obs_event(mode, "max_iters_reached", run_summary_fields({ { "iters", max_iters } }))
-    local max_iters_result = {
-        ok = false,
-        failure_reason = "max_iters",
-        last_error = last_stderr,
-        code = last.code,
-        iters = max_iters,
-        summary = make_summary(false, max_iters, max_iters, "max_iters"),
-        artifact_path = artifact_path,
-        history = history,
-    }
-    -- Preserve modified_files for multi-file branch (single-file uses or {} on consumer side).
-    if multi_file then
-        max_iters_result.modified_files = collect_modified_paths(mf_state.modified_set)
+    local system = conf.system
+    if system == nil then
+        if not diff then
+            system = DEFAULT_SYSTEM
+        elseif multi then
+            system = DIFF_SYSTEM_MULTI
+        else
+            system = DIFF_SYSTEM
+        end
     end
-    return max_iters_result
+
+    local tools, edit_name
+    if diff then
+        tools, edit_name = build_tools(conf, targets, allowed)
+    end
+
+    local llm = PORTS[conf.llm and conf.llm.provider or "anthropic"]:open(port_conf(conf.llm))
+    local stalled = policy.stagnation({ same = STAGNATION_WINDOW, signature = verify_signature })
+
+    local modified = {}
+    local iters, converged = 0, false
+    local failure_reason, last_error = nil, nil
+
+    kernel.session({
+        owner = "compile_loop",
+        -- One unit per beat (the device's default cost), so the grant IS the
+        -- iteration ceiling: the beat after the last one the caller allowed
+        -- comes back `stopped` with nothing called and nothing recorded.
+        budget = { amount = max_iters, tag = "iterations", desc = "one unit per iteration" },
+    }, function(s)
+        local device = kernel.device({
+            llm = llm,
+            system = system,
+            tools = tools,
+            -- What the model asked for and was refused, carried forward as one
+            -- bounded note. Diff mode only: it is the rejected edit that this
+            -- answers, and full mode has no tools to reject anything.
+            filters = diff and { policy.carry({ max_bytes = CARRY_MAX_BYTES, failed = pair_failed })(s) } or nil,
+        })
+
+        s:append({
+            kind = "msg_user",
+            meta = { label = "spec" },
+            data = { content = seed_content(conf, targets, diff, lang) },
+        })
+
+        local zero_edits = 0
+
+        while true do
+            local answer
+            local going = Outcome.match(kernel.beat(s, device), {
+                stopped = function(o)
+                    -- Not a failure and not the model's doing: the quota would
+                    -- not cover another beat. The only grant here is the
+                    -- iteration ceiling, so that is what it says.
+                    if o.reason == "budget" then
+                        failure_reason = "max_iters"
+                    else
+                        failure_reason = "stopped"
+                        last_error = tostring(o.reason)
+                    end
+                    return false
+                end,
+                error = function(o)
+                    -- A transport or protocol failure is not the model failing
+                    -- to edit: it ends the run instead of counting as an
+                    -- iteration that got nowhere.
+                    failure_reason = "llm_call"
+                    last_error = tail(error_text(o), LAST_ERROR_MAX)
+                    return false
+                end,
+                refused = function(o)
+                    failure_reason = "llm_call"
+                    last_error = tail(refusal_text(o), LAST_ERROR_MAX)
+                    return false
+                end,
+                ok = function(o)
+                    answer = o.out
+                    return true
+                end,
+            })
+            if not going then
+                break
+            end
+
+            iters = iters + 1
+            local raw = text_of(answer.content)
+            local code, applied = nil, 0
+
+            if diff then
+                applied = beat_edits(s, answer.beat, edit_name, modified)
+            else
+                -- A response cut off at max_tokens is half a file. Writing it
+                -- would hand the runner code the model never finished, and the
+                -- runner would then blame the model for a syntax error the
+                -- transport caused.
+                if answer.stop_reason == "max_tokens" then
+                    failure_reason = "llm_call"
+                    last_error = "response truncated at max_tokens; nothing written (raise llm.max_tokens)"
+                    break
+                end
+                code = extract_code(raw, lang)
+                if #code > 0 then
+                    applied = 1
+                    local wok, werr = write_file(targets[1], code)
+                    if not wok then
+                        failure_reason = "open_target_file"
+                        last_error = tail(werr, LAST_ERROR_MAX)
+                        break
+                    end
+                    modified[targets[1]] = true
+                end
+            end
+
+            -- The verify. The loop's step and never the model's: it runs after
+            -- every beat, whatever was asked for and whatever landed.
+            local rr = shape.assert_dev(
+                conf.runner(multi and targets or targets[1]),
+                RUNNER_RESULT,
+                "compile_loop conf.runner result"
+            ) or {}
+            s:append({
+                kind = "verify",
+                -- Stamped with the beat it judges, so the record reads back as
+                -- part of it — which is what lets a stagnation signature see it.
+                beat = answer.beat,
+                data = {
+                    ok = rr.ok == true,
+                    stdout = tostring(rr.stdout or ""),
+                    stderr = tostring(rr.stderr or ""),
+                    exit_code = rr.exit_code,
+                    iteration = iters,
+                },
+            })
+            fire_on_iter(conf.on_iter, { iter = iters, code = code, result = rr, raw = raw })
+
+            if rr.ok then
+                converged = true
+                break
+            end
+            last_error = tail(rr.stderr, LAST_ERROR_MAX)
+
+            -- The model is calling tools and nothing is landing. Distinct from
+            -- "the same error three times": the run is busy, not stuck.
+            if applied == 0 then
+                zero_edits = zero_edits + 1
+            else
+                zero_edits = 0
+            end
+            if zero_edits >= STAGNATION_WINDOW then
+                failure_reason = "no_edits_applied"
+                break
+            end
+
+            if stalled(s) ~= nil then
+                failure_reason = "stagnation"
+                break
+            end
+
+            -- The failure goes back as the next user turn. The verify is a
+            -- caller's kind, which the fold skips — a record of what happened
+            -- rather than a message — so what the model is told is said here.
+            local feedback
+            if not diff then
+                if applied == 0 then
+                    feedback = "Your previous attempt produced no usable code."
+                        .. " Output the whole corrected file in a single fenced code block."
+                else
+                    feedback = build_failure_msg(lang, rr)
+                end
+            elseif applied == 0 then
+                feedback = "No edits were applied. Re-read the file — fs_read numbers its lines —"
+                    .. " and retry with an exact expect.\n\n"
+                    .. build_verify_msg(rr)
+            else
+                feedback = build_verify_msg(rr)
+            end
+            s:append({ kind = "msg_user", data = { content = feedback } })
+        end
+    end)
+
+    return {
+        ok = converged,
+        iters = iters,
+        summary = make_summary(converged, iters, max_iters, failure_reason),
+        artifact_path = artifact_path,
+        modified_files = diff and collect_modified_paths(modified) or nil,
+        failure_reason = (not converged) and failure_reason or nil,
+        last_error = (not converged) and last_error or nil,
+    }
 end
 
 -- ============================================================
 -- Public API
 -- ============================================================
 
---- compile_loop.make(conf) → tool_def
+--- Build the tool_def: `{ name, schema, handler }`.
 ---
---- Factory function. Returns a tool_def = {name, schema, handler} that can be
---- passed directly to agent.run({extra_tools = {tool_def}}).
+--- The def is returned and nothing else happens to it. Registering it is the
+--- caller's — `agent.run{ extra_tools = { td } }` takes it directly, and a
+--- caller that wants it in the global registry puts it there itself. A factory
+--- that registered on the side made two runs in one process collide on a name
+--- neither of them chose.
 ---
---- Side-effect: tool.register(name, schema, handler) is called so the tool
---- registry and tool_def.handler are identity-equal.
+--- What the caller got wrong is loud here rather than five iterations in: the
+--- runner, the two modes, the provider, and the shape of every extra tool.
 ---
---- LLM resolution (at handler call time, i.e. when the parent agent invokes the tool):
----   conf.llm.<field> → _AGENT_LLM_CTX top.<field> → nil → llm_proto env fallback
----
---- conf.runner is required and must be a function. Providing conf.llm is optional;
---- omitting it causes the parent agent's provider/model/api_key to be inherited.
+--- @param conf table  { runner, llm?, max_iters?, lang?, name?, system?,
+---                      edit_mode?, tool_mode?, extra_tools?, on_iter? }
+--- @return table tool_def  { name, schema, handler }
 function M.make(conf)
     assert(type(conf) == "table", "conf table required")
     assert(type(conf.runner) == "function", "conf.runner function required")
-    -- tool_mode (diff mode only):
-    --   "auto" (default) declares read_file / read_file_range / fs_edit,
-    --   "read_only" declares only the read tools — it can inspect but never
-    --   converge, so it is a dry run rather than a fix.
+
+    local edit_mode = conf.edit_mode or "full"
+    assert(edit_mode == "full" or edit_mode == "diff", "conf.edit_mode must be 'full' or 'diff'")
+
+    -- tool_mode (diff mode only): "auto" declares fs_read / read_file_range /
+    -- fs_edit, "read_only" declares only the reads — it can inspect but never
+    -- converge, so it is a dry run rather than a fix.
     local tool_mode = conf.tool_mode or "auto"
     assert(
         tool_mode == "auto" or tool_mode == "read_only",
         "conf.tool_mode must be 'auto' or 'read_only' (use edit_mode='full' for a no-tools run)"
     )
 
-    -- extra_tools (optional, multi-file only): caller-registered tools in the
-    -- agent-layer nested form {name, schema = {description?, input_schema}, handler}.
-    -- Declared alongside the built-in tools; dispatched inside the tool loop.
-    -- Built-in names are reserved.
-    local RESERVED_TOOL_NAMES = { read_file = true, read_file_range = true, fs_edit = true }
+    local provider = (conf.llm and conf.llm.provider) or "anthropic"
+    assert(PORTS[provider] ~= nil, "unknown conf.llm.provider '" .. tostring(provider) .. "' (anthropic | openai)")
+
+    -- extra_tools: the agent layer's nested form or a flat spec. A name that
+    -- collides with a built-in is caught by `knl_adapter.tools` when the map is
+    -- built, so there is no reserved list to keep in step with the tool set.
     if conf.extra_tools ~= nil then
         assert(type(conf.extra_tools) == "table", "conf.extra_tools must be a list")
         for i, t in ipairs(conf.extra_tools) do
@@ -2429,10 +970,6 @@ function M.make(conf)
             assert(
                 type(t.name) == "string" and t.name ~= "",
                 "conf.extra_tools[" .. i .. "].name must be a non-empty string"
-            )
-            assert(
-                not RESERVED_TOOL_NAMES[t.name],
-                "conf.extra_tools[" .. i .. "].name '" .. t.name .. "' is reserved (built-in tool)"
             )
             assert(type(t.handler) == "function", "conf.extra_tools[" .. i .. "].handler must be a function")
             assert(
@@ -2445,10 +982,11 @@ function M.make(conf)
     local name = conf.name or "compile_loop"
 
     local schema = {
-        description = [[Run an autonomous compile-and-fix loop: a child LLM emits the
-complete target file on every iteration, the runner executes it, and on
-failure the stderr is fed back until the run passes or the give-up gate
-triggers. Returns ok/iters/summary and, on failure, failure_reason/last_error.
+        description = [[Run an autonomous compile-and-fix loop: a child LLM edits the
+target file (through tools in diff mode, or by emitting the whole file in full
+mode), the runner executes it after every turn, and its output is fed back
+until the run passes or the give-up gate triggers. Returns ok/iters/summary
+and, on failure, failure_reason/last_error.
 
 Single-file mode: provide target_file (string).
 Multi-file mode: provide target_files (array of absolute paths). Requires edit_mode=diff.
@@ -2479,175 +1017,63 @@ target_file and target_files are mutually exclusive.]],
     }
 
     local function handler(input)
-        -- Crux #2: target_file and target_files are mutually exclusive.
         assert(not (input.target_file and input.target_files), "target_file and target_files are mutually exclusive")
-        -- At least one must be provided.
         assert(input.target_file or input.target_files, "target_file (string) or target_files (array) is required")
 
-        -- Determine multi_file mode and normalize to internal list.
-        local multi_file
-        local files_list
-
+        local multi_file, files_list
         if input.target_files then
-            -- Multi-file mode entry.
             multi_file = true
             assert(type(input.target_files) == "table", "target_files must be an array")
             assert(#input.target_files > 0, "target_files must not be empty")
+            files_list = {}
             for i, v in ipairs(input.target_files) do
                 assert(type(v) == "string", "target_files[" .. i .. "] must be a string")
-            end
-            -- Crux #2: normalize to internal list with abs paths applied element-wise.
-            files_list = {}
-            for _, p in ipairs(input.target_files) do
-                table.insert(files_list, to_abs(p))
+                files_list[#files_list + 1] = to_abs(v)
             end
         else
-            -- Single-file mode entry (target_file string).
             multi_file = false
             files_list = { to_abs(input.target_file) }
         end
 
-        -- Crux #2 / design-selection 5: multi-file mode requires edit_mode=diff.
-        local effective_edit_mode = conf.edit_mode
-        assert(not (multi_file and effective_edit_mode == "full"), "multi-file mode requires edit_mode=diff")
+        assert(not (multi_file and edit_mode == "full"), "multi-file mode requires edit_mode=diff")
 
-        -- Resolve LLM fields at call time.
-        -- Priority: conf.llm.<field> → _AGENT_LLM_CTX top → nil (env fallback in llm_proto)
-        local parent_ctx = agent._llm_ctx_top() or {}
-        local llm_conf = conf.llm or {}
+        -- Diff needs something to diff against. This used to fall back to full
+        -- mode with a warning, which meant a caller asking for minimal edits
+        -- could silently get its file rewritten instead.
+        if edit_mode == "diff" then
+            for _, p in ipairs(files_list) do
+                assert(
+                    read_target_if_exists(p) ~= nil,
+                    "edit_mode='diff' requires an existing, non-empty target file: " .. p
+                )
+            end
+        end
 
-        local resolved_conf = {
-            -- runner (from factory conf, never from input)
+        local res = run_loop({
             runner = conf.runner,
-
-            -- tool input fields (normalized)
-            lang = input.lang or conf.lang or "lua",
-            target_files = files_list, -- internal list (1-element for single-file)
-            multi_file = multi_file,
             spec = input.spec,
-
-            -- factory conf fields
+            target_files = files_list,
+            multi_file = multi_file,
+            lang = input.lang or conf.lang or "lua",
             max_iters = conf.max_iters,
             system = conf.system,
-            edit_mode = effective_edit_mode,
+            edit_mode = edit_mode,
             tool_mode = tool_mode,
             extra_tools = conf.extra_tools,
             on_iter = conf.on_iter,
+            llm = conf.llm,
+        })
 
-            -- LLM fields (K-96 full set, all explicit):
-            provider = llm_conf.provider or parent_ctx.provider,
-            base_url = llm_conf.base_url or parent_ctx.base_url,
-            api_key = llm_conf.api_key or parent_ctx.api_key,
-            api_key_env = llm_conf.api_key_env or parent_ctx.api_key_env,
-            model = llm_conf.model or parent_ctx.model,
-            max_tokens = llm_conf.max_tokens,
-            temperature = llm_conf.temperature,
-            disable_thinking = llm_conf.disable_thinking,
-            timeout = llm_conf.timeout,
-            -- Everything llm_proto understands, so the loop is not narrower
-            -- than the protocol layer it calls.
-            thinking = llm_conf.thinking,
-            dialect = llm_conf.dialect,
-            tool_choice = llm_conf.tool_choice,
-            parallel_tool_calls = llm_conf.parallel_tool_calls,
-            cache_control = llm_conf.cache_control,
-            extra_body = llm_conf.extra_body,
-            top_p = llm_conf.top_p,
-            top_k = llm_conf.top_k,
-            stop = llm_conf.stop,
-            seed = llm_conf.seed,
-            response_format = llm_conf.response_format,
-        }
-
-        local res = run_loop(resolved_conf)
-        local filtered = filter_for_tool_output(res)
-        local enc_ok, enc_str = pcall(std.json.encode, filtered)
+        local enc_ok, enc_str = pcall(std.json.encode, filter_for_tool_output(res))
         if enc_ok then
             return enc_str
         end
         return '{"ok":false,"failure_reason":"encode_failed","iters":0,"summary":"json encode failed"}'
     end
 
-    tool.register(name, schema, handler)
     return { name = name, schema = schema, handler = handler }
 end
 
--- ============================================================
--- Test helpers (internal; _ prefix signals non-public)
--- ============================================================
-
---- Override the internal llm_call function for test monkey-patching.
---- Call M._test_reset_llm_call() after the test to restore production behaviour.
---- Production callers must never call this.
-function M._test_set_llm_call(fn)
-    assert(type(fn) == "function", "_test_set_llm_call requires a function")
-    _llm_call_override = fn
-end
-
---- Reset the llm_call override installed by M._test_set_llm_call().
-function M._test_reset_llm_call()
-    _llm_call_override = nil
-end
-
---- Override the tool_loop call the full-mode branch makes.
---- fn signature: (opts: table) → tool_loop result table
---- Call M._test_reset_tool_loop_run() after the test to restore production behaviour.
---- Production callers must never call this.
-function M._test_set_tool_loop_run(fn)
-    assert(type(fn) == "function", "_test_set_tool_loop_run requires a function")
-    _tool_loop_run_override = fn
-end
-
---- Reset the override installed by M._test_set_tool_loop_run().
-function M._test_reset_tool_loop_run()
-    _tool_loop_run_override = nil
-end
-
---- Override std.env.get for test monkey-patching of resolve_temperature().
---- fn signature: (name: string) → string|nil
---- Call M._test_reset_env_get() after the test to restore production behaviour.
---- Production callers must never call this.
-function M._test_set_env_get(fn)
-    assert(type(fn) == "function", "_test_set_env_get requires a function")
-    _env_get_override = fn
-end
-
---- Reset the env_get override installed by M._test_set_env_get().
-function M._test_reset_env_get()
-    _env_get_override = nil
-end
-
---- Return a fresh mf_state table with ST1 initial field defaults.
---- Used by unit tests to assert invariants without running the full make() pipeline.
---- Production callers must never call this.
-function M._test_make_mf_state()
-    return {
-        iter = 0,
-        last_err = nil,
-        sr_digest_prev = nil,
-        sr_history = {},
-        file_digest = {},
-        file_digest_refresh = "auto",
-        modified_set = {},
-    }
-end
-
---- Override the internal distill_subloop function for test monkey-patching.
---- fn signature: (path, content, mf_state, conf) → digest, line_index, err_string|nil
---- Call M._test_reset_distill_subloop() after the test to restore production behaviour.
---- Production callers must never call this.
-function M._test_set_distill_subloop(fn)
-    assert(type(fn) == "function", "_test_set_distill_subloop requires a function")
-    _distill_subloop_override = fn
-end
-
---- Reset the distill_subloop override installed by M._test_set_distill_subloop().
-function M._test_reset_distill_subloop()
-    _distill_subloop_override = nil
-end
-
---- Expose internal helpers for unit testing (read-only access).
---- Returns a table of helper functions so tests can call them directly.
 --- The contracts this module holds callers to, as data.
 ---
 --- Public rather than test-only: a caller writing a `runner` should be able to
@@ -2658,42 +1084,25 @@ M.shapes = {
     tool_output = TOOL_OUTPUT,
 }
 
+--- The pure helpers, for the specs. Everything here is a string / table
+--- transform over its arguments: what the loop itself does needs the kernel,
+--- and is covered by the e2e tests that give it one.
 function M._test_helpers()
     return {
-        should_use_cache = should_use_cache,
-        format_digest_response = format_digest_response,
-        truncate_with_warning = truncate_with_warning,
-        read_file_range_tool_handler = read_file_range_tool_handler,
-        read_file_tool_handler = read_file_tool_handler,
-        write_file = write_file,
-        file_mtime = file_mtime,
-        -- ST3 additions
-        split_lines = split_lines,
-        chunk_by_lines = chunk_by_lines,
-        extract_text = extract_text,
-        call_distill_llm = call_distill_llm,
-        binary_search_pack = binary_search_pack,
-        -- Stagnation / bookkeeping helpers (for unit testing 3-fix)
-        is_stagnant_v2 = is_stagnant_v2,
-        compute_sr_hash = compute_sr_hash,
-        collect_modified_paths = collect_modified_paths,
-        summarize_edits = summarize_edits,
-        update_state = update_state,
-        build_line_index = build_line_index,
-        -- Temperature resolution (for unit testing env override)
-        resolve_temperature = resolve_temperature,
-        -- run_loop (for unit testing bad stagnation / full-loop scenarios without handler)
-        run_loop = run_loop,
-        -- Pure SR-diff / summary / stagnation branches (unit-test only exposure)
         extract_code = extract_code,
+        text_of = text_of,
         make_summary = make_summary,
-        is_stagnant = is_stagnant,
-        fnv1a_hash = fnv1a_hash,
         build_failure_msg = build_failure_msg,
+        build_verify_msg = build_verify_msg,
         filter_for_tool_output = filter_for_tool_output,
-        cl_oai_map_finish_reason = proto_openai.map_finish_reason,
-        cl_oai_normalize = cl_oai_normalize,
-        cl_oai_convert_messages = proto_openai.convert_messages,
+        collect_modified_paths = collect_modified_paths,
+        with_line_numbers = with_line_numbers,
+        read_file_range_handler = read_file_range_handler,
+        sized_read = sized_read,
+        extra_spec = extra_spec,
+        pair_failed = pair_failed,
+        verify_signature = verify_signature,
+        port_conf = port_conf,
     }
 end
 

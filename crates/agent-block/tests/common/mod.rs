@@ -3,9 +3,9 @@
 // shapes); the remaining modules below are migration candidates.
 pub mod compile_loop_anthropic_mock;
 pub mod compile_loop_diff_anthropic_mock;
-pub mod compile_loop_distill_mock;
 pub mod compile_loop_openai_mock;
 pub mod compile_loop_openai_mock_three_turn;
+pub mod compile_loop_range_mock;
 pub mod openai_mock;
 
 use assert_cmd::Command;

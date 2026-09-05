@@ -1,13 +1,12 @@
 -- Fixture for compile_loop diff-mode e2e test (Anthropic mock).
 --
--- Scenario (2 iterations):
---   Iter 1: Mock returns a SEARCH/REPLACE block with a wrong SEARCH text.
---           apply_blocks fails → failure feedback loop → 2nd LLM call.
---   Iter 2: Mock returns a correct SEARCH/REPLACE block.
---           apply_blocks succeeds → file updated → mock_runner returns {ok=true}.
+-- Scenario (2 iterations, 1 LLM call each):
+--   Iter 1: the mock edits with an `expect` that does not match. std.fs rejects
+--           it, nothing is written, and the verify fails.
+--   Iter 2: a matching `expect` → the file is written → mock_runner passes.
 --
 -- Initial file content written before the loop:  print("hello")
--- After correct SEARCH/REPLACE:                  print("world")
+-- After the edit that lands:                     print("world")
 -- mock_runner checks output contains "world" to determine pass.
 
 local base_url = std.env.get("ANTHROPIC_BASE_URL_TEST")
@@ -57,9 +56,9 @@ local result_json = td.handler({
     target_file = target_file,
 })
 
--- The loop must have converged (2 LLM calls: 1 SEARCH fail + 1 success).
-assert(runner_call_count >= 1,
-    "mock_runner must be called at least once, got " .. runner_call_count)
+-- The verify runs after every iteration, including the one whose edit was
+-- rejected: it is the loop's step and not the model's.
+assert(runner_call_count == 2, "mock_runner must be called once per iteration, got " .. runner_call_count)
 
 local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed in diff mode, got: " .. (result.summary or "?"))

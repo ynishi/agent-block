@@ -1,11 +1,14 @@
--- build_tools_dedup.lua — compile_loop.make() registers via tool.register by
--- default, so passing the same tool_def through extra_tools names it twice.
+-- build_tools_dedup.lua — a tool_def that is in the registry AND in
+-- extra_tools names one tool twice.
 --
 -- That used to be a first-wins merge, which picked a winner silently. It is a
 -- loud error now: two sources claiming one name is a wiring bug, and
 -- `knl_adapter.tools` refuses rather than choosing. The case is the same one,
 -- flipped — what is asserted is the refusal, and that the registry alone still
 -- binds the tool exactly once.
+--
+-- `compile_loop.make` no longer registers what it builds, so the registration
+-- is here: it is the caller's, and this fixture is the caller.
 
 local agent = require("agent")
 local compile_loop = require("compile_loop")
@@ -16,6 +19,7 @@ local td = compile_loop.make({
         return { ok = true, stdout = "", stderr = "" }
     end,
 })
+tool.register(td.name, td.schema, td.handler)
 
 local registry = agent._registry_candidates()
 

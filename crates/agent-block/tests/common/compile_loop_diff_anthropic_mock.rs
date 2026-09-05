@@ -1,18 +1,23 @@
 //! In-process Anthropic Messages API mock server for compile_loop diff-mode e2e tests.
 #![allow(dead_code)]
 //!
-//! Implements a 2-turn scenario exercising the SEARCH/REPLACE diff path:
-//!   - Turn 1 (prev == 0): returns a SEARCH/REPLACE block whose SEARCH text does NOT match
-//!     the current file content. compile_loop detects the apply failure and feeds back
-//!     a "block N could not be applied" message, triggering a second LLM call.
-//!   - Turn 2 (prev >= 1): returns a correct SEARCH/REPLACE block that matches and
-//!     replaces the target text. mock_runner returns {ok=true}, ending the loop.
+//! Implements a 2-iteration scenario exercising the tool-driven diff path:
+//!   - Iteration 1 (prev == 0): an `fs_edit` whose `expect` does NOT match the
+//!     current file. std.fs rejects it, so nothing is written; the loop runs the
+//!     verify anyway, it fails, and the rejection is carried into iteration 2.
+//!   - Iteration 2 (prev >= 1): an `fs_edit` whose `expect` matches, so the file
+//!     is written and the verify passes, ending the loop.
+//!
+//! One iteration is one beat, so the turn is the call index. It used to be
+//! "does this request carry a tool result", which worked when every iteration
+//! opened a fresh conversation; the loop keeps one now, so every request after
+//! the first carries the results of the ones before it.
 //!
 //! The initial file written by the Lua fixture contains:
 //!   `print("hello")\n`
-//! Turn 1 SEARCH uses `print("WRONG")` — guaranteed not to match.
-//! Turn 2 SEARCH uses `print("hello")` — exact match — REPLACE emits `print("world")`.
-//! mock_runner checks for `world` in the executed file output and returns ok=true.
+//! Iteration 1 expects `print("WRONG")` — guaranteed not to match.
+//! Iteration 2 expects `print("hello")` — exact — and replaces it with
+//! `print("world")`. mock_runner checks for `world` in the executed file output.
 
 use axum::{
     extract::State,
@@ -36,10 +41,10 @@ pub struct DiffMockState {
 
 /// POST /v1/messages handler for the diff-mode compile_loop test.
 ///
-/// Turn 1: an fs_edit whose `expect` does not match the file (deliberate
-///   mismatch). std.fs rejects it, compile_loop reports zero edits, and the
-///   next iteration carries that feedback.
-/// Turn 2+: an fs_edit whose `expect` matches, so the file is written.
+/// Iteration 1: an fs_edit whose `expect` does not match the file (deliberate
+///   mismatch). std.fs rejects it, the loop reports zero edits, and the next
+///   iteration carries that rejection.
+/// Iteration 2+: an fs_edit whose `expect` matches, so the file is written.
 /// The loop lists its target files in the prompt; the mock edits whichever
 /// path it was given rather than hard-coding a temp dir.
 ///
@@ -83,29 +88,20 @@ async fn diff_messages_handler(
         "print(\"hello\")"
     };
 
-    // Every turn that carries a tool_result is the model's chance to stop; the
-    // loop only needs one edit per iteration, so answering DONE keeps the
-    // iteration short.
-    let carries_tool_result = String::from_utf8_lossy(&body).contains("tool_result");
-
-    let content = if carries_tool_result {
-        json!([{ "type": "text", "text": "DONE" }])
-    } else {
-        json!([{
-            "type": "tool_use",
-            "id": format!("toolu_diff_{}", prev + 1),
-            "name": "fs_edit",
-            "input": {
-                "path": target_path(&body),
-                "edits": [{
-                    "start_line": 1,
-                    "end_line": 1,
-                    "expect": expect_text,
-                    "replace": "print(\"world\")"
-                }]
-            }
-        }])
-    };
+    let content = json!([{
+        "type": "tool_use",
+        "id": format!("toolu_diff_{}", prev + 1),
+        "name": "fs_edit",
+        "input": {
+            "path": target_path(&body),
+            "edits": [{
+                "start_line": 1,
+                "end_line": 1,
+                "expect": expect_text,
+                "replace": "print(\"world\")"
+            }]
+        }
+    }]);
 
     let response_json = json!({
         "id": format!("msg_diff_mock_{}", prev + 1),
@@ -113,7 +109,7 @@ async fn diff_messages_handler(
         "role": "assistant",
         "content": content,
         "model": "claude-haiku-mock",
-        "stop_reason": if carries_tool_result { "end_turn" } else { "tool_use" },
+        "stop_reason": "tool_use",
         "usage": {
             "input_tokens": 10,
             "output_tokens": 20
@@ -131,7 +127,8 @@ async fn diff_messages_handler(
 ///
 /// # Returns
 /// - `base_url`: pass as `ANTHROPIC_BASE_URL_TEST` to the fixture.
-/// - `call_count`: assert `load(SeqCst) == 2` after the subprocess.
+/// - `call_count`: assert `load(SeqCst) == 2` after the subprocess (one beat
+///   per iteration: the rejected edit, then the one that lands).
 /// - `ct`: call `ct.cancel()` to shut down gracefully.
 ///
 /// # Panics

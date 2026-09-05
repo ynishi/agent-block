@@ -7,6 +7,12 @@ passed to `agent.run({extra_tools = {tool_def}})`. When the calling LLM invokes 
 it runs an iterative edit-compile-check loop until the runner reports success or the
 iteration ceiling is reached.
 
+One iteration is one beat of the kernel (`knl.beat`: one model call plus the tools that
+call asked for), run inside a `knl.session` whose grant is `max_iters`. The design and its
+reasons are in the module doc at the head of `init.lua`; this file is the API surface.
+`make` returns the def and does not register it — that is the caller's, and
+`coding_agent.register_tool` is the entry point whose job it is.
+
 ## API
 
 ### `compile_loop.make(conf)`
@@ -17,11 +23,12 @@ iteration ceiling is reached.
 | `llm` | `table` | no | inherited | `{provider, base_url, api_key, api_key_env, model, max_tokens, temperature, disable_thinking, timeout}` |
 | `max_iters` | `int` | no | `5` | Maximum iterations before giving up |
 | `lang` | `string` | no | `"lua"` | Language hint for the LLM |
-| `name` | `string` | no | `"compile_loop"` | Tool name registered in the tool registry |
-| `system` | `string` | no | `nil` | Additional system prompt prepended to the default |
+| `name` | `string` | no | `"compile_loop"` | The returned def's name. Nothing is registered under it |
+| `system` | `string` | no | `nil` | Replaces the built-in system prompt for the mode |
 | `edit_mode` | `"full"\|"diff"` | no | `"full"` | `"full"` rewrites the entire file in one completion; `"diff"` edits through tools |
-| `tool_mode` | `"auto"\|"read_only"` | no | `"auto"` | `"diff"` mode only. `"auto"` declares `read_file` / `read_file_range` / `fs_edit`; `"read_only"` declares just the read tools, which can inspect but never converge |
-| `extra_tools` | `array` | no | — | Multi-file only. Caller-registered tools in the agent-layer nested form `{name, schema = {description?, input_schema}, handler}`. Declared alongside the built-in tools; dispatched inside the tool loop; built-in names are reserved. `handler(input)` returns a string; errors are propagated as recoverable tool_result text. Extra-tool calls do not count as applied edits |
+| `tool_mode` | `"auto"\|"read_only"` | no | `"auto"` | `"diff"` mode only. `"auto"` declares `fs_read` / `read_file_range` / `fs_edit`; `"read_only"` declares just the reads, which can inspect but never converge |
+| `on_iter` | `function` | no | — | `fn({ iter, code, result, raw })` after each iteration's verify. A raise is warned about, not propagated |
+| `extra_tools` | `array` | no | — | Caller tools in the nested form `{name, schema = {description?, input_schema}, handler}` or a flat `{name, description?, input_schema?, handler}`. Declared alongside the built-ins; a name that collides with one is a loud error rather than a reserved-word check. Their calls never count as applied edits |
 
 **Tool inputs** (`spec`, `target_file` or `target_files`, `lang?`) are supplied by the
 calling LLM at tool-call time; factory `conf` fixes the runner and LLM policy at
@@ -110,12 +117,16 @@ local result = agent.run({
 
 ### How `diff` mode edits
 
-Editing goes through tools; there is no text contract. Each iteration runs
-`tool_loop` (`blocks/lib/tool_loop`) with exactly three tools and nothing else:
+Editing goes through tools; there is no text contract. The device carries exactly
+three of them, plus whatever the caller added:
 
-- `read_file` / `read_file_range` — the loop's own readers, so a large file goes
-  through the digest/distill path instead of the context. Their output is
-  line-numbered, and those line numbers are what the edit tool addresses.
+- `fs_read` — `std.fs`'s reader, path-locked to `target_files`. It answers
+  `{ content, lines, version }`, takes an optional `start_line` / `end_line`, and
+  refuses a whole-file read over 10 000 characters with the file's length and a
+  pointer at the range read. There is no digest and no summarising sub-call: a
+  summary is not something `fs_edit` can address.
+- `read_file_range` — a verbatim, line-numbered slice of at most 500 lines. Those
+  line numbers are what `fs_edit` addresses.
 - `fs_edit` — `std.fs`'s editor, scoped to `target_files` by `path_lock`. Edits
   are addressed by line range and verified against the `expect`ed text there;
   a rejection reports what is actually at those lines. There is no fuzzy match.
@@ -124,13 +135,16 @@ Caller-supplied `extra_tools` are declared alongside these. Their calls never
 count as edits: they are read-like by contract, and counting them would let a
 loop that only queried the caller's tool look like it was making progress.
 
-**The build is not a tool.** The loop runs the runner itself after the editing
-turns finish. That is what the block's guarantee rests on — "it compiles" has to
-be something the loop verified, not something the model reported, so the runner
-is never something the model can decline to call.
+**The build is not a tool.** The loop runs the runner itself after every beat —
+whatever the model asked for, and whether or not anything landed. That is what
+the block's guarantee rests on: "it compiles" has to be something the loop
+verified, not something the model reported, so the runner is never something the
+model can decline to call, and there is no turn in which the model gets to say
+the run is over.
 
-An iteration that applied no edits skips the runner (it would report what it
-already reported) and carries the rejection text into the next one.
+Each iteration's result is recorded as a `verify` event on the session log,
+stamped with the beat it judges, and the failure goes back to the model as the
+next user turn.
 
 ## Edit format
 
@@ -139,7 +153,7 @@ already reported) and carries the rejection text into the next one.
 ```json
 {
   "path": "/abs/path/to/file.lua",
-  "base": "<version from read_file, optional>",
+  "base": "<version from fs_read, optional>",
   "edits": [
     { "start_line": 12, "end_line": 14,
       "expect": "the current text of those lines",
@@ -148,8 +162,9 @@ already reported) and carries the rejection text into the next one.
 }
 ```
 
-Line numbers are 1-based and inclusive, and come from the numbered `read_file`
-output. `expect` must match exactly; it verifies the address rather than being
+Line numbers are 1-based and inclusive, and come from the numbered
+`read_file_range` output (or from counting `fs_read`'s content, which the tool's
+own description says is 1-based). `expect` must match exactly; it verifies the address rather than being
 the address, so a wrong guess is reported with the text actually present instead
 of landing the edit somewhere else. Every edit in a call is checked before any
 is applied, so a rejected call changes nothing. Passing `base` makes the call
@@ -189,11 +204,15 @@ end
 | `iters` | `int` | always |
 | `summary` | `string` | always |
 | `artifact_path` | `string\|nil` | single-file only (absolute path of the edited file) |
-| `modified_files` | `list<string>\|nil` | multi-file only (absolute paths of all written files) |
-| `failure_reason` | `string\|nil` | on failure (`"max_iters"`, `"stagnation"`, or `"no_edits_applied"`) |
-| `last_error` | `string\|nil` | on failure |
+| `modified_files` | `list<string>\|nil` | diff mode (absolute paths of every file an edit landed in, on every ending) |
+| `failure_reason` | `string\|nil` | on failure (`"max_iters"`, `"stagnation"`, `"no_edits_applied"`, `"llm_call"`, `"open_target_file"`) |
+| `last_error` | `string\|nil` | on failure (bounded; the untruncated text is in the session log) |
 
 In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
+
+The shape is closed (`compile_loop.shapes.tool_output`), which is how the run's
+transcript is kept out of the caller's context: there is no field for it, so
+adding one fails rather than leaking.
 
 ## Constraints
 
@@ -202,6 +221,9 @@ In multi-file mode `artifact_path` is `nil`; use `modified_files` instead.
 - `target_file` and `target_files` are mutually exclusive. Supplying both raises an assertion
   error.
 - `target_files` must be a non-empty list of strings.
+- **`edit_mode = "diff"` needs its target files to exist and be non-empty**, and says so at
+  handler entry. It used to fall back to `"full"` with a warning, which meant a caller
+  asking for minimal edits could silently get its file rewritten instead.
 - Stagnation detection: when `STAGNATION_WINDOW = 3` consecutive iterations produce identical
   runner `stderr`, the loop exits immediately with `failure_reason = "stagnation"`.
 - Bad stagnation: when `STAGNATION_WINDOW = 3` consecutive iterations apply zero edits (every
@@ -223,16 +245,10 @@ itself is provider-agnostic — these are operational guidance for callers.
 
 ### Deterministic temperature
 
-The OpenAI body defaults `temperature = 0.0` for deterministic greedy decoding,
-which is the desired behaviour for code-editing loops. Callers can override via
-either:
-
-- `compile_loop.make({ llm = { temperature = <number> } })` — explicit caller value
-- `COMPILE_LOOP_LLM_TEMPERATURE=<number>` — env override applied when caller does
-  not pass `llm.temperature`
-
-Precedence: caller > env > `0.0` default. Setting `COMPILE_LOOP_LLM_TEMPERATURE`
-to a non-numeric value falls back to `0.0` with a warning log entry.
+Greedy decoding is what a code-editing loop wants, and it is a conf key like any
+other: `compile_loop.make({ llm = { temperature = 0.0 } })`. There is no default
+and no env tier — `conf.llm` reaches the provider verbatim, and a block-private
+environment variable for one provider knob was a tier nothing else had.
 
 ### Disable thinking mode
 
@@ -248,8 +264,7 @@ local tool = compile_loop.make({
         api_key_env       = "QWEN_API_KEY",
         model             = "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
         disable_thinking  = true,  -- recommended for code-editing loops
-        -- temperature defaults to 0.0; set COMPILE_LOOP_LLM_TEMPERATURE
-        -- or pass explicit temperature here to override.
+        temperature       = 0.0,   -- greedy decoding; no default is applied
     },
     runner = function(path) ... end,
 })
@@ -259,10 +274,10 @@ local tool = compile_loop.make({
 
 The loop distinguishes two failure modes when iterations do not converge:
 
-- `failure_reason = "stagnation"` — runner produced identical `stderr` for
-  `STAGNATION_WINDOW = 3` consecutive iterations after at least one successful
-  edit. This is the "good" stagnation case: the LLM is editing, but the runner
-  is stuck on the same error.
+- `failure_reason = "stagnation"` — the runner produced identical `stderr` for
+  `STAGNATION_WINDOW = 3` consecutive iterations. This is the "good" stagnation
+  case: the LLM is editing, but the runner is stuck on the same error. The
+  reading is `policy.stagnation`'s, over the `verify` events on the log.
 - `failure_reason = "no_edits_applied"` — `STAGNATION_WINDOW = 3` consecutive
   iterations reached disk with nothing: every `fs_edit` was rejected, or the
   model never called it. The "bad" stagnation case: the LLM is not making

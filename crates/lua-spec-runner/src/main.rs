@@ -48,8 +48,8 @@ fn repo_root() -> PathBuf {
 }
 
 /// A fixture is a Lua file that drives the lspec framework. Detected by use
-/// rather than by filename: the existing files are named `*_test.lua`,
-/// `*_lifecycle.lua` and `*_distill.lua`, and a naming convention nobody
+/// rather than by filename: the fixture directory holds e2e scripts and specs
+/// side by side under no one naming convention, and a convention nobody
 /// enforces is a fixture waiting to be skipped silently.
 fn is_spec(source: &str) -> bool {
     source.contains("lust.")

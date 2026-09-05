@@ -5,10 +5,10 @@
 --   just test-lua                          # every spec fixture
 --
 -- `llm_proto.backend` is the whole model call as one closure: build the wire
--- request, post it with the retries worth taking, parse the answer. `tool_loop`
--- and the agent block call it directly, and `knl_adapter`'s Port reuses the
--- same pieces behind a device's `llm`, so every side gets the same transport
--- and none of them carries provider knowledge.
+-- request, post it with the retries worth taking, parse the answer. A block
+-- that wants a model call and no loop holds it directly, and `knl_adapter`'s
+-- Port reuses the same pieces behind a device's `llm`, so both sides get the
+-- same transport and neither carries provider knowledge.
 --
 -- What is pinned here is the closure's end of that arrangement:
 --   1. the result satisfies the contract its callers read (content / usage /

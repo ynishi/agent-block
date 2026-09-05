@@ -508,7 +508,9 @@ end
 --- so a caller that wants a model call holds a function rather than a
 --- provider. Two kinds of caller use it:
 ---
----   * `tool_loop` and the agent block, which call it directly
+---   * a block that wants a model call and no loop, which calls it directly
+---     (the blocks this repository ships have all moved onto the kernel, so
+---     the closure form is now the SDK's rather than one of theirs)
 ---   * `knl_adapter`, whose Port reuses the same pieces (build / parse /
 ---     classify_error / retry_delay) and hands the result to a knl device as
 ---     its `llm` — what `knl.beat(session, device)` then calls

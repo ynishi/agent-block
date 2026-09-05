@@ -1,8 +1,8 @@
 -- compile_loop must declare and dispatch conf.extra_tools.
 --
--- This has no coverage other than here: the tool set handed to tool_loop is
--- assembled inside run_loop, so a caller tool that silently stops being
--- declared looks exactly like a model that chose not to call it.
+-- This has no coverage other than here: the device's tools map is assembled
+-- inside the loop, so a caller tool that silently stops being declared looks
+-- exactly like a model that chose not to call it.
 
 local cl = require("compile_loop")
 

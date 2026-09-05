@@ -1,15 +1,20 @@
--- dispatch_extra_tools.lua — verify that compile_loop.make() registers a tool
--- in the registry and tool.call() can invoke its handler (regression test for
--- a past "tool not found" bug).
+-- dispatch_extra_tools.lua — verify that a registered compile_loop tool_def is
+-- the one tool.call() invokes (regression test for a past "tool not found"
+-- bug).
+--
+-- `compile_loop.make` builds the def and stops; registering it is the caller's,
+-- so the identity this pins is between what the caller registered and what the
+-- registry dispatches.
 
 local compile_loop = require("compile_loop")
 
-local _ = compile_loop.make({
+local td = compile_loop.make({
 	name = "compile_loop",
 	runner = function()
 		return { ok = true, stdout = "PASS", stderr = "", exit_code = 0 }
 	end,
 })
+tool.register(td.name, td.schema, td.handler)
 
 -- Confirm registry entry exists by calling tool.call.
 local ok, res = pcall(tool.call, "compile_loop", {

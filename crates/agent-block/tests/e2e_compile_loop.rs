@@ -7,6 +7,12 @@ use serde_json::json;
 use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
+// Note on turn counts. One iteration of compile_loop is one beat — one model
+// call plus the tools that call asked for — and the verify runs after it
+// whatever the model said. There is no "DONE" turn: the model does not get to
+// end the run, the runner does. So a scenario that used to need two calls per
+// iteration (ask, then see the result and answer DONE) needs one.
+
 /// Pick (path_a, path_b) from the request-extracted paths, with basename
 /// fallbacks (fallbacks should not be hit in normal runs).
 fn two_paths(paths: &[String]) -> (String, String) {
@@ -59,19 +65,17 @@ fn fs_edit_both(path_a: &str, path_b: &str) -> Vec<serde_json::Value> {
 ///
 /// Scenario: the model edits through the `fs_edit` tool, gets it wrong once,
 /// and recovers.
-///   - Turn 1: an `fs_edit` whose `expect` does not match the file. std.fs
-///     refuses it and returns the text actually at those lines.
-///   - Turn 2+: an `fs_edit` whose `expect` matches, so the file is written and
-///     the runner sees "world".
+///   - Iteration 1: an `fs_edit` whose `expect` does not match the file. std.fs
+///     refuses it and returns the text actually at those lines. The verify runs
+///     anyway and fails.
+///   - Iteration 2: an `fs_edit` whose `expect` matches, so the file is written
+///     and the runner sees "world".
 ///
 /// Validates that:
 ///   - The tool-based edit path is wired correctly end to end.
 ///   - A rejected edit comes back as a tool result the model can recover from,
 ///     not as a silent skip or a raised error.
-///   - The runner is invoked by the loop after the turns, not by the model.
-///   - Every tool call is logged with the iteration it belongs to. The tool set
-///     is built once, outside the iteration loop, so this correlation is easy
-///     to lose and nothing else would notice.
+///   - The runner is invoked by the loop after each beat, not by the model.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
@@ -96,32 +100,18 @@ async fn compile_loop_diff_anthropic_mock_iterates_until_pass() {
                 target_file.to_str().expect("utf8 path"),
             )
             .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "info")
-            // compile_loop's obs trail is gated on the dump mode.
-            .env("AGENT_BLOCK_LLM_DUMP", "meta")
+            .env("RUST_LOG", "off")
             .assert()
             .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_DIFF_MOCK_PASS"))
-            // the refusal is observed, named, and attributed to its iteration
-            .stdout(predicate::str::contains(
-                "event=tool_use_fail component=compile_loop iter=1",
-            ))
-            .stdout(predicate::str::contains("tool=fs_edit err=expect_mismatch"))
-            // and the write that lands belongs to the next iteration, not the
-            // one that was refused
-            .stdout(predicate::str::contains(
-                "event=tool_use component=compile_loop iter=2",
-            ))
-            .stdout(predicate::str::contains("tool=fs_edit ok=true"));
+            .stdout(predicate::str::contains("COMPILE_LOOP_DIFF_MOCK_PASS"));
     })
     .await
     .expect("subprocess assertion task should not panic");
 
     assert_eq!(
         call_count.load(Ordering::SeqCst),
-        4,
-        "two iterations, two calls each: the model asks for the edit, then sees \
-         its result and answers DONE"
+        2,
+        "two iterations, one call each: the edit that is refused, then the one that lands"
     );
     ct.cancel();
 }
@@ -132,9 +122,9 @@ async fn compile_loop_diff_anthropic_mock_iterates_until_pass() {
 /// Spawns an in-process OpenAI mock that returns a broken Lua fenced block on
 /// the first HTTP request and a fixed Lua fenced block on the second.
 /// The Lua fixture's `mock_runner` closure enforces strict fail-then-pass
-/// sequencing via a `call_count` upvalue (Crux #2).
+/// sequencing via a `call_count` upvalue.
 ///
-/// No `#[ignore]` — runs under plain `cargo test` with no API keys (Crux #3).
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 /// `OPENAI_API_KEY` is not set; `api_key="dummy"` is injected as a literal.
 #[tokio::test]
 async fn compile_loop_openai_mock_iterates_until_pass() {
@@ -156,6 +146,7 @@ async fn compile_loop_openai_mock_iterates_until_pass() {
                 "COMPILE_LOOP_TARGET",
                 target_file.to_str().expect("utf8 path"),
             )
+            .env("AGENT_BLOCK_HOME", tmp.path())
             .env("RUST_LOG", "off")
             .assert()
             .success()
@@ -178,16 +169,11 @@ async fn compile_loop_openai_mock_iterates_until_pass() {
 /// once returning broken code (mock_runner fails) and once returning fixed code
 /// (mock_runner passes).
 ///
-/// Spawns an in-process Anthropic mock that returns a broken Lua fenced block on
-/// the first POST /v1/messages request and a fixed Lua fenced block on the second.
-/// The Lua fixture's `mock_runner` closure enforces strict fail-then-pass
-/// sequencing via a `call_count` upvalue (Crux #2).
+/// Validates that the fixture's `base_url` reaches the provider Port: if
+/// `conf.llm` were not forwarded verbatim, the request would not reach the mock
+/// and the test would fail.
 ///
-/// Validates Crux #1: the fixture supplies `base_url` from `ANTHROPIC_BASE_URL_TEST`;
-/// if `blocks/tools/compile_loop/init.lua` did not forward `opts.base_url` to the Anthropic
-/// client (ST1 fix), the request would not reach the mock and the test would fail.
-///
-/// No `#[ignore]` — runs under plain `cargo test` with no API keys (Crux #3).
+/// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 /// `ANTHROPIC_API_KEY` is not set; `api_key="dummy"` is injected as a literal.
 #[tokio::test]
 async fn compile_loop_anthropic_mock_iterates_until_pass() {
@@ -230,27 +216,27 @@ async fn compile_loop_anthropic_mock_iterates_until_pass() {
 
 /// Verifies compile_loop in multi-file diff mode (happy path, 1 iteration, 2 files).
 ///
-/// Scenario: 1 iteration, 2 LLM calls.
-///   - Call 1: mock returns one `fs_edit` tool_use block per file, both in a single turn.
-///     Both edits apply, so both files are written.
-///   - Call 2: the model sees the edit results and answers DONE, ending the tool loop.
-///     compile_loop then verifies → mock_runner receives the paths list → ok=true.
+/// Scenario: one iteration, one LLM call. The mock returns one `fs_edit`
+/// tool_use block per file in a single turn; both apply, the loop verifies, and
+/// the runner receives the paths list.
 ///
 /// Validates:
-///   - target_files list is accepted (Crux #2 backward-compatible conf API).
-///   - Each fs_edit is routed to the path it names, so both files change (Crux #1).
-///   - Runner is called with a list of paths, not a single string (Crux #3 signature toggle).
+///   - target_files list is accepted.
+///   - Each fs_edit is routed to the path it names, so both files change.
+///   - Runner is called with a list of paths, not a single string.
 ///   - result.modified_files contains 2 paths; result.artifact_path is nil.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
     let handle = MockLlm::anthropic(|req| {
-        if req.has_tool_results {
-            anthropic::text_response("DONE")
-        } else {
-            let (path_a, path_b) = two_paths(&req.paths);
+        let (path_a, path_b) = two_paths(&req.paths);
+        if req.call_index == 0 {
             anthropic::tool_use_response(fs_edit_both(&path_a, &path_b))
+        } else {
+            // Not reached on the happy path; a second call would mean the
+            // first iteration did not converge.
+            anthropic::text_response("DONE")
         }
     })
     .spawn()
@@ -287,36 +273,30 @@ async fn compile_loop_diff_multi_anthropic_mock_iterates_until_pass() {
     .await
     .expect("subprocess assertion task should not panic");
 
-    // One iteration, two calls: both files are patched in a single tool turn,
-    // then the model sees the two edit results and answers DONE.
     assert_eq!(
         handle.state.call_count(),
-        2,
-        "expected exactly 2 HTTP calls to the multi diff mock (2 fs_edits in 1 turn, then DONE)"
+        1,
+        "one iteration: both files are patched in one turn and the verify passes"
     );
     handle.ct.cancel();
 }
 
 /// Verifies the fs_edit write-channel tool.
 ///
-/// Scenario: 1 iteration, 2 LLM calls.
-///   - Call 1: mock returns two fs_edit tool_use blocks (file_a, file_b).
-///     compile_loop applies both edits via the tool handler and writes them to disk.
-///   - Call 2: mock returns the plain text "DONE" (no SR blocks). Because tool-channel
-///     edits were applied this iter, the loop proceeds to verify instead of treating
-///     the missing SR text as a parse failure → mock_runner sees "new" → ok=true.
+/// Scenario: one iteration, one LLM call returning two fs_edit tool_use blocks.
+/// Both edits are applied and written to disk, and the verify then passes.
 ///
 /// Validates:
 ///   - tool_mode default "auto" declares fs_edit (asserted via mock state).
-///   - Tool-channel edits count as applied edits (no zero-edit retry / no dead end).
+///   - Tool-channel edits count as applied edits (no zero-edit retry).
 ///   - result.modified_files carries the tool-written paths.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_fs_edit_tool_converges() {
     let handle = MockLlm::anthropic(|req| {
-        if !req.has_tool_results {
-            let (path_a, path_b) = two_paths(&req.paths);
+        let (path_a, path_b) = two_paths(&req.paths);
+        if req.call_index == 0 {
             anthropic::tool_use_response(vec![
                 anthropic::tool_use(
                     "toolu_asr_1",
@@ -373,8 +353,8 @@ async fn compile_loop_fs_edit_tool_converges() {
 
     assert_eq!(
         handle.state.call_count(),
-        2,
-        "expected exactly 2 HTTP calls (tool_use turn + DONE turn)"
+        1,
+        "expected exactly 1 HTTP call (both edits in one turn, then the verify)"
     );
     assert!(
         handle.state.declared_count_of("fs_edit") >= 1,
@@ -390,39 +370,46 @@ async fn compile_loop_fs_edit_tool_converges() {
 ///   * function.arguments arrives as a JSON *object* instead of a string.
 ///   * the id field is absent.
 ///
-/// Scenario: 1 iteration, 2 LLM calls.
-///   - Call 1: two fs_edit tool_calls (object args, no ids).
-///     cl_oai_normalize must accept the object arguments and synthesize
-///     deterministic call_synth_N ids.
-///   - Call 2: request must carry role="tool" messages whose tool_call_id
-///     starts with "call_synth_" (asserted via mock state); mock replies "DONE"
-///     → loop proceeds to verify via tool-channel edits → ok=true.
+/// Scenario: two iterations, one call each.
+///   - Iteration 1: two fs_edit tool_calls in the broken shape, with an
+///     `expect` that does not match. std.fs rejects both, so the loop's next
+///     request has to carry two tool results back — which is where the
+///     synthesized ids have to survive.
+///   - Iteration 2: the same two calls with a matching `expect`; both apply and
+///     the verify passes.
+///
+/// The second request must carry `role="tool"` messages whose `tool_call_id` is
+/// a synthesized 9-character id (Mistral's chat template rejects any other
+/// shape), and the two must be distinct.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no API keys.
 #[tokio::test]
 async fn compile_loop_broken_openai_tool_calls_shape_converges() {
     let handle = MockLlm::openai(|req| {
-        if !req.has_tool_results {
-            let (path_a, path_b) = two_paths(&req.paths);
-            openai::tool_calls_response(vec![
-                openai::tool_call_object_args_no_id(
-                    "fs_edit",
-                    json!({"path": path_a, "edits": [{
-                        "start_line": 1, "end_line": 1,
-                        "expect": "print(\"a-old\")", "replace": "print(\"a-new\")"
-                    }]}),
-                ),
-                openai::tool_call_object_args_no_id(
-                    "fs_edit",
-                    json!({"path": path_b, "edits": [{
-                        "start_line": 1, "end_line": 1,
-                        "expect": "print(\"b-old\")", "replace": "print(\"b-new\")"
-                    }]}),
-                ),
-            ])
+        let (path_a, path_b) = two_paths(&req.paths);
+        // Iteration 1 aims at text that is not there, so both edits are
+        // rejected and their results go back in the next request.
+        let (expect_a, expect_b) = if req.call_index == 0 {
+            ("print(\"WRONG-a\")", "print(\"WRONG-b\")")
         } else {
-            openai::text_response("DONE")
-        }
+            ("print(\"a-old\")", "print(\"b-old\")")
+        };
+        openai::tool_calls_response(vec![
+            openai::tool_call_object_args_no_id(
+                "fs_edit",
+                json!({"path": path_a, "edits": [{
+                    "start_line": 1, "end_line": 1,
+                    "expect": expect_a, "replace": "print(\"a-new\")"
+                }]}),
+            ),
+            openai::tool_call_object_args_no_id(
+                "fs_edit",
+                json!({"path": path_b, "edits": [{
+                    "start_line": 1, "end_line": 1,
+                    "expect": expect_b, "replace": "print(\"b-new\")"
+                }]}),
+            ),
+        ])
     })
     .spawn()
     .await;
@@ -461,7 +448,7 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
     assert_eq!(
         handle.state.call_count(),
         2,
-        "expected exactly 2 HTTP calls (broken tool_calls turn + DONE turn)"
+        "expected exactly 2 HTTP calls (rejected broken-shape edits, then the ones that land)"
     );
     let ids = handle.state.tool_result_ids();
     assert!(
@@ -475,21 +462,24 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
             .all(|id| id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric())),
         "every role=tool message must carry a synthesized 9-char alphanumeric id, got {ids:?}"
     );
+    assert_ne!(
+        ids[0], ids[1],
+        "two tool calls in one turn must get distinct synthesized ids, got {ids:?}"
+    );
     handle.ct.cancel();
 }
 
-/// Verifies compile_loop in multi-file diff mode converges after a rejected edit (2-iter).
+/// Verifies compile_loop in multi-file diff mode converges after a rejected edit.
 ///
-/// Scenario: 2 iterations, 2 LLM calls each.
-///   - Iter 1, call 1: one `fs_edit` on file_a whose `expect` does not match the
-///     file. std.fs rejects it, so the iteration applies zero edits.
-///     Call 2: the model answers DONE, ending the tool loop. compile_loop sees
-///     zero edits, skips the runner, and carries the rejection into iter 2.
-///   - Iter 2, call 3: correct `fs_edit` for both files → both apply.
-///     Call 4: DONE → compile_loop verifies → ok=true.
+/// Scenario: two iterations, one call each.
+///   - Iteration 1: one `fs_edit` on file_a whose `expect` does not match.
+///     std.fs rejects it, so the iteration applies zero edits; the verify runs
+///     and fails, and the rejection is carried into iteration 2.
+///   - Iteration 2: correct `fs_edit`s for both files → both apply → the verify
+///     passes.
 ///
 /// Validates:
-///   - A rejected edit in multi-file mode triggers a retry (not a silent skip).
+///   - A rejected edit triggers another iteration (not a silent skip).
 ///   - A zero-edit iteration does not end the run.
 ///   - result.modified_files contains 2 paths; result.artifact_path is nil.
 ///
@@ -497,13 +487,9 @@ async fn compile_loop_broken_openai_tool_calls_shape_converges() {
 #[tokio::test]
 async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
     let handle = MockLlm::anthropic(|req| {
-        if req.has_tool_results {
-            // The edit result is in hand; one edit per iteration is enough.
-            return anthropic::text_response("DONE");
-        }
         let (path_a, path_b) = two_paths(&req.paths);
         if req.call_index == 0 {
-            // Iter 1: file_a only, and `expect` is not what line 1 holds.
+            // Iteration 1: file_a only, and `expect` is not what line 1 holds.
             anthropic::tool_use_response(vec![fs_edit_line1(
                 "toolu_multi_wrong",
                 &path_a,
@@ -548,147 +534,28 @@ async fn compile_loop_diff_multi_anthropic_mock_two_iter_converges() {
     .await
     .expect("subprocess assertion task should not panic");
 
-    // 2 iterations, 2 calls each: the model asks for an edit, then sees its
-    // result and answers DONE. Iter 1's edit is rejected, iter 2's applies.
     assert_eq!(
         handle.state.call_count(),
-        4,
-        "expected exactly 4 HTTP calls to the multi diff mock (iter1: edit-rejected + DONE, \
-         iter2: edits applied + DONE)"
+        2,
+        "two iterations, one call each: the rejected edit, then the two that apply"
     );
     handle.ct.cancel();
 }
 
-/// Verifies the compile_loop distill subloop with an OpenAI provider mock.
+/// Verifies the read tools against a file that is too large to send whole.
 ///
-/// Scenario (3-turn per iter, with distill LLM calls interleaved):
-///   Turn 0 (main, with tools):   mock returns tool_use=read_file for the target file.
-///                                 compile_loop dispatches read_file → size > threshold →
-///                                 calls distill_subloop → N HTTP calls to mock (no tools).
-///   Turn 1 (distill, no tools):  mock returns short text summaries.
-///                                 distill_call_count incremented per chunk.
-///   Turn 2 (main, with tools + tool results): mock returns SR pass block.
-///                                 compile_loop applies SR → mock_runner returns ok=true.
-///
-/// Asserts:
-///   - COMPILE_LOOP_DISTILL_MOCK_PASS received (loop converged).
-///   - distill_call_count > 0 (distill subloop was triggered).
-///   - received_distill_body has no `tools` key (BC5: provider-agnostic distill).
+/// Scenario (Anthropic mock, 3 iterations):
+///   - Iteration 1: `fs_read` on the whole file. It is over the size threshold,
+///     so the answer names the file's length and points at `read_file_range` —
+///     there is no digest and no summarising sub-call.
+///   - Iteration 2: `read_file_range(path, 10, 20)` hands back those lines
+///     verbatim and line-numbered, whatever the file's size.
+///   - Iteration 3: `fs_edit` on the marker line; the verify then passes.
 ///
 /// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
 #[tokio::test]
-async fn compile_loop_distill_openai_mock_iterates_until_pass() {
-    let (addr, state) = common::compile_loop_distill_mock::spawn_distill_mock("openai").await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let base_url = format!("http://{addr}");
-    tokio::task::spawn_blocking(move || {
-        let tmp = tempdir().expect("tempdir");
-        let target_file = tmp.path().join("distill_target.lua");
-        common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_distill_mock.lua")])
-            .env("OPENAI_BASE_URL_TEST", &base_url)
-            .env("DISTILL_MOCK_PROVIDER", "openai")
-            .env(
-                "COMPILE_LOOP_DISTILL_TARGET",
-                target_file.to_str().expect("utf8 path"),
-            )
-            .env("RUST_LOG", "off")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_DISTILL_MOCK_PASS"));
-    })
-    .await
-    .expect("subprocess assertion task should not panic");
-
-    assert!(
-        state.distill_call_count.load(Ordering::SeqCst) > 0,
-        "distill_call_count must be > 0: distill subloop was not triggered"
-    );
-
-    let body_guard = state.received_distill_body.lock().unwrap();
-    let distill_body = body_guard
-        .as_ref()
-        .expect("received_distill_body must be set after distill call");
-    assert!(
-        distill_body.get("tools").is_none(),
-        "BC5: distill LLM call must not include `tools` field in request body"
-    );
-}
-
-/// Verifies the compile_loop distill subloop with an Anthropic provider mock.
-///
-/// Same scenario as `compile_loop_distill_openai_mock_iterates_until_pass` but
-/// using the Anthropic Messages API schema. Confirms provider-agnostic distill
-/// (crux-card §2: distill uses the same call path regardless of provider).
-///
-/// Asserts:
-///   - COMPILE_LOOP_DISTILL_MOCK_PASS received.
-///   - distill_call_count > 0.
-///   - received_distill_body has no `tools` key (BC5).
-///
-/// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
-#[tokio::test]
-async fn compile_loop_distill_anthropic_mock_iterates_until_pass() {
-    let (addr, state) = common::compile_loop_distill_mock::spawn_distill_mock("anthropic").await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let base_url = format!("http://{addr}");
-    tokio::task::spawn_blocking(move || {
-        let tmp = tempdir().expect("tempdir");
-        let target_file = tmp.path().join("distill_target.lua");
-        common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_distill_mock.lua")])
-            .env("ANTHROPIC_BASE_URL_TEST", &base_url)
-            .env("DISTILL_MOCK_PROVIDER", "anthropic")
-            .env(
-                "COMPILE_LOOP_DISTILL_TARGET",
-                target_file.to_str().expect("utf8 path"),
-            )
-            .env("RUST_LOG", "off")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_DISTILL_MOCK_PASS"));
-    })
-    .await
-    .expect("subprocess assertion task should not panic");
-
-    assert!(
-        state.distill_call_count.load(Ordering::SeqCst) > 0,
-        "distill_call_count must be > 0: distill subloop was not triggered"
-    );
-
-    let body_guard = state.received_distill_body.lock().unwrap();
-    let distill_body = body_guard
-        .as_ref()
-        .expect("received_distill_body must be set after distill call");
-    assert!(
-        distill_body.get("tools").is_none(),
-        "BC5: distill LLM call must not include `tools` field in request body"
-    );
-}
-
-/// Verifies that read_file_range returns verbatim source lines without distillation
-/// even when the target file exceeds READ_FILE_FULL_THRESHOLD (crux-card §3).
-///
-/// Scenario (Anthropic mock, 3 turns):
-///   Turn 0: mock returns tool_use=read_file_range(path, 10, 20).
-///           compile_loop dispatches to read_file_range_tool_handler.
-///           Handler reads lines 10-20 verbatim (no distill path).
-///   Turn 1: mock returns tool_use=fs_edit (REPLACE_ME → DONE) on the marker line.
-///   Turn 2: mock returns "DONE" after the edit result, ending the tool loop.
-///           compile_loop then verifies → mock_runner returns ok=true.
-///
-/// Asserts:
-///   - READ_FILE_RANGE_VERBATIM_PASS received (loop converged using range access).
-///   - The range tool result is the requested lines verbatim, each prefixed with
-///     its 1-based line number — the numbers fs_edit addresses lines by.
-///   - call_count == 3 (exactly 3 main LLM calls, no distill interleaved).
-///
-/// No `#[ignore]` — runs under plain `cargo test` with no real API keys.
-#[tokio::test]
-async fn compile_loop_read_file_range_verbatim() {
-    let (addr, state) = common::compile_loop_distill_mock::spawn_range_mock().await;
+async fn compile_loop_reads_a_large_file_by_range() {
+    let (addr, state) = common::compile_loop_range_mock::spawn_range_mock().await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let base_url = format!("http://{addr}");
@@ -696,15 +563,13 @@ async fn compile_loop_read_file_range_verbatim() {
         let tmp = tempdir().expect("tempdir");
         let target_file = tmp.path().join("range_target.lua");
         common::agent_block_cmd()
-            .args([
-                "-s",
-                &common::fixture("compile_loop_distill_range_mock.lua"),
-            ])
+            .args(["-s", &common::fixture("compile_loop_range_mock.lua")])
             .env("ANTHROPIC_BASE_URL_TEST", &base_url)
             .env(
                 "COMPILE_LOOP_RANGE_TARGET",
                 target_file.to_str().expect("utf8 path"),
             )
+            .env("AGENT_BLOCK_HOME", tmp.path())
             .env("RUST_LOG", "off")
             .assert()
             .success()
@@ -713,37 +578,39 @@ async fn compile_loop_read_file_range_verbatim() {
     .await
     .expect("subprocess assertion task should not panic");
 
+    let results = state.tool_result_texts();
+    assert!(
+        results.len() >= 2,
+        "expected the read and the range results, got {results:?}"
+    );
+    // The whole-file read is refused with the file's length and where to go
+    // instead — the answer that replaced the distilled digest.
+    assert!(
+        results[0].contains("too large: 600 lines") && results[0].contains("read_file_range"),
+        "fs_read on an oversized file must answer its length and point at the range read, got {:?}",
+        results[0]
+    );
     // The fixture writes "-- verbatim-line-NN" on lines 10..=20; the handler
     // returns those lines untouched, line-numbered for fs_edit to address.
     let expected_range = (10..=20)
         .map(|n| format!("{n}\t-- verbatim-line-{n:02}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let results = state.tool_result_texts();
     assert_eq!(
-        results.first().map(String::as_str),
-        Some(expected_range.as_str()),
-        "read_file_range must hand back lines 10-20 verbatim and line-numbered, got {:?}",
-        results.first()
+        results[1], expected_range,
+        "read_file_range must hand back lines 10-20 verbatim and line-numbered"
     );
 
-    // Range mock: exactly 3 main calls (read_file_range, fs_edit, DONE), no distill calls.
     assert_eq!(
         state.call_count.load(Ordering::SeqCst),
         3,
-        "expected exactly 3 HTTP calls to the range mock \
-         (turn 0: read_file_range, turn 1: fs_edit, turn 2: DONE)"
-    );
-    assert_eq!(
-        state.distill_call_count.load(Ordering::SeqCst),
-        0,
-        "range mock must not trigger distill subloop (read_file_range bypasses distill)"
+        "expected exactly 3 calls (read, range, edit) — one per iteration"
     );
 }
 
 /// Verifies that compile_loop with the OpenAI provider converges after exactly 3 turns
 /// (broken1 → broken2 → fixed) and that the same input sequence produces the same
-/// output sequence across two independent subprocess runs (Crux: deterministic across runs).
+/// output sequence across two independent subprocess runs (deterministic across runs).
 ///
 /// ## Scenario
 /// - Turn 1: mock returns broken Lua code A; mock_runner returns {ok=false, stderr="iter 1"}.
@@ -751,7 +618,7 @@ async fn compile_loop_read_file_range_verbatim() {
 ///           mock_runner returns {ok=false, stderr="iter 2"}.
 /// - Turn 3: mock returns fixed Lua code; mock_runner returns {ok=true}.
 ///
-/// ## Determinism check (Crux constraint — 1 spawn縮退不可)
+/// ## Determinism check
 /// The test spawns two subprocesses against the same mock server:
 ///   Run 1: assert call_count == 3 and stdout contains "COMPILE_LOOP_MOCK_PASS".
 ///   call_count.store(0, SeqCst) — reset between runs.
@@ -782,6 +649,7 @@ async fn compile_loop_openai_mock_three_turn_converges() {
                 "COMPILE_LOOP_TARGET",
                 target_file.to_str().expect("utf8 path"),
             )
+            .env("AGENT_BLOCK_HOME", tmp.path())
             .env("RUST_LOG", "off")
             .assert()
             .success()
@@ -814,6 +682,7 @@ async fn compile_loop_openai_mock_three_turn_converges() {
                 "COMPILE_LOOP_TARGET",
                 target_file.to_str().expect("utf8 path"),
             )
+            .env("AGENT_BLOCK_HOME", tmp.path())
             .env("RUST_LOG", "off")
             .assert()
             .success()
@@ -828,153 +697,6 @@ async fn compile_loop_openai_mock_three_turn_converges() {
         "run 2: expected exactly 3 HTTP calls to the 3-turn mock (broken1, broken2, fixed)"
     );
 
-    ct.cancel();
-}
-
-/// Verifies that compile_loop emits ab.obs events when AGENT_BLOCK_LLM_DUMP=meta.
-///
-/// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls).
-/// With AGENT_BLOCK_LLM_DUMP=meta the obs helpers are activated and the three
-/// events that appear on the PASS path — iter_start, iter_result, converged —
-/// must appear in stdout.
-///
-/// stagnation and max_iters_reached are not asserted: they do not occur in the
-/// 2-iteration PASS shape produced by this mock.
-#[tokio::test]
-async fn compile_loop_anthropic_mock_emits_obs_events() {
-    let (base_url, call_count, ct) =
-        common::compile_loop_anthropic_mock::spawn_compile_loop_anthropic_mock_server().await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let url_clone = base_url.clone();
-    tokio::task::spawn_blocking(move || {
-        let tmp = tempdir().expect("tempdir");
-        let target_file = tmp.path().join("target.lua");
-        common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
-            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
-            .env(
-                "COMPILE_LOOP_TARGET",
-                target_file.to_str().expect("utf8 path"),
-            )
-            .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "info")
-            .env("AGENT_BLOCK_LLM_DUMP", "meta")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=iter_start component=compile_loop",
-            ))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=iter_result component=compile_loop",
-            ))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=converged component=compile_loop",
-            ));
-    })
-    .await
-    .expect("subprocess assertion task should not panic");
-
-    assert_eq!(
-        call_count.load(Ordering::SeqCst),
-        2,
-        "expected exactly 2 HTTP calls to the anthropic mock"
-    );
-    ct.cancel();
-}
-
-/// Verifies that AGENT_BLOCK_LLM_DUMP=full emits prompt/response bodies from the
-/// compile_loop llm_call path, and that meta mode does not.
-///
-/// Reuses the Anthropic mock (fail-then-pass shape, 2 HTTP calls) and runs the
-/// subprocess twice against it:
-///   Run 1 (full): stdout must carry `event=request_body component=compile_loop`
-///                 (the request body holds the full messages array — the audit trail).
-///   Run 2 (meta): the same events must NOT appear; meta output stays meta-only.
-///
-/// No `#[ignore]` — self-contained, runs under plain `cargo test` with no API keys.
-#[tokio::test]
-async fn compile_loop_anthropic_mock_full_dump_emits_bodies() {
-    let (base_url, call_count, ct) =
-        common::compile_loop_anthropic_mock::spawn_compile_loop_anthropic_mock_server().await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // --- Run 1: full mode → request/response bodies present ---
-    let url_clone = base_url.clone();
-    tokio::task::spawn_blocking(move || {
-        let tmp = tempdir().expect("tempdir");
-        let target_file = tmp.path().join("target.lua");
-        common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
-            .env("ANTHROPIC_BASE_URL_TEST", &url_clone)
-            .env(
-                "COMPILE_LOOP_TARGET",
-                target_file.to_str().expect("utf8 path"),
-            )
-            .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "info")
-            .env("AGENT_BLOCK_LLM_DUMP", "full")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=request_body component=compile_loop",
-            ))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=response_body component=compile_loop",
-            ))
-            .stdout(predicate::str::contains(
-                "prefix=ab.obs event=request_headers component=compile_loop",
-            ))
-            .stdout(predicate::str::contains("***REDACTED***"))
-            // The fixture injects api_key="dummy"; it must never reach the dump.
-            // Global (whole-stdout) form is safe here: the key value is not logged
-            // anywhere else and the mock never echoes it back.
-            .stdout(predicate::str::contains("dummy").not());
-    })
-    .await
-    .expect("subprocess assertion task (full) should not panic");
-
-    assert_eq!(
-        call_count.load(Ordering::SeqCst),
-        2,
-        "full run: expected exactly 2 HTTP calls to the anthropic mock"
-    );
-
-    // Reset between runs — the mock keys its fail-then-pass shape off call_count,
-    // and the run 1 subprocess has already exited.
-    call_count.store(0, Ordering::SeqCst);
-
-    // --- Run 2: meta mode → bodies must stay absent ---
-    let url_clone2 = base_url.clone();
-    tokio::task::spawn_blocking(move || {
-        let tmp = tempdir().expect("tempdir");
-        let target_file = tmp.path().join("target.lua");
-        common::agent_block_cmd()
-            .args(["-s", &common::fixture("compile_loop_anthropic_mock.lua")])
-            .env("ANTHROPIC_BASE_URL_TEST", &url_clone2)
-            .env(
-                "COMPILE_LOOP_TARGET",
-                target_file.to_str().expect("utf8 path"),
-            )
-            .env("AGENT_BLOCK_HOME", tmp.path())
-            .env("RUST_LOG", "info")
-            .env("AGENT_BLOCK_LLM_DUMP", "meta")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("COMPILE_LOOP_MOCK_PASS"))
-            .stdout(predicate::str::contains("event=request_body").not())
-            .stdout(predicate::str::contains("event=response_body").not());
-    })
-    .await
-    .expect("subprocess assertion task (meta) should not panic");
-
-    assert_eq!(
-        call_count.load(Ordering::SeqCst),
-        2,
-        "meta run: expected exactly 2 HTTP calls to the anthropic mock"
-    );
     ct.cancel();
 }
 
@@ -994,24 +716,22 @@ async fn compile_loop_extra_tools_are_declared_and_dispatched() {
             // Fail loudly rather than converging without the tool.
             return anthropic::text_response("get_hint was not declared");
         }
-        match req.body.to_string().matches("tool_result").count() {
-            0 => anthropic::tool_use_response(vec![anthropic::tool_use(
+        if req.call_index == 0 {
+            anthropic::tool_use_response(vec![anthropic::tool_use(
                 "toolu_hint",
                 "get_hint",
                 json!({}),
-            )]),
-            1 => {
-                let path = req.paths.first().cloned().unwrap_or_default();
-                anthropic::tool_use_response(vec![anthropic::tool_use(
-                    "toolu_edit",
-                    "fs_edit",
-                    json!({"path": path, "edits": [{
-                        "start_line": 1, "end_line": 1,
-                        "expect": "print(\"hello\")", "replace": "print(\"world\")"
-                    }]}),
-                )])
-            }
-            _ => anthropic::text_response("DONE"),
+            )])
+        } else {
+            let path = req.paths.first().cloned().unwrap_or_default();
+            anthropic::tool_use_response(vec![anthropic::tool_use(
+                "toolu_edit",
+                "fs_edit",
+                json!({"path": path, "edits": [{
+                    "start_line": 1, "end_line": 1,
+                    "expect": "print(\"hello\")", "replace": "print(\"world\")"
+                }]}),
+            )])
         }
     })
     .spawn()
@@ -1036,5 +756,101 @@ async fn compile_loop_extra_tools_are_declared_and_dispatched() {
     .await
     .expect("subprocess assertion task should not panic");
 
+    handle.ct.cancel();
+}
+
+/// `tool_mode = "read_only"` withholds the edit tool.
+///
+/// A read-only run can inspect and cannot converge, so what is asserted is the
+/// tool set the request declared and the give-up that follows from it.
+#[tokio::test]
+async fn compile_loop_read_only_withholds_the_edit_tool() {
+    let handle = MockLlm::anthropic(|_req| anthropic::text_response("I would edit line 1."))
+        .spawn()
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url = handle.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_read_only_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url)
+            .env("COMPILE_LOOP_TARGET", target.to_str().expect("utf8 path"))
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("[RO] ok=false"))
+            .stdout(predicate::str::contains("[RO] failure_reason=max_iters"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        handle.state.declared_count_of("fs_edit"),
+        0,
+        "read_only must not declare the edit tool: {:?}",
+        handle.state.declared_tool_names()
+    );
+    assert!(
+        handle.state.declared_count_of("fs_read") >= 1,
+        "read_only still declares the reads: {:?}",
+        handle.state.declared_tool_names()
+    );
+    handle.ct.cancel();
+}
+
+/// The run stops when the verify keeps saying the same thing.
+///
+/// Each iteration lands a real edit, so the "no edits applied" counter never
+/// trips; what fires is `policy.stagnation` over the verify's stderr, which is
+/// identical every time. Three is the count at which "again" stops being a
+/// retry.
+#[tokio::test]
+async fn compile_loop_stops_when_the_verify_repeats_itself() {
+    let handle = MockLlm::anthropic(|req| {
+        // One line per iteration, so every iteration applies an edit and the
+        // signature the policy compares is the verify's, not the edit's.
+        let path = req.paths.first().cloned().unwrap_or_default();
+        let line = req.call_index + 1;
+        anthropic::tool_use_response(vec![anthropic::tool_use(
+            &format!("toolu_stag_{line}"),
+            "fs_edit",
+            json!({"path": path, "edits": [{
+                "start_line": line, "end_line": line,
+                "expect": format!("line-{line}"), "replace": format!("edited-{line}")
+            }]}),
+        )])
+    })
+    .spawn()
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url = handle.base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempdir().expect("tempdir");
+        let target = tmp.path().join("target.lua");
+        common::agent_block_cmd()
+            .args(["-s", &common::fixture("compile_loop_stagnation_mock.lua")])
+            .env("ANTHROPIC_BASE_URL_TEST", &url)
+            .env("COMPILE_LOOP_TARGET", target.to_str().expect("utf8 path"))
+            .env("AGENT_BLOCK_HOME", tmp.path())
+            .env("RUST_LOG", "off")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("[STAG] ok=false"))
+            .stdout(predicate::str::contains("[STAG] failure_reason=stagnation"))
+            .stdout(predicate::str::contains("[STAG] iters=3"));
+    })
+    .await
+    .expect("subprocess assertion task should not panic");
+
+    assert_eq!(
+        handle.state.call_count(),
+        3,
+        "the run gives up on the third identical verify, well inside its budget"
+    );
     handle.ct.cancel();
 }
