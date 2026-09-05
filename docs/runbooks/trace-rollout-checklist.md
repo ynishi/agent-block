@@ -7,7 +7,7 @@ propagation.
 
 - [ ] Canonicalize keys to `trace_id`, `run_id`, `agent_id`, `agent_name`
 - [ ] Keep `task_id` compatibility fallback with deprecation warning
-- [ ] Document resolution order (`opts.log_meta > env > runtime fallback`)
+- [ ] Document resolution order (`env > runtime fallback`)
 - [ ] Add unit tests for fallback + warning behavior
 
 ## Phase 2 — Logging Contract

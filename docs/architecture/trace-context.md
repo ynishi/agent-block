@@ -30,9 +30,10 @@ The canonical context is:
 
 For each key:
 
-1. `agent.run({ log_meta = { ... } })`
-2. Environment variable (`AGENT_BLOCK_TRACE_ID`, etc.)
-3. Runtime fallback (for `agent_id`, `std.env.agent_id()`; for others, nil unless policy requires generation)
+1. Environment variable (`AGENT_BLOCK_TRACE_ID`, etc.)
+2. Runtime fallback (for `agent_id`, the process-scoped id the host mints; for others, nil unless policy requires generation)
+
+`agent.run` takes no correlation option: the same environment values are stamped onto the seed event's `meta` (`trace_id` / `run_id` / `agent_id` / `agent_name`, only the ones set), so the session log and the `ab.obs` lines share one set of ids.
 
 ## Runtime Contract
 
@@ -71,6 +72,5 @@ Values containing spaces or `=` must be escaped as JSON strings.
 ## Migration Policy
 
 - `task_id` fallback remains supported temporarily with warning:
-  - `log_meta.task_id -> trace_id`
   - `AGENT_BLOCK_TASK_ID -> AGENT_BLOCK_TRACE_ID`
 - Remove fallback in a future minor release after deprecation window.
