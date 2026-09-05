@@ -1171,30 +1171,25 @@ do
         return "error(" .. tostring(o.kind) .. "): " .. tostring(detail)
     end
 
-    -- A FILE STORE, and not for durability. Siblings write to ONE database —
-    -- their parent's — and the two stores differ in what simultaneous writers
-    -- meet there [実測: 2026-09-05, this fixture]. The in-memory database is
-    -- addressed by a shared-cache URI (`file:knl-<stream>?mode=memory&
-    -- cache=shared`), and shared cache locks per TABLE: a second connection
-    -- writing while the first holds that lock gets SQLITE_LOCKED at once, which
-    -- `busy_timeout` does not wait out, so a child's beat comes back
-    -- `err("state")` with `detail.kind == "busy"` — nondeterministically,
-    -- depending on which write lands first. A file database has no shared
-    -- cache, so the same contention is SQLITE_BUSY and the 5 s busy timeout
-    -- waits it out.
+    -- No store named, which is the point: the default is the file the host
+    -- owns, and siblings write to ONE database — their parent's. This used to
+    -- name a temp file by hand, because the default was the in-memory database
+    -- and a tree on one does not work: it is addressed by a shared-cache URI
+    -- (`file:knl-<stream>?mode=memory&cache=shared`), shared cache locks per
+    -- TABLE, and a second connection writing while the first holds that lock
+    -- gets SQLITE_LOCKED at once, which `busy_timeout` does not wait out. The
+    -- workaround is the default now, and `knl.open{ parent = <mem session> }`
+    -- is refused rather than left to fail nondeterministically.
     --
-    -- That is the store's property and not the supervisor's, and `busy` is the
-    -- one class the kernel calls retryable — asking again is the caller's
-    -- loop's decision (`policy.retry`), which is why nothing here retries. What
-    -- this invariant is about is what `parallel` promises, so it runs where the
-    -- promise is not drowned out by the lock.
-    local path = os.tmpname()
-    local store = { sqlite = path }
+    -- Contention on a file is SQLITE_BUSY and the 5 s busy timeout waits it
+    -- out. `busy` is the one class the kernel calls retryable — asking again is
+    -- the caller's loop's decision (`policy.retry`), which is why nothing here
+    -- retries.
 
     -- (a) AT ONCE, not one after the other. The first child sleeps at a cancel
     -- checkpoint and the second runs straight through; if the two were run in
     -- sequence the second could not possibly finish first.
-    local at_once = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" }, store = store })
+    local at_once = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" } })
     local trace = {}
     local function step(label)
         trace[#trace + 1] = label
@@ -1247,7 +1242,7 @@ do
 
     -- (b) ISOLATE is the default: one sibling raising is that sibling's, and
     -- the other runs to completion.
-    local isolate = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" }, store = store })
+    local isolate = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" } })
     local ids = {}
     local mixed = supervisor.parallel(isolate, {
         {
@@ -1317,7 +1312,6 @@ do
     assert(ids[1] ~= nil and ids[2] ~= nil, "both bodies ran")
 
     isolate:close("done")
-    os.remove(path)
 
     mark("inv15_supervisor_parallel")
 end

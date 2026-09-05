@@ -315,6 +315,25 @@ pub struct SchemaColumn {
     pub pk: bool,
 }
 
+/// What the shared-cache URI of an in-memory kernel database starts with.
+///
+/// One constant for the two directions: [`Db::memory_uri`] builds the address,
+/// and [`is_memory_database`] reads one back.
+const MEMORY_URI_PREFIX: &str = "file:knl-";
+
+/// Whether `database` — an [`EventStore::database`] identity — names an
+/// in-memory database rather than a file.
+///
+/// The identity is documented as a thing to pass along and not to take apart,
+/// and this is the one question about it that is the store's to answer rather
+/// than a caller's to parse: the URI form is minted here, so the reading of it
+/// belongs here too.  The caller that asks is the bridge, deciding whether a
+/// session can be a parent — a tree writes to one database, and the in-memory
+/// one locks per table under its shared cache.
+pub fn is_memory_database(database: &str) -> bool {
+    database.starts_with(MEMORY_URI_PREFIX)
+}
+
 /// Where a store's database lives.
 ///
 /// The store keeps this so it can open a *second* connection to the same
@@ -347,7 +366,7 @@ impl Db {
     /// process finds the same database — which is what makes an in-memory
     /// session resumable while it is still alive.
     fn memory_uri(stream: &str) -> String {
-        format!("file:knl-{stream}?mode=memory&cache=shared")
+        format!("{MEMORY_URI_PREFIX}{stream}?mode=memory&cache=shared")
     }
 
     /// What SQLite is asked to open: a path for a file, the shared-cache URI

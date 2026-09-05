@@ -837,6 +837,23 @@ pub struct HostContext {
     /// Cloneable and shared, like the isle handles beside it; the run loop
     /// drains it once, in [`shutdown`], after the Lua VM is gone.
     pub knl_drivers: crate::knl::IsleDrivers,
+    /// The database a `knl` session opened without a `store` lands in.
+    ///
+    /// `{base_dir}/projects/<slug>/knl.sqlite`, resolved by
+    /// [`crate::bridge::config::knl_path`] from the project root above, or
+    /// whatever `AGENT_BLOCK_KNL_PATH` names. The host owns it for the same
+    /// reason it owns the `sql` / `kv` / `ts` files: where a script's state
+    /// goes is the host's answer, not the script's.
+    ///
+    /// One file per project, so every default session is a stream in it —
+    /// which is what lets a tree opened from a default parent exist at all
+    /// (a child is opened on its parent's database, and the in-memory one
+    /// locks per table under its shared cache). `store = "mem"` remains the
+    /// explicit way to ask for the process-local database instead.
+    ///
+    /// The directory is created at start, beside the other three; the file
+    /// itself is SQLite's to create, on the first session that needs it.
+    pub knl_store: PathBuf,
 }
 
 impl HostContext {
@@ -872,6 +889,25 @@ fn prepare_sqlite_dir(path: &Path, label: &'static str) -> BlockResult<bool> {
         }
     }
     Ok(is_memory)
+}
+
+/// Create the directory the kernel's database goes in.
+///
+/// The same step [`prepare_sqlite_dir`] does for `sql` / `kv` / `ts`, and a
+/// function of its own for two reasons: it is not gated behind the `sqlite`
+/// feature (the kernel is in every build), and the kernel's default path has a
+/// directory *per project* under the base dir, so there is a level to create
+/// that the other three never needed.
+///
+/// A path with no parent — `AGENT_BLOCK_KNL_PATH=":memory:"`, or a bare file
+/// name — has no directory to make, and asking for one would be a create of
+/// the empty path.
+fn prepare_knl_dir(path: &Path) -> BlockResult<()> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|e| BlockError::Runtime(format!("knl dir create {}: {e}", parent.display())))
 }
 
 /// Open the SQLite database at `path` (or `:memory:`) on a connection thread
@@ -1878,6 +1914,13 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         drivers: sqlite_drivers,
     } = init_sqlite(&config).await?;
 
+    // ── the kernel's database ─────────────────────────────────────────
+    // Per project, and resolved here rather than in the bridge: a session
+    // opened without a `store` is the host's to place, exactly as the three
+    // above are. Not gated behind `sqlite` — the kernel is in every build.
+    let knl_store = crate::bridge::config::knl_path(&project_root).map_err(BlockError::Runtime)?;
+    prepare_knl_dir(&knl_store)?;
+
     // Use the script dir derived from the resolved `ScriptSource` for
     // `package.path` lookups. For inline / default-agent variants the dir
     // falls back to `project_root` (set during source resolution above).
@@ -1943,6 +1986,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         event_bus: Arc::clone(&event_bus),
         fs_snapshots: Default::default(),
         knl_drivers: crate::knl::IsleDrivers::new(),
+        knl_store,
     };
     // Kept out of the context clone the bridges get: the run loop needs its
     // own reference to drain the threads after the VM has gone.

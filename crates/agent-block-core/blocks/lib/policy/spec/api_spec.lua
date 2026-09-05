@@ -309,7 +309,7 @@ describe("policy.shapes.api — the registry is executed (dev mode)", function()
 end)
 
 describe("policy.shapes.api — the gate does not answer what `only` owns", function()
-    -- The divergence this closes [実測: 2026-09-05]. The dev-mode gate wraps
+    -- The divergence this closes was a real one. The dev-mode gate wraps
     -- the export, so whatever it judges it judges FIRST. Handed the CLOSED
     -- opts shape it became the thing that reported an unknown option — in dev
     -- only, as "shape violation at $.session: unexpected field", instead of

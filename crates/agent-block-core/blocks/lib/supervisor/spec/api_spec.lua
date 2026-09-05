@@ -22,7 +22,7 @@
 --   halves of that gate are proven here — a wrong-typed call fails through the
 --   registry in dev and reaches the call's own answer in prod, where no
 --   wrapper is installed at all — and so is the line between the gate and
---   `only`, which policy learned the hard way [実測: 2026-09-05].
+--   `only`, which policy learned the hard way.
 --
 -- The fake bridge comes in with `support`, because the shapes here are built on
 -- the kernel's and loading knl is what publishes them.

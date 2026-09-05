@@ -8,7 +8,7 @@
 -- WHY THE BEHAVIOUR IS NOT HERE. `parallel` runs its siblings in a `std.task`
 -- scope, and `std.task` is the HOST's nursery: the pure spec runner builds its
 -- VM out of the framework and a search path and registers no `std` at all
--- [実測: 2026-09-05, `type(rawget(_G, "std")) == "nil"` under the runner].
+-- (`type(rawget(_G, "std")) == "nil"` under the runner).
 -- Nothing here can spawn, cancel or time out, and a stub scope that ran its
 -- children one after another would be a spec about the stub.
 --

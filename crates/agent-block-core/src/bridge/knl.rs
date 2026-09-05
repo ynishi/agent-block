@@ -27,7 +27,8 @@
 //!   raises `refused`, and no session is returned.
 //! - `knl.resume(opts) -> session` — `{ session, store?, budget? }`: reopen a
 //!   stream and re-fold it.  An absent `store` means what it means on open,
-//!   the in-memory database.
+//!   the host's database — so `knl.resume{ session = id }` reopens what
+//!   `knl.open{}` wrote.
 //! - `knl.new_beat_id() -> string` — a time-ordered, session-free id for the
 //!   caller to stamp on the events of one beat.
 //! - `knl.error(e) -> { kind, method, retryable, message }` — read a raised
@@ -197,11 +198,24 @@
 //!
 //! # Storage backend
 //!
-//! `knl.open` takes an optional `store`: absent or `"mem"`
-//! is an in-memory SQLite database that lives as long as the session does,
-//! while `{ sqlite = "<path>" }` is a durable, per-session stream in a file.
+//! **A real session is a file.**  `knl.open` takes an optional `store`, and
+//! leaving it out is the host's database — one file per project,
+//! `{base_dir}/projects/<slug>/knl.sqlite` unless `AGENT_BLOCK_KNL_PATH` says
+//! otherwise ([`crate::bridge::config::knl_path`]) — so every session a script
+//! opens is a stream in one database, and a tree opened from a default parent
+//! is a tree in one file.
+//!
+//! `"mem"` is the other choice and has to be asked for by name: an in-memory
+//! SQLite database that lives as long as the session does, **for tests and
+//! mocks — one session, one process, nothing shared**.  It is not a lighter
+//! version of the default.  A shared-cache URI is how a second connection
+//! reaches one, and shared cache locks per *table*, so a second writer meets
+//! `SQLITE_LOCKED` at once and no busy timeout waits it out; opening a child
+//! on a parent that is on one is therefore a `validation` refusal rather than
+//! a wait.  `{ sqlite = "<path>" }` is a file the caller picked.
+//!
 //! One backend, two kinds of database — the log is a table either way, which
-//! is what `s:query` reads.  `knl.resume({ store = …, session = "<id>",
+//! is what `s:query` reads.  `knl.resume({ session = "<id>", store?,
 //! budget? })` reopens a stream and re-folds it, so a resumed session's
 //! accounting continues from the recorded state — it behaves exactly like a
 //! fresh session, only pre-loaded.  A file survives the process; an in-memory
@@ -361,15 +375,18 @@ pub const SESSION_API: &[(&str, &str)] = &[
 pub const MODULE_API: &[(&str, &str)] = &[
     (
         "open",
-        "open(opts?) -> session — owner? / budget? / store? (\"mem\" for an in-memory database, \
-         or { sqlite = path }); parent? opens a child on the parent's database with \
-         budget = { from_parent = n, tag? }, moving n out of the parent's balance in one write \
-         [raises: validation, refused, closed, busy, storage]",
+        "open(opts?) -> session — owner? / budget? / store? (absent is the host's database, one \
+         file per project; \"mem\" is an in-memory database for tests and mocks — one session, \
+         one process, nothing shared; or { sqlite = path }); parent? opens a child on the \
+         parent's database with budget = { from_parent = n, tag? }, moving n out of the parent's \
+         balance in one write, and a parent on \"mem\" is refused because a tree needs a file \
+         store [raises: validation, refused, closed, busy, storage]",
     ),
     (
         "resume",
-        "resume(opts) -> session — reopen a stream and re-fold it; a closed session is not \
-         resumable [raises: validation, closed, busy, storage, corruption]",
+        "resume(opts) -> session — reopen a stream and re-fold it; an absent store means the \
+         host's database, as on open; a closed session is not resumable \
+         [raises: validation, closed, busy, storage, corruption]",
     ),
     (
         "new_beat_id",
@@ -594,10 +611,13 @@ pub mod types {
         pub n: Option<u64>,
     }
 
-    /// The backend a session's log lives in.
+    /// The backend a session's log lives in, when the caller names one.
     ///
     /// `"mem"` is an in-memory database that lives as long as the session
-    /// does; `{ sqlite = "<path>" }` is a durable stream in a file.
+    /// does — tests and mocks: one session, one process, nothing shared;
+    /// `{ sqlite = "<path>" }` is a stream in a file the caller picked.
+    /// Naming neither is the host's database, which is where a session that
+    /// is not a test belongs (see the module header).
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     #[serde(
         untagged,
@@ -712,7 +732,7 @@ pub mod types {
         /// The quota, and where it came from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub budget: Option<BudgetOpt>,
-        /// Where the log lives.  Absent is the in-memory database — except
+        /// Where the log lives.  Absent is the host's database — except
         /// for a child, which goes where its parent already is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub store: Option<StoreSpec>,
@@ -734,8 +754,8 @@ pub mod types {
     #[serde(deny_unknown_fields)]
     pub struct ResumeOpts {
         /// Where the stream lives.  Absent means the same thing it does on
-        /// open — the in-memory database — which is resumable for exactly as
-        /// long as some handle is still holding it.
+        /// open — the host's database — so a session opened without a store
+        /// is resumed by its id alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub store: Option<StoreSpec>,
         /// The stream to reopen.
@@ -1864,7 +1884,7 @@ fn view_opts(opts: Option<types::ViewOpts>) -> Option<Map<String, Value>> {
 
 /// The storage backend a session's log goes in.
 enum StoreTarget {
-    /// The in-memory store (the default): absent or `"mem"`.
+    /// The in-memory store, asked for by name: `"mem"`, for tests and mocks.
     Mem,
     /// A durable SQLite stream at the given path.
     Sqlite(String),
@@ -1950,11 +1970,11 @@ fn parse_parent(opts: &LuaValue) -> LuaResult<Option<LuaAnyUserData>> {
 async fn open_sqlite(
     owner: String,
     grant: Option<knl::BudgetGrant>,
-    path: &str,
+    path: &std::path::Path,
     drivers: &knl::IsleDrivers,
 ) -> LuaResult<Session> {
     let stream = uuid::Uuid::new_v4().to_string();
-    let store = knl::SqliteEventStore::open(std::path::Path::new(path), stream.clone(), drivers)
+    let store = knl::SqliteEventStore::open(path, stream.clone(), drivers)
         .await
         .map_err(|e| knl_err("open", &e))?;
     let mut state = knl::Session::open_on(owner, grant, Box::new(store))
@@ -2037,6 +2057,14 @@ async fn open_child_store(
 /// The parent is held for the whole of it: the allocation is one transaction
 /// on the parent's store, so the parent's own calls wait for it exactly as
 /// they wait for any other syscall of its own.
+///
+/// A parent on the in-memory database is refused before any of that
+/// ([`knl::is_memory_database`]).  A tree writes to one database and that one
+/// is addressed by a shared-cache URI, whose locks are per table: the child's
+/// first write while the parent holds the table meets `SQLITE_LOCKED`, which
+/// no busy timeout waits out.  So the refusal is the honest answer, and the
+/// alternative — teaching the kernel to wait on that lock — is machinery for a
+/// store that exists for tests and mocks.
 async fn open_child_session(
     lua: Lua,
     parent: LuaAnyUserData,
@@ -2063,6 +2091,15 @@ async fn open_child_session(
                 )
             })?
             .to_string();
+        if knl::is_memory_database(&parent_db) {
+            return Err(err(
+                "open",
+                "a session tree needs a file store: the parent is on the in-memory database \
+                 (store = \"mem\"), whose shared cache locks per table, and the kernel does not \
+                 wait on that lock. Open the parent without a store (the host's database) or on \
+                 { sqlite = <path> }",
+            ));
+        }
         // Minted here and adopted by the child below, so the id `s:id()`
         // reports is the stream the parent's log names as its child.
         let stream = uuid::Uuid::new_v4().to_string();
@@ -2081,8 +2118,9 @@ async fn open_child_session(
 ///
 /// `opts.owner` is the principal (default the reserved anonymous id),
 /// `opts.budget` the grant (`{ amount, tag?, desc? }`), and `opts.store`
-/// the backend (in-memory by default, or `{ sqlite = "<path>" }` for a
-/// durable stream).
+/// the backend — absent is `default_store`, the file the host owns; `"mem"`
+/// asks for the in-memory database by name; `{ sqlite = "<path>" }` is a file
+/// the caller picked.
 ///
 /// `opts.parent` is the other way to open: a session this one is opened
 /// *from*, with `budget = { from_parent = n, tag? }` moving `n` out of that
@@ -2094,6 +2132,7 @@ async fn open_session(
     lua: Lua,
     opts: LuaValue,
     drivers: knl::IsleDrivers,
+    default_store: std::path::PathBuf,
 ) -> LuaResult<LuaAnyUserData> {
     // The parent comes off the table first and by hand: it is a live session
     // handle, which serde cannot carry (see `parse_parent`).
@@ -2108,10 +2147,10 @@ async fn open_session(
     };
     let owner = owner_of(opts.owner)?;
     let budget = budget_source("open", opts.budget)?;
-    // An absent `store` is *not* the in-memory one here: a child with no
-    // store goes where its parent already is, and a child that asked for
-    // "mem" asked for a different database and is refused.  Telling the two
-    // apart is why the question is asked as an Option.
+    // An absent `store` is *not* the default one here: a child with no store
+    // goes where its parent already is, and a child that asked for "mem"
+    // asked for a different database and is refused.  Telling the two apart
+    // is why the question is asked as an Option.
     let named_store = opts
         .store
         .map(|spec| store_target("open", spec))
@@ -2129,9 +2168,14 @@ async fn open_session(
                 ));
             }
         };
-        let session = match named_store.unwrap_or(StoreTarget::Mem) {
-            StoreTarget::Mem => Session::new(owner, grant, &drivers).await?,
-            StoreTarget::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
+        // No store named: the host's database, which is where a real session
+        // belongs.  `"mem"` is the other answer and it has to be asked for.
+        let session = match named_store {
+            None => open_sqlite(owner, grant, &default_store, &drivers).await?,
+            Some(StoreTarget::Mem) => Session::new(owner, grant, &drivers).await?,
+            Some(StoreTarget::Sqlite(path)) => {
+                open_sqlite(owner, grant, std::path::Path::new(&path), &drivers).await?
+            }
         };
         return lua.create_userdata(session);
     };
@@ -2152,9 +2196,12 @@ async fn open_session(
 /// Resume a persisted session — the body of `knl.resume`.
 ///
 /// Requires `opts.session = "<stream id>"`.  `opts.store` says where the
-/// stream lives — `{ sqlite = "<path>" }` for a durable one — and means what
-/// it means on open when it is left out: the in-memory database, which is
-/// reopenable for exactly as long as some handle is still holding it.
+/// stream lives and means what it means on open when it is left out: the file
+/// the host owns, which is where a session opened without a store went.  So
+/// the round trip needs one argument — `knl.resume{ session = id }` reopens
+/// what `knl.open{}` wrote.  `"mem"` reopens an in-memory stream, for exactly
+/// as long as some handle is still holding it, and `{ sqlite = "<path>" }` a
+/// file the caller named.
 /// `opts.budget` is optional and means the owner grants
 /// *again*: it is recorded and added to the balance the log already
 /// carries, rather than replacing it.  The returned userdata is the same
@@ -2164,6 +2211,7 @@ async fn resume_session(
     lua: Lua,
     opts: LuaValue,
     drivers: knl::IsleDrivers,
+    default_store: std::path::PathBuf,
 ) -> LuaResult<LuaAnyUserData> {
     if matches!(opts, LuaValue::Nil) {
         return Err(err("resume", "opts must be a table with store and session"));
@@ -2172,13 +2220,16 @@ async fn resume_session(
     // survives into the awaits below.
     let opts: types::ResumeOpts = from_lua("resume", "opts", opts)?;
     let grant = grant_only("resume", opts.budget)?;
-    let store = match opts.store {
-        None => StoreTarget::Mem,
-        Some(spec) => store_target("resume", spec)?,
-    };
+    let store = opts
+        .store
+        .map(|spec| store_target("resume", spec))
+        .transpose()?;
     let session_id = opts.session;
     let store = match store {
-        StoreTarget::Sqlite(path) => {
+        // The host's database, as on open: a session that named no store
+        // went there, so a resume that names none looks there.
+        None => knl::SqliteEventStore::open(&default_store, session_id.clone(), &drivers).await,
+        Some(StoreTarget::Sqlite(path)) => {
             knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone(), &drivers)
                 .await
         }
@@ -2187,7 +2238,9 @@ async fn resume_session(
         // live one finds the same log.  It cannot outlive the process, and it
         // does not pretend to — a name nobody is holding open resumes as an
         // empty stream, which is refused for having no session in it.
-        StoreTarget::Mem => knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await,
+        Some(StoreTarget::Mem) => {
+            knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await
+        }
     }
     .map_err(|e| knl_err("resume", &e))?;
     let state = resume_on(grant, store, session_id).await?;
@@ -2379,8 +2432,9 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
     as_table(lua, "api", &report)
 }
 
-/// Register the `knl` global.  No [`crate::host::HostContext`] is needed —
-/// this layer keeps all state inside the session userdata.
+/// Register the `knl` global.  Two things come from the host and nothing else
+/// does: the connection threads, and the file a session with no `store` of its
+/// own lands in.  All session state stays inside the userdata.
 ///
 /// The functions are exactly [`MODULE_API`]: `knl.open(opts?)` is the
 /// constructor (owner- and store-aware), `knl.resume(opts)` reopens a
@@ -2396,32 +2450,47 @@ fn api(lua: &Lua, _: ()) -> LuaResult<LuaTable> {
 /// stopped could not take it.  The host owns them for the length of a run and
 /// drains them once at the end of it ([`knl::IsleDrivers`]).
 ///
+/// `default_store` is that file — `{base_dir}/projects/<slug>/knl.sqlite`
+/// unless `AGENT_BLOCK_KNL_PATH` says otherwise
+/// ([`crate::bridge::config::knl_path`]).  It is a path rather than an open
+/// store because a session opens its own stream: one file, one stream per
+/// `knl.open{}`, which is what lets a tree opened from a default parent live
+/// in one database.  Where it goes is the host's answer, so it is decided
+/// there and carried here.
+///
 /// `open` and `resume` are async because opening a stream waits — for the
 /// connection thread to start, for the schema, for the opening events to land
 /// — and this is called on the Lua VM's own thread, which must not wait for
 /// anything.  Both are reachable only from inside a coroutine, which the main
 /// chunk and every bus handler already are.
-pub fn register(lua: &Lua, drivers: knl::IsleDrivers) -> LuaResult<()> {
+pub fn register(
+    lua: &Lua,
+    drivers: knl::IsleDrivers,
+    default_store: std::path::PathBuf,
+) -> LuaResult<()> {
     let knl_tbl = lua.create_table()?;
 
     // knl.open(opts?) -> Session userdata
     {
         let drivers = drivers.clone();
+        let default_store = default_store.clone();
         knl_tbl.set(
             "open",
             lua.create_async_function(move |lua, opts: LuaValue| {
                 let drivers = drivers.clone();
-                open_session(lua, opts, drivers)
+                let default_store = default_store.clone();
+                open_session(lua, opts, drivers, default_store)
             })?,
         )?;
     }
 
-    // knl.resume(opts) -> Session userdata (durable stream re-folded)
+    // knl.resume(opts) -> Session userdata (a recorded stream re-folded)
     knl_tbl.set(
         "resume",
         lua.create_async_function(move |lua, opts: LuaValue| {
             let drivers = drivers.clone();
-            resume_session(lua, opts, drivers)
+            let default_store = default_store.clone();
+            resume_session(lua, opts, drivers, default_store)
         })?,
     )?;
 
@@ -2772,7 +2841,9 @@ mod generated_types {
     #[test]
     fn the_api_publishes_the_module_it_generated() {
         let lua = Lua::new();
-        register(&lua, knl::IsleDrivers::new()).expect("register knl");
+        let dir = tempfile::tempdir().expect("tempdir");
+        register(&lua, knl::IsleDrivers::new(), dir.path().join("knl.sqlite"))
+            .expect("register knl");
         let published: String = lua
             .load(r#"return knl.api().types"#)
             .eval()
@@ -2820,6 +2891,13 @@ mod tests {
         /// the test's lifetime exactly as the host holds them for a run's.
         drivers: knl::IsleDrivers,
         rt: tokio::runtime::Runtime,
+        /// The default store's directory, held so it outlives the VM.
+        ///
+        /// A session opened without a `store` goes into the file the host
+        /// owns; here that is one temp file per VM, which is what keeps a
+        /// test's sessions out of the developer's own database and out of
+        /// every other test's.
+        dir: tempfile::TempDir,
     }
 
     impl Vm {
@@ -2827,14 +2905,25 @@ mod tests {
         fn new() -> Self {
             let lua = Lua::new();
             let drivers = knl::IsleDrivers::new();
-            register(&lua, drivers.clone()).expect("register knl");
+            let dir = tempfile::tempdir().expect("tempdir");
+            register(&lua, drivers.clone(), dir.path().join("knl.sqlite")).expect("register knl");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("a runtime for the VM to yield into");
             rt.block_on(async { lua.load(FIXTURES).exec_async().await })
                 .expect("fixtures");
-            Self { lua, drivers, rt }
+            Self {
+                lua,
+                drivers,
+                rt,
+                dir,
+            }
+        }
+
+        /// The file a session with no `store` of its own lands in.
+        fn default_store(&self) -> std::path::PathBuf {
+            self.dir.path().join("knl.sqlite")
         }
 
         /// Run `chunk` to completion, as a coroutine.
@@ -2869,13 +2958,28 @@ mod tests {
         /// shutting the drivers down is what waits for those writes to land.
         /// A test that reads the database afterwards calls this first.
         fn finish(self) {
-            let Self { lua, drivers, rt } = self;
+            drop(self.finish_keeping_the_store());
+        }
+
+        /// [`Vm::finish`], handing the default store's directory back.
+        ///
+        /// For the test that reads the default database itself: the temp dir
+        /// is deleted when it drops, so a caller that wants to open the file
+        /// afterwards has to hold it.
+        fn finish_keeping_the_store(self) -> tempfile::TempDir {
+            let Self {
+                lua,
+                drivers,
+                rt,
+                dir,
+            } = self;
             drop(lua);
             let failures = rt.block_on(drivers.shutdown());
             assert!(
                 failures.is_empty(),
                 "the connection threads did not shut down cleanly: {failures:?}"
             );
+            dir
         }
     }
 
@@ -3723,15 +3827,16 @@ mod tests {
         .expect("view copy chunk");
     }
 
-    /// `store = "mem"` is the in-memory default spelled out; an unknown
-    /// store string is a `knl: open:` error.
+    /// `store = "mem"` is the in-memory database asked for by name — it opens
+    /// like any other session; an unknown store string is a `knl: open:`
+    /// error.
     #[test]
-    fn store_mem_is_the_default_and_unknown_stores_are_rejected() {
+    fn store_mem_is_asked_for_by_name_and_unknown_stores_are_rejected() {
         let vm = vm();
         vm.exec(
             r#"
             local s = knl.open({ store = "mem", owner = "x", budget = { amount = 10, tag = "beats" } })
-            assert(s:len() == 2, "mem store opens like the default: session_opened + the grant")
+            assert(s:len() == 2, "a mem session opens like any other: session_opened + the grant")
             assert(s:owner() == "x")
             assert(s:append({ kind = "note" }) == 3)
         "#,
@@ -4044,12 +4149,17 @@ mod tests {
     /// alive, by the id it reports, and the resumed handle reads the same log
     /// and continues the same ledger.  What it cannot do is outlive the
     /// process, and nothing here pretends otherwise.
+    ///
+    /// The store is named on both calls, and that is the point of the last
+    /// paragraph: an absent one is the host's database, so a `mem` stream is
+    /// only reachable by asking for `mem`.
     #[test]
     fn an_in_memory_stream_is_resumable_while_it_is_open() {
         let vm = vm();
         vm.exec(
             r#"
-            local s = knl.open({ owner = "mem-user", budget = { amount = 100, tag = "beats" } })
+            local s = knl.open({ store = "mem", owner = "mem-user",
+                                 budget = { amount = 100, tag = "beats" } })
             local id = s:id()
             s:reserve(30)
             s:append({ kind = "note", data = { text = "in memory" } })
@@ -4061,17 +4171,136 @@ mod tests {
             assert(r:remaining() == 70, "resumed remaining: " .. tostring(r:remaining()))
             assert(r:len() == 4, "session_opened + granted + reserved + note")
 
-            -- An absent store means the same thing on resume as it does on
-            -- open: the in-memory database.
-            local r2 = knl.resume({ session = id })
-            assert(r2:remaining() == 70, "resumed again: " .. tostring(r2:remaining()))
-
             -- And the resumed handle writes into the same log.
             r:spend(20)
             assert(s:remaining() == 50, "the writer sees it: " .. tostring(s:remaining()))
+
+            -- An absent store means the same thing on resume as it does on
+            -- open — the host's database — so it does not find this stream:
+            -- nothing about a `mem` session is in that file.
+            local missed = failure(knl.resume, { session = id })
+            assert(missed.kind == "validation", missed.kind)
+            assert(missed.message:find("no session to resume", 1, true), missed.message)
         "#,
         )
         .expect("in-memory resume chunk");
+    }
+
+    // -- the default store: the file the host owns -------------------------
+
+    /// A session opened without a `store` lands in the host's database, and
+    /// two of them are two streams in that one file.
+    ///
+    /// The file is what a project's sessions share — which is what a tree
+    /// opened from a default parent needs — so both halves are asserted: the
+    /// path the host handed to [`register`] is the one that exists, and the
+    /// two sessions are told apart inside it by their stream ids.
+    #[test]
+    fn a_session_with_no_store_lands_in_the_hosts_database() {
+        let vm = vm();
+        let store = vm.default_store();
+        assert!(
+            !store.exists(),
+            "the file is SQLite's to create, on the first session that needs it"
+        );
+
+        let (first, second): (String, String) = vm
+            .eval(
+                r#"
+                local a = knl.open({ owner = "u" })
+                local b = knl.open({ owner = "u" })
+                a:append({ kind = "note", data = { text = "a" } })
+                b:append({ kind = "note", data = { text = "b" } })
+                a:close("done")
+                b:close("done")
+                return a:id(), b:id()
+            "#,
+            )
+            .expect("two default sessions");
+        assert_ne!(first, second, "two opens are two streams");
+
+        // Held, so the file is still there to be read.
+        let _dir = vm.finish_keeping_the_store();
+        assert!(
+            store.exists(),
+            "the default store was never created: {}",
+            store.display()
+        );
+        // One file, both logs: each stream is complete, and reading one does
+        // not turn up the other's events.
+        for stream in [&first, &second] {
+            let log = persisted(&store, stream);
+            let kinds: Vec<&str> = log
+                .iter()
+                .map(|e| e["kind"].as_str().expect("a kind"))
+                .collect();
+            assert_eq!(
+                kinds,
+                ["session_opened", "note", "session_closed"],
+                "stream {stream}"
+            );
+        }
+    }
+
+    /// A session opened without a `store` is resumed by its id alone: the
+    /// resume looks in the same file the open wrote to.
+    #[test]
+    fn a_default_session_resumes_by_id_alone() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local s = knl.open({ owner = "u", budget = { amount = 100, tag = "beats" } })
+            local id = s:id()
+            s:reserve(30)
+            s:append({ kind = "note", data = { text = "recorded" } })
+
+            local r = knl.resume({ session = id })
+            assert(r:id() == id, "resumed id: " .. tostring(r:id()))
+            assert(r:owner() == "u", "resumed owner: " .. tostring(r:owner()))
+            assert(r:remaining() == 70, "the ledger came back: " .. tostring(r:remaining()))
+            assert(r:len() == 4, "session_opened + granted + reserved + note")
+        "#,
+        )
+        .expect("resume by id alone");
+        vm.finish();
+    }
+
+    /// A tree needs a file store, so a parent on `"mem"` is refused — with a
+    /// message that says which store it is and what to open instead.
+    ///
+    /// The refusal is the whole answer: an in-memory database locks per table
+    /// under its shared cache, and the alternative to refusing would be
+    /// teaching the kernel to wait on that lock.
+    #[test]
+    fn a_child_of_a_mem_parent_is_refused() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local parent = knl.open({ store = "mem", owner = "u",
+                                      budget = { amount = 100, tag = "tokens" } })
+            local refused = failure(knl.open, {
+                owner = "w", parent = parent, budget = { from_parent = 10 },
+            })
+            assert(refused.kind == "validation", refused.kind)
+            assert(refused.message:find("a session tree needs a file store", 1, true),
+                   refused.message)
+            assert(refused.message:find("mem", 1, true), refused.message)
+
+            -- Nothing was opened and nothing moved.
+            assert(parent:remaining() == 100, tostring(parent:remaining()))
+
+            -- The same parent on the host's database takes a child.
+            local ok_parent = knl.open({ owner = "u", budget = { amount = 100, tag = "tokens" } })
+            local child = knl.open({ owner = "w", parent = ok_parent,
+                                     budget = { from_parent = 10 } })
+            assert(ok_parent:remaining() == 90, tostring(ok_parent:remaining()))
+            child:close("done")
+            ok_parent:close("done")
+            parent:close("done")
+        "#,
+        )
+        .expect("the refusal");
+        vm.finish();
     }
 
     // -- session lifecycle: `<close>` and the drop backstop ----------------

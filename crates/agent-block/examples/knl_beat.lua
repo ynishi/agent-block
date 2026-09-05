@@ -357,14 +357,16 @@ local function settle(session, beat_device, cap)
     return last
 end
 
--- A file store, and not for durability: siblings write to their parent's
--- database at the same time, and the in-memory one is addressed by a
--- shared-cache URI whose locks are per table — a second writer meets
--- SQLITE_LOCKED at once, which no busy timeout waits out, and a child's beat
--- comes back `err("state")` with `detail.kind == "busy"`. A file database has
--- no shared cache and the kernel's busy timeout covers the same contention.
--- `supervisor.parallel`'s own doc says the same; nothing retries it here,
--- because asking again is the loop's decision (`policy.retry`).
+-- The default store is a file — the database the host owns — and a tree on a
+-- `mem` store is refused: siblings write to their parent's database at the
+-- same time, and the in-memory one is addressed by a shared-cache URI whose
+-- locks are per table, which no busy timeout waits out. So a session tree does
+-- not need a `store` at all. This one names its own file anyway, for the same
+-- reason the run cleans it up below: an example should leave nothing behind in
+-- the project's kernel database. Contention on a file is waited out by the
+-- kernel's busy timeout, and nothing retries it here, because asking again is
+-- the loop's decision (`policy.retry` — `supervisor.parallel`'s own doc says
+-- the same).
 local shared_db = os.tmpname()
 
 kernel.session({

@@ -1191,9 +1191,8 @@ M.shapes.api = {
 -- `only`'s, in both modes (`opts_contract`). A gate that answered it would
 -- make the module say two different things about one typo depending on an
 -- environment variable, which is a divergence between test harnesses waiting
--- to happen [実測: it was one, 2026-09-05 — `just test-lua` sets
--- LSHAPE_CHECK=1 and three refusal cases that passed under a bare runner
--- failed under it].
+-- to happen (and it was one: the spec runner sets LSHAPE_CHECK=1, and three
+-- refusal cases that passed under a bare runner failed under it).
 
 local function arg_checked(name, fn, declared)
     return function(...)

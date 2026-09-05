@@ -496,16 +496,19 @@ end
 ---
 --- ONE DATABASE, AND WHAT SIMULTANEOUS WRITERS MEET THERE. Siblings are
 --- children of one parent, so they write to the parent's database, and the
---- store decides what that costs. On a FILE database, two writers contend and
---- the kernel's busy timeout waits it out. On the IN-MEMORY database the
---- kernel addresses by a shared-cache URI, shared cache locks per TABLE and a
---- second writer gets SQLITE_LOCKED immediately — which the busy timeout does
---- not cover — so a sibling's beat can come back `Outcome.err("state")` with
---- `detail.kind == "busy"` [実測: 2026-09-05, crates/agent-block/tests/
---- fixtures/knl_beat_test.lua inv15: the same two children fail
---- nondeterministically on the in-memory store and pass on a file one].
+--- store decides what that costs. The default store is a FILE — the one the
+--- host owns — where two writers contend and the kernel's busy timeout waits
+--- it out. A tree on a `mem` parent is refused rather than run: the in-memory
+--- database is addressed by a shared-cache URI, shared cache locks per TABLE
+--- and a second writer gets SQLITE_LOCKED immediately, which no busy timeout
+--- covers. The beat fixture's parallel case showed it: the same two children
+--- failed nondeterministically with `Outcome.err("state")` /
+--- `detail.kind == "busy"` on the in-memory store and passed on a file one,
+--- which is why `knl.open{ parent = <mem session> }` raises `validation`
+--- instead.
 ---
---- Nothing here retries it. `busy` is the one class the kernel calls
+--- Contention on the file is still contention, and nothing here retries it.
+--- `busy` is the one class the kernel calls
 --- retryable, and asking again is the caller's loop's decision — how many
 --- times and for how long is what only the loop knows (`policy.retry`, and
 --- knl's header on the same point). A supervisor that quietly retried would be

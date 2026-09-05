@@ -181,6 +181,16 @@
 //! log that could not be queried would be a second, lesser kind of session.
 //! The `Vec`-backed store is `#[cfg(test)]`.
 //!
+//! **A real session is a file.**  A session a script opens is opened on the
+//! database the host owns — one file per project — and the in-memory database
+//! is for tests and mocks: one session, one process, nothing shared.  It is
+//! not a smaller version of the other one.  It is addressed by a shared-cache
+//! URI ([`is_memory_database`]) and shared cache locks per *table*, so a second
+//! writer meets `SQLITE_LOCKED` at once and no busy timeout waits that out —
+//! which is exactly what a session tree is (children write to their parent's
+//! database).  So the kernel does not offer a tree on one, and there is no
+//! lock-waiting machinery here to make it work.
+//!
 //! # Stored shape: envelope, meta, data
 //!
 //! An event is an envelope ([`FIELD_KIND`], an optional `beat`, the kernel's
@@ -350,7 +360,9 @@ pub use session::{
     Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
     DEFAULT_CLOSE_REASON, SYSTEM,
 };
-pub use sqlite_store::{events_schema, IsleDrivers, SchemaColumn, SqliteEventStore, EVENTS_TABLE};
+pub use sqlite_store::{
+    events_schema, is_memory_database, IsleDrivers, SchemaColumn, SqliteEventStore, EVENTS_TABLE,
+};
 
 /// What went wrong in the kernel core, classified.
 ///

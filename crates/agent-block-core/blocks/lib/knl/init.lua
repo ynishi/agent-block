@@ -23,6 +23,21 @@
 ---   Per-beat policy variation is not an override argument: derive another
 ---   device with `d:with{ llm = strong }` and beat with that one.
 ---
+--- Where the log lives
+---   `store` is optional and leaving it out is the answer for a real session:
+---   the log goes into the database the host owns, one file per project. Every
+---   session a script opens is a stream in that one file, so a tree opened from
+---   a default parent is a tree in one database, and `knl.resume{ session = id }`
+---   reopens it by id alone.
+---
+---   `store = "mem"` is the other choice and has to be asked for by name: an
+---   in-memory database, for TESTS AND MOCKS — one session, one process,
+---   nothing shared. It is not a lighter version of the default. Two writers
+---   meet a per-table lock there that no busy timeout waits out, so opening a
+---   child of a `mem` parent is refused rather than made to wait (the kernel's
+---   own header says the same, and `supervisor` says it again for siblings).
+---   `store = { sqlite = <path> }` is a file the caller picked.
+---
 --- Lifecycle belongs to the session
 ---   The canonical bracket is the callback form — the kernel opens, runs the
 ---   body, and closes, so an error escaping the body still records the
@@ -947,10 +962,12 @@ local OPEN_OPTS = T.shape({
     parent = SESSION_HANDLE:is_optional(),
 })
 
---- `knl.resume` opts: the store and the session to reopen, plus the grant
---- this process runs under.
+--- `knl.resume` opts: the session to reopen, plus the grant this process runs
+--- under and, when the stream is not in the host's own database, the store it
+--- is in. Optional for the same reason it is on open: no store named is the
+--- file the host owns, which is where a session opened without one went.
 local RESUME_OPTS = T.shape({
-    store = T.any,
+    store = T.any:is_optional(),
     session = T.string,
     budget = BUDGET_GRANT:is_optional(),
 })
@@ -1802,6 +1819,10 @@ end
 --- raises `refused`; nothing is opened. Nothing comes back when the child
 --- closes, because an allocation is a spend.
 ---
+--- No `store` is the host's database (the header's "Where the log lives");
+--- a child needs none, because it goes where its parent already is — and a
+--- parent on `"mem"` is refused, since a tree needs a file store.
+---
 --- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, parent? }
 --- @return userdata session
 function M.open(opts)
@@ -1817,11 +1838,14 @@ function M.open(opts)
 end
 
 --- Resume a persisted session. The state comes back from the store (the
---- bridge reopens the durable stream and re-folds the log); policy does NOT
+--- bridge reopens the recorded stream and re-folds the log); policy does NOT
 --- — it is a non-serializable closure bundle, so every process builds its
 --- own device.
 ---
---- @param opts table  { store = { sqlite = <path> }, session = <id>, budget? }
+--- `store` means what it means on open, so a session opened without one is
+--- resumed by its id alone: `knl.resume{ session = id }`.
+---
+--- @param opts table  { session = <id>, store? = "mem" | { sqlite = <path> }, budget? }
 --- @return userdata session  pre-loaded with the log
 function M.resume(opts)
     opts = opts or {}
@@ -1908,8 +1932,8 @@ function M.session(opts, fn)
                 body = tostring(returned[2]),
                 close = read_error(cerr),
             }
-            -- The host's `log.warn` takes a string [実測: bridge/log.rs:37,
-            -- `msg: String`], so the structured form is offered first and
+            -- The host's `log.warn` takes a string (see the log bridge's
+            -- `msg: String`), so the structured form is offered first and
             -- the text is the fallback. Both are pcall'd: a warning about a
             -- failure must not become one.
             local warned = pcall(host_log.warn, warning)
