@@ -45,6 +45,10 @@
 --        results come back aligned by index, one sibling raising leaves the
 --        other's untouched, both edges close, and the parent's ledger carries
 --        both allocations
+--  inv16 `supervisor.merge` over a real database: a query answers the `data`
+--        column as JSON text (a syscall read decodes, a SELECT does not), and
+--        the merged request carries the child's decoded content — the string
+--        as a string, the blocks as tables — in the documented order
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately: the Lua kernel is the
@@ -1314,6 +1318,78 @@ do
     isolate:close("done")
 
     mark("inv15_supervisor_parallel")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv16 — supervisor.merge against a real database: the `data` column comes
+-- back as JSON TEXT from a query, and the fold has to decode it
+-- ---------------------------------------------------------------------------
+
+do
+    -- The pack's own spec covers the order, the set and the refusals, but it
+    -- drives a stand-in whose `query` hands back tables somebody built by
+    -- hand. What only a real store can show is the half that stand-in cannot:
+    -- `session:events()` decodes on the way out of the syscall and a QUERY
+    -- does not, so a `data` column arrives here as a string of JSON and a fold
+    -- that forgot to decode it would put `{"content":"find the files"}` on the
+    -- wire as the user's message — a request that is not obviously broken
+    -- until a model reads it.
+    local supervisor = require("supervisor")
+
+    local parent = kernel.open({ owner = "test", budget = { amount = 20, tag = "beats" } })
+    local child = kernel.open({ owner = "worker", parent = parent, budget = { from_parent = 5 } })
+
+    -- A couple of beats on the child, so its stream carries a real exchange
+    -- rather than two hand-written events.
+    local device = kernel.device({
+        llm = stub(
+            response("ok", { { type = "text", text = "two files" } }),
+            response("ok", { { type = "text", text = "one is empty" } })
+        ),
+    })
+    child:append({ kind = "msg_user", data = { content = "find the files" } })
+    assert(Outcome.is_ok(kernel.beat(child, device)), "the child's first beat")
+    child:append({ kind = "msg_user", data = { content = "anything odd?" } })
+    assert(Outcome.is_ok(kernel.beat(child, device)), "the child's second beat")
+    child:close("done")
+
+    parent:append({ kind = "msg_user", data = { content = "put it together" } })
+
+    -- The child, read with one SELECT and folded in front of the parent's own.
+    local request = supervisor.merge(parent, { child })(parent:events(), { system = "be terse" })
+
+    assert(request.system == "be terse", "the device's system rides along: " .. tostring(request.system))
+    assert(#request.messages == 5, "child ×4 then the parent's own, got " .. #request.messages)
+
+    -- (a) A string payload comes back as the string, not as the JSON object it
+    -- was stored inside.
+    local seed = request.messages[1]
+    assert(seed.role == "user", "role: " .. tostring(seed.role))
+    assert(seed.content == "find the files", "decoded seed: " .. tostring(seed.content))
+
+    -- (b) A block array comes back as an array of tables — the shape a
+    -- provider is handed — and not as text that merely contains the words.
+    local answer = request.messages[2]
+    assert(answer.role == "assistant", "role: " .. tostring(answer.role))
+    assert(type(answer.content) == "table", "content is JSON text: " .. tostring(answer.content))
+    assert(#answer.content == 1, "blocks: " .. tostring(#answer.content))
+    assert(answer.content[1].type == "text", "block type: " .. tostring(answer.content[1].type))
+    assert(answer.content[1].text == "two files", "block text: " .. tostring(answer.content[1].text))
+
+    -- (c) The second exchange is there too, in seq order, and the parent's own
+    -- seed is last — the documented order, read off a real log.
+    assert(request.messages[3].content == "anything odd?", tostring(request.messages[3].content))
+    assert(request.messages[4].content[1].text == "one is empty", "second answer")
+    assert(request.messages[5].content == "put it together", tostring(request.messages[5].content))
+
+    -- (d) Reading is all it did: nothing was appended to either stream by the
+    -- fold, and the parent's log still ends at its own seed.
+    local last = parent:events()[#parent:events()]
+    assert(last.kind == "msg_user", "the fold wrote to the parent: " .. tostring(last.kind))
+
+    parent:close("done")
+
+    mark("inv16_supervisor_merge")
 end
 
 print("[KNL] all_ok")

@@ -98,6 +98,26 @@ describe("policy.stagnation — construction", function()
     end)
 end)
 
+describe("policy.stagnation — a read that was cut short", function()
+    it("refuses rather than judging a run over beats it has moved past", function()
+        -- The verdict is about the LAST `same` / `no_progress` beats and the
+        -- cap counts forward, so a truncated read hands this predicate the
+        -- oldest beats instead. Here that is the difference between "repeated"
+        -- and the truth, and neither answer would look wrong from outside.
+        local session = run(repeating_tool(), 3)
+        local stalled = policy.stagnation({ same = 3 })
+        expect(stalled(session)).to.be("repeated")
+
+        support.truncate(session)
+        local ok, err = pcall(stalled, session)
+        expect(ok).to.be(false)
+        err = tostring(err)
+        expect(err:find("policy.stagnation", 1, true) ~= nil).to.be(true)
+        expect(err:find("longer than one read", 1, true) ~= nil).to.be(true)
+        expect(err:find("events", 1, true) ~= nil).to.be(true)
+    end)
+end)
+
 describe("policy.stagnation — repeated", function()
     it("fires when the last `same` beats make one call", function()
         local session = run(repeating_tool(), 3)

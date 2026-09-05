@@ -1172,7 +1172,8 @@ impl Session {
         Ok(committed.seq)
     }
 
-    /// Events with `seq >= from`, cloned, at the current shape.
+    /// Events with `seq >= from`, at most `limit`, cloned, at the current
+    /// shape.
     ///
     /// They come back as [`Current`]s: the read went through the upcaster
     /// seam, and the type says so, so a caller folding them cannot be folding
@@ -1180,11 +1181,21 @@ impl Session {
     /// underlying object — the Lua bridge, building tables — takes it with
     /// [`Current::into_inner`].
     ///
+    /// **The caller says how much it will take.**  A stream grows without
+    /// bound, and every event of it read here is decoded, upcasted, cloned and
+    /// (across the bridge) turned into a Lua table — so an unbounded read is
+    /// an unbounded allocation on the VM's own thread.  `limit` is the
+    /// caller's answer to that; the shell reads a page at a time and pages
+    /// with `from` ([`super::query::DEFAULT_LIMIT`] is what the bridge asks
+    /// for).  `usize::MAX` is still spelled out where a caller really does
+    /// want the whole stream — a restore fold, a test — and says so at the
+    /// call.
+    ///
     /// Fallible: a durable backend can hit a transient busy read or a row it
     /// cannot decode, which surfaces here rather than being dropped silently.
     /// The in-memory backend is always `Ok`.
-    pub async fn events(&self, from: u64) -> KnlResult<Vec<Current>> {
-        self.store.read(from, usize::MAX).await
+    pub async fn events(&self, from: u64, limit: usize) -> KnlResult<Vec<Current>> {
+        self.store.read(from, limit).await
     }
 
     /// Number of recorded events.  Fallible like [`Session::events`].
@@ -1548,7 +1559,13 @@ impl Session {
         match name {
             VIEW_TAIL => {
                 let n = tail_count(opts)?;
-                let events = self.store.read(0, usize::MAX).await?;
+                // Asked for from the end, not sliced off the front: the store
+                // reads `n` rows ([`super::event_store::EventStore::read_last`])
+                // rather than handing over the whole stream for the projection
+                // to throw most of away.  `tail_of` still renders the value,
+                // and on a slice that is already at most `n` long it is the
+                // identity — the cut is in the read now.
+                let events = self.store.read_last(n).await?;
                 Ok(projection::tail_of(&events, n))
             }
             other => Err(KnlError::Validation(format!("unknown view {other:?}"))),
@@ -1630,7 +1647,7 @@ mod tests {
 
     /// The balance the log implies, for checking the counter against it.
     async fn folded(s: &Session) -> Option<i64> {
-        fold_balance(&s.events(0).await.expect("events"))
+        fold_balance(&s.events(0, usize::MAX).await.expect("events"))
     }
 
     /// A raw backend read, as the folds take it.
@@ -1664,7 +1681,7 @@ mod tests {
 
     /// The `budget_*` events of a session, in seq order.
     async fn ledger(s: &Session) -> Vec<Current> {
-        s.events(0)
+        s.events(0, usize::MAX)
             .await
             .expect("events")
             .into_iter()
@@ -1696,7 +1713,7 @@ mod tests {
     async fn a_new_session_already_carries_session_opened() {
         let s = new_session(None).await;
         assert_eq!(s.len().await.expect("len"), 1);
-        let events = s.events(0).await.expect("events");
+        let events = s.events(0, usize::MAX).await.expect("events");
         assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(events[0].seq(), 1);
         assert!(!s.is_closed());
@@ -1736,7 +1753,7 @@ mod tests {
         assert_eq!(s.reserve(10_000).await, Ok(false));
 
         let scope_id = s.scope_id().to_string();
-        let events = s.events(0).await.expect("events");
+        let events = s.events(0, usize::MAX).await.expect("events");
 
         let opened = &events[0];
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
@@ -1775,7 +1792,12 @@ mod tests {
         s.append(obj(json!({ "kind": "note" })))
             .await
             .expect("append");
-        let note = s.events(0).await.expect("events").pop().expect("note");
+        let note = s
+            .events(0, usize::MAX)
+            .await
+            .expect("events")
+            .pop()
+            .expect("note");
         assert_eq!(data_field(&note, FIELD_SCOPE_ID), None, "{note}");
         assert_eq!(note[FIELD_DATA], json!({}), "and no data of its own");
     }
@@ -1807,7 +1829,7 @@ mod tests {
         assert_eq!(s.len().await.expect("len"), 2, "close must be idempotent");
 
         let last = s
-            .events(2)
+            .events(2, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -1822,7 +1844,7 @@ mod tests {
         let mut s = new_session(None).await;
         s.close(None).await.expect("close");
         let last = s
-            .events(2)
+            .events(2, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -1845,7 +1867,7 @@ mod tests {
         // connection runs one job at a time in the order it took them, so a
         // read submitted after the detached write is answered after it.
         let last = s
-            .events(0)
+            .events(0, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -1890,7 +1912,10 @@ mod tests {
             "the ledger is the balance"
         );
         assert!(!exhausted(&s).await);
-        assert_eq!(s.events(0).await.expect("events")[2].kind(), "note");
+        assert_eq!(
+            s.events(0, usize::MAX).await.expect("events")[2].kind(),
+            "note"
+        );
     }
 
     #[tokio::test]
@@ -1944,6 +1969,118 @@ mod tests {
         assert_eq!(err.reason(), r#"unknown view "nope""#);
     }
 
+    /// A store that records what each read was asked for and what it handed
+    /// back, so a test can say how much of a stream a view actually touched.
+    ///
+    /// Every read a session takes goes through one of these two methods, so
+    /// the counters are the whole of what the session asked the backend for.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemEventStore,
+        /// `(from_seq, limit)` of every range read, in order.
+        ranges: Arc<Mutex<Vec<(u64, usize)>>>,
+        /// `(n, rows handed back)` of every read from the end.
+        tails: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for CountingStore {
+        async fn append(&mut self, event: Map<String, Value>) -> KnlResult<crate::knl::Committed> {
+            self.inner.append(event).await
+        }
+
+        async fn append_if(
+            &mut self,
+            kinds: Option<&[&str]>,
+            decide: crate::knl::Decision,
+        ) -> KnlResult<Option<crate::knl::Committed>> {
+            self.inner.append_if(kinds, decide).await
+        }
+
+        async fn read_kinds(
+            &self,
+            kinds: Option<&[&str]>,
+            from_seq: u64,
+            limit: usize,
+        ) -> KnlResult<Vec<Value>> {
+            self.ranges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((from_seq, limit));
+            self.inner.read_kinds(kinds, from_seq, limit).await
+        }
+
+        async fn read_last(&self, n: usize) -> KnlResult<Vec<Value>> {
+            let events = self.inner.read_last(n).await?;
+            self.tails
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((n, events.len()));
+            Ok(events)
+        }
+
+        async fn head(&self) -> KnlResult<Option<u64>> {
+            self.inner.head().await
+        }
+
+        async fn len(&self) -> KnlResult<usize> {
+            self.inner.len().await
+        }
+    }
+
+    /// `tail` asks the store for the end of the stream, not for the stream.
+    ///
+    /// The regression this pins: the view used to read every event, upcast
+    /// every one of them and then keep the last `n`, so a five-event answer
+    /// off a long log cost the whole log.  A thousand events in, a `tail(5)`
+    /// must reach the backend as "the last five" and come back as five —
+    /// and no range read may go out behind it asking for everything.
+    #[tokio::test]
+    async fn tail_reads_the_end_of_the_stream_and_not_the_whole_of_it() {
+        let store = CountingStore::default();
+        let (ranges, tails) = (Arc::clone(&store.ranges), Arc::clone(&store.tails));
+        let mut s = Session::open_on(ANON.to_string(), None, Box::new(store))
+            .await
+            .expect("open");
+        for i in 0..1_000 {
+            s.append(obj(json!({ "kind": format!("e{i}") })))
+                .await
+                .expect("append");
+        }
+
+        // The opening plus the thousand: what a whole read would cost.
+        assert_eq!(s.len().await.expect("len"), 1_001);
+        ranges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        tails.lock().unwrap_or_else(PoisonError::into_inner).clear();
+
+        let tail = s
+            .view(VIEW_TAIL, Some(&obj(json!({ "n": 5 }))))
+            .await
+            .expect("tail");
+        let tail = tail.as_array().expect("an array of events");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(kind_of(&tail[4]), "e999", "the last event is the last one");
+
+        // One read, from the end, for exactly the five that were asked for.
+        let taken = tails.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let scanned = ranges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            taken,
+            vec![(5, 5)],
+            "tail must ask the store for five rows and get five"
+        );
+        assert!(
+            scanned.is_empty(),
+            "no range read goes out behind it: {scanned:?}"
+        );
+    }
+
     /// The token account is not a name the kernel answers to any more: it
     /// reads the `llm_response` payload, so it is a query view written over
     /// the published schema.  Asking the kernel for it is the same error as
@@ -1959,7 +2096,7 @@ mod tests {
 
         // What it needs is in the log, verbatim, for a reader to sum.
         let recorded = s
-            .events(2)
+            .events(2, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -1986,7 +2123,7 @@ mod tests {
             .expect_err("dialogue was served");
         assert_eq!(err.reason(), r#"unknown view "dialogue""#);
 
-        let events = s.events(0).await.expect("events");
+        let events = s.events(0, usize::MAX).await.expect("events");
         assert_eq!(events[1].kind(), "msg_user");
         assert_eq!(*field(&events[1], "content"), json!("hi"));
     }
@@ -2012,7 +2149,7 @@ mod tests {
             .expect("append");
 
         let recorded = s
-            .events(seq)
+            .events(seq, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -2058,7 +2195,7 @@ mod tests {
         .await
         .expect("open");
 
-        let events = s.events(0).await.expect("events");
+        let events = s.events(0, usize::MAX).await.expect("events");
         assert_eq!(events.len(), 2, "session_opened + budget_granted");
         assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
         assert_eq!(
@@ -2229,7 +2366,7 @@ mod tests {
             .await
             .expect("append");
         assert!(
-            !s.events(0)
+            !s.events(0, usize::MAX)
                 .await
                 .expect("events")
                 .iter()
@@ -2241,7 +2378,7 @@ mod tests {
         assert!(s.is_closed());
 
         let closed: Vec<Current> = s
-            .events(0)
+            .events(0, usize::MAX)
             .await
             .expect("events")
             .into_iter()
@@ -2271,7 +2408,7 @@ mod tests {
         assert!(!exhausted(&s).await);
 
         let recorded = s
-            .events(3)
+            .events(3, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -2296,7 +2433,7 @@ mod tests {
 
         let seq = s.append(response(1)).await.expect("an undeclared beat");
         let bare = s
-            .events(seq)
+            .events(seq, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -2324,7 +2461,7 @@ mod tests {
         ] {
             let seq = s.append(obj(event.clone())).await.expect("declared beat");
             let recorded = s
-                .events(seq)
+                .events(seq, usize::MAX)
                 .await
                 .expect("events")
                 .pop()
@@ -2367,7 +2504,7 @@ mod tests {
 
         /// How many model responses the log holds.
         async fn responses(s: &Session) -> usize {
-            s.events(0)
+            s.events(0, usize::MAX)
                 .await
                 .expect("events")
                 .iter()
@@ -2440,7 +2577,7 @@ mod tests {
 
         assert_eq!(s.len().await.expect("len"), 3);
         assert_eq!(
-            s.events(0).await.expect("events")[2].kind(),
+            s.events(0, usize::MAX).await.expect("events")[2].kind(),
             KIND_SESSION_CLOSED
         );
     }
@@ -2459,7 +2596,7 @@ mod tests {
             .await
             .expect("open");
 
-        let events = s.events(0).await.expect("events");
+        let events = s.events(0, usize::MAX).await.expect("events");
         let opened = events.first().expect("session_opened");
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(
@@ -2547,7 +2684,7 @@ mod tests {
         // the Lua query view, over the published schema — has both calls to
         // work from.
         let responses: Vec<Current> = resumed
-            .events(0)
+            .events(0, usize::MAX)
             .await
             .expect("events")
             .into_iter()
@@ -2562,7 +2699,7 @@ mod tests {
         assert_eq!(resumed.reserve(5).await, Ok(true));
         let seq = resumed.append(response(5)).await.expect("third response");
         let recorded = resumed
-            .events(seq)
+            .events(seq, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -2920,7 +3057,11 @@ mod tests {
             .expect("the owner grants");
 
         // The fallback is visible from both sides: the log says nothing…
-        let opened = resumed.events(0).await.expect("events").remove(0);
+        let opened = resumed
+            .events(0, usize::MAX)
+            .await
+            .expect("events")
+            .remove(0);
         assert_eq!(opened.kind(), KIND_SESSION_OPENED);
         assert_eq!(data_field(&opened, FIELD_SCOPE_ID), None, "{opened}");
         assert_eq!(data_field(&opened, FIELD_OWNER), None, "{opened}");
@@ -3092,7 +3233,7 @@ mod tests {
         assert_eq!(seq, 4, "the seq is where the event really landed");
         assert_eq!(s.len().await.expect("len"), 4, "both writes are in the log");
 
-        let log = s.events(0).await.expect("events");
+        let log = s.events(0, usize::MAX).await.expect("events");
         assert_eq!(
             kinds(&log),
             [
@@ -3797,7 +3938,7 @@ mod tests {
         );
 
         // …and so do `events`, the `tail` view and the balance fold.
-        let log = resumed.events(0).await.expect("events");
+        let log = resumed.events(0, usize::MAX).await.expect("events");
         assert_eq!(
             kinds(&log),
             [KIND_SESSION_OPENED, KIND_BUDGET_GRANTED, "llm_response"],
@@ -3923,7 +4064,7 @@ mod tests {
         assert_eq!(resumed.owner(), ANON);
         assert_eq!(remaining(&resumed).await, Some(70), "the ledger came back");
         assert_eq!(
-            kinds(&resumed.events(0).await.expect("events")),
+            kinds(&resumed.events(0, usize::MAX).await.expect("events")),
             vec![
                 KIND_SESSION_OPENED,
                 KIND_BUDGET_GRANTED,
@@ -4098,7 +4239,7 @@ mod tests {
         // the parent, and the scope the handle reports is the one the opening
         // recorded — the child is a resumed session over what was written for
         // it, not a value built beside the log.
-        let opened = child.events(0).await.expect("events");
+        let opened = child.events(0, usize::MAX).await.expect("events");
         assert_eq!(
             kinds(&opened),
             vec![KIND_SESSION_OPENED, KIND_BUDGET_GRANTED]
@@ -4163,7 +4304,7 @@ mod tests {
             .await
             .expect("the allocation");
 
-        let opened = child.events(0).await.expect("events");
+        let opened = child.events(0, usize::MAX).await.expect("events");
         assert_eq!(field(&opened[1], FIELD_TAG).as_str(), Some("turns"));
         let moves = ledger(&parent).await;
         assert_eq!(
@@ -4427,7 +4568,7 @@ mod tests {
 
         parent.close(Some("done")).await.expect("close");
         let boundary = parent
-            .events(0)
+            .events(0, usize::MAX)
             .await
             .expect("events")
             .pop()
@@ -4448,7 +4589,7 @@ mod tests {
         let mut s = new_session(None).await;
         s.close(Some("done")).await.expect("close");
         let boundary = s
-            .events(0)
+            .events(0, usize::MAX)
             .await
             .expect("events")
             .pop()

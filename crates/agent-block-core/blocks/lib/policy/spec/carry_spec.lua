@@ -131,6 +131,39 @@ describe("policy.carry — binding", function()
     end)
 end)
 
+describe("policy.carry — a read that was cut short", function()
+    it("refuses rather than building a note from a stale beat", function()
+        -- The kernel's read is bounded and the cap counts FORWARD, so a
+        -- truncated read is the front of the log: the beat `failure_note`
+        -- would call "the last one" is a beat the run left behind. A note
+        -- built from it would tell the model that a failure it has already
+        -- recovered from just happened.
+        local session = support.session()
+        support.seed(session, "q")
+        session:append({
+            kind = "llm_call_failed",
+            beat = "b1",
+            data = { error = "an old failure", kind = "transport", retryable = true },
+        })
+        local filter = policy.carry({ max_bytes = 256 })(session)
+
+        -- Whole: the note is built, which is what makes the refusal below a
+        -- refusal and not an empty log answering nothing.
+        local whole = filter({ messages = {} })
+        expect(head(whole):find("an old failure", 1, true) ~= nil).to.be(true)
+
+        support.truncate(session)
+        local ok, err = pcall(filter, { messages = {} })
+        expect(ok).to.be(false)
+        err = tostring(err)
+        expect(err:find("policy.carry", 1, true) ~= nil).to.be(true)
+        expect(err:find("longer than one read", 1, true) ~= nil).to.be(true)
+        -- The cap is named by the count that came back, so a reader knows how
+        -- much was seen rather than only that something was missed.
+        expect(err:find("2 events", 1, true) ~= nil).to.be(true)
+    end)
+end)
+
 describe("policy.carry — what is carried", function()
     it("carries a tool that failed, naming the tool", function()
         local session = support.session()

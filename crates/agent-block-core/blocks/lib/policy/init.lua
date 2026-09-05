@@ -107,6 +107,26 @@
 ---   which turns a raising filter into `Outcome.err("filter")`. Swallowing it
 ---   would hide a dead store behind a policy that quietly does nothing.
 ---
+---   A read that was CUT SHORT is refused the same way (`whole_log`). The
+---   kernel's read is bounded and answers `rows, truncated`, and the cap counts
+---   forward — so a truncated read is the FRONT of the log and both of these
+---   policies are asking about its end. Folding one would let `carry` build a
+---   note from a beat that is not the last, and `stagnation` judge repetition
+---   over beats the run has already left behind: wrong answers that look right.
+---
+---   A BOUNDED TAIL READ WOULD NOT FIX IT, which is why neither policy takes
+---   one. `session:view("tail", n)` bounds EVENTS and both of these reason in
+---   BEATS, and a beat writes as many events as the model asked for tool calls:
+---   no `n` is a beat count, and a window can begin in the middle of a beat.
+---   `beats_of` cannot tell that from a whole one, so `failure_note` would
+---   report "a tool call failed" for a pair whose `tool_call` half was outside
+---   the window, and `made_progress` would call a beat idle whose only
+---   `tool_call` was sliced off — the same hole, moved somewhere quieter. The
+---   query views are ruled out above for reasons of their own. A run long
+---   enough to hit the cap wants a window on the request (`policy.window`) or
+---   a fresh session, and that is a caller's decision, so the policy says so
+---   and stops.
+---
 --- Beats, as this module sees them
 ---   The kernel stamps a `beat` id on every event one beat writes and does
 ---   not number them (`knl`'s header). So a beat, here, is derived: the
@@ -256,6 +276,45 @@ local function only(opts, allowed, who)
             error(who .. ": unknown option '" .. tostring(k) .. "'" .. hint, 3)
         end
     end
+end
+
+--- The session's whole log, or a raise saying it does not fit in one read.
+---
+--- `session:events()` is bounded and answers `rows, truncated` (knl's header).
+--- The cap counts FORWARD, so a truncated read is the front of the log with
+--- the newest beats missing — and both readers below are asking about the END
+--- of the run. `carry` would build its note from a beat that is not the last
+--- one, and `stagnation` would judge repetition and idleness over beats the
+--- run has already moved past: two confident wrong answers, and neither of
+--- them looks wrong.
+---
+--- So it refuses. There is no partial reading of "what just happened" that is
+--- worth having, and a policy that quietly answered from a stale window would
+--- be worse than one that stops — see the header for why a bounded tail read
+--- is not the way out either.
+---
+--- Raised at level 0: the message is the whole of it, and where it surfaces is
+--- the policy's caller (beat, for `carry`'s filter; the loop, for
+--- `stagnation`), exactly as a read that failed does.
+---
+--- @param session userdata|table  a knl session
+--- @param who string  the policy's name, for the message
+--- @return table  the events, in seq order
+local function whole_log(session, who)
+    local events, truncated = session:events()
+    if truncated then
+        error(
+            who
+                .. ": the session's log is longer than one read of it — the kernel's row cap "
+                .. "stopped at "
+                .. tostring(#events)
+                .. " events, so the newest beats are not in what came back and this policy would "
+                .. "be judging a run that has already moved on; window the request "
+                .. "(policy.window), or start a new session",
+            0
+        )
+    end
+    return events
 end
 
 --- The beats of an event list, in the order they first appear:
@@ -822,7 +881,7 @@ function M.carry(opts)
             error("policy.carry: bind takes a knl session (from knl.open / knl.resume)", 2)
         end
         return function(request)
-            local note = failure_note(session:events(), limit, failed)
+            local note = failure_note(whole_log(session, "policy.carry"), limit, failed)
             if note == nil then
                 return request
             end
@@ -1006,7 +1065,7 @@ function M.stagnation(opts)
     local signature = opts.signature or default_signature
 
     return function(session)
-        local order = beats_of(session:events())
+        local order = beats_of(whole_log(session, "policy.stagnation"))
         if is_repeated(order, same, signature) then
             return "repeated"
         end

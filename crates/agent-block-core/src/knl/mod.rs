@@ -412,6 +412,22 @@ pub enum KnlError {
     Validation(String),
     /// The request is well-formed but this backend cannot serve it — a query
     /// put to a store that keeps no queryable table.
+    ///
+    /// **Internal to the SPI: nothing a Lua caller does produces one today.**
+    /// Both sites that raise it are [`EventStore`] trait *defaults* — the
+    /// `query` a backend with no table cannot answer, and the two-stream
+    /// `append_if_many` a backend with one stream cannot write — and the only
+    /// backend the product has ([`SqliteEventStore`]) overrides both.  The two
+    /// shapes a caller might expect here answer differently on purpose: a
+    /// child asked for on a `mem` parent is a [`KnlError::Validation`] (the
+    /// argument was wrong, and the message says which), and an unknown view
+    /// name is one too.
+    ///
+    /// It stays in the vocabulary all the same, and is published to Lua with
+    /// the rest ([`KnlError::KINDS`]): a store *may* return it — the trait
+    /// says so — and a class a backend can produce but a caller was never told
+    /// about is a class nobody handles.  A test double that keeps one stream
+    /// reaches both defaults today.
     #[error("unsupported: {0}")]
     Unsupported(String),
     /// A read ran past the time it was given and was cut short.  Distinct

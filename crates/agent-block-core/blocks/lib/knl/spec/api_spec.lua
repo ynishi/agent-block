@@ -484,7 +484,7 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
             "OpenOpts",
             "ResumeOpts",
             "AppendEvent",
-            "EventRows",
+            "EventsResult",
             "QueryParams",
             "QueryOpts",
             "QueryResult",

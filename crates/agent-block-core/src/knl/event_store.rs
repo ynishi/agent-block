@@ -610,6 +610,29 @@ pub trait EventStore: Send + Sync {
         self.read_kinds(None, from_seq, limit).await
     }
 
+    /// The last `n` events of the stream, in `seq` order.
+    ///
+    /// A read *from the end*, which the range reads above cannot express: they
+    /// start at a `seq` and count forward, so "the last five" could only be
+    /// asked for by reading the whole stream and throwing the front of it
+    /// away.  That is what the `tail` view used to do
+    /// ([`super::Session::view`]), and on a long log it is the whole log —
+    /// read, decoded and upcasted — to hand back five rows.
+    ///
+    /// The order handed back is `seq` ascending, like every other read: the
+    /// reversal is the backend's business, not the caller's.
+    ///
+    /// The default is the honest answer for a backend with no reverse read:
+    /// it reads the stream and keeps the end.  Both backends override it —
+    /// [`MemEventStore`] slices its `Vec`, and [`super::SqliteEventStore`]
+    /// asks SQLite for `ORDER BY seq DESC LIMIT n` and reverses what comes
+    /// back — so nothing in the product takes this path.
+    async fn read_last(&self, n: usize) -> KnlResult<Vec<Value>> {
+        let mut events = self.read(0, usize::MAX).await?;
+        let start = events.len().saturating_sub(n);
+        Ok(events.split_off(start))
+    }
+
     /// The current head: the highest `seq`, or `None` for an empty stream.
     ///
     /// Fallible for the same reason as [`EventStore::read`]: a durable
@@ -789,6 +812,14 @@ impl EventStore for MemEventStore {
         }
         events.truncate(limit);
         Ok(events)
+    }
+
+    async fn read_last(&self, n: usize) -> KnlResult<Vec<Value>> {
+        // A `Vec` in this process: the end of it is a slice, so the reverse
+        // read the durable backend does in SQL is a `split_off` here.
+        let mut events = self.history.since(0);
+        let start = events.len().saturating_sub(n);
+        Ok(events.split_off(start))
     }
 
     async fn head(&self) -> KnlResult<Option<u64>> {
@@ -998,6 +1029,18 @@ impl CurrentStore {
     /// Every event from `from_seq` on, as the current shape.
     pub async fn read(&self, from_seq: u64, limit: usize) -> KnlResult<Vec<Current>> {
         self.read_kinds(None, from_seq, limit).await
+    }
+
+    /// The last `n` events, as the current shape
+    /// ([`EventStore::read_last`]).
+    ///
+    /// Through the same seam as every other read, so a `tail` taken off the
+    /// end of an old log reads as what it means today — and only `n` events
+    /// are put through the chain, which is the point of asking the backend
+    /// for the end rather than for everything.
+    pub async fn read_last(&self, n: usize) -> KnlResult<Vec<Current>> {
+        let events = self.inner.read_last(n).await?;
+        Self::project(&self.chain, events)
     }
 
     /// The backend's head ([`EventStore::head`]).
