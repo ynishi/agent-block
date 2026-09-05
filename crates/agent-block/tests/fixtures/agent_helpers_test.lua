@@ -6,16 +6,16 @@
 --
 -- These exercise the I/O-free branches exposed by agent._test_helpers():
 --   * map_finish_reason        — OpenAI finish_reason → Anthropic stop_reason mapping
---   * count_tool_use_blocks    — tool_use block counting (nil / empty / mixed)
---   * count_text_chars         — text char counting (nil text / non-text blocks)
---   * tool_loop._text_of       — text block concatenation (agent delegates here)
---   * normalize_dump_mode      — LLM dump mode normalization (case + alias + fallback)
---   * sanitize_headers_for_dump— secret header redaction (case-insensitive)
---   * kv_escape / format_kv    — structured kv-log escaping
---   * new_budget_tracker       — token budget accumulation / exceeded semantics
+--   * tool_use_blocks          — the tool_use blocks of a response (nil / empty / mixed)
+--   * text_of                  — text block concatenation (the run's answer string)
 --   * normalize_openai_response— OpenAI chat response → Anthropic-shape decode
 --   * convert_messages_to_openai — Anthropic-shape history → OpenAI-shape messages
 --   * resolve_mcp_group        — _meta.group precedence over server_name
+--
+-- Gone with the rewrite onto knl: the dump layer (normalize_dump_mode,
+-- sanitize_headers_for_dump, kv_escape, format_kv and the char/block counters
+-- that only fed its summary line) and new_budget_tracker, whose job is now the
+-- loop reading knl.views.usage.
 --
 -- NOTE: these helpers read the std/log globals that the agent-block runtime injects.
 -- The mlua test harness has neither, so we install minimal stubs (incl. a small but
@@ -236,60 +236,40 @@ describe("agent.map_finish_reason", function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- count_tool_use_blocks / count_text_chars / extract_text
+-- tool_use_blocks / text_of
 -- ─────────────────────────────────────────────────────────────────────────────
 
-describe("agent.count_tool_use_blocks", function()
-    local count = H.count_tool_use_blocks
+-- What the loop counts to decide whether the model asked for anything, and
+-- what `on_turn` is handed as `tool_calls`.
+describe("agent.tool_use_blocks", function()
+    local blocks = H.tool_use_blocks
 
-    it("returns 0 for nil content", function()
-        expect(count(nil)).to.equal(0)
+    it("returns none for nil content", function()
+        expect(#blocks(nil)).to.equal(0)
     end)
 
-    it("returns 0 for empty content", function()
-        expect(count({})).to.equal(0)
+    it("returns none for empty content", function()
+        expect(#blocks({})).to.equal(0)
     end)
 
-    it("counts only tool_use blocks in a mixed array", function()
+    it("keeps only tool_use blocks of a mixed array, in block order", function()
         local content = {
             { type = "text", text = "hi" },
             { type = "tool_use", id = "a", name = "x", input = {} },
             { type = "tool_use", id = "b", name = "y", input = {} },
             { type = "text", text = "bye" },
         }
-        expect(count(content)).to.equal(2)
+        local got = blocks(content)
+        expect(#got).to.equal(2)
+        expect(got[1].id).to.equal("a")
+        expect(got[2].id).to.equal("b")
     end)
 end)
 
-describe("agent.count_text_chars", function()
-    local count = H.count_text_chars
-
-    it("returns 0 for nil content", function()
-        expect(count(nil)).to.equal(0)
-    end)
-
-    it("sums lengths of text blocks only", function()
-        local content = {
-            { type = "text", text = "abc" }, -- 3
-            { type = "tool_use", id = "a", name = "x", input = {} }, -- ignored
-            { type = "text", text = "de" }, -- 2
-        }
-        expect(count(content)).to.equal(5)
-    end)
-
-    it("ignores text blocks missing the text field", function()
-        local content = {
-            { type = "text" }, -- no text → ignored
-            { type = "text", text = "xy" }, -- 2
-        }
-        expect(count(content)).to.equal(2)
-    end)
-end)
-
--- Text extraction moved to tool_loop when agent.run was migrated onto it; the
--- test follows the implementation rather than a re-export kept alive for it.
-describe("tool_loop.text_of", function()
-    local extract = require("tool_loop")._text_of
+-- Text extraction is the agent's own again: the kernel keeps blocks because
+-- the provider does, and a caller who wants one string gets it here.
+describe("agent.text_of", function()
+    local extract = H.text_of
 
     it("returns empty string for nil content", function()
         expect(extract(nil)).to.equal("")
@@ -306,152 +286,6 @@ describe("tool_loop.text_of", function()
 
     it("returns the single text block verbatim", function()
         expect(extract({ { type = "text", text = "only" } })).to.equal("only")
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- normalize_dump_mode
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("agent.normalize_dump_mode", function()
-    local norm = H.normalize_dump_mode
-
-    it("returns nil for nil / empty (unset → caller falls back)", function()
-        expect(norm(nil)).to.equal(nil)
-        expect(norm("")).to.equal(nil)
-    end)
-
-    it("maps 'off' and 'none' to 'off'", function()
-        expect(norm("off")).to.equal("off")
-        expect(norm("none")).to.equal("off")
-    end)
-
-    it("preserves 'meta' and 'full'", function()
-        expect(norm("meta")).to.equal("meta")
-        expect(norm("full")).to.equal("full")
-    end)
-
-    it("is case-insensitive", function()
-        expect(norm("FULL")).to.equal("full")
-        expect(norm("Meta")).to.equal("meta")
-    end)
-
-    it("falls back to 'off' for unrecognized values", function()
-        expect(norm("verbose")).to.equal("off")
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- sanitize_headers_for_dump
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("agent.sanitize_headers_for_dump", function()
-    local san = H.sanitize_headers_for_dump
-
-    it("returns empty table for nil headers", function()
-        local out = san(nil)
-        expect(type(out)).to.equal("table")
-        expect(next(out)).to.equal(nil)
-    end)
-
-    it("redacts x-api-key and authorization (case-insensitive)", function()
-        local out = san({ ["X-Api-Key"] = "secret1", ["Authorization"] = "Bearer secret2" })
-        expect(out["X-Api-Key"]).to.equal("***REDACTED***")
-        expect(out["Authorization"]).to.equal("***REDACTED***")
-    end)
-
-    it("passes non-secret headers through unchanged", function()
-        local out = san({ ["Content-Type"] = "application/json" })
-        expect(out["Content-Type"]).to.equal("application/json")
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- kv_escape / format_kv
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("agent.kv_escape", function()
-    local esc = H.kv_escape
-
-    it("renders nil as the literal 'nil'", function()
-        expect(esc(nil)).to.equal("nil")
-    end)
-
-    it("renders booleans and numbers via tostring", function()
-        expect(esc(true)).to.equal("true")
-        expect(esc(42)).to.equal("42")
-    end)
-
-    it("renders an empty string as quoted empty", function()
-        expect(esc("")).to.equal('""')
-    end)
-
-    it("passes a plain token through unquoted", function()
-        expect(esc("hello")).to.equal("hello")
-    end)
-
-    it("json-quotes a value containing whitespace", function()
-        expect(esc("a b")).to.equal('"a b"')
-    end)
-
-    it("json-quotes a value containing '='", function()
-        expect(esc("k=v")).to.equal('"k=v"')
-    end)
-end)
-
-describe("agent.format_kv", function()
-    local fmt = H.format_kv
-
-    it("joins pairs as space-separated key=value", function()
-        local out = fmt({ { "event", "start" }, { "n", 3 } })
-        expect(out).to.equal("event=start n=3")
-    end)
-
-    it("escapes values that need quoting", function()
-        local out = fmt({ { "msg", "hi there" } })
-        expect(out).to.equal('msg="hi there"')
-    end)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- new_budget_tracker
--- ─────────────────────────────────────────────────────────────────────────────
-
-describe("agent.new_budget_tracker", function()
-    local mk = H.new_budget_tracker
-
-    it("never exceeds when no limit is set", function()
-        local t = mk(nil)
-        t:add({ input_tokens = 1000000, output_tokens = 1000000 })
-        expect(t:exceeded()).to.equal(false)
-    end)
-
-    it("accumulates input and output tokens into total", function()
-        local t = mk(100)
-        t:add({ input_tokens = 10, output_tokens = 5 })
-        t:add({ input_tokens = 20, output_tokens = 0 })
-        local s = t:summary()
-        expect(s.input_tokens).to.equal(30)
-        expect(s.output_tokens).to.equal(5)
-        expect(s.total_tokens).to.equal(35)
-    end)
-
-    it("exceeds once total reaches the limit", function()
-        local t = mk(30)
-        t:add({ input_tokens = 20, output_tokens = 10 })
-        expect(t:exceeded()).to.equal(true)
-    end)
-
-    it("does not exceed just below the limit", function()
-        local t = mk(30)
-        t:add({ input_tokens = 20, output_tokens = 9 })
-        expect(t:exceeded()).to.equal(false)
-    end)
-
-    it("tolerates a nil usage argument", function()
-        local t = mk(10)
-        t:add(nil)
-        expect(t:summary().total_tokens).to.equal(0)
     end)
 end)
 

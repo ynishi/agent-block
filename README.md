@@ -180,8 +180,7 @@ ran and concluded "no" should return normally and say so in its JSON: the two
 are different events and only the block knows which happened.
 
 Because stdio transport owns stdout, this mode writes its logs to stderr, which
-is where MCP clients surface server logs — including the `ab.obs` lines when
-`AGENT_BLOCK_LLM_DUMP=meta` is set.
+is where MCP clients surface server logs — including the `ab.obs` lines.
 
 ## Sandbox mode (Linux)
 
@@ -633,14 +632,7 @@ Key behaviours:
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
 - The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
-- LLM dump logging is safe-by-default and ENV-driven:
-  - `AGENT_BLOCK_LLM_DUMP=off|meta|full` (default `off`)
-  - when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
-  - `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
-  - credential-bearing request *and* response headers (`x-api-key` / `authorization` / `set-cookie` / `cookie` / `proxy-authorization`) are always redacted in dump logs
-  - log lines use fixed-order `key=value` format with a unique marker (`prefix=ab.obs component=llm`); legacy `prefix=ab.llm` lines are also emitted for compatibility
-  - `meta` includes call correlation and runtime signals (`call`, `turn`, `iter`, `latency_ms`, `stop_reason`, `tool_uses`, token usage, context edit count)
-  - optional `agent.run({ log_meta = { trace_id, agent_id, agent_name, run_id } })` appends external context to dump lines (same keys can also come from `AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`)
+- `agent.run` emits no LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead. `AGENT_BLOCK_LLM_DUMP` and the ENV-driven dump it controls are `compile_loop`'s — see the compile_loop section below.
 
 ### compile_loop (Filesystem block — `require("compile_loop")`)
 
@@ -782,9 +774,17 @@ the loop gives up immediately, independent of the remaining iteration budget.
 `failure_reason = "stagnation"`.
 
 **Observability (ab.obs events)**: `compile_loop` emits structured `ab.obs` log events on
-each iteration, gated by `AGENT_BLOCK_LLM_DUMP` (same env var as the agent block). Set
-`AGENT_BLOCK_LLM_DUMP=meta` to activate. Each line uses the `key=value` format with
-`prefix=ab.obs component=compile_loop`.
+each iteration, gated by `AGENT_BLOCK_LLM_DUMP`. Set `AGENT_BLOCK_LLM_DUMP=meta` to
+activate. Each line uses the `key=value` format with `prefix=ab.obs component=compile_loop`.
+
+The dump is safe-by-default and ENV-driven:
+
+- `AGENT_BLOCK_LLM_DUMP=off|meta|full` (default `off`)
+- when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
+- `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
+- credential-bearing request *and* response headers (`x-api-key` / `authorization` / `set-cookie` / `cookie` / `proxy-authorization`) are always redacted in dump logs
+- `full` additionally dumps the request and response headers and bodies
+- the four correlation ids (`AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`) are appended to each line
 
 | event | when emitted | fields |
 |---|---|---|

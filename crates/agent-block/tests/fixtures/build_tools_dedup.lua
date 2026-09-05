@@ -1,35 +1,47 @@
--- build_tools_dedup.lua — verify that compile_loop.make() registers via tool.register
--- by default; extra_tools then dedups against tool.schema() first-wins, so no
--- duplicate tool names appear in _build_tools output.
+-- build_tools_dedup.lua — compile_loop.make() registers via tool.register by
+-- default, so passing the same tool_def through extra_tools names it twice.
+--
+-- That used to be a first-wins merge, which picked a winner silently. It is a
+-- loud error now: two sources claiming one name is a wiring bug, and
+-- `knl_adapter.tools` refuses rather than choosing. The case is the same one,
+-- flipped — what is asserted is the refusal, and that the registry alone still
+-- binds the tool exactly once.
 
 local agent = require("agent")
 local compile_loop = require("compile_loop")
 
--- Build a tool_def via compile_loop.make (default: registers via tool.register).
--- compile_loop.make() registers via `tool.register` by default; extra_tools then
--- dedups against `tool.schema()` first-wins, so dedup_test_tool will be present
--- exactly once in the final tools list.
 local td = compile_loop.make({
-	name = "dedup_test_tool",
-	runner = function()
-		return { ok = true, stdout = "", stderr = "" }
-	end,
+    name = "dedup_test_tool",
+    runner = function()
+        return { ok = true, stdout = "", stderr = "" }
+    end,
 })
 
--- Simulate the extra_tools path: td is passed once via extra_tools.
--- tool.schema() already contains dedup_test_tool (registered above),
--- so _build_tools step 1 picks it up and step 3 dedup drops the extra_tools copy.
-local tools = agent._build_tools({}, { td })
+local registry = agent._registry_candidates()
 
-assert(tools ~= nil and #tools >= 1, "tools must not be empty")
-
-local seen = {}
-for _, t in ipairs(tools) do
-	assert(seen[t.name] == nil, "duplicate tool: " .. t.name)
-	seen[t.name] = true
+local both = {}
+for _, c in ipairs(registry) do
+    both[#both + 1] = c
+end
+for _, c in ipairs(agent._extra_candidates({ td })) do
+    both[#both + 1] = c
 end
 
-assert(seen["dedup_test_tool"] == true, "dedup_test_tool must appear in tools")
+local ok, err = pcall(agent._build_tools, both, nil)
+assert(not ok, "a name claimed by both the registry and extra_tools must be refused, not merged")
+assert(
+    tostring(err):find("duplicate tool name 'dedup_test_tool'", 1, true) ~= nil,
+    "the refusal must name the tool, got: " .. tostring(err)
+)
+
+-- The registry on its own still binds it, exactly once.
+local tools = agent._build_tools(registry, nil)
+assert(tools["dedup_test_tool"] ~= nil, "dedup_test_tool must be bound from the registry")
+
+local count = 0
+for _ in pairs(tools) do
+    count = count + 1
+end
 
 print("dedup=ok")
-print("tool_count=" .. tostring(#tools))
+print("tool_count=" .. tostring(count))

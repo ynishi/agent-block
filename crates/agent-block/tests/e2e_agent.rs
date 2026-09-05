@@ -38,14 +38,24 @@ fn agent_run_basic() {
 }
 
 /// Requires ANTHROPIC_API_KEY — skipped in CI.
-/// Verifies structured `ab.llm` metadata lines are emitted.
+///
+/// Verifies the four correlation ids reach the structured log of a real
+/// `agent.run`. The `ab.llm` lines this used to read are gone with the dump
+/// layer: `agent` is a consumer of the kernel now, and a call is a durable
+/// record (`llm_request` / `llm_response`) rather than a line on stdout. What
+/// the run still emits per model call is the http bridge's own `ab.obs` pair,
+/// which carries the same four ids off the environment — so that is what is
+/// asserted, and `status=200` says the call the ids belong to actually
+/// happened.
 #[test]
 #[ignore]
 fn agent_run_emits_structured_meta_logs() {
     common::agent_block_cmd()
         .args(["-s", "examples/test_agent_log_meta.lua"])
         .env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-        .env("AGENT_BLOCK_LLM_DUMP", "meta")
+        // The obs lines are `tracing::info!`; without this the default filter
+        // decides whether the assertions have anything to read.
+        .env("RUST_LOG", "info")
         .env("AGENT_BLOCK_TRACE_ID", "e2e-trace-01")
         .env("AGENT_BLOCK_AGENT_ID", "e2e-agent-01")
         .env("AGENT_BLOCK_AGENT_NAME", "e2e-agent")
@@ -53,11 +63,16 @@ fn agent_run_emits_structured_meta_logs() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "prefix=ab.obs event=request component=llm",
+            "prefix=ab.obs event=http_request component=http",
+        ))
+        .stdout(predicate::str::contains(
+            "prefix=ab.obs event=http_response component=http",
         ))
         .stdout(predicate::str::contains("trace_id=e2e-trace-01"))
         .stdout(predicate::str::contains("agent_id=e2e-agent-01"))
-        .stdout(predicate::str::contains("run_id=e2e-run-01"));
+        .stdout(predicate::str::contains("agent_name=e2e-agent"))
+        .stdout(predicate::str::contains("run_id=e2e-run-01"))
+        .stdout(predicate::str::contains("status=200"));
 }
 
 /// Verifies the OpenAI provider path with an in-process mock server.
@@ -83,28 +98,14 @@ async fn agent_run_openai_mock_dispatches_tool() {
             .env("OPENAI_BASE_URL_TEST", &url_clone)
             .env("AGENT_BLOCK_HOME", tmp.path())
             .env("RUST_LOG", "info")
-            // The dump is emitted by hooks the agent hands to
-            // tool_loop; without this the only coverage is the live-API test
-            // above, which is ignored in CI.
-            .env("AGENT_BLOCK_LLM_DUMP", "meta")
-            .env("AGENT_BLOCK_TRACE_ID", "mock-trace-01")
-            .env("AGENT_BLOCK_RUN_ID", "mock-run-01")
             .assert()
             .success()
             .stdout(predicate::str::contains("OPENAI_MOCK_TOOL_DISPATCHED_OK"))
-            // request / response / summary, correlated by turn, on both turns
+            // The second turn's answer, which only exists if the first turn's
+            // tool call was dispatched and its result fed back.
             .stdout(predicate::str::contains(
-                "prefix=ab.obs event=request component=llm call=1 turn=1 iter=1 trace_id=mock-trace-01",
-            ))
-            .stdout(predicate::str::contains("run_id=mock-run-01"))
-            .stdout(predicate::str::contains("event=response component=llm call=1 turn=1"))
-            .stdout(predicate::str::contains("event=summary component=llm call=1 turn=1"))
-            .stdout(predicate::str::contains("event=request component=llm call=2 turn=2"))
-            // provider tag and decoded accounting survive the move to hooks
-            .stdout(predicate::str::contains("provider=openai"))
-            .stdout(predicate::str::contains("stop_reason=tool_use"))
-            .stdout(predicate::str::contains("tool_uses=1"))
-            .stdout(predicate::str::contains("status=200"));
+                "Tool result received. Task complete.",
+            ));
     })
     .await
     .expect("subprocess assertion task should not panic");

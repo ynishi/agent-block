@@ -271,13 +271,14 @@ mod tests {
         "proxy-authorization",
     ];
 
-    /// Sync guard for the deliberately-duplicated 写経 copies of the redaction
-    /// list. Consolidating the two sites is out of scope on purpose, so this
-    /// test — not a comment — is what fails when one Lua
-    /// `sanitize_headers_for_dump` copy gains or renames an entry and the other
-    /// is not updated with it.
+    /// Sync guard for the 写経 copy of the redaction list. `blocks/agent` no
+    /// longer has one — it was rewritten as a consumer of the kernel and the
+    /// dump layer went with the rewrite, so the only remaining copy is
+    /// `compile_loop`'s. This test — not a comment — is what fails when that
+    /// copy gains or renames an entry and `REDACTED_HEADERS` is not updated
+    /// with it. When compile_loop moves onto the kernel too, both go.
     #[test]
-    fn redaction_list_is_mirrored_in_both_lua_blocks() {
+    fn redaction_list_is_mirrored_in_the_lua_block() {
         /// Text of the `sanitize_headers_for_dump` body, so a name that merely
         /// appears elsewhere in the file cannot satisfy the assertion.
         fn sanitize_region(rel: &str) -> String {
@@ -292,16 +293,13 @@ mod tests {
             rest[..end].to_string()
         }
 
-        for rel in [
-            "blocks/agent/init.lua",
-            "blocks/tools/compile_loop/init.lua",
-        ] {
+        for rel in ["blocks/tools/compile_loop/init.lua"] {
             let region = sanitize_region(rel);
             for name in REDACTED_HEADERS {
                 assert!(
                     region.contains(name),
                     "{rel}: sanitize_headers_for_dump does not redact '{name}' \
-                     (REDACTED_HEADERS and the two Lua copies must stay in sync)"
+                     (REDACTED_HEADERS and the Lua copy must stay in sync)"
                 );
             }
         }
