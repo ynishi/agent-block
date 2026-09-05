@@ -474,6 +474,18 @@ end
 --- is never nil: a caller reads position 2 to find out about the second
 --- sibling, whatever happened to it.
 ---
+--- WHAT THE SPLIT IS, AND WHAT A FAILED SLOT MEANS, ARE BOTH THE CALLER'S.
+--- This runs the entries it is handed and answers one slot each. It does not
+--- decide which work belongs in which entry, and it cannot: whether two
+--- subsets are independent or the second needed the first's answer is a fact
+--- about the work, and a list is the same list either way. Nor does it read
+--- the slots back. Merging what came off and leaving a failed slot out, asking
+--- that sibling again, and stopping the whole run because one of five did not
+--- answer are three defensible readings of one array, and which is right
+--- depends on what the siblings were for. `parallel` is a deterministic
+--- combinator over a list — the same entries produce the same slots, aligned
+--- by index — and says nothing about either decision.
+---
 --- THE DEFAULT IS ISOLATE. One sibling failing cancels nobody: the others run
 --- to completion and their slots say so. `opts.joiner = "cancel_on_error"`
 --- cancels the scope at the first failure instead, and the siblings that were

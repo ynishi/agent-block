@@ -22,7 +22,12 @@
 --     filter comes out of it unchanged, which is what keeps a filter from
 --     reaching the durable llm_request record;
 --   7 the note goes in FRONT, where it cannot land among a tool_use / tool_result
---     pairing.
+--     pairing;
+--   8 a tool that RETURNS its failure is invisible to the default and is what
+--     `failed` is for. The default reads the kernel's `ok` flag, which is set
+--     only when a handler raises, so a pair answering `{ ok = false, error =
+--     ... }` closes `ok = true`. The first case below pins that gap rather
+--     than papering over it, and the rest prove the predicate closes it.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -102,6 +107,27 @@ describe("policy.carry — binding", function()
         expect(function()
             policy.carry({ max_byte = 10 })
         end).to.fail()
+    end)
+
+    it("insists that `failed` is a function", function()
+        -- Whichever mode this file is run in: the bound is written beside the
+        -- factory, not left to the dev-mode gate. `api_spec` pins prod with no
+        -- gate installed at all.
+        for _, bad in ipairs({ 42, "always", { ok = false } }) do
+            expect(function()
+                policy.carry({ failed = bad })
+            end).to.fail()
+        end
+    end)
+
+    it("takes a well-formed `failed` beside max_bytes", function()
+        local bind = policy.carry({
+            max_bytes = 64,
+            failed = function(_pair)
+                return false
+            end,
+        })
+        expect(type(bind(support.session()))).to.be("function")
     end)
 end)
 
@@ -263,5 +289,109 @@ describe("policy.carry — the note itself", function()
         expect(out.system).to.be("SYS")
         expect(out.messages[2]).to.be(messages[1])
         expect(getmetatable(out.messages).__jsontype).to.be("array")
+    end)
+end)
+
+describe("policy.carry — a tool that RETURNS its failure", function()
+    --- The two events one answered tool call leaves behind, appended the way a
+    --- beat appends them: the call first, then the result it produced.
+    ---
+    --- Written rather than run, because what is under test is a pair the
+    --- kernel closed `ok = true` — a handler that answered a rejection instead
+    --- of raising one, which no stub tool can produce by failing.
+    local function answered(session, name, result, ok)
+        local data = { call_id = "c1", name = name, args = { path = "a.txt", line = 300 } }
+        session:append({ kind = "tool_call", beat = "b-1", data = data })
+        session:append({ kind = "tool_result", beat = "b-1", data = { call_id = "c1", ok = ok, result = result } })
+    end
+
+    --- What an edit tool answers when the model asks to change a line that is
+    --- not in the file: a value, not a raise.
+    local function rejection(reason)
+        return { ok = false, error = reason }
+    end
+
+    --- The predicate for a tool that reports failure in its own result.
+    local function returned_failure(pair)
+        return pair.result and pair.result.ok == false
+    end
+
+    --- One such beat, and the filter bound over the session that holds it.
+    local function after_a_rejection(opts, reason)
+        local session = support.session()
+        support.seed(session, "q")
+        answered(session, "edit", rejection(reason or "there is no line 300"), true)
+        return policy.carry(opts)(session), session
+    end
+
+    it("is invisible to the default: the pair closed ok = true", function()
+        -- The gap, pinned. The kernel sets `ok` from whether the handler
+        -- RAISED, and this one did not, so the default finds no failure and
+        -- hands the request straight back — the same table.
+        local filter = after_a_rejection({})
+        local request = { messages = {} }
+        expect(filter(request)).to.be(request)
+    end)
+
+    it("is carried once `failed` reads the result, and the note holds the tool's own error", function()
+        local filter = after_a_rejection({ max_bytes = 256, failed = returned_failure })
+        local note = head(filter({ messages = {} }))
+        expect(note:find("the previous beat did not complete", 1, true) ~= nil).to.be(true)
+        expect(note:find("edit", 1, true) ~= nil).to.be(true)
+        expect(note:find("there is no line 300", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("is bounded by max_bytes like any other note, and marked where it was cut", function()
+        local filter = after_a_rejection({ max_bytes = 40, failed = returned_failure }, string.rep("x", 4000))
+        local note = head(filter({ messages = {} }))
+        expect(#note).to.be(40)
+        expect(note:sub(-3)).to.be("...")
+    end)
+
+    it("hands the predicate the call's name and input beside the result", function()
+        local seen
+        local filter = after_a_rejection({
+            failed = function(pair)
+                seen = pair
+                return false
+            end,
+        })
+        filter({ messages = {} })
+        expect(seen.name).to.be("edit")
+        expect(seen.input.line).to.be(300)
+        expect(seen.call_id).to.be("c1")
+        expect(seen.beat).to.be("b-1")
+        expect(seen.ok).to.be(true)
+        expect(seen.result.error).to.be("there is no line 300")
+    end)
+
+    it("decides for every tool pair, the ones the kernel closed ok = false included", function()
+        -- A predicate reading a RETURNED failure says nothing about a raised
+        -- one — the result is the raise's message, a string with no `ok` — so
+        -- this pair is not carried. `failed` replaces the default's judgement
+        -- rather than being asked in addition to it, and a caller that wants
+        -- both writes both into the one predicate.
+        local session = support.session()
+        support.seed(session, "q")
+        answered(session, "edit", "the disk is gone", false)
+        local filter = policy.carry({ failed = returned_failure })(session)
+        local request = { messages = {} }
+        expect(filter(request)).to.be(request)
+    end)
+
+    it("carries a call that did not come off whatever the predicate answers", function()
+        -- `llm_call_failed` is not a tool pair: there is no result for a
+        -- predicate to read, and the fold shows nothing of the event at all.
+        local session = support.session()
+        support.seed(session, "q")
+        session:append({ kind = "llm_call_failed", beat = "b-1", data = { error = "the provider said no" } })
+        local filter = policy.carry({
+            failed = function(_pair)
+                return false
+            end,
+        })(session)
+        local note = head(filter({ messages = {} }))
+        expect(note:find("the model call did not come off", 1, true) ~= nil).to.be(true)
+        expect(note:find("the provider said no", 1, true) ~= nil).to.be(true)
     end)
 end)

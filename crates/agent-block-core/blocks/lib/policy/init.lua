@@ -398,9 +398,11 @@ local WINDOW_OPTS, WINDOW_ARG = opts_contract({
     tail = T.number:describe("how many beats the request keeps; a whole number >= 1"),
 })
 
---- What `policy.carry` is configured with.
+--- What `policy.carry` is configured with. `failed` is the caller's reading of
+--- a tool pair, for the failures the kernel's `ok` flag cannot see.
 local CARRY_OPTS, CARRY_ARG = opts_contract({
     max_bytes = T.number:describe("the note's whole length in bytes; a whole number >= 1"):is_optional(),
+    failed = T.fn:describe("fn(pair) -> boolean; default: the pair's ok flag"):is_optional(),
 })
 
 --- What `policy.stagnation` is configured with. Both thresholds count beats,
@@ -461,6 +463,29 @@ local BEAT_RECORD = T.shape({
     events = T.array_of(kernel.shapes.event_base),
 }, { open = false })
 
+--- One answered tool call, as `carry` derives it from the log and hands it to
+--- a caller's `failed`.
+---
+--- The four fields a caller decides on are the ones `knl.views.tool_pairs`
+--- names — `name`, `input`, `result`, `ok` — with the `call_id` and the `beat`
+--- they were written under beside them. The view is read from the store and
+--- carries the identifying half; this pair is read from the log and carries
+--- the `input` the call was made with and the `result` the handler produced,
+--- because whether a returned value is a failure cannot be decided without
+--- them.
+---
+--- `call_id`, `name` and `input` are optional because a `tool_result` whose
+--- `tool_call` is not in the log has nothing to take them from — an
+--- interrupted beat leaves exactly that.
+local TOOL_PAIR = T.shape({
+    beat = T.string,
+    call_id = T.string:is_optional(),
+    name = T.string:is_optional(),
+    input = T.any:is_optional(),
+    result = T.any:is_optional(),
+    ok = T.boolean,
+}, { open = false })
+
 --- What `stagnation` answers when it has a verdict. Two words and no more:
 --- a third reason would be a third policy.
 local STOP_REASON = T.one_of({ "repeated", "no_progress" })
@@ -472,6 +497,7 @@ M.shapes = {
     retry_opts = RETRY_OPTS,
     escalate_opts = ESCALATE_OPTS,
     beat_record = BEAT_RECORD,
+    tool_pair = TOOL_PAIR,
     stop_reason = STOP_REASON,
 }
 
@@ -573,13 +599,70 @@ local function trim(text, limit)
     return text:sub(1, limit - #ELLIPSIS) .. ELLIPSIS
 end
 
+--- A tool pair's `result` as note text: a string verbatim, anything else in
+--- the rendering `canonical` gives it.
+---
+--- Which matters as soon as a caller can call a RETURNED value a failure. A
+--- tool answering `{ ok = false, error = "there is no line 300" }` keeps its
+--- reason inside a table, and `tostring` of a table is an address: a note
+--- reading `table: 0x55…` would carry the failure forward without carrying
+--- what failed, which is the whole of what the next beat needs. `canonical` is
+--- this module's own renderer and costs it no host global.
+local function render_result(result)
+    if type(result) == "string" then
+        return result
+    end
+    return canonical(result)
+end
+
+--- The default reading of a tool pair: the kernel's own flag, and only it.
+---
+--- The kernel closes a pair `ok = false` when the handler RAISED (or when a
+--- `tool_policy` denied the call before it ran) — `knl`'s beat. An `ok` no
+--- record carried is read as true, which keeps this exactly the judgement
+--- `carry` has always made: a pair is a failure when it closed `ok = false`,
+--- not when it left the flag out.
+local function default_failed(pair)
+    return not pair.ok
+end
+
+--- One `tool_result` event as the pair a predicate is handed
+--- (`policy.shapes.tool_pair`), with the call half looked up by id.
+local function pair_of(beat, called, data)
+    local call = called[data.call_id] or {}
+    return {
+        beat = beat,
+        call_id = data.call_id,
+        name = call.name,
+        input = call.input,
+        result = data.result,
+        ok = data.ok ~= false,
+    }
+end
+
+--- What a carried pair says in the note.
+---
+--- The tool's NAME comes off the `tool_call` half of the pair, and when the
+--- pair has no call to take it from the note says a tool call failed rather
+--- than inventing one to blame.
+local function reason_for(pair)
+    local who = "a tool call"
+    if pair.name ~= nil then
+        who = "tool '" .. tostring(pair.name) .. "'"
+    end
+    return who .. " failed: " .. render_result(pair.result)
+end
+
 --- What went wrong in the last beat, as one bounded note, or nil when
 --- nothing did.
 ---
---- Two things count as a failure and they are the two the kernel records as
---- one: a call that did not come off (`llm_call_failed`, which `knl.fold`
---- skips entirely, so without this note the model sees nothing at all of it)
---- and a tool pair closed `ok = false`.
+--- Two things count as a failure. A call that did not come off
+--- (`llm_call_failed`, which `knl.fold` skips entirely, so without this note
+--- the model sees nothing at all of it) is always one, and no predicate is
+--- consulted about it: it is not a tool pair and there is nothing in it for
+--- one to read. Every `tool_result` of the beat is put to `failed`, which by
+--- default is the kernel's `ok` flag and otherwise is the caller's reading of
+--- the pair.
 ---
 --- A RESPONSE THAT WAS TRUNCATED IS NOT ONE. A beat that hit the model's
 --- output ceiling recorded an `llm_response` like any other and its
@@ -589,26 +672,23 @@ end
 --- behind none of the two records this reads. That is the same reason a
 --- refusal is not carried: it is a recorded response, not a failure.
 ---
---- The tool's NAME comes off the `tool_call` half of the pair, and when the
---- pair has no call to take it from the note says a tool call failed rather
---- than inventing one to blame.
----
 --- @param events table|nil  the session's events, in seq order
 --- @param limit number  the note's whole length in bytes
+--- @param failed function  fn(pair) -> boolean, over a `policy.shapes.tool_pair`
 --- @return string|nil  the note, or nil when the last beat did not fail
-local function failure_note(events, limit)
+local function failure_note(events, limit, failed)
     local order = beats_of(events)
     local previous = order[#order]
     if previous == nil then
         return nil
     end
 
-    local named = {}
+    local called = {}
     for _, ev in ipairs(previous.events) do
         if ev.kind == "tool_call" then
             local data = data_of(ev)
-            if data.call_id ~= nil and data.name ~= nil then
-                named[data.call_id] = data.name
+            if data.call_id ~= nil then
+                called[data.call_id] = { name = data.name, input = data.args }
             end
         end
     end
@@ -618,12 +698,10 @@ local function failure_note(events, limit)
         local data = data_of(ev)
         if ev.kind == "llm_call_failed" then
             reasons[#reasons + 1] = "the model call did not come off: " .. tostring(data.error)
-        elseif ev.kind == "tool_result" and data.ok == false then
-            local name = named[data.call_id]
-            if name ~= nil then
-                reasons[#reasons + 1] = "tool '" .. tostring(name) .. "' failed: " .. tostring(data.result)
-            else
-                reasons[#reasons + 1] = "a tool call failed: " .. tostring(data.result)
+        elseif ev.kind == "tool_result" then
+            local pair = pair_of(previous.id, called, data)
+            if failed(pair) then
+                reasons[#reasons + 1] = reason_for(pair)
             end
         end
     end
@@ -676,20 +754,56 @@ end
 --- where the failing beat may itself have been sliced away and the note is
 --- then the only trace of it left.
 ---
---- @param opts table  { max_bytes? = <whole number >= 1> }
+--- WHAT THE DEFAULT CANNOT SEE, and what `failed` is for
+---   The kernel closes a tool pair `ok = false` when the handler RAISED, and
+---   that flag is the only failure the default reads. A tool that reports a
+---   failure by RETURNING one does not trip it: an edit tool handed a line
+---   number that is not in the file, answering `{ ok = false, error = "there
+---   is no line 300" }`, returned perfectly normally, so its pair closes
+---   `ok = true` and the default carries nothing. The next request then shows
+---   the model its own call and an answer, with no word that the answer was a
+---   rejection — and asking the same wrong thing again is exactly the case
+---   this policy exists for.
+---
+---   The kernel cannot close that gap on the caller's behalf. What a handler
+---   returns is the tool's own vocabulary — `ok`, `error`, `status`,
+---   `is_error`, a bare string — and no two tools agree on it, so reading it
+---   is a judgement only the caller who wired those tools can make. `failed`
+---   is where that judgement goes, one predicate over one pair:
+---
+---       local filter = policy.carry({
+---           failed = function(pair) return pair.result and pair.result.ok == false end,
+---       })(session)
+---
+---   It decides for TOOL PAIRS, and for all of them: a pair the kernel closed
+---   `ok = false` is put to the same predicate and is carried only if it says
+---   so. A model call that did not come off is not a pair and is carried
+---   either way. The pair is `policy.shapes.tool_pair`, and what gets carried
+---   is built from its `result` the same way in both modes and cut at the one
+---   point `max_bytes` bounds.
+---
+--- @param opts table  { max_bytes? = <whole number >= 1>, failed? = fn(pair) -> boolean }
 --- @return function bind  fn(session) -> fn(request) -> request
 function M.carry(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
         error("policy.carry: opts must be a table", 2)
     end
-    only(opts, { max_bytes = true }, "policy.carry")
+    only(opts, { max_bytes = true, failed = true }, "policy.carry")
     if opts.max_bytes ~= nil and not whole_at_least(opts.max_bytes, 1) then
         error("policy.carry: max_bytes must be a whole number >= 1, got " .. tostring(opts.max_bytes), 2)
+    end
+    if opts.failed ~= nil and type(opts.failed) ~= "function" then
+        -- Loud in prod too, like every other bound here: a `failed` that was
+        -- not callable would raise out of the FILTER instead, where beat reads
+        -- it as `Outcome.err("filter")` and the policy's mistake is reported
+        -- as the beat's.
+        error("policy.carry: failed must be a function (fn(pair) -> boolean)", 2)
     end
     shape.assert_dev(opts, CARRY_OPTS, "policy.carry opts")
 
     local limit = opts.max_bytes or DEFAULT_MAX_BYTES
+    local failed = opts.failed or default_failed
     return function(session)
         -- The one thing the binder needs off the handle, checked where it is
         -- bound rather than at the first beat: a filter that raised on its
@@ -708,7 +822,7 @@ function M.carry(opts)
             error("policy.carry: bind takes a knl session (from knl.open / knl.resume)", 2)
         end
         return function(request)
-            local note = failure_note(session:events(), limit)
+            local note = failure_note(session:events(), limit, failed)
             if note == nil then
                 return request
             end
@@ -849,6 +963,23 @@ end
 --- The predicate holds no counters. It derives the beats from
 --- `session:events()` on every call, which is what lets a resumed session be
 --- judged on its whole history and two drivers reach the same verdict.
+---
+--- RECOVERING FROM A TRIP IS THE CALLER'S LOOP. This answers that the run is
+--- going in circles and stops there; whether to break, hand the work to a
+--- person, or say something to the model and go round once more is not a
+--- verdict, and there is no factory here for it. A loop that would rather
+--- nudge appends its own message and beats again, under a bound — an
+--- unbounded nudge is the same circle with a sentence in it:
+---
+---     local why = stalled(session)
+---     if why == "repeated" and nudges < MAX_NUDGES then
+---         nudges = nudges + 1
+---         session:append({ kind = "msg_user", data = { content = "that is not working" } })
+---     elseif why ~= nil then break end
+---
+--- The append is the caller's own, on the caller's session, and this module
+--- writes none of it: nothing here appends (the header), and a policy that
+--- nudged on its own behalf would be a loop pretending to be a value.
 ---
 --- @param opts table  { same?, no_progress?, signature? }
 --- @return function predicate  fn(session) -> nil | "repeated" | "no_progress"
@@ -1125,6 +1256,10 @@ M.shapes.api = {
             filter = {
                 args = { arg_of(kernel.shapes.request, "request") },
                 returns = kernel.shapes.request,
+            },
+            failed = {
+                args = { arg_of(TOOL_PAIR, "pair") },
+                returns = "boolean — carry this pair's result forward",
             },
         },
     },

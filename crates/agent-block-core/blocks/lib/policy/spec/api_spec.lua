@@ -207,10 +207,21 @@ describe("policy.shapes — the contracts are published as data", function()
             "retry_opts",
             "escalate_opts",
             "beat_record",
+            "tool_pair",
             "stop_reason",
         }) do
             expect(is_shape(policy.shapes[name])).to.be(true)
         end
+    end)
+
+    it("describes the pair a caller's `failed` is handed", function()
+        local pair = { beat = "b-1", call_id = "c1", name = "edit", input = {}, result = {}, ok = true }
+        expect(check.check(pair, policy.shapes.tool_pair)).to.be(true)
+        -- a result with no call half is still a pair
+        expect(check.check({ beat = "b-1", result = "r", ok = false }, policy.shapes.tool_pair)).to.be(true)
+        expect(check.check({ call_id = "c1", ok = true }, policy.shapes.tool_pair)).to.be(false)
+        expect(check.check({ beat = "b-1", ok = "yes" }, policy.shapes.tool_pair)).to.be(false)
+        expect(check.check({ beat = "b-1", ok = true, extra = 1 }, policy.shapes.tool_pair)).to.be(false)
     end)
 
     it("closes every opts shape (a policy typo must not become a no-op)", function()
@@ -424,6 +435,12 @@ describe("policy.shapes.api — the registry is absent in prod", function()
         end).to.fail()
         expect(function()
             PROD.carry({ max_bytes = 0 })
+        end).to.fail()
+        expect(function()
+            -- A `failed` that is not callable would otherwise raise out of the
+            -- FILTER, where beat reads it as `Outcome.err("filter")` and the
+            -- policy's mistake is reported as the beat's.
+            PROD.carry({ failed = "always" })
         end).to.fail()
     end)
 end)
