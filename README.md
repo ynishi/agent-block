@@ -578,7 +578,7 @@ Environment variables used per provider:
 
 **Protocol options (`llm_proto`)**
 
-Request building lives in the `llm_proto` package, shared by `agent` and `compile_loop`. The vocabulary is OpenAI's; each adapter renames or drops what its provider does not accept, so the same options work on both paths.
+Request building lives in the `llm_proto` package, reached through the provider Port every block's device carries. The vocabulary is OpenAI's; each adapter renames or drops what its provider does not accept, so the same options work on both paths.
 
 ```lua
 local result = agent.run({
@@ -632,12 +632,21 @@ Key behaviours:
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` gains an additive `info.context_management` field that forwards the raw `response.context_management` from Anthropic (`{ applied_edits = { { type, cleared_tool_uses, cleared_input_tokens }, ... } }`). The field is absent on turns where the server did not fire any edit — nil-guard before indexing.
 - The `blocks/` directory is embedded in the binary; place a local `blocks/agent/init.lua` in the project root to override.
-- `agent.run` emits no LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead. `AGENT_BLOCK_LLM_DUMP` and the ENV-driven dump it controls are `compile_loop`'s — see the compile_loop section below.
+- No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
 ### compile_loop (Filesystem block — `require("compile_loop")`)
 
 Tool factory for the autonomous compile-and-fix loop. The primary surface is
 `compile_loop.make(conf)`, which returns a `tool_def` consumable directly by `agent.run`.
+
+One iteration is one beat of the kernel (`knl.beat`: a model call plus the tools that
+call asked for), and the thing this block adds to it is the guarantee it sells: **the
+verify is not a tool**. `conf.runner` runs after every beat, whatever the model asked
+for and whatever it answered, and its verdict — not the model's — ends the run. A tool
+the model can decline to call cannot carry "it compiles".
+
+`max_iters` is the session's grant, so the iteration ceiling is the budget: the beat
+past it stops with nothing called.
 
 Place `blocks/tools/compile_loop/init.lua` in the project root (resolved via the filesystem
 `blocks/` path; no `EMBEDDED_BLOCKS` entry is required).
@@ -664,8 +673,9 @@ local td = compile_loop.make({
     runner    = lua_runner,       -- required: function(path) → {ok, stdout, stderr, exit_code}
     max_iters = 5,                -- optional, default 5
     lang      = "lua",            -- optional, default "lua"
-    -- conf.llm is optional: when omitted the parent agent's provider/model/api_key
-    -- are inherited at call time via _AGENT_LLM_CTX (Crux #2).
+    -- conf.llm is forwarded to the provider Port verbatim. Nothing is inherited
+    -- from the calling agent: a device is passed, not discovered, so an omitted
+    -- api_key falls through to llm_proto's own env resolution and nowhere else.
     llm = {
         provider = "anthropic",
         model    = "claude-haiku-4-5-20251001",
@@ -680,43 +690,35 @@ local result = agent.run({
 })
 ```
 
-**`compile_loop.make(conf)`** returns `{ name, schema, handler }`. As a side-effect
-`tool.register(name, schema, handler)` is called, so the registry and `tool_def.handler`
-share the same function identity. The tool name defaults to `"compile_loop"`; pass
-`conf.name` to override (useful when registering multiple instances).
+**`compile_loop.make(conf)`** returns `{ name, schema, handler }` and nothing else
+happens to it: registering it is the caller's, and `agent.run({ extra_tools = { td } })`
+takes it directly. A caller that wants it in the global registry calls
+`tool.register(td.name, td.schema, td.handler)` itself (which is what
+`coding_agent.register_tool` does). The tool name defaults to `"compile_loop"`; pass
+`conf.name` to override.
 
-**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). Multi-file lazy-load (the `read_file` tool dispatch loop, sliding window K=3, stderr trim) works on both the `"anthropic"` and `"openai"` provider paths. Edits are accepted from either channel: SEARCH/REPLACE text blocks, or the `apply_search_replace` tool (declared by default; agentic-tuned models complete the whole loop via tool calls). `tool_mode = "auto" | "read_only" | "none" | "adaptive"` controls which tools are declared — `"none"` is for callers that inline all file contents in the spec, `"adaptive"` auto-falls-back from tools to the SR-text contract when the declared tools stall the loop. Callers can also inject their own tools via `extra_tools = {{name, schema, handler}, ...}`. See `blocks/tools/compile_loop/README.md` §"Multi-file mode" and the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` / `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` smoke scripts.
+**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). `tool_mode = "auto" | "read_only"` controls which tools are declared — `"read_only"` withholds the edit tool, which makes the run a dry run that can inspect and cannot converge. Callers can inject their own tools via `extra_tools = {{name, schema, handler}, ...}`; a name that collides with a built-in is a loud error rather than a silent winner. See the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` smoke scripts.
 
-**Read-and-distill for large files**: in multi-file lazy-load mode, `read_file` now inspects
-file size before returning content. Files at or below `READ_FILE_FULL_THRESHOLD` (default
-10 000 chars) are returned verbatim as before. Files that exceed the threshold are split into
-line-based chunks and summarised by the child LLM (provider-agnostic, same call path as the
-outer loop), and the tool returns a digest string plus a line-index (`"L1-50: ...\nL51-180: ..."`).
-The digest cache (`mf_state.file_digest[path]`) survives per-iteration resets; only file-mtime
-changes or `file_digest_refresh = "always"` trigger re-distillation.
+**The tools diff mode declares**: `std.fs`' own `fs_read` and `fs_edit`, path-locked to
+the target files for the duration of the call, plus `read_file_range`.
 
-**`read_file_range` tool**: after receiving a digest the LLM can call `read_file_range(path,
-line_start, line_end)` to retrieve the verbatim lines from that range. The handler reads
-directly from disk without passing through distillation, regardless of file size. Guards:
-`target_files` allowlist, 1-indexed inclusive range, max `READ_FILE_RANGE_MAX_LINES`
-lines (default 500) per call.
-
-**New optional `conf` fields for large-file distillation**:
-
-| field | type | default | description |
-|---|---|---|---|
-| `conf.target_func` | string \| nil | `nil` | Function name to prioritise in chunk ordering. Chunks containing this name are ranked second (after `last_err`-overlap chunks). Existing callers that omit this field are unaffected. |
-| `conf.distill_threshold` | number \| nil | 10 000 | Override `READ_FILE_FULL_THRESHOLD` per-instance. |
-| `conf.distill_chunk_lines` | number \| nil | 200 | Lines per distill chunk. |
-| `conf.distill_max_tokens` | number \| nil | 4 000 | Max chars for the packed digest returned to the LLM. |
+**Large files**: a whole-file `fs_read` of something over 10 000 characters is refused
+with the file's length and a pointer at the range read (`fs_read` takes `start_line` /
+`end_line`, and `read_file_range` hands back a verbatim, line-numbered slice of at most
+500 lines). There is no digest, no summarising sub-call and no cache: a model that asked
+for a 400KB file did not mean to spend its context on one, and a summary of a file is not
+a thing `fs_edit` can address.
 
 **Tool input** (supplied by the LLM at call time): `spec` (string, required),
-`target_file` (absolute path, required), `lang` (string, optional).
+`target_file` **or** `target_files` (absolute paths, mutually exclusive), `lang`
+(string, optional).
 
 **`edit_mode` (opt-in diff mode)**: pass `edit_mode = "diff"` to `compile_loop.make` to
-switch the child LLM to Aider-style SEARCH/REPLACE patch output instead of emitting the
-whole file on every iteration. This is the preferred mode for large existing files where
-minimal-edit is critical (e.g. fixing a single function in a 500-line file).
+have the child LLM edit through the tools instead of emitting the whole file on every
+iteration. This is the preferred mode for large existing files where minimal-edit is
+critical (e.g. fixing a single function in a 500-line file). The target files must
+already exist and be non-empty — diff needs something to diff against, and a mode that
+silently became `"full"` was worse than an error.
 
 ```lua
 local td = compile_loop.make({
@@ -726,29 +728,17 @@ local td = compile_loop.make({
 })
 ```
 
-The child LLM must output one or more SEARCH/REPLACE blocks in this exact format:
+The child LLM edits by calling `fs_edit`, which addresses lines rather than searching for
+text: `start_line`, `end_line`, and the `expect`ed current content of those lines, checked
+before anything is applied. A rejected edit comes back as a tool result naming what is
+actually at those lines, so the model can correct itself from the answer instead of
+re-reading the file.
 
-```
-<<<<<<< SEARCH
-<existing text to replace, character-exact>
-=======
-<replacement text>
->>>>>>> REPLACE
-```
-
-`compile_loop` applies each block in order using a two-stage match (exact → whitespace-
-normalized). Blocks whose SEARCH text does not match the current file content are reported
-back to the child LLM with the full file content attached, triggering a retry.
-
-When `target_file` is absent or empty at loop entry, `edit_mode = "diff"` automatically
-falls back to `"full"` with a warn-level log line (diff requires a base file to patch).
-
-**`target_file` dual role**: when `target_file` already exists at loop entry, its content is
-embedded in the initial user message as `=== Current file content ===` so the child LLM can
-build on it rather than generating from scratch. In `full` mode the file is overwritten on
-every iteration; in `diff` mode only the matched regions are replaced. When the file is absent
-or empty, the message contains `spec` only — preserving the original synthesis behaviour
-(backward-compatible).
+**`target_file` dual role** (full mode): when `target_file` already exists at loop entry,
+its content is embedded in the initial user message as `=== Current file content ===` so
+the child LLM can build on it rather than generating from scratch, and the file is
+overwritten on every iteration. When it is absent or empty, the message carries `spec`
+only — the synthesis case.
 
 **Target model class**: the full-file output strategy is designed for Qwen3 / Haiku-grade
 mid-weight models. Emitting the whole file on each iteration avoids the apply-failure cost of
@@ -762,37 +752,32 @@ Sonnet/Opus with native edit-tool support, a diff-based block is a future consid
 { ok, iters, summary, failure_reason?, last_error?, artifact_path }
 ```
 
-`failure_reason` values: `"llm_call"` | `"open_target_file"` | `"stagnation"` | `"max_iters"`.
+`failure_reason` values: `"llm_call"` | `"open_target_file"` | `"stagnation"` |
+`"no_edits_applied"` | `"max_iters"`. `modified_files` is present in diff mode (the paths
+whose edits landed, on every ending, including a give-up); `artifact_path` is the single
+path in single-file mode.
 
-**LLM inheritance (Crux #2)**: when `conf.llm` is omitted (or individual fields are absent),
-`compile_loop` resolves `provider`, `base_url`, `api_key`, `api_key_env`, and `model` from
-the parent `agent.run` call context at tool-dispatch time. No hardcoded provider default;
-no error for missing credentials at `make()` time.
+**LLM resolution**: `conf.llm` is forwarded to the provider Port verbatim, and nothing is
+inherited from a calling agent — a device is passed, not discovered. An omitted `api_key`
+falls through to `llm_proto`'s env resolution (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, or
+whatever `api_key_env` names). `provider` defaults to `"anthropic"` and picks the Port at
+`make()` time, so an unknown one is an error there rather than a failure five iterations in.
 
-**Stagnation detection**: when 3 consecutive iterations produce identical runner `stderr`
-the loop gives up immediately, independent of the remaining iteration budget.
-`failure_reason = "stagnation"`.
+**Giving up**: two readings of the log, each with its own reason.
 
-**Observability (ab.obs events)**: `compile_loop` emits structured `ab.obs` log events on
-each iteration, gated by `AGENT_BLOCK_LLM_DUMP`. Set `AGENT_BLOCK_LLM_DUMP=meta` to
-activate. Each line uses the `key=value` format with `prefix=ab.obs component=compile_loop`.
+- `"stagnation"` — the verify said the same thing three times running
+  (`policy.stagnation` over the recorded `verify` events).
+- `"no_edits_applied"` — three consecutive iterations landed no edit at all. Distinct
+  from the above: the model is acting and nothing is changing.
 
-The dump is safe-by-default and ENV-driven:
+Both are independent of the remaining budget; `"max_iters"` is the budget itself.
 
-- `AGENT_BLOCK_LLM_DUMP=off|meta|full` (default `off`)
-- when unset, `RUST_LOG` containing `debug` or `trace` enables `meta`
-- `full` is downgraded to `meta` when `AGENT_BLOCK_ENV=prod|production` unless `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD=true`
-- credential-bearing request *and* response headers (`x-api-key` / `authorization` / `set-cookie` / `cookie` / `proxy-authorization`) are always redacted in dump logs
-- `full` additionally dumps the request and response headers and bodies
-- the four correlation ids (`AGENT_BLOCK_TRACE_ID`, `AGENT_BLOCK_AGENT_ID`, `AGENT_BLOCK_AGENT_NAME`, `AGENT_BLOCK_RUN_ID`) are appended to each line
-
-| event | when emitted | fields |
-|---|---|---|
-| `iter_start` | start of each iteration | `iter`, `target_file` |
-| `iter_result` | after runner executes | `iter`, `ok`, `exit_code`, `stderr_len` |
-| `converged` | before PASS return | `iters` |
-| `stagnation` | before stagnation give-up | `iters` |
-| `max_iters_reached` | before max_iters give-up | `iters` |
+**Observability**: there is none of this block's own, and that is the point. Every model
+call is a durable record in the session log (`llm_request` / `llm_response` /
+`llm_call_failed`), every tool call is a recorded pair, and each iteration's verify is a
+`verify` event stamped with the beat it judges. Read them with `session:query` or
+`knl.views` rather than from stdout. `AGENT_BLOCK_LLM_DUMP` and the `ab.obs` iteration
+trail are gone.
 
 **Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
 OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
@@ -812,10 +797,8 @@ OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
 | `crates/agent-block/examples/test_qwen_compile_loop_lust.lua` | mlua-probe MCP | Qwen (OpenAI-compat) |
 | `crates/agent-block/examples/test_compile_loop_parent.lua` | inline lua | Anthropic parent + Qwen child |
 | `crates/agent-block/examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
-| `crates/agent-block/examples/test_anthropic_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Anthropic |
-| `crates/agent-block/examples/test_openai_compile_loop_multi_lazy_load.lua` | inline lua (multi-file) | Qwen (OpenAI-compat) |
-| `tests/fixtures/compile_loop_distill_mock.lua` | shared e2e fixture (distill, multi-file) | Anthropic / OpenAI-compat |
-| `tests/fixtures/compile_loop_distill_range_mock.lua` | e2e fixture (read_file_range verbatim) | Anthropic |
+| `crates/agent-block/examples/test_anthropic_compile_loop_multi.lua` | inline lua (multi-file) | Anthropic |
+| `tests/fixtures/compile_loop_range_mock.lua` | e2e fixture (oversized file, range read) | Anthropic |
 
 ### coding_agent (Filesystem block — `require("coding_agent")`, thin facade)
 
@@ -992,15 +975,16 @@ mcp__lua-debugger__test_launch(
   search_paths = ["crates/agent-block-core/blocks"]
 )
 mcp__lua-debugger__test_launch(
-  code_file    = "crates/agent-block/tests/fixtures/compile_loop_sr_apply_test.lua",
+  code_file    = "crates/agent-block/tests/fixtures/compile_loop_helpers_test.lua",
   search_paths = ["crates/agent-block-core/blocks"]
 )
 ```
 
-Existing companion specs: `compile_loop_state_test.lua` (mf_state / stagnation /
-temperature), `compile_loop_distill.lua` (distill subloop), and
-`compile_loop_cache_lifecycle.lua` (read-file cache). Each spec file's header
-documents its exact `test_launch` invocation.
+What a spec can reach is what needs no kernel. `compile_loop`'s loop opens a
+`knl` session, which is a syscall the pure spec runner does not have, so the
+loop itself is covered by `tests/e2e_compile_loop.rs` against a mock provider
+and the specs cover the helpers around it. Each spec file's header documents its
+exact `test_launch` invocation.
 
 ## License
 

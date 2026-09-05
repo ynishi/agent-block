@@ -67,9 +67,13 @@ which one happened.
 
 ## Reading a run afterwards
 
-`AGENT_BLOCK_LLM_DUMP=meta` makes the block emit `ab.obs` lines carrying
-`trace_id` / `run_id` / `agent_id` / `agent_name`, and loop blocks close a run
-with its totals (`edits`, `files`, `lines_removed`, `lines_added`). They go to
-this server's stderr, which the MCP client shows as server logs. Set the ids
+A run leaves a durable record rather than a log to grep: every model call is an
+`llm_request` / `llm_response` (or `llm_call_failed`) event on the block's
+session log, every tool call is a recorded pair, and a loop block's own steps
+are the kinds it appends. Read them back with `session:query` or `knl.views`.
+
+What still reaches this server's stderr — which the MCP client shows as server
+logs — is the http bridge's `ab.obs` `http_request` / `http_response` pair,
+carrying `trace_id` / `run_id` / `agent_id` / `agent_name`. Set those ids
 (`AGENT_BLOCK_RUN_ID`, …) in the server's environment when you want to
 correlate a run against something outside.

@@ -78,12 +78,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemma chat templates have no `tool` role and require strictly alternating
   turns; the transcript is flattened accordingly for those models.
 - `compile_loop` could not reach `tool_choice`, `thinking`, `dialect`,
-  `cache_control`, `extra_body`, or the sampling options, and its distill
-  sub-loop dropped `max_tokens` / `temperature` / `timeout` / thinking settings,
-  running that call at provider defaults.
+  `cache_control`, `extra_body`, or the sampling options. `conf.llm` now goes to
+  the provider Port verbatim, so it is no narrower than the protocol layer.
 
 ### Changed
 
+- **`compile_loop` runs on the kernel.** One iteration is now one `knl.beat` —
+  one model call plus the tools that call asked for — inside a `knl.session`
+  whose grant is `max_iters`, so the iteration ceiling is the budget and the
+  beat past it stops with nothing called. The block's one guarantee is
+  unchanged and is now the whole of what it adds: the verify is not a tool.
+  `conf.runner` runs after every beat, whatever the model asked for and
+  whatever it answered, its result is recorded as a `verify` event stamped with
+  the beat it judges, and its failure goes back as the next user turn. There is
+  no "DONE" turn any more, which is why a scenario that used to take two calls
+  per iteration now takes one. Giving up is two readings of the log:
+  `policy.stagnation` over the verify's stderr (`"stagnation"`) and a count of
+  consecutive iterations that landed no edit (`"no_edits_applied"`).
+  `make(conf)` keeps its contract — the same `tool_def`, the same handler input,
+  the same closed JSON result — and `coding_agent` is unchanged.
+- `compile_loop`'s diff mode declares `std.fs`' own path-locked `fs_read` and
+  `fs_edit` (it used to wrap its own reader around them) plus `read_file_range`.
+  A whole-file read over the size threshold is refused with the file's length
+  and a pointer at the range read.
+- `compile_loop.make` no longer registers the tool it builds. The def is
+  returned and putting it in the global registry is the caller's — two runs in
+  one process used to collide on a name neither of them chose.
+  `coding_agent.register_tool`, whose job is registration, does it there.
+- `compile_loop`'s `edit_mode = "diff"` with a missing or empty target file is
+  an error instead of a silent fallback to `"full"`. A caller asking for
+  minimal edits could get its file rewritten instead.
+- `compile_loop` no longer inherits a provider, model or key from the calling
+  agent: `conf.llm` is forwarded to the provider Port verbatim and then the
+  environment answers, so nothing is injected behind a caller's back. An unset
+  `provider` is `"anthropic"` (it was `"openai"` in full mode) and is resolved
+  at `make()` time, so an unknown one fails there.
 - `require` resolution moved to `mlua-pkg` (`Registry` + `FsResolver` +
   `MemoryResolver`), replacing the hand-rolled `package.searchers` hook. The
   priority chain is unchanged: script dir, then `project_root/blocks`, then
@@ -96,6 +125,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`blocks/lib/tool_loop`.** It was the ReAct mechanics of one turn — call,
+  dispatch the tools that call asked for, repeat — and both of its consumers
+  (`agent`, then `compile_loop`) now compose `knl.beat` on the spot instead. A
+  loop is written where it is run rather than provided: the kernel's header says
+  so, and the two loops that replaced it are 40 lines each against its 452.
+- **`AGENT_BLOCK_LLM_DUMP`** and the `ab.obs` iteration trail it gated, along
+  with `AGENT_BLOCK_LLM_DUMP_ALLOW_PROD`, the `RUST_LOG`-implies-`meta` rule and
+  the request/response header redaction that went with them. Every model call is
+  already a durable fact in the session log (`llm_request` / `llm_response` /
+  `llm_call_failed`), every tool call is a recorded pair, and each iteration's
+  verify is a `verify` event — a second, lossier copy on stdout was a
+  transcription of the record rather than a reading of it. Nothing records a
+  header any more, so there is nothing left to redact.
+- **`compile_loop`'s read-and-distill subsystem**: the size-branched digest, the
+  chunker, the per-chunk summarising LLM sub-run, the byte-budget packing, the
+  line index and the mtime+TTL digest cache. A file over the threshold answers
+  with its length and a pointer at `read_file_range` instead. What went with it:
+  `conf.target_func`, `conf.distill_threshold`, `conf.distill_chunk_lines` and
+  `conf.distill_max_tokens`.
+- `COMPILE_LOOP_LLM_TEMPERATURE` and the `0.0` default it backed. Temperature is
+  a conf key like every other one the provider takes.
+- `agent._llm_ctx_top` / `agent._log_meta` and `agent.shapes.log_meta`, the
+  shims `compile_loop` reached for while it still ran its own loop and resolved
+  its own correlation ids. Under the kernel a run is named by its session id and
+  a call by its beat id. `agent.run`'s `log_meta` option is still accepted and
+  still not read by the loop.
 - `AGENT_BLOCK_LLM_DUMP_DIR` and the per-call JSONL dump it wrote at the HTTP
   primitive, along with the `dump = "full"` request flag that opted into it.
   The kernel's session log already records every model call — `llm_request`,

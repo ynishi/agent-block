@@ -258,50 +258,10 @@ async fn read_sse(mut resp: reqwest::Response, on_data: &Option<LuaFunction>) ->
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    /// Credential-bearing header names the `ab.obs` full-mode log events must
-    /// mask. The redaction itself lives in the two Lua blocks; this list is the
-    /// reference the guard below compares them against.
-    const REDACTED_HEADERS: [&str; 5] = [
-        "x-api-key",
-        "authorization",
-        "set-cookie",
-        "cookie",
-        "proxy-authorization",
-    ];
-
-    /// Sync guard for the 写経 copy of the redaction list. `blocks/agent` no
-    /// longer has one — it was rewritten as a consumer of the kernel and the
-    /// dump layer went with the rewrite, so the only remaining copy is
-    /// `compile_loop`'s. This test — not a comment — is what fails when that
-    /// copy gains or renames an entry and `REDACTED_HEADERS` is not updated
-    /// with it. When compile_loop moves onto the kernel too, both go.
-    #[test]
-    fn redaction_list_is_mirrored_in_the_lua_block() {
-        /// Text of the `sanitize_headers_for_dump` body, so a name that merely
-        /// appears elsewhere in the file cannot satisfy the assertion.
-        fn sanitize_region(rel: &str) -> String {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let start = src
-                .find("local function sanitize_headers_for_dump")
-                .unwrap_or_else(|| panic!("{} has no sanitize_headers_for_dump", path.display()));
-            let rest = &src[start..];
-            let end = rest.find("\nend\n").map_or(rest.len(), |i| i + 5);
-            rest[..end].to_string()
-        }
-
-        for rel in ["blocks/tools/compile_loop/init.lua"] {
-            let region = sanitize_region(rel);
-            for name in REDACTED_HEADERS {
-                assert!(
-                    region.contains(name),
-                    "{rel}: sanitize_headers_for_dump does not redact '{name}' \
-                     (REDACTED_HEADERS and the Lua copy must stay in sync)"
-                );
-            }
-        }
-    }
-}
+// The redaction-mirror guard that used to live here is gone with what it
+// guarded. It held a list of credential-bearing header names against the copy
+// in a Lua block's `sanitize_headers_for_dump`, and both Lua copies have since
+// been deleted: `agent` and `compile_loop` are consumers of the kernel now, a
+// model call is a durable record (`llm_request` / `llm_response`) rather than a
+// dump on stdout, and no block reads a response header at all. A test that
+// checks two files agree is dead the moment one of them stops existing.

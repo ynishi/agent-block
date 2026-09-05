@@ -4,13 +4,15 @@
 --   * function.arguments is a JSON object (not a string) — Ollama native
 --     /api/chat, Gemini functionCall.args, and some vLLM tool-call parsers
 --     emit this shape through OpenAI-compatible endpoints.
---   * the id field is absent — compile_loop must synthesize call_synth_N ids
---     so the tool_result (role="tool", tool_call_id) pairing keeps working.
+--   * the id field is absent — a synthesized id must be put on the call so the
+--     tool_result (role="tool", tool_call_id) pairing keeps working.
 --
--- Scenario (1 iteration, 2 LLM calls):
---   Call 1: two apply_search_replace tool_calls (object args, no ids).
---   Call 2: plain "DONE" — the loop proceeds to verify via the tool-channel
---           edits contract.
+-- Scenario (2 iterations, 1 LLM call each):
+--   Iter 1: two fs_edit tool_calls in the broken shape, aimed at text that is
+--           not there. Both are rejected, so their results — carrying the
+--           synthesized ids — have to go back in the next request.
+--   Iter 2: the same two calls with a matching expect; both apply and the
+--           verify passes.
 
 local base_url = std.env.get("OPENAI_BASE_URL_TEST")
 assert(base_url, "OPENAI_BASE_URL_TEST must be set")
@@ -81,7 +83,7 @@ assert(runner_call_count >= 1, "mock_runner must be called at least once, got " 
 
 local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed despite object-arguments + missing ids, got: " .. (result.summary or "?"))
-assert(result.iters == 1, "loop must converge in 1 iter, got " .. tostring(result.iters))
+assert(result.iters == 2, "loop must converge in 2 iters (rejected, then applied), got " .. tostring(result.iters))
 assert(type(result.modified_files) == "table", "result.modified_files must be a table in multi-file mode")
 assert(#result.modified_files == 2, "result.modified_files must contain 2 paths, got " .. #result.modified_files)
 

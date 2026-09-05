@@ -148,6 +148,12 @@ end
 -- M.register_tool(opts) — thin facade (backward-compatible signature)
 -- ============================================================
 -- Returns the registered tool name ("compile_loop" or opts.name).
+--
+-- The registration happens HERE. `compile_loop.make` builds the tool_def and
+-- stops there: a factory that also put its def in the global registry meant two
+-- runs in one process collided on a name neither of them chose. This entry
+-- point is the one whose whole job is to register, so it is the one that calls
+-- `tool.register`.
 function M.register_tool(opts)
     assert(type(opts) == "table", "opts table required")
     assert(opts.runner_kind ~= nil, "opts.runner_kind required")
@@ -179,6 +185,7 @@ function M.register_tool(opts)
     }
 
     local td = cl.make(conf)
+    tool.register(td.name, td.schema, td.handler)
     return td.name
 end
 

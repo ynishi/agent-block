@@ -107,32 +107,6 @@ describe("compile_loop.shapes.runner_result", function()
     end)
 end)
 
-describe("agent.shapes.log_meta", function()
-    local schema = agent.shapes.log_meta
-
-    it("accepts an entirely unset environment", function()
-        expect(check.check({}, schema)).to.equal(true)
-    end)
-
-    it("accepts all four ids", function()
-        local ok = check.check({
-            trace_id = "t",
-            run_id = "r",
-            agent_id = "a",
-            agent_name = "n",
-        }, schema)
-        expect(ok).to.equal(true)
-    end)
-
-    it("is closed, so a fifth key is drift rather than an extra", function()
-        expect(check.check({ trace_id = "t", session_id = "s" }, schema)).to.equal(false)
-    end)
-
-    it("rejects an id that is not a string", function()
-        expect(check.check({ run_id = 7 }, schema)).to.equal(false)
-    end)
-end)
-
 describe("compile_loop.shapes.tool_output", function()
     local schema = compile_loop.shapes.tool_output
 
@@ -318,17 +292,5 @@ describe("agent.shapes.mcp_call_result", function()
 
     it("rejects is_error arriving as a string", function()
         expect(check.check({ ok = true, content = {}, is_error = "true" }, schema)).to.equal(false)
-    end)
-end)
-
-describe("agent._log_meta", function()
-    it("returns a value its own contract accepts", function()
-        expect(check.check(agent._log_meta(nil), agent.shapes.log_meta)).to.equal(true)
-    end)
-
-    it("passes explicit log_meta through", function()
-        local meta = agent._log_meta({ log_meta = { trace_id = "t-1", run_id = "r-1" } })
-        expect(meta.trace_id).to.equal("t-1")
-        expect(meta.run_id).to.equal("r-1")
     end)
 end)

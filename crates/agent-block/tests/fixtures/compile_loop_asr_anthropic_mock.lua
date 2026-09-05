@@ -1,11 +1,9 @@
 -- Fixture for the compile_loop fs_edit (write-channel tool) e2e test.
 --
--- Scenario (1 iteration, 2 LLM calls):
---   Call 1: Mock returns two fs_edit tool_use blocks (file_a, file_b).
---           compile_loop applies both edits and writes them to disk immediately.
---   Call 2: Mock returns the plain text "DONE" (no SR blocks). Because the edits
---           were applied via the tool channel, compile_loop must proceed to
---           verify instead of treating the missing SR text as a parse failure.
+-- Scenario (1 iteration, 1 LLM call):
+--   The mock returns two fs_edit tool_use blocks (file_a, file_b). Both are
+--   applied and written to disk, and the loop then runs the verify — which it
+--   does after every beat, without waiting for the model to say it is done.
 --
 -- tool_mode is left unset — the default "auto" must declare fs_edit.
 --
@@ -86,7 +84,7 @@ assert(runner_call_count >= 1, "mock_runner must be called at least once, got " 
 
 local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed via the fs_edit tool channel, got: " .. (result.summary or "?"))
-assert(result.iters == 1, "loop must converge in 1 iter (tool-channel edits + DONE), got " .. tostring(result.iters))
+assert(result.iters == 1, "loop must converge in 1 iter (both edits, then the verify), got " .. tostring(result.iters))
 
 -- multi-file mode: modified_files must list both tool-written paths.
 assert(type(result.modified_files) == "table", "result.modified_files must be a table in multi-file mode")

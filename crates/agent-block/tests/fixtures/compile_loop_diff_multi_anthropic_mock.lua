@@ -1,13 +1,13 @@
 -- Fixture for compile_loop multi-file diff-mode e2e test (Anthropic mock, happy path).
 --
--- Scenario (1 iteration):
---   Iter 1: Mock returns path-header SEARCH/REPLACE for both file_a and file_b.
---           apply_blocks succeeds for both → mock_runner(paths) returns {ok=true}.
+-- Scenario (1 iteration, 1 LLM call):
+--   The mock returns one fs_edit per file in a single turn; both apply, and the
+--   loop then runs the verify with the paths list.
 --
 -- Initial file contents written before the loop:
 --   file_a: print("a-old")
 --   file_b: print("b-old")
--- After SEARCH/REPLACE apply:
+-- After the edits:
 --   file_a: print("a-new")
 --   file_b: print("b-new")
 -- mock_runner checks that both files contain "new".
@@ -81,9 +81,8 @@ local result_json = td.handler({
     target_files = { file_a_path, file_b_path },
 })
 
--- Happy path: 1 LLM call, both files patched in a single turn.
-assert(runner_call_count >= 1,
-    "mock_runner must be called at least once, got " .. runner_call_count)
+-- Happy path: 1 LLM call, both files patched in a single turn, one verify.
+assert(runner_call_count == 1, "mock_runner must be called once, got " .. runner_call_count)
 
 local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed in multi-file diff mode, got: " .. (result.summary or "?"))

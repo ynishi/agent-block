@@ -1,15 +1,15 @@
 -- Fixture for compile_loop multi-file diff-mode 2-iter e2e test (Anthropic mock).
 --
--- Scenario (2 iterations):
---   Iter 1: Mock returns file_a SEARCH/REPLACE with wrong SEARCH text ("WRONG").
---           apply_blocks fails for file_a → failure feedback loop → 2nd LLM call.
---   Iter 2: Mock returns correct SEARCH/REPLACE for both file_a and file_b.
---           apply_blocks succeeds → mock_runner returns {ok=true}.
+-- Scenario (2 iterations, 1 LLM call each):
+--   Iter 1: the mock edits file_a with an `expect` that does not match. std.fs
+--           rejects it, the iteration applies nothing, the verify fails, and
+--           the rejection is carried into the next request.
+--   Iter 2: correct edits for file_a and file_b → both apply → the verify passes.
 --
 -- Initial file contents written before the loop:
 --   file_a: print("a-old")
 --   file_b: print("b-old")
--- After correct SEARCH/REPLACE apply:
+-- After the edits that land:
 --   file_a: print("a-new")
 --   file_b: print("b-new")
 
@@ -83,9 +83,9 @@ local result_json = td.handler({
     target_files = { file_a_path, file_b_path },
 })
 
--- 2-iter path: runner called at least once (after successful apply on iter 2).
-assert(runner_call_count >= 1,
-    "mock_runner must be called at least once, got " .. runner_call_count)
+-- The verify runs after every iteration, including the one whose only edit was
+-- rejected: it is the loop's step and not the model's.
+assert(runner_call_count == 2, "mock_runner must be called once per iteration, got " .. runner_call_count)
 
 local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed in multi-file diff mode (2-iter), got: " .. (result.summary or "?"))

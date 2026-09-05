@@ -10,13 +10,13 @@ agent-block -s examples/<file>.lua
 
 ## compile_loop
 
-Autonomous compile-and-fix loop. See `blocks/tools/compile_loop/README.md` for the API and the SEARCH/REPLACE format.
+Autonomous compile-and-fix loop. See `blocks/tools/compile_loop/README.md` for the API and the edit format.
 
 ### Anthropic — single-file
 
 | Script | Scenario | Env |
 |---|---|---|
-| `test_anthropic_compile_loop.lua` | Single-file smoke (Crux #2: parent agent provider/model inheritance) | `ANTHROPIC_API_KEY` |
+| `test_anthropic_compile_loop.lua` | Single-file smoke | `ANTHROPIC_API_KEY` |
 | `test_anthropic_compile_loop_pytest.lua` | Single-file with pytest runner | `ANTHROPIC_API_KEY` |
 | `test_compile_loop_parent.lua` | Parent agent + compile_loop tool composition | `ANTHROPIC_API_KEY` |
 
@@ -25,7 +25,7 @@ Autonomous compile-and-fix loop. See `blocks/tools/compile_loop/README.md` for t
 | Script | Scenario | Env |
 |---|---|---|
 | `test_anthropic_compile_loop_multi.lua` | Add a function to both files (basic additive multi-file diff) | `ANTHROPIC_API_KEY` |
-| `test_anthropic_compile_loop_multi_delete.lua` | Remove a function + assertions from both files (REPLACE-empty deletion) | `ANTHROPIC_API_KEY` |
+| `test_anthropic_compile_loop_multi_delete.lua` | Remove a function + assertions from both files (empty-replacement deletion) | `ANTHROPIC_API_KEY` |
 | `test_anthropic_compile_loop_multi_selective.lua` | Edit one file only; verifies untouched file is byte-identical | `ANTHROPIC_API_KEY` |
 | `test_anthropic_compile_loop_multi_stagnation.lua` | Forced-fail runner; asserts `max_iters` bound and `ok=false` return | `ANTHROPIC_API_KEY` |
 

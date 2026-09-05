@@ -69,13 +69,6 @@
 --   * No first-wins tool merge. Two sources claiming one name is a wiring
 --     bug, and `knl_adapter.tools` says so loudly.
 --
--- Temporary: the compile_loop shims
---   `M._llm_ctx_top` and `M._log_meta` are kept for `blocks/tools/compile_loop`,
---   which still runs its own loop and resolves its own correlation ids from the
---   environment. Both go when compile_loop moves onto knl — under the kernel
---   the ids are the beat id and the session id, minted per beat and stamped on
---   every event.
---
 -- Notes:
 --   - All MCP/HTTP bridge calls are async (coroutine yield). agent.run() must be
 --     called inside isle.coroutine_eval() or equivalent async context.
@@ -110,23 +103,6 @@ local PORTS = {
     anthropic = adapter.anthropic,
     openai = adapter.openai,
 }
-
---- The four ab.obs correlation fields.
----
---- Closed: this stopped being an internal detail when compile_loop began
---- resolving its own obs ids through `_log_meta`. Every field is optional
---- because an unset environment is the ordinary case, but an unexpected key
---- means the two components have drifted apart on what the fields are — which
---- is the failure the convention exists to prevent, and it would otherwise show
---- up as a run that cannot be selected rather than as an error.
----
---- Checked only in dev mode (LSHAPE_CHECK=1).
-local LOG_META = T.shape({
-    trace_id = T.string:is_optional(),
-    run_id = T.string:is_optional(),
-    agent_id = T.string:is_optional(),
-    agent_name = T.string:is_optional(),
-}, { open = false })
 
 --- Token accounting. `thinking_tokens` is optional because a caller may hold a
 --- result produced before the counts were normalized to three.
@@ -181,53 +157,6 @@ local MCP_CALL_RESULT = T.shape({
     is_error = T.boolean:is_optional(),
     structured_content = T.any:is_optional(),
 }, { open = false })
-
--- ============================================================
--- Compat shims for compile_loop (this round only)
--- ============================================================
-
---- M._llm_ctx_top() → nil
----
---- Kept for compile_loop until it moves to knl. There is no stack any more:
---- nothing is injected behind a caller's back, so a child resolves its own
---- provider / model / key from its conf and then the environment, which is
---- what compile_loop already does when this answers nothing.
-function M._llm_ctx_top()
-    return nil
-end
-
---- Build the four correlation ids from `opts.log_meta` over the environment.
-local function build_log_meta(opts)
-    local meta = opts and opts.log_meta or {}
-    local trace_id = meta.trace_id or std.env.get("AGENT_BLOCK_TRACE_ID")
-    if not trace_id then
-        trace_id = meta.task_id or std.env.get("AGENT_BLOCK_TASK_ID")
-        if trace_id then
-            log.warn("agent: log_meta.task_id / AGENT_BLOCK_TASK_ID is deprecated; use trace_id / AGENT_BLOCK_TRACE_ID")
-        end
-    end
-    return shape.assert_dev({
-        trace_id = trace_id,
-        agent_id = meta.agent_id or std.env.get("AGENT_BLOCK_AGENT_ID") or std.env.agent_id(),
-        agent_name = meta.agent_name or std.env.get("AGENT_BLOCK_AGENT_NAME"),
-        run_id = meta.run_id or std.env.get("AGENT_BLOCK_RUN_ID"),
-    }, LOG_META, "agent log_meta")
-end
-
---- The four ab.obs correlation fields, resolved from `opts.log_meta` and the
---- environment.
----
---- Kept for compile_loop until it moves to knl: that block emits its own
---- ab.obs lines and has to resolve the ids the same way, and a convention where
---- each component reaches for the environment slightly differently is one that
---- cannot be relied on to select a run. This loop reads none of them — under
---- the kernel a run is named by `session:id()` and a call by its beat id.
----
---- @param opts table|nil  May carry `log_meta` with any of the four fields.
---- @return table  { trace_id, run_id, agent_id, agent_name }, any of them nil.
-function M._log_meta(opts)
-    return build_log_meta(opts)
-end
 
 -- ============================================================
 -- Reading an answer
@@ -1014,9 +943,10 @@ end
 ---   on_turn         (optional) Callback function(turn_info). turn_info has
 ---                   keys: turn_number, content, tool_calls, usage.
 ---                   Returning false stops the run.
----   log_meta        (optional) External metadata, kept for the sibling block
----                   that still emits ab.obs lines. This loop reads none of it:
----                   a run is named by its session id and a call by its beat id.
+---   log_meta        (optional) External correlation ids. Accepted and not
+---                   read: a run is named by its session id and a call by its
+---                   beat id, and the four `ab.obs` ids the http bridge stamps
+---                   come off the environment rather than off this table.
 ---   history         (optional) Prior messages array (e.g. from session.load).
 ---                   Laid down as the events they are made of before the new
 ---                   prompt, so the fold sees the full thread.
@@ -1114,11 +1044,10 @@ M._resolve_mcp_group = resolve_mcp_group -- internal: for tests only
 
 --- The contracts this module holds itself to, as data.
 ---
---- Public so a sibling block consuming `_log_meta`, or a fixture checking what
---- the `mcp.call` bridge produced, can read the same schema rather than a doc
+--- Public so a caller checking a result, or a fixture checking what the
+--- `mcp.call` bridge produced, can read the same schema rather than a doc
 --- comment.
 M.shapes = {
-    log_meta = LOG_META,
     usage = USAGE,
     run_result = RUN_RESULT,
     mcp_call_result = MCP_CALL_RESULT,
