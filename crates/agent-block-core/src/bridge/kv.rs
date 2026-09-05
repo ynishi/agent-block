@@ -8,22 +8,25 @@
 //! delegating to [`mlua_batteries_sqlite::kv::register_with`], then layers the
 //! agent-block Lua tool helpers (`kv_tools.lua`) on top.
 //!
-//! The connection is not passed in any more: what the batteries take is a
-//! handle to the thread that owns it ([`crate::host::HostContext::kv_isle`]).
-//! Opening the database, the busy timeout and `journal_mode` are the host's,
-//! applied where the isle is spawned — see `host.rs` — and the ENV → config
-//! mapping is in `bridge/config.rs`.
+//! What the batteries take is the connection the host opened
+//! ([`crate::host::HostContext::kv_conn`]) — a database of its own, shared as
+//! `Arc<Mutex<_>>` with its `InterruptHandle` beside it.  Opening it, the busy
+//! timeout and `journal_mode` are the host's (see `host.rs`), and the ENV →
+//! config mapping is in `bridge/config.rs`.
 //!
-//! # Why this one call is driven to completion here
+//! # Registration is synchronous, and so is the schema
 //!
-//! `kv::register_with` is `async`, because creating the `__kv` table is one
-//! round trip to the connection thread.  Bridge registration is not: it runs
-//! inside a closure the Lua Isle executes on its own thread, and there is no
-//! async form of that closure to hand the future to.  So the future is driven
-//! here, and this is safe rather than merely convenient: the only thing it
-//! waits on is the *SQLite* isle's thread, which is already running and is not
-//! the thread being blocked.  It happens once, during host init, before any
-//! script has run.
+//! `register_with` creates the `__kv` table on the supplied connection if it
+//! is not there, which is a statement run right here, on the Isle's own thread
+//! during init — no future to drive, which is what the `futures-executor`
+//! `block_on` this module used to hold was for.  The host has already run
+//! [`mlua_batteries_sqlite::kv::init_schema`] against the same connection when
+//! it opened it, so in practice the DDL here finds the table present and does
+//! nothing; `CREATE TABLE IF NOT EXISTS` makes that harmless either way.
+//!
+//! Once registered, a `std.kv` call behaves like a `std.sql` one: the
+//! statement goes to `tokio::task::spawn_blocking`, the mutex is taken inside
+//! that closure, and the Lua VM yields rather than waiting.
 
 use mlua::prelude::*;
 use mlua_batteries_sqlite::sql::SqlConfig;
@@ -34,11 +37,12 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let cfg = SqlConfig {
         query_timeout: super::config::sql_query_timeout(),
     };
-    futures_executor::block_on(mlua_batteries_sqlite::kv::register_with(
+    mlua_batteries_sqlite::kv::register_with(
         lua,
-        ctx.kv_isle.clone(),
+        ctx.kv_conn.conn.clone(),
+        ctx.kv_conn.interrupt.clone(),
         cfg,
-    ))?;
+    )?;
 
     // Load std.kv.register_tools (LLM-facing helper; requires `tool` global).
     lua.load(include_str!("kv_tools.lua"))

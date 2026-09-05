@@ -16,7 +16,12 @@ default = ["mesh", "sqlite", "mcp-http"]
 mesh = ["dep:agent-mesh-core", "dep:agent-mesh-sdk"]
 # `sqlite` — SQLite-backed `sql.*` / `kv.*` / `ts.*` Lua bridges. Pulls in the
 # `mlua-batteries-sqlite` batteries (`std.sql` / `std.kv`), which since 0.5 are
-# a crate of their own rather than features of `mlua-batteries`.
+# a crate of their own rather than features of `mlua-batteries`. Since that
+# crate's 0.6 the host opens their `rusqlite::Connection`s itself and hands
+# each over as `Arc<Mutex<_>>` plus an `InterruptHandle`; the statements run
+# in `tokio::task::spawn_blocking`, so the VM thread still never waits on
+# SQLite. `std.ts` and the kernel store keep their own connection threads
+# (`rusqlite-isle`), which is the other way of honouring the same rule.
 #
 # It does not gate rusqlite: the kernel (`knl`) keeps every session's event log
 # in a SQLite table — a file for a durable session, an in-memory database for
@@ -25,7 +30,7 @@ mesh = ["dep:agent-mesh-core", "dep:agent-mesh-sdk"]
 # session. So rusqlite / rusqlite-isle are ordinary dependencies below, and
 # this feature is what it always was for the *batteries*: the `sql.*` /
 # `kv.*` / `ts.*` Lua surface.
-sqlite = ["dep:mlua-batteries-sqlite", "dep:futures-executor"]
+sqlite = ["dep:mlua-batteries-sqlite"]
 # `mcp-http` — Streamable HTTP / SSE MCP transport (`mcp.connect_http`).
 # Forwards to agent-block-mcp's `mcp-http` feature (stdio transport is always on).
 mcp-http = ["agent-block-mcp/mcp-http"]
@@ -40,11 +45,10 @@ agent-block-mcp.workspace = true
 mlua.workspace = true
 mlua-isle.workspace = true
 mlua-batteries.workspace = true
-# The `std.sql` / `std.kv` batteries, behind the `sqlite` feature.
+# The `std.sql` / `std.kv` batteries, behind the `sqlite` feature. Both
+# registrations are synchronous (0.6), so nothing here has to drive a future
+# from the Isle's sync init closure.
 mlua-batteries-sqlite = { workspace = true, optional = true }
-# Drives `std.kv`'s async registration from the Lua Isle's sync closure; see
-# `bridge/kv.rs`. Behind `sqlite` because that is its only caller.
-futures-executor = { workspace = true, optional = true }
 mlua-pkg.workspace = true
 agent-mesh-core = { workspace = true, optional = true }
 agent-mesh-sdk = { workspace = true, optional = true }
@@ -52,10 +56,12 @@ llm-extract.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 # Not optional: the kernel's event store is a SQLite table in every build
-# (see the `sqlite` feature note above). `rusqlite-isle` owns the connection —
-# on its own thread, with the transaction, retry and cancellation behaviour the
-# store used to hand-roll — and `rusqlite` supplies the types its closures are
-# written in. Both come from the cluster `mlua-batteries-sqlite` builds on, so
+# (see the `sqlite` feature note above). `rusqlite-isle` owns that connection
+# and the `std.ts` one — each on its own thread, with the transaction, retry
+# and cancellation behaviour the store used to hand-roll — and `rusqlite`
+# supplies the types its closures are written in, plus the `Connection` /
+# `InterruptHandle` the host opens for `std.sql` / `std.kv` and hands to the
+# batteries. Both come from the cluster `mlua-batteries-sqlite` builds on, so
 # there is one libsqlite3-sys in the graph.
 rusqlite = { workspace = true }
 rusqlite-isle = { workspace = true }

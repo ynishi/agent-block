@@ -31,11 +31,17 @@
 //!
 //! The bridge holds no connection and takes no lock. What it holds is a
 //! [`rusqlite_isle::AsyncIsle`] — a handle to the thread that owns the
-//! connection, the same shape `std.sql` and `std.kv` sit on. A `std.ts` call is
-//! therefore a closure sent to that thread and a result *awaited*: every one of
-//! them is an `mlua` async function, so the Lua VM yields while SQLite works
-//! and goes on driving its other coroutines. Nothing here blocks the VM thread
-//! on the OS, and nothing spawns a blocking task to hide that it does.
+//! connection, the same shape the kernel's event store sits on. A `std.ts`
+//! call is therefore a closure sent to that thread and a result *awaited*:
+//! every one of them is an `mlua` async function, so the Lua VM yields while
+//! SQLite works and goes on driving its other coroutines.
+//!
+//! `std.sql` and `std.kv` reach the same place by the other route: their
+//! connection is host-owned and shared (`Arc<Mutex<_>>`), and each statement
+//! runs in `tokio::task::spawn_blocking` with the lock taken inside that
+//! closure. Both satisfy the rule this file's tests are written against — the
+//! VM thread hands the work off and yields — and the difference is only where
+//! the waiting happens: a connection thread here, the blocking pool there.
 //!
 //! Argument validation (tag keys, `bucket_ms` / `limit` / `offset` bounds,
 //! JSON encoding of values) is CPU work over Lua values and stays on the VM
@@ -905,10 +911,14 @@ mod tests {
     /// async function of its own — for the *whole* time an append is waiting
     /// on a write lock another connection is holding.
     ///
-    /// Before this round the bridge took a `Mutex<Connection>` and pushed the
-    /// statement through `spawn_blocking`; the lock and the DDL were the VM
-    /// thread's, so a contended write parked it and the ticker counted nothing
-    /// until the lock was released.
+    /// Before this round the bridge held a `Mutex<Connection>` and locked it
+    /// *on the VM thread* before handing the statement to `spawn_blocking`,
+    /// and ran its DDL there too — so a contended write parked the VM and the
+    /// ticker counted nothing until the lock was released. The shared
+    /// connection is not what was wrong with that: `std.sql` and `std.kv` run
+    /// on one, and pass this same property, because the lock is taken inside
+    /// the blocking closure and the schema is the host's. What was wrong was
+    /// waiting for either on the thread the VM runs on.
     ///
     /// # Test categories
     ///

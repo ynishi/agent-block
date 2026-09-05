@@ -159,9 +159,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// a thread its own store had already stopped could not take it.
 ///
 /// So the drivers are parked here instead: one collection per host run, shut
-/// down once at the end of it, exactly as the `sql` / `kv` connection threads
-/// are.  Cheap to clone (an `Arc`), because every site that opens a store
-/// needs to reach it.
+/// down once at the end of it, exactly as the `std.ts` connection thread is.
+/// Cheap to clone (an `Arc`), because every site that opens a store needs to
+/// reach it.
 ///
 /// The lock is a plain [`Mutex`] and is never held across an `.await`:
 /// [`IsleDrivers::shutdown`] takes the whole list out under the lock and

@@ -74,7 +74,6 @@ dependencies = [
  "agent-mesh-sdk",
  "async-trait",
  "dotenvy",
- "futures-executor",
  "landlock",
  "libc",
  "llm-extract",
@@ -1727,9 +1726,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-batteries"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd5f8d324e5f47a3b443fdf6581234d1ad7dd8be1023e9bb2a90e6335a557b41"
+checksum = "6b6ff2b7e7d0e98caf1954704daf2e3f2288777548e7e0fad0a639dac7ef2d95"
 dependencies = [
  "globset",
  "mlua",
@@ -1741,14 +1740,13 @@ dependencies = [
 
 [[package]]
 name = "mlua-batteries-sqlite"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a259b403be697445a75940e127deddc3fff352186979b19b8e5b8e74b0ea1d"
+checksum = "edfd74fc399f22d84d78f31f989248394ddb1ddf82fbb9a8269ce9b7fff45d1b"
 dependencies = [
  "mlua",
  "mlua-batteries",
  "rusqlite",
- "rusqlite-isle",
  "serde_json",
  "tokio",
  "tracing",
