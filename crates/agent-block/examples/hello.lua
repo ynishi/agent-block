@@ -1,7 +1,7 @@
 -- hello.lua — Anthropic Messages API via http.request
 --
 -- Usage:
---   ANTHROPIC_API_KEY=sk-... agent-block -s scripts/hello.lua
+--   ANTHROPIC_API_KEY=sk-... agent-block -s crates/agent-block/examples/hello.lua
 
 local api_key = std.env.get("ANTHROPIC_API_KEY")
 if not api_key then

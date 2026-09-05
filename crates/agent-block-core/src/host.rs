@@ -108,7 +108,7 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
 /// [`EMBEDDED_LIBS`] stays shadowable.
 ///
 /// Checked by [`check_sealed_modules`] at host start, against the same
-/// filesystem roots [`build_blocks_roots`] hands to the require registry. A
+/// filesystem roots [`lib_roots`] hands to the require registry. A
 /// sealed name found there fails the run; `AGENT_BLOCK_UNSEAL=1` downgrades
 /// the refusal to a `warn!` for work on the kernel itself. Reading a sealed
 /// module is not shadowing it: `require("embedded.knl")` always resolves to
@@ -131,8 +131,8 @@ const SEALED: &[&str] = &[
 /// Prefix under which every embedded module is `require`-able a second time.
 ///
 /// `require("embedded.agent")` is the embedded `agent` whatever
-/// `project_root/blocks/agent/init.lua` says, which is what lets a project
-/// block shadow a module and still delegate to the one it replaced:
+/// `project_root/lib/agent/init.lua` says, which is what lets a project
+/// module shadow an embedded one and still delegate to the one it replaced:
 ///
 /// ```lua
 /// local base = require("embedded.agent")
@@ -325,49 +325,60 @@ pub fn inspect_tools(config: &BlockConfig) -> Vec<ToolMeta> {
     out
 }
 
-/// Build the `blocks/` portion of `package.path` from filesystem locations.
+/// Filesystem roots that `require` searches for libraries, highest priority
+/// first. Only existing directories are returned.
 ///
-/// Priority (highest first):
-/// 1. `project_root/blocks/` — user-customisable, overrides embedded StdPkg
-/// 2. `exe_dir/blocks/`      — development hot-reload (next to the binary)
+/// 1. `project_root/lib/` — the project's own modules
+/// 2. `$AGENT_BLOCK_HOME/lib/` (default `~/.agent-block/lib/`) — the user's
+///    modules, shared by every project on the machine
 ///
-/// Returns a semicolon-terminated string ready to prepend to `package.path`,
-/// or an empty string when no `blocks/` directories are found.
-fn build_blocks_path(project_root: &Path) -> String {
-    let mut out = String::new();
+/// The embedded sources come after these, and the script's own directory
+/// before them; both are wired in [`build_isle_init`].
+///
+/// `lib/` and `blocks/` are two directories on purpose. `blocks/` holds
+/// entry points — scripts the CLI `--block` flag and `agent-block mcp` run
+/// by name — and is never on the require path, so a helper dropped beside
+/// a block does not become a callable block, and a block cannot be
+/// `require`d as if it were a module. A module that starts as a helper
+/// inside a project's `lib/` moves to the user's `lib/` and then upstream
+/// (into [`EMBEDDED_LIBS`]) without renaming: each tier resolves the same
+/// name, and the first one that has it wins.
+///
+/// `AGENT_BLOCK_HOME` being unresolvable (no `HOME`) only drops the user
+/// tier; it is not an error here because the kv / sql / ts bridges report
+/// that condition already, on the paths they actually need.
+pub fn lib_roots(project_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
 
-    // 1. project_root/blocks/
-    let project_blocks = project_root.join("blocks");
-    if project_blocks.is_dir() {
-        let pb = project_blocks.to_string_lossy();
-        out.push_str(&format!("{pb}/?.lua;{pb}/?/init.lua;"));
+    let project_lib = project_root.join("lib");
+    if project_lib.is_dir() {
+        out.push(project_lib);
     }
 
-    // 2. exe_dir/blocks/
-    match std::env::current_exe() {
-        Ok(exe) => {
-            if let Some(exe_dir) = exe.parent() {
-                let exe_blocks = exe_dir.join("blocks");
-                if exe_blocks.is_dir() {
-                    let eb = exe_blocks.to_string_lossy();
-                    out.push_str(&format!("{eb}/?.lua;{eb}/?/init.lua;"));
-                }
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "current_exe() failed; skipping exe_dir/blocks/ from package.path");
+    if let Ok(home) = crate::bridge::config::base_dir() {
+        let user_lib = home.join("lib");
+        if user_lib.is_dir() {
+            out.push(user_lib);
         }
     }
 
     out
 }
 
-/// Filesystem roots that `require` searches, highest priority first.
+/// Filesystem roots that hold entry points — blocks run by name — highest
+/// priority first. Only existing directories are returned.
 ///
-/// Same two locations [`build_blocks_path`] encodes into `package.path`,
-/// returned as roots so they can also be handed to `mlua_pkg::FsResolver`
-/// (which takes a directory, not a `?.lua` pattern).
-fn build_blocks_roots(project_root: &Path) -> Vec<PathBuf> {
+/// 1. `project_root/blocks/`
+/// 2. `$AGENT_BLOCK_HOME/blocks/` (default `~/.agent-block/blocks/`)
+///
+/// The tiers mirror [`lib_roots`] so that a script and the modules it needs
+/// live side by side at each level: `blocks/summarize.lua` next to
+/// `lib/summarize_util.lua`, in the project or in the user's home. A block is
+/// `<name>.lua` or `<name>/init.lua` directly under one of these roots; what
+/// is in them is never `require`d, and what is in `lib/` is never run. The
+/// CLI (`--block <name>`) and `agent-block mcp` both resolve names through
+/// these roots, so the same file is the same block on both surfaces.
+pub fn block_roots(project_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     let project_blocks = project_root.join("blocks");
@@ -375,20 +386,25 @@ fn build_blocks_roots(project_root: &Path) -> Vec<PathBuf> {
         out.push(project_blocks);
     }
 
-    match std::env::current_exe() {
-        Ok(exe) => {
-            if let Some(exe_dir) = exe.parent() {
-                let exe_blocks = exe_dir.join("blocks");
-                if exe_blocks.is_dir() {
-                    out.push(exe_blocks);
-                }
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "current_exe() failed; skipping exe_dir/blocks/ from require roots");
+    if let Ok(home) = crate::bridge::config::base_dir() {
+        let user_blocks = home.join("blocks");
+        if user_blocks.is_dir() {
+            out.push(user_blocks);
         }
     }
 
+    out
+}
+
+/// Render `roots` as a semicolon-terminated `package.path` prefix, trying
+/// `<name>.lua` before `<name>/init.lua` under each root — the same order
+/// `mlua_pkg::FsResolver` uses, so the two resolution paths agree.
+fn package_path_prefix(roots: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for root in roots {
+        let r = root.to_string_lossy();
+        out.push_str(&format!("{r}/?.lua;{r}/?/init.lua;"));
+    }
     out
 }
 
@@ -408,7 +424,7 @@ fn require_candidates(root: &Path, name: &str) -> [PathBuf; 2] {
 /// module.
 ///
 /// Runs once at host start, before any Isle exists, over exactly the roots the
-/// require registry is about to search — so a `blocks/knl/init.lua` stops the
+/// require registry is about to search — so a `lib/knl/init.lua` stops the
 /// run rather than quietly becoming the kernel. `AGENT_BLOCK_UNSEAL=1` turns
 /// the refusal into a `warn!`; it exists for work on the kernel itself and is
 /// documented as such.
@@ -1118,8 +1134,8 @@ where
 fn build_isle_init(
     script_name: String,
     script_dir: String,
-    blocks_paths: String,
-    blocks_roots: Vec<PathBuf>,
+    lib_paths: String,
+    lib_roots: Vec<PathBuf>,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
@@ -1172,20 +1188,22 @@ fn build_isle_init(
         }
 
         // ── package.path ──────────────────────────────────────────────
-        // Priority: script_dir > project_root/blocks/ > exe_dir/blocks/ > default
+        // Priority: script_dir > project_root/lib/ > $AGENT_BLOCK_HOME/lib/ > default
         let package: mlua::Table = lua.globals().get("package")?;
         let current_path: String = package.get("path")?;
         let new_path =
-            format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{blocks_paths}{current_path}");
+            format!("{script_dir}/?.lua;{script_dir}/?/init.lua;{lib_paths}{current_path}");
         package.set("path", new_path)?;
 
         // ── require resolution — mlua-pkg Registry ────────────────────
         // One priority chain instead of two parallel mechanisms:
         //
-        //   script_dir/  >  project_root/blocks/  >  exe_dir/blocks/  >  embedded
+        //   script_dir/  >  project_root/lib/  >  $AGENT_BLOCK_HOME/lib/  >  embedded
         //
         // with one name space held out of it: `embedded.<name>` resolves from
-        // memory and only from memory (see below).
+        // memory and only from memory (see below). `blocks/` directories are
+        // deliberately absent: they hold entry points, not modules (see
+        // `lib_roots`).
         //
         // which is exactly the order `package.path` + the old trailing
         // searcher produced. The Registry hook installs at the FRONT of
@@ -1202,7 +1220,7 @@ fn build_isle_init(
         // order (`mlua_pkg::Registry::add`), so a resolver ahead of the
         // filesystem ones is the only way to say "this name comes from memory,
         // whatever is on disk": a project that happens to have an
-        // `blocks/embedded/agent.lua` cannot make `require("embedded.agent")`
+        // `lib/embedded/agent.lua` cannot make `require("embedded.agent")`
         // mean something else, which would turn the delegation idiom into a
         // second override. Every key here carries the prefix, so no
         // unprefixed name is affected by the position.
@@ -1217,7 +1235,7 @@ fn build_isle_init(
         registry.add(aliases);
 
         let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
-        fs_roots.extend(blocks_roots.iter().cloned());
+        fs_roots.extend(lib_roots.iter().cloned());
         for root in fs_roots {
             // Symlink-aware, not the plain constructor: this repo's own
             // `blocks/agent` is a symlink into `crates/agent-block-core/blocks/`,
@@ -1239,7 +1257,7 @@ fn build_isle_init(
         }
 
         // Embedded sources baked in at compile time — lowest priority, so a
-        // filesystem copy of `blocks/agent/init.lua` still overrides it.
+        // filesystem copy of `lib/agent/init.lua` still overrides it.
         let mut memory = mlua_pkg::resolvers::MemoryResolver::new();
         for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
             memory = memory.add(*name, *source);
@@ -1276,8 +1294,8 @@ fn build_isle_init(
 async fn spawn_handler_isle(
     script_name: String,
     script_dir: String,
-    blocks_paths: String,
-    blocks_roots: Vec<PathBuf>,
+    lib_paths: String,
+    lib_roots: Vec<PathBuf>,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
@@ -1285,8 +1303,8 @@ async fn spawn_handler_isle(
     let init = build_isle_init(
         script_name,
         script_dir,
-        blocks_paths,
-        blocks_roots,
+        lib_paths,
+        lib_roots,
         prompt,
         context,
         extra_globals,
@@ -1604,8 +1622,8 @@ struct SpawnedIsles {
 async fn spawn_isles(
     script_name: &str,
     script_dir: &str,
-    blocks_paths: &str,
-    blocks_roots: &[PathBuf],
+    lib_paths: &str,
+    lib_roots: &[PathBuf],
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: &HashMap<String, serde_json::Value>,
@@ -1613,8 +1631,8 @@ async fn spawn_isles(
     let (isle, driver) = AsyncIsle::spawn(build_isle_init(
         script_name.to_string(),
         script_dir.to_string(),
-        blocks_paths.to_string(),
-        blocks_roots.to_vec(),
+        lib_paths.to_string(),
+        lib_roots.to_vec(),
         prompt.clone(),
         context.clone(),
         extra_globals.clone(),
@@ -1627,8 +1645,8 @@ async fn spawn_isles(
     let (handler_isle, handler_driver) = spawn_handler_isle(
         script_name.to_string(),
         script_dir.to_string(),
-        blocks_paths.to_string(),
-        blocks_roots.to_vec(),
+        lib_paths.to_string(),
+        lib_roots.to_vec(),
         prompt,
         context,
         extra_globals.clone(),
@@ -2062,8 +2080,8 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // `Arc<AsyncIsle>`, which is available only after `AsyncIsle::spawn`
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
-    let blocks_paths = build_blocks_path(&project_root);
-    let blocks_roots = build_blocks_roots(&project_root);
+    let lib_roots = lib_roots(&project_root);
+    let lib_paths = package_path_prefix(&lib_roots);
 
     // The seal, checked here because here is where the roots are known and
     // still before an Isle exists: a project that would replace the kernel is
@@ -2071,7 +2089,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // side was declared against. Same roots, same order, as the require
     // registry the init closure builds below.
     let require_roots: Vec<PathBuf> = std::iter::once(script_dir_pathbuf.clone())
-        .chain(blocks_roots.iter().cloned())
+        .chain(lib_roots.iter().cloned())
         .collect();
     check_sealed_modules(&require_roots)?;
 
@@ -2087,8 +2105,8 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     } = spawn_isles(
         &script_name,
         &script_dir,
-        &blocks_paths,
-        &blocks_roots,
+        &lib_paths,
+        &lib_roots,
         prompt,
         context,
         &config.extra_globals,

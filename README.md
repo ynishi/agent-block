@@ -89,7 +89,10 @@ checksums are attached to each release for direct download.
 
 ```sh
 # Basic
-agent-block --script scripts/hello.lua
+agent-block --script crates/agent-block/examples/hello.lua
+
+# A registered block, by name (see "Blocks and libraries" below)
+agent-block --block summarize --prompt "Summarise the README"
 
 # With project context
 agent-block --script scripts/test_fcloop.lua --project .
@@ -123,14 +126,48 @@ Both flags also accept environment variables as fallback:
 | `--prompt` | `AGENT_BLOCK_PROMPT` |
 | `-c / --context` | `AGENT_BLOCK_CONTEXT` |
 
+## Blocks and libraries
+
+Two directories, two jobs, at two tiers:
+
+```text
+<project>/blocks/<name>.lua | <name>/init.lua   entry points — run by name
+<project>/lib/<name>.lua    | <name>/init.lua   modules     — require("<name>")
+~/.agent-block/blocks/…                          the user's blocks, every project
+~/.agent-block/lib/…                             the user's modules, every project
+                                                 (`$AGENT_BLOCK_HOME` moves the pair)
+```
+
+A **block** is a script the host runs for the one value it returns. It is
+callable by name — `agent-block --block <name>` from a shell, `run_block` over
+MCP — and the two surfaces share one registry: `<project>/blocks/` then
+`$AGENT_BLOCK_HOME/blocks/`, the project winning a clash. A **module** is what
+a block `require`s: `script_dir` → `<project>/lib/` → `$AGENT_BLOCK_HOME/lib/`
+→ embedded, first hit wins. Nothing crosses: a file in `blocks/` cannot be
+required, a file in `lib/` is never run by name, so a helper dropped beside a
+block does not become a callable block by accident.
+
+The working shape is a script that grows a library:
+
+```text
+blocks/summarize.lua              write it, run it: agent-block -b summarize
+lib/summarize_util.lua            pull the reusable part out; require("summarize_util")
+~/.agent-block/lib/summarize_util.lua   mv it here when a second project wants it
+crates/agent-block-core/blocks/lib/…    upstream, once it is general (EMBEDDED_LIBS)
+```
+
+The file and its `require` name never change on the way up; each tier
+resolves the same name. `--project` names the project root only (`.env`, the
+sandbox write root, the kernel database) — it is not a library path.
+
 ## Serving blocks over MCP
 
-`agent-block mcp` serves a directory of `.lua` blocks to an MCP client as one
+`agent-block mcp` serves the registered blocks to an MCP client as one
 `run_block` tool. The same scripts the CLI runs become callable from an agent
 that speaks MCP, without that agent knowing where they live:
 
 ```sh
-agent-block mcp --block-dir ./blocks
+agent-block mcp --project .
 ```
 
 ```json
@@ -138,11 +175,14 @@ agent-block mcp --block-dir ./blocks
   "mcpServers": {
     "agent-block": {
       "command": "agent-block",
-      "args": ["mcp", "--block-dir", "/abs/path/to/blocks", "--project", "/abs/path/to/project"]
+      "args": ["mcp", "--project", "/abs/path/to/project"]
     }
   }
 }
 ```
+
+That serves `<project>/blocks/` and `~/.agent-block/blocks/`; `--block-dir
+<dir>` (repeatable) adds a directory that lives elsewhere.
 
 A block runs against its own model with its own credentials, so its LLM turns
 never enter the calling agent's context — only its return value does. That is
@@ -170,10 +210,11 @@ carry the tool's `prompt` / `context` arguments, exactly as the CLI flags do.
 | resource `agent-block://blocks` | the registry as JSON |
 | resource `agent-block://blocks/<name>` | one block's source |
 
-Only `.lua` files directly inside a `--block-dir` are callable, and the
-directories are re-scanned per request — a new block is callable as soon as the
-file lands, without restarting the server. A block's leading `--` comment is
-what the caller reads as its description, so it is worth writing.
+A block is `<name>.lua` or `<name>/init.lua` directly inside a block root;
+nothing deeper, and nothing under `lib/`, is callable. The roots are re-scanned
+per request — a new block is callable as soon as the file lands, without
+restarting the server. A block's leading `--` comment is what the caller reads
+as its description, so it is worth writing.
 
 A Lua error comes back as a failed tool call carrying the message. A block that
 ran and concluded "no" should return normally and say so in its JSON: the two
@@ -485,27 +526,28 @@ Storage: `AGENT_BLOCK_HOME/ts.sqlite` (override via `AGENT_BLOCK_TS_PATH`; `:mem
 
 ### Embedded blocks: four layers
 
-The `blocks/` directory is baked into the binary, so `require("agent")` works after
-`cargo install` with no path configuration. A filesystem copy of a module normally wins
-over the embedded one — but the four layers below differ in whether that is the intended
-way to change them.
+The crate's `blocks/` directory is baked into the binary, so `require("agent")` works
+after `cargo install` with no path configuration. A filesystem copy of a module in a
+`lib/` tier normally wins over the embedded one — but the four layers below differ in
+whether that is the intended way to change them.
 
 | layer | modules | how to change it |
 |---|---|---|
 | kernel + declaration | `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | **Sealed** — a filesystem copy fails the run rather than replacing the module. The kernel is one thing across Rust and Lua, held together by declaration tests a Lua-side replacement would pass while meaning something else. Change it upstream. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning, for work on the kernel itself and not for shipping. |
 | shell packs | `policy`, `supervisor` | Do not shadow: a pack is a value you hand to `knl.device` or consult in your own loop, not a registry the host reads. Write your own pack beside them and pass that. For a partial change, delegate through `embedded.<name>`. |
-| consumers | `agent`, `compile_loop`, `coding_agent` | Copy-on-write is the intended way — drop your own `blocks/agent/init.lua` in the project root and it is the `agent` your scripts get. For a partial change, delegate through `embedded.<name>`. |
+| consumers | `agent`, `compile_loop`, `coding_agent` | Copy-on-write is the intended way — drop your own `lib/agent/init.lua` in the project root (or `~/.agent-block/lib/`) and it is the `agent` your scripts get. For a partial change, delegate through `embedded.<name>`. |
 | utilities | `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Shadowing works, but `knl_adapter` requires `llm_proto` and `mcp_tools`, so replacing either replaces a sealed module's dependency. Prefer delegation. |
 
 Resolution order, highest priority first: the script's own directory →
-`project_root/blocks/` → `exe_dir/blocks/` → embedded. The seal is checked once at start
-over those filesystem roots, before the script runs; the error names the module and the
-file that would have replaced it.
+`project_root/lib/` → `$AGENT_BLOCK_HOME/lib/` → embedded. `blocks/` directories are
+not on it (see [Blocks and libraries](#blocks-and-libraries)). The seal is checked once
+at start over those filesystem roots, before the script runs; the error names the module
+and the file that would have replaced it.
 
 Delegation — a shadowing module reaching the one it replaced:
 
 ```lua
--- project_root/blocks/agent/init.lua
+-- project_root/lib/agent/init.lua
 local base = require("embedded.agent")
 local M = setmetatable({}, { __index = base })
 function M.run(opts) print("OVERRIDE"); return base.run(opts) end
@@ -514,16 +556,17 @@ return M
 
 `embedded.<name>` resolves from memory and only from memory: every embedded module is
 registered a second time under that prefix, ahead of the filesystem roots, so a
-`blocks/embedded/` directory cannot stand in for it. The alias evaluates the embedded
+`lib/embedded/` directory cannot stand in for it. The alias evaluates the embedded
 source under its own name, which means `require("agent")` (yours) and
 `require("embedded.agent")` (the base) are two tables — exactly the pair the idiom needs.
 It exists for sealed modules too: `require("embedded.knl")` reads the kernel, which is
 fine; replacing it is what the seal refuses.
 
-Promotion runs the other way. A block that starts as `project_root/blocks/<name>/init.lua`
-and proves general becomes an embedded lib by a change upstream — the same file, moved
-under `crates/agent-block-core/blocks/` and listed in `EMBEDDED_LIBS`. Projects still
-carrying their own copy keep resolving to it until they delete it.
+Promotion runs the other way. A module that starts as `project_root/lib/<name>/init.lua`
+moves to `~/.agent-block/lib/` when a second project wants it, and becomes an embedded
+lib by a change upstream once it proves general — the same file, moved under
+`crates/agent-block-core/blocks/` and listed in `EMBEDDED_LIBS`. Projects still carrying
+their own copy keep resolving to it until they delete it.
 
 ### agent (StdPkg — `require("agent")`)
 
@@ -684,7 +727,7 @@ Key behaviours:
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` is handed exactly four keys — `turn_number`, `content`, `tool_calls`, `usage` — and returning `false` from it stops the run. What the server did with context editing is not among them; the response that carried it is in the session log as `llm_response`.
-- `agent` is a consumer block: a local `blocks/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
+- `agent` is a consumer block: a local `lib/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 - No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
 ### compile_loop (StdPkg — `require("compile_loop")`)
@@ -701,7 +744,7 @@ the model can decline to call cannot carry "it compiles".
 `max_iters` is the session's grant, so the iteration ceiling is the budget: the beat
 past it stops with nothing called.
 
-Embedded, and a consumer block: `blocks/compile_loop/init.lua` in the project root replaces
+Embedded, and a consumer block: `lib/compile_loop/init.lua` in the project root replaces
 it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 
 ```lua
@@ -868,7 +911,7 @@ is no loop here — iterations, the verify, the give-up gates and the result sha
 `compile_loop`'s. `edit_mode`, `tool_mode` and `extra_tools` are not on the facade's opts;
 a caller who wants them calls `compile_loop.make` directly.
 
-Embedded, and a consumer block: `blocks/coding_agent/init.lua` in the project root replaces
+Embedded, and a consumer block: `lib/coding_agent/init.lua` in the project root replaces
 it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 
 **`coding_agent.run(opts)`** — run the loop directly from Lua (facade over `compile_loop`).
