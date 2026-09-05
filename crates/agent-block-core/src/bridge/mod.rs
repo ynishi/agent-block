@@ -76,7 +76,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     #[cfg(feature = "sqlite")]
     sql::register(lua, ctx)?;
     #[cfg(feature = "sqlite")]
-    ts::register(lua, ctx)?;
+    ts::register(lua, ctx.ts_isle.clone())?;
     task::register(lua)?;
     Ok(())
 }

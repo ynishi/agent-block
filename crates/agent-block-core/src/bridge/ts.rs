@@ -1,8 +1,9 @@
 //! `std.ts.*` — SQLite-backed time-series primitive.
 //!
 //! This is the only storage bridge whose implementation is in-tree
-//! (mlua_batteries provides no TSDB module). DDL / append / query /
-//! last all live in this file.
+//! (mlua_batteries provides no TSDB module). Append / query / last all live in
+//! this file; the DDL below is run by the host, on the connection thread,
+//! before the VM is handed the isle.
 //!
 //! Backend: single `ts` table in `ts.sqlite` (or `:memory:`).
 //!
@@ -26,16 +27,43 @@
 //!   so that callers can append plain numeric metrics or structured MCP
 //!   envelope payloads without loss (dual-type contract, Crux §3.8 C1)
 //!
-//! See `bridge/config.rs` for the ENV → path mapping (`AGENT_BLOCK_TS_PATH`).
+//! # The connection lives on a thread of its own, and the VM never waits on it
+//!
+//! The bridge holds no connection and takes no lock. What it holds is a
+//! [`rusqlite_isle::AsyncIsle`] — a handle to the thread that owns the
+//! connection, the same shape `std.sql` and `std.kv` sit on. A `std.ts` call is
+//! therefore a closure sent to that thread and a result *awaited*: every one of
+//! them is an `mlua` async function, so the Lua VM yields while SQLite works
+//! and goes on driving its other coroutines. Nothing here blocks the VM thread
+//! on the OS, and nothing spawns a blocking task to hide that it does.
+//!
+//! Argument validation (tag keys, `bucket_ms` / `limit` / `offset` bounds,
+//! JSON encoding of values) is CPU work over Lua values and stays on the VM
+//! thread, where the Lua state is; only the statement crosses to the isle.
+//!
+//! The isle is opened in `host.rs` — path, busy timeout, `journal_mode` and
+//! [`SCHEMA_DDL`] are the host's, applied on the connection thread before the
+//! isle takes its first job — and its driver is drained at host shutdown
+//! beside the `sql` / `kv` ones. See `bridge/config.rs` for the ENV → path
+//! mapping (`AGENT_BLOCK_TS_PATH`).
 
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mlua::prelude::*;
-use rusqlite::Connection;
+use rusqlite_isle::AsyncIsle;
 
 use crate::bridge::{json_to_lua, lua_to_json};
-use crate::host::HostContext;
+
+/// The `ts` table and its `(series, ts)` index.
+///
+/// `IF NOT EXISTS` throughout, so opening a fresh database and reopening one an
+/// earlier run wrote take the same path. Run by the host in the isle's init
+/// closure: it is one statement batch that waits on SQLite, and waiting is the
+/// connection thread's business, not the VM's.
+pub const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS ts \
+     (series TEXT NOT NULL, ts INTEGER NOT NULL, \
+      tags TEXT, value TEXT NOT NULL); \
+     CREATE INDEX IF NOT EXISTS idx_ts_series_ts ON ts(series, ts);";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +85,32 @@ fn validate_tag_key(key: &str) -> LuaResult<()> {
             "ts tag key must be [a-zA-Z0-9_]+".to_string(),
         ))
     }
+}
+
+/// Collect a Lua tag table into `(key, comparison-string)` pairs.
+///
+/// Runs on the VM thread: it reads Lua values, so it cannot travel with the
+/// job. Keys are validated here for the same reason — the check is the reason
+/// the key may be interpolated into a `json_extract` path at all.
+///
+/// # Errors
+///
+/// Returns `LuaError` if a key fails [`validate_tag_key`] or a value cannot be
+/// converted to JSON.
+fn collect_tag_filter(lua: &Lua, tbl: LuaTable) -> LuaResult<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for p in tbl.pairs::<String, LuaValue>() {
+        let (k, v) = p?;
+        validate_tag_key(&k)?;
+        // Encode tag value as a JSON string for comparison.
+        let v_json = lua_to_json(lua, v).map_err(LuaError::external)?;
+        let v_str = match &v_json {
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string(other).map_err(LuaError::external)?,
+        };
+        pairs.push((k, v_str));
+    }
+    Ok(pairs)
 }
 
 /// Build the SQL query string for `std.ts.query`.
@@ -192,55 +246,35 @@ fn build_query_sql(
 
 /// Register the `std.ts` bridge into `lua`.
 ///
-/// On first call this function:
-/// 1. Acquires the ts SQLite connection and runs the DDL (idempotent —
-///    `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`).
-/// 2. Installs `std.ts.append`, `std.ts.query`, and `std.ts.last` as async
+/// Registration itself waits on nothing: the table it installs holds three
+/// async functions closing over `isle`, and the DDL has already run on the
+/// connection thread by the time the host has an isle to pass here.
+///
+/// 1. Installs `std.ts.append`, `std.ts.query`, and `std.ts.last` as async
 ///    Lua functions.
-/// 3. Loads `ts_tools.lua` to provide `std.ts.register_tools`.
+/// 2. Loads `ts_tools.lua` to provide `std.ts.register_tools`.
 ///
 /// # Arguments
 ///
 /// - `lua`: the Lua state to register into (main Isle or handler Isle)
-/// - `ctx`: host context providing `ts_conn` (Arc<Mutex<Connection>>)
+/// - `isle`: handle to the thread that owns the `ts` connection
 ///
 /// # Errors
 ///
-/// Returns a `LuaError` if:
-/// - the Mutex is poisoned (`ts conn lock poisoned`)
-/// - the DDL `execute_batch` fails (`ts DDL: <rusqlite error>`)
-/// - the `std` global is not a table or any `std.ts` assignment fails
-pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
-    // ── DDL init ─────────────────────────────────────────────────────────
-    let conn = ctx.ts_conn.lock().map_err(|e| {
-        tracing::warn!(error = %e, "ts conn lock poisoned during DDL");
-        LuaError::external(format!("ts conn lock poisoned: {e}"))
-    })?;
-
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ts \
-         (series TEXT NOT NULL, ts INTEGER NOT NULL, \
-          tags TEXT, value TEXT NOT NULL); \
-         CREATE INDEX IF NOT EXISTS idx_ts_series_ts ON ts(series, ts);",
-    )
-    .map_err(|e| {
-        tracing::warn!(error = %e, "ts ddl failed");
-        LuaError::external(format!("ts DDL: {e}"))
-    })?;
-
-    drop(conn);
-
+/// Returns a `LuaError` if the `std` global is not a table, any `std.ts`
+/// assignment fails, or `ts_tools.lua` fails to load.
+pub fn register(lua: &Lua, isle: AsyncIsle) -> LuaResult<()> {
     // ── Build std.ts table ────────────────────────────────────────────────
     let ts_tbl = lua.create_table()?;
 
     // ── std.ts.append ─────────────────────────────────────────────────────
-    ts_tbl.set("append", make_append(lua, Arc::clone(&ctx.ts_conn))?)?;
+    ts_tbl.set("append", make_append(lua, isle.clone())?)?;
 
     // ── std.ts.query ──────────────────────────────────────────────────────
-    ts_tbl.set("query", make_query(lua, Arc::clone(&ctx.ts_conn))?)?;
+    ts_tbl.set("query", make_query(lua, isle.clone())?)?;
 
     // ── std.ts.last ───────────────────────────────────────────────────────
-    ts_tbl.set("last", make_last(lua, Arc::clone(&ctx.ts_conn))?)?;
+    ts_tbl.set("last", make_last(lua, isle)?)?;
 
     // ── Install into std global ───────────────────────────────────────────
     let std_table: LuaTable = lua.globals().get("std")?;
@@ -258,18 +292,23 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 
 /// Create the `std.ts.append(series, value, tags?, at?)` async function.
 ///
+/// The row is written inside the isle's `IMMEDIATE` transaction
+/// ([`AsyncIsle::call_write`]), so a contended write waits out the busy
+/// timeout on the connection thread while the VM goes on running.
+///
 /// # Arguments
 ///
 /// - `lua`: the Lua state
-/// - `conn`: shared SQLite connection
+/// - `isle`: handle to the connection thread
 ///
 /// # Errors
 ///
-/// Returns `LuaError` on Mutex poison, rusqlite error, or JSON encode error.
-fn make_append(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction> {
+/// Returns `LuaError` on tag key validation failure, JSON encode error, a
+/// failed insert, or a closed / cancelled isle.
+fn make_append(lua: &Lua, isle: AsyncIsle) -> LuaResult<LuaFunction> {
     lua.create_async_function(
         move |lua, (series, value, tags, at): (String, LuaValue, Option<LuaTable>, Option<i64>)| {
-            let conn = Arc::clone(&conn);
+            let isle = isle.clone();
             async move {
                 tracing::trace!(series = %series, "ts.append");
 
@@ -283,10 +322,10 @@ fn make_append(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction
                         .as_millis() as i64
                 });
 
-                // ── encode value before entering spawn_blocking ───────────
-                // lua_to_json requires &Lua (Lua VM access) and cannot be
-                // called inside spawn_blocking.  Serialise to String here
-                // in the async context, then move the String into the closure.
+                // ── encode value before handing the job to the isle ───────
+                // lua_to_json requires &Lua (Lua VM access) and the job runs
+                // on the connection thread.  Serialise to String here, on the
+                // VM thread, then move the String into the closure.
                 let value_json = lua_to_json(&lua, value).map_err(LuaError::external)?;
                 let value_str = serde_json::to_string(&value_json).map_err(LuaError::external)?;
 
@@ -305,20 +344,22 @@ fn make_append(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction
                     }
                 };
 
-                // ── blocking SQLite insert ────────────────────────────────
-                let result = tokio::task::spawn_blocking(move || {
-                    let conn = conn
-                        .lock()
-                        .map_err(|e| format!("ts conn lock poisoned: {e}"))?;
-                    conn.execute(
-                        "INSERT INTO ts (series, ts, tags, value) VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![series, ts_ms, tags_str, value_str],
-                    )
-                    .map_err(|e| format!("ts append: {e}"))?;
-                    Ok::<(), String>(())
-                })
-                .await
-                .map_err(|e| LuaError::external(format!("ts task: {e}")))?;
+                // ── the insert, on the connection thread ──────────────────
+                // The inner `Result<_, String>` carries the statement's own
+                // message; the outer one is the isle's (closed, cancelled,
+                // panicked), which is why the two are unwrapped separately.
+                let result: Result<(), String> = isle
+                    .call_write(move |tx| {
+                        Ok(tx
+                            .execute(
+                                "INSERT INTO ts (series, ts, tags, value) VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![series, ts_ms, tags_str, value_str],
+                            )
+                            .map(|_| ())
+                            .map_err(|e| format!("ts append: {e}")))
+                    })
+                    .await
+                    .map_err(|e| LuaError::external(format!("ts task: {e}")))?;
 
                 result.map_err(|e| {
                     tracing::warn!(error = %e, "ts append failed");
@@ -355,10 +396,11 @@ fn make_append(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction
 ///
 /// # Errors
 ///
-/// Returns `LuaError` on validation failure, Mutex poison, or rusqlite error.
-fn make_query(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction> {
+/// Returns `LuaError` on validation failure, a failed statement, or a closed /
+/// cancelled isle.
+fn make_query(lua: &Lua, isle: AsyncIsle) -> LuaResult<LuaFunction> {
     lua.create_async_function(move |lua, (series, opts): (String, Option<LuaTable>)| {
-        let conn = Arc::clone(&conn);
+        let isle = isle.clone();
         async move {
             tracing::trace!(series = %series, "ts.query");
 
@@ -413,95 +455,79 @@ fn make_query(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction>
             }
 
             // ── extract and validate tags filter ──────────────────────
-            // Tags k/v pairs are collected into (key, json_string) pairs
-            // before entering spawn_blocking so we can access the Lua VM.
+            // Tags k/v pairs are collected into (key, json_string) pairs on
+            // the VM thread, where the Lua values are.
             let tags_filter: Vec<(String, String)> = match opts
                 .as_ref()
                 .and_then(|t| t.get::<Option<LuaTable>>("tags").ok().flatten())
             {
                 None => vec![],
-                Some(tbl) => {
-                    let mut pairs = Vec::new();
-                    for p in tbl.pairs::<String, LuaValue>() {
-                        let (k, v) = p?;
-                        validate_tag_key(&k)?;
-                        // Encode tag value as a JSON string for comparison.
-                        let v_json = lua_to_json(&lua, v).map_err(LuaError::external)?;
-                        let v_str = match &v_json {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => serde_json::to_string(other).map_err(LuaError::external)?,
-                        };
-                        pairs.push((k, v_str));
-                    }
-                    pairs
-                }
+                Some(tbl) => collect_tag_filter(&lua, tbl)?,
             };
 
             let tag_keys: Vec<String> = tags_filter.iter().map(|(k, _)| k.clone()).collect();
-            let tag_values: Vec<String> = tags_filter.iter().map(|(_, v)| v.clone()).collect();
+            let tag_values: Vec<String> = tags_filter.into_iter().map(|(_, v)| v).collect();
 
             // ── build SQL ─────────────────────────────────────────────
             let agg_ref = agg.as_deref();
             let sql = build_query_sql(agg_ref, bucket_ms, &tag_keys, limit, offset)
                 .map_err(LuaError::external)?;
 
-            // ── execute in blocking thread ────────────────────────────
+            // ── execute on the connection thread ──────────────────────
             let is_single_agg = agg.is_some() && bucket_ms.is_none();
             let is_last_single = agg.as_deref() == Some("last") && bucket_ms.is_none();
             let is_bucketed = agg.is_some() && bucket_ms.is_some();
 
-            let rows_raw: Result<Vec<Vec<Option<String>>>, String> =
-                tokio::task::spawn_blocking(move || {
-                    let conn = conn
-                        .lock()
-                        .map_err(|e| format!("ts conn lock poisoned: {e}"))?;
+            let rows_raw: Result<Vec<Vec<Option<String>>>, String> = isle
+                .call(move |conn| {
+                    Ok((|| -> Result<Vec<Vec<Option<String>>>, String> {
+                        let mut stmt = conn
+                            .prepare(&sql)
+                            .map_err(|e| format!("ts query prepare: {e}"))?;
 
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("ts query prepare: {e}"))?;
+                        // Build the parameter list dynamically.
+                        // Order: series, from_ts, to_ts, [tag_values…]
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                            vec![Box::new(series), Box::new(from_ts), Box::new(to_ts)];
+                        for v in tag_values {
+                            params.push(Box::new(v));
+                        }
+                        // Note: bucket_ms is embedded as a literal in the SQL
+                        // (see build_query_sql path 3), so no additional params
+                        // are needed for the bucketed-aggregate case.
 
-                    // Build the parameter list dynamically.
-                    // Order: series, from_ts, to_ts, [tag_values…], [bucket_ms × 2 if bucketed]
-                    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                        vec![Box::new(series), Box::new(from_ts), Box::new(to_ts)];
-                    for v in tag_values {
-                        params.push(Box::new(v));
-                    }
-                    // Note: bucket_ms is embedded as a literal in the SQL
-                    // (see build_query_sql path 3), so no additional params
-                    // are needed for the bucketed-aggregate case.
+                        let param_refs: Vec<&dyn rusqlite::ToSql> =
+                            params.iter().map(|p| p.as_ref()).collect();
 
-                    let param_refs: Vec<&dyn rusqlite::ToSql> =
-                        params.iter().map(|p| p.as_ref()).collect();
+                        let col_count = stmt.column_count();
+                        let rows: Vec<Vec<Option<String>>> = stmt
+                            .query(param_refs.as_slice())
+                            .map_err(|e| format!("ts query exec: {e}"))?
+                            .mapped(|row| {
+                                let mut cols = Vec::with_capacity(col_count);
+                                for i in 0..col_count {
+                                    // Use Value (not String) to handle INTEGER and REAL columns.
+                                    // rusqlite's FromSql for String only accepts Text/Blob and
+                                    // returns FromSqlError::InvalidType for INTEGER or REAL values
+                                    // (e.g. the `ts` column, COUNT(*), SUM, AVG, bucket_ts).
+                                    let v: rusqlite::types::Value =
+                                        row.get::<_, rusqlite::types::Value>(i)?;
+                                    let s = match v {
+                                        rusqlite::types::Value::Null => None,
+                                        rusqlite::types::Value::Integer(n) => Some(n.to_string()),
+                                        rusqlite::types::Value::Real(f) => Some(f.to_string()),
+                                        rusqlite::types::Value::Text(s) => Some(s),
+                                        rusqlite::types::Value::Blob(_) => None,
+                                    };
+                                    cols.push(s);
+                                }
+                                Ok(cols)
+                            })
+                            .collect::<Result<_, _>>()
+                            .map_err(|e| format!("ts query row: {e}"))?;
 
-                    let col_count = stmt.column_count();
-                    let rows: Vec<Vec<Option<String>>> = stmt
-                        .query(param_refs.as_slice())
-                        .map_err(|e| format!("ts query exec: {e}"))?
-                        .mapped(|row| {
-                            let mut cols = Vec::with_capacity(col_count);
-                            for i in 0..col_count {
-                                // Use Value (not String) to handle INTEGER and REAL columns.
-                                // rusqlite's FromSql for String only accepts Text/Blob and
-                                // returns FromSqlError::InvalidType for INTEGER or REAL values
-                                // (e.g. the `ts` column, COUNT(*), SUM, AVG, bucket_ts).
-                                let v: rusqlite::types::Value =
-                                    row.get::<_, rusqlite::types::Value>(i)?;
-                                let s = match v {
-                                    rusqlite::types::Value::Null => None,
-                                    rusqlite::types::Value::Integer(n) => Some(n.to_string()),
-                                    rusqlite::types::Value::Real(f) => Some(f.to_string()),
-                                    rusqlite::types::Value::Text(s) => Some(s),
-                                    rusqlite::types::Value::Blob(_) => None,
-                                };
-                                cols.push(s);
-                            }
-                            Ok(cols)
-                        })
-                        .collect::<Result<_, _>>()
-                        .map_err(|e| format!("ts query row: {e}"))?;
-
-                    Ok(rows)
+                        Ok(rows)
+                    })())
                 })
                 .await
                 .map_err(|e| LuaError::external(format!("ts task: {e}")))?;
@@ -606,39 +632,26 @@ fn make_query(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction>
 /// # Arguments
 ///
 /// - `lua`: the Lua state
-/// - `conn`: shared SQLite connection
+/// - `isle`: handle to the connection thread
 ///
 /// # Errors
 ///
-/// Returns `LuaError` on tag key validation failure, Mutex poison, or rusqlite
-/// error.
-fn make_last(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction> {
+/// Returns `LuaError` on tag key validation failure, a failed statement, or a
+/// closed / cancelled isle.
+fn make_last(lua: &Lua, isle: AsyncIsle) -> LuaResult<LuaFunction> {
     lua.create_async_function(move |lua, (series, tags): (String, Option<LuaTable>)| {
-        let conn = Arc::clone(&conn);
+        let isle = isle.clone();
         async move {
             tracing::trace!(series = %series, "ts.last");
 
             // ── extract and validate tags filter ──────────────────────
             let tags_filter: Vec<(String, String)> = match tags {
                 None => vec![],
-                Some(tbl) => {
-                    let mut pairs = Vec::new();
-                    for p in tbl.pairs::<String, LuaValue>() {
-                        let (k, v) = p?;
-                        validate_tag_key(&k)?;
-                        let v_json = lua_to_json(&lua, v).map_err(LuaError::external)?;
-                        let v_str = match &v_json {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => serde_json::to_string(other).map_err(LuaError::external)?,
-                        };
-                        pairs.push((k, v_str));
-                    }
-                    pairs
-                }
+                Some(tbl) => collect_tag_filter(&lua, tbl)?,
             };
 
             let tag_keys: Vec<String> = tags_filter.iter().map(|(k, _)| k.clone()).collect();
-            let tag_values: Vec<String> = tags_filter.iter().map(|(_, v)| v.clone()).collect();
+            let tag_values: Vec<String> = tags_filter.into_iter().map(|(_, v)| v).collect();
 
             // Build tag_clauses for WHERE.
             let tag_clauses: String = tag_keys
@@ -652,37 +665,38 @@ fn make_last(lua: &Lua, conn: Arc<Mutex<Connection>>) -> LuaResult<LuaFunction> 
                  ORDER BY ts DESC, rowid DESC LIMIT 1"
             );
 
-            let row_raw: Result<Option<(i64, String, Option<String>)>, String> =
-                tokio::task::spawn_blocking(move || {
-                    let conn = conn
-                        .lock()
-                        .map_err(|e| format!("ts conn lock poisoned: {e}"))?;
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("ts last prepare: {e}"))?;
+            type LastRow = Option<(i64, String, Option<String>)>;
+            let row_raw: Result<LastRow, String> = isle
+                .call(move |conn| {
+                    Ok((|| -> Result<LastRow, String> {
+                        let mut stmt = conn
+                            .prepare(&sql)
+                            .map_err(|e| format!("ts last prepare: {e}"))?;
 
-                    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                        vec![Box::new(series), Box::new(i64::MIN), Box::new(i64::MAX)];
-                    for v in tag_values {
-                        params.push(Box::new(v));
-                    }
-                    let param_refs: Vec<&dyn rusqlite::ToSql> =
-                        params.iter().map(|p| p.as_ref()).collect();
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                            vec![Box::new(series), Box::new(i64::MIN), Box::new(i64::MAX)];
+                        for v in tag_values {
+                            params.push(Box::new(v));
+                        }
+                        let param_refs: Vec<&dyn rusqlite::ToSql> =
+                            params.iter().map(|p| p.as_ref()).collect();
 
-                    let mut rows = stmt
-                        .query(param_refs.as_slice())
-                        .map_err(|e| format!("ts last query: {e}"))?;
+                        let mut rows = stmt
+                            .query(param_refs.as_slice())
+                            .map_err(|e| format!("ts last query: {e}"))?;
 
-                    if let Some(row) = rows.next().map_err(|e| format!("ts last row: {e}"))? {
-                        let ts_val: i64 = row.get(0).map_err(|e| format!("ts last ts col: {e}"))?;
-                        let value_str: String =
-                            row.get(1).map_err(|e| format!("ts last value col: {e}"))?;
-                        let tags_str: Option<String> =
-                            row.get(2).map_err(|e| format!("ts last tags col: {e}"))?;
-                        Ok(Some((ts_val, value_str, tags_str)))
-                    } else {
-                        Ok(None)
-                    }
+                        if let Some(row) = rows.next().map_err(|e| format!("ts last row: {e}"))? {
+                            let ts_val: i64 =
+                                row.get(0).map_err(|e| format!("ts last ts col: {e}"))?;
+                            let value_str: String =
+                                row.get(1).map_err(|e| format!("ts last value col: {e}"))?;
+                            let tags_str: Option<String> =
+                                row.get(2).map_err(|e| format!("ts last tags col: {e}"))?;
+                            Ok(Some((ts_val, value_str, tags_str)))
+                        } else {
+                            Ok(None)
+                        }
+                    })())
                 })
                 .await
                 .map_err(|e| LuaError::external(format!("ts task: {e}")))?;
@@ -787,12 +801,7 @@ mod tests {
         // Safety: open_in_memory() only fails on internal SQLite allocation
         // errors which cannot occur in a controlled test environment.
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE ts (series TEXT NOT NULL, ts INTEGER NOT NULL, \
-             tags TEXT, value TEXT NOT NULL); \
-             CREATE INDEX idx_ts_series_ts ON ts(series, ts);",
-        )
-        .expect("ddl");
+        conn.execute_batch(SCHEMA_DDL).expect("ddl");
 
         // Insert three rows with identical ts=1000 ms.
         conn.execute(
@@ -857,12 +866,7 @@ mod tests {
         // Safety: open_in_memory() only fails on internal SQLite allocation
         // errors which cannot occur in a controlled test environment.
         let conn = Connection::open_in_memory().expect("open in-memory sqlite");
-        conn.execute_batch(
-            "CREATE TABLE ts (series TEXT NOT NULL, ts INTEGER NOT NULL, \
-             tags TEXT, value TEXT NOT NULL); \
-             CREATE INDEX idx_ts_series_ts ON ts(series, ts);",
-        )
-        .expect("ddl");
+        conn.execute_batch(SCHEMA_DDL).expect("ddl");
 
         for v in ["\"first\"", "\"second\"", "\"third\""] {
             conn.execute(
@@ -889,5 +893,144 @@ mod tests {
             value, "\"third\"",
             "last path returned non-last INSERT value: {value}"
         );
+    }
+
+    // -- the rule this round exists for -------------------------------------
+
+    /// **A slow `std.ts.append` does not stop the VM.**
+    ///
+    /// This is the property the round is about, so it is asserted directly
+    /// rather than inferred from the shape of the code: a second coroutine on
+    /// the same Lua state goes on running — advancing a counter through an
+    /// async function of its own — for the *whole* time an append is waiting
+    /// on a write lock another connection is holding.
+    ///
+    /// Before this round the bridge took a `Mutex<Connection>` and pushed the
+    /// statement through `spawn_blocking`; the lock and the DDL were the VM
+    /// thread's, so a contended write parked it and the ticker counted nothing
+    /// until the lock was released.
+    ///
+    /// # Test categories
+    ///
+    /// - (T1) Happy path: the append lands once the lock is released.
+    /// - (T2) Concurrency: ticks keep landing while the write waits.
+    #[test]
+    fn a_slow_write_does_not_block_another_coroutine_on_the_same_vm() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// How long the blocker holds the write lock.
+        const HELD: Duration = Duration::from_millis(300);
+        /// How long each tick takes, so ~60 fit inside `HELD`.
+        const TICK: Duration = Duration::from_millis(5);
+        /// The floor the assertion uses.  Far below what should actually
+        /// happen (~60), because the point is "the VM kept running", not a
+        /// measurement of how fast it ran.
+        const AT_LEAST: usize = 5;
+        /// Long enough that the contended write waits the lock out rather
+        /// than failing — the host's default is the same order.
+        const BUSY: Duration = Duration::from_secs(5);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the VM to yield into");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ts.sqlite");
+
+        // The isle the host would open: the DDL runs on its thread, before
+        // the VM is handed the handle.
+        let (isle, driver) = rt.block_on(async {
+            AsyncIsle::builder()
+                .thread_name("ts-test")
+                .busy_timeout(BUSY)
+                .spawn(&path, |conn| conn.execute_batch(SCHEMA_DDL))
+                .await
+                .expect("open the ts isle")
+        });
+
+        let lua = Lua::new();
+        lua.globals()
+            .set("std", lua.create_table().expect("std table"))
+            .expect("set std");
+        register(&lua, isle).expect("register std.ts");
+
+        // `tick()` waits like any async bridge function does; `ticks()` reads
+        // the counter without waiting for anything.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ticks);
+        let tick = lua
+            .create_async_function(move |_, ()| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    tokio::time::sleep(TICK).await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+            })
+            .expect("create tick");
+        lua.globals().set("tick", tick).expect("set tick");
+        let counter = Arc::clone(&ticks);
+        let read_ticks = lua
+            .create_function(move |_, ()| Ok(counter.load(Ordering::Relaxed)))
+            .expect("create ticks");
+        lua.globals().set("ticks", read_ticks).expect("set ticks");
+
+        // A second connection holds the write lock for `HELD`, on a thread of
+        // its own so the test can go on driving the VM.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker_path = path.clone();
+        let blocker = std::thread::spawn(move || {
+            let conn = Connection::open(&blocker_path).expect("open the blocker");
+            conn.busy_timeout(HELD).expect("busy timeout");
+            conn.execute_batch("BEGIN EXCLUSIVE")
+                .expect("take the write lock");
+            locked_tx.send(()).expect("announce the lock");
+            std::thread::sleep(HELD);
+            conn.execute_batch("ROLLBACK").expect("release the lock");
+        });
+        locked_rx.recv().expect("the lock was taken");
+
+        // Two coroutines, driven together on the VM's runtime: one blocked on
+        // the write, one counting.  `during` is the number of ticks that
+        // landed while the append was waiting.
+        let during: usize = rt.block_on(async {
+            let writer = lua
+                .load(
+                    r#"
+                    local before = ticks()
+                    std.ts.append("slow", 1)
+                    return ticks() - before
+                "#,
+                )
+                .eval_async::<usize>();
+            let ticker = lua.load(r#"for _ = 1, 200 do tick() end"#).exec_async();
+            // Both futures poll the same Lua state on this one thread, which
+            // is exactly what the VM's own LocalSet does with its coroutines.
+            let (written, _ticked) = tokio::join!(writer, ticker);
+            written.expect("the append eventually lands")
+        });
+
+        blocker.join().expect("the blocker thread");
+
+        assert!(
+            during >= AT_LEAST,
+            "the VM stopped while the write was waiting: only {during} tick(s) ran"
+        );
+
+        // And the write itself landed once the lock was released.
+        let value: i64 = rt.block_on(async {
+            lua.load(r#"return std.ts.last("slow").value"#)
+                .eval_async::<i64>()
+                .await
+                .expect("the slow append landed")
+        });
+        assert_eq!(value, 1, "the row the append wrote");
+
+        drop(lua);
+        rt.block_on(driver.shutdown())
+            .expect("the connection thread shut down cleanly");
     }
 }
