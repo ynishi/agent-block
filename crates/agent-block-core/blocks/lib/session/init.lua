@@ -24,6 +24,18 @@
 -- Trim / compaction / summarisation are caller's responsibility:
 --   session.save(id, trim_last_n(r.messages, 20))
 --
+-- Why this is not `knl.resume`
+--   The kernel's log IS the thread, so resuming a kernel session by id would be
+--   the smaller mechanism — but the two ids are not the same id. This block's
+--   is the CALLER's name for a conversation ("default", `$AGENT_ID`), chosen
+--   before anything is opened; `knl.resume{ session = <id> }` takes the id the
+--   kernel MINTED when the stream was opened. Bridging the two needs
+--   `agent.run` to hand its session id back and to accept one to resume into,
+--   and `agent.run`'s result shape is closed with no field for it. Until that
+--   exists this stays what it is: `agent.run`'s `messages` out, into `std.kv`,
+--   and back in as `history` — which the run then lays down as events, so the
+--   thread the kernel folds is the thread the caller saved.
+--
 -- API:
 --   session.load(id)           → table (messages array; {} when absent)
 --   session.save(id, msgs)     → void

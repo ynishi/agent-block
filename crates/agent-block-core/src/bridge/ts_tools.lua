@@ -36,7 +36,7 @@ std.ts.register_tools = function(opts)
                 properties = {
                     series = {
                         type = "string",
-                        description = "Logical stream name (e.g. \"cpu_load\", \"agent_events\").",
+                        description = 'Logical stream name (e.g. "cpu_load", "agent_events").',
                     },
                     value = {
                         description = "Data point payload: a number or a table (JSON-encoded).",
@@ -65,7 +65,7 @@ std.ts.register_tools = function(opts)
                 .. "{ ts, value, tags }. Single-aggregate mode (`agg` without `bucket_ms`): "
                 .. "returns one row { value } with the scalar result. Time-bucketed mode "
                 .. "(`agg` + `bucket_ms`): each row is { bucket_ts, value }. "
-                .. "Supported agg values: \"count\", \"sum\", \"avg\", \"last\". "
+                .. 'Supported agg values: "count", "sum", "avg", "last". '
                 .. "sum/avg interpret `value` as a number via CAST; rows with object values "
                 .. "contribute 0.0. Tag filtering uses a conjunction of json_extract checks "
                 .. "(AND semantics); rows without tags never match a tag filter.",
@@ -87,8 +87,7 @@ std.ts.register_tools = function(opts)
                             },
                             to = {
                                 type = "integer",
-                                description = "End of time range (Unix ms, inclusive). "
-                                    .. "Default: end of time.",
+                                description = "End of time range (Unix ms, inclusive). " .. "Default: end of time.",
                             },
                             tags = {
                                 type = "object",
@@ -98,8 +97,7 @@ std.ts.register_tools = function(opts)
                             },
                             agg = {
                                 type = "string",
-                                description = "Aggregation function: "
-                                    .. "\"count\" | \"sum\" | \"avg\" | \"last\".",
+                                description = "Aggregation function: " .. '"count" | "sum" | "avg" | "last".',
                                 enum = { "count", "sum", "avg", "last" },
                             },
                             bucket_ms = {
@@ -140,8 +138,7 @@ std.ts.register_tools = function(opts)
                     },
                     tags = {
                         type = "object",
-                        description = "Optional AND-filter for tag matching. "
-                            .. "Keys: [a-zA-Z0-9_]+.",
+                        description = "Optional AND-filter for tag matching. " .. "Keys: [a-zA-Z0-9_]+.",
                         additionalProperties = { type = "string" },
                     },
                 },
@@ -159,11 +156,7 @@ std.ts.register_tools = function(opts)
         local d = defs[op]
         if d then
             local name = prefix .. op
-            tool.register(
-                name,
-                { description = d.description, input_schema = d.input_schema },
-                d.handler
-            )
+            tool.register(name, { description = d.description, input_schema = d.input_schema }, d.handler)
             table.insert(registered, name)
         end
     end

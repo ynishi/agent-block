@@ -21,12 +21,18 @@ std.kv.register_tools = function(opts)
             props.ns = { type = "string", description = "Namespace (logical group)" }
             table.insert(required, "ns")
         end
-        for k, v in pairs(extra_props) do props[k] = v end
-        for _, r in ipairs(extra_required) do table.insert(required, r) end
+        for k, v in pairs(extra_props) do
+            props[k] = v
+        end
+        for _, r in ipairs(extra_required) do
+            table.insert(required, r)
+        end
         local schema = { type = "object", properties = props }
         -- Empty Lua tables serialize as JSON objects, but Anthropic expects
         -- `required` to be a JSON array. Omit the field when empty.
-        if #required > 0 then schema.required = required end
+        if #required > 0 then
+            schema.required = required
+        end
         return schema
     end
 
@@ -42,7 +48,7 @@ std.kv.register_tools = function(opts)
         set = {
             description = "Store a value in the agent's local key-value store (JSON-file backed, persists across runs, agent-private). Overwrites any existing value at the same key.",
             input_schema = build_schema({
-                key   = { type = "string" },
+                key = { type = "string" },
                 value = { description = "Value to store (string / number / bool / table)" },
             }, { "key", "value" }),
             handler = function(input)

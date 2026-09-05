@@ -141,8 +141,9 @@ describe("compile_loop.shapes.tool_output", function()
         expect(ok).to.equal(true)
     end)
 
-    -- The Counter WF-A defence, as something that fails rather than something
-    -- that is written down next to the fields it is about.
+    -- The context defence, as something that fails rather than something that
+    -- is written down next to the fields it is about: the run's transcript
+    -- belongs in the session log, not in the caller's context.
     it("rejects leaked code", function()
         local ok = check.check({
             ok = true,

@@ -17,7 +17,7 @@
 --   * make_summary            — the sentence each give-up reason produces
 --   * build_failure_msg       — full mode's feedback turn
 --   * build_verify_msg        — diff mode's feedback turn
---   * filter_for_tool_output  — code / transcript stripping (Counter WF-A)
+--   * filter_for_tool_output  — code / transcript stripping (the output filter)
 --   * collect_modified_paths  — the sorted path list the result carries
 --   * with_line_numbers       — the numbering fs_edit addresses lines by
 --   * read_file_range_handler — the guards, before it opens anything
@@ -26,6 +26,8 @@
 --   * pair_failed             — a returned rejection counts as a failure
 --   * verify_signature        — what stagnation compares beats by
 --   * port_conf               — disable_thinking, and everything else verbatim
+--   * beat_edits              — the count off the log, and its refusal to take
+--                               one from a read the kernel's row cap cut short
 --
 -- The runtime injects std / log / tool as globals; the harness has none, and
 -- none of the helpers below reads one.
@@ -131,8 +133,69 @@ describe("compile_loop.make_summary", function()
         expect(summary(false, 2, 10, "llm_call")).to.equal("give-up: llm_call failed at iter 2/10")
     end)
 
+    it("reports the log-outgrew-a-read give-up in its own words", function()
+        expect(contains(summary(false, 4, 10, "log_truncated"), "outgrew one read at iter 4/10")).to.equal(true)
+    end)
+
     it("reports an unknown reason verbatim", function()
         expect(summary(false, 1, 10, "weird_reason")).to.equal("give-up: weird_reason")
+    end)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- beat_edits
+-- ─────────────────────────────────────────────────────────────────────────────
+
+describe("compile_loop.beat_edits", function()
+    local beat_edits = H.beat_edits
+
+    --- A session stand-in answering one method: the rows, and whether the
+    --- kernel's row cap cut the read short.
+    local function session_of(events, truncated)
+        return {
+            events = function()
+                return events, truncated
+            end,
+        }
+    end
+
+    --- One applied edit of `path`, as the pair the log records for it.
+    local function edit_pair(beat, call_id, path)
+        return {
+            { kind = "tool_call", beat = beat, data = { name = "fs_edit", call_id = call_id, args = { path = path } } },
+            { kind = "tool_result", beat = beat, data = { call_id = call_id, result = { ok = true } } },
+        }
+    end
+
+    it("counts the applied edits of the named beat and collects their paths", function()
+        local a, b = edit_pair("b1", "c1", "a.lua"), edit_pair("b1", "c2", "b.lua")
+        local other = edit_pair("b0", "c0", "old.lua")
+        local log = { other[1], other[2], a[1], a[2], b[1], b[2] }
+
+        local modified = {}
+        local applied, why = beat_edits(session_of(log, false), "b1", "fs_edit", modified)
+        expect(applied).to.equal(2)
+        expect(why).to.equal(nil)
+        expect(modified["a.lua"]).to.equal(true)
+        expect(modified["b.lua"]).to.equal(true)
+        expect(modified["old.lua"]).to.equal(nil)
+    end)
+
+    it("answers nil and a reason when the read hit the row cap — never a count of zero", function()
+        -- The cap counts forward, so what a truncated read is missing is the
+        -- END of the log: the beat asked about here. Reading it as "no edits
+        -- applied" would make the loop give up (or count a stagnation) over a
+        -- beat that edited every target, which is the worst answer available.
+        local pair = edit_pair("b1", "c1", "a.lua")
+        local modified = {}
+        local applied, why = beat_edits(session_of({ pair[1], pair[2] }, true), "b1", "fs_edit", modified)
+
+        expect(applied).to.equal(nil)
+        expect(type(why)).to.equal("string")
+        expect(contains(why, "longer than one read")).to.equal(true)
+        expect(contains(why, "2 events")).to.equal(true)
+        -- And nothing was collected on the way to refusing.
+        expect(next(modified)).to.equal(nil)
     end)
 end)
 

@@ -145,9 +145,9 @@ assert(tool_output.ok ~= nil, "FAIL: tool_output.ok is absent")
 assert(tool_output.iters ~= nil, "FAIL: tool_output.iters is absent")
 assert(tool_output.summary ~= nil, "FAIL: tool_output.summary is absent")
 
--- Counter WF-A: code / history must NOT appear in tool output
-assert(tool_output.code == nil, "Counter WF-A: code leaked to caller")
-assert(tool_output.history == nil, "Counter WF-A: history leaked to caller")
+-- code / history must NOT appear in tool output
+assert(tool_output.code == nil, "code leaked to caller")
+assert(tool_output.history == nil, "history leaked to caller")
 
 log.info(
     string.format(

@@ -66,7 +66,9 @@ local tok = std.task.cancel_token()
 print("token_initial=" .. tostring(tok:is_cancelled()))
 tok:cancel()
 print("token_after_cancel=" .. tostring(tok:is_cancelled()))
-local check_ok, check_err = pcall(function() tok:check() end)
+local check_ok, check_err = pcall(function()
+    tok:check()
+end)
 print("token_check_raises=" .. tostring((not check_ok) and tostring(check_err):find("cancelled") ~= nil))
 
 -- 7. scope error propagation: when the scope body errors, siblings are
@@ -93,7 +95,9 @@ print("sibling_cancelled_ok=" .. tostring(sibling_cancelled))
 -- 8. scope:spawn returns a Handle whose :join yields the function value.
 local joined
 std.task.scope(function(scope)
-    local h = scope:spawn(function() return 7 end)
+    local h = scope:spawn(function()
+        return 7
+    end)
     joined = h:join()
 end)
 print("scope_spawn_join=" .. tostring(joined))

@@ -26,19 +26,19 @@ local call_count = 0
 local function mock_runner(path)
     call_count = call_count + 1
     if call_count == 1 then
-        return {ok=false, stderr="forced fail iter 1", exit_code=1}
+        return { ok = false, stderr = "forced fail iter 1", exit_code = 1 }
     elseif call_count == 2 then
-        return {ok=false, stderr="forced fail iter 2", exit_code=1}
+        return { ok = false, stderr = "forced fail iter 2", exit_code = 1 }
     else
-        return {ok=true, stdout="", exit_code=0}
+        return { ok = true, stdout = "", exit_code = 0 }
     end
 end
 
 local td = compile_loop.make({
     runner = mock_runner,
-    llm = { provider="openai", base_url=base_url, api_key="dummy", model="x" }
+    llm = { provider = "openai", base_url = base_url, api_key = "dummy", model = "x" },
 })
-local result_json = td.handler({spec="emit a passing print statement", target_file=target_file})
+local result_json = td.handler({ spec = "emit a passing print statement", target_file = target_file })
 
 -- Double-gate assertion: Lua side verifies call_count, Rust side verifies
 -- the HTTP call counter on the mock server (both must equal 3).

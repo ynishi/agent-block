@@ -57,14 +57,10 @@ local ok_sql_b, err_sql_b = pcall(function()
 end)
 local err_sql_str = tostring(err_sql_b)
 print("sql_cancel_raises_b=" .. tostring(not ok_sql_b))
-print("sql_cancel_err_match=" .. tostring(
-    string.find(err_sql_str, "task cancelled during sql.query", 1, true) ~= nil
-))
+print("sql_cancel_err_match=" .. tostring(string.find(err_sql_str, "task cancelled during sql.query", 1, true) ~= nil))
 -- Regression guard: the pre-fix format "task cancelled during sql sql.*"
 -- (double "sql") must never reappear.
-print("sql_cancel_no_hybrid=" .. tostring(
-    string.find(err_sql_str, "during sql sql", 1, true) == nil
-))
+print("sql_cancel_no_hybrid=" .. tostring(string.find(err_sql_str, "during sql sql", 1, true) == nil))
 
 -- ─── 2. KV cancellation via task.with_timeout ──────────────────────────
 -- KV ops are normally sub-millisecond, so we exercise cancellation by
@@ -104,13 +100,9 @@ local ok_kv_b, err_kv_b = pcall(function()
 end)
 local err_kv_str = tostring(err_kv_b)
 print("kv_cancel_raises_b=" .. tostring(not ok_kv_b))
-print("kv_cancel_err_match=" .. tostring(
-    string.find(err_kv_str, "task cancelled during kv.set", 1, true) ~= nil
-))
+print("kv_cancel_err_match=" .. tostring(string.find(err_kv_str, "task cancelled during kv.set", 1, true) ~= nil))
 -- Regression guard: "during sql kv.*" must never reappear.
-print("kv_cancel_no_hybrid=" .. tostring(
-    string.find(err_kv_str, "during sql kv", 1, true) == nil
-))
+print("kv_cancel_no_hybrid=" .. tostring(string.find(err_kv_str, "during sql kv", 1, true) == nil))
 
 -- ─── 3. Top-level calls (no task scope) still work ────────────────────
 -- effective_token() returns None outside any scope → cancel arm never

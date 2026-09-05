@@ -10,7 +10,11 @@
 --   * text_of                  — text block concatenation (the run's answer string)
 --   * normalize_openai_response— OpenAI chat response → Anthropic-shape decode
 --   * convert_messages_to_openai — Anthropic-shape history → OpenAI-shape messages
---   * resolve_mcp_group        — _meta.group precedence over server_name
+--
+-- plus one that is not on that accessor:
+--   * agent._resolve_mcp_group — _meta.group precedence over server_name. The
+--     tool-set builders live on `agent._*` and only there; `build_tools_*.lua`
+--     and `resolve_mcp_group.lua` are the other fixtures on that surface.
 --
 -- Gone with the rewrite onto knl: the dump layer (normalize_dump_mode,
 -- sanitize_headers_for_dump, kv_escape, format_kv and the char/block counters
@@ -446,7 +450,9 @@ end)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 describe("agent.resolve_mcp_group", function()
-    local resolve = H.resolve_mcp_group
+    -- Reached through `agent._resolve_mcp_group`, which is its one surface:
+    -- `_test_helpers()` used to carry a second copy of the same function.
+    local resolve = agent._resolve_mcp_group
 
     it("uses _meta.group when it is a non-empty string", function()
         expect(resolve({ _meta = { group = "search" } }, "outline")).to.equal("search")

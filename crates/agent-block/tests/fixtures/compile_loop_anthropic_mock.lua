@@ -13,9 +13,9 @@ local call_count = 0
 local function mock_runner(path)
     call_count = call_count + 1
     if call_count == 1 then
-        return {ok=false, stderr="forced fail iter 1", exit_code=1}
+        return { ok = false, stderr = "forced fail iter 1", exit_code = 1 }
     else
-        return {ok=true, stdout="", exit_code=0}
+        return { ok = true, stdout = "", exit_code = 0 }
     end
 end
 
@@ -24,17 +24,16 @@ local td = compile_loop.make({
     llm = {
         provider = "anthropic",
         base_url = base_url,
-        api_key  = "dummy",
-        model    = "claude-haiku-mock",
+        api_key = "dummy",
+        model = "claude-haiku-mock",
     },
 })
 
 local result_json = td.handler({
-    spec        = "emit a passing print statement",
+    spec = "emit a passing print statement",
     target_file = target_file,
 })
 
-assert(call_count == 2,
-    "mock_runner must be called exactly 2 times, got " .. call_count)
+assert(call_count == 2, "mock_runner must be called exactly 2 times, got " .. call_count)
 
 print("COMPILE_LOOP_MOCK_PASS")

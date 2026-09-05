@@ -20,7 +20,7 @@ print("current_cancelled=" .. tostring(info_dump.cancelled))
 -- 3. coroutine driver with yield(ms) sleeps; total must be >= the sleep window.
 local t0 = std.time.millis()
 local h_cr = std.task.spawn(function()
-    coroutine.yield(30)  -- sleep 30ms
+    coroutine.yield(30) -- sleep 30ms
     return "coro_done"
 end, { driver = "coroutine" })
 local cr_val = h_cr:join()
@@ -31,14 +31,22 @@ print("coro_sleep_ok=" .. tostring(cr_elapsed >= 25))
 -- 4. coroutine driver with yield() (no arg) cooperatively yields N times
 --    then returns — ensures the driver handles nil yield values.
 local h_y = std.task.spawn(function()
-    for _ = 1, 5 do coroutine.yield() end
+    for _ = 1, 5 do
+        coroutine.yield()
+    end
     return 99
 end, { driver = "coroutine" })
 print("coro_yield_val=" .. tostring(h_y:join()))
 
 -- 5. Two coroutine-driven tasks run concurrently (each sleeps 30ms via yield).
-local c1 = std.task.spawn(function() coroutine.yield(30); return "x" end, { driver = "coroutine" })
-local c2 = std.task.spawn(function() coroutine.yield(30); return "y" end, { driver = "coroutine" })
+local c1 = std.task.spawn(function()
+    coroutine.yield(30)
+    return "x"
+end, { driver = "coroutine" })
+local c2 = std.task.spawn(function()
+    coroutine.yield(30)
+    return "y"
+end, { driver = "coroutine" })
 local tc0 = std.time.millis()
 local cx = c1:join()
 local cy = c2:join()
@@ -47,7 +55,9 @@ print("coro_concurrent_ok=" .. tostring(cx == "x" and cy == "y" and coro_concurr
 
 -- 6. Unknown driver string errors.
 local ok_driver, err_driver = pcall(function()
-    std.task.spawn(function() return 1 end, { driver = "bogus" })
+    std.task.spawn(function()
+        return 1
+    end, { driver = "bogus" })
 end)
 print("unknown_driver_rejected=" .. tostring((not ok_driver) and tostring(err_driver):find("unknown driver") ~= nil))
 

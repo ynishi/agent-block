@@ -37,7 +37,9 @@ std.task.sleep(300)
 
 print(string.format("UPDATE_HITS=%d", update_hits))
 assert(update_hits >= 1, "update_hits must be >= 1, got: " .. tostring(update_hits))
-assert(received_uri == "resource:///test-e2e",
-    "received_uri must be resource:///test-e2e, got: " .. tostring(received_uri))
+assert(
+    received_uri == "resource:///test-e2e",
+    "received_uri must be resource:///test-e2e, got: " .. tostring(received_uri)
+)
 
 print("FIXTURE_DONE")

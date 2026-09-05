@@ -36,12 +36,17 @@ print("v3=" .. tostring(v3))
 print("concurrent_ok=" .. tostring(concurrent_ms < 55))
 
 -- 4. name option propagates
-local h4 = std.task.spawn(function() return 1 end, { name = "worker" })
+local h4 = std.task.spawn(function()
+    return 1
+end, { name = "worker" })
 print("h4.name=" .. tostring(h4.name))
 h4:join()
 
 -- 5. elapsed() returns a number in ms
-local h5 = std.task.spawn(function() std.task.sleep(10); return 1 end)
+local h5 = std.task.spawn(function()
+    std.task.sleep(10)
+    return 1
+end)
 h5:join()
 local el = h5:elapsed()
 print("h5.elapsed_type=" .. type(el))

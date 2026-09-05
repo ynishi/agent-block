@@ -52,7 +52,7 @@ local function mock_runner(paths)
     for _, p in ipairs(paths) do
         local f = io.open(p, "r")
         if not f then
-            return {ok=false, stderr="cannot open " .. p, stdout="", exit_code=1}
+            return { ok = false, stderr = "cannot open " .. p, stdout = "", exit_code = 1 }
         end
         local content = f:read("*a") or ""
         f:close()
@@ -62,22 +62,22 @@ local function mock_runner(paths)
         end
     end
 
-    return {ok=all_ok, stdout=combined_stdout, stderr="", exit_code=all_ok and 0 or 1}
+    return { ok = all_ok, stdout = combined_stdout, stderr = "", exit_code = all_ok and 0 or 1 }
 end
 
 local td = compile_loop.make({
-    runner    = mock_runner,
+    runner = mock_runner,
     edit_mode = "diff",
     llm = {
         provider = "anthropic",
         base_url = base_url,
-        api_key  = "dummy",
-        model    = "claude-haiku-mock",
+        api_key = "dummy",
+        model = "claude-haiku-mock",
     },
 })
 
 local result_json = td.handler({
-    spec         = "change a-old to a-new and b-old to b-new",
+    spec = "change a-old to a-new and b-old to b-new",
     target_files = { file_a_path, file_b_path },
 })
 
@@ -88,22 +88,21 @@ local result = std.json.decode(result_json)
 assert(result.ok, "compile_loop must succeed in multi-file diff mode, got: " .. (result.summary or "?"))
 
 -- multi-file mode: modified_files must be a list of 2 paths.
-assert(type(result.modified_files) == "table",
-    "result.modified_files must be a table in multi-file mode")
-assert(#result.modified_files == 2,
-    "result.modified_files must contain 2 paths, got " .. #result.modified_files)
+assert(type(result.modified_files) == "table", "result.modified_files must be a table in multi-file mode")
+assert(#result.modified_files == 2, "result.modified_files must contain 2 paths, got " .. #result.modified_files)
 
 -- multi-file mode: artifact_path must be nil (not a single path).
-assert(result.artifact_path == nil,
-    "result.artifact_path must be nil in multi-file mode, got: " .. tostring(result.artifact_path))
+assert(
+    result.artifact_path == nil,
+    "result.artifact_path must be nil in multi-file mode, got: " .. tostring(result.artifact_path)
+)
 
 -- Verify each file was actually updated.
 for _, p in ipairs({ file_a_path, file_b_path }) do
     local f = assert(io.open(p, "r"))
     local content = f:read("*a") or ""
     f:close()
-    assert(content:find("new", 1, true),
-        "file " .. p .. " must contain 'new' after apply, got: " .. content)
+    assert(content:find("new", 1, true), "file " .. p .. " must contain 'new' after apply, got: " .. content)
 end
 
 print("COMPILE_LOOP_DIFF_MULTI_MOCK_PASS")

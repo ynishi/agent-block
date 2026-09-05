@@ -1,19 +1,37 @@
--- blocks/tools/coding_agent/init.lua — Thin backward-compatible facade over compile_loop.
+-- blocks/tools/coding_agent/init.lua — a facade over compile_loop.
 --
--- Primary surface is now compile_loop.make(conf) in blocks/tools/compile_loop/init.lua.
--- This module remains for callers that used coding_agent.run() / register_tool().
+-- The primary surface is `compile_loop.make(conf)`; this module remains for
+-- callers that used `coding_agent.run()` / `register_tool()`.
 --
--- NOTE: coding_agent.run() return shape is NOW:
---   { ok, iters, summary, failure_reason?, last_error?, artifact_path }
--- Fields "code" and "history" are NO LONGER returned (Q3 = A, breaking accepted).
--- Counter WF-A defence is maintained via filter_for_tool_output inside compile_loop.
+-- What it is
+--   Three things and nothing else: the two built-in runners (`"lua"` /
+--   `"cargo"`) that resolve a `runner_kind` string to a function, one call to
+--   `compile_loop.make`, and — in `register_tool` — the `tool.register` that
+--   `make` deliberately does not do. There is no loop here, no LLM wiring and
+--   no result shaping: `run` hands back what `compile_loop`'s handler answered,
+--   decoded.
+--
+-- What it does not do
+--   * No loop of its own. Iterations, the verify, the give-up gates and the
+--     result shape are all `compile_loop`'s; this file has no opinion on any
+--     of them.
+--   * No mode selection. `edit_mode` / `tool_mode` / `extra_tools` are not on
+--     the facade's opts — a caller who wants them calls `compile_loop.make`.
+--   * No transcript. `run` returns { ok, iters, summary, failure_reason?,
+--     last_error?, artifact_path }; `code` and `history` are not returned, and
+--     the closed shape inside compile_loop is what keeps them out.
+--
+-- Round-tripping through JSON: `compile_loop`'s handler answers a JSON string
+-- because it is a tool handler, and `run` decodes it. That is deliberate — it
+-- keeps the closed shape the only exit, so the facade cannot hand back a field
+-- the tool boundary would have filtered.
 
 local M = {}
 
 local cl = require("compile_loop")
 
 -- ============================================================
--- BUILTIN_RUNNERS — facade-local only (Issue §確定 5)
+-- BUILTIN_RUNNERS — facade-local only
 -- compile_loop itself does NOT have these; callers that pass runner_kind string
 -- get them resolved here before the function-only compile_loop API is invoked.
 --
@@ -90,39 +108,45 @@ local function resolve_runner(kind)
     return nil, "runner_kind must be a string or function, got: " .. type(kind)
 end
 
+-- The provider knobs the facade's flat opts carry, as the `conf.llm` table
+-- `compile_loop.make` takes. Listed rather than copied wholesale: the facade's
+-- opts are flat and mix its own keys (spec / target_file / runner / max_iters)
+-- with the LLM's, so which is which has to be said somewhere.
+local function llm_conf(opts)
+    return {
+        provider = opts.provider,
+        base_url = opts.base_url,
+        api_key = opts.api_key,
+        api_key_env = opts.api_key_env,
+        model = opts.model,
+        max_tokens = opts.max_tokens,
+        temperature = opts.temperature,
+        disable_thinking = opts.disable_thinking,
+        timeout = opts.timeout,
+    }
+end
+
 -- ============================================================
 -- M.run(opts) — thin facade (backward-compatible signature)
 -- ============================================================
 -- Return shape: { ok, iters, summary, failure_reason?, last_error?, artifact_path }
--- "code" and "history" are intentionally absent (Q3 = A).
+-- "code" and "history" are intentionally absent.
 function M.run(opts)
     assert(type(opts) == "table", "opts table required")
     assert(opts.target_file, "opts.target_file required")
     assert(opts.spec, "opts.spec required")
     assert(type(opts.runner) == "function", "opts.runner (function) required")
 
-    -- Build conf with all K-96 fields explicitly listed.
-    local conf = {
+    -- No `name`: the def is called, never registered, so what it is called
+    -- does not reach anything.
+    local td = cl.make({
         runner = opts.runner,
         lang = opts.lang,
         max_iters = opts.max_iters,
         system = opts.system,
         on_iter = opts.on_iter,
-        name = "compile_loop",
-        llm = {
-            provider = opts.provider,
-            base_url = opts.base_url,
-            api_key = opts.api_key,
-            api_key_env = opts.api_key_env,
-            model = opts.model,
-            max_tokens = opts.max_tokens,
-            temperature = opts.temperature,
-            disable_thinking = opts.disable_thinking,
-            timeout = opts.timeout,
-        },
-    }
-
-    local td = cl.make(conf)
+        llm = llm_conf(opts),
+    })
 
     -- handler expects the tool input shape: {spec, target_file, lang?}
     local raw_json = td.handler({
@@ -158,33 +182,20 @@ function M.register_tool(opts)
     assert(type(opts) == "table", "opts table required")
     assert(opts.runner_kind ~= nil, "opts.runner_kind required")
 
-    -- Resolve runner_kind → runner function (facade-local, Issue §確定 5).
+    -- Resolve runner_kind → runner function (facade-local).
     local runner, rerr = resolve_runner(opts.runner_kind)
     if not runner then
         error("coding_agent.register_tool: " .. tostring(rerr))
     end
 
-    -- Build conf with all K-96 fields explicitly listed.
-    local conf = {
+    local td = cl.make({
         runner = runner,
         lang = opts.lang,
         max_iters = opts.max_iters,
         system = opts.system,
         name = opts.name,
-        llm = {
-            provider = opts.provider,
-            base_url = opts.base_url,
-            api_key = opts.api_key,
-            api_key_env = opts.api_key_env,
-            model = opts.model,
-            max_tokens = opts.max_tokens,
-            temperature = opts.temperature,
-            disable_thinking = opts.disable_thinking,
-            timeout = opts.timeout,
-        },
-    }
-
-    local td = cl.make(conf)
+        llm = llm_conf(opts),
+    })
     tool.register(td.name, td.schema, td.handler)
     return td.name
 end

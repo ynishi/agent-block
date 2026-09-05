@@ -24,7 +24,9 @@ print("r1.note_is_nil=" .. tostring(r1.note == nil))
 -- Key must still be present in the row table (we didn't skip NULL anymore).
 local has_note_key = false
 for k, _ in pairs(r1) do
-    if k == "note" then has_note_key = true end
+    if k == "note" then
+        has_note_key = true
+    end
 end
 print("r1.has_note_key=" .. tostring(has_note_key))
 

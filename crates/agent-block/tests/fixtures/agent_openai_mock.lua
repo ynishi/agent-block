@@ -30,9 +30,6 @@ local result = agent.run({
 })
 
 assert(result.ok == true, "agent.run failed: " .. tostring(result.error))
-assert(
-    result.content ~= nil and result.content ~= "",
-    "content should not be empty"
-)
+assert(result.content ~= nil and result.content ~= "", "content should not be empty")
 print("OPENAI_MOCK_TOOL_DISPATCHED_OK")
 print(result.content)

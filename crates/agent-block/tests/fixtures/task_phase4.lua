@@ -67,12 +67,16 @@ print("b_inner_child_ran=" .. tostring(b_inner_child_ran))
 
 -- 3. Unknown opts key is rejected (M3).
 local ok3, err3 = pcall(function()
-    std.task.spawn(function() return 1 end, { drivr = "coroutine" })
+    std.task.spawn(function()
+        return 1
+    end, { drivr = "coroutine" })
 end)
 print("unknown_opts_rejected=" .. tostring((not ok3) and tostring(err3):find("unknown opts key") ~= nil))
 
 -- 4. sleep rejects +Infinity (H3).
-local ok4, err4 = pcall(function() std.task.sleep(1/0) end)
+local ok4, err4 = pcall(function()
+    std.task.sleep(1 / 0)
+end)
 print("sleep_rejects_inf=" .. tostring((not ok4) and tostring(err4):find("invalid duration") ~= nil))
 
 -- 5. coroutine sleep is cancel-aware: scope:cancel() breaks a long
@@ -91,28 +95,41 @@ print("coro_cancel_bounded=" .. tostring(cr_elapsed < 300))
 -- 6. parse_opts type / key validation.
 -- 6a. opts.name = <non-string> must be rejected with an opts.name-tagged error.
 local ok_nname, err_nname = pcall(function()
-    std.task.spawn(function() return 1 end, { name = 123 })
+    std.task.spawn(function()
+        return 1
+    end, { name = 123 })
 end)
 print("opts_name_non_string_rejected=" .. tostring((not ok_nname) and tostring(err_nname):find("opts.name") ~= nil))
 
 -- 6b. opts.driver = <non-string> must be rejected with an opts.driver-tagged error.
 local ok_ndrv, err_ndrv = pcall(function()
-    std.task.spawn(function() return 1 end, { driver = 42 })
+    std.task.spawn(function()
+        return 1
+    end, { driver = 42 })
 end)
 print("opts_driver_non_string_rejected=" .. tostring((not ok_ndrv) and tostring(err_ndrv):find("opts.driver") ~= nil))
 
 -- 6c. Non-string opts key (integer array key) must be rejected.
 local ok_intk, err_intk = pcall(function()
-    std.task.spawn(function() return 1 end, { [1] = "foo" })
+    std.task.spawn(function()
+        return 1
+    end, { [1] = "foo" })
 end)
-print("opts_non_string_key_rejected=" .. tostring((not ok_intk) and tostring(err_intk):find("opts keys must be strings") ~= nil))
+print(
+    "opts_non_string_key_rejected="
+        .. tostring((not ok_intk) and tostring(err_intk):find("opts keys must be strings") ~= nil)
+)
 
 -- 6d. driver = "async_fn" must be an accepted alias for the default driver.
-local h_afn = std.task.spawn(function() return 7 end, { driver = "async_fn" })
+local h_afn = std.task.spawn(function()
+    return 7
+end, { driver = "async_fn" })
 print("driver_async_fn_alias_ok=" .. tostring(h_afn:join() == 7))
 
 -- 6e. driver = "async" must also be an accepted alias.
-local h_a = std.task.spawn(function() return 8 end, { driver = "async" })
+local h_a = std.task.spawn(function()
+    return 8
+end, { driver = "async" })
 print("driver_async_alias_ok=" .. tostring(h_a:join() == 8))
 
 -- 7. with_timeout grace_ms — 3-stage (cancel → grace → abort) semantics.
@@ -123,7 +140,9 @@ print("driver_async_alias_ok=" .. tostring(h_a:join() == 8))
 local gz_t0 = std.time.millis()
 local ok_gz = pcall(function()
     std.task.with_timeout(20, function(scope)
-        scope:spawn(function() std.task.sleep(1000) end)
+        scope:spawn(function()
+            std.task.sleep(1000)
+        end)
         std.task.sleep(1000)
     end, { grace_ms = 0 })
 end)
@@ -138,7 +157,9 @@ local cleanup_ran = false
 pcall(function()
     std.task.with_timeout(20, function(scope)
         scope:spawn(function()
-            pcall(function() std.task.sleep(1000) end) -- swallows cancel
+            pcall(function()
+                std.task.sleep(1000)
+            end) -- swallows cancel
             cleanup_ran = true -- must execute before grace expires
         end)
         std.task.sleep(1000)
@@ -159,7 +180,9 @@ end)
 print("grace_non_number_rejected=" .. tostring((not ok_gt) and tostring(err_gt):find("grace_ms") ~= nil))
 
 -- 8. ms upper bound — Infinity and values beyond u64-ns range must raise.
-local ok_ub, err_ub = pcall(function() std.task.sleep(1e20) end)
+local ok_ub, err_ub = pcall(function()
+    std.task.sleep(1e20)
+end)
 print("sleep_ms_out_of_range=" .. tostring((not ok_ub) and tostring(err_ub):find("out of range") ~= nil))
 
 print("done")
