@@ -101,11 +101,14 @@
 //!   require the field, and asks only that a `beat` you do write is a
 //!   string.
 //! - **I3 budget monotonicity.**  The budget is a quota an owner grants
-//!   the session, not a ledger of what it used.  `reserve(n)` asks *before*
-//!   spending — it deducts and returns `true`, or refuses with `false,
-//!   tag` and leaves the balance exactly as it was — and `spend(n)`
-//!   settles afterwards, returning nothing: the settlement landing *is* the
-//!   answer, and `remaining()` is the separate question of what is left.
+//!   the session, not a ledger of what it used.  Two deductions take from it
+//!   and neither holds anything for the other: `reserve(n)` is the deduction
+//!   that *asks* — it takes `n` off and returns `true`, or refuses with
+//!   `false, tag` and leaves the balance exactly as it was — and `spend(n)`
+//!   is the deduction that does not ask, returning nothing: the write landing
+//!   *is* the answer, and `remaining()` is the separate question of what is
+//!   left.  There is no hold and nothing to release, so **a beat that calls
+//!   both deducts twice**; which of the two a beat uses is yours to pick.
 //!   Both take non-negative whole amounts and the balance can only decrease;
 //!   there is no API to raise or reset it, and no `append` moves it.  What a
 //!   session actually consumed is read off the responses it recorded
@@ -143,9 +146,10 @@
 //!   parent whose children are still open is not refused; the boundary
 //!   records them (`session_closed.data.open_children`).
 //! - **K2 model call.**  There is no composite call and the session keeps
-//!   no backend of its own.  The driver reserves what it estimates the
-//!   call will cost, calls the backend itself, appends the `llm_response`,
-//!   and settles the difference with `spend`.
+//!   no backend of its own.  The driver takes the beat's cost off the quota
+//!   itself — `reserve` before the call to be stopped when it will not fit,
+//!   or `spend` after it to meter what happened — calls the backend, and
+//!   appends the `llm_response`.  Doing both charges the beat twice.
 //!
 //! # Driving a beat from Lua
 //!
@@ -155,14 +159,16 @@
 //!     budget = { amount = 10000, tag = "tokens" },
 //! })
 //! s:append({ kind = "msg_user", data = { content = "hi" } })
-//! -- Drive the beat yourself: name it, ask for the estimate first, call
-//! -- the backend, append the response, then settle what it really cost.
+//! -- Drive the beat yourself: name it, take the cost off the quota, call
+//! -- the backend, append the response.  This beat asks first, so it is
+//! -- stopped before it spends; a beat that only meters what happened calls
+//! -- `s:spend(actual)` after the response instead.  Not both: the two
+//! -- deductions are independent, so a beat that uses both is charged twice.
 //! local beat = knl.new_beat_id()
 //! local ok, tag = s:reserve(est)
 //! if not ok then return { budget_stopped = true, tag = tag } end
 //! s:append({ kind = "llm_response", beat = beat,
 //!            data = { content = blocks, usage = u } })
-//! s:spend(math.max(actual - est, 0))     -- the settlement
 //! local events = s:events(from)          -- the record, from `from` on
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
 //! s:close("done")
@@ -317,12 +323,13 @@ pub const SESSION_API: &[(&str, &str)] = &[
     ),
     (
         "reserve",
-        "reserve(n) -> true | false, tag — refuse if remaining < n, atomic, both answers recorded \
-         [raises: validation, closed, busy, storage, corruption]",
+        "reserve(n) -> true | false, tag — the deduction that asks: refuse if remaining < n, \
+         atomic, both answers recorded [raises: validation, closed, busy, storage, corruption]",
     ),
     (
         "spend",
-        "spend(n) -> nil — settle after the fact; the write is the answer, read the balance \
+        "spend(n) -> nil — the deduction that does not ask; independent of reserve, so calling \
+         both for one beat deducts twice; the write is the answer, read the balance \
          with remaining() [raises: validation, closed, busy, storage]",
     ),
     (
@@ -1535,12 +1542,14 @@ impl LuaUserData for Session {
             Ok((granted, tag))
         });
 
-        // s:spend(n) — the settlement after a reservation.
+        // s:spend(n) — the deduction that does not ask.
         //
-        // K4.  Non-negative amounts only, and the balance never rises.
+        // K4.  Non-negative amounts only, and the balance never rises.  It
+        // holds nothing for `reserve` to release and releases nothing
+        // `reserve` held: a beat that calls both is charged twice.
         //
         // It returns nothing.  It used to hand back the balance it read
-        // afterwards, which made a settlement that landed and then failed its
+        // afterwards, which made a deduction that landed and then failed its
         // read-back indistinguishable from one that never landed — the caller
         // saw an error either way and could not tell whether the `budget_spent`
         // was in the log.  Two questions, two calls: this one raises only if

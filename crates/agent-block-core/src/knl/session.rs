@@ -855,6 +855,16 @@ impl Session {
     /// word is written.  A tree spread over two logs could be neither written
     /// atomically nor read back by one statement, so it is not a tree.
     ///
+    /// **The child's stream must be empty.**  The two events written over
+    /// there are a session's first, so `child_stream` names a stream nothing
+    /// has been written to; one that already carries an event is a
+    /// [`KnlError::Validation`] with nothing written on either side.  The
+    /// emptiness is decided inside the same transaction as the rest — the
+    /// decision is shown the other stream's first event along with this
+    /// ledger ([`EventStore::append_if_many`]) — because two allocations
+    /// naming one stream would otherwise both be told it was free and both
+    /// open a session on it.
+    ///
     /// **A refusal is an error here, not a `false`.**  When the balance does
     /// not cover the allocation, a `budget_refused` naming the child is
     /// recorded on this session, nothing is opened, and
@@ -927,14 +937,16 @@ impl Session {
         let child_scope_id = Scope::new(owner.clone(), None).id().to_string();
 
         // What the decision saw, carried out of it: the decision runs on the
-        // store's own thread, so the balance a refusal reports and the
-        // ending it found come back through cells rather than through the
-        // events it returns.
+        // store's own thread, so the balance a refusal reports, the ending it
+        // found and the stream it found already in use come back through cells
+        // rather than through the events it returns.
         let ended = Arc::new(AtomicBool::new(false));
+        let occupied = Arc::new(AtomicBool::new(false));
         let refused = Arc::new(AtomicBool::new(false));
         let measured = Arc::new(AtomicI64::new(0));
-        let (found_ending, said_no, balance_seen) = (
+        let (found_ending, found_events, said_no, balance_seen) = (
             Arc::clone(&ended),
+            Arc::clone(&occupied),
             Arc::clone(&refused),
             Arc::clone(&measured),
         );
@@ -944,7 +956,25 @@ impl Session {
             .append_if_many(
                 &child_stream,
                 Some(ALLOCATION_KINDS),
-                Box::new(move |events: Vec<Current>| {
+                Box::new(move |seen: Split<Current>| {
+                    // A child opens once, on a stream of its own.  The two
+                    // events written over there are a session's *first*, so a
+                    // stream that already carries any is not a child being
+                    // opened but an existing log being written into — a second
+                    // `session_opened` under a scope its earlier handles never
+                    // heard of, and a `budget_granted` nobody's owner allowed.
+                    //
+                    // Inside the invariant for the same reason the ending is:
+                    // asked before the transaction, two allocations naming one
+                    // stream would both be told it was empty.  Nothing is
+                    // written on either side — this is the caller having given
+                    // a bad argument, like a child store on another database,
+                    // and there is no fact about the parent's ledger in it.
+                    if !seen.other.is_empty() {
+                        found_events.store(true, Ordering::Relaxed);
+                        return None;
+                    }
+                    let events = seen.own;
                     // The ending is part of the invariant, not a check taken
                     // beforehand: a parent that closed between the read and
                     // the write would otherwise get a child anyway.
@@ -990,6 +1020,17 @@ impl Session {
             )
             .await?;
 
+        // Read before the ending is, because a decision that found the child's
+        // stream occupied returned before it looked at the parent at all: the
+        // stream was the wrong argument, and reporting it as a closed parent
+        // would send the caller after the wrong thing.
+        if occupied.load(Ordering::Relaxed) {
+            return Err(KnlError::Validation(format!(
+                "a child opens on a stream of its own, and {child_stream:?} already has events on \
+                 it: pass a stream nothing has been written to (nothing was written here, on \
+                 either side)"
+            )));
+        }
         if committed.is_none() || ended.load(Ordering::Relaxed) {
             return Err(KnlError::Closed(format!(
                 "{CLOSED} (the parent's log already carries its ending)"
@@ -4243,6 +4284,82 @@ mod tests {
             .await
             .expect_err("no database to open a child on");
         assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+    }
+
+    /// A child opens on a stream of its own.  A stream that already carries
+    /// events is a bad argument rather than a decision about the balance:
+    /// nothing is written on either side, so a stream id that came round twice
+    /// cannot leave a log with two `session_opened`s and a `budget_granted`
+    /// nobody's owner allowed.
+    #[tokio::test]
+    async fn a_child_does_not_open_on_a_stream_that_already_has_events() {
+        let mut parent = new_session(Some(100)).await;
+
+        // A stream a child is already on: the same id, offered twice.
+        let taken = stream_id();
+        let store = store_beside(&parent, &taken).await;
+        parent
+            .open_child(
+                taken.clone(),
+                "user-42".to_string(),
+                Allocation::new(10),
+                store,
+            )
+            .await
+            .expect("the first allocation");
+        let before = parent.len().await.expect("len");
+        assert_eq!(remaining(&parent).await, Some(90));
+
+        let store = store_beside(&parent, &taken).await;
+        let err = parent
+            .open_child(
+                taken.clone(),
+                "user-42".to_string(),
+                Allocation::new(10),
+                store,
+            )
+            .await
+            .expect_err("that stream is a session already");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains("already has events"), "{err}");
+
+        // Neither side moved: no reservation here, and over there the opening
+        // and the grant the first child really got, with nothing after them.
+        assert_eq!(parent.len().await.expect("len"), before);
+        assert_eq!(remaining(&parent).await, Some(90));
+        let occupied = store_beside(&parent, &taken).await;
+        assert_eq!(occupied.len().await.expect("len"), 2);
+
+        // Any event is enough — the stream does not have to be a session for
+        // a child's opening to be the wrong thing to write onto it.
+        let stranger = stream_id();
+        let mut seeded = store_beside(&parent, &stranger).await;
+        seeded.append(response(1)).await.expect("seed the stream");
+        let store = store_beside(&parent, &stranger).await;
+        let err = parent
+            .open_child(stranger, "user-42".to_string(), Allocation::new(10), store)
+            .await
+            .expect_err("something is written there already");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert_eq!(parent.len().await.expect("len"), before);
+        assert_eq!(seeded.len().await.expect("len"), 1, "and nothing was added");
+
+        // The ledger carries no refusal either: a balance that was never
+        // measured has nothing to record.
+        assert_eq!(
+            kinds(&ledger(&parent).await),
+            vec![KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED]
+        );
+
+        // …and a stream nothing has been written to still opens.
+        let fresh = stream_id();
+        let store = store_beside(&parent, &fresh).await;
+        let child = parent
+            .open_child(fresh, "user-42".to_string(), Allocation::new(10), store)
+            .await
+            .expect("an empty stream is what a child opens on");
+        assert_eq!(remaining(&child).await, Some(10));
+        assert_eq!(remaining(&parent).await, Some(80));
     }
 
     /// A closed parent opens nothing — whether this handle knows it closed,

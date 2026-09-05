@@ -241,7 +241,7 @@ impl IsleDrivers {
 /// ([`events_schema`]).
 pub const EVENTS_TABLE: &str = "events";
 
-/// The DDL for [`EVENTS_TABLE`] and its two indexes.
+/// The DDL for [`EVENTS_TABLE`] and its three indexes.
 ///
 /// `IF NOT EXISTS` throughout, so opening a fresh database and reopening one
 /// an earlier build wrote take the same path.  The `(stream, kind, seq)`
@@ -249,6 +249,32 @@ pub const EVENTS_TABLE: &str = "events";
 /// than the size of the stream, and it keeps the rows in `seq` order within a
 /// kind, so the read needs no sort; `(stream, beat, seq)` does the same for
 /// the events of one beat.
+///
+/// `events_session_opened_parent` does it for the close-time scan
+/// ([`open_children_in`]), which asks across streams rather than within one:
+/// which openings name *this* stream as their parent.  It is a *partial
+/// expression* index and both halves are load-bearing.  The expression is
+/// written exactly as the scan writes it, because SQLite matches an indexed
+/// expression against a query's by form — a path bound as a parameter would
+/// never match one written as a literal, which is why
+/// [`child_scan_sql`] spells its words out.  The `WHERE` keeps the index to
+/// the openings: `parent` lives on `session_opened` and nowhere else, so
+/// indexing every row would be storing a NULL per event to find the handful
+/// that are not.
+///
+/// That is the kernel's vocabulary sitting in the store's schema, which the
+/// rest of this backend avoids ([`ChildScan`] is an argument, not a constant).
+/// The price of the index is that those words are settled at DDL time; what it
+/// buys is that a close on a large log looks the openings up instead of walking
+/// the table.  A scan under some other vocabulary still reads correctly — it
+/// just reads without the index.
+///
+/// **An index is not a stored shape**, so adding one does not touch
+/// [`super::event_store::CURRENT_SCHEMA_VERSION`]: the rows say exactly what
+/// they said before, and a database an earlier build wrote picks the index up
+/// on the next open, the same `IF NOT EXISTS` path a fresh one takes.  What
+/// obliges a version bump and an upcaster is a change to what an event *is* —
+/// see the [`super::event_store`] module docs.
 ///
 /// `beat` is the one nullable column: it is the caller's to declare and most
 /// events do not belong to a beat.  `meta` and `data` are `NOT NULL` because
@@ -268,7 +294,10 @@ const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS events ( \
      CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
          ON events (stream, kind, seq); \
      CREATE INDEX IF NOT EXISTS events_stream_beat_seq \
-         ON events (stream, beat, seq);";
+         ON events (stream, beat, seq); \
+     CREATE INDEX IF NOT EXISTS events_session_opened_parent \
+         ON events (json_extract(data, '$.parent')) \
+      WHERE kind = 'session_opened';";
 
 /// One column of [`EVENTS_TABLE`], as SQLite itself reports it.
 ///
@@ -1110,6 +1139,13 @@ fn insert_batch(
 /// A `None` decision commits nothing.  A [`Split`] with an empty `other`
 /// writes only this stream, which is how a refusal is recorded: the fact that
 /// the allocation was asked for and turned down, with no child opened.
+///
+/// Both streams are *read* as well, and the second one for a single question:
+/// whether it carries anything at all.  One row settles it, so the decision is
+/// shown at most the other stream's first event — inside this transaction,
+/// which is the whole point: a command whose invariant is "the target is
+/// empty" cannot ask before taking the write lock, or a second one would
+/// answer the same and both would write.
 fn append_if_many_in(
     conn: &mut Connection,
     stream: &str,
@@ -1120,8 +1156,14 @@ fn append_if_many_in(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(JobError::Sqlite)?;
-    let events = read_in(&tx, stream, kinds, 0, i64::MAX)?;
-    let Some(split) = decide(events) else {
+    let seen = Split {
+        own: read_in(&tx, stream, kinds, 0, i64::MAX)?,
+        // Unfiltered and capped at one: the question is "is there an event",
+        // not "which", so a kind filter could only make an occupied stream
+        // look empty.
+        other: read_in(&tx, other, None, 0, 1)?,
+    };
+    let Some(split) = decide(seen) else {
         // Nothing to write: the transaction is rolled back on drop.
         return Ok(None);
     };
@@ -1160,13 +1202,53 @@ fn append_with_open_children_in(
         .ok_or_else(|| JobError::Terminal(KnlError::Storage("the close wrote nothing".to_string())))
 }
 
+/// `text` as an SQL string literal, with any quote in it doubled.
+///
+/// For the two places a *word* rather than a value has to go into a statement
+/// ([`child_scan_sql`]): `json_extract`'s path argument is not a value SQLite
+/// will take a parameter for, and a term the planner has to compare against a
+/// partial index's `WHERE` cannot be one either.  Doubling is the whole of
+/// SQLite's escaping rule for a single-quoted literal, so this closes the hole
+/// that interpolating text otherwise opens.
+fn sql_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The statement [`open_children_in`] runs, with the scan's two words written
+/// into it as literals.
+///
+/// The kind and the JSON path are literals rather than parameters *so that the
+/// planner can see them*: `events_session_opened_parent` ([`SCHEMA_DDL`]) is a
+/// partial index on an expression, and both halves are matched by form — a
+/// `kind = ?` term proves nothing about `WHERE kind = 'session_opened'`, and a
+/// bound path never matches an indexed one.  The parent being looked for stays
+/// a parameter, because it is a value.  A test holds the query plan against
+/// the index name, so this cannot quietly become a table scan again.
+fn child_scan_sql(scan: &ChildScan) -> String {
+    let opened = sql_literal(&scan.opened);
+    let closed = sql_literal(&scan.closed);
+    let path = sql_literal(&format!("$.{}", scan.parent_field));
+    format!(
+        "SELECT opened.stream \
+           FROM events AS opened \
+          WHERE opened.kind = {opened} \
+            AND json_extract(opened.data, {path}) = ?1 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM events AS ending \
+                 WHERE ending.stream = opened.stream AND ending.kind = {closed} \
+            ) \
+          ORDER BY opened.epoch_ms, opened.stream"
+    )
+}
+
 /// The streams that name `stream` as their parent and carry no ending.
 ///
 /// The vocabulary is the caller's ([`ChildScan`]): which kind opens a stream,
 /// which kind ends one, and where in the opening's `data` the parent is
-/// named.  The JSON path is built from the field name here rather than being
-/// bound as a value, because `json_extract`'s path argument is not one — the
-/// name is the kernel's own constant, never a caller's text.
+/// named.  Those three words are written into the statement
+/// ([`child_scan_sql`]) rather than bound, which is what lets the scan read by
+/// `events_session_opened_parent` instead of walking every event in the
+/// database.
 ///
 /// Ordered by when each child opened, so a close records its children in the
 /// order they were started rather than in whatever order the rows came back.
@@ -1175,21 +1257,8 @@ fn open_children_in(
     stream: &str,
     scan: &ChildScan,
 ) -> rusqlite::Result<Vec<String>> {
-    let path = format!("$.{}", scan.parent_field);
-    let mut stmt = conn.prepare(
-        "SELECT opened.stream \
-           FROM events AS opened \
-          WHERE opened.kind = ?1 \
-            AND json_extract(opened.data, ?2) = ?3 \
-            AND NOT EXISTS ( \
-                SELECT 1 FROM events AS ending \
-                 WHERE ending.stream = opened.stream AND ending.kind = ?4 \
-            ) \
-          ORDER BY opened.epoch_ms, opened.stream",
-    )?;
-    let rows = stmt.query_map(params![scan.opened, path, stream, scan.closed], |row| {
-        row.get::<_, String>(0)
-    })?;
+    let mut stmt = conn.prepare(&child_scan_sql(scan))?;
+    let rows = stmt.query_map(params![stream], |row| row.get::<_, String>(0))?;
     rows.collect()
 }
 
@@ -1728,7 +1797,11 @@ mod tests {
                 "c",
                 None,
                 Box::new(|events| {
-                    assert_eq!(events.len(), 1, "the decision reads its own stream");
+                    assert_eq!(events.own.len(), 1, "the decision reads its own stream");
+                    assert!(
+                        events.other.is_empty(),
+                        "and is shown that the other one is empty"
+                    );
                     Some(Split {
                         own: vec![ev(2)],
                         other: vec![ev(3), ev(4)],
@@ -1787,6 +1860,108 @@ mod tests {
             .expect_err("kind is required");
         assert_eq!(parent.len().await.expect("len"), 3, "nothing was written");
         assert_eq!(child.len().await.expect("len"), 2);
+    }
+
+    /// The close-time child scan reads by `events_session_opened_parent`
+    /// instead of walking every event in the database.
+    ///
+    /// The plan is the assertion because the alternative is silent: a bound
+    /// `kind` proves nothing about the index's `WHERE kind = 'session_opened'`
+    /// and a bound path never matches an indexed expression, so getting either
+    /// wrong still answers correctly — it just answers by reading the whole
+    /// table, on the one query that is not scoped to a stream.  The rows are
+    /// checked too, so the literals that buy the index cannot buy it by
+    /// asking a different question.
+    ///
+    /// What the plan reads today: `SEARCH opened USING INDEX
+    /// events_session_opened_parent (<expr>=?)`, with the ending's `NOT
+    /// EXISTS` served by `events_stream_kind_seq`.
+    #[test]
+    fn the_child_scan_reads_by_the_parent_index() {
+        let conn = Connection::open_in_memory().expect("an in-memory database");
+        conn.execute_batch(SCHEMA_DDL).expect("the schema");
+
+        let insert = |stream: &str, seq: i64, kind: &str, data: &str| {
+            conn.execute(
+                "INSERT INTO events \
+                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+                 VALUES (?1, ?2, ?3, ?4, 1, NULL, '{}', ?5)",
+                params![stream, seq, seq * 10, kind, data],
+            )
+            .expect("insert");
+        };
+        insert("c1", 1, "session_opened", r#"{"parent":"p"}"#);
+        insert("c2", 1, "session_opened", r#"{"parent":"p"}"#);
+        insert("c2", 2, "session_closed", "{}");
+        insert("c3", 1, "session_opened", r#"{"parent":"elsewhere"}"#);
+        insert("p", 1, "session_opened", "{}");
+
+        // The kernel's own vocabulary, which is the one the index is cut for.
+        let scan = ChildScan {
+            opened: "session_opened".to_string(),
+            closed: "session_closed".to_string(),
+            parent_field: "parent".to_string(),
+        };
+        assert_eq!(
+            open_children_in(&conn, "p", &scan).expect("scan"),
+            vec!["c1".to_string()],
+            "the ended child and the other parent's are not this stream's open children"
+        );
+
+        let sql = format!("EXPLAIN QUERY PLAN {}", child_scan_sql(&scan));
+        let mut stmt = conn.prepare(&sql).expect("prepare the plan");
+        let plan: Vec<String> = stmt
+            .query_map(params!["p"], |row| row.get::<_, String>(3))
+            .expect("the plan's rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("the plan's rows");
+
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("events_session_opened_parent")),
+            "the openings must be looked up by the index: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.starts_with("SCAN events AS opened")),
+            "and not found by walking the table: {plan:?}"
+        );
+    }
+
+    /// The scan's words go into the statement as literals, so a quote in one
+    /// of them is doubled rather than closing the string early.
+    ///
+    /// They are the kernel's own constants today, which is why writing them
+    /// in is safe *and* why nothing would notice if they stopped being: the
+    /// vocabulary is an argument ([`ChildScan`]), and a word that ended the
+    /// literal would turn the rest of the statement into SQL somebody else
+    /// wrote.
+    #[test]
+    fn a_word_written_into_the_scan_stays_one_word() {
+        assert_eq!(sql_literal("parent"), "'parent'");
+        assert_eq!(sql_literal("a'b"), "'a''b'");
+
+        let conn = Connection::open_in_memory().expect("an in-memory database");
+        conn.execute_batch(SCHEMA_DDL).expect("the schema");
+        conn.execute(
+            "INSERT INTO events \
+                 (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
+             VALUES ('c', 1, 10, 'it''s open', 1, NULL, '{}', ?1)",
+            params![r#"{"pa'rent":"p"}"#],
+        )
+        .expect("insert");
+
+        let scan = ChildScan {
+            opened: "it's open".to_string(),
+            closed: "it's over".to_string(),
+            parent_field: "pa'rent".to_string(),
+        };
+        assert_eq!(
+            open_children_in(&conn, "p", &scan).expect("the statement parses and runs"),
+            vec!["c".to_string()],
+            "the quoted words are still the words being matched"
+        );
     }
 
     /// `database` names the database, not the stream: two stores on one file

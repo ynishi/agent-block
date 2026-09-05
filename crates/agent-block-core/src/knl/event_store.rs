@@ -120,6 +120,13 @@ pub const SCHEMA_VERSION_FIELD: &str = "_schema_version";
 /// written under an older one and there is no step to take.  A shape change
 /// *after* the first release bumps this and registers the matching
 /// [`Upcaster`] — see the module docs.
+///
+/// **What counts as a shape change** is what an event *is*: a kind renamed, a
+/// field added, moved, retyped or dropped.  How the rows are stored beside
+/// that — an index added to the durable backend's DDL, a page size, a pragma
+/// — changes no event and bumps nothing: the same bytes read the same way
+/// afterwards, and a database an earlier build wrote picks the index up on
+/// the next open with nothing to upcast.
 pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 
 /// The upcaster chain every session reads through, newest step last.
@@ -315,6 +322,11 @@ pub type CurrentDecision = Box<dyn FnOnce(Vec<Current>) -> Option<Map<String, Va
 /// `own` is this store's stream — the one it was opened on — and `other` is
 /// the stream named at the call.  Either may be empty: a refused allocation
 /// writes the refusal on the parent and opens nothing.
+///
+/// The same shape carries the decision's *input*
+/// ([`EventStore::append_if_many`]): what it is shown from this stream, and
+/// what it is shown from the other one.  One name for both directions, because
+/// the two streams are the same two streams either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Split<T> {
     /// What lands on this store's own stream.
@@ -335,12 +347,16 @@ impl<T> Split<T> {
 
 /// A [`Decision`] that writes to two streams: the backend's form, in raw
 /// [`Value`]s.
+///
+/// It is shown a [`Split`] as well as returning one — `own` is this stream
+/// filtered by the call's `kinds`, `other` is at most the first event of the
+/// stream being written to ([`EventStore::append_if_many`]).
 pub type SplitDecision =
-    Box<dyn FnOnce(Vec<Value>) -> Option<Split<Map<String, Value>>> + Send + 'static>;
+    Box<dyn FnOnce(Split<Value>) -> Option<Split<Map<String, Value>>> + Send + 'static>;
 
 /// [`SplitDecision`] as the kernel writes one: decided on upcasted events.
 pub type CurrentSplitDecision =
-    Box<dyn FnOnce(Vec<Current>) -> Option<Split<Map<String, Value>>> + Send>;
+    Box<dyn FnOnce(Split<Current>) -> Option<Split<Map<String, Value>>> + Send>;
 
 /// What a closing event is built from once the store has found this stream's
 /// open children ([`EventStore::append_with_open_children`]).
@@ -480,10 +496,21 @@ pub trait EventStore: Send + Sync {
     /// session that opened with a quota nobody paid for.
     ///
     /// `kinds` filters what the decision is shown *from this stream*, exactly
-    /// as it does for [`EventStore::append_if`]; the other stream is written,
-    /// never read.  A `None` decision writes nothing at all
+    /// as it does for [`EventStore::append_if`], and it arrives as the `own`
+    /// half of a [`Split`].  A `None` decision writes nothing at all
     /// (`Ok(None)`), and a [`Split`] with an empty `other` writes only this
     /// stream — which is how a refusal is recorded without opening anything.
+    ///
+    /// **The other stream is read for one question**: whether it carries
+    /// anything at all.  A command that writes a stream's *first* events — an
+    /// allocation opens the child's log ([`super::Session::open_child`]) — has
+    /// an invariant about the target as well as about this ledger, and a
+    /// second `session_opened` landing on a stream that already had one is
+    /// exactly what asking beforehand would fail to catch.  So the decision is
+    /// shown the other stream's first event, unfiltered, in the `other` half of
+    /// its input: one row answers "is it empty", and reading more would be
+    /// paying for an answer nobody asked for.  A decision that does not care
+    /// ignores the field.
     ///
     /// **Both streams must be in one database**, which is the caller's to
     /// arrange ([`EventStore::database`] says which one this store is on): a
@@ -491,10 +518,11 @@ pub trait EventStore: Send + Sync {
     /// no atomicity to offer.
     ///
     /// The default refuses.  A store that keeps a single stream has no other
-    /// stream to write to, and the request being well-formed while this
-    /// backend cannot serve it is exactly [`KnlError::Unsupported`] — the
-    /// same answer [`EventStore::query`] gives a store that is not a
-    /// database.
+    /// stream to write to — nor to read the emptiness of — and the request
+    /// being well-formed while this backend cannot serve it is exactly
+    /// [`KnlError::Unsupported`] — the same answer [`EventStore::query`] gives
+    /// a store that is not a database.  The in-memory test store takes it as
+    /// it stands: it holds one stream, so there is nothing for it to override.
     async fn append_if_many(
         &mut self,
         other: &str,
@@ -893,6 +921,14 @@ impl CurrentStore {
     /// has nowhere to report one through: a read that could not be projected
     /// must not reach the decision as an empty stream, which is what a
     /// balance would fold to zero from.
+    ///
+    /// **Both halves go through the chain.**  The other stream's first event
+    /// is a read like any other, and a decision that meets it unprojected
+    /// would be the one place in the kernel where a stored shape reaches a
+    /// fold as it was written.  A projection failure on either half parks the
+    /// same way and the decision is not called at all — which matters most
+    /// here, since an unreadable other stream would otherwise arrive as the
+    /// empty one it is being checked for.
     pub async fn append_if_many(
         &mut self,
         other: &str,
@@ -902,16 +938,19 @@ impl CurrentStore {
         let chain = self.chain.clone();
         let failure: Arc<Mutex<Option<KnlError>>> = Arc::new(Mutex::new(None));
         let parked = Arc::clone(&failure);
-        let upcasted: SplitDecision =
-            Box::new(
-                move |events: Vec<Value>| match Self::project(&chain, events) {
-                    Ok(current) => decide(current),
-                    Err(fault) => {
-                        *parked.lock().unwrap_or_else(PoisonError::into_inner) = Some(fault);
-                        None
-                    }
-                },
-            );
+        let upcasted: SplitDecision = Box::new(move |events: Split<Value>| {
+            let projected = Self::project(&chain, events.own).and_then(|own| {
+                let other = Self::project(&chain, events.other)?;
+                Ok(Split { own, other })
+            });
+            match projected {
+                Ok(current) => decide(current),
+                Err(fault) => {
+                    *parked.lock().unwrap_or_else(PoisonError::into_inner) = Some(fault);
+                    None
+                }
+            }
+        });
         let committed = self.inner.append_if_many(other, kinds, upcasted).await;
         let parked = failure
             .lock()
