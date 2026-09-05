@@ -101,6 +101,38 @@
 //! belong in the same counter.  If the ledger ever grows named axes, each
 //! axis declares which of the two it is.
 //!
+//! # Facts live in the kernel, structure is run by the supervisor
+//!
+//! A session can be opened *from* another one ([`Session::open_child`]), and
+//! the kernel records exactly two facts about that and no more: the child's
+//! stream names its parent on its `session_opened`, and the allocation that
+//! paid for it is one transaction on the parent's ledger — a
+//! `budget_reserved` naming the child, against a `budget_granted` on the
+//! child naming the parent, or a `budget_refused` and no child at all.  The
+//! child is opened on the *same database* as its parent, because a tree that
+//! spanned two logs could not be read back by one statement, and both halves
+//! of an allocation have to land or neither may.
+//!
+//! Nothing is released when a child closes.  An allocation is a spend from
+//! the parent's point of view (§ *The budget is a quota*, "Allocation, not
+//! limit"): the units left with the child, and a refund would be the balance
+//! rising without an owner granting.
+//!
+//! **A close is never refused for a child that is still running.**  It
+//! records them — `session_closed.data.open_children` — and lands, in the
+//! same transaction as the scan that found them, because the log never turns
+//! a write away and "this ended while its children had not" is precisely the
+//! fact an audit is reading for.
+//!
+//! What the kernel does *not* know is what a tree is.  It does not walk one,
+//! does not stop a close, does not cascade an ending, does not decide who may
+//! allocate to whom, and holds no parent pointer in memory — the facts are in
+//! the log and a reader assembles them ([`Session::query`]; the Lua kernel's
+//! `knl.views.tree` is one recursive `SELECT` over exactly these fields).  A
+//! supervisor pack above the kernel is where a policy over a tree belongs,
+//! and it needs the kernel only for the part it cannot do for itself: making
+//! the two sides of an allocation one write.
+//!
 //! # Views: the log is the only source of truth
 //!
 //! A *view* ([`projection`]) is derived from the log.  Folding never changes
@@ -217,8 +249,9 @@
 //! # Errors
 //!
 //! A failure is classified rather than described.  [`KnlError`] is a closed
-//! set of seven classes ([`KnlError::KINDS`]) — `busy`, `storage`,
-//! `corruption`, `closed`, `validation`, `unsupported`, `timeout` — and the
+//! set of eight classes ([`KnlError::KINDS`]) — `busy`, `storage`,
+//! `corruption`, `closed`, `validation`, `unsupported`, `timeout`,
+//! `refused` — and the
 //! variant *is* the classification: the payload is a human-readable reason
 //! and nothing a caller should branch on.  [`KnlError::is_retryable`] answers
 //! the one question that belongs to a program rather than to a person, and
@@ -291,15 +324,17 @@ pub mod scope;
 pub mod session;
 pub mod sqlite_store;
 
-pub use budget::{fold_balance, BudgetGrant};
+pub use budget::{fold_balance, Allocation, BudgetGrant};
 pub use event::{
-    is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_EPOCH_MS, FIELD_KIND, FIELD_SEQ,
+    is_kernel_only, now_ms, validate_event, BUDGET_KINDS, FIELD_CHILD, FIELD_EPOCH_MS, FIELD_KIND,
+    FIELD_OPEN_CHILDREN, FIELD_PARENT, FIELD_SEQ,
 };
 #[cfg(test)]
 pub use event_store::MemEventStore;
 pub use event_store::{
-    apply_upcasters, kernel_upcasters, Committed, Current, CurrentDecision, CurrentStore, Decision,
-    EventStore, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    apply_upcasters, kernel_upcasters, ChildScan, ChildrenDecision, Committed, Current,
+    CurrentDecision, CurrentSplitDecision, CurrentStore, Decision, EventStore, Split,
+    SplitDecision, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
 pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
@@ -366,6 +401,24 @@ pub enum KnlError {
     /// what changes the answer is a narrower query or a longer deadline.
     #[error("timeout: {0}")]
     Timeout(String),
+    /// A quota did not cover what was asked for, and the refusal was
+    /// recorded.
+    ///
+    /// The one class that reports a *decision* rather than a fault.  Nothing
+    /// is wrong: the request was well-formed, the store answered, and the
+    /// answer is no — [`Session::open_child`] raises it when the parent's
+    /// balance will not cover the allocation, having written the
+    /// `budget_refused` that says so.  Distinct from
+    /// [`KnlError::Validation`] because the caller's arguments were fine, and
+    /// not retryable, because the same call against the same balance gets the
+    /// same answer; what changes it is the owner granting more.
+    ///
+    /// [`Session::reserve`] does *not* raise this — it answers `false`,
+    /// because a reservation is asked for in a loop that is expected to be
+    /// told no.  An allocation is not: it either produced a child or it did
+    /// not, and there is no half-opened session to hand back.
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 impl KnlError {
@@ -383,6 +436,8 @@ impl KnlError {
     pub const UNSUPPORTED: &'static str = "unsupported";
     /// The stable name of the [`KnlError::Timeout`] class.
     pub const TIMEOUT: &'static str = "timeout";
+    /// The stable name of the [`KnlError::Refused`] class.
+    pub const REFUSED: &'static str = "refused";
 
     /// Every class a kernel failure can have, in one closed list.
     ///
@@ -398,6 +453,7 @@ impl KnlError {
         Self::VALIDATION,
         Self::UNSUPPORTED,
         Self::TIMEOUT,
+        Self::REFUSED,
     ];
 
     /// This failure's class, as one of [`KnlError::KINDS`].
@@ -410,6 +466,7 @@ impl KnlError {
             Self::Validation(_) => Self::VALIDATION,
             Self::Unsupported(_) => Self::UNSUPPORTED,
             Self::Timeout(_) => Self::TIMEOUT,
+            Self::Refused(_) => Self::REFUSED,
         }
     }
 
@@ -444,7 +501,8 @@ impl KnlError {
             | Self::Closed(reason)
             | Self::Validation(reason)
             | Self::Unsupported(reason)
-            | Self::Timeout(reason) => reason,
+            | Self::Timeout(reason)
+            | Self::Refused(reason) => reason,
         }
     }
 }
@@ -467,6 +525,7 @@ mod tests {
             KnlError::Validation("kind is required".to_string()),
             KnlError::Unsupported("this store keeps no queryable table".to_string()),
             KnlError::Timeout("query interrupted".to_string()),
+            KnlError::Refused("the balance does not cover it".to_string()),
         ]
     }
 
@@ -484,7 +543,8 @@ mod tests {
                 "closed",
                 "validation",
                 "unsupported",
-                "timeout"
+                "timeout",
+                "refused"
             ]
         );
         assert_eq!(

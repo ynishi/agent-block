@@ -126,9 +126,9 @@
 ---   that is not one SELECT / WITH, and resolves `$stream` (this session)
 ---   and `$sessions` (`opts.sessions`, the set to read across). That is the
 ---   whole mechanism: no builder, no query object, no registration hook.
----   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` are the four this
----   module ships, and a consumer's own view is a function of exactly the
----   same form — nothing about the four is privileged.
+---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `tree` are the
+---   five this module ships, and a consumer's own view is a function of
+---   exactly the same form — nothing about the five is privileged.
 ---
 ---   Token usage is a query view and not a built-in one, deliberately.
 ---   Every `llm_response` carries the counts its adapter normalized out of
@@ -148,6 +148,25 @@
 ---   *means* is whatever the owner tagged the grant with — the kernel reads
 ---   the number and nothing else, and token usage (`knl.views.usage`) is a
 ---   separate reading that beat never folds back into the budget.
+---
+--- Sessions opened from sessions
+---   `knl.open{ parent = s, budget = { from_parent = n } }` opens a session
+---   out of `s`'s balance: `s`'s ledger gains a reservation naming the child,
+---   the child's log opens with `parent` recorded on it and `n` of its own,
+---   and the two are ONE write on the parent's database. A balance that will
+---   not cover it records a refusal on the parent and raises `refused` —
+---   nothing is opened, and there is no half-opened session to hand back.
+---   Nothing comes back when the child closes: an allocation is a spend, the
+---   same way a reservation is.
+---
+---   The kernel keeps no tree. It records two facts — the parent on the
+---   child's opening, the child on the parent's ledger entry — and, when a
+---   session closes with children that had not ended, their ids on the
+---   boundary (`session_closed.data.open_children`, recorded in the same
+---   write; a close is never refused for them). Everything else is a
+---   supervisor's: `knl.views.tree` is one recursive SELECT over those
+---   fields, and a policy over a subtree is a pack above this module rather
+---   than a rule inside it.
 ---
 --- What a device promises, function by function
 ---   Every one of these is the caller's code, and beat holds it to a written
@@ -691,7 +710,31 @@ local EVENT_BASE = T.shape({
 --- `msg_user` is not a kind a beat writes — it is the seed a caller writes
 --- (see the header) — and it is declared here with the rest so the form is
 --- published rather than remembered.
+---
+--- Two kinds here are the KERNEL's, not this layer's: `session_opened` and
+--- `session_closed`. Nothing in Lua may write them (the kernel refuses a
+--- hand-written boundary) and their shape is checked on the other side of
+--- the syscall — they are declared here because a supervisor READS them.
+--- `parent` and `open_children` are how a session tree is recorded, and a
+--- view over them (`knl.views.tree`) is tied to those two paths the same way
+--- `usage` is tied to `llm_response`: the declaration is what says which
+--- reads move when the shape does.
 local EVENT_DATA = {
+    session_opened = T.shape({
+        scope_id = T.string,
+        owner = T.string,
+        -- Absent on a root, which is what makes a root a root: there is no
+        -- "parent = nil" to tell apart from an unrecorded one.
+        parent = T.string:is_optional(),
+    }, { open = false }),
+    session_closed = T.shape({
+        reason = T.string,
+        detail = T.string:is_optional(),
+        -- The children that had not ended when this one did, as the close
+        -- found them in the same write. A record and never a refusal:
+        -- the log turns no write away.
+        open_children = T.array_of(T.string):is_optional(),
+    }, { open = false }),
     msg_user = T.shape({
         content = T.any,
     }, { open = false }),
@@ -761,11 +804,32 @@ local BUDGET_GRANT = T.shape({
     desc = T.string:is_optional(),
 })
 
+--- What a parent hands a child out of its own balance: `from_parent` units,
+--- counted in `tag` (the parent's unit when it is left out).
+---
+--- Not a grant, and the difference is where the units come from. A grant is
+--- an owner allowing — a balance appearing, which only an owner may do — and
+--- an allocation is a move: the parent's balance falls by exactly what the
+--- child's rises by, in one write. So there is no `desc` either; what the
+--- log records about why is the parent it names.
+local BUDGET_ALLOCATION = T.shape({
+    from_parent = T.number:describe("a whole number of units, out of the parent's balance"),
+    tag = T.string:is_optional(),
+}, { open = false })
+
 --- `knl.open` opts: state only. Policy has its own constructor.
+---
+--- `parent` is a session this one is opened *from*: the child lands on the
+--- parent's database, its opening names the parent, and its quota is moved
+--- out of the parent's balance — one write, both ledgers. It goes with
+--- `budget = { from_parent = n }` and with nothing else: an owner's grant on
+--- a child would be a quota nobody paid for, and `from_parent` with no parent
+--- has nowhere to take it from. The kernel refuses each with the other named.
 local OPEN_OPTS = T.shape({
     owner = T.string:is_optional(),
-    budget = BUDGET_GRANT:is_optional(),
+    budget = T.any_of({ BUDGET_GRANT, BUDGET_ALLOCATION }):is_optional(),
     store = T.any:is_optional(),
+    parent = SESSION_HANDLE:is_optional(),
 })
 
 --- `knl.resume` opts: the store and the session to reopen, plus the grant
@@ -861,7 +925,13 @@ local LLM_RESULT = T.discriminated("status", {
 --- `session:query` that ran past its deadline was interrupted, and it is not
 --- retryable — the same statement over the same data would run just as long.
 --- `busy` remains the one class the kernel calls worth asking about again.
-local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported", "timeout" }
+---
+--- `refused` is the odd one out and deliberately so: every other class is a
+--- fault, and that one is a decision. A child asked for more than its
+--- parent's balance covered, the refusal is in the log, and nothing is
+--- wrong — so it is not retryable either, because the same balance answers
+--- the same way until an owner grants more.
+local ERROR_KINDS = { "busy", "storage", "corruption", "closed", "validation", "unsupported", "timeout", "refused" }
 
 --- A raised kernel failure, read back as data (`knl.error(e)`).
 ---
@@ -955,9 +1025,12 @@ M.shapes = {
     request = REQUEST,
     event_base = EVENT_BASE,
     event_meta = EVENT_META,
-    -- The `data` shapes of the kinds this layer writes, by kind. The
-    -- envelope is `event_base`; this is the half whose owner is the writer.
+    -- The `data` shapes of the kinds this layer writes, by kind, plus the
+    -- two kernel boundary kinds a supervisor reads (`session_opened` /
+    -- `session_closed`). The envelope is `event_base`; this is the half
+    -- whose owner is the writer.
     events = EVENT_DATA,
+    budget_allocation = BUDGET_ALLOCATION,
     device_config = DEVICE_CONFIG,
     tool_entry = TOOL_ENTRY,
     tool_policy_decision = TOOL_POLICY_DECISION,
@@ -1088,6 +1161,12 @@ local VIEWS = {
         args = view_args(),
         returns = "{ { stream, calls, input_tokens, output_tokens, thinking_tokens }, ... }, truncated"
             .. " — one row per stream that answered, the counts the providers reported",
+    },
+    tree = {
+        args = view_args(),
+        returns = "{ { session, parent, opened_epoch_ms, closed_epoch_ms?, open_children? }, ... }, truncated"
+            .. " — the subtree rooted at this session, discovered from the log;"
+            .. " `open_children` is the JSON array the close recorded",
     },
 }
 
@@ -1491,7 +1570,7 @@ end
 -- open / resume / session — the state half
 -- ============================================================
 
-local OPEN_STATE_KEYS = { owner = true, budget = true, store = true }
+local OPEN_STATE_KEYS = { owner = true, budget = true, store = true, parent = true }
 local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 
 --- Reject anything that is not a state key. Policy has its own constructor
@@ -1512,7 +1591,14 @@ end
 --- wraps nothing: `s:append`, `s:events`, `s:reserve`, `s:view`, `s:close`
 --- and `<close>` are the kernel's own surface.
 ---
---- @param opts table  { owner?, budget? = { amount, tag?, desc? }, store? }
+--- With `parent` it opens a CHILD: on the parent's database, out of the
+--- parent's balance (`budget = { from_parent = n, tag? }`), and in one write
+--- — the child's opening and grant, and the parent's reservation naming it.
+--- A balance that will not cover it records a refusal on the parent and
+--- raises `refused`; nothing is opened. Nothing comes back when the child
+--- closes, because an allocation is a spend.
+---
+--- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, parent? }
 --- @return userdata session
 function M.open(opts)
     opts = opts or {}
@@ -1522,6 +1608,7 @@ function M.open(opts)
         owner = opts.owner,
         budget = opts.budget,
         store = opts.store,
+        parent = opts.parent,
     })
 end
 
@@ -2276,6 +2363,56 @@ SELECT stream,
  ORDER BY stream
 ]]
 
+--- The session tree, rooted at the session the view is called on.
+---
+--- The one view that does not take its streams from `$sessions`, and the
+--- reason is what a tree is: the set is not something a caller names, it is
+--- what the log says was opened from what. So the root is `$stream` — this
+--- session — and the walk follows `session_opened.data.parent` down from it
+--- with a recursive CTE, which is a `WITH` statement and therefore a read
+--- like any other (the query layer needed no change for this: a statement
+--- sees the `events` table, and `$stream` / `$sessions` are values bound
+--- into it rather than a fence around what it may look at).
+---
+--- `UNION` and not `UNION ALL`: a stream is in the subtree once, and the
+--- duplicate-eliminating form is also what stops a `parent` cycle — which
+--- the kernel does not prevent and a log written by hand could contain —
+--- from running forever.
+---
+--- The three per-session readings are correlated subqueries rather than
+--- joins, so a stream that recorded two endings (two handles that both
+--- closed — the log keeps both) is still one row: the first ending is the
+--- one reported, and `MIN(epoch_ms)` says the same for the opening.
+---
+--- `open_children` comes back as the JSON array text the close recorded,
+--- because that is what the column holds: `json_extract` of an array is its
+--- JSON, and re-encoding it into a Lua list here would be this view
+--- inventing a shape the log does not have.
+local TREE_SQL = [[
+WITH RECURSIVE tree(session, parent) AS (
+    SELECT root.stream, json_extract(root.data, '$.parent')
+      FROM events AS root
+     WHERE root.kind = 'session_opened'
+       AND root.stream = $stream
+    UNION
+    SELECT child.stream, json_extract(child.data, '$.parent')
+      FROM events AS child, tree
+     WHERE child.kind = 'session_opened'
+       AND json_extract(child.data, '$.parent') = tree.session
+)
+SELECT t.session AS session,
+       t.parent  AS parent,
+       (SELECT MIN(o.epoch_ms) FROM events AS o
+         WHERE o.stream = t.session AND o.kind = 'session_opened') AS opened_epoch_ms,
+       (SELECT MIN(c.epoch_ms) FROM events AS c
+         WHERE c.stream = t.session AND c.kind = 'session_closed') AS closed_epoch_ms,
+       (SELECT json_extract(c.data, '$.open_children') FROM events AS c
+         WHERE c.stream = t.session AND c.kind = 'session_closed'
+         ORDER BY c.seq LIMIT 1) AS open_children
+  FROM tree AS t
+ ORDER BY opened_epoch_ms, session
+]]
+
 --- Run one view's statement over `session`.
 ---
 --- The options are the caller's, passed through untouched: `sessions` is
@@ -2355,6 +2492,29 @@ end
 --- @return boolean truncated
 function M.views.usage(session, opts)
     return read_view(session, USAGE_SQL, opts)
+end
+
+--- The subtree rooted at `session`: `{ session, parent, opened_epoch_ms,
+--- closed_epoch_ms, open_children }`, in the order the sessions opened.
+---
+--- The rows are the sessions the log says were opened from this one, however
+--- deep. `parent` is nil on a session whose opening recorded none — the root
+--- of the whole tree, which this session is not necessarily. `closed_epoch_ms`
+--- is nil while a session is still running, and `open_children` is the JSON
+--- array a close recorded when it ended with children that had not (see
+--- `TREE_SQL`).
+---
+--- `opts.sessions` is not read: which streams are in a tree is what this view
+--- answers, not something a caller names. `timeout_ms` and `limit` are the
+--- same knobs as anywhere else, and a subtree bigger than the limit reports
+--- `truncated` like any other read.
+---
+--- @param session userdata|table  a knl session — the root of the walk
+--- @param opts table|nil  query opts (`timeout_ms` / `limit`)
+--- @return table rows
+--- @return boolean truncated
+function M.views.tree(session, opts)
+    return read_view(session, TREE_SQL, opts)
 end
 
 -- ============================================================

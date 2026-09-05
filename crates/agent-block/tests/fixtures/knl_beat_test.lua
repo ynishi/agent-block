@@ -37,6 +37,9 @@
 --  inv13 `policy` is reachable as an embedded lib, its `window` fold bounds
 --        what a beat sends, and its `stagnation` predicate stops a caller's
 --        loop that would otherwise run to the budget
+--  inv14 a session opened from a session: the allocation moves units out of
+--        the parent's balance in one write, the child beats on its own, and
+--        `knl.views.tree` reads the edge back out of the log
 
 -- `knl` (global) is the Rust syscall bridge; `kernel` (local) is the Lua
 -- module under test. They share the name deliberately: the Lua kernel is the
@@ -963,6 +966,69 @@ do
     s:close("done")
 
     mark("inv13_policy_embedded")
+end
+
+-- ---------------------------------------------------------------------------
+-- inv14 — a session opened from a session: the allocation is one write, the
+-- child beats on its own budget, and the tree is read back out of the log
+-- ---------------------------------------------------------------------------
+
+do
+    local parent = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
+    local child = kernel.open({
+        owner = "worker",
+        parent = parent,
+        budget = { from_parent = 10 },
+    })
+
+    -- (a) the units moved: the child holds exactly what the parent paid, and
+    -- the parent's balance fell by it. Nothing was created and nothing lost.
+    assert(child:id() ~= parent:id(), "a child is a stream of its own")
+    assert(child:remaining() == 10, "child: " .. tostring(child:remaining()))
+    assert(parent:remaining() == 90, "parent: " .. tostring(parent:remaining()))
+
+    -- (b) it is an ordinary session — a beat runs in it, on its own budget
+    child:append({ kind = "msg_user", data = { content = "go" } })
+    local out = kernel.beat(child, kernel.device({ llm = stub(response("ok")) }))
+    assert(Outcome.is_ok(out), "the child's beat: " .. tostring(out.status))
+    assert(child:remaining() == 9, "the beat spent the child's own: " .. tostring(child:remaining()))
+    assert(parent:remaining() == 90, "and not the parent's: " .. tostring(parent:remaining()))
+
+    -- (c) the child's log says where it came from
+    local opened = child:events()[1]
+    assert(opened.kind == "session_opened", opened.kind)
+    assert(opened.data.parent == parent:id(), "opened.data.parent: " .. tostring(opened.data.parent))
+
+    -- (d) and the parent's ledger says what it paid, and to whom: the grant
+    -- that opened the account, then the reservation that opened the child
+    local ledger_rows = kernel.views.ledger(parent)
+    assert(#ledger_rows == 2, "grant + allocation, got " .. #ledger_rows)
+    assert(ledger_rows[2].kind == "budget_reserved", "second: " .. tostring(ledger_rows[2].kind))
+    assert(ledger_rows[2].amount == 10, "allocated: " .. tostring(ledger_rows[2].amount))
+
+    child:close("done")
+
+    -- (e) the tree, discovered from the root rather than named: one recursive
+    -- SELECT over `session_opened.data.parent`, and the edge is in it
+    local rows = kernel.views.tree(parent)
+    assert(#rows == 2, "the parent and its child, got " .. #rows)
+    local by_id = {}
+    for _, row in ipairs(rows) do
+        by_id[row.session] = row
+    end
+    local root = by_id[parent:id()]
+    assert(root ~= nil, "the root is in its own subtree")
+    assert(root.parent == nil, "the root records no parent: " .. tostring(root.parent))
+    assert(root.closed_epoch_ms == nil, "the root has not closed")
+    local edge = by_id[child:id()]
+    assert(edge ~= nil, "the child is in the tree")
+    assert(edge.parent == parent:id(), "the edge names the parent: " .. tostring(edge.parent))
+    assert(type(edge.opened_epoch_ms) == "number", "opened: " .. tostring(edge.opened_epoch_ms))
+    assert(edge.closed_epoch_ms ~= nil, "the child closed and the tree says so")
+
+    parent:close("done")
+
+    mark("inv14_session_tree")
 end
 
 print("[KNL] all_ok")

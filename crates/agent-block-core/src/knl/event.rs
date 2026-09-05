@@ -44,14 +44,26 @@
 //! own six kinds — the ones [`is_kernel_only`] names, which are the only ones
 //! it writes:
 //!
-//! | kernel kind       | required `data`                                | optional `data`   |
-//! |-------------------|------------------------------------------------|-------------------|
-//! | `session_opened`  | `scope_id: string`, `owner: string`            | —                 |
-//! | `session_closed`  | `reason: string`                               | `detail`          |
-//! | `budget_granted`  | `amount: integer`                              | `tag`, `desc`     |
-//! | `budget_reserved` | `amount: integer`                              | `tag`             |
-//! | `budget_refused`  | `amount: integer`, `remaining: integer`        | `tag`             |
-//! | `budget_spent`    | `amount: integer`                              | `tag`             |
+//! | kernel kind       | required `data`                                | optional `data`             |
+//! |-------------------|------------------------------------------------|-----------------------------|
+//! | `session_opened`  | `scope_id: string`, `owner: string`            | `parent`                    |
+//! | `session_closed`  | `reason: string`                               | `detail`, `open_children`   |
+//! | `budget_granted`  | `amount: integer`                              | `tag`, `desc`, `parent`     |
+//! | `budget_reserved` | `amount: integer`                              | `tag`, `child`              |
+//! | `budget_refused`  | `amount: integer`, `remaining: integer`        | `tag`, `child`              |
+//! | `budget_spent`    | `amount: integer`                              | `tag`                       |
+//!
+//! The four optional fields on the right of that table are the whole of what
+//! the kernel records about the *structure* between sessions, and they are
+//! written on one occasion each: an allocation
+//! ([`super::Session::open_child`]) records the child's [`FIELD_PARENT`] on
+//! its opening and on the grant it opened with, and the parent's
+//! [`FIELD_CHILD`] on the reservation (or the refusal) that paid for it; a
+//! close records [`FIELD_OPEN_CHILDREN`] when children of this session had
+//! not ended yet.  They are facts, not a tree: what a tree *is* — whether an
+//! open child should stop a close, who may allocate to whom, what to do about
+//! a subtree that outlived its root — belongs to the supervisor above the
+//! kernel, which reads them back with a query.
 //!
 //! Every other kind passes with its envelope checked and its `data` untouched.
 //! That includes the kinds a turn is made of — `msg_user`, `llm_request`,
@@ -228,6 +240,30 @@ pub const FIELD_OWNER: &str = "owner";
 /// and every move of its balance — so a reader can tell whose authority a
 /// ledger entry was written with from the log alone.
 pub const FIELD_SCOPE_ID: &str = "scope_id";
+/// Optional `data` field of `session_opened` and of the `budget_granted`
+/// that opened a child: the stream of the session this one was allocated
+/// from.
+///
+/// Absent on a root, which is what makes a root a root: there is no
+/// "parent = null" state to tell from an unrecorded one.  Written by
+/// [`super::Session::open_child`] alone, on a kind only the kernel writes,
+/// so a session cannot claim a parent it was not given one by.
+pub const FIELD_PARENT: &str = "parent";
+/// Optional `data` field of `budget_reserved` / `budget_refused`: the stream
+/// the amount was allocated to (or would have been).
+///
+/// The other end of [`FIELD_PARENT`], on the parent's side of the ledger, so
+/// the entry that paid for a child names it — an allocation reads as a spend
+/// with a destination rather than as an unexplained reservation.
+pub const FIELD_CHILD: &str = "child";
+/// Optional `data` field of `session_closed`: the streams that named this
+/// session as their parent and had not recorded an ending of their own when
+/// it closed.
+///
+/// A record, not a refusal.  The log never turns a write away, so a close
+/// with open children lands like any other and says so; what to do about it
+/// is the supervisor's.  Absent when there were none.
+pub const FIELD_OPEN_CHILDREN: &str = "open_children";
 
 /// Expected JSON shape of a required `data` field on a kernel kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

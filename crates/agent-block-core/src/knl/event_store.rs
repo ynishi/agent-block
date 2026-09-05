@@ -6,6 +6,19 @@
 //! the session is the stream, so there is no `stream` parameter here —
 //! multiple streams are a durable-backend concern.
 //!
+//! Two calls are outside that scoping, and both are outside it because one
+//! transaction has to cover two streams — which is the one thing a caller
+//! cannot build on top of the SPI for itself.
+//! [`EventStore::append_if_many`] decides against this stream and writes to
+//! this one and one other (a parent's ledger entry beside the child's opening
+//! and grant), and [`EventStore::append_with_open_children`] scans the
+//! database for the streams that name this one as their parent and appends an
+//! event built from what it found.  Both take the kinds and the field names
+//! they work with as arguments: the vocabulary stays the caller's, and the
+//! backend only knows how to walk.  Both are answered by the durable backend
+//! and by nothing else — a store that keeps one stream has no second one to
+//! write ([`KnlError::Unsupported`]) and no children to find (an empty list).
+//!
 //! # Append-only is the shape, not a runtime check
 //!
 //! The trait has no `update`, `delete` or `overwrite`.  Immutability is
@@ -291,6 +304,70 @@ pub type Decision = Box<dyn FnOnce(Vec<Value>) -> Option<Map<String, Value>> + S
 /// [`Decision`] as the kernel writes one: decided on upcasted events.
 pub type CurrentDecision = Box<dyn FnOnce(Vec<Current>) -> Option<Map<String, Value>> + Send>;
 
+/// What a two-stream command writes, split by where each part lands.
+///
+/// The SPI is otherwise scoped to a single stream, and this is the one shape
+/// that is not: an allocation is a move *between* two ledgers, so the events
+/// that record it belong to two streams and either both land or neither may
+/// ([`EventStore::append_if_many`]).  Naming the two halves is what keeps
+/// that from becoming a list the backend has to guess the routing of.
+///
+/// `own` is this store's stream — the one it was opened on — and `other` is
+/// the stream named at the call.  Either may be empty: a refused allocation
+/// writes the refusal on the parent and opens nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split<T> {
+    /// What lands on this store's own stream.
+    pub own: Vec<T>,
+    /// What lands on the other stream of the same database.
+    pub other: Vec<T>,
+}
+
+impl<T> Split<T> {
+    /// A split that writes only this store's own stream.
+    pub fn own(own: Vec<T>) -> Self {
+        Self {
+            own,
+            other: Vec::new(),
+        }
+    }
+}
+
+/// A [`Decision`] that writes to two streams: the backend's form, in raw
+/// [`Value`]s.
+pub type SplitDecision =
+    Box<dyn FnOnce(Vec<Value>) -> Option<Split<Map<String, Value>>> + Send + 'static>;
+
+/// [`SplitDecision`] as the kernel writes one: decided on upcasted events.
+pub type CurrentSplitDecision =
+    Box<dyn FnOnce(Vec<Current>) -> Option<Split<Map<String, Value>>> + Send>;
+
+/// What a closing event is built from once the store has found this stream's
+/// open children ([`EventStore::append_with_open_children`]).
+///
+/// Not an `Option`: the event is recorded whatever the scan found, because
+/// the children are something to *record* and never a reason to refuse a
+/// close.  The ids arrive in the order the scan produced them.
+pub type ChildrenDecision = Box<dyn FnOnce(Vec<String>) -> Map<String, Value> + Send + 'static>;
+
+/// How a backend recognises the streams that were opened *from* this one.
+///
+/// The kernel's kind vocabulary is not the store's — [`EventStore`] takes the
+/// kinds it reads as arguments everywhere else, and this is the same rule for
+/// a scan that has to look at other streams: the caller says which kind
+/// records an opening, which one records an ending, and which `data` field of
+/// the opening names the parent.  The backend does the walk and knows nothing
+/// about what the words mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildScan {
+    /// The kind that records a stream's opening.
+    pub opened: String,
+    /// The kind that records a stream's ending.
+    pub closed: String,
+    /// The `data` field of `opened` that names the parent's stream.
+    pub parent_field: String,
+}
+
 /// The coordinates a store assigns to an appended event.
 ///
 /// Returned inline from every write so no follow-up read is needed to
@@ -389,6 +466,88 @@ pub trait EventStore: Send + Sync {
         kinds: Option<&[&str]>,
         decide: Decision,
     ) -> KnlResult<Option<Committed>>;
+
+    /// [`EventStore::append_if`] over two streams of one database: decide
+    /// against this stream, and write to this one *and* `other` in the same
+    /// transaction.
+    ///
+    /// The single-stream scoping above holds for everything else, and this is
+    /// the one operation that cannot live inside it.  An allocation moves
+    /// units from a parent's ledger to a child's: the reservation on one side
+    /// and the opening plus the grant on the other are three records of one
+    /// event, and a reader that could see either side alone would be reading
+    /// units that had left one ledger without arriving in another — or a
+    /// session that opened with a quota nobody paid for.
+    ///
+    /// `kinds` filters what the decision is shown *from this stream*, exactly
+    /// as it does for [`EventStore::append_if`]; the other stream is written,
+    /// never read.  A `None` decision writes nothing at all
+    /// (`Ok(None)`), and a [`Split`] with an empty `other` writes only this
+    /// stream — which is how a refusal is recorded without opening anything.
+    ///
+    /// **Both streams must be in one database**, which is the caller's to
+    /// arrange ([`EventStore::database`] says which one this store is on): a
+    /// backend has one connection and one transaction, so two databases have
+    /// no atomicity to offer.
+    ///
+    /// The default refuses.  A store that keeps a single stream has no other
+    /// stream to write to, and the request being well-formed while this
+    /// backend cannot serve it is exactly [`KnlError::Unsupported`] — the
+    /// same answer [`EventStore::query`] gives a store that is not a
+    /// database.
+    async fn append_if_many(
+        &mut self,
+        other: &str,
+        kinds: Option<&[&str]>,
+        decide: SplitDecision,
+    ) -> KnlResult<Option<Split<Committed>>> {
+        let _ = (other, kinds, decide);
+        Err(KnlError::Unsupported(
+            "this store keeps one stream, so it cannot write two in one transaction".to_string(),
+        ))
+    }
+
+    /// Append the event a decision builds from the ids of this stream's *open
+    /// children*, in one transaction with the scan that found them.
+    ///
+    /// The close path.  Which streams named this one as their parent, and
+    /// which of those have not ended, is a question about the whole database,
+    /// and asking it before the write would answer about a moment the write
+    /// does not happen in — a child could end, or a new one open, in between,
+    /// and the boundary would record something that was true just now.  So
+    /// the scan and the insert share the transaction, and the decision runs
+    /// between them.
+    ///
+    /// The decision is handed the ids and returns the event; there is no
+    /// `Option`, because open children are a fact to record and never a
+    /// reason to refuse a close ([`super::Session::close`]).
+    ///
+    /// The default is not a refusal but the truthful answer for a store that
+    /// keeps one stream: it has no other streams, therefore no children, so
+    /// the decision is shown an empty list and its event is appended
+    /// normally.
+    async fn append_with_open_children(
+        &mut self,
+        scan: &ChildScan,
+        decide: ChildrenDecision,
+    ) -> KnlResult<Committed> {
+        let _ = scan;
+        self.append(decide(Vec::new())).await
+    }
+
+    /// Which database this store's stream lives in, or `None` for a backend
+    /// that is not one.
+    ///
+    /// Two stores answer with the same string exactly when they are the same
+    /// database, which is the whole of what it is for: an allocation writes
+    /// two streams in one transaction, so the kernel checks that the child's
+    /// store is on the parent's database before it starts
+    /// ([`super::Session::open_child`]) rather than discovering it as a
+    /// half-written tree.  It is an identity, not a location a caller should
+    /// take apart.
+    fn database(&self) -> Option<&str> {
+        None
+    }
 
     /// Events of `kinds` with `seq >= from_seq`, at most `limit`, cloned in
     /// `seq` order.
@@ -723,6 +882,64 @@ impl CurrentStore {
             Some(fault) => Err(fault),
             None => committed,
         }
+    }
+
+    /// Decide inside the store's serialization and write two streams of one
+    /// database ([`EventStore::append_if_many`]), on events projected to the
+    /// current shape.
+    ///
+    /// The same projection [`CurrentStore::append_if`] makes, for the same
+    /// reason and with the same parking of a failure the backend's decision
+    /// has nowhere to report one through: a read that could not be projected
+    /// must not reach the decision as an empty stream, which is what a
+    /// balance would fold to zero from.
+    pub async fn append_if_many(
+        &mut self,
+        other: &str,
+        kinds: Option<&[&str]>,
+        decide: CurrentSplitDecision,
+    ) -> KnlResult<Option<Split<Committed>>> {
+        let chain = self.chain.clone();
+        let failure: Arc<Mutex<Option<KnlError>>> = Arc::new(Mutex::new(None));
+        let parked = Arc::clone(&failure);
+        let upcasted: SplitDecision =
+            Box::new(
+                move |events: Vec<Value>| match Self::project(&chain, events) {
+                    Ok(current) => decide(current),
+                    Err(fault) => {
+                        *parked.lock().unwrap_or_else(PoisonError::into_inner) = Some(fault);
+                        None
+                    }
+                },
+            );
+        let committed = self.inner.append_if_many(other, kinds, upcasted).await;
+        let parked = failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match parked {
+            Some(fault) => Err(fault),
+            None => committed,
+        }
+    }
+
+    /// Append a closing event built from this stream's open children
+    /// ([`EventStore::append_with_open_children`]).
+    ///
+    /// Straight through, and nothing to project: the decision is shown stream
+    /// *ids*, not events, so there is no stored shape here for the chain to
+    /// bring forward.
+    pub async fn append_with_open_children(
+        &mut self,
+        scan: &ChildScan,
+        decide: ChildrenDecision,
+    ) -> KnlResult<Committed> {
+        self.inner.append_with_open_children(scan, decide).await
+    }
+
+    /// Which database the backend's stream lives in ([`EventStore::database`]).
+    pub fn database(&self) -> Option<&str> {
+        self.inner.database()
     }
 
     /// Events of `kinds` from `from_seq` on, as the current shape
@@ -1134,6 +1351,64 @@ mod tests {
             "a stored event carries the version it was written under: {}",
             stored[0]
         );
+    }
+
+    /// A store that keeps one stream has no second one to write, and no
+    /// database to share with another store: both answers are "not this
+    /// backend", said plainly, rather than a write that lands somewhere
+    /// unexpected.
+    #[tokio::test]
+    async fn a_single_stream_store_cannot_write_two_streams() {
+        let mut store = MemEventStore::new();
+        assert_eq!(store.database(), None, "one stream, no database to share");
+
+        let err = store
+            .append_if_many(
+                "another-stream",
+                None,
+                Box::new(|_| {
+                    panic!("the decision must not run: there is nowhere for its other half to go")
+                }),
+            )
+            .await
+            .expect_err("two streams are a durable backend's");
+        assert_eq!(err.kind(), KnlError::UNSUPPORTED, "{err}");
+        assert!(!err.is_retryable(), "asking again changes nothing: {err}");
+        assert_eq!(
+            store.len().await.expect("len"),
+            0,
+            "and nothing was written"
+        );
+    }
+
+    /// The same store has no *children* either — there are no other streams
+    /// for one to be in — so a close over it is shown an empty list and its
+    /// event is appended like any other.  That is the truthful answer, not a
+    /// refusal: the question was asked and the answer is none.
+    #[tokio::test]
+    async fn a_single_stream_store_finds_no_children_and_appends_anyway() {
+        let mut store = MemEventStore::new();
+        let scan = ChildScan {
+            opened: "session_opened".to_string(),
+            closed: "session_closed".to_string(),
+            parent_field: "parent".to_string(),
+        };
+        let seen: Arc<Mutex<Option<usize>>> = Arc::default();
+        let counted = Arc::clone(&seen);
+        let committed = store
+            .append_with_open_children(
+                &scan,
+                Box::new(move |children| {
+                    *counted.lock().expect("not poisoned") = Some(children.len());
+                    ev(1)
+                }),
+            )
+            .await
+            .expect("the close lands");
+
+        assert_eq!(*seen.lock().expect("not poisoned"), Some(0));
+        assert_eq!(committed.seq, 1);
+        assert_eq!(store.len().await.expect("len"), 1);
     }
 
     /// A store that is not a database says so, rather than answering a query

@@ -95,6 +95,28 @@
 //! expect after it.  That is where a closed stream refuses; the writes do
 //! not.
 //!
+//! # A child is a fact, not a handle
+//!
+//! [`Session::open_child`] opens a session from this one and pays for it out
+//! of this one's balance.  It is the second *command with an invariant* the
+//! kernel has, and the only one whose write spans two streams
+//! ([`EventStore::append_if_many`]): the child's `session_opened` and
+//! `budget_granted` land on the child's stream in the same transaction as the
+//! `budget_reserved` on this one, or a `budget_refused` lands here and no
+//! child is opened at all.  Both streams are in one database, which is
+//! checked before anything is written — an allocation that could half-land
+//! would leave units in neither ledger.
+//!
+//! The session holds nothing afterwards.  There is no list of children here,
+//! no pointer to a parent, and no cascade: what the kernel knows about the
+//! structure is in the log — `session_opened.data.parent` on the child, and
+//! the child's stream named on the parent's ledger entry — and a supervisor
+//! reads it back with a query.  A close *records* the children that had not
+//! ended ([`Session::close`], `session_closed.data.open_children`) inside the
+//! same write as the boundary, and lands anyway: the log never refuses a
+//! write, and what to do about a subtree that outlived its root is a
+//! decision, which is not the kernel's to take.
+//!
 //! # Stored shape change ⇒ upcaster
 //!
 //! Every read a session makes — the restore fold, the view folds, `events`,
@@ -151,19 +173,19 @@
 //!
 //! [`close`]: Session::close
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Map, Value};
 
-use super::budget::{self, fold_balance, last_grant, BudgetGrant};
+use super::budget::{self, fold_balance, last_grant, Allocation, BudgetGrant};
 use super::event::{
-    data_field, is_kernel_only, kernel_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_DESC, FIELD_DETAIL,
-    FIELD_KIND, FIELD_OWNER, FIELD_REASON, FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG,
-    KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED, KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT,
-    KIND_SESSION_CLOSED, KIND_SESSION_OPENED,
+    data_field, is_kernel_only, kernel_event, BUDGET_KINDS, FIELD_AMOUNT, FIELD_CHILD, FIELD_DESC,
+    FIELD_DETAIL, FIELD_KIND, FIELD_OPEN_CHILDREN, FIELD_OWNER, FIELD_PARENT, FIELD_REASON,
+    FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED,
+    KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED, KIND_SESSION_OPENED,
 };
-use super::event_store::{kernel_upcasters, Current, CurrentStore, EventStore};
+use super::event_store::{kernel_upcasters, ChildScan, Current, CurrentStore, EventStore, Split};
 use super::projection::{tail_count, VIEW_TAIL};
 use super::query::{self, QueryOpts, QueryParams, QueryRows};
 use super::scope::{Scope, ScopeId};
@@ -281,6 +303,77 @@ fn refused_event(
     kernel_event(KIND_BUDGET_REFUSED, data)
 }
 
+/// The parent's side of an allocation: the same `budget_reserved` a
+/// [`Session::reserve`] writes, naming the child the units went to.
+///
+/// An allocation *is* a reservation from the parent's side — units left the
+/// balance and are not coming back — so it is the same kind and folds the
+/// same way.  What [`FIELD_CHILD`] adds is where they went, which is the one
+/// thing a reservation for a call of its own has no answer to.
+fn allocated_event(
+    amount: i64,
+    tag: Option<&str>,
+    scope_id: &str,
+    child: &str,
+) -> Map<String, Value> {
+    let mut data = budget_move_data(amount, tag, scope_id);
+    data.insert(FIELD_CHILD.to_string(), Value::from(child.to_string()));
+    kernel_event(KIND_BUDGET_RESERVED, data)
+}
+
+/// The parent's side of an allocation that did not happen: what was asked
+/// for, the balance it was measured against, and the child that was not
+/// opened.
+fn allocation_refused_event(
+    amount: i64,
+    remaining: i64,
+    tag: Option<&str>,
+    scope_id: &str,
+    child: &str,
+) -> Map<String, Value> {
+    let mut event = refused_event(amount, remaining, tag, scope_id);
+    if let Some(Value::Object(data)) = event.get_mut(super::event::FIELD_DATA) {
+        data.insert(FIELD_CHILD.to_string(), Value::from(child.to_string()));
+    }
+    event
+}
+
+/// A child's `session_opened`: the scope it opens under, and the stream it
+/// was opened from.
+///
+/// The same event [`Session::open_on`] writes plus [`FIELD_PARENT`], and
+/// written by the parent's store rather than the child's — the opening and
+/// the reservation that paid for it are one transaction, so the child's first
+/// event arrives before the child has a handle at all.
+fn child_opened_event(owner: &str, scope_id: &str, parent: &str) -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert(FIELD_OWNER.to_string(), Value::from(owner.to_string()));
+    data.insert(
+        FIELD_SCOPE_ID.to_string(),
+        Value::from(scope_id.to_string()),
+    );
+    data.insert(FIELD_PARENT.to_string(), Value::from(parent.to_string()));
+    kernel_event(KIND_SESSION_OPENED, data)
+}
+
+/// A child's `budget_granted`: the units the parent moved, naming where they
+/// came from.
+///
+/// A grant on the child's ledger like any other — its balance is the fold of
+/// its own stream, and this is the entry that starts it — with
+/// [`FIELD_PARENT`] recording that an owner did not conjure it: it was paid
+/// for by a `budget_reserved` on the stream named here, in the same write.
+fn child_granted_event(
+    amount: i64,
+    tag: Option<&str>,
+    scope_id: &str,
+    parent: &str,
+) -> Map<String, Value> {
+    let mut data = budget_move_data(amount, tag, scope_id);
+    data.insert(FIELD_PARENT.to_string(), Value::from(parent.to_string()));
+    kernel_event(KIND_BUDGET_GRANTED, data)
+}
+
 /// The `session_closed` event a close records.
 ///
 /// One builder for both close paths — the awaited [`Session::close_with`] and
@@ -288,7 +381,17 @@ fn refused_event(
 /// backstop is the same event, with the same fields, as one a caller asked
 /// for.  The reason defaults to [`DEFAULT_CLOSE_REASON`]; an absent `detail`
 /// is an absent field rather than a null.
-fn closing_event(reason: Option<&str>, detail: Option<&str>) -> Map<String, Value> {
+///
+/// `children` are the sessions this one opened that had not ended when it
+/// did, found by the store inside the same transaction that writes this
+/// event.  An empty list is an absent field, not an empty array: "there were
+/// none" and "nobody looked" then read the same way, which is the truth for
+/// the detached path — it cannot scan, so it writes none.
+fn closing_event(
+    reason: Option<&str>,
+    detail: Option<&str>,
+    children: Vec<String>,
+) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert(
         FIELD_REASON.to_string(),
@@ -297,8 +400,45 @@ fn closing_event(reason: Option<&str>, detail: Option<&str>) -> Map<String, Valu
     if let Some(detail) = detail {
         data.insert(FIELD_DETAIL.to_string(), Value::from(detail.to_string()));
     }
+    if !children.is_empty() {
+        data.insert(
+            FIELD_OPEN_CHILDREN.to_string(),
+            Value::from(children.into_iter().map(Value::from).collect::<Vec<_>>()),
+        );
+    }
     kernel_event(KIND_SESSION_CLOSED, data)
 }
+
+/// How the store recognises the children of this session: the two kernel
+/// kinds that bracket a session, and the `data` field a child's opening names
+/// its parent in.
+///
+/// Built here rather than in the store because the vocabulary is the
+/// kernel's — [`EventStore::append_with_open_children`] walks a database and
+/// knows nothing about what `session_opened` means.
+fn child_scan() -> ChildScan {
+    ChildScan {
+        opened: KIND_SESSION_OPENED.to_string(),
+        closed: KIND_SESSION_CLOSED.to_string(),
+        parent_field: FIELD_PARENT.to_string(),
+    }
+}
+
+/// What an allocation's decision is shown: the ledger it measures, and the
+/// ending it must not open a child under.
+///
+/// [`BUDGET_KINDS`] plus `session_closed`, written out rather than
+/// concatenated because a `const` cannot join two slices — and held against
+/// the ledger's own list by a test below, so a kind added to the ledger and
+/// missed here goes red instead of quietly falling out of the balance an
+/// allocation is decided against.
+const ALLOCATION_KINDS: &[&str] = &[
+    KIND_BUDGET_GRANTED,
+    KIND_BUDGET_RESERVED,
+    KIND_BUDGET_REFUSED,
+    KIND_BUDGET_SPENT,
+    KIND_SESSION_CLOSED,
+];
 
 /// What a caller should have called instead of hand-appending `kind`.
 ///
@@ -623,6 +763,190 @@ impl Session {
         self.scope.grant_more(grant)
     }
 
+    /// Open a session *from* this one, paying for it out of this session's
+    /// balance — one transaction, both ledgers.
+    ///
+    /// The kernel's whole part in a session tree.  It records two facts and
+    /// performs one move:
+    ///
+    /// - the child's `session_opened` carries [`FIELD_PARENT`] — this
+    ///   session's stream — and the `budget_granted` it opens with carries it
+    ///   too, so where the units came from is in the log beside them;
+    /// - this session's ledger gains a `budget_reserved` naming the child
+    ///   ([`FIELD_CHILD`]).  An allocation is a *spend* from here: the
+    ///   balance falls by exactly what the child's rises by, and nothing is
+    ///   returned when the child closes.  A refund would be a balance rising
+    ///   without an owner granting, which is the one thing the ledger does
+    ///   not allow.
+    ///
+    /// All of it is decided and written inside one transaction on this
+    /// session's store ([`EventStore::append_if_many`]), so two children
+    /// asking at once cannot both be given what only one balance covers, and
+    /// no reader ever meets a child that opened without the reservation that
+    /// paid for it.
+    ///
+    /// **The child is on the parent's database.**  `child_store` must be a
+    /// store on the same database ([`EventStore::database`]) opened on
+    /// `child_stream`; anything else is a [`KnlError::Validation`] before a
+    /// word is written.  A tree spread over two logs could be neither written
+    /// atomically nor read back by one statement, so it is not a tree.
+    ///
+    /// **A refusal is an error here, not a `false`.**  When the balance does
+    /// not cover the allocation, a `budget_refused` naming the child is
+    /// recorded on this session, nothing is opened, and
+    /// [`KnlError::Refused`] is raised: unlike [`Session::reserve`], which is
+    /// asked in a loop that expects to be told no, an allocation either
+    /// produced a session or it did not, and there is no half-opened one to
+    /// hand back.
+    ///
+    /// **The parent must be open.**  This handle having closed is refused
+    /// straight away, and a stream whose log already carries an ending is
+    /// refused *inside the transaction* — the decision is shown
+    /// `session_closed` along with the ledger — both as
+    /// [`KnlError::Closed`], the same answer a resume of a closed stream
+    /// gives.
+    ///
+    /// The child comes back as an ordinary session with its scope restored
+    /// from the events just written ([`Session::resume`] over the two of
+    /// them): its balance is the fold of its own ledger, its owner and scope
+    /// are what the opening recorded, and nothing about it is special
+    /// afterwards.  What it is *not* is a handle this session holds — the
+    /// parent keeps no pointer, and a supervisor reads the structure back out
+    /// of the log.
+    pub async fn open_child(
+        &mut self,
+        child_stream: String,
+        owner: String,
+        allocation: Allocation,
+        child_store: Box<dyn EventStore>,
+    ) -> KnlResult<Self> {
+        if self.closed {
+            return Err(KnlError::Closed(format!(
+                "{CLOSED} (a child is opened from an open parent)"
+            )));
+        }
+        budget::check_amount(allocation.amount)?;
+
+        // One log, checked before anything is written: the two halves of an
+        // allocation land in one transaction, and a transaction covers one
+        // database.
+        match (self.store.database(), child_store.database()) {
+            (Some(parent), Some(child)) if parent == child => {}
+            (Some(parent), Some(child)) => {
+                return Err(KnlError::Validation(format!(
+                    "a child opens on its parent's database, and a tree is one log: the parent is \
+                     on {parent:?} and the child was given {child:?}"
+                )));
+            }
+            _ => {
+                return Err(KnlError::Validation(
+                    "a child opens on its parent's database, and one of the two stores keeps a \
+                     single stream with no database to share"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let amount = allocation.amount;
+        // The units come out of this ledger, so they are counted in its unit
+        // unless the caller renamed them for the child.
+        let parent_tag = self.scope.grant().and_then(|grant| grant.tag.clone());
+        let child_tag = allocation.tag.clone().or_else(|| parent_tag.clone());
+        let parent_scope = self.scope.id().to_string();
+        let parent_id = self.id.clone();
+        let child_id = child_stream.clone();
+
+        // The child's scope is issued before its first event, exactly as
+        // `open_on` issues one.  The value is not kept: the handle below is
+        // built by a resume, which restores the scope from the very
+        // `session_opened` this id is about to be written onto.
+        let child_scope_id = Scope::new(owner.clone(), None).id().to_string();
+
+        // What the decision saw, carried out of it: the decision runs on the
+        // store's own thread, so the balance a refusal reports and the
+        // ending it found come back through cells rather than through the
+        // events it returns.
+        let ended = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicBool::new(false));
+        let measured = Arc::new(AtomicI64::new(0));
+        let (found_ending, said_no, balance_seen) = (
+            Arc::clone(&ended),
+            Arc::clone(&refused),
+            Arc::clone(&measured),
+        );
+
+        let committed = self
+            .store
+            .append_if_many(
+                &child_stream,
+                Some(ALLOCATION_KINDS),
+                Box::new(move |events: Vec<Current>| {
+                    // The ending is part of the invariant, not a check taken
+                    // beforehand: a parent that closed between the read and
+                    // the write would otherwise get a child anyway.
+                    if events.iter().any(|e| e.kind() == KIND_SESSION_CLOSED) {
+                        found_ending.store(true, Ordering::Relaxed);
+                        return None;
+                    }
+                    // No grant on the parent is no ledger to measure against
+                    // — the same rule `reserve` follows — so the allocation
+                    // is allowed and recorded, and the fold ignores a
+                    // reservation with nothing granted before it.
+                    if let Some(balance) = fold_balance(&events) {
+                        if balance < amount {
+                            said_no.store(true, Ordering::Relaxed);
+                            balance_seen.store(balance, Ordering::Relaxed);
+                            return Some(Split::own(vec![allocation_refused_event(
+                                amount,
+                                balance,
+                                parent_tag.as_deref(),
+                                &parent_scope,
+                                &child_id,
+                            )]));
+                        }
+                    }
+                    Some(Split {
+                        own: vec![allocated_event(
+                            amount,
+                            parent_tag.as_deref(),
+                            &parent_scope,
+                            &child_id,
+                        )],
+                        other: vec![
+                            child_opened_event(&owner, &child_scope_id, &parent_id),
+                            child_granted_event(
+                                amount,
+                                child_tag.as_deref(),
+                                &child_scope_id,
+                                &parent_id,
+                            ),
+                        ],
+                    })
+                }),
+            )
+            .await?;
+
+        if committed.is_none() || ended.load(Ordering::Relaxed) {
+            return Err(KnlError::Closed(format!(
+                "{CLOSED} (the parent's log already carries its ending)"
+            )));
+        }
+        if refused.load(Ordering::Relaxed) {
+            let balance = measured.load(Ordering::Relaxed);
+            return Err(KnlError::Refused(format!(
+                "the parent's balance is {balance}, which does not cover an allocation of \
+                 {amount}; the refusal is in the log and no child was opened"
+            )));
+        }
+
+        // The opening and the grant are committed, so the child's stream is a
+        // session: resuming it restores the scope and folds the balance out
+        // of the two events that were just written for it.
+        let mut child = Self::resume(None, child_store).await?;
+        child.adopt_id(child_stream);
+        Ok(child)
+    }
+
     /// The session-correlation id.
     pub fn id(&self) -> &str {
         &self.id
@@ -663,6 +987,17 @@ impl Session {
     /// Whose scope this is (a principal id, or [`ANON`] / [`SYSTEM`]).
     pub fn owner(&self) -> &str {
         self.scope.owner()
+    }
+
+    /// The database this session's log lives in, or `None` for a backend that
+    /// is not one ([`EventStore::database`]).
+    ///
+    /// Published for one caller: whoever opens a child has to open its store
+    /// on the parent's database, and asking the parent is how it knows which
+    /// that is ([`Session::open_child`] refuses any other).  It is an
+    /// identity to pass along, not a location to take apart.
+    pub fn database(&self) -> Option<&str> {
+        self.store.database()
     }
 
     /// Record an event, returning its `seq`.  The one write path.
@@ -958,6 +1293,14 @@ impl Session {
     /// ending in the log — the truthful record of two handles both believing
     /// they owned the session, and the shape an audit needs to see.
     ///
+    /// **Open children are recorded, never a refusal.**  In the same write,
+    /// the store looks for the streams that name this session as their parent
+    /// and carry no ending of their own ([`Session::open_child`]); if it
+    /// finds any, their ids go on the boundary as
+    /// `data.open_children`.  The close still succeeds — the log turns no
+    /// write away, and a run that ended while what it started was still going
+    /// is exactly the fact worth having in it.
+    ///
     /// Fallible on a durable backend: the `session_closed` append can fail on
     /// a database that stays contended past its retries, or a store that is
     /// gone.  On failure the session stays open (closed is not set), so the
@@ -986,20 +1329,34 @@ impl Session {
         if self.closed {
             return Ok(());
         }
-        let event = closing_event(reason, detail);
+        // Owned, because the event is built on the store's own thread: the
+        // decision below travels there with the scan it is answered from.
+        let reason = reason.map(str::to_string);
+        let detail = detail.map(str::to_string);
 
-        // A plain append, taken through the kernel's own path because
-        // `session_closed` is kernel-only and the guarded `append` would
-        // refuse the very event that ends the session.  The store is not
-        // asked whether an ending is there already: two handles closing one
-        // stream write two `session_closed` events, which is what happened
-        // and therefore what the log says.
+        // The boundary and the scan that finds this session's open children
+        // are one write.  A close is never refused for them — the log turns
+        // nothing away, and a run that ended while what it started was still
+        // going is the fact an audit is reading for — so what the scan
+        // produces is recorded on the event rather than raised at the caller.
         //
-        // The flag moves only after the boundary landed, so a failed append
+        // Kernel-only kinds do not go through the guarded `append`, which
+        // would refuse the very event that ends the session; this path is the
+        // kernel's own, like `append_kernel`, and carries the same `closed`
+        // check above.
+        //
+        // The flag moves only after the boundary landed, so a failed write
         // leaves this handle open and the caller free to retry — a close that
         // reported success with nothing in the log would break every later
         // read of it.
-        self.append_kernel(event).await?;
+        self.store
+            .append_with_open_children(
+                &child_scan(),
+                Box::new(move |children| {
+                    closing_event(reason.as_deref(), detail.as_deref(), children)
+                }),
+            )
+            .await?;
         self.closed = true;
         Ok(())
     }
@@ -1024,7 +1381,8 @@ impl Session {
         if self.closed {
             return;
         }
-        self.store.detach_append(closing_event(Some(reason), None));
+        self.store
+            .detach_append(closing_event(Some(reason), None, Vec::new()));
         self.closed = true;
     }
 
@@ -3241,5 +3599,457 @@ mod tests {
             .query("SELECT 1 AS one", QueryParams::None, &QueryOpts::default())
             .await
             .is_ok());
+    }
+
+    // -- children: the parent link, and the allocation that paid for it ------
+
+    /// A store for `stream` on the database `parent` is already on.
+    ///
+    /// What [`Session::open_child`] requires, built the way the bridge builds
+    /// it: the parent is asked where it is, and the child's store is opened
+    /// there.  The drivers are thrown away on the spot for the same reason
+    /// the rest of these tests throw them away — the connection thread lives
+    /// as long as the store holding its handle does.
+    async fn store_beside(parent: &Session, stream: &str) -> Box<dyn EventStore> {
+        let db = parent.database().expect("the parent is on a database");
+        Box::new(
+            SqliteEventStore::open(std::path::Path::new(db), stream, &IsleDrivers::new())
+                .await
+                .expect("a store on the parent's database"),
+        )
+    }
+
+    /// A fresh stream id, as the layer that opens a child mints one.
+    fn stream_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// A second handle on `of`'s stream: another store on the same database,
+    /// resumed.
+    ///
+    /// Two handles on one stream is a supported shape — the store serializes
+    /// their writes — and it is the only way to have two callers allocating
+    /// from one parent at the same time.
+    async fn another_handle(of: &Session) -> Session {
+        let db = of.database().expect("a database");
+        let store = SqliteEventStore::open(std::path::Path::new(db), of.id(), &IsleDrivers::new())
+            .await
+            .expect("reopen the stream");
+        let mut handle = Session::resume(None, Box::new(store))
+            .await
+            .expect("resume");
+        handle.adopt_id(of.id().to_string());
+        handle
+    }
+
+    /// A session with `budget` on the file at `path`, so two handles can
+    /// contend for one balance through two real connections.
+    async fn file_session(path: &std::path::Path, budget: i64, drivers: &IsleDrivers) -> Session {
+        let stream = stream_id();
+        let store = SqliteEventStore::open(path, stream.clone(), drivers)
+            .await
+            .expect("open the stream");
+        let mut session = Session::open_on(ANON.to_string(), Some(grant(budget)), Box::new(store))
+            .await
+            .expect("open");
+        session.adopt_id(stream);
+        session
+    }
+
+    /// (2a) The allocation lands on both sides: the child opens with the
+    /// units and with its parent named, and the parent's ledger carries the
+    /// reservation that paid for them — one transaction, two streams.
+    ///
+    /// And nothing comes back.  A child closing is not a refund: the balance
+    /// only rises when an owner grants.
+    #[tokio::test]
+    async fn an_allocation_opens_the_child_and_moves_the_units() {
+        let mut parent = new_session(Some(100)).await;
+        let stream = stream_id();
+        let store = store_beside(&parent, &stream).await;
+
+        let mut child = parent
+            .open_child(
+                stream.clone(),
+                "user-42".to_string(),
+                Allocation::new(40),
+                store,
+            )
+            .await
+            .expect("the parent's balance covers it");
+
+        assert_eq!(child.id(), stream, "the child is the stream it was given");
+        assert_eq!(child.owner(), "user-42");
+        assert_eq!(remaining(&parent).await, Some(60), "the parent paid");
+        assert_eq!(remaining(&child).await, Some(40), "and the child holds it");
+
+        // The child's log: it opened, and it opened with the grant. Both name
+        // the parent, and the scope the handle reports is the one the opening
+        // recorded — the child is a resumed session over what was written for
+        // it, not a value built beside the log.
+        let opened = child.events(0).await.expect("events");
+        assert_eq!(
+            kinds(&opened),
+            vec![KIND_SESSION_OPENED, KIND_BUDGET_GRANTED]
+        );
+        assert_eq!(
+            field(&opened[0], FIELD_PARENT).as_str(),
+            Some(parent.id()),
+            "{}",
+            opened[0]
+        );
+        assert_eq!(
+            field(&opened[0], FIELD_SCOPE_ID).as_str(),
+            Some(child.scope_id())
+        );
+        assert_eq!(*field(&opened[1], FIELD_AMOUNT), json!(40));
+        assert_eq!(field(&opened[1], FIELD_PARENT).as_str(), Some(parent.id()));
+        assert_eq!(
+            field(&opened[1], FIELD_TAG).as_str(),
+            Some("tokens"),
+            "the child counts in the parent's unit unless it was renamed"
+        );
+
+        // The parent's ledger: an ordinary reservation, naming where the
+        // units went.
+        let moves = ledger(&parent).await;
+        assert_eq!(
+            kinds(&moves),
+            vec![KIND_BUDGET_GRANTED, KIND_BUDGET_RESERVED]
+        );
+        assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(40));
+        assert_eq!(
+            field(&moves[1], FIELD_CHILD).as_str(),
+            Some(stream.as_str())
+        );
+
+        // A child that closes gives nothing back.
+        child.close(Some("done")).await.expect("close the child");
+        assert_eq!(
+            remaining(&parent).await,
+            Some(60),
+            "an allocation is a spend"
+        );
+    }
+
+    /// A child may count in a unit of its own, and the parent's own ledger
+    /// entry stays in the parent's.
+    #[tokio::test]
+    async fn an_allocation_may_rename_the_unit_for_the_child() {
+        let mut parent = new_session(Some(100)).await;
+        let stream = stream_id();
+        let store = store_beside(&parent, &stream).await;
+        let child = parent
+            .open_child(
+                stream,
+                "user-42".to_string(),
+                Allocation {
+                    amount: 10,
+                    tag: Some("turns".to_string()),
+                },
+                store,
+            )
+            .await
+            .expect("the allocation");
+
+        let opened = child.events(0).await.expect("events");
+        assert_eq!(field(&opened[1], FIELD_TAG).as_str(), Some("turns"));
+        let moves = ledger(&parent).await;
+        assert_eq!(
+            field(&moves[1], FIELD_TAG).as_str(),
+            Some("tokens"),
+            "the parent's entry counts what the parent counts"
+        );
+    }
+
+    /// (2b) A balance that will not cover it: the refusal is recorded on the
+    /// parent, nothing is opened, and the caller is told with the one class
+    /// that reports a decision rather than a fault.
+    #[tokio::test]
+    async fn an_allocation_the_balance_cannot_cover_is_refused_and_recorded() {
+        let mut parent = new_session(Some(10)).await;
+        let stream = stream_id();
+        let store = store_beside(&parent, &stream).await;
+
+        let err = parent
+            .open_child(
+                stream.clone(),
+                "user-42".to_string(),
+                Allocation::new(40),
+                store,
+            )
+            .await
+            .expect_err("10 does not cover 40");
+        assert_eq!(err.kind(), KnlError::REFUSED, "{err}");
+        assert!(
+            !err.is_retryable(),
+            "the same balance answers the same: {err}"
+        );
+        assert!(err.reason().contains("40"), "{err}");
+
+        // The balance did not move, and the refusal says what it was measured
+        // against and which child it was for.
+        assert_eq!(remaining(&parent).await, Some(10));
+        let moves = ledger(&parent).await;
+        assert_eq!(
+            kinds(&moves),
+            vec![KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED]
+        );
+        assert_eq!(*field(&moves[1], FIELD_AMOUNT), json!(40));
+        assert_eq!(*field(&moves[1], FIELD_REMAINING), json!(10));
+        assert_eq!(
+            field(&moves[1], FIELD_CHILD).as_str(),
+            Some(stream.as_str())
+        );
+
+        // …and the child's stream was never written: a refused allocation
+        // leaves no half-opened session behind.
+        let unused = store_beside(&parent, &stream).await;
+        assert_eq!(unused.len().await.expect("len"), 0);
+    }
+
+    /// A parent with no budget has no ledger to measure against, so the
+    /// allocation is allowed — the same rule `reserve` follows.  The child
+    /// gets a ledger of its own all the same, because a grant is what starts
+    /// one.
+    #[tokio::test]
+    async fn a_parent_with_no_budget_allocates_without_a_balance_to_measure() {
+        let mut parent = new_session(None).await;
+        let stream = stream_id();
+        let store = store_beside(&parent, &stream).await;
+        let child = parent
+            .open_child(stream, "user-42".to_string(), Allocation::new(7), store)
+            .await
+            .expect("there is no balance to refuse against");
+
+        assert_eq!(remaining(&parent).await, None, "still no budget here");
+        assert_eq!(remaining(&child).await, Some(7));
+    }
+
+    /// The tree is one log.  A child store on another database is refused
+    /// before anything is written, because the two halves of an allocation
+    /// share a transaction and a transaction covers one database.
+    #[tokio::test]
+    async fn a_child_on_another_database_is_refused() {
+        let mut parent = new_session(Some(100)).await;
+
+        let stranger = stream_id();
+        let elsewhere = SqliteEventStore::open_memory(stranger.clone(), &IsleDrivers::new())
+            .await
+            .expect("another in-memory database");
+        let err = parent
+            .open_child(
+                stranger,
+                "user-42".to_string(),
+                Allocation::new(10),
+                Box::new(elsewhere),
+            )
+            .await
+            .expect_err("that is a different log");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains("one log"), "{err}");
+        assert_eq!(
+            parent.len().await.expect("len"),
+            2,
+            "opened + granted, and nothing else"
+        );
+
+        // A store that is not a database at all has no database to share, and
+        // says so rather than being taken as "the same one".
+        let mut single = Session::open_on(
+            ANON.to_string(),
+            Some(grant(50)),
+            Box::new(MemEventStore::new()),
+        )
+        .await
+        .expect("open");
+        let err = single
+            .open_child(
+                stream_id(),
+                "user-42".to_string(),
+                Allocation::new(1),
+                Box::new(MemEventStore::new()),
+            )
+            .await
+            .expect_err("no database to open a child on");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+    }
+
+    /// A closed parent opens nothing — whether this handle knows it closed,
+    /// or whether the ending is only in the log.  The second is decided
+    /// *inside* the write, so a parent that closes between the read and the
+    /// insert cannot get a child anyway.
+    #[tokio::test]
+    async fn a_closed_parent_opens_no_child() {
+        let mut parent = new_session(Some(100)).await;
+        // Taken while the stream is open: a resume refuses a closed one.
+        let mut other = another_handle(&parent).await;
+        parent.close(Some("done")).await.expect("close");
+
+        let stream = stream_id();
+        let store = store_beside(&parent, &stream).await;
+        let err = parent
+            .open_child(stream, "user-42".to_string(), Allocation::new(1), store)
+            .await
+            .expect_err("this handle closed");
+        assert_eq!(err.kind(), KnlError::CLOSED, "{err}");
+
+        // The other handle never saw the ending; the decision does.
+        let stream = stream_id();
+        let store = store_beside(&other, &stream).await;
+        let err = other
+            .open_child(
+                stream.clone(),
+                "user-42".to_string(),
+                Allocation::new(1),
+                store,
+            )
+            .await
+            .expect_err("the log carries an ending");
+        assert_eq!(err.kind(), KnlError::CLOSED, "{err}");
+        let unused = store_beside(&other, &stream).await;
+        assert_eq!(unused.len().await.expect("len"), 0, "nothing was opened");
+    }
+
+    /// A close records the children that had not ended, and lands anyway: the
+    /// log never refuses a write, and "this ended while what it started was
+    /// still going" is the fact worth having.
+    #[tokio::test]
+    async fn a_close_records_the_children_that_had_not_ended() {
+        let mut parent = new_session(Some(100)).await;
+
+        let still_open = stream_id();
+        let store = store_beside(&parent, &still_open).await;
+        let _running = parent
+            .open_child(
+                still_open.clone(),
+                "user-42".to_string(),
+                Allocation::new(10),
+                store,
+            )
+            .await
+            .expect("the allocation");
+
+        let ended = stream_id();
+        let store = store_beside(&parent, &ended).await;
+        let mut done = parent
+            .open_child(ended, "user-42".to_string(), Allocation::new(10), store)
+            .await
+            .expect("the allocation");
+        done.close(Some("done")).await.expect("close the child");
+
+        parent.close(Some("done")).await.expect("close");
+        let boundary = parent
+            .events(0)
+            .await
+            .expect("events")
+            .pop()
+            .expect("the boundary");
+        assert_eq!(boundary.kind(), KIND_SESSION_CLOSED);
+        assert_eq!(
+            *field(&boundary, FIELD_OPEN_CHILDREN),
+            json!([still_open]),
+            "the child that had ended is not among them: {boundary}"
+        );
+    }
+
+    /// A session with no children says nothing about them: an absent field,
+    /// not an empty list, so "there were none" reads the same as it always
+    /// did.
+    #[tokio::test]
+    async fn a_close_with_no_open_children_records_no_such_field() {
+        let mut s = new_session(None).await;
+        s.close(Some("done")).await.expect("close");
+        let boundary = s
+            .events(0)
+            .await
+            .expect("events")
+            .pop()
+            .expect("the boundary");
+        assert_eq!(
+            data_field(&boundary, FIELD_OPEN_CHILDREN),
+            None,
+            "{boundary}"
+        );
+    }
+
+    /// Two callers allocating from one parent at the same time cannot both be
+    /// paid: the decision and the write share a transaction, so the second
+    /// measures a balance the first has already spent from.
+    ///
+    /// On a file, through two connections, because that is where the
+    /// contention is real — the loser waits out the winner's `IMMEDIATE`
+    /// transaction and then decides against what it committed.
+    #[tokio::test]
+    async fn two_children_allocating_at_once_never_over_allocate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
+
+        let mut one = file_session(&path, 100, &drivers).await;
+        let mut two = another_handle(&one).await;
+
+        let first = stream_id();
+        let second = stream_id();
+        let first_store = store_beside(&one, &first).await;
+        let second_store = store_beside(&two, &second).await;
+
+        let (a, b) = tokio::join!(
+            one.open_child(
+                first,
+                "child-a".to_string(),
+                Allocation::new(60),
+                first_store
+            ),
+            two.open_child(
+                second,
+                "child-b".to_string(),
+                Allocation::new(60),
+                second_store
+            ),
+        );
+
+        // 60 + 60 is more than the parent had, so exactly one of them was
+        // paid for and the sum of what was granted is within the balance.
+        let granted: i64 = [&a, &b].iter().filter(|outcome| outcome.is_ok()).count() as i64 * 60;
+        assert_eq!(granted, 60, "exactly one allocation may land");
+        assert!(
+            granted <= 100,
+            "the sum of the grants is within the balance"
+        );
+
+        let refused = match (&a, &b) {
+            (Err(e), Ok(_)) | (Ok(_), Err(e)) => e,
+            _ => panic!("one grant and one refusal, got {a:?} / {b:?}"),
+        };
+        assert_eq!(refused.kind(), KnlError::REFUSED, "{refused}");
+
+        // The parent's log tells the same story: it paid once and turned the
+        // other down, and the balance is what is left after the one it paid.
+        assert_eq!(remaining(&one).await, Some(40));
+        assert_eq!(
+            kinds(&ledger(&one).await),
+            vec![
+                KIND_BUDGET_GRANTED,
+                KIND_BUDGET_RESERVED,
+                KIND_BUDGET_REFUSED
+            ]
+        );
+    }
+
+    /// An allocation is decided against the whole ledger and against the
+    /// ending, so the kinds it asks the store for have to be exactly those.
+    /// A kind added to the ledger and missed here would silently fall out of
+    /// the balance an allocation measures.
+    #[test]
+    fn an_allocation_folds_the_ledger_and_looks_for_the_ending() {
+        for kind in BUDGET_KINDS {
+            assert!(
+                ALLOCATION_KINDS.contains(kind),
+                "the ledger's {kind} must reach an allocation's decision"
+            );
+        }
+        assert!(ALLOCATION_KINDS.contains(&KIND_SESSION_CLOSED));
+        assert_eq!(ALLOCATION_KINDS.len(), BUDGET_KINDS.len() + 1);
     }
 }

@@ -18,8 +18,13 @@
 //! Five module functions and one userdata.
 //!
 //! - `knl.open(opts?) -> session` — `{ owner?, budget? = { amount, tag?,
-//!   desc? }, store? }`.  State only: the policy half a beat runs against is
-//!   built by the Lua kernel's own constructor, never here.
+//!   desc? }, store?, parent? }`.  State only: the policy half a beat runs
+//!   against is built by the Lua kernel's own constructor, never here.
+//!   `parent` opens the session *from* another one, on that one's database
+//!   and out of its balance — `budget = { from_parent = n, tag? }` — which is
+//!   one write: the child's opening and grant, and the parent's reservation.
+//!   A balance that will not cover it records a refusal on the parent and
+//!   raises `refused`, and no session is returned.
 //! - `knl.resume(opts) -> session` — `{ store, session, budget? }`: reopen a
 //!   stream and re-fold it.
 //! - `knl.new_beat_id() -> string` — a time-ordered, session-free id for the
@@ -126,6 +131,15 @@
 //!   endings, not one.  One reader consults `session_closed` at all —
 //!   `knl.resume`, which refuses a stream whose ending is already in the log,
 //!   because a session is disposable.
+//! - **A child is paid for, and then it is on its own.**  `knl.open{ parent =
+//!   s, budget = { from_parent = n } }` moves `n` out of `s`'s balance and
+//!   opens a session on `s`'s database with `n` of its own, in one write:
+//!   `s`'s ledger gains a `budget_reserved` naming the child, and the child's
+//!   log opens with `parent` recorded on it.  Nothing comes back when the
+//!   child closes — an allocation is a spend — and `s` holds no handle on it:
+//!   the structure is in the log, and `knl.views.tree` reads it.  Closing a
+//!   parent whose children are still open is not refused; the boundary
+//!   records them (`session_closed.data.open_children`).
 //! - **K2 model call.**  There is no composite call and the session keeps
 //!   no backend of its own.  The driver reserves what it estimates the
 //!   call will cost, calls the backend itself, appends the `llm_response`,
@@ -318,7 +332,9 @@ pub const MODULE_API: &[(&str, &str)] = &[
     (
         "open",
         "open(opts?) -> session — owner? / budget? / store? (\"mem\" for an in-memory database, \
-         or { sqlite = path }) [raises: validation, busy, storage]",
+         or { sqlite = path }); parent? opens a child on the parent's database with \
+         budget = { from_parent = n, tag? }, moving n out of the parent's balance in one write \
+         [raises: validation, refused, closed, busy, storage]",
     ),
     (
         "resume",
@@ -908,7 +924,24 @@ impl LuaUserData for Session {
 
 /// The fields a `budget` table may carry.  Anything else is a typo, and a
 /// typo in a quota must not be read as "no limit on that axis".
-const BUDGET_FIELDS: [&str; 3] = ["amount", "tag", "desc"];
+const BUDGET_FIELDS: [&str; 4] = ["amount", "tag", "desc", "from_parent"];
+
+/// What `opts.budget` asked for.
+///
+/// Two things a caller can mean by "this session's budget", and they are not
+/// interchangeable: `amount` is an owner *granting* — a balance out of
+/// nothing the kernel can account for, which only an owner may do — while
+/// `from_parent` is an *allocation*, units moved out of the balance a parent
+/// session already holds.  One is a quota appearing, the other is a quota
+/// changing hands, so they are parsed apart here and refused together
+/// ([`parse_budget`]).
+enum BudgetOpt {
+    /// `{ amount, tag?, desc? }` — what an owner allows this session.
+    Grant(knl::BudgetGrant),
+    /// `{ from_parent, tag? }` — what the parent named in `opts.parent`
+    /// hands over out of its own balance.
+    FromParent(knl::Allocation),
+}
 
 /// Read an optional string field of the `budget` table.
 fn budget_string(budget: &LuaTable, field: &str) -> LuaResult<Option<String>> {
@@ -923,14 +956,22 @@ fn budget_string(budget: &LuaTable, field: &str) -> LuaResult<Option<String>> {
     }
 }
 
-/// Read `opts.budget` into the session's grant: `{ amount, tag?, desc? }`.
+/// Read `opts.budget`: `{ amount, tag?, desc? }` (an owner's grant) or
+/// `{ from_parent, tag? }` (an allocation from `opts.parent`'s balance).
 ///
-/// `amount` is the quota and the only field the kernel interprets; `tag`
-/// names its unit and `desc` records what was allowed and why, both of
-/// which ride onto `budget_granted` verbatim.  An unknown field is an error
-/// rather than a value quietly ignored: a misspelt cap that reads as
-/// "no cap" is exactly the failure a budget exists to prevent.
-fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> {
+/// `amount` / `from_parent` is the quota and the only field the kernel
+/// interprets; `tag` names its unit and `desc` records what was allowed and
+/// why, both of which ride onto `budget_granted` verbatim.  An unknown field
+/// is an error rather than a value quietly ignored: a misspelt cap that reads
+/// as "no cap" is exactly the failure a budget exists to prevent.
+///
+/// The two amounts are mutually exclusive, and naming both is refused rather
+/// than resolved by precedence: "the owner allows 100" and "the parent hands
+/// over 100" are different claims about where a balance came from, and a
+/// table that makes both says neither.  `desc` belongs to a grant alone — an
+/// allocation records the parent it came from, which is the whole of what the
+/// kernel knows about why it happened.
+fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<BudgetOpt>> {
     let Some(opts) = opts else {
         return Ok(None);
     };
@@ -958,16 +999,49 @@ fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> 
         if !BUDGET_FIELDS.contains(&name.as_str()) {
             return Err(err(
                 "session",
-                format!("unknown budget field {name:?} (expected amount / tag / desc)"),
+                format!(
+                    "unknown budget field {name:?} (expected amount / tag / desc / from_parent)"
+                ),
             ));
         }
     }
 
     let amount: LuaValue = budget.get("amount")?;
+    let from_parent: LuaValue = budget.get("from_parent")?;
+    let tag = budget_string(&budget, "tag")?;
+
+    if !matches!(from_parent, LuaValue::Nil) {
+        if !matches!(amount, LuaValue::Nil) {
+            return Err(err(
+                "session",
+                "budget names both amount and from_parent: an owner's grant and an allocation \
+                 out of a parent's balance are different claims about where the quota came from",
+            ));
+        }
+        if budget_string(&budget, "desc")?.is_some() {
+            return Err(err(
+                "session",
+                "budget.desc belongs to an owner's grant; an allocation records the parent it \
+                 came from instead",
+            ));
+        }
+        let Some(amount) = as_whole_non_negative(&from_parent) else {
+            return Err(err(
+                "session",
+                format!(
+                    "budget.from_parent must be a non-negative whole number, got {}",
+                    lua_value_for_msg(&from_parent)
+                ),
+            ));
+        };
+        return Ok(Some(BudgetOpt::FromParent(knl::Allocation { amount, tag })));
+    }
+
     if matches!(amount, LuaValue::Nil) {
         return Err(err(
             "session",
-            "budget.amount is required (non-negative whole number)",
+            "budget.amount is required (non-negative whole number), or budget.from_parent to \
+             allocate out of a parent's balance",
         ));
     }
     let Some(amount) = as_whole_non_negative(&amount) else {
@@ -980,11 +1054,29 @@ fn parse_budget(opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> 
         ));
     };
 
-    Ok(Some(knl::BudgetGrant {
+    Ok(Some(BudgetOpt::Grant(knl::BudgetGrant {
         amount,
-        tag: budget_string(&budget, "tag")?,
+        tag,
         desc: budget_string(&budget, "desc")?,
-    }))
+    })))
+}
+
+/// Read `opts.budget` where only an owner's grant makes sense.
+///
+/// `knl.resume` reopens a stream that already exists, so there is no parent
+/// to allocate from and no child being opened: an allocation there is a
+/// caller reaching for the wrong call, and it is named as such rather than
+/// silently read as a grant of the same size.
+fn parse_grant(method: &str, opts: Option<&LuaTable>) -> LuaResult<Option<knl::BudgetGrant>> {
+    match parse_budget(opts)? {
+        None => Ok(None),
+        Some(BudgetOpt::Grant(grant)) => Ok(Some(grant)),
+        Some(BudgetOpt::FromParent(_)) => Err(err(
+            method,
+            "budget.from_parent allocates from a parent's balance, which is what \
+             open{ parent = … } does; this call takes an owner's grant (amount)",
+        )),
+    }
 }
 
 /// Read `opts.owner`: the principal the session belongs to.
@@ -1204,6 +1296,42 @@ fn parse_store(method: &str, opts: Option<&LuaTable>) -> LuaResult<StoreSpec> {
     }
 }
 
+/// Whether `opts` named a store at all.
+///
+/// [`parse_store`] answers what an absent `store` *means* (the in-memory
+/// one), which is the right default for a session that stands on its own and
+/// the wrong one for a child: a child with no `store` goes where its parent
+/// is, and a child that asked for `"mem"` asked for a different database and
+/// is refused.  Telling the two apart needs the question asked separately.
+fn has_store(opts: Option<&LuaTable>) -> LuaResult<bool> {
+    let Some(opts) = opts else {
+        return Ok(false);
+    };
+    Ok(!matches!(opts.get::<LuaValue>("store")?, LuaValue::Nil))
+}
+
+/// Read `opts.parent`: the session this one is opened from, if any.
+///
+/// Only its presence and its type are settled here.  Whether it really is a
+/// kernel session — and whether its balance covers what is being asked for —
+/// is answered where the allocation runs, with the parent borrowed.
+fn parse_parent(opts: Option<&LuaTable>) -> LuaResult<Option<LuaAnyUserData>> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    match opts.get::<LuaValue>("parent")? {
+        LuaValue::Nil => Ok(None),
+        LuaValue::UserData(parent) => Ok(Some(parent)),
+        other => Err(err(
+            "open",
+            format!(
+                "parent must be a session (the userdata knl.open returns), got {}",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
 /// Open a NEW durable session on the SQLite stream at `path`.
 ///
 /// The stream id is minted here and adopted as the session's own id, so the
@@ -1267,12 +1395,91 @@ async fn resume_on(
     Ok(Session::from_state(state))
 }
 
+/// Open the store a child's stream will live in.
+///
+/// `named` is what the caller asked for and `parent_db` is where the parent
+/// is; an absent `store` means the child goes where its parent already is,
+/// which is the only answer that always works.  A store the caller *did*
+/// name is opened as asked and handed to the kernel, which refuses it if it
+/// turns out to be a different database — the check belongs there, next to
+/// the transaction that would have to span both.
+async fn open_child_store(
+    named: Option<StoreSpec>,
+    parent_db: &str,
+    stream: &str,
+    drivers: &knl::IsleDrivers,
+) -> LuaResult<Box<dyn knl::EventStore>> {
+    let store = match named {
+        // The parent's database, addressed exactly as it was opened (a path,
+        // or the in-memory database's shared-cache URI).
+        None => knl::SqliteEventStore::open(std::path::Path::new(parent_db), stream, drivers).await,
+        Some(StoreSpec::Sqlite(path)) => {
+            knl::SqliteEventStore::open(std::path::Path::new(&path), stream, drivers).await
+        }
+        Some(StoreSpec::Mem) => knl::SqliteEventStore::open_memory(stream, drivers).await,
+    };
+    Ok(Box::new(store.map_err(|e| knl_err("open", &e))?))
+}
+
+/// Open a session from `parent`, paying for it out of the parent's balance —
+/// the `knl.open{ parent = … }` path.
+///
+/// The parent is held for the whole of it: the allocation is one transaction
+/// on the parent's store, so the parent's own calls wait for it exactly as
+/// they wait for any other syscall of its own.
+async fn open_child_session(
+    lua: Lua,
+    parent: LuaAnyUserData,
+    owner: String,
+    allocation: knl::Allocation,
+    named_store: Option<StoreSpec>,
+    drivers: knl::IsleDrivers,
+) -> LuaResult<LuaAnyUserData> {
+    let handle = parent.borrow::<Session>().map_err(|_| {
+        err(
+            "open",
+            "parent must be a session returned by knl.open / knl.resume",
+        )
+    })?;
+    let child = {
+        let mut state = handle.state.lock().await;
+        let parent_db = state
+            .database()
+            .ok_or_else(|| {
+                err(
+                    "open",
+                    "the parent's store keeps a single stream, so there is no database to open a \
+                     child on",
+                )
+            })?
+            .to_string();
+        // Minted here and adopted by the child below, so the id `s:id()`
+        // reports is the stream the parent's log names as its child.
+        let stream = uuid::Uuid::new_v4().to_string();
+        let store = open_child_store(named_store, &parent_db, &stream, &drivers).await?;
+        state
+            .open_child(stream, owner, allocation, store)
+            .await
+            .map_err(|e| knl_err("open", &e))?
+    };
+    // The parent is released before Lua is re-entered to build the userdata.
+    drop(handle);
+    lua.create_userdata(Session::from_state(child))
+}
+
 /// Build a session userdata from `opts` — the body of `knl.open`.
 ///
 /// `opts.owner` is the principal (default the reserved anonymous id),
 /// `opts.budget` the grant (`{ amount, tag?, desc? }`), and `opts.store`
 /// the backend (in-memory by default, or `{ sqlite = "<path>" }` for a
 /// durable stream).
+///
+/// `opts.parent` is the other way to open: a session this one is opened
+/// *from*, with `budget = { from_parent = n, tag? }` moving `n` out of that
+/// session's balance in the same write that opens this one.  The two forms
+/// are exclusive in both directions — a parent with an owner's grant would be
+/// a child whose quota nobody paid for, and `from_parent` with no parent has
+/// nowhere to take it from — so each is refused with the other named.
 async fn open_session(
     lua: Lua,
     opts: LuaValue,
@@ -1289,17 +1496,45 @@ async fn open_session(
         }
     };
     let owner = parse_owner(opts.as_ref())?;
-    let grant = parse_budget(opts.as_ref())?;
+    let budget = parse_budget(opts.as_ref())?;
     let spec = parse_store("open", opts.as_ref())?;
+    let named_store = has_store(opts.as_ref())?.then_some(spec);
+    let parent = parse_parent(opts.as_ref())?;
     // The options are read out of Lua *before* the first await: `opts` is a
     // `LuaTable`, which must not be held across a suspension point, and the
-    // three parses above are the only things that touch it.
+    // parses above are the only things that touch it.
     drop(opts);
-    let session = match spec {
-        StoreSpec::Mem => Session::new(owner, grant, &drivers).await?,
-        StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
+
+    let Some(parent) = parent else {
+        let grant = match budget {
+            None => None,
+            Some(BudgetOpt::Grant(grant)) => Some(grant),
+            Some(BudgetOpt::FromParent(_)) => {
+                return Err(err(
+                    "open",
+                    "budget.from_parent allocates out of a parent's balance, so it needs \
+                     opts.parent: the session to open this one from",
+                ));
+            }
+        };
+        let session = match named_store.unwrap_or(StoreSpec::Mem) {
+            StoreSpec::Mem => Session::new(owner, grant, &drivers).await?,
+            StoreSpec::Sqlite(path) => open_sqlite(owner, grant, &path, &drivers).await?,
+        };
+        return lua.create_userdata(session);
     };
-    lua.create_userdata(session)
+
+    let allocation = match budget {
+        Some(BudgetOpt::FromParent(allocation)) => allocation,
+        _ => {
+            return Err(err(
+                "open",
+                "a child's quota comes out of its parent's: opts.parent needs \
+                 budget = { from_parent = n, tag? }",
+            ));
+        }
+    };
+    open_child_session(lua, parent, owner, allocation, named_store, drivers).await
 }
 
 /// Resume a persisted session — the body of `knl.resume`.
@@ -1327,7 +1562,7 @@ async fn resume_session(
             ));
         }
     };
-    let grant = parse_budget(Some(&opts))?;
+    let grant = parse_grant("resume", Some(&opts))?;
     let store = parse_store("resume", Some(&opts))?;
     let session: LuaValue = opts.get("session")?;
     let session_id = match session {
@@ -3964,5 +4199,197 @@ mod tests {
         // And the write itself landed once the lock was released.
         vm.exec(r#"assert(kinds_of(session) == "session_opened,slow", kinds_of(session))"#)
             .expect("the slow append landed");
+    }
+
+    /// `knl.open{ parent = s, budget = { from_parent = n } }` opens a session
+    /// on the parent's database and out of its balance, in one write: the
+    /// child's log names the parent and carries the grant, and the parent's
+    /// ledger carries the reservation naming the child.
+    #[test]
+    fn open_with_a_parent_allocates_out_of_the_parents_balance() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local parent = knl.open({ owner = "u", budget = { amount = 100, tag = "tokens" } })
+            local child  = knl.open({
+                owner  = "worker",
+                parent = parent,
+                budget = { from_parent = 40 },
+            })
+
+            assert(child:id() ~= parent:id(), "a child is its own stream")
+            assert(child:owner() == "worker", child:owner())
+            assert(parent:remaining() == 60, "parent: " .. tostring(parent:remaining()))
+            assert(child:remaining() == 40, "child: " .. tostring(child:remaining()))
+
+            -- the child's own log: opened, and opened with the grant
+            assert(kinds_of(child) == "session_opened,budget_granted", kinds_of(child))
+            local opened = child:events()[1]
+            assert(opened.data.parent == parent:id(), tostring(opened.data.parent))
+            local granted = child:events()[2]
+            assert(granted.data.parent == parent:id(), tostring(granted.data.parent))
+            assert(granted.data.amount == 40, tostring(granted.data.amount))
+            assert(granted.data.tag == "tokens", "the parent's unit by default")
+
+            -- the parent's side: a reservation naming where the units went
+            local ledger = parent:events()
+            local reserved = ledger[#ledger]
+            assert(reserved.kind == "budget_reserved", reserved.kind)
+            assert(reserved.data.child == child:id(), tostring(reserved.data.child))
+
+            -- and closing the child gives nothing back
+            child:close("done")
+            assert(parent:remaining() == 60, "an allocation is a spend")
+            parent:close("done")
+        "#,
+        )
+        .expect("the allocation");
+        vm.finish();
+    }
+
+    /// A balance that will not cover the allocation raises `refused` — the
+    /// class that reports a decision — with the refusal in the parent's log
+    /// and no session handed back.
+    #[test]
+    fn a_child_the_parent_cannot_pay_for_is_refused() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local parent = knl.open({ owner = "u", budget = { amount = 10, tag = "tokens" } })
+            local read, raised = failure(knl.open, {
+                owner = "worker", parent = parent, budget = { from_parent = 40 },
+            })
+            assert(read.kind == "refused", "kind: " .. tostring(read.kind))
+            assert(read.method == "open", "method: " .. tostring(read.method))
+            assert(read.retryable == false, "the same balance answers the same")
+            assert(tostring(raised):find("40", 1, true), tostring(raised))
+
+            -- recorded on the parent, and the balance did not move
+            assert(parent:remaining() == 10, tostring(parent:remaining()))
+            local ledger = parent:events()
+            local refused = ledger[#ledger]
+            assert(refused.kind == "budget_refused", refused.kind)
+            assert(refused.data.remaining == 10, tostring(refused.data.remaining))
+            assert(type(refused.data.child) == "string", "the refusal names the child")
+            parent:close("done")
+        "#,
+        )
+        .expect("the refusal");
+        vm.finish();
+    }
+
+    /// The two forms of `budget` are exclusive in both directions, and a
+    /// child on another store is refused as the validation it is.  A quota
+    /// nobody paid for and a tree spread over two logs are the two shapes
+    /// this rules out.
+    #[test]
+    fn a_parent_and_a_grant_are_not_mixed() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local parent = knl.open({ owner = "u", budget = { amount = 100, tag = "tokens" } })
+
+            -- from_parent with nobody to take it from
+            local orphan = failure(knl.open, { owner = "w", budget = { from_parent = 5 } })
+            assert(orphan.kind == "validation", orphan.kind)
+            assert(orphan.message:find("opts.parent", 1, true), orphan.message)
+
+            -- a parent, and an owner's grant instead of an allocation
+            local granted = failure(knl.open, {
+                owner = "w", parent = parent, budget = { amount = 5 },
+            })
+            assert(granted.kind == "validation", granted.kind)
+            assert(granted.message:find("from_parent", 1, true), granted.message)
+
+            -- both at once says neither
+            local both = failure(knl.open, {
+                owner = "w", parent = parent, budget = { amount = 5, from_parent = 5 },
+            })
+            assert(both.kind == "validation", both.kind)
+
+            -- a parent that is not a session
+            local nonsense = failure(knl.open, {
+                owner = "w", parent = "s-1", budget = { from_parent = 5 },
+            })
+            assert(nonsense.kind == "validation", nonsense.kind)
+            assert(nonsense.message:find("must be a session", 1, true), nonsense.message)
+
+            -- a child on a store of its own is a second log, and a tree is one
+            local split = failure(knl.open, {
+                owner = "w", parent = parent, budget = { from_parent = 5 }, store = "mem",
+            })
+            assert(split.kind == "validation", split.kind)
+            assert(split.message:find("one log", 1, true), split.message)
+
+            -- none of it moved the balance
+            assert(parent:remaining() == 100, tostring(parent:remaining()))
+            parent:close("done")
+        "#,
+        )
+        .expect("the refusals");
+        vm.finish();
+    }
+
+    /// Closing a parent whose children are still open is not refused: the
+    /// boundary records them and lands.
+    #[test]
+    fn a_close_records_the_children_that_were_still_open() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local parent = knl.open({ owner = "u", budget = { amount = 100, tag = "tokens" } })
+            local running = knl.open({ owner = "w", parent = parent, budget = { from_parent = 10 } })
+            local done    = knl.open({ owner = "w", parent = parent, budget = { from_parent = 10 } })
+            done:close("done")
+
+            parent:close("done")
+            local events = parent:events()
+            local boundary = events[#events]
+            assert(boundary.kind == "session_closed", boundary.kind)
+            local open_children = boundary.data.open_children
+            assert(type(open_children) == "table", type(open_children))
+            assert(#open_children == 1, "one child was still open, got " .. #open_children)
+            assert(open_children[1] == running:id(), tostring(open_children[1]))
+            running:close("done")
+        "#,
+        )
+        .expect("the close");
+        vm.finish();
+    }
+
+    /// A durable tree: the child goes into the parent's file without being
+    /// told where that is, and one recursive statement reads the shape back
+    /// out of the log.
+    #[test]
+    fn a_childs_stream_lands_in_the_parents_database() {
+        let vm = vm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tree.db");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        let rows: usize = vm
+            .eval(&format!(
+                r#"
+                local parent = knl.open({{
+                    owner = "u",
+                    budget = {{ amount = 100, tag = "tokens" }},
+                    store = {{ sqlite = "{path_str}" }},
+                }})
+                local child = knl.open({{
+                    owner = "w", parent = parent, budget = {{ from_parent = 25 }},
+                }})
+                -- The child was never told where the log is, and it is in it:
+                -- one statement over the parent's own store reaches both.
+                local found = parent:query(
+                    "SELECT stream FROM events WHERE kind = 'session_opened' ORDER BY stream"
+                )
+                child:close("done")
+                parent:close("done")
+                return #found
+            "#
+            ))
+            .expect("the durable tree");
+        assert_eq!(rows, 2, "the parent and its child are in one database");
+        vm.finish();
     }
 }

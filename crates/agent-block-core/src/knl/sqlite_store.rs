@@ -140,8 +140,8 @@ use super::event::{
     FIELD_SEQ,
 };
 use super::event_store::{
-    stamp_schema_version, Committed, Decision, EventStore, CURRENT_SCHEMA_VERSION,
-    SCHEMA_VERSION_FIELD,
+    stamp_schema_version, ChildScan, ChildrenDecision, Committed, Decision, EventStore, Split,
+    SplitDecision, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 use super::query::{session_slot, QueryParams, QueryPlan, QueryRows, STREAM_PARAM};
 use super::{now_ms, KnlError, KnlResult};
@@ -301,6 +301,17 @@ enum Db {
 }
 
 impl Db {
+    /// The identity of this database, as [`EventStore::database`] reports it.
+    ///
+    /// The same string the connection is opened by — a path for a file, the
+    /// shared-cache URI for an in-memory database — because that is exactly
+    /// what "the same database" means here: two stores opened by the same
+    /// target reach the same rows, and the `(stream, seq)` key keeps their
+    /// streams apart inside it.
+    fn id(&self) -> String {
+        self.target().to_string_lossy().into_owned()
+    }
+
     /// The URI an in-memory database for `stream` is addressed by.
     ///
     /// Derived from the stream id, so reopening the same stream in the same
@@ -446,6 +457,9 @@ pub struct SqliteEventStore {
     drivers: IsleDrivers,
     /// The stream this store is scoped to — the session id.
     stream: String,
+    /// The identity of the database, computed once at open ([`Db::id`]) so
+    /// [`EventStore::database`] can hand back a borrow of it.
+    db_id: String,
 }
 
 impl SqliteEventStore {
@@ -480,12 +494,14 @@ impl SqliteEventStore {
     /// preset and ensures the table and its indexes before it takes a job.
     async fn init(db: Db, stream: String, drivers: &IsleDrivers) -> KnlResult<Self> {
         let writer = db.spawn_writer(drivers).await?;
+        let db_id = db.id();
         Ok(Self {
             writer,
             db,
             reader: OnceCell::new(),
             drivers: drivers.clone(),
             stream,
+            db_id,
         })
     }
 
@@ -621,6 +637,55 @@ impl EventStore for SqliteEventStore {
             .call(move |conn| finish(append_if_in(conn, &stream, kinds.as_deref(), decide)))
             .await
             .map_err(KnlError::from)?
+    }
+
+    async fn append_if_many(
+        &mut self,
+        other: &str,
+        kinds: Option<&[&str]>,
+        decide: SplitDecision,
+    ) -> KnlResult<Option<Split<Committed>>> {
+        // One IMMEDIATE transaction over both streams, exactly as
+        // `append_if` takes one over this stream: they are rows of the same
+        // table on the same connection, so "two streams" costs the write
+        // nothing beyond a second `MAX(seq)`.  Not retried, for the reason
+        // `append_if` is not — the decision is a `FnOnce` and an attempt
+        // consumes it.
+        let stream = self.stream.clone();
+        let other = other.to_string();
+        let kinds = owned_kinds(kinds);
+        self.writer
+            .call(move |conn| {
+                finish(append_if_many_in(
+                    conn,
+                    &stream,
+                    &other,
+                    kinds.as_deref(),
+                    decide,
+                ))
+            })
+            .await
+            .map_err(KnlError::from)?
+    }
+
+    async fn append_with_open_children(
+        &mut self,
+        scan: &ChildScan,
+        decide: ChildrenDecision,
+    ) -> KnlResult<Committed> {
+        // The scan reads other streams and the insert writes this one, so
+        // they share the IMMEDIATE transaction: what the boundary records is
+        // what was true at the instant it landed, not a moment before it.
+        let stream = self.stream.clone();
+        let scan = scan.clone();
+        self.writer
+            .call(move |conn| finish(append_with_open_children_in(conn, &stream, &scan, decide)))
+            .await
+            .map_err(KnlError::from)?
+    }
+
+    fn database(&self) -> Option<&str> {
+        Some(&self.db_id)
     }
 
     async fn read_kinds(
@@ -993,19 +1058,139 @@ fn append_many_in(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(JobError::Sqlite)?;
-    let mut seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
+    let committed = insert_batch(&tx, stream, events)?;
+    tx.commit().map_err(JobError::Sqlite)?;
+    Ok(committed)
+}
+
+/// Number `events` on from `stream`'s live head, stamp them and insert them,
+/// inside a transaction the caller opened and commits.
+///
+/// The one numbering rule for every batch a transaction writes — a plain
+/// [`append_many_in`], and each side of an allocation
+/// ([`append_if_many_in`]) — so the second stream of a two-stream write is
+/// numbered exactly as the first is: from its own head, which is what makes
+/// `seq` per-stream rather than per-transaction.
+///
+/// It validates, because an event that reaches here has not always been
+/// checked: a decision's events are the decision's, and one it built wrong
+/// must not be the first thing a stream carries.  A [`JobError::Terminal`]
+/// drops the transaction, so a batch that fails part-way writes nothing.
+fn insert_batch(
+    tx: &Connection,
+    stream: &str,
+    events: &[Map<String, Value>],
+) -> Result<Vec<Committed>, JobError> {
+    let mut seq = next_seq(tx, stream).map_err(JobError::Sqlite)?;
     let mut committed = Vec::with_capacity(events.len());
     for event in events {
+        validate_event(event).map_err(JobError::Terminal)?;
         let epoch_ms = now_ms();
         let mut row = event.clone();
         stamp_schema_version(&mut row);
         stamp(&mut row, seq, epoch_ms);
-        insert_row(&tx, stream, seq, epoch_ms, &row)?;
+        insert_row(tx, stream, seq, epoch_ms, &row)?;
         committed.push(Committed { seq, epoch_ms });
         seq = seq.saturating_add(1);
     }
-    tx.commit().map_err(JobError::Sqlite)?;
     Ok(committed)
+}
+
+/// One `IMMEDIATE` decide-then-append over two streams: read this stream,
+/// ask the decision what to record where, and insert both sides before
+/// committing.
+///
+/// The two-stream twin of [`append_if_in`], and the reason it exists is the
+/// atomicity rather than the convenience: an allocation is a move between two
+/// ledgers, and a reader that met one side without the other would be reading
+/// units that had left one balance without arriving in the other.  Both
+/// streams are rows of the same table on this one connection, so the same
+/// transaction covers them.
+///
+/// A `None` decision commits nothing.  A [`Split`] with an empty `other`
+/// writes only this stream, which is how a refusal is recorded: the fact that
+/// the allocation was asked for and turned down, with no child opened.
+fn append_if_many_in(
+    conn: &mut Connection,
+    stream: &str,
+    other: &str,
+    kinds: Option<&[String]>,
+    decide: SplitDecision,
+) -> Result<Option<Split<Committed>>, JobError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JobError::Sqlite)?;
+    let events = read_in(&tx, stream, kinds, 0, i64::MAX)?;
+    let Some(split) = decide(events) else {
+        // Nothing to write: the transaction is rolled back on drop.
+        return Ok(None);
+    };
+    let own = insert_batch(&tx, stream, &split.own)?;
+    let other = insert_batch(&tx, other, &split.other)?;
+    tx.commit().map_err(JobError::Sqlite)?;
+    Ok(Some(Split { own, other }))
+}
+
+/// One `IMMEDIATE` scan-then-append: find the streams this one is the parent
+/// of that have not ended, hand them to the decision, and insert the event it
+/// builds.
+///
+/// The scan is inside the transaction on purpose.  Asked before the write, it
+/// would answer about a moment the boundary does not land in — a child could
+/// end, or a new one open, in between — and a `session_closed` that named a
+/// child which had already closed would be a record of something that never
+/// happened.
+fn append_with_open_children_in(
+    conn: &mut Connection,
+    stream: &str,
+    scan: &ChildScan,
+    decide: ChildrenDecision,
+) -> Result<Committed, JobError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(JobError::Sqlite)?;
+    let children = open_children_in(&tx, stream, scan).map_err(JobError::Sqlite)?;
+    let committed = insert_batch(&tx, stream, &[decide(children)])?;
+    tx.commit().map_err(JobError::Sqlite)?;
+    // One event in, one out: `insert_batch` numbers what it is given, and it
+    // was given exactly one.
+    committed
+        .into_iter()
+        .next()
+        .ok_or_else(|| JobError::Terminal(KnlError::Storage("the close wrote nothing".to_string())))
+}
+
+/// The streams that name `stream` as their parent and carry no ending.
+///
+/// The vocabulary is the caller's ([`ChildScan`]): which kind opens a stream,
+/// which kind ends one, and where in the opening's `data` the parent is
+/// named.  The JSON path is built from the field name here rather than being
+/// bound as a value, because `json_extract`'s path argument is not one — the
+/// name is the kernel's own constant, never a caller's text.
+///
+/// Ordered by when each child opened, so a close records its children in the
+/// order they were started rather than in whatever order the rows came back.
+fn open_children_in(
+    conn: &Connection,
+    stream: &str,
+    scan: &ChildScan,
+) -> rusqlite::Result<Vec<String>> {
+    let path = format!("$.{}", scan.parent_field);
+    let mut stmt = conn.prepare(
+        "SELECT opened.stream \
+           FROM events AS opened \
+          WHERE opened.kind = ?1 \
+            AND json_extract(opened.data, ?2) = ?3 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM events AS ending \
+                 WHERE ending.stream = opened.stream AND ending.kind = ?4 \
+            ) \
+          ORDER BY opened.epoch_ms, opened.stream",
+    )?;
+    let rows = stmt.query_map(params![scan.opened, path, stream, scan.closed], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect()
 }
 
 /// One `IMMEDIATE` decide-then-append: read the stream, ask the caller's
@@ -1519,6 +1704,207 @@ mod tests {
             .expect("empty")
             .is_empty());
         assert_eq!(store.len().await.expect("len"), 4);
+    }
+
+    /// A two-stream write is one transaction: each side is numbered from its
+    /// own head, both land together, and a `None` decision — or a malformed
+    /// event on either side — leaves both streams exactly as they were.
+    #[tokio::test]
+    async fn append_if_many_writes_both_streams_or_neither() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
+
+        let mut parent = SqliteEventStore::open(&path, "p", &drivers)
+            .await
+            .expect("open the parent");
+        let child = SqliteEventStore::open(&path, "c", &drivers)
+            .await
+            .expect("open the child");
+        parent.append(ev(1)).await.expect("seed");
+
+        let committed = parent
+            .append_if_many(
+                "c",
+                None,
+                Box::new(|events| {
+                    assert_eq!(events.len(), 1, "the decision reads its own stream");
+                    Some(Split {
+                        own: vec![ev(2)],
+                        other: vec![ev(3), ev(4)],
+                    })
+                }),
+            )
+            .await
+            .expect("both sides")
+            .expect("the decision wrote");
+        assert_eq!(
+            committed.own.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [2],
+            "this stream numbers on from its own head"
+        );
+        assert_eq!(
+            committed.other.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            [1, 2],
+            "and the other from its own, which was empty"
+        );
+        assert_eq!(child.len().await.expect("len"), 2, "the other side landed");
+
+        // A `None` is a decision too: neither stream is touched.
+        assert_eq!(
+            parent
+                .append_if_many("c", None, Box::new(|_| None))
+                .await
+                .expect("append_if_many"),
+            None
+        );
+        assert_eq!(parent.len().await.expect("len"), 2);
+        assert_eq!(child.len().await.expect("len"), 2);
+
+        // One side may be empty — a refusal writes only this stream.
+        parent
+            .append_if_many("c", None, Box::new(|_| Some(Split::own(vec![ev(5)]))))
+            .await
+            .expect("append_if_many")
+            .expect("the decision wrote");
+        assert_eq!(parent.len().await.expect("len"), 3);
+        assert_eq!(child.len().await.expect("len"), 2, "and nothing else");
+
+        // A malformed event on the far side takes the whole transaction with
+        // it, including the well-formed one on this side.
+        parent
+            .append_if_many(
+                "c",
+                None,
+                Box::new(|_| {
+                    Some(Split {
+                        own: vec![ev(6)],
+                        other: vec![obj(json!({ "text": "no kind" }))],
+                    })
+                }),
+            )
+            .await
+            .expect_err("kind is required");
+        assert_eq!(parent.len().await.expect("len"), 3, "nothing was written");
+        assert_eq!(child.len().await.expect("len"), 2);
+    }
+
+    /// `database` names the database, not the stream: two stores on one file
+    /// answer with the same string and a store on another file does not.
+    /// That is the whole of what the identity is for — deciding whether one
+    /// transaction can cover both.
+    #[tokio::test]
+    async fn database_is_the_same_for_two_streams_of_one_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let elsewhere = dir.path().join("other.db");
+        let drivers = IsleDrivers::new();
+
+        let a = SqliteEventStore::open(&path, "a", &drivers)
+            .await
+            .expect("open a");
+        let b = SqliteEventStore::open(&path, "b", &drivers)
+            .await
+            .expect("open b");
+        let far = SqliteEventStore::open(&elsewhere, "a", &drivers)
+            .await
+            .expect("open far");
+
+        assert_eq!(a.database(), b.database(), "two streams, one database");
+        assert_ne!(a.database(), far.database(), "two databases");
+        assert_eq!(
+            a.database(),
+            Some(path.to_string_lossy().as_ref()),
+            "the target it was opened by"
+        );
+
+        // An in-memory database has an identity too, and it is the URI a
+        // second connection reaches it by.
+        let (mem, _mem_drivers) = mem_store().await;
+        let uri = mem.database().expect("a database").to_string();
+        assert!(uri.contains("mode=memory"), "{uri}");
+        let beside = SqliteEventStore::open(std::path::Path::new(&uri), "beside", &drivers)
+            .await
+            .expect("open beside");
+        assert_eq!(
+            beside.database(),
+            Some(uri.as_str()),
+            "opening that target reaches the same database"
+        );
+    }
+
+    /// The child scan finds the streams that name this one as their parent
+    /// and carry no ending — and nobody else's children, and not the ones
+    /// that already closed.
+    #[tokio::test]
+    async fn open_children_are_the_unended_streams_that_name_this_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.db");
+        let drivers = IsleDrivers::new();
+
+        /// A `session_opened` naming `parent`.
+        fn opened(parent: &str) -> Map<String, Value> {
+            obj(json!({
+                "kind": "session_opened",
+                "data": { "scope_id": "sc", "owner": "anon", "parent": parent }
+            }))
+        }
+        let ended = obj(json!({ "kind": "session_closed", "data": { "reason": "done" } }));
+
+        let mut parent = SqliteEventStore::open(&path, "p", &drivers)
+            .await
+            .expect("open p");
+        // Still running.
+        let mut running = SqliteEventStore::open(&path, "kid-a", &drivers)
+            .await
+            .expect("open kid-a");
+        running.append(opened("p")).await.expect("opened");
+        // Opened from p and already over.
+        let mut over = SqliteEventStore::open(&path, "kid-b", &drivers)
+            .await
+            .expect("open kid-b");
+        over.append(opened("p")).await.expect("opened");
+        over.append(ended.clone()).await.expect("closed");
+        // Somebody else's child, still running.
+        let mut theirs = SqliteEventStore::open(&path, "kid-c", &drivers)
+            .await
+            .expect("open kid-c");
+        theirs.append(opened("q")).await.expect("opened");
+        // A stream with no parent at all.
+        let mut root = SqliteEventStore::open(&path, "r", &drivers)
+            .await
+            .expect("open r");
+        root.append(obj(
+            json!({ "kind": "session_opened", "data": { "scope_id": "sc", "owner": "anon" } }),
+        ))
+        .await
+        .expect("opened");
+
+        let scan = ChildScan {
+            opened: "session_opened".to_string(),
+            closed: "session_closed".to_string(),
+            parent_field: "parent".to_string(),
+        };
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        let committed = parent
+            .append_with_open_children(
+                &scan,
+                Box::new(move |children| {
+                    *recorded.lock().expect("not poisoned") = children;
+                    ended.clone()
+                }),
+            )
+            .await
+            .expect("the close lands");
+
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            ["kid-a"],
+            "only the unended streams that named this one"
+        );
+        assert_eq!(committed.seq, 1, "and the event it built was appended");
+        assert_eq!(parent.len().await.expect("len"), 1);
     }
 
     /// A kind-filtered read is answered off the index: only the kinds asked

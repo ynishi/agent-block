@@ -158,6 +158,38 @@ impl BudgetGrant {
     }
 }
 
+/// What a parent hands to a child: an amount out of its own balance, and
+/// optionally the unit the child's ledger names it by.
+///
+/// Not a [`BudgetGrant`], and the difference is where the units come from.  A
+/// grant is an owner *allowing* — it raises a balance out of nothing the
+/// kernel can see, and only an owner may write one.  An allocation moves
+/// units that already exist: the parent's balance falls by exactly what the
+/// child's rises by, in one transaction ([`super::Session::open_child`]), so
+/// no total is created and none is lost.
+///
+/// There is no `desc`.  What an allocation is *for* is a supervisor's
+/// vocabulary, and the two events it writes already say the whole of what the
+/// kernel knows: which parent, which child, how much.
+///
+/// `tag` defaults to the parent's — the units come out of that ledger, so
+/// they are counted in that unit unless the caller renames them for the
+/// child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allocation {
+    /// How much of the parent's balance to move.  Non-negative.
+    pub amount: i64,
+    /// The unit the child's ledger names, or the parent's when absent.
+    pub tag: Option<String>,
+}
+
+impl Allocation {
+    /// An allocation of `amount`, counted in the parent's own unit.
+    pub fn new(amount: i64) -> Self {
+        Self { amount, tag: None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -431,6 +431,21 @@ describe("knl.shapes.error — the failure vocabulary is one list", function()
         )
     end)
 
+    it("names the class an allocation the parent cannot pay for comes back as", function()
+        -- The one class that reports a decision rather than a fault: a child
+        -- asked for more than its parent's balance covered, the refusal is in
+        -- the log, and asking again against the same balance answers the
+        -- same — so it is not retryable either.
+        local declared = {}
+        for _, kind in ipairs(K.shapes.error_kinds) do
+            declared[kind] = true
+        end
+        expect(declared.refused).to.be(true)
+        expect(check.check({ kind = "refused", method = "open", retryable = false, message = "…" }, K.shapes.error)).to.be(
+            true
+        )
+    end)
+
     it("declares knl.error in the bridge registry, like every other syscall", function()
         local entry = K.shapes.module.error
         expect(entry).to.exist()
@@ -501,10 +516,12 @@ describe("knl.views — every predefined query view is declared", function()
         expect(K.shapes.api.views.members).to.be(views)
     end)
 
-    it("covers the four the design names", function()
+    it("covers the five the design names", function()
         -- `usage` is one of them: the token counts are a question put to the
-        -- log like any other, not a reading the kernel serves itself.
-        for _, name in ipairs({ "beats", "tool_pairs", "ledger", "usage" }) do
+        -- log like any other, not a reading the kernel serves itself. So is
+        -- `tree`: the shape of a session tree is read back out of the log,
+        -- not held anywhere.
+        for _, name in ipairs({ "beats", "tool_pairs", "ledger", "usage", "tree" }) do
             expect(type(K.views[name])).to.be("function")
             expect(views[name]).to.exist()
         end
@@ -569,15 +586,16 @@ describe("knl.shapes.schema — the read schema is published as data", function(
     end)
 end)
 
-describe("knl.shapes.events — the `data` shape of every kind this layer writes", function()
+describe("knl.shapes.events — the `data` shape of every kind this layer writes or reads", function()
     -- The kernel validates the envelope and the `data` of its OWN kinds
     -- (session_* / budget_*) and nothing else, so these are the only
-    -- declaration there is of what a beat writes. Same completeness rule as
-    -- the registries above: checked, not remembered.
+    -- declaration there is of what a beat writes — plus the two boundary
+    -- kinds a supervisor reads the session tree out of. Same completeness
+    -- rule as the registries above: checked, not remembered.
     local events = K.shapes.events
 
     -- The vocabulary a beat writes, plus the seed form a caller writes
-    -- (`msg_user`). The kernel's own kinds are deliberately absent.
+    -- (`msg_user`).
     local WRITTEN = {
         "msg_user",
         "llm_request",
@@ -585,6 +603,16 @@ describe("knl.shapes.events — the `data` shape of every kind this layer writes
         "llm_call_failed",
         "tool_call",
         "tool_result",
+    }
+
+    -- The two kernel kinds declared here anyway, because a supervisor READS
+    -- them: they carry the session tree (`parent` on an opening,
+    -- `open_children` on a close) and `knl.views.tree` reads those paths.
+    -- Nothing in Lua may write either — the kernel refuses a hand-written
+    -- boundary — so this is a reader's declaration, not a writer's.
+    local READ_ONLY = {
+        "session_opened",
+        "session_closed",
     }
 
     it("declares each kind a beat writes, plus the seed a caller writes", function()
@@ -597,9 +625,39 @@ describe("knl.shapes.events — the `data` shape of every kind this layer writes
         expect(listed(missing)).to.be("")
     end)
 
-    it("declares nothing else (the vocabulary here is what this layer writes)", function()
+    it("declares the two kernel boundary kinds a supervisor reads", function()
+        local missing = {}
+        for _, kind in ipairs(READ_ONLY) do
+            if not is_shape(events[kind]) then
+                missing[#missing + 1] = kind
+            end
+        end
+        expect(listed(missing)).to.be("")
+    end)
+
+    it("carries the session tree on those two and nowhere else", function()
+        -- The two fields a tree is made of, each declared on the kind that
+        -- records it. `knl.views.tree` reads exactly these paths, so a
+        -- rename here is a view that has to move with it.
+        local opened = rawget(events.session_opened, "fields")
+        local closed = rawget(events.session_closed, "fields")
+        expect(opened.parent ~= nil).to.be(true)
+        expect(closed.open_children ~= nil).to.be(true)
+        -- Both optional: a root has no parent, and a close with no children
+        -- still running says nothing about them.
+        expect(check.check({ scope_id = "s", owner = "u" }, events.session_opened)).to.be(true)
+        expect(check.check({ reason = "done" }, events.session_closed)).to.be(true)
+        expect(check.check({ scope_id = "s", owner = "u", parent = "p" }, events.session_opened)).to.be(true)
+        expect(check.check({ reason = "done", open_children = { "a", "b" } }, events.session_closed)).to.be(true)
+        expect(check.check({ reason = "done", open_children = "a" }, events.session_closed)).to.be(false)
+    end)
+
+    it("declares nothing else (the vocabulary here is what this layer writes or reads)", function()
         local known = {}
         for _, kind in ipairs(WRITTEN) do
+            known[kind] = true
+        end
+        for _, kind in ipairs(READ_ONLY) do
             known[kind] = true
         end
         local extra = {}
@@ -632,6 +690,42 @@ describe("knl.shapes.events — the `data` shape of every kind this layer writes
         expect(is_shape(K.shapes.event_meta)).to.be(true)
         expect(check.check({ label = "seed", n = 1, on = true }, K.shapes.event_meta)).to.be(true)
         expect(check.check({ label = { deep = 1 } }, K.shapes.event_meta)).to.be(false)
+    end)
+end)
+
+describe("knl.shapes.open_opts — a session on its own, or one opened from another", function()
+    local opts = K.shapes.open_opts
+
+    it("takes an owner's grant", function()
+        expect(check.check({ owner = "u", budget = { amount = 100, tag = "tokens" } }, opts)).to.be(true)
+        expect(check.check({}, opts)).to.be(true)
+    end)
+
+    it("takes an allocation out of a parent's balance", function()
+        -- The parent is a session handle, which is userdata over the bridge
+        -- and a table in a VM that has none — the same widening every other
+        -- session argument is declared with.
+        expect(check.check({ owner = "w", parent = {}, budget = { from_parent = 25 } }, opts)).to.be(true)
+        expect(check.check({ parent = {}, budget = { from_parent = 25, tag = "turns" } }, opts)).to.be(true)
+    end)
+
+    it("closes the allocation on its two fields", function()
+        -- `desc` is a grant's; an allocation records the parent it came from,
+        -- which is the whole of what the kernel knows about why it happened.
+        -- A closed shape is what makes that a failure rather than a field
+        -- that quietly does nothing.
+        expect(rawget(K.shapes.budget_allocation, "open")).to.be(false)
+        expect(check.check({ from_parent = 5, desc = "for the worker" }, K.shapes.budget_allocation)).to.be(false)
+        expect(check.check({ amount = 5 }, K.shapes.budget_allocation)).to.be(false)
+        expect(check.check({ from_parent = 5 }, K.shapes.budget_allocation)).to.be(true)
+    end)
+
+    it("publishes the allocation beside the grant", function()
+        -- Two shapes because they are two claims about where a balance came
+        -- from: an owner allowing, and a parent handing over. Which of them
+        -- a call may make is the kernel's answer, not this shape's.
+        expect(is_shape(K.shapes.budget_grant)).to.be(true)
+        expect(is_shape(K.shapes.budget_allocation)).to.be(true)
     end)
 end)
 
