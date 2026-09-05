@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.1] - 2026-09-05
+
+### Fixed
+
+- `llm_proto`: a non-200 reply's own explanation now reaches the caller.
+  `transport` reported `API error 400 (invalid_request)` and dropped the
+  message `classify_error` had already extracted, so a context overflow and
+  a malformed body looked the same; the error string now carries the server's
+  message after the kind (`API error 400 (invalid_request): maximum context
+  length exceeded`). `classify_error` also reads a top-level `message` — the
+  shape vLLM answers with — where OpenAI-compatible servers nest it under
+  `error.message`; the fallback used to be the bare `HTTP <status>`.
+
 ## [0.37.0] - 2026-09-05
 
 ### Changed
