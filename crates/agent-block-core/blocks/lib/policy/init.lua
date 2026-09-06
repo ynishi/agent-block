@@ -455,6 +455,9 @@ end
 --- What `policy.window` is configured with.
 local WINDOW_OPTS, WINDOW_ARG = opts_contract({
     tail = T.number:describe("how many beats the request keeps; a whole number >= 1"),
+    keep_seed = T.boolean
+        :describe("also keep every event before the first beat (the caller's seed), ahead of the window; default false")
+        :is_optional(),
 })
 
 --- What `policy.carry` is configured with. `failed` is the caller's reading of
@@ -580,13 +583,23 @@ M.shapes = {
 --- those and dropping only the beats would make the request say something the
 --- log does not — a conversation that begins where it began and then skips.
 ---
+--- `keep_seed` asks for exactly that skip, on purpose. Everything before the
+--- first beat — the seed the caller opened the session with — stays ahead of
+--- the window, and the beats between it and the window are what goes. A loop
+--- whose task is stated in its seed and that runs for more beats than fit has
+--- no other way to keep the task in the request: a window without the seed
+--- forgets what it was asked. The request then does say something the log
+--- does not, and a fold that wanted to say so could add a note; this one
+--- does not, because the models this is for follow the seed either way.
+---
 --- A log with `tail` beats or fewer is not cut at all, and the same list is
 --- handed back rather than copied.
 ---
 --- @param events table|nil  a session's events, in seq order
 --- @param tail number  how many beats to keep
+--- @param keep_seed boolean|nil  keep the events before the first beat too
 --- @return table  the slice, in seq order
-local function window_slice(events, tail)
+local function window_slice(events, tail, keep_seed)
     events = events or {}
     local order, first_at = {}, {}
     for i, ev in ipairs(events) do
@@ -601,6 +614,11 @@ local function window_slice(events, tail)
     end
     local from = first_at[order[#order - tail + 1]]
     local slice = {}
+    if keep_seed then
+        for i = 1, first_at[order[1]] - 1 do
+            slice[#slice + 1] = events[i]
+        end
+    end
     for i = from, #events do
         slice[#slice + 1] = events[i]
     end
@@ -618,22 +636,32 @@ end
 ---
 ---     knl.device({ llm = llm, fold = policy.window({ tail = 4 }) })
 ---
---- @param opts table  { tail = <whole number >= 1> }
+--- With `keep_seed = true` the events before the first beat stay in the
+--- request ahead of the window (see `window_slice`): the task stated in the
+--- seed survives however many beats the loop runs.
+---
+---     knl.device({ llm = llm, fold = policy.window({ tail = 4, keep_seed = true }) })
+---
+--- @param opts table  { tail = <whole number >= 1>, keep_seed = <boolean>? }
 --- @return function fold  fn(events, device) -> request
 function M.window(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
         error("policy.window: opts must be a table", 2)
     end
-    only(opts, { tail = true }, "policy.window")
+    only(opts, { tail = true, keep_seed = true }, "policy.window")
     if not whole_at_least(opts.tail, 1) then
         error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
+    end
+    if opts.keep_seed ~= nil and type(opts.keep_seed) ~= "boolean" then
+        error("policy.window: keep_seed must be a boolean, got " .. tostring(opts.keep_seed), 2)
     end
     shape.assert_dev(opts, WINDOW_OPTS, "policy.window opts")
 
     local tail = opts.tail
+    local keep_seed = opts.keep_seed == true
     return function(events, device)
-        return kernel.fold(window_slice(events, tail), device)
+        return kernel.fold(window_slice(events, tail, keep_seed), device)
     end
 end
 
