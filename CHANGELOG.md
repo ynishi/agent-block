@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.result_cap({ port, conf?, share? })` wraps a device's `tools` so no
+  single tool result may take more than a share of the model's window (a
+  quarter by default). It is the one shape a fold cannot absorb: `window{ fit }`
+  drops whole beats and must not drop the newest one, which holds the result
+  the model is waiting for, so an oversized answer ends the run. The refusal
+  is an answer rather than a raise — `{ ok = false, reason =
+  "result_too_large", tokens, limit, error }`, the shape `std.fs`' own
+  refusals use — and it names what to ask for instead. The limit is read off
+  the Port, not written into the tool: 16 KB is a fifth of a 32k window and a
+  rounding error in a million.
 - Counting and the window are asked of the server where it has a surface for
   them, and estimated with a stated margin where it does not. llm_proto's
   adapters gain `count(spec)` and `profile(spec)`: Anthropic through
@@ -57,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the window. A windowed loop whose task is stated in its seed no longer
   forgets it once the beats outrun `tail`; the beats between the seed and the
   window are what goes. Default unchanged (`false`: the seed goes with them).
+  `fit` never drops the newest beat in the process: a request without it
+  answers nothing the model asked and would send it reading the same file
+  again, so when that one beat does not fit, nothing does and the fold says
+  so rather than quietly handing back the seed alone.
 
 ## [0.37.1] - 2026-09-05
 
