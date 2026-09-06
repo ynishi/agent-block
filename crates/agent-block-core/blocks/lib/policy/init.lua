@@ -15,7 +15,7 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The seven, and where each one plugs in
+--- The eight, and where each one plugs in
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
 ---                                         fit the model's window
@@ -32,11 +32,14 @@
 ---                                         tagged "tokens"
 ---     policy.result_cap  -> `tools`       one tool result may not outgrow a
 ---                                         share of the model's window
+---     policy.verdict     -> a check       the loop runs it after every beat:
+---                                         is the thing outside the
+---                                         conversation true yet?
 ---
 ---   `window`, `carry`, `tokens` and `result_cap` are device fields
 ---   (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
----   `stagnation`, `retry` and `escalate` are the loop's own and the kernel
----   never sees them. That
+---   `stagnation`, `retry`, `escalate` and `verdict` are the loop's own and
+---   the kernel never sees them. That
 ---   split is the whole shape of this module: a policy either changes what
 ---   one beat SENDS (or reserves), or it decides what the loop does BETWEEN
 ---   beats. Nothing here decides what a beat does while it runs — that is the
@@ -246,6 +249,11 @@ local DEFAULT_NO_PROGRESS = 2
 --- retries past the original is the point where a failure the kernel called
 --- retryable has stopped looking transient.
 local DEFAULT_MAX_ATTEMPTS = 3
+
+--- The event kind a verdict is recorded under when the caller names none.
+--- "verify" because that is what every consumer in this tree already
+--- appends, and a second name for one thing is a second thing to query.
+local DEFAULT_VERDICT_KIND = "verify"
 
 --- How much of the window one tool result may take when `result_cap` is not
 --- told. A quarter leaves room for three more of the same size beside the
@@ -513,6 +521,17 @@ local WINDOW_OPTS, WINDOW_ARG = opts_contract({
 local TOKENS_OPTS, TOKENS_ARG = opts_contract({
     port = T.table:describe("an LLM Port: anything answering count(request, conf) -> integer"),
     conf = T.table:describe("the conf the port is opened with; forwarded to count"):is_optional(),
+})
+
+--- What `policy.verdict` is configured with. `run` is the caller's — only it
+--- knows what "it works" is for this run — and everything else is about what
+--- the loop does with the answer.
+local VERDICT_OPTS, VERDICT_ARG = opts_contract({
+    run = FUNCTION
+        :describe("fn() -> { ok, stdout?, stderr?, exit_code? }; nil = no verdict, the run is the model's word")
+        :is_optional(),
+    changed = FUNCTION:describe("fn(session) -> boolean; a green with nothing changed is not a pass"):is_optional(),
+    kind = T.string:describe('the event kind the answer is recorded under; default "verify"'):is_optional(),
 })
 
 --- What `policy.result_cap` is configured with. The share is of the window
@@ -987,6 +1006,116 @@ function M.tokens(opts)
             return 1
         end
         return n
+    end
+end
+
+-- ============================================================
+-- verdict — what ends a run, when the model's word is not enough
+-- ============================================================
+
+--- Build the check a loop runs after every beat.
+---
+---     local verdict = policy.verdict({ run = function() return build() end })
+---     ...
+---     local out = knl.beat(s, device)
+---     local v = verdict(s, out)
+---     if v.ok then break end        -- the run is done because the check says so
+---
+--- Three things can end a loop, and they belong in three places. The BUDGET
+--- is the kernel's: a quota an owner granted, refused before the call, and
+--- the one stop the caller cannot forget to check. The MODEL's own ending —
+--- it asked for no tools, it says it is finished — is a fact about the last
+--- beat and the loop reads it off `out`. A VERDICT is neither: it is
+--- something outside the conversation being true, and only the caller knows
+--- what to run to find out.
+---
+--- What this adds is that the verdict is not a tool. A tool the model can
+--- decline to call cannot carry "it compiles": a run that ended because the
+--- model said so has no evidence, and a loop written to trust that will
+--- report success it never checked. Here `run` is called after every beat,
+--- whatever the model asked for and whatever it answered, and its answer is
+--- appended to the log under `kind` (default `"verify"`) stamped with the
+--- beat it judges — so the record says what was checked and when, and a
+--- `stagnation` signature can read it.
+---
+--- `changed` is the second half of the same honesty. On a task whose
+--- deliverable is the test that proves it, the check passes before any work
+--- is done; a loop that stopped there would report a pass for an empty
+--- diff. When `changed` is given, a green counts only if it also answers
+--- true, and the verdict says why it was withheld.
+---
+--- `run` is optional. Without it this answers `{ ok = false, checked =
+--- false }` on every beat: there is no verdict, so nothing here ever ends
+--- the run, and the loop is left with the budget and the model's own ending.
+--- That is the honest default — the alternative, a green with nothing
+--- checked, is the exact claim this module exists to refuse.
+---
+--- @param opts table|nil  { run?, changed?, kind? }
+--- @return function verdict  fn(session, out) -> { ok, checked, changed?, result?, reason? }
+function M.verdict(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.verdict: opts must be a table", 2)
+    end
+    only(opts, { run = true, changed = true, kind = true }, "policy.verdict")
+    if opts.run ~= nil and type(opts.run) ~= "function" then
+        error("policy.verdict: run must be a function (fn() -> { ok, ... })", 2)
+    end
+    if opts.changed ~= nil and type(opts.changed) ~= "function" then
+        error("policy.verdict: changed must be a function (fn(session) -> boolean)", 2)
+    end
+    if opts.kind ~= nil and (type(opts.kind) ~= "string" or opts.kind == "") then
+        error("policy.verdict: kind must be a non-empty string, got " .. tostring(opts.kind), 2)
+    end
+    shape.assert_dev(opts, VERDICT_OPTS, "policy.verdict opts")
+
+    local run, changed = opts.run, opts.changed
+    local kind = opts.kind or DEFAULT_VERDICT_KIND
+
+    return function(session, out)
+        if run == nil then
+            return { ok = false, checked = false }
+        end
+        if type(session) ~= "table" or type(session.append) ~= "function" then
+            error("policy.verdict: session must be a knl session", 2)
+        end
+
+        local result = run()
+        if type(result) ~= "table" or type(result.ok) ~= "boolean" then
+            error("policy.verdict: run must answer { ok = <boolean>, ... }, got " .. tostring(result), 2)
+        end
+
+        -- Recorded before it is judged, and recorded either way: the log is
+        -- what says the check happened, and a check whose answer decided
+        -- nothing is still a fact about the run.
+        session:append({
+            kind = kind,
+            beat = type(out) == "table" and out.beat or nil,
+            data = {
+                ok = result.ok,
+                stdout = tostring(result.stdout or ""),
+                stderr = tostring(result.stderr or ""),
+                exit_code = result.exit_code,
+            },
+        })
+
+        if not result.ok then
+            return { ok = false, checked = true, result = result }
+        end
+        if changed == nil then
+            return { ok = true, checked = true, result = result }
+        end
+        local moved = changed(session) == true
+        if moved then
+            return { ok = true, checked = true, changed = true, result = result }
+        end
+        return {
+            ok = false,
+            checked = true,
+            changed = false,
+            result = result,
+            reason = "unchanged",
+        }
     end
 end
 
@@ -1772,6 +1901,24 @@ M.shapes.api = {
             cost = {
                 args = { arg_of(kernel.shapes.request, "request") },
                 returns = "integer >= 1",
+            },
+        },
+    },
+    verdict = {
+        args = { arg_of(VERDICT_ARG, "opts") },
+        returns = "verdict — fn(session, out) -> { ok, checked, changed?, result?, reason? }",
+        members = {
+            verdict = {
+                args = { SESSION_ARG, arg_of(T.table, "out (the beat's answer)") },
+                returns = "table — { ok, checked, changed?, result?, reason? }",
+            },
+            run = {
+                args = {},
+                returns = "table — { ok, stdout?, stderr?, exit_code? }",
+            },
+            changed = {
+                args = { SESSION_ARG },
+                returns = "boolean — did this run change anything",
             },
         },
     },

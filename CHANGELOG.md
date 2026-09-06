@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.verdict({ run?, changed?, kind? })` is the check a loop runs after
+  every beat: `run` is the caller's closure (a build, a test, anything it can
+  reach — tools included), its answer is appended to the log under `"verify"`
+  stamped with the beat it judges, and `{ ok, checked, changed?, result?,
+  reason? }` comes back. Three things end a loop and they now sit in three
+  places: the budget is the kernel's, the model's own ending is a fact about
+  the last beat, and a verdict is something outside the conversation being
+  true. It is not a tool because a tool the model can decline to call cannot
+  carry "it compiles". `changed` withholds a green that changed nothing — the
+  pass an empty diff earns on a task whose deliverable is the test itself.
+  `run` is optional: without it nothing is checked and nothing ends, which is
+  the honest default rather than a green nobody verified.
 - `policy.result_cap({ port, conf?, share? })` wraps a device's `tools` so no
   single tool result may take more than a share of the model's window (a
   quarter by default). It is the one shape a fold cannot absorb: `window{ fit }`
