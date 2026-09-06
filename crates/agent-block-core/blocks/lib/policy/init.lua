@@ -473,6 +473,25 @@ local CALLABLE = T.any_of({ FUNCTION, T.table, USERDATA })
 --- says the two types it can have and the binder makes the real judgement.
 local SESSION_HANDLE = T.any_of({ T.table, USERDATA })
 
+--- Hold `session` to being one, by what it can do rather than what it is.
+---
+--- The kernel hands back USERDATA and a spec drives a Lua table (see
+--- `SESSION_HANDLE` above), so a guard that asked for a table would reject
+--- the real thing and accept only the stand-in — which is exactly what it
+--- did until a run failed on `policy.window fits: session must be a knl
+--- session` with a session that was perfectly good. The question a binder
+--- can actually answer is whether the method it is about to call is there.
+---
+--- @param session any  the value a caller passed
+--- @param method string  the method this policy calls on it
+--- @param who string  the policy's name, for the message
+local function needs_session(session, method, who)
+    local t = type(session)
+    if (t ~= "table" and t ~= "userdata") or type(session[method]) ~= "function" then
+        error(who .. ": session must be a knl session (nothing here answers :" .. method .. "())", 3)
+    end
+end
+
 --- An opts contract, as the two shapes it has to be.
 ---
 --- CLOSED is the published one (`policy.shapes.*_opts`) and the one the
@@ -942,9 +961,7 @@ function M.window(opts)
 
     --- The same question, asked before the beat rather than inside it.
     local fits = function(session, device)
-        if type(session) ~= "table" or type(session.events) ~= "function" then
-            error("policy.window fits: session must be a knl session", 2)
-        end
+        needs_session(session, "events", "policy.window fits")
         local request = largest_fitting(whole_log(session, "policy.window fits"), device or {})
         if request == nil then
             return "context"
@@ -1076,9 +1093,7 @@ function M.verdict(opts)
         if run == nil then
             return { ok = false, checked = false }
         end
-        if type(session) ~= "table" or type(session.append) ~= "function" then
-            error("policy.verdict: session must be a knl session", 2)
-        end
+        needs_session(session, "append", "policy.verdict")
 
         local result = run()
         if type(result) ~= "table" or type(result.ok) ~= "boolean" then

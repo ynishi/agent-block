@@ -1082,6 +1082,81 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- inv13b — the policies that take a SESSION take the real one.
+--
+-- Only a host can prove this. `knl.open` answers userdata; every pure spec
+-- drives the Lua stand-in a table can be, so a binder that asked for a table
+-- passed every unit test and refused the kernel's own handle the moment a run
+-- reached it — which is what happened: `policy.window fits: session must be a
+-- knl session`, on a session that was perfectly good. What a binder can ask
+-- is whether the method it is about to call is there, and this case is the
+-- one place the difference is visible.
+-- ---------------------------------------------------------------------------
+
+do
+    local policy = require("policy")
+    for _, name in ipairs({ "verdict", "result_cap", "tokens" }) do
+        assert(policy[name] ~= nil, "the embedded policy lib is missing " .. name)
+    end
+
+    local s = kernel.open({ owner = "test", budget = { amount = 10, tag = "beats" } })
+    assert(type(s) == "userdata", "the kernel's session is userdata, got " .. type(s))
+    s:append({ kind = "msg_user", data = { content = "go" } })
+
+    -- A Port that counts characters and declares a window wide enough for
+    -- this log: `fits` has to reach `s:events()` through the handle.
+    local port = {
+        profile = function()
+            return { context_window = 100000, max_output = 100 }
+        end,
+        count = function()
+            return 10
+        end,
+    }
+    local fold, fits = policy.window({ fit = { port = port }, keep_seed = true })
+    assert(type(fold) == "function" and type(fits) == "function", "fit answers a fold and a predicate")
+    assert(fits(s, {}) == nil, "the predicate must accept the kernel's own session")
+
+    local d = kernel.device({
+        llm = function(_req)
+            return response("ok", { { type = "text", text = "done" } }, nil, "end_turn")
+        end,
+        fold = fold,
+    })
+    local out = kernel.beat(s, d)
+    assert(Outcome.is_ok(out), "the beat must come off with a fitted fold")
+
+    -- And the verdict, which appends through the same handle.
+    local ran = 0
+    local verdict = policy.verdict({
+        run = function()
+            ran = ran + 1
+            return { ok = true, stdout = "green" }
+        end,
+        changed = function()
+            return true
+        end,
+    })
+    local v = verdict(s, out.out)
+    assert(v.ok == true and v.checked == true, "the verdict must accept the kernel's own session")
+    assert(ran == 1, "the check runs once per call, ran " .. ran)
+
+    local verifies = 0
+    for _, e in ipairs(s:events()) do
+        if e.kind == "verify" then
+            verifies = verifies + 1
+            assert(e.beat == out.out.beat, "the verify is stamped with the beat it judges")
+            assert(e.data.ok == true, "the verify records what the check answered")
+        end
+    end
+    assert(verifies == 1, "one verify event, got " .. verifies)
+
+    s:close("done")
+
+    mark("inv13b_policy_takes_the_kernels_session")
+end
+
+-- ---------------------------------------------------------------------------
 -- inv14 — a session opened from a session: the allocation is one write, the
 -- child beats on its own budget, and the tree is read back out of the log
 -- ---------------------------------------------------------------------------
