@@ -144,6 +144,16 @@ end)
 -- computed from what the kernel's own fold produces rather than guessed.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+--- A session that answers one read with these events: what the predicate
+--- reaches the log through, and all of it that the predicate touches.
+local function log_of(events)
+    return {
+        events = function()
+            return events, false
+        end,
+    }
+end
+
 local function counting_port(window, output)
     return {
         profile = function()
@@ -207,6 +217,58 @@ describe("policy.window — fit", function()
         expect(tostring(err):find("does not fit", 1, true) ~= nil).to.be(true)
         local ok2 = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), events, {})
         expect(ok2).to.be(false)
+    end)
+
+    it("hands back a predicate beside the fold, and it answers nil while the log fits", function()
+        local fold, fits = policy.window({ fit = { port = counting_port(10000, 10) } })
+        expect(type(fold)).to.be("function")
+        expect(type(fits)).to.be("function")
+        expect(fits(log_of(events), {})).to.be(nil)
+    end)
+
+    it('the predicate answers "context" where the fold would have raised', function()
+        local port = counting_port(12, 10)
+        local fold, fits = policy.window({ fit = { port = port }, keep_seed = true })
+        expect(fits(log_of(events), {})).to.be("context")
+        -- The same question, and the fold is still the one that fails loudly
+        -- for a loop that did not ask.
+        expect(function()
+            fold(events, {})
+        end).to.fail()
+    end)
+
+    it("a window of beats alone hands back no predicate — it always fits something", function()
+        local _, fits = policy.window({ tail = 2 })
+        expect(fits).to.be(nil)
+    end)
+
+    it("finds the same window a walk would, over fewer candidates", function()
+        -- Eight beats, each the same size: the limit admits exactly three of
+        -- them, and a bisection has to land on three rather than on the
+        -- first candidate it tries.
+        local many = seed("first", 1)
+        for i = 1, 8 do
+            many = concat(many, answered("b" .. i, "body" .. i, i * 2))
+        end
+        local three = #rendered(kernel.fold({ many[12], many[13], many[14], many[15], many[16], many[17] }, {}))
+        local asked = 0
+        local port = {
+            profile = function()
+                return { context_window = three + 10, max_output = 10 }
+            end,
+            count = function(_, request)
+                asked = asked + 1
+                return #rendered(request)
+            end,
+        }
+        local fold = policy.window({ fit = { port = port } })
+        local text = rendered(fold(many, {}))
+        expect(text:find("body8", 1, true) ~= nil).to.be(true)
+        expect(text:find("body6", 1, true) ~= nil).to.be(true)
+        expect(text:find("body5", 1, true)).to.be(nil)
+        -- A walk from eight down to three is six counts; the bisection is
+        -- fewer, and this is the property that keeps a long log cheap.
+        expect(asked < 6).to.be(true)
     end)
 
     it("raises when the port's profile names no window — a guess would be the overflow one step later", function()

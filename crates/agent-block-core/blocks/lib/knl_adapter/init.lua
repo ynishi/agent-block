@@ -315,30 +315,65 @@ local function spec_of(conf, request)
     return spec
 end
 
---- A deterministic text for a table, for a cache key: keys sorted, values
---- rendered, so two requests with the same content key the same entry
---- whatever order Lua walks them in.
-local function canonical(v)
-    local t = type(v)
-    if t == "string" then
-        return string.format("%q", v)
-    elseif t == "number" or t == "boolean" or t == "nil" then
-        return tostring(v)
-    elseif t ~= "table" then
-        return "<" .. t .. ">"
+--- A cache key for a request: a 64-bit FNV-1a over the request's content,
+--- walked in a fixed order (keys sorted) so two requests with the same
+--- content key the same entry whatever order Lua happens to walk them in.
+---
+--- Hashed rather than kept whole because the thing being keyed is a whole
+--- conversation: a key that was the request's text would be as long as the
+--- request, built again for every candidate the fold tries and again for the
+--- cost's repeat of the chosen one. The digest is built by folding each
+--- string as it is reached — nothing is concatenated — so the walk allocates
+--- nothing beyond the sorted key lists.
+---
+--- A collision would answer one request with another's count. At 64 bits and
+--- a working set of a few dozen requests that is not a risk worth carrying
+--- structure for; what makes it tolerable is that the count is an input to a
+--- fold that only has to be *close enough to fit*, not a durable fact.
+--- Written as hex literals because the 64-bit offset basis is larger than
+--- the largest positive Lua integer: a hex numeral wraps into a valid
+--- integer (Lua 5.4 §3.1) where a decimal one would become a float and stop
+--- being xor-able. The arithmetic then wraps on overflow, which is the
+--- modulus FNV asks for.
+local FNV_OFFSET, FNV_PRIME = 0xcbf29ce484222325, 0x100000001b3
+
+local function digest_of(v)
+    local h = FNV_OFFSET
+    local function feed(text)
+        for i = 1, #text do
+            h = (h ~ text:byte(i)) * FNV_PRIME
+        end
     end
-    local keys = {}
-    for k in pairs(v) do
-        keys[#keys + 1] = k
+    local function walk(value)
+        local t = type(value)
+        if t == "string" then
+            feed("s")
+            feed(value)
+        elseif t == "number" or t == "boolean" then
+            feed("v")
+            feed(tostring(value))
+        elseif t ~= "table" then
+            feed("?")
+            feed(t)
+        else
+            local keys = {}
+            for k in pairs(value) do
+                keys[#keys + 1] = k
+            end
+            table.sort(keys, function(a, b)
+                return tostring(a) < tostring(b)
+            end)
+            feed("{")
+            for _, k in ipairs(keys) do
+                feed(tostring(k))
+                feed("=")
+                walk(value[k])
+            end
+            feed("}")
+        end
     end
-    table.sort(keys, function(a, b)
-        return tostring(a) < tostring(b)
-    end)
-    local parts = {}
-    for _, k in ipairs(keys) do
-        parts[#parts + 1] = tostring(k) .. "=" .. canonical(v[k])
-    end
-    return "{" .. table.concat(parts, ",") .. "}"
+    walk(v)
+    return string.format("%016x", h)
 end
 
 --- The window a served model has is the same for every request on it: one
@@ -405,7 +440,10 @@ end
 --- @return table profile  { context_window = <tokens>|nil, max_output = <tokens>|nil, estimated = boolean? }
 function LLMPort:profile(conf)
     conf = conf or {}
-    local profile = { context_window = conf.context_window, max_output = conf.max_tokens }
+    -- The room is what the wire will ask for: the conf's `max_tokens`, or the
+    -- default the impl's build sends in its place (`default_max_output`), so a
+    -- caller that names no cap is still sized for the answer it will get.
+    local profile = { context_window = conf.context_window, max_output = conf.max_tokens or self.default_max_output }
     if profile.context_window ~= nil then
         return profile
     end
@@ -451,7 +489,7 @@ function LLMPort:count(request, conf)
     conf = conf or {}
     self._counts = self._counts or { order = {}, by_key = {} }
     local cache = self._counts
-    local key = profile_key(conf) .. "|" .. canonical(request)
+    local key = profile_key(conf) .. "|" .. digest_of(request)
     local hit = cache.by_key[key]
     if hit ~= nil then
         return hit
@@ -480,7 +518,7 @@ function LLMPort:count(request, conf)
 end
 
 M._estimate_tokens = estimate
-M._canonical = canonical
+M._digest_of = digest_of
 
 --- Open the Port into the closure a device carries as its `llm`
 --- (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
@@ -684,6 +722,9 @@ M.anthropic = LLMPort.new({
     build = anthropic_build,
     parse = anthropic_parse,
     classify = anthropic_classify,
+    -- What `build` sends as `max_tokens` when the conf names none: the
+    -- profile's room has to be the number that goes on the wire.
+    default_max_output = proto_anthropic.DEFAULT_MAX_TOKENS,
     -- The API counts and describes its own models (count_tokens, GET
     -- /v1/models/{id}); llm_proto's anthropic adapter holds both calls.
     tokenize = function(_, spec)
@@ -782,6 +823,7 @@ M.openai = LLMPort.new({
     build = openai_build,
     parse = openai_parse,
     classify = openai_classify,
+    default_max_output = proto_openai.DEFAULT_MAX_TOKENS,
     -- The compatible servers count and describe their models (vLLM
     -- /tokenize + /v1/models, llama.cpp /apply-template + /tokenize +
     -- /props, Ollama /api/show); OpenAI's own chat completions do neither,

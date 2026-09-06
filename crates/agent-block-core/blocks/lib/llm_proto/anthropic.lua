@@ -19,6 +19,10 @@ local proto = require("llm_proto")
 local M = { name = "anthropic" }
 
 local DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+--- The answer's cap `build` sends when the spec names none. Exported so
+--- `profile` answers the same number `build` will send.
+M.DEFAULT_MAX_TOKENS = 4096
 local API_URL = "https://api.anthropic.com/v1/messages"
 local API_VERSION = "2023-06-01"
 
@@ -161,7 +165,7 @@ function M.build(spec)
 
     local body = {
         model = model,
-        max_tokens = spec.max_tokens or 4096,
+        max_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS,
         messages = spec.messages or {},
     }
 
@@ -459,11 +463,16 @@ function M.profile(spec)
     if type(decoded.max_input_tokens) ~= "number" then
         return nil, "models/" .. model .. " names no max_input_tokens"
     end
-    local output = spec.max_tokens
-    if output == nil and type(decoded.max_tokens) == "number" then
-        output = decoded.max_tokens
-    end
-    return { context_window = math.floor(decoded.max_input_tokens), max_output = output }, nil
+    -- The room is what `build` will send as `max_tokens` — the caller's value
+    -- or the same default — never the model's own maximum, which is a
+    -- different number (what the model allows) and rides along as
+    -- `max_output_limit` for a caller that wants to raise its cap.
+    return {
+        context_window = math.floor(decoded.max_input_tokens),
+        max_output = spec.max_tokens or M.DEFAULT_MAX_TOKENS,
+        max_output_limit = type(decoded.max_tokens) == "number" and math.floor(decoded.max_tokens) or nil,
+    },
+        nil
 end
 
 return M

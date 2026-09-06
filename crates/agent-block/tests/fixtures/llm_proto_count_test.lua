@@ -236,23 +236,25 @@ describe("anthropic adapter count / profile", function()
         expect(requests[1].headers["x-api-key"]).to.equal("sk-ant-test")
     end)
 
-    it(
-        "reads max_input_tokens off /v1/models/{model}; the room is the caller's max_tokens, else the model's",
-        function()
-            reset()
-            table.insert(queue, { status = 200, response = { max_input_tokens = 200000, max_tokens = 64000 } })
-            local p = anthropic.profile(spec({}))
-            expect(p.context_window).to.equal(200000)
-            expect(p.max_output).to.equal(100)
-            expect(requests[1].url).to.equal("https://api.anthropic.com/v1/models/m")
-            expect(requests[1].method).to.equal("GET")
+    it("reads max_input_tokens off /v1/models/{model}; the room is what build will send", function()
+        reset()
+        table.insert(queue, { status = 200, response = { max_input_tokens = 200000, max_tokens = 64000 } })
+        local p = anthropic.profile(spec({}))
+        expect(p.context_window).to.equal(200000)
+        expect(p.max_output).to.equal(100)
+        -- The model's own ceiling is a different fact and rides along as one.
+        expect(p.max_output_limit).to.equal(64000)
+        expect(requests[1].url).to.equal("https://api.anthropic.com/v1/models/m")
+        expect(requests[1].method).to.equal("GET")
 
-            reset()
-            table.insert(queue, { status = 200, response = { max_input_tokens = 200000, max_tokens = 64000 } })
-            local bare = anthropic.profile({ model = "m" })
-            expect(bare.max_output).to.equal(64000)
-        end
-    )
+        -- With no cap named, the room is the cap `build` sends in its place —
+        -- not the model's maximum, which is not what goes on the wire.
+        reset()
+        table.insert(queue, { status = 200, response = { max_input_tokens = 200000, max_tokens = 64000 } })
+        local bare = anthropic.profile({ model = "m" })
+        expect(bare.max_output).to.equal(anthropic.DEFAULT_MAX_TOKENS)
+        expect(bare.max_output_limit).to.equal(64000)
+    end)
 
     it("follows a caller's base_url", function()
         reset()

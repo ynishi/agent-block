@@ -22,6 +22,11 @@ local proto = require("llm_proto")
 local M = { name = "openai" }
 
 local DEFAULT_MODEL = "gpt-4o-mini"
+
+--- The answer's cap `build` sends when the spec names none. Exported so
+--- `profile` — and any Port asking how much room an answer takes — answers
+--- the same number `build` will send, never a room the wire does not ask for.
+M.DEFAULT_MAX_TOKENS = 4096
 local DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 -- ============================================================
@@ -344,9 +349,9 @@ function M.build(spec)
     -- the rename reject `max_completion_tokens`. Compatible servers only know
     -- the original name.
     if reasoning_model then
-        body.max_completion_tokens = spec.max_tokens or 4096
+        body.max_completion_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS
     else
-        body.max_tokens = spec.max_tokens or 4096
+        body.max_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS
     end
 
     -- Reasoning models accept only the default for the sampling knobs and
@@ -866,7 +871,7 @@ function M.profile(spec)
         return nil, "no window discovery on the " .. dialect .. " dialect; declare context_window"
     end
 
-    return { context_window = math.floor(window), max_output = spec.max_tokens }, nil
+    return { context_window = math.floor(window), max_output = spec.max_tokens or M.DEFAULT_MAX_TOKENS }, nil
 end
 
 return M

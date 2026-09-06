@@ -593,9 +593,10 @@ local TOOL_PAIR = T.shape({
     ok = T.boolean,
 }, { open = false })
 
---- What `stagnation` answers when it has a verdict. Two words and no more:
---- a third reason would be a third policy.
-local STOP_REASON = T.one_of({ "repeated", "no_progress" })
+--- What a policy answers when it has a verdict: `stagnation`'s two, and
+--- `window{ fit }`'s one. Each word is one policy's, and a word nobody
+--- answers would be a policy nobody wrote.
+local STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
 
 M.shapes = {
     window_opts = WINDOW_OPTS,
@@ -761,8 +762,24 @@ end
 ---
 ---     knl.device({ llm = port:open(conf), fold = policy.window({ fit = { port = port, conf = conf }, keep_seed = true }) })
 ---
+--- The fold raising is the last resort and not the intended one. A loop that
+--- would rather stop than fail asks the SECOND value `fit` hands back —
+--- a predicate in `stagnation`'s form, answering `"context"` when the next
+--- request would not fit and `nil` when it would:
+---
+---     local fold, fits = policy.window({ fit = { port = port, conf = conf }, keep_seed = true })
+---     local device = knl.device({ llm = port:open(conf), fold = fold })
+---     ...
+---     if fits(session, device) then break end   -- a planned stop, before the beat
+---     local out = knl.beat(session, device)
+---
+--- The two share one implementation and the Port's count cache, so asking
+--- costs the fold it was going to do anyway. Without `fit` the second value
+--- is nil: a window of n beats always fits something.
+---
 --- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf? }? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request
+--- @return function|nil fits  fn(session, device) -> nil | "context" (with `fit` only)
 function M.window(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
@@ -797,27 +814,69 @@ function M.window(opts)
     -- letting a Port whose window is learned late (a served model queried
     -- for it) answer the truth.
     local floor = keep_seed and 0 or 1
-    return function(events, device)
+
+    --- The largest window that fits, or nil and what the smallest one cost.
+    --- Whole beats go, oldest first: the candidates are nested, so the search
+    --- is over a monotone predicate and a bisection finds the same answer as
+    --- the walk in log candidates rather than all of them — which matters
+    --- because each candidate is a fold and, on a Port with a server to ask,
+    --- a count the first time it is seen.
+    local function largest_fitting(events, device)
         local limit = request_limit(port:profile(conf), "policy.window")
         local n = beat_count(events)
         local most = tail and math.min(tail, n) or n
-        local request, tokens
-        for k = most, floor, -1 do
-            request = kernel.fold(window_slice(events, k, keep_seed), device)
-            tokens = port:count(request, conf)
+
+        local function fold_at(k)
+            local request = kernel.fold(window_slice(events, k, keep_seed), device)
+            local tokens = port:count(request, conf)
             if type(tokens) ~= "number" then
-                error("policy.window: port:count must answer a number, got " .. tostring(tokens), 2)
+                error("policy.window: port:count must answer a number, got " .. tostring(tokens), 3)
             end
+            return request, tokens
+        end
+
+        local whole, whole_tokens = fold_at(most)
+        if whole_tokens <= limit then
+            return whole
+        end
+
+        -- Everything fits at `lo` or below and nothing at `hi` or above;
+        -- `floor` is the smallest window there is, and it has already failed
+        -- when the loop ends without an answer.
+        local lo, hi = floor, most
+        local best, smallest_tokens = nil, nil
+        while lo <= hi do
+            local mid = (lo + hi) // 2
+            local request, tokens = fold_at(mid)
             if tokens <= limit then
-                return request
+                best = request
+                lo = mid + 1
+            else
+                hi = mid - 1
+                if mid == floor then
+                    smallest_tokens = tokens
+                end
             end
-            if k == 0 or n == 0 then
-                break
-            end
+        end
+        if best then
+            return best
+        end
+        if smallest_tokens == nil then
+            local _, tokens = fold_at(floor)
+            smallest_tokens = tokens
+        end
+        return nil, smallest_tokens, limit
+    end
+
+    local fold = function(events, device)
+        local request, tokens, limit = largest_fitting(events, device)
+        if request then
+            return request
         end
         error(
             string.format(
-                "policy.window: nothing left to drop and the request still does not fit: %d tokens > %d (the seed%s)",
+                "policy.window: nothing left to drop and the request still does not fit: %d tokens > %d (the seed%s). "
+                    .. "Ask the second value this factory answers before the beat to stop instead of failing.",
                 tokens,
                 limit,
                 keep_seed and " alone" or " is not kept; the newest beat alone"
@@ -825,6 +884,20 @@ function M.window(opts)
             2
         )
     end
+
+    --- The same question, asked before the beat rather than inside it.
+    local fits = function(session, device)
+        if type(session) ~= "table" or type(session.events) ~= "function" then
+            error("policy.window fits: session must be a knl session", 2)
+        end
+        local request = largest_fitting(whole_log(session, "policy.window fits"), device or {})
+        if request == nil then
+            return "context"
+        end
+        return nil
+    end
+
+    return fold, fits
 end
 
 -- ============================================================
@@ -1540,11 +1613,15 @@ local OUTCOME_ARG = arg_of(kernel.shapes.outcome, "outcome")
 M.shapes.api = {
     window = {
         args = { arg_of(WINDOW_ARG, "opts") },
-        returns = "fold — fn(events, device) -> request",
+        returns = 'fold — fn(events, device) -> request; and, with `fit`, fits — fn(session, device) -> nil | "context"',
         members = {
             fold = {
                 args = { EVENTS_ARG, arg_of(T.table, "device (read for system / tools)") },
                 returns = kernel.shapes.request,
+            },
+            fits = {
+                args = { SESSION_ARG, arg_of(T.table, "device (read for system / tools)") },
+                returns = 'nil | policy.shapes.stop_reason ("context")',
             },
         },
     },
