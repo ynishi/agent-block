@@ -536,7 +536,7 @@ whether that is the intended way to change them.
 |---|---|---|
 | kernel + declaration | `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | **Sealed** — a filesystem copy fails the run rather than replacing the module. The kernel is one thing across Rust and Lua, held together by declaration tests a Lua-side replacement would pass while meaning something else. Change it upstream. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning, for work on the kernel itself and not for shipping. |
 | shell packs | `policy`, `supervisor` | Do not shadow: a pack is a value you hand to `knl.device` or consult in your own loop, not a registry the host reads. The two are one set — a loop is composed from both — and a model's limits are not a third pack: they go into the seams the kernel already has (`fold` / `filters` / `cost` / `tool_policy`, the loop's predicates, the supervisor's tree) and into what the Port declares (`LLMPort:profile`); see the `policy` module header. For a partial change, delegate through `embedded.<name>`. |
-| consumers | `agent`, `compile_loop`, `coding_agent` | Copy-on-write is the intended way — drop your own `lib/agent/init.lua` in the project root (or `~/.agent-block/lib/`) and it is the `agent` your scripts get. For a partial change, delegate through `embedded.<name>`. |
+| consumers | `agent` | Copy-on-write is the intended way — drop your own `lib/agent/init.lua` in the project root (or `~/.agent-block/lib/`) and it is the `agent` your scripts get. For a partial change, delegate through `embedded.<name>`. |
 | utilities | `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Shadowing works, but `knl_adapter` requires `llm_proto` and `mcp_tools`, so replacing either replaces a sealed module's dependency. Prefer delegation. |
 
 Resolution order, highest priority first: the script's own directory →
@@ -731,268 +731,6 @@ Key behaviours:
 - `agent` is a consumer block: a local `lib/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
 - No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
-### compile_loop (StdPkg — `require("compile_loop")`)
-
-Tool factory for the autonomous compile-and-fix loop. The primary surface is
-`compile_loop.make(conf)`, which returns a `tool_def` consumable directly by `agent.run`.
-
-One iteration is one beat of the kernel (`knl.beat`: a model call plus the tools that
-call asked for), and the thing this block adds to it is the guarantee it sells: **the
-verify is not a tool**. `conf.runner` runs after every beat, whatever the model asked
-for and whatever it answered, and its verdict — not the model's — ends the run. A tool
-the model can decline to call cannot carry "it compiles".
-
-`max_iters` is the session's grant, so the iteration ceiling is the budget: the beat
-past it stops with nothing called.
-
-Embedded, and a consumer block: `lib/compile_loop/init.lua` in the project root replaces
-it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
-
-```lua
-local compile_loop = require("compile_loop")
-local agent        = require("agent")
-
--- Define a caller-supplied runner function
-local LUA_RUNNER_TIMEOUT = 60
-
-local function lua_runner(file_path)
-    local res = sh.exec("lua " .. file_path, { timeout = LUA_RUNNER_TIMEOUT })
-    if not res.ok then
-        -- spawn failure or timeout: no exit code exists
-        return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
-    end
-    local pass = res.code == 0 and res.stdout:find("ALL_PASS", 1, true) ~= nil
-    return { ok = pass, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
-end
-
--- Build a tool_def and pass it to the parent agent
-local td = compile_loop.make({
-    runner    = lua_runner,       -- required: function(path) → {ok, stdout, stderr, exit_code}
-    max_iters = 5,                -- optional, default 5
-    lang      = "lua",            -- optional, default "lua"
-    -- conf.llm is forwarded to the provider Port verbatim. Nothing is inherited
-    -- from the calling agent: a device is passed, not discovered, so an omitted
-    -- api_key falls through to llm_proto's own env resolution and nowhere else.
-    llm = {
-        provider = "anthropic",
-        model    = "claude-haiku-4-5-20251001",
-        -- api_key / api_key_env / base_url / max_tokens / temperature / timeout
-    },
-})
-
-local result = agent.run({
-    prompt      = "Write a Lua function that returns the nth Fibonacci number.",
-    model       = "claude-haiku-4-5-20251001",
-    extra_tools = { td },         -- tool_def passed directly; no caller-side adaptation
-})
-```
-
-**`compile_loop.make(conf)`** returns `{ name, schema, handler }` and nothing else
-happens to it: registering it is the caller's, and `agent.run({ extra_tools = { td } })`
-takes it directly. A caller that wants it in the global registry calls
-`tool.register(td.name, td.schema, td.handler)` itself (which is what
-`coding_agent.register_tool` does). The tool name defaults to `"compile_loop"`; pass
-`conf.name` to override.
-
-**Multi-file mode**: pass `target_files = {pathA, pathB, ...}` together with `edit_mode = "diff"` to edit several files in a single loop. The runner signature changes to `function(paths)` (list). `tool_mode = "auto" | "read_only"` controls which tools are declared — `"read_only"` withholds the edit tool, which makes the run a dry run that can inspect and cannot converge. Callers can inject their own tools via `extra_tools = {{name, schema, handler}, ...}`; a name that collides with a built-in is a loud error rather than a silent winner. See the `crates/agent-block/examples/test_anthropic_compile_loop_multi*.lua` smoke scripts.
-
-**The tools diff mode declares**: `std.fs`' own `fs_read` and `fs_edit`, path-locked to
-the target files for the duration of the call, plus `read_file_range`.
-
-**Large files**: a whole-file `fs_read` of something over 10 000 characters is refused
-with the file's length and a pointer at the range read (`fs_read` takes `start_line` /
-`end_line`, and `read_file_range` hands back a verbatim, line-numbered slice of at most
-500 lines). There is no digest, no summarising sub-call and no cache: a model that asked
-for a 400KB file did not mean to spend its context on one, and a summary of a file is not
-a thing `fs_edit` can address.
-
-**Tool input** (supplied by the LLM at call time): `spec` (string, required),
-`target_file` **or** `target_files` (absolute paths, mutually exclusive), `lang`
-(string, optional).
-
-**`edit_mode` (opt-in diff mode)**: pass `edit_mode = "diff"` to `compile_loop.make` to
-have the child LLM edit through the tools instead of emitting the whole file on every
-iteration. This is the preferred mode for large existing files where minimal-edit is
-critical (e.g. fixing a single function in a 500-line file). The target files must
-already exist and be non-empty — diff needs something to diff against, and a mode that
-silently became `"full"` was worse than an error.
-
-```lua
-local td = compile_loop.make({
-    runner    = lua_runner,
-    edit_mode = "diff",        -- opt-in; default is "full"
-    llm       = { provider = "anthropic", model = "claude-haiku-4-5-20251001" },
-})
-```
-
-The child LLM edits by calling `fs_edit`, which addresses lines rather than searching for
-text: `start_line`, `end_line`, and the `expect`ed current content of those lines, checked
-before anything is applied. A rejected edit comes back as a tool result naming what is
-actually at those lines, so the model can correct itself from the answer instead of
-re-reading the file.
-
-**`target_file` dual role** (full mode): when `target_file` already exists at loop entry,
-its content is embedded in the initial user message as `=== Current file content ===` so
-the child LLM can build on it rather than generating from scratch, and the file is
-overwritten on every iteration. When it is absent or empty, the message carries `spec`
-only — the synthesis case.
-
-**Target model class**: the full-file output strategy is designed for Qwen3 / Haiku-grade
-mid-weight models. Emitting the whole file on each iteration avoids the apply-failure cost of
-diff/Edit-tool workflows and keeps the feedback loop simple and fast. For the latest
-Sonnet/Opus with native edit-tool support, a diff-based block is a future consideration
-(separate issue; out of scope here).
-
-**Tool output JSON** (never contains `code` or `history`: the run's transcript is the
-session log, and handing a caller one contaminates its context. The shape is closed, so
-there is no field a transcript could leave by):
-
-```
-{ ok, iters, summary, failure_reason?, last_error?, artifact_path }
-```
-
-`failure_reason` values: `"llm_call"` | `"open_target_file"` | `"stagnation"` |
-`"no_edits_applied"` | `"max_iters"` | `"stopped"` (the kernel stopping a beat for a
-reason other than the grant, which a caller should not normally see; `last_error` carries
-the kernel's word for it). `modified_files` is present in diff mode (the paths whose edits
-landed, on every ending, including a give-up); `artifact_path` is the single path in
-single-file mode.
-
-**LLM resolution**: `conf.llm` is forwarded to the provider Port verbatim, and nothing is
-inherited from a calling agent — a device is passed, not discovered. An omitted `api_key`
-falls through to `llm_proto`'s env resolution (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, or
-whatever `api_key_env` names). `provider` defaults to `"anthropic"` and picks the Port at
-`make()` time, so an unknown one is an error there rather than a failure five iterations in.
-
-**Giving up**: two readings of the log, each with its own reason.
-
-- `"stagnation"` — the verify said the same thing three times running
-  (`policy.stagnation` over the recorded `verify` events).
-- `"no_edits_applied"` — three consecutive iterations landed no edit at all. Distinct
-  from the above: the model is acting and nothing is changing.
-
-Both are independent of the remaining budget; `"max_iters"` is the budget itself.
-
-**Observability**: there is none of this block's own, and that is the point. Every model
-call is a durable record in the session log (`llm_request` / `llm_response` /
-`llm_call_failed`), every tool call is a recorded pair, and each iteration's verify is a
-`verify` event stamped with the beat it judges. Read them with `session:query` or
-`knl.views` rather than from stdout. `AGENT_BLOCK_LLM_DUMP` and the `ab.obs` iteration
-trail are gone.
-
-**Provider support**: `"anthropic"` and `"openai"`-compatible endpoints (vLLM, llama.cpp,
-OpenRouter, RunPod, etc.) are both fully implemented in `conf.llm`.
-
-| `conf.llm.provider` | Default key env     | Override via                        |
-|---------------------|---------------------|-------------------------------------|
-| `"anthropic"`       | `ANTHROPIC_API_KEY` | `conf.llm.api_key` / `api_key_env`  |
-| `"openai"`          | `OPENAI_API_KEY`    | `conf.llm.api_key` / `api_key_env`  |
-
-#### External runner examples
-
-| Example | Runner | Provider |
-|---|---|---|
-| `crates/agent-block/examples/test_anthropic_compile_loop.lua` | inline lua | Anthropic |
-| `crates/agent-block/examples/test_qwen_compile_loop.lua` | inline lua | Qwen (OpenAI-compat) |
-| `crates/agent-block/examples/test_qwen_compile_loop_rust.lua` | inline cargo | Qwen (OpenAI-compat) |
-| `crates/agent-block/examples/test_qwen_compile_loop_lust.lua` | mlua-probe MCP | Qwen (OpenAI-compat) |
-| `crates/agent-block/examples/test_compile_loop_parent.lua` | inline lua | Anthropic parent + Qwen child |
-| `crates/agent-block/examples/test_anthropic_compile_loop_pytest.lua` | inline pytest | Anthropic |
-| `crates/agent-block/examples/test_anthropic_compile_loop_multi.lua` | inline lua (multi-file) | Anthropic |
-| `tests/fixtures/compile_loop_range_mock.lua` | e2e fixture (oversized file, range read) | Anthropic |
-
-### coding_agent (StdPkg — `require("coding_agent")`, thin facade)
-
-Backward-compatible facade over `compile_loop`. Prefer the `compile_loop.make()` API for
-new code. `coding_agent` is retained for existing callers.
-
-It is three things and nothing else: the two built-in runners below, one call to
-`compile_loop.make`, and the `tool.register` that `make` deliberately does not do. There
-is no loop here — iterations, the verify, the give-up gates and the result shape are all
-`compile_loop`'s. `edit_mode`, `tool_mode` and `extra_tools` are not on the facade's opts;
-a caller who wants them calls `compile_loop.make` directly.
-
-Embedded, and a consumer block: `lib/coding_agent/init.lua` in the project root replaces
-it. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
-
-**`coding_agent.run(opts)`** — run the loop directly from Lua (facade over `compile_loop`).
-
-```lua
-local coding = require("coding_agent")
-
-local res = coding.run({
-    provider    = "anthropic",                    -- "openai" | "anthropic"
-    api_key     = "...",                          -- or api_key_env = "ANTHROPIC_API_KEY"
-    model       = "claude-haiku-4-5-20251001",
-    target_file = "/tmp/work/solution.lua",
-    spec        = "Write a Lua function that returns the nth Fibonacci number.",
-    lang        = "lua",                          -- code fence label (default "lua")
-    max_iters   = 5,
-    runner      = function(file_path)
-        -- return { ok=bool, stdout, stderr, exit_code }
-        local res = sh.exec("lua " .. file_path, { timeout = 60 })
-        if not res.ok then  -- spawn failure or timeout: no exit code exists
-            return { ok = false, stdout = "", stderr = tostring(res.error), exit_code = -1 }
-        end
-        return { ok = res.code == 0, stdout = res.stdout, stderr = res.stderr, exit_code = res.code }
-    end,
-    on_iter = function(info) print("iter", info.iter, info.result.ok) end,
-})
-
--- res fields:
---   ok             boolean
---   artifact_path  string      absolute path of the target file
---   iters          int
---   summary        string      "PASS in N iters" or "give-up: <reason>"
---   failure_reason string?     see the compile_loop section above for the full set
---   last_error     string?     last runner stderr (trimmed to 800 chars) on failure
---
--- NOTE: "code" and "history" fields are no longer returned (removed in this release).
-```
-
-**`coding_agent.register_tool(opts)`** — register the `compile_loop` tool with the host
-tool registry so a parent LLM can invoke it via `tool.call`. Returns the registered tool name.
-
-```lua
-local coding = require("coding_agent")
-
--- Register once (typically at agent startup)
-coding.register_tool({
-    provider    = "openai",
-    base_url    = "http://localhost:8080/v1",
-    api_key     = "...",
-    model       = "Qwen/Qwen2.5-Coder-7B",
-    runner_kind = "lua",    -- "lua" | "cargo" | runner function
-    max_iters   = 5,
-    lang        = "lua",
-})
-
--- The parent LLM can now call the "compile_loop" tool with:
---   { spec = "...", target_file = "/abs/path/to/file.lua", lang = "lua" }
--- The tool response JSON contains: ok, artifact_path, iters, summary,
---   failure_reason?, last_error?   (code and history are excluded).
-```
-
-Built-in `runner_kind` values (resolved in the `coding_agent` facade; `compile_loop` itself
-accepts only a runner function):
-
-| `runner_kind` | Behaviour |
-|---------------|-----------|
-| `"lua"`       | Runs `lua <file>` and passes on exit 0 + `ALL_PASS` in stdout (60 s timeout) |
-| `"cargo"`     | Runs `cargo test --offline` in the file's directory; passes on exit 0 + `"test result: ok"` (300 s timeout) |
-| function      | Called as `runner(file_path)` — must return `{ ok, stdout, stderr, exit_code }` |
-
-Both built-ins execute through `sh.exec`, so the host's own credential variables are stripped
-from the child (see `sh.*`), stdout and stderr stay separate, and a hung command is SIGKILLed
-when the timeout above expires (`sh.exec` spawns with `kill_on_drop`). Caller-supplied runner
-functions should use `sh.exec` for the same reasons — `io.popen` children inherit the host
-environment unfiltered and outlive any timeout.
-
-Runner commands execute with **cwd = the project root** (`sh.exec`'s default), not the directory
-`agent-block` was started from — deliberately deterministic, and a change from the earlier
-`io.popen` behaviour, which inherited the host process's cwd. Pass `cwd` in the `sh.exec` opts to
-override; the `"cargo"` built-in does exactly that with the target file's directory.
-
 ### lshape (Vendored package — `require("lshape")`)
 
 `lshape` is vendored under `blocks/lib/lshape/` so scripts can use schema validation
@@ -1070,29 +808,25 @@ cargo test --workspace
 
 ### Lua block unit specs (mlua-lspec)
 
-The embedded blocks (`crates/agent-block-core/blocks/agent`, `.../compile_loop`) expose
-their pure, I/O-free helpers via a `_test_helpers()` accessor. Branch-level unit specs
-live under `crates/agent-block/tests/fixtures/*_test.lua` and run with the
-mlua-lspec framework (`describe` / `it` / `expect`) — they need no API keys and no
-network. Run them via the `lua-debugger` MCP `test_launch` tool with the block
-directory on the search path:
+The whole suite runs in one command:
 
 ```
-mcp__lua-debugger__test_launch(
-  code_file    = "crates/agent-block/tests/fixtures/agent_helpers_test.lua",
-  search_paths = ["crates/agent-block-core/blocks"]
-)
-mcp__lua-debugger__test_launch(
-  code_file    = "crates/agent-block/tests/fixtures/compile_loop_helpers_test.lua",
-  search_paths = ["crates/agent-block-core/blocks"]
-)
+just test-lua              # every spec
+just test-lua window_spec  # one, by filename substring
 ```
 
-What a spec can reach is what needs no kernel. `compile_loop`'s loop opens a
-`knl` session, which is a syscall the pure spec runner does not have, so the
-loop itself is covered by `tests/e2e_compile_loop.rs` against a mock provider
-and the specs cover the helpers around it. Each spec file's header documents its
-exact `test_launch` invocation.
+Two kinds of file are picked up: the fixtures under
+`crates/agent-block/tests/fixtures/*_test.lua`, and each block's own specs under
+`crates/agent-block-core/blocks/lib/<block>/spec/`. Both run with the mlua-lspec
+framework (`describe` / `it` / `expect`) and need no API keys and no network.
+The embedded blocks expose their pure, I/O-free helpers through a
+`_test_helpers()` accessor so a spec can reach them.
+
+What a spec can reach is what needs no kernel: `knl` is a syscall bridge the
+pure runner does not have, so a loop that opens a session is covered by the
+Rust e2e suite in the full host (`tests/e2e_knl_beat.rs`) and the specs cover
+what sits around it. Each spec file's header documents how to run it on its
+own.
 
 ## License
 

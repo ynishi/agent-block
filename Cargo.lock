@@ -43,7 +43,6 @@ version = "0.37.1"
 dependencies = [
  "agent-block-core",
  "agent-block-mcp",
- "agent-block-testkit",
  "agent-block-types",
  "anyhow",
  "assert_cmd",

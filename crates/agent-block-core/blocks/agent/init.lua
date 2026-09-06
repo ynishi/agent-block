@@ -168,12 +168,10 @@ local MCP_CALL_RESULT = T.shape({
 -- Reading an answer
 -- ============================================================
 --
--- `text_of` here and `error_text` / `refusal_text` below are the same functions
--- `blocks/tools/compile_loop` carries, character for character: reading an
--- Outcome is consumer plumbing and both consumers read it the same way. They
--- are duplicated rather than shared because a shared module would have to be
--- an embedded lib, and the two copies agree — a change to one belongs in the
--- other on the same commit.
+-- `text_of` here and `error_text` / `refusal_text` below are consumer
+-- plumbing: reading an Outcome is the caller's job, and every loop written
+-- over the kernel does it the same way. A loop of your own writes its own,
+-- or copies these — they are short on purpose.
 
 --- The `tool_use` blocks of a response, in block order. This is what
 --- `on_turn` has always been handed as `tool_calls`, and what the loop counts
@@ -280,8 +278,9 @@ end
 
 --- The caller's `extra_tools`, as candidates.
 ---
---- Two accepted shapes, because `compile_loop.make()` answers the nested one:
---- `{ name, schema = { description, input_schema }, handler }` is flattened,
+--- Two accepted shapes, because a tool factory that returns a def answers the
+--- nested one: `{ name, schema = { description, input_schema }, handler }` is
+--- flattened,
 --- and a flat `{ name, description, input_schema, handler? }` passes through.
 --- A flat entry that spells the schema field `schema` reaches
 --- `knl_adapter.tools`' loud error rather than the provider with no schema.

@@ -7,18 +7,26 @@
 -- flipped — what is asserted is the refusal, and that the registry alone still
 -- binds the tool exactly once.
 --
--- `compile_loop.make` no longer registers what it builds, so the registration
--- is here: it is the caller's, and this fixture is the caller.
+-- The def is written out here in the nested `{name, schema, handler}` form
+-- rather than built by a factory: registration is the caller's, and this
+-- fixture is the caller.
 
 local agent = require("agent")
-local compile_loop = require("compile_loop")
 
-local td = compile_loop.make({
+local td = {
     name = "dedup_test_tool",
-    runner = function()
-        return { ok = true, stdout = "", stderr = "" }
+    schema = {
+        description = "A tool that exists twice over.",
+        input_schema = {
+            type = "object",
+            properties = { spec = { type = "string" } },
+            required = { "spec" },
+        },
+    },
+    handler = function()
+        return "ok"
     end,
-})
+}
 tool.register(td.name, td.schema, td.handler)
 
 local registry = agent._registry_candidates()

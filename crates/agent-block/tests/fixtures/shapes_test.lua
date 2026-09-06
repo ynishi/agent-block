@@ -4,7 +4,7 @@
 --   just test-lua shapes_test   # this file
 --   just test-lua               # every spec fixture
 --
--- The contracts themselves (agent.shapes / compile_loop.shapes) are plain data,
+-- The contracts themselves (agent.shapes) are plain data,
 -- so they are checked here directly with `lshape.check.check` rather than
 -- through the dev-mode assert at the call sites. That keeps the cases readable
 -- and, more to the point, makes them run whether or not dev mode is on.
@@ -41,137 +41,16 @@ if not std then
                 return tostring(v)
             end,
         },
-        fs = {
-            metadata = function(_path)
-                return nil
-            end,
-            tool_specs = function(_opts)
-                return {
-                    {
-                        name = "fs_edit",
-                        description = "stub (shapes_test)",
-                        input_schema = { type = "object" },
-                        handler = function()
-                            error("std.fs edit handler is not stubbed in this fixture", 0)
-                        end,
-                    },
-                }
-            end,
-        },
     }
 end
 
 local lshape = require("lshape")
 local check = lshape.check
 local agent = require("agent")
-local compile_loop = require("compile_loop")
 
 describe("lshape dev mode", function()
     it("is on, so the call-site asserts are live in the specs", function()
         expect(check.is_dev_mode()).to.equal(true)
-    end)
-end)
-
-describe("compile_loop.shapes.runner_result", function()
-    local schema = compile_loop.shapes.runner_result
-
-    it("accepts the full form the bundled runners return", function()
-        local ok = check.check({ ok = true, stdout = "out", stderr = "", exit_code = 0 }, schema)
-        expect(ok).to.equal(true)
-    end)
-
-    it("accepts ok on its own", function()
-        expect(check.check({ ok = false }, schema)).to.equal(true)
-    end)
-
-    it("stays open to keys the loop does not read", function()
-        expect(check.check({ ok = true, duration_ms = 12 }, schema)).to.equal(true)
-    end)
-
-    it("rejects a missing ok, which is the field the loop branches on", function()
-        local ok, why = check.check({ stdout = "out" }, schema)
-        expect(ok).to.equal(false)
-        expect(why ~= nil).to.be.truthy()
-    end)
-
-    it("rejects a truthy non-boolean ok", function()
-        expect(check.check({ ok = "yes" }, schema)).to.equal(false)
-    end)
-
-    it("rejects an exit_code that arrived as a string", function()
-        expect(check.check({ ok = false, exit_code = "1" }, schema)).to.equal(false)
-    end)
-
-    it("rejects a runner that returned nothing", function()
-        expect(check.check(nil, schema)).to.equal(false)
-    end)
-end)
-
-describe("compile_loop.shapes.tool_output", function()
-    local schema = compile_loop.shapes.tool_output
-
-    it("accepts the single-file form", function()
-        local ok = check.check({
-            ok = true,
-            iters = 4,
-            summary = "PASS in 4 iters",
-            artifact_path = "/abs/x.lua",
-        }, schema)
-        expect(ok).to.equal(true)
-    end)
-
-    it("accepts the multi-file form", function()
-        local ok = check.check({
-            ok = true,
-            iters = 2,
-            summary = "PASS in 2 iters",
-            modified_files = { "/abs/a.lua", "/abs/b.lua" },
-        }, schema)
-        expect(ok).to.equal(true)
-    end)
-
-    it("accepts a failure carrying its reason", function()
-        local ok = check.check({
-            ok = false,
-            iters = 5,
-            summary = "give-up: max_iters reached (5)",
-            failure_reason = "max_iters",
-            last_error = "still failing",
-        }, schema)
-        expect(ok).to.equal(true)
-    end)
-
-    -- The context defence, as something that fails rather than something that
-    -- is written down next to the fields it is about: the run's transcript
-    -- belongs in the session log, not in the caller's context.
-    it("rejects leaked code", function()
-        local ok = check.check({
-            ok = true,
-            iters = 1,
-            summary = "PASS in 1 iters",
-            code = "print('leaked source')",
-        }, schema)
-        expect(ok).to.equal(false)
-    end)
-
-    it("rejects leaked history", function()
-        local ok = check.check({
-            ok = true,
-            iters = 1,
-            summary = "PASS in 1 iters",
-            history = { { iter = 1 } },
-        }, schema)
-        expect(ok).to.equal(false)
-    end)
-
-    it("rejects modified_files holding something other than paths", function()
-        local ok = check.check({
-            ok = true,
-            iters = 1,
-            summary = "PASS in 1 iters",
-            modified_files = { 1, 2 },
-        }, schema)
-        expect(ok).to.equal(false)
     end)
 end)
 

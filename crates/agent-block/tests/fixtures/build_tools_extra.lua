@@ -10,7 +10,7 @@
 local agent = require("agent")
 local kernel = require("knl")
 
--- nested-schema+handler form: what compile_loop.make() returns
+-- nested-schema+handler form: what a tool factory returns
 local nested_tool = {
     name = "nested_x",
     schema = { description = "nested desc", input_schema = { type = "object", properties = {} } },

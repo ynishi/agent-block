@@ -3,7 +3,7 @@
 //! `crates/agent-block-core/blocks/lib/<block>/spec/`.
 //!
 //! Both are Lua unit tests for the Lua side of the runtime (`blocks/agent`,
-//! `blocks/lib/llm_proto`, `blocks/lib/knl`, `blocks/tools/compile_loop`).
+//! `blocks/lib/llm_proto`, `blocks/lib/knl`, `blocks/lib/policy`).
 //! They were reachable only by hand, through the lua-debugger MCP, so nothing
 //! ran them on the way to a commit — which is how eight of them came to be
 //! failing against a stub that had not kept up with the `std.fs` bridge, and
@@ -110,11 +110,10 @@ fn main() -> ExitCode {
     let blocks = root.join("crates/agent-block-core/blocks");
     let dirs = spec_dirs(&root);
 
-    // `require("compile_loop")` / `require("llm_proto")` / `require("knl")` /
-    // `require("agent")` resolve against the three directories blocks are laid
-    // out in — the same paths for a fixture and for a spec sitting inside the
-    // block it covers.
-    let search: Vec<String> = ["tools", "lib", ""]
+    // `require("llm_proto")` / `require("knl")` / `require("agent")` resolve
+    // against the two directories blocks are laid out in — the same paths for
+    // a fixture and for a spec sitting inside the block it covers.
+    let search: Vec<String> = ["lib", ""]
         .iter()
         .map(|sub| blocks.join(sub).display().to_string())
         .collect();
