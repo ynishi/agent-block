@@ -37,6 +37,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `fs_edit` says which file its line numbers address, and reports every edit
+  that failed rather than the first. The tool takes a batch of line ranges and
+  checks all of them against one reading of the file, applying bottom-up — so
+  the numbers a caller sends must be counted against the file as it is now, not
+  against the file each earlier edit in the same call would leave behind. The
+  description never said so. It said the batch is checked before anything is
+  applied and that a rejected call changes nothing, which is true and does not
+  settle the question, and a model that numbered the second edit against the
+  first one's result was not contradicting anything it had been told: on one
+  run three correct edits were discarded whole because the second and third
+  were low by exactly the line the first one inserted. The description now
+  states the basis, and says what a shared offset across several rejections
+  means.
+
+  Reporting one failure could not show that. `expect_mismatch` returned on the
+  first edit that did not match, so a caller with a wrong basis saw a single
+  line whose text looked unrelated — which reads as a misread line, and the
+  answer to a misread line is to read the file again. The reply now keeps its
+  existing fields, first failure and all, and adds `failures`: every rejected
+  edit in order, with its own reason. Several off by the same amount is a
+  legible shape; one is not.
+
+- `fs_search_replace` reports every snippet that did not resolve, and says how
+  many times an ambiguous one occurs. It stopped at the first, which is the
+  same shortfall as above and matters more here: this is the batch that is
+  supposed to be a batch — a snippet identifies itself, so several in one call
+  is coherent where several line ranges are not — and it is therefore the one
+  where several go wrong together. A caller working from a reading the file has
+  moved past misses every snippet in the changed region at once, and the set is
+  what says the region moved; one of them says only that one line is not where
+  it was thought to be. `search_ambiguous` now carries `matches`, because "it
+  occurs 4 times" tells a caller how much surrounding text to add and "more
+  than once" does not.
+
 - `knl.is_session(v)` is published, and the packs use it. The kernel already
   had the judgement — it asks a handle for the whole of `knl.shapes.session`,
   which is generated from the Rust side's own types, through a pcall because

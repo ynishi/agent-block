@@ -163,11 +163,18 @@ std.fs.tool_specs = function(opts)
         edit = {
             description = "Replace one or more line ranges in a file. Addressed by line "
                 .. "number, not by searching for text: give `start_line`, `end_line` and the "
-                .. "`expect`ed current text of those lines. Every edit is checked before any "
-                .. "is applied, so a rejected call changes nothing. On `expect_mismatch` the "
-                .. "reply carries the text actually at those lines — correct it from that "
-                .. "instead of re-reading the file. Pass `base` from the read to be told when "
-                .. "the file changed under you. There is no fuzzy matching: `expect` must be exact.",
+                .. "`expect`ed current text of those lines. **Every line number in the call "
+                .. "addresses the file as it is now, before any of these edits.** When you "
+                .. "send several, do not shift the later ones to account for lines an earlier "
+                .. "one adds or removes — they are all checked and applied against one "
+                .. "reading, as a set. Every edit is checked before any is applied, so a "
+                .. "rejected call changes nothing. On `expect_mismatch` the reply carries the "
+                .. "text actually at those lines, and `failures` lists every edit that did "
+                .. "not pass — correct them from that instead of re-reading the file. Several "
+                .. "of them off by the same number of lines means the numbers were counted "
+                .. "against the edited file; re-count against the file as you read it. Pass "
+                .. "`base` from the read to be told when the file changed under you. There is "
+                .. "no fuzzy matching: `expect` must be exact.",
             input_schema = {
                 type = "object",
                 properties = {
@@ -179,19 +186,25 @@ std.fs.tool_specs = function(opts)
                     },
                     edits = {
                         type = "array",
-                        description = "Edits to apply together. Ranges must not overlap.",
+                        description = "Edits to apply together. Every range addresses the "
+                            .. "file as it is now; none of them shifts to account for another. "
+                            .. "Ranges must not overlap.",
                         items = {
                             type = "object",
                             properties = {
-                                start_line = { type = "integer", description = "1-based first line to replace." },
+                                start_line = {
+                                    type = "integer",
+                                    description = "1-based first line to replace, in the file as it is now.",
+                                },
                                 end_line = {
                                     type = "integer",
-                                    description = "1-based last line to replace, inclusive.",
+                                    description = "1-based last line to replace, inclusive, in the file "
+                                        .. "as it is now.",
                                 },
                                 expect = {
                                     type = "string",
-                                    description = "Exact current text of those lines, newline-joined, "
-                                        .. "without a trailing newline.",
+                                    description = "Exact current text of those lines as the file stands "
+                                        .. "now, newline-joined, without a trailing newline.",
                                 },
                                 replace = {
                                     type = "string",
@@ -224,7 +237,10 @@ std.fs.tool_specs = function(opts)
                 .. "resolved before any is applied, a rejected call changes nothing, and two "
                 .. "edits may not touch the same line. `search_not_found` means the text is "
                 .. "not in the file as it is now — re-read that region rather than guessing. "
-                .. "`search_ambiguous` means it occurs more than once — add surrounding lines. "
+                .. "`search_ambiguous` means it occurs more than once and says how many in "
+                .. "`matches` — add surrounding lines until it is one. `failures` lists every "
+                .. "edit that did not resolve, so correct them together; several missing at "
+                .. "once means the region moved, and one re-read of it fixes the whole call. "
                 .. "Pass `base` from the read to be told when the file changed under you.",
             input_schema = {
                 type = "object",
@@ -270,22 +286,59 @@ std.fs.tool_specs = function(opts)
                 -- then handed over as one batch: the edit primitive's own
                 -- overlap check and `base` check decide together whether
                 -- anything is written.
+                --
+                -- Every search is resolved before any refusal is returned, and
+                -- the reply names all of them. This is the batch that is
+                -- supposed to be a batch — a snippet identifies itself, so
+                -- several in one call is coherent where several line ranges
+                -- are not — and it is therefore the one where several can be
+                -- wrong at once: a caller working from a stale reading has
+                -- every snippet from the changed region miss together. Naming
+                -- one of them sends it back to re-read for a single line; the
+                -- set is what shows the region moved.
                 local content = std.fs.read_versioned(input.path).content
                 local translated = {}
+                local failures = {}
                 for i, e in ipairs(edits) do
                     local search = type(e) == "table" and e.search or nil
                     local replace = type(e) == "table" and e.replace or nil
                     if type(search) ~= "string" or search == "" or type(replace) ~= "string" then
-                        return { ok = false, reason = "bad_edit", edit_index = i }
+                        table.insert(failures, { reason = "bad_edit", edit_index = i })
+                    else
+                        local pos = content:find(search, 1, true)
+                        if not pos then
+                            table.insert(failures, { reason = "search_not_found", edit_index = i })
+                        else
+                            -- Count the rest rather than stopping at the second:
+                            -- "occurs 4 times" tells the caller how much context
+                            -- to add, where "more than once" does not.
+                            local matches = 1
+                            local at = content:find(search, pos + #search, true)
+                            while at do
+                                matches = matches + 1
+                                at = content:find(search, at + #search, true)
+                            end
+                            if matches > 1 then
+                                table.insert(failures, {
+                                    reason = "search_ambiguous",
+                                    edit_index = i,
+                                    matches = matches,
+                                })
+                            else
+                                translated[i] = line_edit_for(content, pos, search, replace)
+                            end
+                        end
                     end
-                    local pos = content:find(search, 1, true)
-                    if not pos then
-                        return { ok = false, reason = "search_not_found", edit_index = i }
-                    end
-                    if content:find(search, pos + 1, true) then
-                        return { ok = false, reason = "search_ambiguous", edit_index = i }
-                    end
-                    translated[i] = line_edit_for(content, pos, search, replace)
+                end
+                if #failures > 0 then
+                    local first = failures[1]
+                    return {
+                        ok = false,
+                        reason = first.reason,
+                        edit_index = first.edit_index,
+                        matches = first.matches,
+                        failures = failures,
+                    }
                 end
                 return std.fs.edit(input.path, { base = input.base, edits = translated })
             end,

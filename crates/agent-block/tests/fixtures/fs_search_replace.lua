@@ -6,7 +6,9 @@
 -- one spanning lines and ending with a newline, the first line, the last line
 -- of a file without a trailing newline, an empty replacement — and every
 -- refusal that leaves the file untouched: not found, ambiguous, two edits on
--- one line, a stale base.
+-- one line, a stale base. The refusals also carry what a caller needs to
+-- recover in one turn rather than by re-reading: how many times an ambiguous
+-- snippet occurs, and every edit that failed rather than the first.
 
 local dir = std.env.get("AGENT_BLOCK_HOME")
 local path = dir .. "/target.txt"
@@ -75,11 +77,31 @@ res = sr({ path = path, base = r.version, edits = { { search = "gamma", replace 
 check("missing.rejected", res.ok == false and res.reason == "search_not_found" and res.edit_index == 1)
 check("missing.file_untouched", std.fs.read(path) == "alpha\nbravo\n")
 
--- ambiguous: nothing changes ----------------------------------------------
-r = reset("x\nx\n")
+-- ambiguous: nothing changes, and the count says how far off unique it is --
+r = reset("x\nx\nx\n")
 res = sr({ path = path, base = r.version, edits = { { search = "x", replace = "y" } } })
 check("ambiguous.rejected", res.ok == false and res.reason == "search_ambiguous")
-check("ambiguous.file_untouched", std.fs.read(path) == "x\nx\n")
+check("ambiguous.counts_matches", res.matches == 3)
+check("ambiguous.file_untouched", std.fs.read(path) == "x\nx\nx\n")
+
+-- every edit that did not resolve is named, not just the first. A caller
+-- working from a reading the file has moved past misses several snippets at
+-- once, and the set is what says the region moved rather than one line.
+r = reset("alpha\nbravo\ncharlie\n")
+res = sr({
+    path = path,
+    base = r.version,
+    edits = {
+        { search = "alpha", replace = "A" },
+        { search = "gamma", replace = "G" },
+        { search = "delta", replace = "D" },
+    },
+})
+check("all_failures.rejected", res.ok == false and res.reason == "search_not_found")
+check("all_failures.first_on_top", res.edit_index == 2)
+check("all_failures.reports_both", #res.failures == 2)
+check("all_failures.indices", res.failures[1].edit_index == 2 and res.failures[2].edit_index == 3)
+check("all_failures.file_untouched", std.fs.read(path) == "alpha\nbravo\ncharlie\n")
 
 -- two edits on one line are the edit primitive's overlap -------------------
 r = reset("alpha bravo\n")
