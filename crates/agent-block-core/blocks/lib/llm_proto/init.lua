@@ -622,4 +622,100 @@ end
 --- metatable convention is a second thing to keep in step.
 M.response_blocks = response_blocks
 
+-- ============================================================
+-- Counting and the window — what the adapters share
+-- ============================================================
+--
+-- Each provider adapter answers two more questions beside build / parse:
+-- `count(spec) -> tokens | nil, err` (how many tokens the request is, as the
+-- server would count it) and `profile(spec) -> { context_window, max_output }
+-- | nil, err` (what the model can take). Both are answered by the server's
+-- own surface where it has one — Anthropic's count_tokens, vLLM's /tokenize
+-- and /v1/models, llama.cpp's /apply-template + /tokenize and /props — and
+-- `nil` where it does not (OpenAI's chat completions, Ollama), so the caller
+-- falls back to an estimate it knows is one. The helpers below are the plain
+-- one-shot HTTP the adapters do that with: no retry, a short timeout, the
+-- error text on the way out. They are not `transport`, which is the model
+-- call and carries its retry policy and hooks.
+
+--- Timeout for a counting / discovery call: local servers answer in
+--- milliseconds and a hosted one in well under this.
+local PROBE_TIMEOUT = 15
+
+--- One JSON round trip. `method` "GET" sends no body.
+---
+--- @param method string  "GET" | "POST"
+--- @param url string
+--- @param headers table
+--- @param body table|nil  encoded as JSON when given
+--- @param timeout number|nil
+--- @return table|nil decoded
+--- @return string|nil err
+function M.probe(method, url, headers, body, timeout)
+    local opts = {
+        method = method,
+        headers = headers,
+        timeout = timeout or PROBE_TIMEOUT,
+    }
+    if body ~= nil then
+        opts.body = std.json.encode(body)
+    end
+    local ok, resp = pcall(http.request, url, opts)
+    if not ok then
+        return nil, "probe " .. url .. ": " .. tostring(resp)
+    end
+    if resp.status ~= 200 then
+        local classified = M.classify_error(resp.status, resp.body, resp.headers)
+        return nil, "probe " .. url .. ": HTTP " .. tostring(resp.status) .. ": " .. tostring(classified.message)
+    end
+    local decoded_ok, decoded = pcall(std.json.decode, resp.body)
+    if not decoded_ok or type(decoded) ~= "table" then
+        return nil, "probe " .. url .. ": response JSON decode failed"
+    end
+    return decoded, nil
+end
+
+--- The server root a compatible server hangs its non-OpenAI endpoints off:
+--- `/tokenize`, `/props`, `/api/show` live beside `/v1`, not under it.
+---
+--- @param base_url string  e.g. "http://localhost:8000/v1"
+--- @return string root  e.g. "http://localhost:8000"
+function M.server_root(base_url)
+    local root = base_url:gsub("/+$", "")
+    root = root:gsub("/v1$", "")
+    return root
+end
+
+--- The estimate for a request no server will count: bytes over every string
+--- in it, at `bytes_per_token`. The default of 3.2 is the safe side of what
+--- was measured — 4 bytes to the token was 11-21% low against a vLLM-served
+--- Qwen on code and tool schemas, and this margin covers the worst of those
+--- calls — which is the only correctness an estimate can offer: a request it
+--- passes fits. A caller that knows its model's ratio passes a larger value.
+---
+--- @param request table  knl.fold output: { messages, system?, tools? }
+--- @param bytes_per_token number|nil  default 3.2
+--- @return integer tokens
+function M.estimate_tokens(request, bytes_per_token)
+    local per = bytes_per_token or 3.2
+    local bytes = 0
+    local function walk(v)
+        local t = type(v)
+        if t == "string" then
+            bytes = bytes + #v
+        elseif t == "number" or t == "boolean" then
+            bytes = bytes + 4
+        elseif t == "table" then
+            for k, child in pairs(v) do
+                if type(k) == "string" then
+                    bytes = bytes + #k
+                end
+                walk(child)
+            end
+        end
+    end
+    walk(request)
+    return math.ceil(bytes / per)
+end
+
 return M

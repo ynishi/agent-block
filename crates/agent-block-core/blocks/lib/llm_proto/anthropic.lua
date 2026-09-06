@@ -381,4 +381,89 @@ function M.parse(raw)
         nil
 end
 
+-- ============================================================
+-- count / profile — what the API knows about the request and the model
+-- ============================================================
+
+--- Fields of a Messages request that `count_tokens` does not take: the
+--- answer's shape, not its input.
+local NOT_COUNTED = {
+    max_tokens = true,
+    stream = true,
+    temperature = true,
+    top_p = true,
+    top_k = true,
+    stop_sequences = true,
+    metadata = true,
+}
+
+--- Count the request with `POST /v1/messages/count_tokens`.
+---
+--- The body is the one `build` would send, less the generation fields, so
+--- the system prompt, the messages, the tools and the thinking switch are
+--- counted as they will be sent. The API documents the answer as an
+--- estimate that may differ by a small amount; it is the provider's own, and
+--- it is free, on a rate limit of its own.
+---
+--- @param spec table  the same spec `build` takes
+--- @return integer|nil tokens
+--- @return string|nil err
+function M.count(spec)
+    local wire, berr = M.build(spec or {})
+    if not wire then
+        return nil, berr
+    end
+    local body = {}
+    for key, value in pairs(wire.body) do
+        if not NOT_COUNTED[key] then
+            body[key] = value
+        end
+    end
+    local url = wire.url:gsub("/v1/messages$", "/v1/messages/count_tokens")
+    local decoded, err = proto.probe("POST", url, wire.headers, body)
+    if not decoded then
+        return nil, err
+    end
+    if type(decoded.input_tokens) ~= "number" then
+        return nil, "count_tokens answered no input_tokens"
+    end
+    return math.floor(decoded.input_tokens), nil
+end
+
+--- What the model behind `spec` can take, from `GET /v1/models/{model}`:
+--- `max_input_tokens` is the window and `max_tokens` the largest answer the
+--- model allows. `max_output` answers the caller's `max_tokens` when set —
+--- the room `build` will actually ask for — and the model's maximum
+--- otherwise.
+---
+--- @param spec table  the same spec `build` takes
+--- @return table|nil profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
+--- @return string|nil err
+function M.profile(spec)
+    spec = spec or {}
+    local api_key = spec.api_key or std.env.get(spec.api_key_env or "ANTHROPIC_API_KEY")
+    if not api_key then
+        return nil, (spec.api_key_env or "ANTHROPIC_API_KEY") .. " not set"
+    end
+    local model = spec.model or std.env.get_or("ANTHROPIC_MODEL", DEFAULT_MODEL)
+    local base = spec.base_url and (spec.base_url .. "/v1") or API_URL:gsub("/messages$", "")
+    local headers = proto.merge_headers({
+        ["x-api-key"] = api_key,
+        ["anthropic-version"] = API_VERSION,
+        ["content-type"] = "application/json",
+    }, spec.headers)
+    local decoded, err = proto.probe("GET", base .. "/models/" .. model, headers)
+    if not decoded then
+        return nil, err
+    end
+    if type(decoded.max_input_tokens) ~= "number" then
+        return nil, "models/" .. model .. " names no max_input_tokens"
+    end
+    local output = spec.max_tokens
+    if output == nil and type(decoded.max_tokens) == "number" then
+        output = decoded.max_tokens
+    end
+    return { context_window = math.floor(decoded.max_input_tokens), max_output = output }, nil
+end
+
 return M

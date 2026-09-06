@@ -280,45 +280,94 @@ function LLMPort.new(impl)
     return setmetatable(impl, LLMPort)
 end
 
---- What the model behind this Port can take: the context window and the room
---- an answer needs inside it, in tokens.
----
---- This is the Port's knowledge, not the kernel's and not a policy's: the
---- kernel's budget counts whatever unit the owner tagged the grant with, and
---- `policy.window{ fit }` / `policy.tokens` only ask. The shared answer reads
---- the conf the Port is opened with — `context_window` for the window, and
---- `max_tokens` (the same key `build` sends as the answer's cap) for the
---- room — so a caller declares a model's window once, beside its name. A
---- provider Port that knows its models may override `profile` and answer
---- from a table of them; the default declares nothing it was not told,
---- because a window guessed wrong is the overflow this exists to prevent,
---- one step later.
----
---- @param conf table|nil  the conf the Port is (or will be) opened with
---- @return table profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
-function LLMPort:profile(conf)
-    conf = conf or {}
-    return {
-        context_window = conf.context_window,
-        max_output = conf.max_tokens,
-    }
+-- ============================================================
+-- profile / count — what the model can take, and what a request is
+-- ============================================================
+--
+-- Two more questions a Port answers beside build / parse / classify, and the
+-- two the shell's `policy.window{ fit }` and `policy.tokens` ask. Both are the
+-- Port's knowledge: the kernel's budget counts whatever unit the owner tagged
+-- the grant with, and a policy only asks.
+--
+-- A provider impl may carry two optional methods the shim consults:
+--
+--     discover(spec) -> profile | nil, err   ask the server what the model
+--                                            can take (llm_proto's `profile`)
+--     tokenize(spec) -> tokens | nil, err    count the request as the server
+--                                            would (llm_proto's `count`)
+--
+-- `spec` is the conf merged with the request, the same table `build` gets.
+-- What the shim adds around them is the part that does not change per
+-- provider: the conf's own declaration wins over discovery, an answer is
+-- cached so the server is asked once per window and once per distinct
+-- request, and a Port with no server to ask estimates — with the margin an
+-- estimate needs — and says so in the profile.
+
+--- Merge conf under request, the way `build` sees them.
+local function spec_of(conf, request)
+    local spec = {}
+    for key, value in pairs(conf or {}) do
+        spec[key] = value
+    end
+    for key, value in pairs(request or {}) do
+        spec[key] = value
+    end
+    return spec
 end
 
---- How many tokens a request is, as this Port would send it.
----
---- The shared answer is an estimate — four bytes to the token over every
---- string in the request, and the request as the kernel folds it, before the
---- provider wire adds its framing — and it is deliberately on the high side
---- for prose in Latin script, so a request it passes fits. A provider Port
---- with a tokenizer, or one that calibrates against the `usage.input` its
---- last answer reported, overrides `count`; what does not change is that the
---- number is the Port's, so the fold that sizes the request and the cost
---- that reserves it agree.
----
---- @param request table  knl.fold output: { messages, system?, tools? }
---- @param _conf table|nil  the conf the Port is opened with (unused here)
---- @return integer tokens  a whole number >= 0
-function LLMPort:count(request, _conf)
+--- A deterministic text for a table, for a cache key: keys sorted, values
+--- rendered, so two requests with the same content key the same entry
+--- whatever order Lua walks them in.
+local function canonical(v)
+    local t = type(v)
+    if t == "string" then
+        return string.format("%q", v)
+    elseif t == "number" or t == "boolean" or t == "nil" then
+        return tostring(v)
+    elseif t ~= "table" then
+        return "<" .. t .. ">"
+    end
+    local keys = {}
+    for k in pairs(v) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        parts[#parts + 1] = tostring(k) .. "=" .. canonical(v[k])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+--- The window a served model has is the same for every request on it: one
+--- answer per (base_url, model), kept on the Port.
+local function profile_key(conf)
+    return tostring(conf.base_url) .. "|" .. tostring(conf.model)
+end
+
+--- Requests repeat — the fold's chosen request is counted again by the cost
+--- one step later — so counts are kept, per Port, for the last few distinct
+--- requests. Small and first-in-first-out: the working set is one beat's
+--- candidates.
+local COUNT_CACHE_SIZE = 32
+
+--- Bytes to the token when nothing can count: the safe side of what was
+--- measured against a vLLM-served Qwen on code and tool schemas (four bytes
+--- to the token was 11-21% low; 3.2 covers the worst of those calls).
+local ESTIMATE_BYTES_PER_TOKEN = 3.2
+
+--- A fallback is worth a line in the log, where there is one: the spec
+--- runner has no `log` global and a Port must not need one to count.
+local function note(message)
+    if type(log) == "table" and type(log.debug) == "function" then
+        log.debug(message)
+    end
+end
+
+--- The estimate for a request no server will count.
+local function estimate(request)
     local bytes = 0
     local function walk(v)
         local t = type(v)
@@ -336,8 +385,102 @@ function LLMPort:count(request, _conf)
         end
     end
     walk(request)
-    return math.ceil(bytes / 4)
+    return math.ceil(bytes / ESTIMATE_BYTES_PER_TOKEN)
 end
+
+--- What the model behind this Port can take: the context window and the room
+--- an answer needs inside it, in tokens.
+---
+--- The conf the Port is opened with is read first — `context_window` for the
+--- window, `max_tokens` (the same key `build` sends as the answer's cap) for
+--- the room — so a caller that declares a model's window beside its name is
+--- believed. What the conf leaves unsaid is asked of the server through the
+--- impl's `discover`, once per (base_url, model), and the answer kept on the
+--- Port. A Port with nothing to ask declares nothing it was not told: a
+--- window guessed wrong is the overflow this exists to prevent, one step
+--- later. `estimated = true` marks a profile whose window came from
+--- discovery rather than the conf — the same number, said with its source.
+---
+--- @param conf table|nil  the conf the Port is (or will be) opened with
+--- @return table profile  { context_window = <tokens>|nil, max_output = <tokens>|nil, estimated = boolean? }
+function LLMPort:profile(conf)
+    conf = conf or {}
+    local profile = { context_window = conf.context_window, max_output = conf.max_tokens }
+    if profile.context_window ~= nil then
+        return profile
+    end
+    if type(self.discover) ~= "function" then
+        return profile
+    end
+    self._profiles = self._profiles or {}
+    local key = profile_key(conf)
+    local found = self._profiles[key]
+    if found == nil then
+        local discovered, err = self:discover(spec_of(conf, nil))
+        if not discovered then
+            note("knl_adapter: profile discovery answered nothing: " .. tostring(err))
+            return profile
+        end
+        found = discovered
+        self._profiles[key] = found
+    end
+    profile.context_window = found.context_window
+    if profile.max_output == nil then
+        profile.max_output = found.max_output
+    end
+    profile.discovered = true
+    return profile
+end
+
+--- How many tokens a request is, as this Port would send it.
+---
+--- Asked of the server through the impl's `tokenize` where there is one —
+--- Anthropic's count_tokens, vLLM's /tokenize, llama.cpp's template and
+--- tokenizer — so the number is the one the prefill will have, tools and
+--- template included. Where there is none, or the server did not answer,
+--- the estimate: bytes over every string in the request at
+--- `ESTIMATE_BYTES_PER_TOKEN`, on the safe side, so a request it passes
+--- fits. Either way the number is the Port's, so the fold that sizes the
+--- request and the cost that reserves it agree, and either way it is kept
+--- for the request's repeat.
+---
+--- @param request table  knl.fold output: { messages, system?, tools? }
+--- @param conf table|nil  the conf the Port is opened with
+--- @return integer tokens  a whole number >= 0
+function LLMPort:count(request, conf)
+    conf = conf or {}
+    self._counts = self._counts or { order = {}, by_key = {} }
+    local cache = self._counts
+    local key = profile_key(conf) .. "|" .. canonical(request)
+    local hit = cache.by_key[key]
+    if hit ~= nil then
+        return hit
+    end
+
+    local tokens
+    if type(self.tokenize) == "function" then
+        local counted, err = self:tokenize(spec_of(conf, request))
+        if type(counted) == "number" then
+            tokens = math.floor(counted)
+        else
+            note("knl_adapter: count fell back to the estimate: " .. tostring(err))
+        end
+    end
+    if tokens == nil then
+        tokens = estimate(request)
+    end
+
+    cache.by_key[key] = tokens
+    cache.order[#cache.order + 1] = key
+    if #cache.order > COUNT_CACHE_SIZE then
+        local oldest = table.remove(cache.order, 1)
+        cache.by_key[oldest] = nil
+    end
+    return tokens
+end
+
+M._estimate_tokens = estimate
+M._canonical = canonical
 
 --- Open the Port into the closure a device carries as its `llm`
 --- (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
@@ -541,6 +684,20 @@ M.anthropic = LLMPort.new({
     build = anthropic_build,
     parse = anthropic_parse,
     classify = anthropic_classify,
+    -- The API counts and describes its own models (count_tokens, GET
+    -- /v1/models/{id}); llm_proto's anthropic adapter holds both calls.
+    tokenize = function(_, spec)
+        if type(proto_anthropic.count) ~= "function" then
+            return nil, "llm_proto anthropic adapter has no count"
+        end
+        return proto_anthropic.count(spec)
+    end,
+    discover = function(_, spec)
+        if type(proto_anthropic.profile) ~= "function" then
+            return nil, "llm_proto anthropic adapter has no profile"
+        end
+        return proto_anthropic.profile(spec)
+    end,
 })
 
 -- ============================================================
@@ -625,6 +782,22 @@ M.openai = LLMPort.new({
     build = openai_build,
     parse = openai_parse,
     classify = openai_classify,
+    -- The compatible servers count and describe their models (vLLM
+    -- /tokenize + /v1/models, llama.cpp /apply-template + /tokenize +
+    -- /props, Ollama /api/show); OpenAI's own chat completions do neither,
+    -- and llm_proto's openai adapter answers nil there so the shim estimates.
+    tokenize = function(_, spec)
+        if type(proto_openai.count) ~= "function" then
+            return nil, "llm_proto openai adapter has no count"
+        end
+        return proto_openai.count(spec)
+    end,
+    discover = function(_, spec)
+        if type(proto_openai.profile) ~= "function" then
+            return nil, "llm_proto openai adapter has no profile"
+        end
+        return proto_openai.profile(spec)
+    end,
 })
 
 -- ============================================================

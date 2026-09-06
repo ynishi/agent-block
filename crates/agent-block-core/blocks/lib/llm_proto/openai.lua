@@ -723,4 +723,150 @@ function M.parse(raw)
         nil
 end
 
+-- ============================================================
+-- count / profile — what the server knows about the request and the model
+-- ============================================================
+
+--- Count the request as the server would, where the server can.
+---
+--- The compatible servers tokenize for free and without inference:
+---   vllm      `POST /tokenize` with the chat form — `messages` + `tools` +
+---             `chat_template_kwargs` — runs the same template path as
+---             generation, so the count is the prefill's
+---   llamacpp  `POST /apply-template` renders the messages to the prompt
+---             string, `POST /tokenize` counts it
+--- OpenAI's chat completions and Ollama have no counting surface: the answer
+--- is nil, and the caller estimates knowing that it is one.
+---
+--- The wire is built with `M.build` so what is counted is what would be
+--- sent — the converted messages, the tool declarations, the template
+--- switches — and not a second rendering of them.
+---
+--- @param spec table  the same spec `build` takes
+--- @return integer|nil tokens
+--- @return string|nil err  when the dialect has no counter or the call failed
+function M.count(spec)
+    spec = spec or {}
+    local dialect = resolve_dialect(spec)
+    if dialect ~= "vllm" and dialect ~= "llamacpp" then
+        return nil, "no token counter on the " .. dialect .. " dialect"
+    end
+    local wire, berr = M.build(spec)
+    if not wire then
+        return nil, berr
+    end
+    local root = proto.server_root(spec.base_url or DEFAULT_BASE_URL)
+    local body = wire.body
+
+    if dialect == "vllm" then
+        local decoded, err = proto.probe("POST", root .. "/tokenize", wire.headers, {
+            model = body.model,
+            messages = body.messages,
+            tools = body.tools,
+            chat_template_kwargs = body.chat_template_kwargs,
+            add_generation_prompt = true,
+        })
+        if not decoded then
+            return nil, err
+        end
+        if type(decoded.count) ~= "number" then
+            return nil, "vllm /tokenize answered no count"
+        end
+        return math.floor(decoded.count), nil
+    end
+
+    -- llamacpp: the template first, then the tokens of the rendered prompt.
+    local rendered, rerr = proto.probe("POST", root .. "/apply-template", wire.headers, {
+        messages = body.messages,
+        tools = body.tools,
+    })
+    if not rendered then
+        return nil, rerr
+    end
+    if type(rendered.prompt) ~= "string" then
+        return nil, "llama.cpp /apply-template answered no prompt"
+    end
+    local counted, cerr = proto.probe("POST", root .. "/tokenize", wire.headers, {
+        content = rendered.prompt,
+        add_special = false,
+    })
+    if not counted then
+        return nil, cerr
+    end
+    if type(counted.tokens) ~= "table" then
+        return nil, "llama.cpp /tokenize answered no tokens"
+    end
+    return #counted.tokens, nil
+end
+
+--- What the model behind `spec` can take, asked of the server where it says.
+---
+---   vllm      `GET /v1/models` → the card's `max_model_len`
+---   llamacpp  `GET /props` → `default_generation_settings.n_ctx`
+---   ollama    `POST /api/show` → `model_info["<arch>.context_length"]`
+---             (the training window; the served `num_ctx` may be smaller)
+--- OpenAI's models list carries no window: nil, so a caller declares it.
+---
+--- `max_output` is the caller's `max_tokens` on every dialect — it is what
+--- `build` will send as the answer's cap, so it is the room the answer needs.
+---
+--- @param spec table  the same spec `build` takes
+--- @return table|nil profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
+--- @return string|nil err  when the dialect has no discovery or the call failed
+function M.profile(spec)
+    spec = spec or {}
+    local dialect = resolve_dialect(spec)
+    local model = spec.model or std.env.get_or("OPENAI_MODEL", DEFAULT_MODEL)
+    local root = proto.server_root(spec.base_url or DEFAULT_BASE_URL)
+    local headers = proto.merge_headers({ ["Content-Type"] = "application/json" }, spec.headers)
+    local api_key = spec.api_key or std.env.get(spec.api_key_env or "OPENAI_API_KEY")
+    if api_key then
+        headers["Authorization"] = "Bearer " .. api_key
+    end
+    local window
+
+    if dialect == "vllm" then
+        local decoded, err = proto.probe("GET", root .. "/v1/models", headers)
+        if not decoded then
+            return nil, err
+        end
+        for _, card in ipairs(decoded.data or {}) do
+            if card.id == model and type(card.max_model_len) == "number" then
+                window = card.max_model_len
+            end
+        end
+        if window == nil then
+            return nil, "vllm /v1/models names no max_model_len for " .. tostring(model)
+        end
+    elseif dialect == "llamacpp" then
+        local decoded, err = proto.probe("GET", root .. "/props", headers)
+        if not decoded then
+            return nil, err
+        end
+        local settings = decoded.default_generation_settings
+        if type(settings) == "table" and type(settings.n_ctx) == "number" then
+            window = settings.n_ctx
+        else
+            return nil, "llama.cpp /props names no n_ctx"
+        end
+    elseif dialect == "ollama" then
+        local decoded, err = proto.probe("POST", root .. "/api/show", headers, { model = model })
+        if not decoded then
+            return nil, err
+        end
+        for key, value in pairs(decoded.model_info or {}) do
+            if type(key) == "string" and key:match("%.context_length$") and type(value) == "number" then
+                window = value
+            end
+        end
+        if window == nil then
+            return nil, "ollama /api/show names no context_length for " .. tostring(model)
+        end
+    else
+        return nil, "no window discovery on the " .. dialect .. " dialect; declare context_window"
+    end
+
+    return { context_window = math.floor(window), max_output = spec.max_tokens }, nil
+end
+
 return M

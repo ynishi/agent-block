@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Counting and the window are asked of the server where it has a surface for
+  them, and estimated with a stated margin where it does not. llm_proto's
+  adapters gain `count(spec)` and `profile(spec)`: Anthropic through
+  `count_tokens` and `GET /v1/models/{model}`; the OpenAI-compatible servers
+  through vLLM's `/tokenize` (the chat form, tools and template switches
+  included) and `/v1/models`' `max_model_len`, llama.cpp's `/apply-template`
+  + `/tokenize` and `/props`, Ollama's `/api/show` for the window; OpenAI's
+  own chat completions answer nil for both. `LLMPort` consults them through
+  two optional impl methods, `tokenize` and `discover`, keeps one profile per
+  (base_url, model) and the counts of the last few distinct requests, and
+  falls back to the estimate — now 3.2 bytes to the token, the safe side of a
+  measured 11-21% shortfall at 4 — when a server has nothing to say. A
+  profile from discovery carries `discovered = true`.
 - The model's context window is now something the runtime knows about, in
   two places that already existed for it. `LLMPort:profile(conf)` answers
   `{ context_window, max_output }` — read off the conf the Port is opened
