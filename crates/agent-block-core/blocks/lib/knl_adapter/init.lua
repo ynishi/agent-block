@@ -280,6 +280,65 @@ function LLMPort.new(impl)
     return setmetatable(impl, LLMPort)
 end
 
+--- What the model behind this Port can take: the context window and the room
+--- an answer needs inside it, in tokens.
+---
+--- This is the Port's knowledge, not the kernel's and not a policy's: the
+--- kernel's budget counts whatever unit the owner tagged the grant with, and
+--- `policy.window{ fit }` / `policy.tokens` only ask. The shared answer reads
+--- the conf the Port is opened with — `context_window` for the window, and
+--- `max_tokens` (the same key `build` sends as the answer's cap) for the
+--- room — so a caller declares a model's window once, beside its name. A
+--- provider Port that knows its models may override `profile` and answer
+--- from a table of them; the default declares nothing it was not told,
+--- because a window guessed wrong is the overflow this exists to prevent,
+--- one step later.
+---
+--- @param conf table|nil  the conf the Port is (or will be) opened with
+--- @return table profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
+function LLMPort:profile(conf)
+    conf = conf or {}
+    return {
+        context_window = conf.context_window,
+        max_output = conf.max_tokens,
+    }
+end
+
+--- How many tokens a request is, as this Port would send it.
+---
+--- The shared answer is an estimate — four bytes to the token over every
+--- string in the request, and the request as the kernel folds it, before the
+--- provider wire adds its framing — and it is deliberately on the high side
+--- for prose in Latin script, so a request it passes fits. A provider Port
+--- with a tokenizer, or one that calibrates against the `usage.input` its
+--- last answer reported, overrides `count`; what does not change is that the
+--- number is the Port's, so the fold that sizes the request and the cost
+--- that reserves it agree.
+---
+--- @param request table  knl.fold output: { messages, system?, tools? }
+--- @param _conf table|nil  the conf the Port is opened with (unused here)
+--- @return integer tokens  a whole number >= 0
+function LLMPort:count(request, _conf)
+    local bytes = 0
+    local function walk(v)
+        local t = type(v)
+        if t == "string" then
+            bytes = bytes + #v
+        elseif t == "number" or t == "boolean" then
+            bytes = bytes + 4
+        elseif t == "table" then
+            for k, child in pairs(v) do
+                if type(k) == "string" then
+                    bytes = bytes + #k
+                end
+                walk(child)
+            end
+        end
+    end
+    walk(request)
+    return math.ceil(bytes / 4)
+end
+
 --- Open the Port into the closure a device carries as its `llm`
 --- (`knl.device{ llm = adapter.anthropic:open{...} }`), and the one
 --- `knl.beat` calls. Shared by every Port instance — it knows no provider dialect,
