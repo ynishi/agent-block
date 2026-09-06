@@ -42,8 +42,8 @@ async-trait  = "0.1"
 # are NOT declared here so they can be gated behind the agent-block-mcp
 # `mcp-http` feature. The base set (stdio child-process transport) is always on.
 rmcp         = { version = "3.0.1", features = ["client", "transport-child-process"] }
-mlua-isle    = { version = "0.4.1", features = ["pool", "tokio"] }
-mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "serialize"] }
+mlua-isle    = { version = "0.6.0", features = ["pool", "tokio"] }
+mlua         = { version = "0.12", features = ["lua54", "vendored", "async", "serialize"] }
 # `std.sql` / `std.kv` no longer live here: as of 0.5 they are their own crate
 # (`mlua-batteries-sqlite`, below), so this dependency carries no SQLite weight
 # at all and needs no feature gating. 0.5.1 adds `async_overrides`, the opt-in
@@ -51,7 +51,7 @@ mlua         = { version = "0.11", features = ["lua54", "vendored", "async", "se
 # `std.http.*` / `std.fs.*` entries with async ones so a script cannot park the
 # VM thread; the host installs it right after `register_all` (see `host.rs`).
 # It lives behind the `task` feature, which is in the list below.
-mlua-batteries = { version = "0.5.1", features = ["json", "fs", "env", "path", "time", "task"] }
+mlua-batteries = { version = "0.6.0", features = ["json", "fs", "env", "path", "time", "task"] }
 # The `std.sql` / `std.kv` batteries, split out of mlua-batteries at 0.5. Kept
 # out of the workspace-wide default set and pulled in only under the
 # agent-block-core `sqlite` feature, which is what that feature has always
@@ -62,11 +62,11 @@ mlua-batteries = { version = "0.5.1", features = ["json", "fs", "env", "path", "
 # `InterruptHandle` for cancellation — so the VM thread still never waits on
 # SQLite, and registration is synchronous again (no `block_on` to drive an
 # async `kv::register`).
-mlua-batteries-sqlite = "0.6"
+mlua-batteries-sqlite = "0.7"
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
-mlua-pkg     = "0.7"
+mlua-pkg     = "0.9"
 # The kernel's own SQLite, taken from the same cluster mlua-batteries-sqlite
 # builds on (that crate depends on rusqlite 0.37 directly since its 0.6, and
 # rusqlite-isle 0.5 is on the same 0.37 → libsqlite3-sys 0.35 line), so the
