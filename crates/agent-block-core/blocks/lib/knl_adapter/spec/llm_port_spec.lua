@@ -210,7 +210,7 @@ describe("knl_adapter Port — profile and count (what the model can take)", fun
         expect(type(port:profile(nil))).to.be("table")
     end)
 
-    it("count estimates four bytes to the token over the request's strings, and grows with them", function()
+    it("count estimates bytes over the request's strings on the safe side, and grows with them", function()
         local port = make_test_port({})
         local small = port:count({ messages = { { role = "user", content = "hi" } } })
         local large = port:count({ messages = { { role = "user", content = string.rep("word ", 400) } } })
@@ -237,6 +237,71 @@ describe("knl_adapter Port — profile and count (what the model can take)", fun
         })
         expect(port:profile({}).context_window).to.be(1000)
         expect(port:count({ messages = { {}, {}, {} } })).to.be(30)
+    end)
+
+    it("count asks the impl's tokenize once per distinct request and keeps the answer", function()
+        local asked = 0
+        local port = knl_adapter.LLMPort.new({
+            build = function() end,
+            parse = function() end,
+            classify = function()
+                return { status = "ok" }
+            end,
+            tokenize = function(_, spec)
+                asked = asked + 1
+                return #spec.messages * 100
+            end,
+        })
+        local conf = { model = "m", base_url = "http://x" }
+        local one = { messages = { { role = "user", content = "a" } } }
+        expect(port:count(one, conf)).to.be(100)
+        expect(port:count({ messages = { { role = "user", content = "a" } } }, conf)).to.be(100)
+        expect(asked).to.be(1)
+        expect(port:count({ messages = { {}, {} } }, conf)).to.be(200)
+        expect(asked).to.be(2)
+    end)
+
+    it("count falls back to the estimate when tokenize has nothing to say", function()
+        local port = knl_adapter.LLMPort.new({
+            build = function() end,
+            parse = function() end,
+            classify = function()
+                return { status = "ok" }
+            end,
+            tokenize = function()
+                return nil, "no counter here"
+            end,
+        })
+        local request = { messages = { { role = "user", content = string.rep("x", 3200) } } }
+        expect(port:count(request, { model = "m" })).to.be(knl_adapter._estimate_tokens(request))
+    end)
+
+    it("profile believes the conf, asks discover once per (base_url, model) otherwise, and says which", function()
+        local asked = 0
+        local port = knl_adapter.LLMPort.new({
+            build = function() end,
+            parse = function() end,
+            classify = function()
+                return { status = "ok" }
+            end,
+            discover = function()
+                asked = asked + 1
+                return { context_window = 32768, max_output = 4096 }
+            end,
+        })
+        local declared = port:profile({ model = "m", base_url = "http://x", context_window = 1000, max_tokens = 10 })
+        expect(declared.context_window).to.be(1000)
+        expect(declared.discovered).to.be(nil)
+        expect(asked).to.be(0)
+
+        local found = port:profile({ model = "m", base_url = "http://x", max_tokens = 10 })
+        expect(found.context_window).to.be(32768)
+        expect(found.max_output).to.be(10)
+        expect(found.discovered).to.be(true)
+        expect(port:profile({ model = "m", base_url = "http://x" }).max_output).to.be(4096)
+        expect(asked).to.be(1)
+        port:profile({ model = "other", base_url = "http://x" })
+        expect(asked).to.be(2)
     end)
 end)
 
