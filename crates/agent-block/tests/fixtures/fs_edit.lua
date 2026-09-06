@@ -32,7 +32,32 @@ local mismatch = std.fs.edit(path, {
 })
 check("mismatch.rejected", mismatch.ok == false and mismatch.reason == "expect_mismatch")
 check("mismatch.reports_actual", mismatch.actual == "bravo")
+check("mismatch.failures_lists_the_one", #mismatch.failures == 1 and mismatch.failures[1].edit_index == 1)
 check("mismatch.file_untouched", std.fs.read(path) == "alpha\nbravo\ncharlie\ndelta\n")
+
+-- numbers counted against the edited file, which is the mistake the tool
+-- description now names. Edit 1 inserts a line; edits 2 and 3 address "bravo"
+-- and "delta" one line lower than they are, as they would be once edit 1 had
+-- landed. Every one of them is reported, so the constant offset is visible
+-- without re-reading the file.
+local shifted = std.fs.edit(path, {
+    base = r.version,
+    edits = {
+        { start_line = 1, end_line = 1, expect = "alpha", replace = "ALPHA\nAAA" },
+        { start_line = 3, end_line = 3, expect = "bravo", replace = "BRAVO" },
+        { start_line = 5, end_line = 5, expect = "delta", replace = "DELTA" },
+    },
+})
+check("shifted.rejected", shifted.ok == false and shifted.reason == "expect_mismatch")
+check("shifted.first_failure_on_top", shifted.edit_index == 2 and shifted.actual == "charlie")
+check("shifted.reports_both", #shifted.failures == 2)
+check(
+    "shifted.failure_reasons",
+    shifted.failures[1].reason == "expect_mismatch" and shifted.failures[2].reason == "out_of_range"
+)
+check("shifted.failure_indices", shifted.failures[1].edit_index == 2 and shifted.failures[2].edit_index == 3)
+check("shifted.out_of_range_carries_length", shifted.failures[2].file_lines == 4)
+check("shifted.file_untouched", std.fs.read(path) == "alpha\nbravo\ncharlie\ndelta\n")
 
 -- overlapping edits are refused as a set ----------------------------------
 local overlap = std.fs.edit(path, {

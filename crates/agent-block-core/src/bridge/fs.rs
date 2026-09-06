@@ -24,9 +24,18 @@
 //! * each edit names `start_line` / `end_line` and the `expect`ed text there.
 //!   A mismatch returns the text that is actually at those lines, so the
 //!   caller can correct without re-reading the whole file.
+//! * every line number in a call addresses the content as read, before any of
+//!   the call's own edits. A batch is one question about one version of the
+//!   file, not a script run top to bottom, and the tool description says so —
+//!   a caller left to guess will number the second edit against the file the
+//!   first one would produce, and every edit after the first is then wrong by
+//!   the lines the earlier ones added.
 //! * edits are validated as a set (in range, non-overlapping) and applied
 //!   bottom-up in one write, so a rejected batch leaves the file untouched
-//!   rather than half-edited.
+//!   rather than half-edited. Validation does not stop at the first bad edit:
+//!   the reply keeps the first failure's fields and adds `failures`, every
+//!   rejected edit in order, because a wrong basis shows as a constant offset
+//!   across several of them and one rejection cannot show that.
 //!
 //! There is deliberately no fuzzy fallback and no `replace_all`. A precise
 //! failure is more useful than a guess at what the caller meant, and "replace
@@ -98,6 +107,40 @@ struct Edit {
     start_line: usize,
     end_line: usize,
     replace: String,
+}
+
+/// One requested edit that did not pass, held until the whole call is checked.
+///
+/// Collected rather than returned on the spot so the reply can carry every
+/// rejected edit: a caller whose line numbers came from the wrong basis is
+/// wrong in several of them at once, and that is only visible together.
+struct EditFailure {
+    index: usize,
+    reason: &'static str,
+    start_line: usize,
+    end_line: usize,
+    /// The text actually at that range, for `expect_mismatch`. `None` when the
+    /// range could not be read at all.
+    actual: Option<String>,
+    /// The file's line count, for `out_of_range`.
+    file_lines: Option<usize>,
+}
+
+impl EditFailure {
+    fn to_table(&self, lua: &Lua) -> LuaResult<LuaTable> {
+        let t = lua.create_table()?;
+        t.set("reason", self.reason)?;
+        t.set("edit_index", self.index)?;
+        t.set("start_line", self.start_line)?;
+        t.set("end_line", self.end_line)?;
+        if let Some(actual) = self.actual.as_deref() {
+            t.set("actual", actual)?;
+        }
+        if let Some(file_lines) = self.file_lines {
+            t.set("file_lines", file_lines)?;
+        }
+        Ok(t)
+    }
 }
 
 /// Run `f` on the blocking pool, reporting a join failure as a Lua error.
@@ -197,6 +240,17 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
                 let (lines, trailing_newline) = split_lines(&content);
                 let mut edits: Vec<Edit> = Vec::new();
 
+                // Every edit is checked, not just up to the first bad one.
+                // A caller that numbered its edits against the file as it
+                // would be *after* the earlier ones is wrong by the same
+                // offset in each of them, and one rejection cannot show that:
+                // the reply would name a single line whose text looks
+                // unrelated, which reads as "I misread that line" rather than
+                // "I used the wrong basis". Reporting them together makes the
+                // constant shift visible, and a caller can correct the whole
+                // call in one turn instead of re-reading the file.
+                let mut failures: Vec<EditFailure> = Vec::new();
+
                 for (i, entry) in edits_tbl.sequence_values::<LuaTable>().enumerate() {
                     let entry = entry?;
                     let start_line: usize = entry.get("start_line")?;
@@ -205,30 +259,41 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
                     let replace: String = entry.get("replace")?;
 
                     if start_line == 0 || end_line < start_line {
-                        let t = failure(&lua, "bad_range")?;
-                        t.set("edit_index", i + 1)?;
-                        t.set("start_line", start_line)?;
-                        t.set("end_line", end_line)?;
-                        return Ok(t);
+                        failures.push(EditFailure {
+                            index: i + 1,
+                            reason: "bad_range",
+                            start_line,
+                            end_line,
+                            actual: None,
+                            file_lines: None,
+                        });
+                        continue;
                     }
                     if end_line > lines.len() {
-                        let t = failure(&lua, "out_of_range")?;
-                        t.set("edit_index", i + 1)?;
-                        t.set("end_line", end_line)?;
-                        t.set("file_lines", lines.len())?;
-                        return Ok(t);
+                        failures.push(EditFailure {
+                            index: i + 1,
+                            reason: "out_of_range",
+                            start_line,
+                            end_line,
+                            actual: None,
+                            file_lines: Some(lines.len()),
+                        });
+                        continue;
                     }
 
                     let actual = lines[start_line - 1..end_line].join("\n");
                     if actual != expect {
-                        let t = failure(&lua, "expect_mismatch")?;
-                        t.set("edit_index", i + 1)?;
-                        t.set("start_line", start_line)?;
-                        t.set("end_line", end_line)?;
-                        // The text actually there, so the caller can correct
-                        // without re-reading the file.
-                        t.set("actual", actual)?;
-                        return Ok(t);
+                        failures.push(EditFailure {
+                            index: i + 1,
+                            reason: "expect_mismatch",
+                            start_line,
+                            end_line,
+                            // The text actually there, so the caller can
+                            // correct without re-reading the file.
+                            actual: Some(actual),
+                            file_lines: None,
+                        });
+                        continue;
                     }
 
                     edits.push(Edit {
@@ -237,6 +302,34 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
                         end_line,
                         replace,
                     });
+                }
+
+                // The first failure is the reply, unchanged in shape from when
+                // this returned on the spot; `failures` carries every one of
+                // them, the first included, so a reader that only knows the
+                // old fields still works.
+                if let Some(first) = failures.first() {
+                    let t = failure(&lua, first.reason)?;
+                    t.set("edit_index", first.index)?;
+                    match first.reason {
+                        "out_of_range" => {
+                            t.set("end_line", first.end_line)?;
+                            t.set("file_lines", first.file_lines.unwrap_or(lines.len()))?;
+                        }
+                        _ => {
+                            t.set("start_line", first.start_line)?;
+                            t.set("end_line", first.end_line)?;
+                        }
+                    }
+                    if let Some(actual) = first.actual.as_deref() {
+                        t.set("actual", actual)?;
+                    }
+                    let all = lua.create_table()?;
+                    for (n, f) in failures.iter().enumerate() {
+                        all.set(n + 1, f.to_table(&lua)?)?;
+                    }
+                    t.set("failures", all)?;
+                    return Ok(t);
                 }
 
                 if edits.is_empty() {
