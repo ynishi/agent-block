@@ -841,7 +841,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             use mlua::prelude::*;
                             let loaded: LuaFunction = lua
                                 .load(bytecode.as_slice())
-                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
                                 .map_err(|e| {
@@ -909,7 +909,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             use mlua::prelude::*;
                             let loaded: LuaFunction = lua
                                 .load(bytecode.as_slice())
-                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
                                 .map_err(|e| {
@@ -978,7 +978,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             use mlua::prelude::*;
                             let loaded: LuaFunction = lua
                                 .load(bytecode.as_slice())
-                                .set_mode(mlua::ChunkMode::Binary)
+                                .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
                                 .map_err(|e| {

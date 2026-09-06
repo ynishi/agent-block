@@ -298,7 +298,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .exec(move |lua| {
                         let loaded: LuaFunction = lua
                             .load(bytecode.as_slice())
-                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_mode(mlua::chunk::ChunkMode::Binary)
                             .set_name(&bytecode_name)
                             .into_function()
                             .map_err(|e| IsleError::Lua(format!("bus.on load: {e}")))?;
@@ -377,7 +377,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .exec(move |lua| {
                         let loaded: LuaFunction = lua
                             .load(bytecode.as_slice())
-                            .set_mode(mlua::ChunkMode::Binary)
+                            .set_mode(mlua::chunk::ChunkMode::Binary)
                             .set_name(&bytecode_name)
                             .into_function()
                             .map_err(|e| IsleError::Lua(format!("bus.on_any load: {e}")))?;
@@ -821,7 +821,7 @@ mod tests {
         install_bus_dispatcher_on_handler_isle(&dst).unwrap();
         let loaded: LuaFunction = dst
             .load(bytecode.as_slice())
-            .set_mode(mlua::ChunkMode::Binary)
+            .set_mode(mlua::chunk::ChunkMode::Binary)
             .set_name("@bus_handler[mesh]")
             .into_function()
             .unwrap();

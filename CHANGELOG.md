@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Lua stack moves to mlua 0.12: `mlua` 0.11 → 0.12, `mlua-isle` 0.4.1 →
+  0.6, `mlua-batteries` 0.5.1 → 0.6, `mlua-batteries-sqlite` 0.6 → 0.7,
+  `mlua-pkg` 0.7 → 0.9 (each already published against 0.12; this repository
+  was the one holding the old pin). One source change was needed —
+  `ChunkMode` is reached through `mlua::chunk` rather than the crate root —
+  and nothing else in the bridge, the kernel or the blocks moved. Every
+  suite passes unchanged.
+
 ### Added
 
 - `policy.verdict({ run?, changed?, kind? })` is the check a loop runs after
