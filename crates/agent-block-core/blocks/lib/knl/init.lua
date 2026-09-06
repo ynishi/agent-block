@@ -1214,6 +1214,15 @@ M.shapes = {
     llm_result = LLM_RESULT,
     llm_usage = USAGE,
     tool_use_block = TOOL_USE_BLOCK,
+    -- The two types a session handle can have, for a shell pack declaring a
+    -- function that takes one. Every pack above this module wrote this same
+    -- `any_of` for itself; the judgement that goes with it is `is_session`,
+    -- and having the two come from one place is what keeps them agreeing.
+    session_handle = SESSION_HANDLE,
+    -- Callable, for the same reason: a pack that takes a caller's function
+    -- and accepts a `__call` table (a Port shim hands back either) was
+    -- restating this too.
+    callable = CALLABLE,
     open_opts = OPEN_OPTS,
     resume_opts = RESUME_OPTS,
     budget_grant = BUDGET_GRANT,
@@ -1440,6 +1449,10 @@ M.shapes.api = {
     api = {
         args = {},
         returns = RUST.ApiReport,
+    },
+    is_session = {
+        args = { arg_of(T.any, "a value that may be a session handle") },
+        returns = "boolean — it answers the whole of `shapes.session`",
     },
     Outcome = {
         -- A namespace table, not a function: nothing to hold, and the
@@ -2104,6 +2117,24 @@ local function is_session(s)
         end
     end
     return true
+end
+
+--- Whether `s` is a session handle — the same judgement `beat` makes, for the
+--- callers that have to make it too.
+---
+--- A policy that takes a session and a supervisor that opens one both have to
+--- answer this before they touch the handle, and neither can do it from the
+--- outside: the surface is `M.shapes.session`, which is generated from the
+--- Rust side's own types, and the real handle is userdata whose metatable is
+--- protected. Every consumer that asked it for itself asked a smaller
+--- question — one method instead of the surface, `type(s) == "table"` instead
+--- of both types — and one of those refused a perfectly good session in a
+--- run. Published, there is one answer and it moves with the declaration.
+---
+--- @param s any
+--- @return boolean
+function M.is_session(s)
+    return is_session(s)
 end
 
 --- Append an event this beat is writing, through the dev-mode contract.

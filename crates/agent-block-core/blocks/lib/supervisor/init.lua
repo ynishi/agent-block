@@ -139,12 +139,16 @@ local function only(opts, allowed, who)
     end
 end
 
---- Whether `v` can be reached as a knl session: the kernel's userdata, or the
---- faithful Lua stand-in a spec drives. No schema can ask a userdata what it
---- can do, so this is the type test and the kernel makes the rest of the
---- judgement when the handle is used.
+--- Whether `v` can be reached as a knl session.
+---
+--- The kernel's own, not a type test written again here: `knl.is_session`
+--- asks the handle for the whole of `knl.shapes.session` — generated from the
+--- Rust side's types — through a pcall, because the real handle is userdata
+--- whose indexing can raise. This used to answer `table or userdata`, which
+--- let a table that was not a session through to fail further in, on a method
+--- the caller had every right to make.
 local function is_handle(v)
-    return type(v) == "table" or type(v) == "userdata"
+    return kernel.is_session(v)
 end
 
 --- Read a raised kernel failure back as data — `{ kind?, method?, retryable,
@@ -211,12 +215,11 @@ end
 -- copy of a contract is a contract with two versions.
 
 --- A Lua function, as a shape. `lshape.t` exposes only the five prims it
---- names, so these two are built from the same plain-data schema form.
+--- names, so this is built from the same plain-data schema form.
 local FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
-local USERDATA = setmetatable({ kind = "prim", prim = "userdata" }, lshape.t._internal.schema_mt)
 
---- A session handle: the kernel's userdata, or a spec's stand-in.
-local SESSION_HANDLE = T.any_of({ T.table, USERDATA })
+--- A session handle: the kernel's shape, not a second copy of it.
+local SESSION_HANDLE = kernel.shapes.session_handle
 
 --- An opts contract, as the two shapes it has to be: CLOSED is the published
 --- one and the one a call asserts in dev, OPEN is the same fields with the
@@ -306,7 +309,7 @@ local PARALLEL_OPTS, PARALLEL_OPTS_ARG = opts_contract({
 })
 
 --- A session `merge` reads: its id, or a handle to ask for one.
-local MERGE_SESSION = T.any_of({ T.string, T.table, USERDATA })
+local MERGE_SESSION = T.any_of({ T.string, SESSION_HANDLE })
 
 --- What `supervisor.merge` is configured with: the two knobs any other read
 --- has. There is no `sessions` key — the set is the argument, because it is

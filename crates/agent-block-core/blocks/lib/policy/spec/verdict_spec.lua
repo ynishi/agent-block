@@ -25,14 +25,24 @@ local support = require("policy.spec.support")
 local kernel = require("knl")
 local policy = require("policy")
 
---- A session that records what it was appended, without a kernel behind it.
+--- A session, and the events of one kind it holds.
+---
+--- `support.session()` and not a table that answers `append`: `policy` asks
+--- `knl.is_session`, which asks the handle for the whole of
+--- `knl.shapes.session`. A stand-in narrower than that is not a session, and
+--- a spec built on one would be pinning a check the kernel does not make.
 local function recorder()
-    local s = { appended = {} }
-    function s:append(event)
-        self.appended[#self.appended + 1] = event
-        return event
+    return support.session()
+end
+
+local function recorded(s, kind)
+    local out = {}
+    for _, ev in ipairs(s:events()) do
+        if ev.kind == (kind or "verify") then
+            out[#out + 1] = ev
+        end
     end
-    return s
+    return out
 end
 
 describe("policy.verdict — construction", function()
@@ -89,14 +99,15 @@ describe("policy.verdict — the check", function()
         })
         bad_verdict(s, { beat = "b2" })
 
-        expect(#s.appended).to.be(2)
-        expect(s.appended[1].kind).to.be("verify")
-        expect(s.appended[1].beat).to.be("b1")
-        expect(s.appended[1].data.ok).to.be(true)
-        expect(s.appended[2].beat).to.be("b2")
-        expect(s.appended[2].data.ok).to.be(false)
-        expect(s.appended[2].data.stderr).to.be("E0308")
-        expect(s.appended[2].data.exit_code).to.be(101)
+        local kept = recorded(s)
+        expect(#kept).to.be(2)
+        expect(kept[1].kind).to.be("verify")
+        expect(kept[1].beat).to.be("b1")
+        expect(kept[1].data.ok).to.be(true)
+        expect(kept[2].beat).to.be("b2")
+        expect(kept[2].data.ok).to.be(false)
+        expect(kept[2].data.stderr).to.be("E0308")
+        expect(kept[2].data.exit_code).to.be(101)
     end)
 
     it("records under the kind it was given", function()
@@ -107,7 +118,7 @@ describe("policy.verdict — the check", function()
                 return { ok = true }
             end,
         })(s, { beat = "b1" })
-        expect(s.appended[1].kind).to.be("acceptance")
+        expect(#recorded(s, "acceptance")).to.be(1)
     end)
 
     it("answers ok on a green, and carries the run's own result", function()
@@ -139,7 +150,7 @@ describe("policy.verdict — the check", function()
         expect(before.reason).to.be("unchanged")
         -- The check still ran and is still on the record: it passed, and
         -- that is a fact whether or not it ended the run.
-        expect(s.appended[1].data.ok).to.be(true)
+        expect(recorded(s)[1].data.ok).to.be(true)
 
         moved = true
         local after = verdict(s, { beat = "b2" })
@@ -177,7 +188,7 @@ describe("policy.verdict — the check", function()
                 end,
             })(s, { beat = "b1" })
         end).to.fail()
-        expect(#s.appended).to.be(0)
+        expect(#recorded(s)).to.be(0)
     end)
 end)
 
@@ -187,7 +198,7 @@ describe("policy.verdict — without a run", function()
         local v = policy.verdict()(s, { beat = "b1" })
         expect(v.ok).to.be(false)
         expect(v.checked).to.be(false)
-        expect(#s.appended).to.be(0)
+        expect(#recorded(s)).to.be(0)
         expect(policy.verdict({})(s, { beat = "b1" }).checked).to.be(false)
     end)
 end)

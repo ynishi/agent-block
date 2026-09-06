@@ -144,14 +144,19 @@ end)
 -- computed from what the kernel's own fold produces rather than guessed.
 -- ─────────────────────────────────────────────────────────────────────────────
 
---- A session that answers one read with these events: what the predicate
---- reaches the log through, and all of it that the predicate touches.
+--- A session holding these events, for the predicate to read them back.
+---
+--- A real one (`support.session()`, the whole declared surface) and not a
+--- table answering `events`: the predicate asks `knl.is_session`, which asks
+--- for the surface `knl.shapes.session` declares. The fake append passes
+--- every field through untouched, `beat` included, so what goes in is what
+--- the fold sees.
 local function log_of(events)
-    return {
-        events = function()
-            return events, false
-        end,
-    }
+    local s = support.session()
+    for _, ev in ipairs(events) do
+        s:append(ev)
+    end
+    return s
 end
 
 local function counting_port(window, output)
