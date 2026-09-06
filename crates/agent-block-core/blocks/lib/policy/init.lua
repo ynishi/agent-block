@@ -15,9 +15,10 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The five, and where each one plugs in
+--- The six, and where each one plugs in
 ---
----     policy.window      -> a `fold`      the last n beats, folded as usual
+---     policy.window      -> a `fold`      the last n beats, or as many as
+---                                         fit the model's window
 ---     policy.carry       -> a `filter`    one bounded note about the beat
 ---                                         that failed
 ---     policy.stagnation  -> a predicate   the loop asks it between beats:
@@ -30,12 +31,41 @@
 ---                                         the Port's count, for a grant
 ---                                         tagged "tokens"
 ---
----   The first two are device fields (`knl.device{ fold = ..., filters =
----   { ... } }`); the last three are the loop's own and the kernel never
----   sees them. That split is the whole shape of this module: a policy either
----   changes what one beat SENDS, or it decides what the loop does BETWEEN
+---   `window`, `carry` and `tokens` are device fields (`knl.device{ fold =
+---   ..., filters = { ... }, cost = ... }`); `stagnation`, `retry` and
+---   `escalate` are the loop's own and the kernel never sees them. That
+---   split is the whole shape of this module: a policy either changes what
+---   one beat SENDS (or reserves), or it decides what the loop does BETWEEN
 ---   beats. Nothing here decides what a beat does while it runs — that is the
 ---   kernel's, and it is not a seam.
+---
+--- One shell, two packs — and where a model's limits go
+---   The shell above the kernel is this module and `supervisor`, and the two
+---   are a SET: a loop is composed from both — policies on the device and
+---   between beats, the supervisor for the session tree — and neither is a
+---   loop by itself. A third pack beside them is not how the shell grows.
+---
+---   In particular, a model's limits are not a pack. A narrow context window,
+---   a model that re-reads what it has already seen, one that cannot copy an
+---   `expect` exactly, one that stalls on a hard error, a task too large for
+---   one loop — each of these is answered where the kernel already left a
+---   seam for it, and by what the Port already knows:
+---
+---     the window            the Port declares it (`LLMPort:profile`), and
+---                           `window{ fit }` / `tokens` ask it
+---     what a tool may do    `tool_policy` on the device, reading the log
+---     what a request says   `fold` (what is sent) and `filters` (a note)
+---     when to stop          a predicate the loop asks (`stagnation`, and
+---                           its siblings a loop may write)
+---     too big for one loop  `supervisor.child` / `parallel` / `merge`
+---
+---   The thresholds a particular model wants (how many bytes a read may
+---   return, how many times a range may be re-read) are opts on those
+---   factories, and the model's name never appears in this module. Before a
+---   new module is written for a model, the question is whether the kernel
+---   lacks a seam (then the kernel is the change) or whether the Port lacks a
+---   declaration (then the adapter is) — and one of the two has so far been
+---   the answer every time.
 ---
 --- Opts are policy, the session is an argument
 ---   `knl.device` and `knl.open` split policy from state: a device holds
