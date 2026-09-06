@@ -15,7 +15,7 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The six, and where each one plugs in
+--- The seven, and where each one plugs in
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
 ---                                         fit the model's window
@@ -30,10 +30,13 @@
 ---     policy.tokens      -> a `cost`      the beat's request in tokens, by
 ---                                         the Port's count, for a grant
 ---                                         tagged "tokens"
+---     policy.result_cap  -> `tools`       one tool result may not outgrow a
+---                                         share of the model's window
 ---
----   `window`, `carry` and `tokens` are device fields (`knl.device{ fold =
----   ..., filters = { ... }, cost = ... }`); `stagnation`, `retry` and
----   `escalate` are the loop's own and the kernel never sees them. That
+---   `window`, `carry`, `tokens` and `result_cap` are device fields
+---   (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
+---   `stagnation`, `retry` and `escalate` are the loop's own and the kernel
+---   never sees them. That
 ---   split is the whole shape of this module: a policy either changes what
 ---   one beat SENDS (or reserves), or it decides what the loop does BETWEEN
 ---   beats. Nothing here decides what a beat does while it runs — that is the
@@ -243,6 +246,13 @@ local DEFAULT_NO_PROGRESS = 2
 --- retries past the original is the point where a failure the kernel called
 --- retryable has stopped looking transient.
 local DEFAULT_MAX_ATTEMPTS = 3
+
+--- How much of the window one tool result may take when `result_cap` is not
+--- told. A quarter leaves room for three more of the same size beside the
+--- system prompt, the tools and the conversation — enough that a loop can
+--- read, edit and read again without the fold running out of beats to drop,
+--- and small enough that one answer cannot end the run on its own.
+local DEFAULT_RESULT_SHARE = 0.25
 
 --- How deep `canonical` renders a nested value before it stops. A tool input
 --- is JSON-shaped and shallow; the cap is what keeps a cyclic hand-built one
@@ -505,6 +515,17 @@ local TOKENS_OPTS, TOKENS_ARG = opts_contract({
     conf = T.table:describe("the conf the port is opened with; forwarded to count"):is_optional(),
 })
 
+--- What `policy.result_cap` is configured with. The share is of the window
+--- the Port declares, never a count of bytes: what is large depends on the
+--- model, and the model is what the Port knows.
+local RESULT_CAP_OPTS, RESULT_CAP_ARG = opts_contract({
+    port = T.table:describe("an LLM Port: profile(conf) for the window, count(request, conf) for the size"),
+    conf = T.table:describe("the conf the port is opened with"):is_optional(),
+    share = T.number
+        :describe("the most of the window one tool result may take, 0 < share <= 1; default 0.25")
+        :is_optional(),
+})
+
 --- What `policy.carry` is configured with. `failed` is the caller's reading of
 --- a tool pair, for the failures the kernel's `ok` flag cannot see.
 local CARRY_OPTS, CARRY_ARG = opts_contract({
@@ -658,9 +679,7 @@ local function window_slice(events, tail, keep_seed)
     if #order <= tail then
         return events
     end
-    -- `tail == 0` keeps no beat at all: the slice is the seed (with
-    -- `keep_seed`) or nothing. Only `fit` asks for it, as the last candidate.
-    local from = tail == 0 and (#events + 1) or first_at[order[#order - tail + 1]]
+    local from = first_at[order[#order - tail + 1]]
     local slice = {}
     if keep_seed then
         for i = 1, first_at[order[1]] - 1 do
@@ -809,12 +828,18 @@ function M.window(opts)
         end
     end
 
+    -- The newest beat is never dropped, `keep_seed` or not. It holds the
+    -- tool_result the model is waiting for, and a request without it answers
+    -- nothing the model asked: it would read the file again, which is the
+    -- loop this fold exists to prevent. When even that one beat does not fit,
+    -- the honest answer is that nothing fits — said out loud, by the
+    -- predicate or by the raise — and not a request that quietly forgot.
+    local floor = 1
+
     -- The profile is read per fold, not captured: a Port opened with one conf
     -- answers one profile, and reading it each time costs nothing while
     -- letting a Port whose window is learned late (a served model queried
     -- for it) answer the truth.
-    local floor = keep_seed and 0 or 1
-
     --- The largest window that fits, or nil and what the smallest one cost.
     --- Whole beats go, oldest first: the candidates are nested, so the search
     --- is over a monotone predicate and a bisection finds the same answer as
@@ -833,6 +858,16 @@ function M.window(opts)
                 error("policy.window: port:count must answer a number, got " .. tostring(tokens), 3)
             end
             return request, tokens
+        end
+
+        if most < floor then
+            -- No beat yet: the seed alone is the whole conversation, and
+            -- there is nothing to choose between.
+            local request, tokens = fold_at(0)
+            if tokens <= limit then
+                return request
+            end
+            return nil, tokens, limit
         end
 
         local whole, whole_tokens = fold_at(most)
@@ -875,11 +910,12 @@ function M.window(opts)
         end
         error(
             string.format(
-                "policy.window: nothing left to drop and the request still does not fit: %d tokens > %d (the seed%s). "
+                "policy.window: the newest beat does not fit%s: %d tokens > %d. One tool result is larger "
+                    .. "than the window can hold — cap what a tool may answer (policy.result_cap). "
                     .. "Ask the second value this factory answers before the beat to stop instead of failing.",
+                keep_seed and " even with the seed alone beside it" or " on its own",
                 tokens,
-                limit,
-                keep_seed and " alone" or " is not kept; the newest beat alone"
+                limit
             ),
             2
         )
@@ -951,6 +987,110 @@ function M.tokens(opts)
             return 1
         end
         return n
+    end
+end
+
+-- ============================================================
+-- result_cap — one tool result may not outgrow the window
+-- ============================================================
+
+--- Build a wrapper over a device's `tools` map that refuses a result larger
+--- than `share` of the model's window.
+---
+---     tools = policy.result_cap({ port = port, conf = conf })(
+---         knl_adapter.tools({ read_spec, edit_spec })
+---     )
+---
+--- Why this is not the fold's job. `window{ fit }` drops whole BEATS until
+--- the request fits, and the newest beat is the one it must not drop — it
+--- holds the tool_result the model is waiting for. So a single result larger
+--- than the window is the one shape no fold can absorb: nothing is left to
+--- drop and the run stops. Bounding what one call may answer is what keeps
+--- that from happening, and it can only be done where the result is, which
+--- is after the tool ran.
+---
+--- Why it is not the tool's job either. What counts as large is the window's
+--- fraction, and the window belongs to the model: a 16 KB read is a fifth of
+--- a 32k context and a rounding error in a million. A byte limit written into
+--- a tool would be a constant standing in for something the Port knows, so
+--- the rule lives here, in the shell, and reads the Port for the number —
+--- the same arrangement `window{ fit }` and `tokens` already have.
+---
+--- A refused call is answered, not raised: the tool returns
+--- `{ ok = false, reason = "result_too_large", ... }` — the shape `std.fs`'
+--- own refusals use — carrying the size, the limit and what to do instead,
+--- so the model narrows its next call rather than being told nothing.
+--- Everything else passes through untouched, including a handler that
+--- answered a refusal of its own.
+---
+--- @param opts table  { port, conf?, share? }
+--- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
+function M.result_cap(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.result_cap: opts must be a table", 2)
+    end
+    only(opts, { port = true, conf = true, share = true }, "policy.result_cap")
+    if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
+        error("policy.result_cap: port must answer count(request, conf) and profile(conf)", 2)
+    end
+    if opts.conf ~= nil and type(opts.conf) ~= "table" then
+        error("policy.result_cap: conf must be a table when given", 2)
+    end
+    if opts.share ~= nil and (type(opts.share) ~= "number" or opts.share <= 0 or opts.share > 1) then
+        error("policy.result_cap: share must be a number in (0, 1], got " .. tostring(opts.share), 2)
+    end
+    shape.assert_dev(opts, RESULT_CAP_OPTS, "policy.result_cap opts")
+
+    local port, conf = opts.port, opts.conf
+    local share = opts.share or DEFAULT_RESULT_SHARE
+
+    return function(tools)
+        if type(tools) ~= "table" then
+            error("policy.result_cap: tools must be the device's map of name -> entry", 2)
+        end
+        local out = {}
+        for name, entry in pairs(tools) do
+            if type(entry) ~= "table" or type(entry.handler) ~= "function" then
+                error("policy.result_cap: tool '" .. tostring(name) .. "' has no handler", 2)
+            end
+            local capped = {}
+            for key, value in pairs(entry) do
+                capped[key] = value
+            end
+            local handler = entry.handler
+            capped.handler = function(args)
+                local result = handler(args)
+                -- Measured as the kernel will render it — a string verbatim,
+                -- anything else as JSON — because that rendering is what
+                -- reaches the request, not the table.
+                local text = type(result) == "string" and result or std.json.encode(result)
+                local limit = math.floor(request_limit(port:profile(conf), "policy.result_cap") * share)
+                local tokens = port:count({ messages = { { role = "user", content = text } } }, conf)
+                if type(tokens) ~= "number" then
+                    error("policy.result_cap: port:count must answer a number, got " .. tostring(tokens), 2)
+                end
+                if tokens <= limit then
+                    return result
+                end
+                return {
+                    ok = false,
+                    reason = "result_too_large",
+                    tokens = tokens,
+                    limit = limit,
+                    error = string.format(
+                        "'%s' answered %d tokens and one result may take at most %d — the whole conversation "
+                            .. "has to fit the model's window. Ask for a smaller piece: a narrower range, "
+                            .. "fewer items, one file at a time.",
+                        tostring(name),
+                        tokens,
+                        limit
+                    ),
+                }
+            end
+            out[name] = capped
+        end
+        return out
     end
 end
 
@@ -1632,6 +1772,16 @@ M.shapes.api = {
             cost = {
                 args = { arg_of(kernel.shapes.request, "request") },
                 returns = "integer >= 1",
+            },
+        },
+    },
+    result_cap = {
+        args = { arg_of(RESULT_CAP_ARG, "opts") },
+        returns = "bind — fn(tools) -> tools",
+        members = {
+            bind = {
+                args = { arg_of(T.table, "tools (the device's map of name -> entry)") },
+                returns = "table — the same map, each handler capped",
             },
         },
     },
