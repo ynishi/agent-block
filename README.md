@@ -470,6 +470,7 @@ live in `docs/architecture/mcp-support.md`.
 - `std.fs.read(path)`, `std.fs.write(path, content)`, `std.fs.glob(pattern)`, `std.fs.exists(path)`
 - `std.fs.walk(dir)`, `std.fs.copy(src, dst)`, `std.fs.mkdir(path)`, `std.fs.remove(path)`
 - `std.fs.is_file(path)`, `std.fs.is_dir(path)`, `std.fs.read_binary(path)`, `std.fs.write_binary(path, bytes)`
+- `std.fs.tool_specs(opts)` / `std.fs.register_tools(opts)` — the LLM-facing file tools (agent-block): `fs_read` and `fs_edit` (line-addressed, checked against an `expect` of the current text) by default; opt in through `opts.allowed` to `fs_write`, `fs_rollback` and `fs_search_replace`, which addresses an edit by a unique verbatim snippet and carries it out as `fs_edit` with the same checks — the form to offer a model that reconstructs `expect` from memory instead of copying it
 
 ### sh.*
 - `sh.exec(cmd, opts)` — Execute a shell command. `opts.cwd` (default: project root), `opts.timeout` (seconds, default 30). On timeout the child is SIGKILLed, not left running.

@@ -153,6 +153,38 @@ describe("policy.window — the slice", function()
         expect(text:find("first", 1, true)).to.be(nil)
     end)
 
+    it("keeps the seed ahead of the window when asked (keep_seed)", function()
+        local events =
+            concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4), answered("b3", "three", 6))
+        local text = rendered(policy.window({ tail = 2, keep_seed = true })(events, {}))
+        -- The opening line survives, the beat between it and the window is
+        -- the one thing that goes, and the window itself is unchanged.
+        expect(text:find("first", 1, true) ~= nil).to.be(true)
+        expect(text:find("one", 1, true)).to.be(nil)
+        expect(text:find("two", 1, true) ~= nil).to.be(true)
+        expect(text:find("three", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("keep_seed folds the seed plus the slice exactly as the kernel would", function()
+        local events =
+            concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4), answered("b3", "three", 6))
+        local windowed = policy.window({ tail = 2, keep_seed = true })(events, {})
+        local direct = kernel.fold({ events[1], events[4], events[5], events[6], events[7] }, {})
+        expect(#windowed.messages).to.be(#direct.messages)
+        expect(rendered(windowed)).to.be(rendered(direct))
+    end)
+
+    it("keep_seed changes nothing when the log is not cut", function()
+        local events = concat(seed("first", 1), answered("b1", "one", 2))
+        local windowed = policy.window({ tail = 3, keep_seed = true })(events, {})
+        expect(rendered(windowed)).to.be(rendered(kernel.fold(events, {})))
+    end)
+
+    it("keep_seed must be a boolean", function()
+        local ok = pcall(policy.window, { tail = 2, keep_seed = "yes" })
+        expect(ok).to.be(false)
+    end)
+
     it("folds the slice exactly as the kernel folds it (one implementation)", function()
         local events = concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4))
         local windowed = policy.window({ tail = 1 })(events, {})

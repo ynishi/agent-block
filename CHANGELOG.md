@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.fs.tool_specs` / `register_tools` gain an opt-in `search_replace` op
+  (`fs_search_replace`): the model names a verbatim snippet and the text that
+  replaces it, and the handler finds the snippet in the file as it is now and
+  carries the edit out as `fs_edit` — same line range, same `expect` read off
+  the same content, same overlap and `base` checks, nothing applied that
+  `fs_edit` would not apply. Two new refusals, `search_not_found` and
+  `search_ambiguous`, leave the file untouched. It exists for models that
+  cannot produce an exact `expect` for lines they have read and churn on
+  `expect_mismatch`; on a real-repository task the line-addressed form did
+  not reach green in four runs and this form did in one to three, three
+  times out of three. Which form a loop offers is the caller's choice.
+- `policy.window({ tail = n, keep_seed = true })` keeps every event before
+  the first beat — the seed the caller opened the session with — ahead of
+  the window. A windowed loop whose task is stated in its seed no longer
+  forgets it once the beats outrun `tail`; the beats between the seed and the
+  window are what goes. Default unchanged (`false`: the seed goes with them).
+
 ## [0.37.1] - 2026-09-05
 
 ### Fixed
