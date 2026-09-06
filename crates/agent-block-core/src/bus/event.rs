@@ -23,9 +23,10 @@ pub type AckSender = oneshot::Sender<AckResult>;
 /// Receiver half of the ack channel. Held by whatever source produced the
 /// event and awaits the handler's return value.
 ///
-/// Used by `Event::with_ack` callers (ST4 adapters: webhook/WSS/timer).
-/// Kept exported for downstream consumers; not referenced within the ST3
-/// cut where the mesh adapter in `host.rs` drives the ack loop directly.
+/// Used by `Event::with_ack` callers — an adapter that pushes events in and
+/// waits for what the handler returned (webhook / WSS / timer). Kept exported
+/// for downstream consumers; no adapter in this crate uses it, because the
+/// mesh adapter in `host.rs` drives the ack loop directly.
 #[allow(dead_code)]
 pub type AckReceiver = oneshot::Receiver<AckResult>;
 
@@ -54,8 +55,9 @@ pub struct Event {
 impl Event {
     /// Construct a new event without an ack channel (fire-and-forget).
     ///
-    /// Intended for ST4 adapters (webhook broadcast / timer). Not used by
-    /// the ST3 mesh path (which needs the ack round-trip).
+    /// Intended for an adapter that broadcasts without waiting (webhook
+    /// broadcast / timer). Not used by the mesh path, which needs the ack
+    /// round-trip.
     #[allow(dead_code)]
     pub fn fire_and_forget(kind: impl Into<String>, id: impl Into<String>, payload: Value) -> Self {
         Self {
@@ -71,9 +73,10 @@ impl Event {
     /// event (to be pushed to the bus) and the receiver half (to be awaited
     /// by the source).
     ///
-    /// Used by the dispatcher's in-crate tests and by forthcoming ST4
-    /// adapters. The ST3 mesh adapter constructs `Event` directly to keep
-    /// control over the `meta` map and ack sender lifetime.
+    /// Used by the dispatcher's in-crate tests, and by an adapter that wants
+    /// the ack without assembling the channel itself. The mesh adapter
+    /// constructs `Event` directly instead, to keep control over the `meta`
+    /// map and the ack sender's lifetime.
     #[allow(dead_code)]
     pub fn with_ack(
         kind: impl Into<String>,

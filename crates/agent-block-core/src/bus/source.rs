@@ -23,9 +23,9 @@ use agent_block_types::error::BlockError;
 
 /// A producer of [`Event`]s.
 ///
-/// ST3 uses push-style ingress (`mpsc::Sender<Event>` cloned into each
-/// adapter) and does not exercise this trait. Retained for ST4+ adapters
-/// that prefer a pull interface.
+/// Ingress in this crate is push-style — an `mpsc::Sender<Event>` cloned into
+/// each adapter — so nothing here exercises this trait. Retained for an adapter
+/// that prefers a pull interface.
 #[allow(dead_code)]
 #[async_trait]
 pub trait Source: Send + Sync {

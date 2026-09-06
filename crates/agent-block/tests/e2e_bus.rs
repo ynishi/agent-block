@@ -21,8 +21,8 @@ mod common;
 
 #[test]
 fn single_run_non_regression_exits_zero() {
-    // A script that does NOT call bus.serve() must still behave like
-    // before ST4: run to completion and exit 0.
+    // A script that does NOT call bus.serve() must behave as it did before
+    // the bus existed: run to completion and exit 0.
     common::agent_block_cmd()
         .args(["-s", &common::fixture("hello.lua")])
         .assert()

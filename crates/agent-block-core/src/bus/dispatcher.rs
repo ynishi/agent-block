@@ -69,9 +69,9 @@ pub trait Handler: Send + Sync + 'static {
 
 /// Boxed handler reference used inside [`EventBus`].
 ///
-/// Named `HandlerKey` to stay aligned with `subtask-1.md` §Design,
-/// where the field is called `HandlerKey`. In Subtask 3 this type will be
-/// replaced with a concrete struct wrapping `mlua::RegistryKey`.
+/// A boxed trait object today. The name anticipates the concrete struct that
+/// would replace it — one wrapping `mlua::RegistryKey` — so the field it is
+/// stored in does not have to be renamed when that happens.
 pub type HandlerKey = Arc<dyn Handler>;
 
 /// The serial event dispatcher.

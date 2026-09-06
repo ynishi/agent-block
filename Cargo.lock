@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block"
-version = "0.37.1"
+version = "0.38.0"
 dependencies = [
  "agent-block-core",
  "agent-block-mcp",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block-core"
-version = "0.37.1"
+version = "0.38.0"
 dependencies = [
  "agent-block-mcp",
  "agent-block-types",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block-mcp"
-version = "0.37.1"
+version = "0.38.0"
 dependencies = [
  "agent-block-types",
  "async-trait",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block-testkit"
-version = "0.37.1"
+version = "0.38.0"
 dependencies = [
  "axum",
  "serde_json",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "agent-block-types"
-version = "0.37.1"
+version = "0.38.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",

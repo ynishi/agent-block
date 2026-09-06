@@ -923,9 +923,9 @@ pub struct HostContext {
     /// `coroutine_call("__bus_dispatch", ...)`.
     pub handler_isle: Arc<AsyncIsle>,
     /// Ingress sender for the EventBus. Adapters (mesh / webhook / …)
-    /// clone this and push `Event`s. The ST3 mesh adapter captures its own
-    /// clone at `MeshAgent::connect` time, so the field itself is not read
-    /// elsewhere in the ST3 cut — kept `pub` for ST4+ adapter wiring.
+    /// clone this and push `Event`s. The mesh adapter captures its own clone
+    /// at `MeshAgent::connect` time, so nothing reads the field itself today —
+    /// kept `pub` so a further adapter can be wired without reopening this.
     #[allow(dead_code)]
     pub bus_tx: mpsc::Sender<Event>,
     /// Mutex-wrapped `Option<EventBus>` so `bus.on` / `bus.on_any` can lock

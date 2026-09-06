@@ -702,8 +702,8 @@ mod tests {
 
     /// `__bus_dispatch` resolves a kind-specific handler, decodes JSON, and
     /// JSON-encodes the return value. This is a pure Lua-side test; the
-    /// Rust `LuaHandler` is exercised indirectly via a production-like
-    /// integration in ST4.
+    /// Rust `LuaHandler` is exercised indirectly, through the e2e suite that
+    /// drives the bus in the full host.
     #[test]
     fn dispatcher_resolves_kind_and_encodes_return() {
         let lua = Lua::new();
