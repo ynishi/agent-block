@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `knl.is_session(v)` is published, and the packs use it. The kernel already
+  had the judgement — it asks a handle for the whole of `knl.shapes.session`,
+  which is generated from the Rust side's own types, through a pcall because
+  the real handle is userdata whose indexing can raise — but kept it private,
+  so every consumer wrote a weaker copy: `policy.carry` asked for one method,
+  `window{ fit }` and `verdict` asked for `type(session) == "table"` (and
+  refused a perfectly good session in a run), `supervisor` asked only
+  `table or userdata`. One answer now, and it moves with the declaration.
+  `knl.shapes.session_handle` and `knl.shapes.callable` are published for the
+  same reason: both packs had retyped them locally.
+
 - The Lua stack moves to mlua 0.12: `mlua` 0.11 → 0.12, `mlua-isle` 0.4.1 →
   0.6, `mlua-batteries` 0.5.1 → 0.6, `mlua-batteries-sqlite` 0.6 → 0.7,
   `mlua-pkg` 0.7 → 0.9 (each already published against 0.12; this repository

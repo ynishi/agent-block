@@ -461,34 +461,30 @@ end
 --- A Lua function, as a shape. `lshape.t` exposes only the five prims it
 --- names, so this is built from the same plain-data schema form.
 local FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
-local USERDATA = setmetatable({ kind = "prim", prim = "userdata" }, lshape.t._internal.schema_mt)
 
---- Something a beat can call: a function, or a table / userdata carrying
---- `__call`. `callable` above is the exact test, run loudly at construction;
---- this is its data shape.
-local CALLABLE = T.any_of({ FUNCTION, T.table, USERDATA })
+--- Something a beat can call, and a session handle: the kernel's, not a
+--- second copy. Both used to be written here as well, in the same `any_of`
+--- form and with the same words around them, which is a contract with two
+--- versions waiting to disagree.
+local CALLABLE = kernel.shapes.callable
+local SESSION_HANDLE = kernel.shapes.session_handle
 
---- A session handle: the kernel's userdata, or the faithful Lua stand-in a
---- spec drives. No schema can ask a userdata what it can do, so the shape
---- says the two types it can have and the binder makes the real judgement.
-local SESSION_HANDLE = T.any_of({ T.table, USERDATA })
-
---- Hold `session` to being one, by what it can do rather than what it is.
+--- Hold `session` to being one — the kernel's judgement, not a local retelling
+--- of it.
 ---
---- The kernel hands back USERDATA and a spec drives a Lua table (see
---- `SESSION_HANDLE` above), so a guard that asked for a table would reject
---- the real thing and accept only the stand-in — which is exactly what it
---- did until a run failed on `policy.window fits: session must be a knl
---- session` with a session that was perfectly good. The question a binder
---- can actually answer is whether the method it is about to call is there.
+--- `knl.is_session` asks the handle for the whole of `knl.shapes.session`,
+--- which is generated from the Rust side's own types, through a pcall because
+--- the real handle is userdata whose indexing can raise. Every version of this
+--- question written here instead asked a smaller one: a single method, or
+--- `type(session) == "table"` — and that last one refused a perfectly good
+--- session in a run, before its first beat. There is one answer and it lives
+--- with the declaration.
 ---
 --- @param session any  the value a caller passed
---- @param method string  the method this policy calls on it
 --- @param who string  the policy's name, for the message
-local function needs_session(session, method, who)
-    local t = type(session)
-    if (t ~= "table" and t ~= "userdata") or type(session[method]) ~= "function" then
-        error(who .. ": session must be a knl session (nothing here answers :" .. method .. "())", 3)
+local function needs_session(session, who)
+    if not kernel.is_session(session) then
+        error(who .. ": session must be a knl session (from knl.open / knl.resume)", 3)
     end
 end
 
@@ -961,7 +957,7 @@ function M.window(opts)
 
     --- The same question, asked before the beat rather than inside it.
     local fits = function(session, device)
-        needs_session(session, "events", "policy.window fits")
+        needs_session(session, "policy.window fits")
         local request = largest_fitting(whole_log(session, "policy.window fits"), device or {})
         if request == nil then
             return "context"
@@ -1093,7 +1089,7 @@ function M.verdict(opts)
         if run == nil then
             return { ok = false, checked = false }
         end
-        needs_session(session, "append", "policy.verdict")
+        needs_session(session, "policy.verdict")
 
         local result = run()
         if type(result) ~= "table" or type(result.ok) ~= "boolean" then
@@ -1465,22 +1461,10 @@ function M.carry(opts)
     local limit = opts.max_bytes or DEFAULT_MAX_BYTES
     local failed = opts.failed or default_failed
     return function(session)
-        -- The one thing the binder needs off the handle, checked where it is
-        -- bound rather than at the first beat: a filter that raised on its
-        -- first call would be reported as a filter failure, which is not what
-        -- went wrong. The read itself is pcall'd because the real handle is
-        -- Rust userdata whose indexing can raise — the same reason knl's own
-        -- session gate duck-types through a pcall.
-        local reachable = type(session) == "table" or type(session) == "userdata"
-        local readable, events_fn = false, nil
-        if reachable then
-            readable, events_fn = pcall(function()
-                return session.events
-            end)
-        end
-        if not readable or not callable(events_fn) then
-            error("policy.carry: bind takes a knl session (from knl.open / knl.resume)", 2)
-        end
+        -- Checked where it is bound rather than at the first beat: a filter
+        -- that raised on its first call would be reported as a filter
+        -- failure, which is not what went wrong.
+        needs_session(session, "policy.carry bind")
         return function(request)
             local note = failure_note(whole_log(session, "policy.carry"), limit, failed)
             if note == nil then

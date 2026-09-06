@@ -1103,6 +1103,17 @@ do
     assert(type(s) == "userdata", "the kernel's session is userdata, got " .. type(s))
     s:append({ kind = "msg_user", data = { content = "go" } })
 
+    -- The judgement itself, published: every pack that takes a session asks
+    -- this one function rather than writing a type test of its own, and the
+    -- surface it asks for is `shapes.session` — generated from the Rust
+    -- types, so it moves when they do.
+    assert(kernel.is_session(s), "the kernel's own session must pass its own gate")
+    assert(not kernel.is_session({}), "an empty table answers none of the surface")
+    assert(not kernel.is_session({ events = function() end }), "one method is not the surface")
+    assert(not kernel.is_session("session"), "a string is not a handle")
+    assert(kernel.shapes.session_handle ~= nil, "the handle's shape is published for the packs")
+    assert(kernel.shapes.callable ~= nil, "callable is published for the packs")
+
     -- A Port that counts characters and declares a window wide enough for
     -- this log: `fits` has to reach `s:events()` through the handle.
     local port = {
