@@ -26,6 +26,9 @@
 ---                                         is this failure worth asking again?
 ---     policy.escalate    -> `next`        the device for the next beat: this
 ---                                         one, or one with a stronger llm
+---     policy.tokens      -> a `cost`      the beat's request in tokens, by
+---                                         the Port's count, for a grant
+---                                         tagged "tokens"
 ---
 ---   The first two are device fields (`knl.device{ fold = ..., filters =
 ---   { ... } }`); the last three are the loop's own and the kernel never
@@ -454,10 +457,22 @@ end
 
 --- What `policy.window` is configured with.
 local WINDOW_OPTS, WINDOW_ARG = opts_contract({
-    tail = T.number:describe("how many beats the request keeps; a whole number >= 1"),
+    tail = T.number:describe("how many beats the request keeps; a whole number >= 1"):is_optional(),
     keep_seed = T.boolean
         :describe("also keep every event before the first beat (the caller's seed), ahead of the window; default false")
         :is_optional(),
+    fit = T.table
+        :describe(
+            "{ port, conf? }: keep as many beats as fit the port's context window — port:count(request, conf) + profile.max_output <= profile.context_window"
+        )
+        :is_optional(),
+})
+
+--- What `policy.tokens` is configured with: the Port whose counting the cost
+--- delegates to, and the conf that Port was (or will be) opened with.
+local TOKENS_OPTS, TOKENS_ARG = opts_contract({
+    port = T.table:describe("an LLM Port: anything answering count(request, conf) -> integer"),
+    conf = T.table:describe("the conf the port is opened with; forwarded to count"):is_optional(),
 })
 
 --- What `policy.carry` is configured with. `failed` is the caller's reading of
@@ -612,7 +627,9 @@ local function window_slice(events, tail, keep_seed)
     if #order <= tail then
         return events
     end
-    local from = first_at[order[#order - tail + 1]]
+    -- `tail == 0` keeps no beat at all: the slice is the seed (with
+    -- `keep_seed`) or nothing. Only `fit` asks for it, as the last candidate.
+    local from = tail == 0 and (#events + 1) or first_at[order[#order - tail + 1]]
     local slice = {}
     if keep_seed then
         for i = 1, first_at[order[1]] - 1 do
@@ -623,6 +640,65 @@ local function window_slice(events, tail, keep_seed)
         slice[#slice + 1] = events[i]
     end
     return slice
+end
+
+--- How many beats `events` holds.
+local function beat_count(events)
+    local seen, n = {}, 0
+    for _, ev in ipairs(events or {}) do
+        local id = ev.beat
+        if id ~= nil and not seen[id] then
+            seen[id] = true
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- What a Port must answer for `fit`, checked at construction so a window that
+--- cannot count is refused before a beat asks it to.
+local function port_for_fit(fit, who)
+    if type(fit) ~= "table" or type(fit.port) ~= "table" then
+        error(who .. ": fit must be { port = <Port>, conf? }", 3)
+    end
+    if type(fit.port.count) ~= "function" or type(fit.port.profile) ~= "function" then
+        error(who .. ": fit.port must answer count(request, conf) and profile(conf)", 3)
+    end
+    if fit.conf ~= nil and type(fit.conf) ~= "table" then
+        error(who .. ": fit.conf must be a table when given", 3)
+    end
+    return fit.port, fit.conf
+end
+
+--- The tokens a request may take, read off the Port's profile: the window
+--- less the room the answer needs. Loud when the profile does not say —
+--- a window that guessed would be the 400 it exists to prevent, one step
+--- later.
+local function request_limit(profile, who)
+    if type(profile) ~= "table" then
+        error(who .. ": port:profile(conf) must answer a table, got " .. tostring(profile), 3)
+    end
+    local window, output = profile.context_window, profile.max_output
+    if not whole_at_least(window, 1) then
+        error(
+            who
+                .. ": the port's profile names no context_window; declare it in the conf the port is opened with "
+                .. "(context_window = <tokens>) or on the port",
+            3
+        )
+    end
+    if output == nil then
+        output = 0
+    elseif not whole_at_least(output, 0) then
+        error(who .. ": profile.max_output must be a whole number >= 0, got " .. tostring(output), 3)
+    end
+    if output >= window then
+        error(
+            string.format("%s: profile.max_output (%d) leaves no room in context_window (%d)", who, output, window),
+            3
+        )
+    end
+    return window - output
 end
 
 --- Build a `fold` that folds the last `tail` beats of the log.
@@ -642,26 +718,136 @@ end
 ---
 ---     knl.device({ llm = llm, fold = policy.window({ tail = 4, keep_seed = true }) })
 ---
---- @param opts table  { tail = <whole number >= 1>, keep_seed = <boolean>? }
+--- With `fit = { port, conf? }` the window is sized by the model rather than
+--- by a number of beats: the fold keeps as many of the last beats as the
+--- Port's context window has room for, counting each candidate request with
+--- `port:count(request, conf)` against `port:profile(conf).context_window -
+--- max_output`. Whole beats go, oldest first, `tail` (if given) is a cap on
+--- top, and the seed is the last thing standing when `keep_seed` is set. A
+--- request that does not fit even then raises: the loop was going to be
+--- refused by the server one step later, and this is the step that can say
+--- why. The counting and the window are the Port's — this fold knows no
+--- model.
+---
+---     knl.device({ llm = port:open(conf), fold = policy.window({ fit = { port = port, conf = conf }, keep_seed = true }) })
+---
+--- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf? }? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request
 function M.window(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
         error("policy.window: opts must be a table", 2)
     end
-    only(opts, { tail = true, keep_seed = true }, "policy.window")
-    if not whole_at_least(opts.tail, 1) then
+    only(opts, { tail = true, keep_seed = true, fit = true }, "policy.window")
+    if opts.fit == nil and not whole_at_least(opts.tail, 1) then
+        error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
+    end
+    if opts.tail ~= nil and not whole_at_least(opts.tail, 1) then
         error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
     end
     if opts.keep_seed ~= nil and type(opts.keep_seed) ~= "boolean" then
         error("policy.window: keep_seed must be a boolean, got " .. tostring(opts.keep_seed), 2)
     end
+    local port, conf
+    if opts.fit ~= nil then
+        port, conf = port_for_fit(opts.fit, "policy.window")
+    end
     shape.assert_dev(opts, WINDOW_OPTS, "policy.window opts")
 
     local tail = opts.tail
     local keep_seed = opts.keep_seed == true
+    if port == nil then
+        return function(events, device)
+            return kernel.fold(window_slice(events, tail, keep_seed), device)
+        end
+    end
+
+    -- The profile is read per fold, not captured: a Port opened with one conf
+    -- answers one profile, and reading it each time costs nothing while
+    -- letting a Port whose window is learned late (a served model queried
+    -- for it) answer the truth.
+    local floor = keep_seed and 0 or 1
     return function(events, device)
-        return kernel.fold(window_slice(events, tail, keep_seed), device)
+        local limit = request_limit(port:profile(conf), "policy.window")
+        local n = beat_count(events)
+        local most = tail and math.min(tail, n) or n
+        local request, tokens
+        for k = most, floor, -1 do
+            request = kernel.fold(window_slice(events, k, keep_seed), device)
+            tokens = port:count(request, conf)
+            if type(tokens) ~= "number" then
+                error("policy.window: port:count must answer a number, got " .. tostring(tokens), 2)
+            end
+            if tokens <= limit then
+                return request
+            end
+            if k == 0 or n == 0 then
+                break
+            end
+        end
+        error(
+            string.format(
+                "policy.window: nothing left to drop and the request still does not fit: %d tokens > %d (the seed%s)",
+                tokens,
+                limit,
+                keep_seed and " alone" or " is not kept; the newest beat alone"
+            ),
+            2
+        )
+    end
+end
+
+-- ============================================================
+-- tokens — a cost in tokens
+-- ============================================================
+
+--- Build a `cost` that reserves a beat's request in tokens.
+---
+--- The kernel's budget is a quota in whatever unit the owner tagged the grant
+--- with, and `device.cost(request)` is how many of that unit one beat asks
+--- for before its call; the default is one, so a grant counts beats. This
+--- answers the request's token count instead, so that
+---
+---     knl.session({ budget = { amount = 200000, tag = "tokens" } }, function(s)
+---         local device = knl.device({ llm = port:open(conf), cost = policy.tokens({ port = port, conf = conf }) })
+---
+--- counts tokens: the balance is what the session may still send, a beat
+--- that would overrun it is `Outcome.stopped("budget", "tokens")` with no
+--- call made, and nothing about token usage is folded back from the answer —
+--- `knl.views.usage` is the provider's accounting of what a call cost, read
+--- for what it is, and not a second ledger.
+---
+--- The number is the Port's (`port:count(request, conf)`), the same count
+--- `policy.window{ fit }` sizes the request by, so the two agree by
+--- construction. The kernel requires a cost of at least one; an empty
+--- request still spends a beat.
+---
+--- @param opts table  { port = <Port answering count(request, conf)>, conf = <table>? }
+--- @return function cost  fn(request) -> integer >= 1
+function M.tokens(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.tokens: opts must be a table", 2)
+    end
+    only(opts, { port = true, conf = true }, "policy.tokens")
+    if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" then
+        error("policy.tokens: port must be a table answering count(request, conf)", 2)
+    end
+    if opts.conf ~= nil and type(opts.conf) ~= "table" then
+        error("policy.tokens: conf must be a table when given", 2)
+    end
+    shape.assert_dev(opts, TOKENS_OPTS, "policy.tokens opts")
+
+    local port, conf = opts.port, opts.conf
+    return function(request)
+        local n = port:count(request, conf)
+        if not whole_at_least(n, 0) then
+            error("policy.tokens: port:count must answer a whole number >= 0, got " .. tostring(n), 2)
+        end
+        if n < 1 then
+            return 1
+        end
+        return n
     end
 end
 
@@ -1329,6 +1515,16 @@ M.shapes.api = {
             fold = {
                 args = { EVENTS_ARG, arg_of(T.table, "device (read for system / tools)") },
                 returns = kernel.shapes.request,
+            },
+        },
+    },
+    tokens = {
+        args = { arg_of(TOKENS_ARG, "opts") },
+        returns = "cost — fn(request) -> integer >= 1 (the request's tokens, by the port's count)",
+        members = {
+            cost = {
+                args = { arg_of(kernel.shapes.request, "request") },
+                returns = "integer >= 1",
             },
         },
     },

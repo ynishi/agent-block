@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The model's context window is now something the runtime knows about, in
+  two places that already existed for it. `LLMPort:profile(conf)` answers
+  `{ context_window, max_output }` — read off the conf the Port is opened
+  with (`context_window`, and `max_tokens` for the answer's room), so a
+  window is declared once beside the model's name; a provider Port may
+  override it. `LLMPort:count(request, conf)` answers a request's tokens
+  (a four-bytes-per-token estimate by default; a Port with a tokenizer
+  overrides it). Neither touches `knl.views.usage`, which stays the
+  provider's accounting of what a call cost.
+- `policy.window({ fit = { port, conf? } })` sizes the window by the model:
+  whole beats go, oldest first, until `port:count(request) <=
+  context_window - max_output`; `tail` is a cap on top, `keep_seed` makes
+  the seed the last thing standing, and a request that does not fit even
+  then raises with the numbers instead of letting the server refuse it.
+- `policy.tokens({ port, conf? })` is a device `cost` in tokens: with a
+  grant tagged `"tokens"` (`budget = { amount = N, tag = "tokens" }`, the
+  form the kernel already documents) the balance is what the session may
+  still send, and a beat that would overrun it is `stopped("budget")` with
+  no call made. The count is the Port's, the same one `fit` sizes by.
 - `std.fs.tool_specs` / `register_tools` gain an opt-in `search_replace` op
   (`fs_search_replace`): the model names a verbatim snippet and the text that
   replaces it, and the handler finds the snippet in the file as it is now and

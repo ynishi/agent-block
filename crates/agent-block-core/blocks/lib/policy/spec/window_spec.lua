@@ -138,6 +138,92 @@ describe("policy.window — construction", function()
     end)
 end)
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- fit: the window sized by a Port's profile rather than a beat count. The fake
+-- Port counts the rendered request's characters, so the limits below are
+-- computed from what the kernel's own fold produces rather than guessed.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function counting_port(window, output)
+    return {
+        profile = function()
+            return { context_window = window, max_output = output }
+        end,
+        count = function(_, request)
+            return #rendered(request)
+        end,
+    }
+end
+
+describe("policy.window — fit", function()
+    local events =
+        concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4), answered("b3", "three", 6))
+
+    it("is constructed without a tail, and refuses a port that cannot count", function()
+        expect(type(policy.window({ fit = { port = counting_port(1000, 10) } }))).to.be("function")
+        expect(function()
+            policy.window({ fit = { port = {} } })
+        end).to.fail()
+        expect(function()
+            policy.window({ fit = "port" })
+        end).to.fail()
+    end)
+
+    it("keeps every beat when the whole log fits", function()
+        local fold = policy.window({ fit = { port = counting_port(10000, 10) } })
+        expect(rendered(fold(events, {}))).to.be(rendered(kernel.fold(events, {})))
+    end)
+
+    it("drops the oldest beats, whole, until the request fits the window less the answer's room", function()
+        -- The limit is exactly what the last two beats cost, so three do not fit.
+        local two = #rendered(kernel.fold({ events[4], events[5], events[6], events[7] }, {}))
+        local fold = policy.window({ fit = { port = counting_port(two + 10, 10) } })
+        local text = rendered(fold(events, {}))
+        expect(text:find("two", 1, true) ~= nil).to.be(true)
+        expect(text:find("three", 1, true) ~= nil).to.be(true)
+        expect(text:find("one", 1, true)).to.be(nil)
+        expect(text:find("first", 1, true)).to.be(nil)
+    end)
+
+    it("keeps the seed ahead of what fits when keep_seed is set", function()
+        local seeded = #rendered(kernel.fold({ events[1], events[6], events[7] }, {}))
+        local fold = policy.window({ fit = { port = counting_port(seeded + 10, 10) }, keep_seed = true })
+        local text = rendered(fold(events, {}))
+        expect(text:find("first", 1, true) ~= nil).to.be(true)
+        expect(text:find("three", 1, true) ~= nil).to.be(true)
+        expect(text:find("two", 1, true)).to.be(nil)
+    end)
+
+    it("tail is a cap on top of fit", function()
+        local fold = policy.window({ fit = { port = counting_port(10000, 10) }, tail = 1 })
+        local text = rendered(fold(events, {}))
+        expect(text:find("three", 1, true) ~= nil).to.be(true)
+        expect(text:find("two", 1, true)).to.be(nil)
+    end)
+
+    it("raises when nothing left to drop still does not fit, naming the numbers", function()
+        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) }, keep_seed = true }), events, {})
+        expect(ok).to.be(false)
+        expect(tostring(err):find("does not fit", 1, true) ~= nil).to.be(true)
+        local ok2 = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), events, {})
+        expect(ok2).to.be(false)
+    end)
+
+    it("raises when the port's profile names no window — a guess would be the overflow one step later", function()
+        local port = {
+            profile = function()
+                return {}
+            end,
+            count = function()
+                return 1
+            end,
+        }
+        local ok, err = pcall(policy.window({ fit = { port = port } }), events, {})
+        expect(ok).to.be(false)
+        expect(tostring(err):find("context_window", 1, true) ~= nil).to.be(true)
+    end)
+end)
+
 describe("policy.window — the slice", function()
     it("keeps the last `tail` beats and drops what came before", function()
         local events =

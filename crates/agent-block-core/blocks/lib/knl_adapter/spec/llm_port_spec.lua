@@ -198,6 +198,48 @@ local function make_test_port(opts)
     return port, seen
 end
 
+describe("knl_adapter Port — profile and count (what the model can take)", function()
+    it("profile reads the window and the answer's room off the conf, and declares nothing it was not told", function()
+        local port = make_test_port({})
+        local p = port:profile({ model = "m", context_window = 32768, max_tokens = 4096 })
+        expect(p.context_window).to.be(32768)
+        expect(p.max_output).to.be(4096)
+        local bare = port:profile({ model = "m" })
+        expect(bare.context_window).to.be(nil)
+        expect(bare.max_output).to.be(nil)
+        expect(type(port:profile(nil))).to.be("table")
+    end)
+
+    it("count estimates four bytes to the token over the request's strings, and grows with them", function()
+        local port = make_test_port({})
+        local small = port:count({ messages = { { role = "user", content = "hi" } } })
+        local large = port:count({ messages = { { role = "user", content = string.rep("word ", 400) } } })
+        expect(small >= 1).to.be(true)
+        expect(large > small).to.be(true)
+        -- 2000 bytes of content alone is 500 tokens; the framing adds a few.
+        expect(large >= 500).to.be(true)
+        expect(port:count({ messages = {} }) >= 0).to.be(true)
+    end)
+
+    it("a provider Port overrides both, and the shim's own answers stay out of its way", function()
+        local port = knl_adapter.LLMPort.new({
+            build = function() end,
+            parse = function() end,
+            classify = function()
+                return { status = "ok" }
+            end,
+            profile = function(_, conf)
+                return { context_window = 1000, max_output = conf.max_tokens or 100 }
+            end,
+            count = function(_, request)
+                return #request.messages * 10
+            end,
+        })
+        expect(port:profile({}).context_window).to.be(1000)
+        expect(port:count({ messages = { {}, {}, {} } })).to.be(30)
+    end)
+end)
+
 describe("knl_adapter Port", function()
     it("1: LLMPort.new rejects an impl missing build/parse/classify", function()
         local function f() end
