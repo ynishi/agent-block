@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `compile_loop` and `coding_agent` are gone, and with them the last blocks
+  that owned a loop. `compile_loop` sold one guarantee — keep editing until a
+  runner says green, or stop at `max_iters` — and every part it needed to sell
+  it is now something a caller holds directly: the iteration is `knl.beat` in a
+  `while` the caller writes, the ceiling is the grant on `knl.session`, the
+  history is bounded by `policy.window` / `result_cap` / `carry`, the stop is
+  `policy.verdict` or `policy.stagnation`, the edit surface is
+  `std.fs.tool_specs{ allowed, path_lock }` (the `search_replace` form
+  included), the runner is `sh.exec`, exposing the whole thing to a parent
+  model is `agent.run{ extra_tools }`, and splitting it across children is
+  `supervisor`. What the block added on top of those was the wiring, and the
+  wiring is what a shell is for. `examples/knl_beat.lua` is the reference now.
+
+  Removed: `blocks/tools/` entirely (1,164 + 215 lines of Lua and a 295-line
+  README), `tests/e2e_compile_loop.rs` and `tests/e2e_coding_agent.rs` with
+  their five mock modules, 14 fixtures, 11 example scripts, and the two README
+  sections. `require("compile_loop")` and `require("coding_agent")` now fail;
+  there is no shim. Two fixtures that had used `compile_loop.make` only as a
+  source of a tool def — the registry/`extra_tools` name-clash case and the
+  dispatch regression — write the def out literally instead, which is what they
+  were always testing.
+
+  `agent-block-testkit` loses its only consumer with the e2e suite that used
+  it. The crate is unchanged and still published; the path dev-dependency on it
+  is dropped, and nothing in this workspace exercises it now.
+
 ### Changed
 
 - `knl.is_session(v)` is published, and the packs use it. The kernel already

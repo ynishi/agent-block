@@ -44,6 +44,7 @@ let handle = MockLlm::openai(|req| {
 // point the client under test at handle.base_url, then assert on handle.state
 ```
 
-The first consumer is agent-block's own `compile_loop` e2e suite
-(`crates/agent-block/tests/e2e_compile_loop.rs`), which doubles as the
-regression gate for this crate.
+The first consumer was agent-block's own `compile_loop` e2e suite, and that
+loop has since been removed from the repository. Nothing in this workspace
+exercises the crate today, so it has no regression gate here; the shapes are
+pinned by the provider wire formats they mirror.

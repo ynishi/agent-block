@@ -4,8 +4,8 @@
 --   just test-lua llm_proto_test   # this file
 --   just test-lua                  # every spec fixture
 --
--- Covers the pieces that used to be duplicated (or missing) across
--- blocks/agent and blocks/tools/compile_loop:
+-- Covers the pieces that used to be duplicated (or missing) across the blocks
+-- that call an LLM endpoint:
 --   * tool_choice normalization across both provider vocabularies
 --   * Anthropic manual vs adaptive extended thinking, chosen by model generation
 --   * the thinking x forced-tool-use combination Anthropic rejects

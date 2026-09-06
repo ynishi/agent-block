@@ -139,8 +139,4 @@ async fn inspect_tools_lists_host_and_embedded_sources() {
         embedded.contains(&"agent"),
         "embedded list should include 'agent', got {embedded:?}"
     );
-    assert!(
-        embedded.contains(&"compile_loop"),
-        "embedded list should include 'compile_loop', got {embedded:?}"
-    );
 }

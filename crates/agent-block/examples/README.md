@@ -8,48 +8,26 @@ agent-block -s examples/<file>.lua
 
 `.env` is auto-loaded from the project root (see project `CLAUDE.md` — no manual `source` needed). Required environment variables are listed per script below.
 
-## compile_loop
+Every script in this directory is listed here. A new one belongs in a table below on the commit that adds it.
 
-Autonomous compile-and-fix loop. See `blocks/tools/compile_loop/README.md` for the API and the edit format.
+## The kernel and a loop over it
 
-### Anthropic — single-file
-
-| Script | Scenario | Env |
+| Script | Purpose | Env |
 |---|---|---|
-| `test_anthropic_compile_loop.lua` | Single-file smoke | `ANTHROPIC_API_KEY` |
-| `test_anthropic_compile_loop_pytest.lua` | Single-file with pytest runner | `ANTHROPIC_API_KEY` |
-| `test_compile_loop_parent.lua` | Parent agent + compile_loop tool composition | `ANTHROPIC_API_KEY` |
-
-### Anthropic — multi-file (`target_files` + `edit_mode = "diff"`)
-
-| Script | Scenario | Env |
-|---|---|---|
-| `test_anthropic_compile_loop_multi.lua` | Add a function to both files (basic additive multi-file diff) | `ANTHROPIC_API_KEY` |
-| `test_anthropic_compile_loop_multi_delete.lua` | Remove a function + assertions from both files (empty-replacement deletion) | `ANTHROPIC_API_KEY` |
-| `test_anthropic_compile_loop_multi_selective.lua` | Edit one file only; verifies untouched file is byte-identical | `ANTHROPIC_API_KEY` |
-| `test_anthropic_compile_loop_multi_stagnation.lua` | Forced-fail runner; asserts `max_iters` bound and `ok=false` return | `ANTHROPIC_API_KEY` |
-
-### Qwen / OpenAI-compatible vLLM
-
-Run against a Qwen vLLM endpoint (e.g. RunPod proxy). All require `OPENAI_API_KEY` (often dummy), `QWEN_BASE_URL`, optionally `QWEN_MODEL`.
-
-| Script | Scenario |
-|---|---|
-| `test_qwen_compile_loop.lua` | Baseline smoke |
-| `test_qwen_compile_loop_hard.lua` | Harder spec, exercises stagnation handling |
-| `test_qwen_compile_loop_lust.lua` | Lua + lust testing framework |
-| `test_qwen_compile_loop_rust.lua` | Rust runner |
-| `test_qwen_openai.lua` | Bare Qwen OpenAI-compatible call (no compile_loop) |
+| `knl_beat.lua` | The smallest real shell over `knl.beat`, in three sections: the plain kernel with a caller-written loop; the same run with the `policy` pack in the seams the device already has; the same again split across a `supervisor` tree. This is the reference for writing a loop of your own | `ANTHROPIC_API_KEY` |
+| `fcloop.lua` / `test_fcloop.lua` | A function-call loop built directly on `http.request`, below the kernel — what the layers above are saving you from | `ANTHROPIC_API_KEY` |
 
 ## Agent basics
 
-| Script | Purpose |
-|---|---|
-| `hello.lua` / `hello_stream.lua` | Minimal `agent.run` (non-stream / stream) |
-| `test_agent.lua` | Agent + tools smoke |
-| `test_agent_log_meta.lua` | Verifies `ab.obs` log metadata fields |
-| `test_provider_switch.lua` | Anthropic ↔ OpenAI-compatible switching |
-| `test_prompt_cache.lua` | Anthropic prompt cache controls |
+| Script | Purpose | Env |
+|---|---|---|
+| `hello.lua` / `hello_stream.lua` | Minimal `agent.run` (non-stream / stream) | `ANTHROPIC_API_KEY` |
+| `test_agent.lua` | Agent + tools smoke | `ANTHROPIC_API_KEY` |
+| `test_agent_log_meta.lua` | Verifies `ab.obs` log metadata fields | `ANTHROPIC_API_KEY` |
+| `test_provider_switch.lua` | Anthropic ↔ OpenAI-compatible switching | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` |
+| `test_prompt_cache.lua` | Anthropic prompt cache controls | `ANTHROPIC_API_KEY` |
+| `test_qwen_openai.lua` | A bare OpenAI-compatible call against a Qwen vLLM endpoint | `OPENAI_API_KEY` (often dummy), `QWEN_BASE_URL`, `QWEN_MODEL?` |
+| `session_chat.lua` | One CLI invocation that joins a conversation persisted through `std.kv`; run it repeatedly with the same `AGENT_ID` | `ANTHROPIC_API_KEY` |
 
 ## Storage / state
 
@@ -57,12 +35,12 @@ Run against a Qwen vLLM endpoint (e.g. RunPod proxy). All require `OPENAI_API_KE
 |---|---|
 | `agent_with_kv.lua` / `agent_with_kv_v2.lua` | Agent + KV store |
 | `agent_with_sql.lua` | Agent + SQL store |
+| `test_ts.lua` | `std.ts.*` time-series store smoke — no external service |
 
 ## Composition / orchestration
 
 | Script | Purpose |
 |---|---|
-| `fcloop.lua` / `test_fcloop.lua` | Function-call loop primitive |
 | `agentify_flow.lua` | Agentify flow demo |
 | `test_bus.lua` | Event bus smoke |
 
@@ -80,7 +58,13 @@ Run against a Qwen vLLM endpoint (e.g. RunPod proxy). All require `OPENAI_API_KE
 | Script | Purpose |
 |---|---|
 | `test_mcp.lua` | MCP client smoke |
-| `verify_echo_harness.lua` | Verification script for the bundled `echo_mcp_server` (see root README §MCP) |
+| `test_mcp_ping.lua` | `mcp.ping` keepalive + round-trip latency |
+| `test_mcp_complete.lua` | `mcp.complete` over both prompt-ref and resource-ref |
+| `test_mcp_resource_templates.lua` | `mcp.list_resource_templates` |
+| `test_mcp_roots.lua` | `mcp.set_roots_handler` + `mcp.notify_roots_list_changed` |
+| `test_mcp_elicitation.lua` | `mcp.set_elicitation_handler` — server-originated prompts |
+| `mcp_resource_subscribe.lua` | All six Resource Subscribe APIs against the bundled subscribe smoke server (see root README §MCP Resource Subscribe Smoke Server) |
+| `verify_echo_harness.lua` | Verification script for the bundled `echo_mcp_server` (see root README §MCP Echo Harness) |
 
 ## Exit codes
 

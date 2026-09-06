@@ -28,20 +28,9 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Baked into the binary at compile time so `cargo install` works without any
 /// extra file distribution. The `require` name on the left is independent of
-/// the path on the right: `blocks/` is laid out by role
-/// (`agent/` runtime, `tools/`, `lib/`) while callers keep writing
-/// `require("compile_loop")`.
-const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
-    ("agent", include_str!("../blocks/agent/init.lua")),
-    (
-        "compile_loop",
-        include_str!("../blocks/tools/compile_loop/init.lua"),
-    ),
-    (
-        "coding_agent",
-        include_str!("../blocks/tools/coding_agent/init.lua"),
-    ),
-];
+/// the path on the right: `blocks/` is laid out by role (`agent/` runtime,
+/// `lib/`) while callers keep writing `require("agent")`.
+const EMBEDDED_BLOCKS: &[(&str, &str)] = &[("agent", include_str!("../blocks/agent/init.lua"))];
 
 /// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]
 /// but not part of the block surface reported by [`inspect_tools`].
@@ -290,7 +279,7 @@ pub struct ToolMeta {
 pub enum ToolSource {
     /// Supplied via [`BlockConfig::host_tools`] (Rust-implemented).
     HostRust,
-    /// Embedded StdPkg block (`agent`, `compile_loop`, …) — discovered
+    /// Embedded StdPkg block (`agent`) — discovered
     /// statically from [`EMBEDDED_BLOCKS`]. Note: not every embedded
     /// block exposes a registered tool; this entry simply records that
     /// the module is available via `require(...)`.

@@ -261,7 +261,7 @@ async fn read_sse(mut resp: reqwest::Response, on_data: &Option<LuaFunction>) ->
 // The redaction-mirror guard that used to live here is gone with what it
 // guarded. It held a list of credential-bearing header names against the copy
 // in a Lua block's `sanitize_headers_for_dump`, and both Lua copies have since
-// been deleted: `agent` and `compile_loop` are consumers of the kernel now, a
+// been deleted: `agent` is a consumer of the kernel now, a
 // model call is a durable record (`llm_request` / `llm_response`) rather than a
 // dump on stdout, and no block reads a response header at all. A test that
 // checks two files agree is dead the moment one of them stops existing.

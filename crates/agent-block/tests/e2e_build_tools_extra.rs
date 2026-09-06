@@ -47,7 +47,7 @@ fn build_tools_extra_flatten() {
 }
 
 #[test]
-fn compile_loop_make_default_dedup() {
+fn registry_and_extra_tools_name_clash_is_refused() {
     let tmp = tempdir().expect("tempdir");
     common::agent_block_cmd()
         .env("AGENT_BLOCK_HOME", tmp.path())

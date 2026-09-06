@@ -1,23 +1,31 @@
--- dispatch_extra_tools.lua — verify that a registered compile_loop tool_def is
--- the one tool.call() invokes (regression test for a past "tool not found"
--- bug).
+-- dispatch_extra_tools.lua — verify that a registered tool_def is the one
+-- tool.call() invokes (regression test for a past "tool not found" bug).
 --
--- `compile_loop.make` builds the def and stops; registering it is the caller's,
--- so the identity this pins is between what the caller registered and what the
--- registry dispatches.
+-- The def is written out here in the nested `{name, schema, handler}` form:
+-- building a def and registering it are two steps, and the identity this pins
+-- is between what the caller registered and what the registry dispatches.
 
-local compile_loop = require("compile_loop")
-
-local td = compile_loop.make({
-    name = "compile_loop",
-    runner = function()
-        return { ok = true, stdout = "PASS", stderr = "", exit_code = 0 }
+local td = {
+    name = "dispatch_probe",
+    schema = {
+        description = "Echo the spec back as JSON.",
+        input_schema = {
+            type = "object",
+            properties = {
+                spec = { type = "string" },
+                target_file = { type = "string" },
+            },
+            required = { "spec" },
+        },
+    },
+    handler = function(args)
+        return std.json.encode({ ok = true, spec = args.spec })
     end,
-})
+}
 tool.register(td.name, td.schema, td.handler)
 
 -- Confirm registry entry exists by calling tool.call.
-local ok, res = pcall(tool.call, "compile_loop", {
+local ok, res = pcall(tool.call, "dispatch_probe", {
     spec = "no-op spec",
     target_file = "/tmp/dispatch_test_target.lua",
 })
@@ -26,9 +34,8 @@ if not ok then
     return
 end
 
--- handler returns a JSON string. Dispatch is confirmed if we received any
--- JSON string back (handler was invoked). ok=false with failure_reason=llm_call
--- is expected in test environments where no API key is configured.
+-- The handler returns a JSON string. Dispatch is confirmed if we received one
+-- back, which is only possible if the handler ran.
 if type(res) == "string" and res:find('"ok":', 1, true) then
     print("dispatch=ok")
 else
