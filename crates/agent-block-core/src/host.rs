@@ -1974,6 +1974,12 @@ pub async fn run(config: BlockConfig) -> BlockResult<()> {
 /// (`agent-block mcp`) is the first such caller. Nothing about the run differs;
 /// a script that returns nothing simply yields an empty string.
 pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
+    // `sh.exec` puts each command in a process group of its own so a timeout
+    // reaches what the command started. That also takes the command out of the
+    // group the terminal signals, so the host forwards the signal on. Install
+    // once; the call is idempotent and a server host reaches it per request.
+    bridge::sh::install_signal_cleanup();
+
     // ── Resolve sources ───────────────────────────────────────────
     // Convert the `Source` enums on `BlockConfig` to their concrete
     // payloads before any Isle setup. `File`/`Path`/`Env` variants

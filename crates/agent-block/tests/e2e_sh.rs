@@ -42,3 +42,22 @@ fn sh_exec_strips_own_credentials() {
                 .and(predicate::str::contains("dummy-mesh-3f9c1a").not()),
         );
 }
+
+/// A timed-out command takes its descendants with it.
+///
+/// The fixture starts a `sleep` in the background and blocks, so the command
+/// outlives its own child; the timeout has to reach past the command to end
+/// it. Without a process group of its own only the command dies and the sleep
+/// is still there afterwards — which is a runaway build left on a shared
+/// machine, in miniature.
+#[test]
+fn sh_exec_timeout_kills_the_process_group() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("sh_exec_timeout_group.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[SHG] done"))
+        .stdout(predicate::str::contains("= false").not());
+}

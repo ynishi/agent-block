@@ -26,12 +26,111 @@
 //! removal, and it is not an env allowlist — everything else is still inherited.
 
 use mlua::prelude::*;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use agent_block_types::creds::OWN_CREDENTIAL_ENV_VARS;
 
 use crate::host::HostContext;
+
+/// Process groups this bridge started and has not yet seen finish.
+///
+/// A timeout kills its own group directly, so this exists for the other way a
+/// run ends: a signal to the host. `kill_on_drop` cannot cover that — the
+/// default disposition of SIGINT ends the process without running a
+/// destructor, so nothing would fire. The set is walked by
+/// [`install_signal_cleanup`] instead.
+///
+/// Process-global rather than per-host because a signal is delivered to the
+/// process, not to a host.
+static LIVE_GROUPS: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
+
+fn remember_group(pgid: i32) {
+    if let Ok(mut g) = LIVE_GROUPS.lock() {
+        g.insert(pgid);
+    }
+}
+
+fn forget_group(pgid: i32) {
+    if let Ok(mut g) = LIVE_GROUPS.lock() {
+        g.remove(&pgid);
+    }
+}
+
+/// SIGKILL every process group still running under this bridge.
+///
+/// The pid of a group leader is its group id, and killing the group is what
+/// reaches the descendants: `sh -c "cargo test"` is the command, but the test
+/// binary it built is a grandchild, and killing the command alone leaves that
+/// binary running. On a shared machine it stays there.
+#[cfg(unix)]
+pub fn kill_live_groups() {
+    let groups: Vec<i32> = match LIVE_GROUPS.lock() {
+        Ok(g) => g.iter().copied().collect(),
+        Err(_) => return,
+    };
+    for pgid in groups {
+        // SAFETY: `killpg` is a libc call with no invariants for the caller to
+        // uphold. A group that has already gone answers ESRCH, which is the
+        // answer this wants anyway.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        forget_group(pgid);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_live_groups() {}
+
+/// Forward a terminating signal to the process groups `sh.exec` started.
+///
+/// Called once by the host. With each command in a group of its own the
+/// terminal's Ctrl-C no longer reaches it — the signal goes to the host's
+/// group, and the command is no longer in it — so the host has to pass it on,
+/// or a command would outlive the interrupt that was meant to stop it.
+///
+/// After forwarding, this waits `AGENT_BLOCK_TASK_GRACE_MS` and then ends the
+/// process. The wait is what lets a shutdown path that is already listening
+/// finish first: `bus.serve` has its own handler for the same signals and
+/// cancels its token there, and when it ends the run this never reaches its
+/// exit. When nothing else is listening — a plain script — the exit is what
+/// keeps Ctrl-C meaning what it did before, since installing a listener at all
+/// takes the default disposition away.
+pub fn install_signal_cleanup() {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // The host calls this per run, and a server host runs many. One
+        // listener is what is wanted; more would race each other to the exit.
+        static INSTALLED: AtomicBool = AtomicBool::new(false);
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sh: SIGTERM handler not installed");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            kill_live_groups();
+            tokio::time::sleep(Duration::from_millis(super::config::task_grace_ms())).await;
+            // 128 + SIGINT, the shell's convention for a signalled exit.
+            std::process::exit(130);
+        });
+    }
+}
 
 pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     let sh_tbl = lua.create_table()?;
@@ -92,8 +191,24 @@ async fn run_async(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Tokio does NOT kill children on drop by default; without this the
-        // timeout below would return while the command kept running.
+        // timeout below would return while the command kept running. It is the
+        // backstop for every way this future can be cancelled; the timeout
+        // path below does not rely on it, because it reaches further.
         .kill_on_drop(true);
+
+    // A group of its own, so a timeout can reach the whole tree rather than
+    // the command alone. `sh -c "cargo test"` is one process and the test
+    // binary is two below it; SIGKILL to the command leaves that binary
+    // running, and on a shared machine it stays. Off by configuration, the
+    // command stays in the host's group and the old reach applies.
+    #[cfg(unix)]
+    let grouped = super::config::sh_process_group();
+    #[cfg(unix)]
+    if grouped {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let grouped = false;
 
     for var in OWN_CREDENTIAL_ENV_VARS {
         command.env_remove(var);
@@ -101,13 +216,36 @@ async fn run_async(
 
     let child = command.spawn().map_err(|e| format!("exec error: {e}"))?;
 
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
+    // Read before the child moves into `wait_with_output`. A group leader's
+    // pid is its group id, which is the handle the timeout needs.
+    let pgid = if grouped {
+        child.id().map(|id| id as i32)
+    } else {
+        None
+    };
+    if let Some(p) = pgid {
+        remember_group(p);
+    }
+
+    let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
+
+    if let Some(p) = pgid {
+        #[cfg(unix)]
+        if waited.is_err() {
+            // SAFETY: see `kill_live_groups`.
+            unsafe {
+                libc::killpg(p, libc::SIGKILL);
+            }
+        }
+        forget_group(p);
+    }
+
+    let output = waited
         .map_err(|_| {
-            // Timeout expired. `child` was moved into `wait_with_output`, so it
-            // cannot be killed by name here; cancelling that future drops the
-            // child, and `kill_on_drop(true)` above turns that drop into a
-            // SIGKILL. Without that flag the child would survive this return.
+            // Timeout expired. Cancelling the wait drops the child, and
+            // `kill_on_drop(true)` turns that into a SIGKILL for the command
+            // itself; the `killpg` above is what reaches what the command
+            // started. Without a group of its own only the first happens.
             format!("timeout after {}s", timeout.as_secs())
         })?
         .map_err(|e| format!("wait error: {e}"))?;

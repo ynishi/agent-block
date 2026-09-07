@@ -14,6 +14,7 @@
 //! | `AGENT_BLOCK_SQL_JOURNAL_MODE`     | `WAL`                    | all      |
 //! | `AGENT_BLOCK_BUS_CAPACITY`         | `64`                     | EventBus |
 //! | `AGENT_BLOCK_TASK_GRACE_MS`        | `1000`                   | task/bus |
+//! | `AGENT_BLOCK_SH_PROCESS_GROUP`     | `1`                      | sh.exec  |
 //! | `AGENT_BLOCK_UNSEAL`               | unset                    | blocks   |
 //!
 //! `AGENT_BLOCK_UNSEAL=1` is the one knob here that is not a path or a bound:
@@ -232,6 +233,27 @@ pub fn task_grace_ms() -> u64 {
             DEFAULT_TASK_GRACE_MS
         }),
         Err(_) => DEFAULT_TASK_GRACE_MS,
+    }
+}
+
+/// Whether `sh.exec` puts each command in a process group of its own.
+/// `AGENT_BLOCK_SH_PROCESS_GROUP` → on. Any of `0` / `false` / `no` / `off`
+/// turns it off; anything else, including unset, leaves it on.
+///
+/// On, a timeout kills the group, so the descendants of the command go with
+/// it — `sh -c "cargo test"` leaves no test binary behind. Off, the command
+/// shares the host's group and a timeout reaches only the command itself,
+/// which is what this knob exists to let a caller choose: a group of its own
+/// also means the terminal's Ctrl-C no longer reaches the command directly.
+/// The host forwards it (see `sh::install_signal_cleanup`), so the effect is
+/// the same for anyone who has not replaced that path.
+pub fn sh_process_group() -> bool {
+    match std::env::var("AGENT_BLOCK_SH_PROCESS_GROUP") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
     }
 }
 
