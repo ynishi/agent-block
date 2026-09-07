@@ -17,7 +17,15 @@
 --     checked = false }`, no event, no call — the honest default rather
 --     than a green nobody verified;
 --   5 the bounds are loud: a `run` that is not a function, one that answers
---     the wrong shape, an option the factory does not know.
+--     the wrong shape, an option the factory does not know;
+--   6 with `timeout`, the seconds handed to `run` are read off the log —
+--     the gap between the kernel's stamps on the last answered check and
+--     the record before it, times `factor`, held between `floor` and
+--     `first` — and nothing about it is kept in the factory, so a fresh
+--     verdict on the same log hands out the same number; `budget` is
+--     refused, because that word is the kernel's;
+--   7 a check that did not answer (`ran = false`) says so on the verdict
+--     and in the log, and is not what the next timeout is read from.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -208,12 +216,14 @@ describe("policy.verdict — driving a real beat", function()
         local device = kernel.device({ llm = support.always(support.text("all done!")) })
         -- The model answers text and asks for nothing: on its own word the
         -- run is over. The check says otherwise for two beats.
-        local greens = 0
+        local greens, handed = 0, {}
         local verdict = policy.verdict({
-            run = function()
+            run = function(timeout)
                 greens = greens + 1
+                handed[#handed + 1] = timeout
                 return { ok = greens >= 3, stderr = greens < 3 and "still red" or "" }
             end,
+            timeout = { first = 900, floor = 1 },
         })
 
         local beats, ended = 0, nil
@@ -246,5 +256,156 @@ describe("policy.verdict — driving a real beat", function()
 
         expect(ended).to.be("verdict")
         expect(beats).to.be(3)
+        -- A real session stamps `epoch_ms`, so the first check is handed
+        -- `first` and every one after it a number read off the log: at least
+        -- the floor, never more than `first`.
+        expect(handed[1]).to.be(900)
+        expect(type(handed[2])).to.be("number")
+        expect(handed[2] >= 1 and handed[2] <= 900).to.be(true)
+        expect(type(handed[3])).to.be("number")
+    end)
+end)
+
+describe("policy.verdict — the seconds a check may take", function()
+    -- History, written rather than waited for. The stand-in passes
+    -- `epoch_ms` through untouched, so a spec can record a check that took
+    -- `secs` the way the kernel would have stamped it: a record before it,
+    -- and the check's own record `secs` later.
+    local function checked_in(s, at_ms, secs, data)
+        s:append({ kind = "msg_user", epoch_ms = at_ms, data = { content = "go" } })
+        s:append({ kind = "verify", epoch_ms = at_ms + secs * 1000, data = data or { ok = false } })
+        return s
+    end
+
+    -- What a fresh verdict hands `run` on `s`. Fresh on purpose: the number
+    -- has to come from the log, not from a verdict that was there when the
+    -- history was made.
+    local function handed(s, timeout)
+        local seen
+        policy.verdict({
+            run = function(t)
+                seen = t
+                return { ok = false }
+            end,
+            timeout = timeout,
+        })(s, {})
+        return seen
+    end
+
+    it("hands the first check the whole of `first`", function()
+        expect(handed(recorder(), { first = 900 })).to.be(900)
+    end)
+
+    it("reads the next off what the last answered check took", function()
+        local s = checked_in(recorder(), 1000, 30)
+        expect(handed(s, { first = 900, factor = 3, floor = 1 })).to.be(90)
+    end)
+
+    it("reads the latest check, not the first", function()
+        local s = checked_in(recorder(), 1000, 30)
+        checked_in(s, 100000, 60)
+        expect(handed(s, { first = 900, factor = 3, floor = 1 })).to.be(180)
+    end)
+
+    it("holds a fast check up to `floor`", function()
+        local s = checked_in(recorder(), 1000, 2)
+        expect(handed(s, { first = 900, factor = 3, floor = 60 })).to.be(60)
+    end)
+
+    it("holds a slow check down to `first`", function()
+        local s = checked_in(recorder(), 1000, 600)
+        expect(handed(s, { first = 900, factor = 3, floor = 60 })).to.be(900)
+    end)
+
+    it("keeps nothing in the factory: the same log hands out the same number", function()
+        local s = checked_in(recorder(), 1000, 30)
+        local timeout = { first = 900, factor = 3, floor = 1 }
+        expect(handed(s, timeout)).to.be(handed(s, timeout))
+    end)
+
+    it("keeps `first` while no check has answered", function()
+        -- Cut off at 900 and never answered: there is nothing to read, so the
+        -- next one may not be shortened on the strength of it.
+        local s = checked_in(recorder(), 1000, 900, { ok = false, ran = false })
+        expect(handed(s, { first = 900, factor = 3, floor = 1 })).to.be(900)
+    end)
+
+    it("keeps `first` when the log carries no clock", function()
+        -- The stand-in stamps `seq` and nothing else, so a check it recorded
+        -- has no `epoch_ms` and measures nothing.
+        local s = recorder()
+        local timeout = { first = 900, factor = 3, floor = 1 }
+        handed(s, timeout)
+        expect(#recorded(s)).to.be(1)
+        expect(handed(s, timeout)).to.be(900)
+    end)
+
+    it("records what it handed the check", function()
+        local s = checked_in(recorder(), 1000, 30)
+        handed(s, { first = 900, factor = 3, floor = 1 })
+        expect(recorded(s)[2].data.timeout_s).to.be(90)
+    end)
+
+    it("reads no log, and hands run nothing, when no timeout was given", function()
+        local s = recorder()
+        local reads, events = 0, s.events
+        s.events = function(self)
+            reads = reads + 1
+            return events(self)
+        end
+        local seen = "untouched"
+        policy.verdict({
+            run = function(t)
+                seen = t
+                return { ok = true }
+            end,
+        })(s, {})
+        expect(seen).to.be(nil)
+        expect(reads).to.be(0)
+        expect(recorded(s)[1].data.timeout_s).to.be(nil)
+    end)
+
+    it("refuses a timeout without a positive `first`", function()
+        expect(function()
+            policy.verdict({ run = function() end, timeout = {} })
+        end).to.fail()
+        expect(function()
+            policy.verdict({ run = function() end, timeout = { first = 0 } })
+        end).to.fail()
+        expect(function()
+            policy.verdict({ run = function() end, timeout = { first = 10, factor = -1 } })
+        end).to.fail()
+    end)
+
+    it("refuses `budget`: that word is the kernel's quota, not a check's seconds", function()
+        expect(function()
+            policy.verdict({ run = function() end, budget = { first = 900 } })
+        end).to.fail()
+    end)
+end)
+
+describe("policy.verdict — a check that did not answer", function()
+    it("says so on the verdict and in the log", function()
+        local s = recorder()
+        local v = policy.verdict({
+            run = function()
+                return { ok = false, ran = false, stderr = "timeout after 300s" }
+            end,
+        })
+        local got = v(s, {})
+        expect(got.checked).to.be(true)
+        expect(got.ran).to.be(false)
+        expect(recorded(s)[1].data.ran).to.be(false)
+    end)
+
+    it("counts a result with no `ran` as answered", function()
+        local s = recorder()
+        local v = policy.verdict({
+            run = function()
+                return { ok = false }
+            end,
+        })
+        expect(v(s, {}).ran).to.be(true)
+        expect(recorded(s)[1].data.ran).to.be(true)
     end)
 end)
