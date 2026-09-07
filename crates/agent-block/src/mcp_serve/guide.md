@@ -103,6 +103,18 @@ one client fall out for free instead of having to be rebuilt here.
 If this surface grows, the direction is reading a run's record rather than
 running longer ones.
 
+## The job manager, from here
+
+The scheduler for long work is `agent-block serve`: a block with a `job.toml`
+beside it runs on its interval, in a process of its own, and the manager
+records every run. This server carries the manager's five verbs as tools —
+`jobs_list`, `runs_list`, `run_get`, `job_run`, `run_stop` — each one route
+of the manager's HTTP listener (`--serve-url`, default `http://127.0.0.1:7788`,
+token from `$AGENT_BLOCK_HOME/serve.token`). `job_run` and `run_stop` record
+a request and answer at once; the manager acts on its next tick, so read the
+outcome back with `runs_list` rather than waiting on the call. When the
+manager is not running the tool says so; starting it is not this server's.
+
 ## Reading a run afterwards
 
 A run leaves a durable record rather than a log to grep: every model call is an

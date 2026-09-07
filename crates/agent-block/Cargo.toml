@@ -41,13 +41,14 @@ rmcp = { workspace = true, features = ["server"] }
 serde.workspace = true
 toml = "0.8"
 uuid.workspace = true
+# The job tools of `agent-block mcp` are a client of `agent-block serve`'s
+# HTTP listener (and `tests/e2e_serve.rs` talks to it directly).
+reqwest.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
-# `tests/e2e_serve.rs` talks to the manager's HTTP listener.
-reqwest.workspace = true
 # Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
 # `transport-streamable-http-server` enables the axum-backed in-process HTTP

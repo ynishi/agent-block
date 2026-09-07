@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent-block mcp` carries the job manager's five verbs as tools —
+  `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` — each one
+  route of `agent-block serve`'s HTTP listener, sent over loopback with the
+  token the manager minted (`--serve-url` names the manager; the default is
+  the manager's default bind). The MCP server is a client of the manager and
+  nothing more: it neither starts it nor waits on a run, and when the manager
+  is not running the tool says so.
 - `agent-block serve`: a thin job manager. A block that has a `job.toml`
   beside it (`every = "2m"`, `timeout = "10m"`, `prompt`, `context`) is run
   on that interval, each run in a process of its own — `agent-block -s
