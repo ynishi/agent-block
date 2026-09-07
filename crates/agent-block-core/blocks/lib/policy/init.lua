@@ -122,6 +122,10 @@
 ---     retry       reads NO log: the `Outcome` it is given, plus `attempt`,
 ---                 which is the caller's own count and is passed in
 ---     escalate    reads NO log: the `Outcome` it is given
+---     verdict     reads the log — `session:events()`, per call, and only
+---                 when `timeout` is given: what the last check took is a
+---                 gap between two of the kernel's stamps, not a number
+---                 the factory kept
 ---
 ---   The escape hatch the design allows — an explicit `run` table the CALLER
 ---   creates and owns for one shell run — is not used by any of the five,
@@ -254,6 +258,14 @@ local DEFAULT_MAX_ATTEMPTS = 3
 --- "verify" because that is what every consumer in this tree already
 --- appends, and a second name for one thing is a second thing to query.
 local DEFAULT_VERDICT_KIND = "verify"
+
+--- How many times what the last check took the next one may take, and the
+--- least it is ever given, when `verdict{ timeout }` is not told. Three
+--- covers a check that builds one more crate than the last did; a minute is
+--- the smallest span in which "it is still compiling" and "it is hung" can
+--- be told apart at all.
+local DEFAULT_TIMEOUT_FACTOR = 3
+local DEFAULT_TIMEOUT_FLOOR = 60
 
 --- How much of the window one tool result may take when `result_cap` is not
 --- told. A quarter leaves room for three more of the same size beside the
@@ -543,10 +555,15 @@ local TOKENS_OPTS, TOKENS_ARG = opts_contract({
 --- the loop does with the answer.
 local VERDICT_OPTS, VERDICT_ARG = opts_contract({
     run = FUNCTION
-        :describe("fn() -> { ok, stdout?, stderr?, exit_code? }; nil = no verdict, the run is the model's word")
+        :describe(
+            "fn(timeout?) -> { ok, ran?, stdout?, stderr?, exit_code? }; nil = no verdict, the run is the model's word"
+        )
         :is_optional(),
     changed = FUNCTION:describe("fn(session) -> boolean; a green with nothing changed is not a pass"):is_optional(),
     kind = T.string:describe('the event kind the answer is recorded under; default "verify"'):is_optional(),
+    timeout = T.table
+        :describe("{ first, factor?, floor? } in seconds; the seconds handed to run, read off what the last check took")
+        :is_optional(),
 })
 
 --- What `policy.result_cap` is configured with. The share is of the window
@@ -1026,6 +1043,33 @@ end
 -- verdict — what ends a run, when the model's word is not enough
 -- ============================================================
 
+--- How long the last check that answered took, in seconds, off the log.
+---
+--- The kernel stamps `epoch_ms` on every record, so a check's time is the
+--- gap between its record and the one before it. Only checks that answered
+--- count (`data.ran ~= false`; a record from before the field existed counts
+--- as answered), and a record without a stamp on either side measures
+--- nothing rather than something wrong. The latest one wins: what the
+--- repository costs to check now is better read off the check that just ran
+--- than off the one that ran first.
+---
+--- @param events table  a session's events, in seq order
+--- @param kind string  the kind checks are recorded under
+--- @return number|nil  seconds, or nil when no check has answered
+local function last_check_seconds(events, kind)
+    local taken
+    for i = 2, #events do
+        local ev = events[i]
+        if ev.kind == kind and type(ev.data) == "table" and ev.data.ran ~= false then
+            local at, before = ev.epoch_ms, events[i - 1].epoch_ms
+            if type(at) == "number" and type(before) == "number" and at >= before then
+                taken = (at - before) / 1000
+            end
+        end
+    end
+    return taken
+end
+
 --- Build the check a loop runs after every beat.
 ---
 ---     local verdict = policy.verdict({ run = function() return build() end })
@@ -1063,16 +1107,76 @@ end
 --- That is the honest default — the alternative, a green with nothing
 --- checked, is the exact claim this module exists to refuse.
 ---
---- @param opts table|nil  { run?, changed?, kind? }
---- @return function verdict  fn(session, out) -> { ok, checked, changed?, result?, reason? }
+--- The seconds a check may take, when the loop wants that decided here
+---
+---   `timeout = { first = <secs>, factor? = <n>, floor? = <secs> }`
+---
+--- Given one, `run` is called with a number of seconds and is expected to
+--- apply it — `sh.exec`'s own `timeout`, or whatever the check is made of;
+--- the option carries that name because it is that number. Lua has no
+--- preemption, so nothing here can cut a check short: `run` is a call, and a
+--- call that does not return does not return. What is decided here is the
+--- number; applying it is the seam's.
+---
+--- It is not the budget. The budget is the kernel's quota — an allocation
+--- the owner granted, spent and never refilled — and this is a limit, given
+--- whole to every check; the kernel's header says the two have different
+--- arithmetic and do not share a counter, and they do not share a word here
+--- either. `budget` in these opts is refused as the state key it is.
+---
+--- The number is read, not kept. Every record the kernel writes carries
+--- `epoch_ms`, so what a check took is the gap between its own record and
+--- the record before it — the beat it judged, in a loop that checks straight
+--- after the beat; whatever the loop did in between is counted with it. The
+--- last check that answered says how long the next may take: `taken *
+--- factor`, held to `floor` below and `first` above. Until one has answered
+--- there is nothing to read and `first` stands — it covers a check that has
+--- to build from nothing. A check that never answered (`ran = false`, below)
+--- is left out: a run cut off at a timeout says nothing about how long the
+--- check takes. Defaults: `factor` 3, `floor` 60.
+---
+--- Read rather than kept for the reason the header gives: a factory closure
+--- holds only what it was configured with, so a resumed session does not
+--- start from `first` again and two loops on one session hand `run` the
+--- same number. That makes `verdict{ timeout }` a log-reading policy — it
+--- reads `session:events()` on every call and is refused a log that does not
+--- fit in one read (`whole_log`), exactly as `stagnation` is. Without
+--- `timeout` nothing is read. A record with no stamp — a stand-in session's,
+--- or one appended by hand — measures nothing rather than something wrong.
+---
+--- A check that did not answer
+---
+--- `run` may say so with `ran = false` — a timeout, a spawn that failed,
+--- anything where the check was attempted and no answer came back. It reaches
+--- the caller as `ran = false` on the verdict and in the log, and it is not
+--- the same event as a check that ran and said no: one is the thing under
+--- test being wrong, the other is not knowing. Absent the field a result
+--- counts as answered, which is what every result meant before it existed.
+---
+--- @param opts table|nil  { run?, changed?, kind?, timeout? }
+--- @return function verdict  fn(session, out) -> { ok, checked, ran, changed?, result?, reason? }
 function M.verdict(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
         error("policy.verdict: opts must be a table", 2)
     end
-    only(opts, { run = true, changed = true, kind = true }, "policy.verdict")
+    only(opts, { run = true, changed = true, kind = true, timeout = true }, "policy.verdict")
     if opts.run ~= nil and type(opts.run) ~= "function" then
-        error("policy.verdict: run must be a function (fn() -> { ok, ... })", 2)
+        error("policy.verdict: run must be a function (fn(timeout?) -> { ok, ... })", 2)
+    end
+    if opts.timeout ~= nil then
+        if type(opts.timeout) ~= "table" then
+            error("policy.verdict: timeout must be a table { first, factor?, floor? }", 2)
+        end
+        if type(opts.timeout.first) ~= "number" or opts.timeout.first <= 0 then
+            error("policy.verdict: timeout.first must be a positive number of seconds", 2)
+        end
+        for _, k in ipairs({ "factor", "floor" }) do
+            local v = opts.timeout[k]
+            if v ~= nil and (type(v) ~= "number" or v <= 0) then
+                error("policy.verdict: timeout." .. k .. " must be a positive number", 2)
+            end
+        end
     end
     if opts.changed ~= nil and type(opts.changed) ~= "function" then
         error("policy.verdict: changed must be a function (fn(session) -> boolean)", 2)
@@ -1084,6 +1188,14 @@ function M.verdict(opts)
 
     local run, changed = opts.run, opts.changed
     local kind = opts.kind or DEFAULT_VERDICT_KIND
+    -- Frozen at construction, like every other factory's opts. Nothing about
+    -- a particular run lives here; what the last check took is in the log.
+    local first, factor, floor
+    if opts.timeout then
+        first = opts.timeout.first
+        factor = opts.timeout.factor or DEFAULT_TIMEOUT_FACTOR
+        floor = opts.timeout.floor or DEFAULT_TIMEOUT_FLOOR
+    end
 
     return function(session, out)
         if run == nil then
@@ -1091,19 +1203,40 @@ function M.verdict(opts)
         end
         needs_session(session, "policy.verdict")
 
-        local result = run()
+        local timeout
+        if first then
+            local taken = last_check_seconds(whole_log(session, "policy.verdict"), kind)
+            if taken == nil then
+                timeout = first
+            else
+                timeout = taken * factor
+                if timeout < floor then
+                    timeout = floor
+                end
+                if timeout > first then
+                    timeout = first
+                end
+            end
+        end
+
+        local result = run(timeout)
         if type(result) ~= "table" or type(result.ok) ~= "boolean" then
             error("policy.verdict: run must answer { ok = <boolean>, ... }, got " .. tostring(result), 2)
         end
+        local ran = result.ran ~= false
 
         -- Recorded before it is judged, and recorded either way: the log is
         -- what says the check happened, and a check whose answer decided
-        -- nothing is still a fact about the run.
+        -- nothing is still a fact about the run. What the check took is not
+        -- written here: the kernel's `epoch_ms` on this record and the one
+        -- before it already say it, and a second copy could disagree.
         session:append({
             kind = kind,
             beat = type(out) == "table" and out.beat or nil,
             data = {
                 ok = result.ok,
+                ran = ran,
+                timeout_s = timeout,
                 stdout = tostring(result.stdout or ""),
                 stderr = tostring(result.stderr or ""),
                 exit_code = result.exit_code,
@@ -1111,18 +1244,19 @@ function M.verdict(opts)
         })
 
         if not result.ok then
-            return { ok = false, checked = true, result = result }
+            return { ok = false, checked = true, ran = ran, result = result }
         end
         if changed == nil then
-            return { ok = true, checked = true, result = result }
+            return { ok = true, checked = true, ran = ran, result = result }
         end
         local moved = changed(session) == true
         if moved then
-            return { ok = true, checked = true, changed = true, result = result }
+            return { ok = true, checked = true, ran = ran, changed = true, result = result }
         end
         return {
             ok = false,
             checked = true,
+            ran = ran,
             changed = false,
             result = result,
             reason = "unchanged",
