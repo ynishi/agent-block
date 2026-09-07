@@ -91,6 +91,12 @@ thiserror.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 seccompiler.workspace = true
+
+# `killpg` for `sh.exec`'s timeout, which is a POSIX call and not a Linux one —
+# the binaries built for macOS need it as much as the Linux ones do. It is
+# listed here rather than only above so the sandbox's Linux-only-ness does not
+# decide it.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

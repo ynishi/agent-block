@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A timed-out `sh.exec` takes what the command started with it. It killed the
+  command and nothing below it: `kill_on_drop` reaches the direct child, and
+  `sh -c "cargo test"` is one process with the test binary two below, so a
+  build that hung left that binary running. On a shared machine it stays there
+  — this host has been brought down once by concurrent builds, and an
+  unattended loop that times out repeatedly is the same shape arriving on its
+  own. Each command now runs in a process group of its own and the timeout
+  kills the group. Measured both ways: with the group the descendant is gone
+  after the timeout, without it the descendant is still running.
+
+  A group of its own also takes the command out of the group the terminal
+  signals, so Ctrl-C no longer reaches it directly. The host forwards it — one
+  listener kills the live groups, waits `AGENT_BLOCK_TASK_GRACE_MS`, then ends
+  the process. The wait is what lets a shutdown path that is already listening
+  finish first, which is why `bus.serve`'s own handler still runs the show when
+  it is the one serving; the exit is what keeps Ctrl-C meaning what it did for
+  a plain script, since installing a listener at all takes the default
+  disposition away.
+
+  `AGENT_BLOCK_SH_PROCESS_GROUP=0` puts it back the way it was, for a caller
+  who wants the command in the host's own group. `libc` moves from a
+  Linux-only dependency to a Unix one, because `killpg` is POSIX and the macOS
+  builds need it too.
+
 ### Changed
 
 - The MCP guide says what this surface is for, and what it is not. A stdio
