@@ -91,6 +91,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Whether `bus.serve` has been entered in this process. Read by the
+/// signal cleanup in `sh` to decide who ends the process on a terminating
+/// signal: while a script is serving, the signal ends `bus.serve` and the
+/// script's own return does the rest, so the cleanup's timed exit stands
+/// down. Never cleared — a process that served once is a serving process
+/// to the end, and what follows `bus.serve` in the script is part of it.
+static SERVING: AtomicBool = AtomicBool::new(false);
+
+/// Whether `bus.serve` has been entered in this process.
+pub fn is_serving() -> bool {
+    SERVING.load(Ordering::SeqCst)
+}
+
 use async_trait::async_trait;
 use mlua::prelude::*;
 use mlua_isle::{AsyncIsle, CancelToken, IsleError};
@@ -464,6 +477,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 if serving.swap(true, Ordering::SeqCst) {
                     return Err(LuaError::external("bus.serve: already running"));
                 }
+                SERVING.store(true, Ordering::SeqCst);
 
                 // Take the EventBus out of the mutex BEFORE any await.
                 let bus = {

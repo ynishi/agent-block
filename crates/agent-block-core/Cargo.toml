@@ -84,6 +84,10 @@ async-trait.workspace = true
 dotenvy.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+# The HTTP bus source (`bus::http_source`): one listener that turns a request
+# into an event and the handler's answer into the response. `json` is for the
+# reply body; the client side of HTTP stays on `reqwest` above.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 
 # Sandbox backend (`crate::sandbox`). Linux-only: Landlock and seccomp have no
 # equivalent elsewhere, and `sandbox::apply` returns an explicit "Linux-only"

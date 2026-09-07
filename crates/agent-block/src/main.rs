@@ -5,6 +5,7 @@
 
 mod blocks;
 mod mcp_serve;
+mod serve;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -112,6 +113,14 @@ enum Command {
     /// { "command": "agent-block", "args": ["mcp", "--project", "/path/to/project"] }
     /// ```
     Mcp(mcp_serve::McpArgs),
+    /// Run the job manager: start the blocks that declare a `job.toml` on
+    /// their interval, each in a process of its own, and answer
+    /// submit / list / stop / read over a loopback HTTP listener.
+    ///
+    /// One long-lived process per machine is the shape: the unit a service
+    /// manager holds is this one, and a lane adds or removes a job by adding
+    /// or removing a file beside its block.
+    Serve(serve::ServeArgs),
 }
 
 // Deliberately *not* `#[tokio::main]`: the sandbox has to be installed before
@@ -144,7 +153,9 @@ fn startup() -> anyhow::Result<()> {
     // subcommand: `mcp` speaks JSON-RPC on stdout, so a log line written there
     // is a protocol violation, not noise. Nothing logs before this point.
     let cli = Cli::parse();
-    let log_to_stderr = matches!(cli.command, Some(Command::Mcp(_)));
+    // stdio MCP owns stdout; a long-lived manager's logs are what a service
+    // manager collects, and stderr is where it looks.
+    let log_to_stderr = matches!(cli.command, Some(Command::Mcp(_)) | Some(Command::Serve(_)));
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -183,8 +194,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_RPC_TIMEOUT);
 
-    if let Some(Command::Mcp(args)) = cli.command {
-        return mcp_serve::serve(args, &cli.project, mcp_rpc_timeout).await;
+    match cli.command {
+        Some(Command::Mcp(args)) => {
+            return mcp_serve::serve(args, &cli.project, mcp_rpc_timeout).await;
+        }
+        Some(Command::Serve(args)) => {
+            return serve::serve(args, &cli.project, mcp_rpc_timeout).await;
+        }
+        None => {}
     }
 
     // clap cannot mark `script` required now that `--block` or a subcommand

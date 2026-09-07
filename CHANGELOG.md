@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `agent-block serve`: a thin job manager. A block that has a `job.toml`
+  beside it (`every = "2m"`, `timeout = "10m"`, `prompt`, `context`) is run
+  on that interval, each run in a process of its own — `agent-block -s
+  <block>` in the block's project root, with its own `.env` and its own
+  session log — and the manager records every start and end on a session log
+  of its own (`$AGENT_BLOCK_HOME/serve.sqlite`), which is the only thing it
+  reads to decide: one live run per job, `every` counted from the previous
+  end, a manager-wide `--max-runs`, a run that never ended closed as `lost`
+  on the next start. The manager holds no state of its own; a restart
+  continues the same record (each start opens a session of its own and reads
+  across all of them with the kernel's `$sessions`). It answers over a
+  loopback HTTP listener (`--bind`,
+  default `127.0.0.1:7788`; a bearer token minted into
+  `$AGENT_BLOCK_HOME/serve.token` is required on every request): `GET /jobs`,
+  `GET /runs`, `GET /runs/<id>`, `POST /jobs/<name>/runs` (run now),
+  `DELETE /runs/<id>` (stop). The unit a service manager holds is this one
+  process; a lane adds or removes a job by adding or removing a file.
+  `docs/runbooks/job-serve.md` has the systemd and launchd units.
+- `job` (`require("job")`): the manager's Lua — `decl` / `read` / `tick` /
+  `run` / `reconcile` / `runs` / `request` / `stop`. `tick` is a pure
+  function of the declarations, the facts read off the log, and the time, so
+  the decision is specified without a clock or a process; `run` is a record,
+  a `sh.exec`, and a record.
+- `bus.on("http", ...)` has a source: `BlockConfig::http_source` starts an
+  axum listener whose every request becomes an event (`{ method, path,
+  query, body }`) and whose handler's `{ status?, body? }` is the response.
+  `Host` and `Origin` must name a loopback host or the bound address (a 403
+  otherwise — a loopback bind alone does not stop DNS rebinding), and a
+  configured bearer token is required (401). Nothing that fails those checks
+  reaches Lua.
+- `sh.exec` says `timed_out = true` on a result that hit its `timeout`,
+  beside the `error` message it already carried, so a caller can tell a
+  command that did not answer from one that could not start without reading
+  prose.
+
 ### Fixed
 
 - A timed-out `sh.exec` takes what the command started with it. It killed the

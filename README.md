@@ -223,6 +223,57 @@ are different events and only the block knows which happened.
 Because stdio transport owns stdout, this mode writes its logs to stderr, which
 is where MCP clients surface server logs — including the `ab.obs` lines.
 
+## Running blocks on a schedule
+
+`agent-block serve` is a thin job manager: a block that has a `job.toml`
+beside it runs on that interval, each run in a process of its own, and the
+manager keeps the record.
+
+```toml
+# blocks/drain/job.toml — beside blocks/drain/init.lua
+every   = "2m"     # since the previous run ended; omit to run only on request
+timeout = "10m"    # the run's process group is killed at this; default 10m
+prompt  = "..."    # _PROMPT in the block; optional
+context = "..."    # _CONTEXT; optional
+```
+
+```sh
+agent-block serve --project .          # 127.0.0.1:7788, tick 5s, at most 4 live runs
+```
+
+A run is `agent-block -s <block>` started in the block's project root, so it
+loads that project's `.env` and writes its own session log under
+`~/.agent-block/runs/<job>/`. The manager itself decides nothing it cannot
+read back: every start and end is a record on its own log
+(`~/.agent-block/serve.sqlite`), `every` counts from the previous end, one
+run per job is live at a time, a run the manager did not survive is closed
+as `lost` on the next start, and a restart continues the same record (each
+start opens a session of its own and reads across all of them). Adding
+the file adds the job; removing it removes the job; there is nothing to
+write for a service manager beyond the one unit that runs `serve` itself
+(`docs/runbooks/job-serve.md` has systemd and launchd units).
+
+The listener answers with a bearer token (`~/.agent-block/serve.token`,
+minted on first start) on every request:
+
+| Route | Meaning |
+|---|---|
+| `GET /jobs` | the declarations, each with its last end and live run |
+| `GET /runs?job=&limit=` | runs, newest first |
+| `GET /runs/<id>` | one run, with the tail of its stderr |
+| `POST /jobs/<name>/runs` | ask for a run now; the next tick starts it (202) |
+| `DELETE /runs/<id>` | ask a live run to stop; the next tick kills its group (202) |
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.agent-block/serve.token)" http://127.0.0.1:7788/jobs
+```
+
+Loopback is the default and a tunnel (`ssh -L`, a mesh VPN) is how it is
+reached from elsewhere; `--bind 0.0.0.0:7788` is the opt-in to a wider bind,
+behind the same token. `Host` and `Origin` must name a loopback host or the
+bound address — a loopback bind on its own does not stop a page in a local
+browser from reaching it.
+
 ## Sandbox mode (Linux)
 
 `--sandbox` wraps the whole process in an OS-level execution boundary built from
