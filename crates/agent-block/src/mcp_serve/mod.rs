@@ -18,6 +18,7 @@
 //! | Kind | Name | Meaning |
 //! |---|---|---|
 //! | tool | `run_block` | run one registered block, return what it returned |
+//! | tool | `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` | the job manager's verbs, as a client of `agent-block serve` (see [`jobs`]) |
 //! | resource | `agent-block://guide` | how to write a block for this surface |
 //! | resource | `agent-block://blocks` | the registry, as JSON |
 //! | resource | `agent-block://blocks/<name>` | one block's source |
@@ -36,6 +37,8 @@
 //! clients surface a server's stderr as its log, which is where the `ab.obs`
 //! lines land.
 
+pub mod jobs;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +48,7 @@ use crate::blocks::{self, Block};
 use agent_block_core::host::{PromptSource, ScriptSource};
 use agent_block_core::{run_capture, BlockConfig};
 use clap::Args;
+use jobs::JobsClient;
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListResourcesResult,
@@ -79,6 +83,10 @@ pub struct McpArgs {
     /// inside the directory.
     #[arg(long = "block-dir", value_name = "DIR")]
     pub block_dirs: Vec<PathBuf>,
+    /// Where `agent-block serve` listens. The job tools (`jobs_list` /
+    /// `runs_list` / `run_get` / `job_run` / `run_stop`) are a client of it.
+    #[arg(long = "serve-url", value_name = "URL", default_value = jobs::DEFAULT_SERVE_URL)]
+    pub serve_url: String,
 }
 
 /// Description shown for the `run_block` tool, listing what is registered.
@@ -118,6 +126,8 @@ struct BlockServer {
     extra_dirs: Arc<Vec<PathBuf>>,
     project_root: PathBuf,
     mcp_rpc_timeout: Duration,
+    /// The job manager's verbs, answered by asking `agent-block serve`.
+    jobs: JobsClient,
 }
 
 impl BlockServer {
@@ -241,12 +251,13 @@ impl ServerHandler for BlockServer {
             "required": ["block"]
         });
 
-        let tool = Tool::new(
+        let mut tools = vec![Tool::new(
             "run_block",
             run_block_description(&blocks),
             Arc::new(schema.as_object().cloned().unwrap_or_default()),
-        );
-        std::future::ready(Ok(ListToolsResult::with_all_items(vec![tool])))
+        )];
+        tools.extend(self.jobs.tools());
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
     }
 
     async fn call_tool(
@@ -254,13 +265,16 @@ impl ServerHandler for BlockServer {
         params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        match params.name.as_ref() {
-            "run_block" => self.run_block(&params).await,
-            other => Err(McpError::invalid_params(
-                format!("unknown tool: {other}"),
-                None,
-            )),
+        if params.name.as_ref() == "run_block" {
+            return self.run_block(&params).await;
         }
+        if let Some(answer) = self.jobs.call_tool(&params).await {
+            return answer;
+        }
+        Err(McpError::invalid_params(
+            format!("unknown tool: {}", params.name),
+            None,
+        ))
     }
 
     fn list_resources(
@@ -375,6 +389,7 @@ pub async fn serve(
         extra_dirs: Arc::new(extra_dirs),
         project_root: project_root.to_path_buf(),
         mcp_rpc_timeout,
+        jobs: JobsClient::new(args.serve_url),
     };
 
     let found = server.blocks();
@@ -411,6 +426,7 @@ mod tests {
             extra_dirs: Arc::new(vec![dir.path().to_path_buf()]),
             project_root: dir.path().to_path_buf(),
             mcp_rpc_timeout: Duration::from_secs(30),
+            jobs: JobsClient::new(jobs::DEFAULT_SERVE_URL),
         };
 
         assert!(server
@@ -431,6 +447,7 @@ mod tests {
             extra_dirs: Arc::new(vec![dir.path().to_path_buf()]),
             project_root: dir.path().to_path_buf(),
             mcp_rpc_timeout: Duration::from_secs(30),
+            jobs: JobsClient::new(jobs::DEFAULT_SERVE_URL),
         };
 
         assert_eq!(server.read_uri(GUIDE_URI).unwrap().1, GUIDE_MIME);

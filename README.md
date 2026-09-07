@@ -206,6 +206,7 @@ carry the tool's `prompt` / `context` arguments, exactly as the CLI flags do.
 | Surface | Meaning |
 |---|---|
 | tool `run_block` | run one registered block; `block` is an enum of the registered names |
+| tools `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` | the job manager's verbs, as a client of `agent-block serve` (`--serve-url`; see below) |
 | resource `agent-block://guide` | the authoring contract, in full |
 | resource `agent-block://blocks` | the registry as JSON |
 | resource `agent-block://blocks/<name>` | one block's source |
