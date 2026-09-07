@@ -126,6 +126,15 @@ pub fn install_signal_cleanup() {
             }
             kill_live_groups();
             tokio::time::sleep(Duration::from_millis(super::config::task_grace_ms())).await;
+            // `bus.serve` has a handler for the same signal and ends the
+            // run through the script — it returns, what follows it runs,
+            // the host shuts down, the process exits 0. That path is not
+            // bounded by this grace (a manager records what it stopped
+            // before leaving), so while it is serving the exit is its.
+            if super::bus::is_serving() {
+                tracing::info!("sh: signal forwarded; bus.serve owns the exit");
+                return;
+            }
             // 128 + SIGINT, the shell's convention for a signalled exit.
             std::process::exit(130);
         });
@@ -163,10 +172,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                         t.set("stderr", stderr)?;
                         Ok(t)
                     }
-                    Err(e) => {
+                    Err(failure) => {
                         let t = lua.create_table()?;
                         t.set("ok", false)?;
-                        t.set("error", e)?;
+                        t.set("error", failure.message)?;
+                        // Said as a field and not only in the message: a
+                        // caller that tells "did not answer in time" from
+                        // "could not start" should not have to parse prose.
+                        t.set("timed_out", failure.timed_out)?;
                         Ok(t)
                     }
                 }
@@ -178,11 +191,36 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
     Ok(())
 }
 
+/// Why a command did not answer, and whether that was the timeout. The
+/// message is what `sh.exec` puts in `error`; `timed_out` is the one
+/// distinction a caller acts on differently (a run that did not answer is
+/// not a run that answered no).
+struct ExecFailure {
+    message: String,
+    timed_out: bool,
+}
+
+impl ExecFailure {
+    fn timed_out(message: String) -> Self {
+        Self {
+            message,
+            timed_out: true,
+        }
+    }
+
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            timed_out: false,
+        }
+    }
+}
+
 async fn run_async(
     cmd: &str,
     cwd: &PathBuf,
     timeout: Duration,
-) -> Result<(i32, String, String), String> {
+) -> Result<(i32, String, String), ExecFailure> {
     let mut command = tokio::process::Command::new("sh");
     command
         .arg("-c")
@@ -214,7 +252,9 @@ async fn run_async(
         command.env_remove(var);
     }
 
-    let child = command.spawn().map_err(|e| format!("exec error: {e}"))?;
+    let child = command
+        .spawn()
+        .map_err(|e| ExecFailure::other(format!("exec error: {e}")))?;
 
     // Read before the child moves into `wait_with_output`. A group leader's
     // pid is its group id, which is the handle the timeout needs.
@@ -246,9 +286,9 @@ async fn run_async(
             // `kill_on_drop(true)` turns that into a SIGKILL for the command
             // itself; the `killpg` above is what reaches what the command
             // started. Without a group of its own only the first happens.
-            format!("timeout after {}s", timeout.as_secs())
+            ExecFailure::timed_out(format!("timeout after {}s", timeout.as_secs()))
         })?
-        .map_err(|e| format!("wait error: {e}"))?;
+        .map_err(|e| ExecFailure::other(format!("wait error: {e}")))?;
 
     let code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

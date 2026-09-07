@@ -81,6 +81,7 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "supervisor",
         include_str!("../blocks/lib/supervisor/init.lua"),
     ),
+    ("job", include_str!("../blocks/lib/job/init.lua")),
 ];
 
 /// Embedded modules a filesystem copy may not replace.
@@ -621,6 +622,11 @@ pub struct BlockConfig {
     /// Defaults to `None` (legacy behavior: `run()` only completes when
     /// the script returns naturally).
     pub shutdown_token: Option<CancellationToken>,
+    /// An HTTP listener that feeds the bus ([`crate::bus::http_source`]):
+    /// every request becomes an event the script handles with `bus.on`, and
+    /// the handler's answer is the response. Started before the script
+    /// runs, stopped after it returns. Defaults to `None`.
+    pub http_source: Option<crate::bus::http_source::HttpSourceConfig>,
 }
 
 impl BlockConfig {
@@ -686,6 +692,7 @@ pub struct BlockConfigBuilder {
     extra_globals: HashMap<String, serde_json::Value>,
     auto_serve_bus: bool,
     shutdown_token: Option<CancellationToken>,
+    http_source: Option<crate::bus::http_source::HttpSourceConfig>,
 }
 
 impl BlockConfigBuilder {
@@ -708,6 +715,7 @@ impl BlockConfigBuilder {
             extra_globals: HashMap::new(),
             auto_serve_bus: false,
             shutdown_token: None,
+            http_source: None,
         }
     }
 
@@ -828,6 +836,13 @@ impl BlockConfigBuilder {
         self
     }
 
+    /// Start an HTTP listener that feeds the bus
+    /// (`BlockConfig::http_source`). Defaults to `None`.
+    pub fn http_source(mut self, http_source: crate::bus::http_source::HttpSourceConfig) -> Self {
+        self.http_source = Some(http_source);
+        self
+    }
+
     /// Finalize the builder into a [`BlockConfig`].
     pub fn build(self) -> BlockConfig {
         BlockConfig {
@@ -848,6 +863,7 @@ impl BlockConfigBuilder {
             extra_globals: self.extra_globals,
             auto_serve_bus: self.auto_serve_bus,
             shutdown_token: self.shutdown_token,
+            http_source: self.http_source,
         }
     }
 }
@@ -2024,6 +2040,19 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         &bus_tx,
     )
     .await?;
+
+    // The HTTP source, when asked for: bound now so a bind failure is the
+    // run's error rather than a listener that quietly never came up, and
+    // stopped after the script returns (below), alongside the auto-serve
+    // dispatcher.
+    let http_source = match &config.http_source {
+        Some(cfg) => Some(
+            crate::bus::http_source::start(cfg.clone(), bus_tx.clone())
+                .await
+                .map_err(BlockError::Bus)?,
+        ),
+        None => None,
+    };
     // `secret_key` / `relay_url` are consumed only by the mesh connect path.
     #[cfg(not(feature = "mesh"))]
     let _ = (&secret_key_resolved, &config.relay_url);
@@ -2174,6 +2203,9 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // Let the dispatcher drain events queued by the script, then signal
     // shutdown and bound the join. Mirrors `bus.serve`'s grace pattern.
     drain_auto_serve(auto_serve_state).await;
+    if let Some(listener) = http_source {
+        listener.shutdown().await;
+    }
 
     // ── Shutdown ──────────────────────────────────────────────────
     shutdown(

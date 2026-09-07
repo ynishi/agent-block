@@ -10,6 +10,7 @@
 
 pub mod dispatcher;
 pub mod event;
+pub mod http_source;
 pub mod source;
 
 // Consumed by `bridge::bus` (Lua bridge) and `host::BusRelayHandler`

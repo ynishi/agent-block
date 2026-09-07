@@ -36,11 +36,18 @@ rustls.workspace = true
 # built from) for `agent-block mcp`. The workspace default enables the client
 # features the SDK needs; cargo unions the two.
 rmcp = { workspace = true, features = ["server"] }
+# `agent-block serve`: the job declarations beside blocks are TOML, and the
+# bearer token the listener requires is minted once from random bytes.
+serde.workspace = true
+toml = "0.8"
+uuid.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# `tests/e2e_serve.rs` talks to the manager's HTTP listener.
+reqwest.workspace = true
 # Enable rmcp `server` (and transitively `transport-async-rw`) for in-process
 # concurrency tests that run an MCP server over tokio::io::duplex pipes.
 # `transport-streamable-http-server` enables the axum-backed in-process HTTP
