@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The MCP guide says what this surface is for, and what it is not. A stdio
+  server is a subprocess of its client, so a run still going when the client's
+  session ends goes with it, and the environment is the one the client launched
+  the server with rather than the caller's shell — `AGENT_BLOCK_KNL_PATH` set
+  per run reaches the shell that set it and nothing else, so every run through
+  this server writes to the one session log resolved at startup. Both are
+  properties of the transport, not gaps to close: a stdio server outliving its
+  client would be the bug. What the guide adds is the consequence — the blocks
+  that belong here are the ones whose answer belongs in the conversation, long
+  work gets its own process through the CLI owned by whatever schedules it, and
+  a block that wants its own log takes the path as an argument and opens with
+  `store = { sqlite = <path> }`. Long blocks still run; they are not refused.
+
 ## [0.38.0] - 2026-09-06
 
 ### Removed
