@@ -510,12 +510,19 @@ local function outcome_of(result)
         return "failed", nil, "run answered " .. tostring(result)
     end
     if result.ok then
+        -- Ended by `sh.kill` — a stop request, or the manager leaving and
+        -- taking its runs with it. `killed` is the fact; the exit code that
+        -- leaves depends on what the command was (a signalled process has
+        -- none, a nested host that forwarded the signal exits 130), so it
+        -- is recorded but not read.
+        if result.killed == true then
+            return "stopped", result.code, nil
+        end
         if result.code == 0 then
             return "ok", 0, nil
         end
-        -- No exit code is a process ended by a signal: `sh.exec` answers -1
-        -- for it. That is a run someone stopped — a stop request, or the
-        -- manager leaving and taking its runs with it — not a run that said no.
+        -- No exit code is a process ended by a signal from elsewhere: still
+        -- a run someone stopped, not a run that said no.
         if type(result.code) == "number" and result.code < 0 then
             return "stopped", result.code, nil
         end
@@ -574,7 +581,11 @@ function M.run(session, decl, opts)
         },
     })
 
-    local result = exec(M.command(decl, opts.log, { bin = opts.bin }), { cwd = decl.cwd, timeout = decl.timeout })
+    -- `label` is what a stop reaches the process by: `sh.kill(run_id)` ends
+    -- the run's whole group, and this call answers with no exit code, which
+    -- is read as `stopped` below.
+    local result =
+        exec(M.command(decl, opts.log, { bin = opts.bin }), { cwd = decl.cwd, timeout = decl.timeout, label = run_id })
     local took = now() - started
     local outcome, exit_code, err = outcome_of(result)
 
