@@ -76,6 +76,32 @@ that ran and decided the answer is "no" should instead return successfully with
 that fact in its JSON — the two are different events, and only the block knows
 which one happened.
 
+## How long a block should run here
+
+This server speaks stdio, which means the client launched it as a subprocess:
+it lives exactly as long as the client's session. A run still going when that
+session ends goes with it. Nothing in the protocol changes that — a stdio
+server outliving its client would be the bug, not the feature.
+
+The environment is the server's too, fixed when the client launched it, not the
+caller's shell. So anything that has to vary per call has to arrive in
+`prompt` — `AGENT_BLOCK_KNL_PATH` set per run reaches the shell that set it and
+not this server, and every run here writes to the one session log the server
+resolved at startup. A block that wants its own log takes the path as an
+argument and opens its session with `store = { sqlite = <path> }`.
+
+So the blocks that belong on this surface are the ones whose answer belongs in
+the conversation: fetch a specification, read some state, write a result back.
+A long one — a coding loop, a batch over many inputs — will run, and is not
+refused, but it is being run in the wrong place. Give that work its own process
+through the CLI, owned by whatever schedules it, and let this server be the
+entry point rather than the executor. One run per process is what makes the
+per-run environment, the per-run session log, and a lifetime independent of any
+one client fall out for free instead of having to be rebuilt here.
+
+If this surface grows, the direction is reading a run's record rather than
+running longer ones.
+
 ## Reading a run afterwards
 
 A run leaves a durable record rather than a log to grep: every model call is an
