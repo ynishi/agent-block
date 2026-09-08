@@ -20,6 +20,7 @@
 --   CODING_REPO      the directory verify runs in and targets are under (default: cwd)
 --   CODING_ITERS     iterations, each ending in a verify (default 5)
 --   CODING_TURNS     beats per iteration before verify runs anyway (default 8)
+--   CODING_BASELINE  "false" skips the verify before the first beat (default: run it)
 --
 -- The exit code is 0 whenever the loop ran — `ok` in the value says whether
 -- the verify passed — and non-zero only when it could not run (missing input
@@ -77,6 +78,7 @@ local result = coding.run({
     llm = llm,
     iters = tonumber(E.get("CODING_ITERS") or "5"),
     turns = tonumber(E.get("CODING_TURNS") or "8"),
+    baseline = E.get("CODING_BASELINE") ~= "false",
 })
 
 print("[coding_loop] " .. result.summary)
