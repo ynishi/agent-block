@@ -397,6 +397,13 @@ local BACKEND_CONF = {
     on_decoded = true,
 }
 
+--- The first line of what the host's http device raised: the sentence, not
+--- the traceback that rides behind it in dev mode. That is what a warning
+--- line and a health answer carry; the raise itself is let out whole.
+local function first_line(raised)
+    return (tostring(raised):match("^[^\n]*"))
+end
+
 --- POST with retries for the failures worth retrying.
 ---
 --- Rate limits, overload and 5xx come back on their own; auth failures,
@@ -432,7 +439,7 @@ local function post_with_retry(url, request_opts, max_retries)
             if attempt >= max_retries then
                 error(resp, 0)
             end
-            classified = { kind = "transport", retryable = true, message = tostring(resp) }
+            classified = { kind = "transport", retryable = true, message = first_line(resp) }
         end
         attempt = attempt + 1
         local delay = M.retry_delay(attempt, classified, attempt)
@@ -742,7 +749,7 @@ function M.ping(url, headers, timeout)
         timeout = timeout or PROBE_TIMEOUT,
     })
     if not ok then
-        return nil, "ping " .. url .. ": " .. tostring(resp)
+        return nil, "ping " .. url .. ": " .. first_line(resp)
     end
     return { status = resp.status, body = resp.body, headers = resp.headers }, nil
 end
