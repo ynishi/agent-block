@@ -205,12 +205,16 @@ SELECT json_extract(s.data, '$.job')    AS job,
           WHERE e.stream IN $sessions
             AND e.kind = 'run_ended'
             AND json_extract(e.data, '$.run_id') = json_extract(s.data, '$.run_id'))
- ORDER BY s.seq
+ ORDER BY s.epoch_ms, s.seq
 ]]
 
 --- The requests nothing has answered yet: `{ job, seq, by }`. A request is
 --- answered by any `run_started` or `run_skipped` for the same job that
---- comes after it.
+--- comes after it — after in TIME (`epoch_ms`), never in `seq`: `seq`
+--- counts within one stream, and a manager's record spans one stream per
+--- start, so a start from yesterday's stream can carry a larger `seq` than
+--- today's request. Read by `seq`, it answered the request; the run never
+--- began.
 local REQUESTED_SQL = [[
 SELECT json_extract(r.data, '$.job') AS job,
        r.seq                         AS seq,
@@ -222,9 +226,9 @@ SELECT json_extract(r.data, '$.job') AS job,
          SELECT 1 FROM events AS s
           WHERE s.stream IN $sessions
             AND s.kind IN ('run_started', 'run_skipped')
-            AND s.seq > r.seq
+            AND s.epoch_ms >= r.epoch_ms
             AND json_extract(s.data, '$.job') = json_extract(r.data, '$.job'))
- ORDER BY r.seq
+ ORDER BY r.epoch_ms, r.seq
 ]]
 
 --- The runs, newest first, each start joined to its end if it has one:
@@ -248,7 +252,7 @@ SELECT json_extract(s.data, '$.job')       AS job,
    AND json_extract(e.data, '$.run_id') = json_extract(s.data, '$.run_id')
  WHERE s.stream IN $sessions
    AND s.kind = 'run_started'
- ORDER BY s.seq DESC
+ ORDER BY s.epoch_ms DESC, s.seq DESC
  LIMIT :limit
 ]]
 
@@ -270,7 +274,7 @@ SELECT json_extract(s.data, '$.job')       AS job,
  WHERE s.stream IN $sessions
    AND s.kind = 'run_started'
    AND json_extract(s.data, '$.job') = :job
- ORDER BY s.seq DESC
+ ORDER BY s.epoch_ms DESC, s.seq DESC
  LIMIT :limit
 ]]
 
@@ -309,7 +313,7 @@ SELECT json_extract(r.data, '$.run_id') AS run_id,
           WHERE e.stream IN $sessions
             AND e.kind = 'run_ended'
             AND json_extract(e.data, '$.run_id') = json_extract(r.data, '$.run_id'))
- ORDER BY r.seq
+ ORDER BY r.epoch_ms, r.seq
 ]]
 
 --- Rows of one statement, or a raise that says the read was cut short — a
@@ -342,7 +346,10 @@ end
 --- across the set with the kernel's own `$sessions`, while every write goes
 --- to the current session. Facts do not move between streams; the set is
 --- what makes `every` count from a run the previous process ended and
---- `reconcile` find what it left live.
+--- `reconcile` find what it left live. Across streams only `epoch_ms`
+--- orders events — `seq` starts again with each — so every "after" and
+--- every "newest first" here is by time, with `seq` breaking ties within a
+--- stream.
 ---
 --- @param session userdata|table  the manager's current knl session
 --- @param opts table|nil  { sessions? }

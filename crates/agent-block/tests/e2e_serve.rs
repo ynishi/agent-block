@@ -224,6 +224,16 @@ fn write_project(root: &Path) -> PathBuf {
         ),
     )
     .expect("write job.toml");
+    // A job without `every`: it runs only when asked, which is what tells a
+    // request that worked from a run that was due anyway.
+    let manual_dir = root.join("blocks/manual");
+    std::fs::create_dir_all(&manual_dir).expect("mkdir blocks/manual");
+    std::fs::write(
+        manual_dir.join("init.lua"),
+        "-- manual: returns.\nreturn std.json.encode({ ok = true })\n",
+    )
+    .expect("write block");
+    std::fs::write(manual_dir.join("job.toml"), "timeout = \"30s\"\n").expect("write job.toml");
     mark
 }
 
@@ -273,6 +283,17 @@ async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
         .await;
     assert_eq!(status, 404);
 
+    // A run that happens only on request, so the first stream carries a
+    // `run_started` of it for the restart below to be confused by.
+    let (status, _) = manager
+        .call(reqwest::Method::POST, "/jobs/manual/runs")
+        .await;
+    assert_eq!(status, 202);
+    let first_manual = manager.wait_run("manual", "ok").await["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+
     // Refusals: no such live run; no token.
     let (status, _) = manager.call(reqwest::Method::DELETE, "/runs/nope").await;
     assert_eq!(status, 404);
@@ -301,6 +322,37 @@ async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
         ids.contains(&run_id),
         "earlier run {run_id} missing from {ids:?}"
     );
+
+    // A request after the restart is answered by a run after the restart —
+    // not by the earlier stream's run of the same job, whose `seq` is larger
+    // than this request's. Found on a machine: read by `seq`, the request
+    // was "already answered" and nothing began.
+    let (status, _) = manager
+        .call(reqwest::Method::POST, "/jobs/manual/runs")
+        .await;
+    assert_eq!(status, 202);
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    loop {
+        let (_, body) = manager.get("/runs?job=manual&limit=10").await;
+        let after_restart = body["runs"]
+            .as_array()
+            .map(|rows| {
+                rows.iter().any(|r| {
+                    r["outcome"] == "ok" && r["run_id"].as_str() != Some(first_manual.as_str())
+                })
+            })
+            .unwrap_or(false);
+        if after_restart {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the request after the restart never ran: {body}; log:\n{}",
+            manager.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
     let log = manager.stop();
     assert!(log.contains("serve: stopped"), "log:\n{log}");
 }

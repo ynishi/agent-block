@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- After a restart, a requested run never began. Whether a request had been
+  answered was read by `seq` — a later `run_started` of the same job — and
+  `seq` counts within one stream, while the manager's record spans one
+  stream per start: yesterday's start carried a larger `seq` than today's
+  request and was read as its answer. Every "after" and every "newest
+  first" in the `job` module is now by `epoch_ms`, with `seq` breaking
+  ties within a stream. The e2e now asks for a run after the restart.
 - `agent-block serve`'s HTTP handler kept no session handle: it resumed the
   manager's session on every request and let the handle go, and a handle
   that goes away records `session_closed` on its stream — the kernel's rule
