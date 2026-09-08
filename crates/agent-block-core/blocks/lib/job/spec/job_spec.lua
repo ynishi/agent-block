@@ -90,6 +90,9 @@ local function fake_session()
                     exit_code = e and e.data.exit_code or nil,
                     took_s = e and e.data.took_s or nil,
                     error = e and e.data.error or nil,
+                    result = e and e.data.result or nil,
+                    result_path = e and e.data.result_path or nil,
+                    result_truncated = e and e.data.result_truncated or nil,
                     stderr = e and e.data.stderr or nil,
                 }
             end
@@ -395,6 +398,79 @@ describe("job.run — a record, a process, a record", function()
         })
         expect(seen[1].opts.cwd).to.be("/repo")
         expect(seen[1].opts.timeout).to.be(30)
+    end)
+
+    it("records the block's answer, read back from the file the process was told to write", function()
+        local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
+        local s = fake_session()
+        local got = job.run(s, decl("a"), {
+            log = "/l",
+            result = "/r/a-1.result",
+            exec = exec,
+            read = function(path)
+                expect(path).to.be("/r/a-1.result")
+                return '{"ok":true,"n":3}'
+            end,
+            now = function()
+                return 0
+            end,
+        })
+        expect(seen[1].cmd:find("AGENT_BLOCK_RESULT_PATH='/r/a-1.result'", 1, true) ~= nil).to.be(true)
+        expect(got.result).to.be('{"ok":true,"n":3}')
+        local ended = s:events()[2].data
+        expect(ended.result).to.be('{"ok":true,"n":3}')
+        expect(ended.result_path).to.be("/r/a-1.result")
+        expect(ended.result_truncated).to.be(nil)
+        expect(job.runs(s)[1].result).to.be('{"ok":true,"n":3}')
+    end)
+
+    it("leaves an answer past the cap in its file, and says so", function()
+        local s = fake_session()
+        local got = job.run(s, decl("a"), {
+            log = "/l",
+            result = "/r/a-2.result",
+            exec = answering({ ok = true, code = 0 }),
+            read = function()
+                return string.rep("x", 70000)
+            end,
+            now = function()
+                return 0
+            end,
+        })
+        expect(got.result).to.be(nil)
+        local ended = s:events()[2].data
+        expect(ended.result).to.be(nil)
+        expect(ended.result_truncated).to.be(true)
+        expect(ended.result_path).to.be("/r/a-2.result")
+    end)
+
+    it("records no answer when the process left none, and asks for none without a path", function()
+        local s = fake_session()
+        job.run(s, decl("a"), {
+            log = "/l",
+            result = "/r/a-3.result",
+            exec = answering({ ok = true, code = 1 }),
+            read = function()
+                error("no such file")
+            end,
+            now = function()
+                return 0
+            end,
+        })
+        expect(s:events()[2].data.result).to.be(nil)
+        expect(s:events()[2].data.result_path).to.be("/r/a-3.result")
+        local exec, seen = answering({ ok = true, code = 0 })
+        job.run(fake_session(), decl("a"), {
+            log = "/l",
+            exec = exec,
+            read = function()
+                error("must not be asked")
+            end,
+            now = function()
+                return 0
+            end,
+        })
+        expect(seen[1].cmd:find("AGENT_BLOCK_RESULT_PATH", 1, true)).to.be(nil)
     end)
 
     it("labels the process with the run id, which is what a stop reaches it by", function()

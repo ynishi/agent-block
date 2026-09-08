@@ -39,7 +39,8 @@
 ---     run_requested       { job, by }                    someone asked for a run now
 ---     run_stop_requested  { run_id, by }                 someone asked a run to stop
 ---     run_started         { job, run_id, block, cwd, log, timeout_s, requested? }
----     run_ended           { job, run_id, outcome, exit_code?, took_s, error? }
+---     run_ended           { job, run_id, outcome, exit_code?, took_s, error?, stderr?,
+---                           result?, result_path?, result_truncated? }
 ---     run_skipped         { job, reason, requested? }    a start that was asked for and refused
 ---
 ---   `outcome` is one of `ok` (exit 0) / `failed` (exit ≠ 0, or the process
@@ -51,6 +52,14 @@
 ---   the log — either is its answer; a stop is pending until the run it
 ---   names has ended. Reading those as "the latest fact wins" is what lets a
 ---   request be a record rather than a queue.
+---
+---   `result` is the block's answer — the JSON string it returned, read back
+---   from the file the run was told to write it to (`opts.result` on `run`,
+---   `AGENT_BLOCK_RESULT_PATH` in the process). The same block called through
+---   MCP hands that value to its caller; a run is not a second contract, so
+---   the record carries it too. Whole or absent: a JSON string cut short is
+---   nothing, so a value past the cap is left in its file and `result_path`
+---   with `result_truncated` say so.
 ---
 ---   Only a refused REQUEST is recorded as `run_skipped`. A job that is due
 ---   by its interval while its previous run is still live is not an event:
@@ -83,6 +92,10 @@ local DEFAULT_TIMEOUT_S = 600
 local DEFAULT_MAX_RUNS = 4
 local DEFAULT_BIN = "agent-block"
 local STDERR_TAIL_BYTES = 4096
+--- The most of a block's returned value the record carries whole. The
+--- contract is one JSON string, and a JSON string cut anywhere is not one,
+--- so it is kept entire up to this or left in its file and pointed at.
+local RESULT_MAX_BYTES = 65536
 
 -- ============================================================
 -- duration — "2m" is 120 seconds
@@ -244,7 +257,10 @@ SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(e.data, '$.outcome')   AS outcome,
        json_extract(e.data, '$.exit_code') AS exit_code,
        json_extract(e.data, '$.took_s')    AS took_s,
-       json_extract(e.data, '$.error')     AS error
+       json_extract(e.data, '$.error')     AS error,
+       json_extract(e.data, '$.result')    AS result,
+       json_extract(e.data, '$.result_path')      AS result_path,
+       json_extract(e.data, '$.result_truncated') AS result_truncated
   FROM events AS s
   LEFT JOIN events AS e
     ON e.stream IN $sessions
@@ -265,7 +281,10 @@ SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(e.data, '$.outcome')   AS outcome,
        json_extract(e.data, '$.exit_code') AS exit_code,
        json_extract(e.data, '$.took_s')    AS took_s,
-       json_extract(e.data, '$.error')     AS error
+       json_extract(e.data, '$.error')     AS error,
+       json_extract(e.data, '$.result')    AS result,
+       json_extract(e.data, '$.result_path')      AS result_path,
+       json_extract(e.data, '$.result_truncated') AS result_truncated
   FROM events AS s
   LEFT JOIN events AS e
     ON e.stream IN $sessions
@@ -288,7 +307,10 @@ SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(e.data, '$.exit_code') AS exit_code,
        json_extract(e.data, '$.took_s')    AS took_s,
        json_extract(e.data, '$.error')     AS error,
-       json_extract(e.data, '$.stderr')    AS stderr
+       json_extract(e.data, '$.stderr')    AS stderr,
+       json_extract(e.data, '$.result')    AS result,
+       json_extract(e.data, '$.result_path')      AS result_path,
+       json_extract(e.data, '$.result_truncated') AS result_truncated
   FROM events AS s
   LEFT JOIN events AS e
     ON e.stream IN $sessions
@@ -485,13 +507,20 @@ end
 --- since the CLI reads both from `AGENT_BLOCK_PROMPT` / `AGENT_BLOCK_CONTEXT`
 --- and a shell argument would have to survive the quoting twice.
 ---
+--- `opts.result` names the file the block's returned value is written to
+--- (`AGENT_BLOCK_RESULT_PATH`); the CLI prints nothing on a return, so this
+--- is the only way the answer leaves the process.
+---
 --- @param decl table  a decl
 --- @param log string  the run's session log path
---- @param opts table|nil  { bin? }
+--- @param opts table|nil  { bin?, result? }
 --- @return string command
 function M.command(decl, log, opts)
     opts = opts or {}
     local parts = { "AGENT_BLOCK_KNL_PATH=" .. sq(log) }
+    if opts.result ~= nil then
+        parts[#parts + 1] = "AGENT_BLOCK_RESULT_PATH=" .. sq(opts.result)
+    end
     if decl.prompt ~= nil then
         parts[#parts + 1] = "AGENT_BLOCK_PROMPT=" .. sq(decl.prompt)
     end
@@ -591,10 +620,34 @@ function M.run(session, decl, opts)
     -- `label` is what a stop reaches the process by: `sh.kill(run_id)` ends
     -- the run's whole group, and this call answers with no exit code, which
     -- is read as `stopped` below.
-    local result =
-        exec(M.command(decl, opts.log, { bin = opts.bin }), { cwd = decl.cwd, timeout = decl.timeout, label = run_id })
+    local result = exec(
+        M.command(decl, opts.log, { bin = opts.bin, result = opts.result }),
+        { cwd = decl.cwd, timeout = decl.timeout, label = run_id }
+    )
     local took = now() - started
     local outcome, exit_code, err = outcome_of(result)
+
+    -- The block's answer: the value it returned, read back from the file
+    -- the process was told to write it to. Whole or not at all — a JSON
+    -- string cut short is nothing — and pointed at when it is too large.
+    local answer, answer_truncated
+    if opts.result ~= nil then
+        local read = opts.read
+        if read == nil then
+            local std = rawget(_G, "std")
+            read = std and std.fs and std.fs.read
+        end
+        if type(read) == "function" then
+            local ok, content = pcall(read, opts.result)
+            if ok and type(content) == "string" then
+                if #content <= RESULT_MAX_BYTES then
+                    answer = content
+                else
+                    answer_truncated = true
+                end
+            end
+        end
+    end
 
     session:append({
         kind = "run_ended",
@@ -606,9 +659,19 @@ function M.run(session, decl, opts)
             took_s = took,
             error = err,
             stderr = type(result) == "table" and tail(result.stderr, STDERR_TAIL_BYTES) or nil,
+            result = answer,
+            result_path = opts.result,
+            result_truncated = answer_truncated,
         },
     })
-    return { run_id = run_id, outcome = outcome, exit_code = exit_code, took_s = took, error = err }
+    return {
+        run_id = run_id,
+        outcome = outcome,
+        exit_code = exit_code,
+        took_s = took,
+        error = err,
+        result = answer,
+    }
 end
 
 --- Close every run the log says is live as `lost`, and answer how many. For

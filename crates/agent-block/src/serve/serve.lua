@@ -123,9 +123,11 @@ local function tick()
         local decl, requested = item.decl, item.requested
         local run_id = string.format("%s-%d", decl.name, math.floor(now * 1000))
         local log_path = string.format("%s/%s/%s.sqlite", S.runs_dir, decl.name, run_id)
+        local result_path = string.format("%s/%s/%s.result", S.runs_dir, decl.name, run_id)
         handles[run_id] = std.task.spawn(function()
             local ok, err = pcall(job.run, s, decl, {
                 log = log_path,
+                result = result_path,
                 run_id = run_id,
                 requested = requested,
                 bin = S.bin,
@@ -160,6 +162,19 @@ bus.on("http", function(ev)
 
     local function reply(status, body)
         return { status = status, body = body }
+    end
+
+    -- A block's answer is a JSON string; on the wire it is the value it
+    -- encodes when it decodes, and the string as it was when it does not.
+    local function decoded(text)
+        if type(text) ~= "string" then
+            return text
+        end
+        local ok, value = pcall(std.json.decode, text)
+        if ok then
+            return value
+        end
+        return text
     end
 
     -- All of the manager's sessions, for reading; the last is the current
@@ -225,6 +240,9 @@ bus.on("http", function(ev)
 
     if method == "GET" and path == "/runs" then
         local rows = job_h.runs(session, { job = query.job, limit = tonumber(query.limit), sessions = ids })
+        for _, row in ipairs(rows) do
+            row.result = decoded(row.result)
+        end
         return reply(200, { runs = rows })
     end
 
@@ -234,6 +252,7 @@ bus.on("http", function(ev)
         if row == nil then
             return reply(404, { error = "no such run" })
         end
+        row.result = decoded(row.result)
         return reply(200, { run = row })
     end
 

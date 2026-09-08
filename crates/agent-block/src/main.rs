@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
 use agent_block_core::sandbox::{self, SandboxConfig};
-use agent_block_core::{run, BlockConfig};
+use agent_block_core::{run_capture, BlockConfig};
 use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
 
 #[derive(Parser, Debug)]
@@ -99,6 +99,16 @@ struct Cli {
     /// manual read supports the documented truthy/falsy set (`1`, `yes`, …).
     #[arg(long)]
     sandbox: bool,
+
+    /// Write the value the script returned to this file (the block contract's
+    /// JSON string, verbatim). stdout stays what it is — the logs — so a
+    /// caller that runs a block in a process of its own, as `agent-block
+    /// serve` does, has somewhere to read the answer back from. Written only
+    /// when the script returns; a script that raises writes nothing.
+    ///
+    /// Env: `AGENT_BLOCK_RESULT_PATH`.
+    #[arg(long, value_name = "FILE", env = "AGENT_BLOCK_RESULT_PATH")]
+    result: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -277,5 +287,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     }
     let config = builder.build();
 
-    Ok(run(config).await?)
+    let value = run_capture(config).await?;
+    if let Some(path) = cli.result {
+        std::fs::write(&path, &value)
+            .with_context(|| format!("writing the script's result to '{}'", path.display()))?;
+    }
+    Ok(())
 }

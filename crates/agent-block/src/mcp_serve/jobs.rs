@@ -116,8 +116,9 @@ impl JobsClient {
             Tool::new(
                 "runs_list",
                 "Runs the manager recorded, newest first: job, run_id, when it started and ended, \
-                 outcome (ok / failed / timeout / stopped / lost), exit code, and the path of the \
-                 run's own session log.",
+                 outcome (ok / failed / timeout / stopped / lost), exit code, the value the block \
+                 returned (`result`, decoded when it is JSON), and the path of the run's own \
+                 session log.",
                 schema(
                     json!({
                         "job": job,
@@ -128,7 +129,7 @@ impl JobsClient {
             ),
             Tool::new(
                 "run_get",
-                "One run by id, with the tail of its stderr.",
+                "One run by id: everything runs_list says, plus the tail of its stderr.",
                 schema(json!({ "run_id": run_id }), &["run_id"]),
             ),
             Tool::new(

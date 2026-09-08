@@ -273,6 +273,11 @@ async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
     assert_eq!(status, 200);
     assert_eq!(body["run"]["run_id"], run_id);
     assert_eq!(body["run"]["outcome"], "ok");
+    // The block's answer — the JSON it returned — is on the record, decoded.
+    assert_eq!(body["run"]["result"]["ok"], true, "{body}");
+    assert_eq!(run["result"]["ok"], true, "{run}");
+    let result_path = PathBuf::from(body["run"]["result_path"].as_str().expect("result_path"));
+    assert!(result_path.is_file(), "{} missing", result_path.display());
 
     // A request is recorded and answered on a later tick.
     let (status, body) = manager.call(reqwest::Method::POST, "/jobs/echo/runs").await;
