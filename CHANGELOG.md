@@ -60,6 +60,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command that did not answer from one that could not start without reading
   prose.
 
+### Changed
+
+- The `serve` runbook's systemd and launchd units set `PATH`. A run inherits
+  the manager's environment, and a service manager's is the system default
+  without the user's toolchains: a block that runs `agent-block` or `cargo`
+  found neither (exit 127), a failure a shell never shows because a shell's
+  `PATH` has them. The `job` module's doc also says what `outcome` is not:
+  the process's word, not a reading of the block's answer — a block that
+  reports failure in its return value ends `ok`, and a block whose work could
+  not be done should raise.
+
 ### Fixed
 
 - After a restart, a requested run never began. Whether a request had been

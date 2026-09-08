@@ -256,7 +256,11 @@ as `lost` on the next start, and a restart continues the same record (each
 start opens a session of its own and reads across all of them). Adding
 the file adds the job; removing it removes the job; there is nothing to
 write for a service manager beyond the one unit that runs `serve` itself
-(`docs/runbooks/job-serve.md` has systemd and launchd units).
+(`docs/runbooks/job-serve.md` has systemd and launchd units). A run inherits
+the manager's environment, and under a service manager that is a short
+`PATH` without the user's toolchains — a block that runs `cargo` or
+`agent-block` finds them from a shell and, under the manager, only if the
+unit says where; the runbook's units set it.
 
 The listener answers with a bearer token (`~/.agent-block/serve.token`,
 minted on first start) on every request:
