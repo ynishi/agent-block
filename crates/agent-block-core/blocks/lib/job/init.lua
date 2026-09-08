@@ -79,6 +79,11 @@
 ---   `max_runs`. A pending request makes a job due regardless of `every`.
 ---
 --- What this is not
+---   Not a reader of the block's answer: `outcome` is the PROCESS's word —
+---   it returned (exit 0), said no (exit ≠ 0), was cut off, was stopped, was
+---   lost — and `result` is the BLOCK's, recorded and not interpreted. A
+---   block that reports failure in its return value ends `ok`; a block whose
+---   work could not be done should raise, and the exit code carries it.
 ---   Not a scheduler with a clock of its own: the caller says what time it
 ---   is, so a tick is testable and the log is the only memory. Not a
 ---   supervisor: a run is a process, not a child session, and the kernel's

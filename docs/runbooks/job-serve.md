@@ -15,6 +15,14 @@ What the manager needs from its environment:
 | `--project <dir>` | the project whose `blocks/` is scanned (with `~/.agent-block/blocks/`; `--block-dir` adds more) |
 | `--bind` | `127.0.0.1:7788` unless told otherwise |
 | the block's own `.env` | a run is started in the block's project root and loads that `.env`; the manager's environment does not need model credentials |
+| `PATH` | a run inherits the manager's environment, and a service manager's `PATH` is short: `~/.cargo/bin` and the rustup shims are not on it. A block that runs `agent-block`, `cargo` or anything from a user toolchain gets `command not found` (exit 127) that a shell never shows. Set it on the unit, as below |
+
+Two things a lane learns only under the manager, both from the environment
+being the unit's rather than a shell's: the `PATH` above, and that a block
+which reports failure in its return value ends as `outcome = "ok"` — the
+outcome is the process's word (it returned, exit 0) and `result` is the
+block's. A block whose work could not be done should raise; a value is an
+answer.
 
 The listener requires the bearer token in `$AGENT_BLOCK_HOME/serve.token` on
 every request, loopback included. Reaching it from another machine is a
@@ -38,6 +46,9 @@ RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Environment=AGENT_BLOCK_HOME=%h/.agent-block
+# The PATH a run inherits. A user service starts with the system default,
+# without the user's toolchains; every command a block runs resolves here.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -78,6 +89,8 @@ paths; write it through `sed` from this template, which fills them in:
   <dict>
     <key>AGENT_BLOCK_HOME</key>
     <string>__HOME__/.agent-block</string>
+    <key>PATH</key>
+    <string>__HOME__/.cargo/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
