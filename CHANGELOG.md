@@ -26,9 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declaration lines, and every part in a seam the kernel already has —
   `window{fit, keep_seed}`, `result_cap`, `repeat_cap`, `carry`,
   `stagnation`, `verdict{timeout}` — plus the grant of beats on the session.
-  It answers `{ ok, iters, summary, session, failure_reason?, last_error? }`
-  and holds nothing the seams do not: no retry policy, no branch on a
-  model's name, no commit or branch of its own. `compile_loop` sold the same
+  It answers `{ ok, iters, summary, session, baseline_ok?, failure_reason?,
+  last_error? }` and holds nothing the seams do not: no retry policy, no
+  branch on a model's name, no commit or branch of its own. The verify runs
+  once before the first beat (`baseline = false` opts out), so the record
+  has the run's starting point, `timeout` takes its first measurement from
+  it, and a repository that was red before the model touched it says so in
+  the seed and in every failure after — a continuation run over an earlier
+  attempt's worktree is red this way as a matter of course, and a model
+  that cannot tell "still failing" from "you broke it" edits the wrong
+  thing. `failure_reason = "no_edits"` names three iterations with no edit
+  landed, which a caller retries differently from a build that stays red. `compile_loop` sold the same
   job as a block with a loop and a fold of its own and went in 0.38.0 when
   the seams could carry every part; this is the wiring, promoted the way
   the four-layer table says a module is — proven in a lane that ran it
