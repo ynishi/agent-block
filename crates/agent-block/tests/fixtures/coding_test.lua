@@ -126,8 +126,21 @@ describe("coding.run — what it refuses", function()
         end).to.fail()
     end)
 
-    it("declares its opts and result shapes", function()
+    it("declares its opts and result shapes, baseline and no_edits included", function()
         expect(type(coding.shapes.run_opts)).to.be("table")
         expect(type(coding.shapes.run_result)).to.be("table")
+        local check = require("lshape").check
+        expect(
+            check.check(
+                { ok = true, iters = 1, summary = "PASS in 1 iters", baseline_ok = false },
+                coding.shapes.run_result
+            )
+        ).to.be(true)
+        expect(
+            check.check(
+                { ok = false, iters = 3, summary = "give-up", failure_reason = "no_edits" },
+                coding.shapes.run_result
+            )
+        ).to.be(true)
     end)
 end)

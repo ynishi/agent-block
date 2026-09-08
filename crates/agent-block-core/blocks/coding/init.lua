@@ -14,9 +14,19 @@
 --       turns   = 8,                            -- beats per iteration before verify runs anyway
 --       timeout = { first = 900, factor = 3, floor = 60 },  -- seconds a verify may take
 --       store   = { sqlite = "/path/run.sqlite" },          -- the session's store; default the host's
+--       baseline = true,                        -- verify once before the first beat (default)
 --   })
 --
--- result: { ok, iters, summary, session, failure_reason?, last_error? }
+-- result: { ok, iters, summary, session, baseline_ok?, failure_reason?, last_error? }
+--
+-- The verify runs once BEFORE the first beat (unless `baseline = false`), so
+-- the record has the run's starting point, `timeout` takes its first
+-- measurement from it, a green on unmodified code is read as the fact it is,
+-- and a failure after an edit is told apart from one the repository had
+-- already: a red baseline goes into the seed with the output that names the
+-- lines, and the model is told to fix those first. `failure_reason` says
+-- `no_edits` when three iterations in a row landed no edit — the model not
+-- editing, which a caller retries differently from a build that stays red.
 --
 -- What this module is
 --   A CONSUMER of the kernel, beside `agent`: the kernel provides one beat and
@@ -135,6 +145,9 @@ local RUN_OPTS = T.shape({
         :describe("policy.result_cap's share of the window per tool result; default 0.25")
         :is_optional(),
     repeat_max = T.number:describe("policy.repeat_cap's max; default 2"):is_optional(),
+    baseline = T.boolean
+        :describe("run the verify once before the first beat, so the record has the starting point; default true")
+        :is_optional(),
 })
 
 local RUN_RESULT = T.shape({
@@ -142,8 +155,11 @@ local RUN_RESULT = T.shape({
     iters = T.number:describe("iterations run, each ending in a verify"),
     summary = T.string:describe("one line: PASS in n iters, or give-up: reason at iter n/m"),
     session = T.string:describe("the session id the run's record is under"):is_optional(),
+    baseline_ok = T.boolean
+        :describe("whether the verify passed before any edit; absent when the baseline was not run")
+        :is_optional(),
     failure_reason = T.string
-        :describe("max_iters | stagnation | context | stopped | llm_call, when not ok")
+        :describe("max_iters | no_edits | stagnation | context | stopped | llm_call, when not ok")
         :is_optional(),
     last_error = T.string:describe("the tail of the last verify output or model error, when not ok"):is_optional(),
 })
@@ -424,6 +440,8 @@ function M._run_impl(opts)
 
     local stalled = policy.stagnation({ same = STAGNATION_WINDOW, signature = verify_signature })
     local iters, converged, failure_reason, last_error, session_id = 0, false, nil, nil, nil
+    local zero_edits = 0
+    local baseline_ok = nil
 
     kernel.session({
         owner = opts.owner or "coding",
@@ -439,6 +457,26 @@ function M._run_impl(opts)
             fold = fold,
             filters = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) },
         })
+        -- The state before any edit: the verify once, recorded like the ones
+        -- the iterations make (under no beat), so the record has the run's
+        -- starting point, `timeout` learns its first measurement from it, an
+        -- "unchanged green" later is a fact and not a guess, and a failure
+        -- later can be told from one inherited. A repo that is red before
+        -- the model touches it says so in the seed — the part of the request
+        -- the fold keeps — with the output that names the lines; a
+        -- continuation run over an earlier attempt's worktree is red this
+        -- way as a matter of course.
+        if opts.baseline ~= false then
+            local b = verdict(s, {})
+            baseline_ok = b.result.ok == true
+            if not baseline_ok then
+                seed = seed
+                    .. "\n\n## Current build status: FAILING\nThe verify command ALREADY fails on the current state "
+                    .. "of the files, before any edit of yours. Fix these errors FIRST — the output names the "
+                    .. "lines to edit:\n\n"
+                    .. tail(b.result.stderr, FEEDBACK_TAIL)
+            end
+        end
         s:append({ kind = "msg_user", meta = { label = "spec" }, data = { content = seed } })
 
         local function stop(reason, err)
@@ -508,9 +546,21 @@ function M._run_impl(opts)
 
             iters = iters + 1
             edits_applied = edits_applied + applied_here
+            zero_edits = applied_here == 0 and zero_edits + 1 or 0
             local v = verdict(s, answer)
             if v.ok then
                 converged = true
+                break
+            end
+            if not v.result.ok then
+                last_error = tail(v.result.stderr, ERROR_TAIL)
+            end
+            if zero_edits >= STAGNATION_WINDOW then
+                -- Iteration after iteration with no edit landing is the
+                -- model failing to edit, which is not the same as editing
+                -- toward a build that stays red — a caller that retries
+                -- one should not retry the other.
+                stop("no_edits", last_error)
                 break
             end
             if iters >= max_iters then
@@ -525,13 +575,20 @@ function M._run_impl(opts)
                     .. edit_spec.name
                     .. "."
             else
-                last_error = tail(v.result.stderr, ERROR_TAIL)
                 if stalled(s) ~= nil then
                     stop("stagnation", last_error)
                     break
                 end
+                local said
+                if baseline_ok == false then
+                    said = "The verify still fails, as it did before you started:\n"
+                elseif baseline_ok == true then
+                    said = "The verify passed before your edits and fails now — your edits broke it:\n"
+                else
+                    said = "The verify failed:\n"
+                end
                 feedback = (applied_here == 0 and "No edits were applied. " or "")
-                    .. "The verify failed:\n"
+                    .. said
                     .. tail(v.result.stderr, FEEDBACK_TAIL)
             end
             s:append({ kind = "msg_user", data = { content = feedback } })
@@ -544,6 +601,7 @@ function M._run_impl(opts)
         summary = converged and string.format("PASS in %d iters", iters)
             or string.format("give-up: %s at iter %d/%d", tostring(failure_reason), iters, max_iters),
         session = session_id,
+        baseline_ok = baseline_ok,
         failure_reason = (not converged) and failure_reason or nil,
         last_error = (not converged) and last_error or nil,
     }
