@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+
+- How to stop a run, in the job-serve runbook and the MCP guide: `run_stop`
+  (`DELETE /runs/<id>`), which kills the run's process group and records
+  `stopped` — not a kill by pid, which records `failed` and loses the
+  difference between a run that broke and one somebody stopped, and not a
+  `pkill -f`, which misses the grandchildren and matches the shell that
+  issued it. The order when the run's endpoint is going away too:
+  `runs_list` → `run_stop` → read `stopped` back → take the endpoint down.
+  `runs_list` and `run_stop` say the same in their tool descriptions, and
+  `deferred` joins the outcome vocabulary they list.
+
 ### Changed
 
 - `policy.verdict{ timeout }`: which check the next window is read off is

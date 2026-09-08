@@ -116,7 +116,7 @@ impl JobsClient {
             Tool::new(
                 "runs_list",
                 "Runs the manager recorded, newest first: job, run_id, when it started and ended, \
-                 outcome (ok / failed / timeout / stopped / lost), exit code, the value the block \
+                 outcome (ok / deferred / failed / timeout / stopped / lost), exit code, the value the block \
                  returned (`result`, decoded when it is JSON), and the path of the run's own \
                  session log.",
                 schema(
@@ -142,7 +142,10 @@ impl JobsClient {
             Tool::new(
                 "run_stop",
                 "Ask a live run to stop. Recorded as a request; the manager's next tick kills the \
-                 run's process group and records it as stopped. Answers 202.",
+                 run's process group (the block, its shell, whatever is under them) and records \
+                 it as stopped. Answers 202; read `stopped` back with runs_list. Use this rather \
+                 than killing the process from outside: a kill by pid records the run as failed, \
+                 and the log then cannot tell a run that broke from one somebody stopped.",
                 schema(json!({ "run_id": run_id }), &["run_id"]),
             ),
         ]

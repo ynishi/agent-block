@@ -115,6 +115,18 @@ a request and answer at once; the manager acts on its next tick, so read the
 outcome back with `runs_list` rather than waiting on the call. When the
 manager is not running the tool says so; starting it is not this server's.
 
+To stop a run, `run_stop` it — never kill its process from outside. The
+manager kills the run's whole process group (the block, its shell, the
+`cargo` under that) and records `outcome = "stopped"`; a kill by pid records
+`failed`, and the log loses the difference between a run that broke and one
+somebody stopped. A `pkill -f <pattern>` also matches the shell that issued
+it. When the run's endpoint is going away as well, the order is `runs_list`
+→ `run_stop` → read `stopped` back → take the endpoint down.
+
+A run that looked at what it needs and did not start (`job.defer` in the
+block, exit 75) is `outcome = "deferred"`: neither `ok` nor `failed`, and not
+a run to stop.
+
 ## Reading a run afterwards
 
 A run leaves a durable record rather than a log to grep: every model call is an
