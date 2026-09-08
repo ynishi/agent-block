@@ -12,7 +12,8 @@
 --       llm     = { port = adapter.openai, conf = { base_url = ..., model = ..., ... } },
 --       iters   = 5,                            -- iterations, each ending in a verify
 --       turns   = 8,                            -- beats per iteration before verify runs anyway
---       timeout = { first = 900, factor = 3, floor = 60 },  -- seconds a verify may take
+--       timeout = 360,                          -- seconds a verify may take, every time; or
+--       timeout = { first = 900, factor = 3, floor = 60, measure = "longest" },  -- read off the log
 --       store   = { sqlite = "/path/run.sqlite" },          -- the session's store; default the host's
 --       baseline = true,                        -- verify once before the first beat (default)
 --   })
@@ -20,7 +21,7 @@
 -- result: { ok, iters, summary, session, baseline_ok?, failure_reason?, last_error? }
 --
 -- The verify runs once BEFORE the first beat (unless `baseline = false`), so
--- the record has the run's starting point, `timeout` takes its first
+-- the record has the run's starting point, a table `timeout` takes its first
 -- measurement from it, a green on unmodified code is read as the fact it is,
 -- and a failure after an edit is told apart from one the repository had
 -- already: a red baseline goes into the seed with the output that names the
@@ -129,8 +130,11 @@ local RUN_OPTS = T.shape({
     }):describe("the model"),
     iters = T.number:describe("iterations, each ending in a verify; default 5"):is_optional(),
     turns = T.number:describe("beats per iteration before verify runs anyway; default 8"):is_optional(),
-    timeout = T.table
-        :describe("policy.verdict's timeout: { first, factor?, floor? } seconds; default { 900, 3, 60 }")
+    timeout = T.any_of({ T.number, T.table })
+        :describe(
+            "policy.verdict's timeout: seconds handed to every verify as they are, or "
+                .. '{ first, factor?, floor?, measure? } read off the log; default { 900, 3, 60, "longest" }'
+        )
         :is_optional(),
     store = T.any:describe("the session's store, as knl.session takes it; default the host's"):is_optional(),
     owner = T.string:describe('the session\'s owner; default "coding"'):is_optional(),

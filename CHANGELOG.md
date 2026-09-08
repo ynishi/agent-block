@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `policy.verdict{ timeout }`: which check the next window is read off is
+  now the caller's choice, `timeout.measure` — `"longest"` (the default),
+  `"last"`, `"last_ok"`, `"first"`, or the caller's own `fn(events, kind)
+  -> seconds | nil` — and a plain number for `timeout` is handed to every
+  check as it is, reading nothing. Before, the window was always read off
+  the latest answered check, pass or fail. Measured against a repository
+  whose verify takes about forty seconds whole, a failing check stopped
+  early at a compile error, the window was read off that quick failure,
+  and the whole pass that followed was cut at the floor and recorded red
+  — a green run reported as a failure. Whether a failing check is quicker
+  than a passing one is a fact about the repository, not a rule, so the
+  reading is chosen rather than assumed; the default assumes nothing about
+  direction (the longest reading never shrinks, and a check that was cut
+  off counts as the seconds it was given, a bound it exceeded, so a cut-off
+  widens the window instead of being forgotten). `coding{ timeout }` takes
+  the same forms.
+
 ### Added
 
 - `job.defer(reason)` and `outcome = "deferred"`: a block that looks at what
