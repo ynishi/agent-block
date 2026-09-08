@@ -151,3 +151,40 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:7788/jobs/drain
 A run's own session log is the `log` path on its record; read it with
 `knl.resume{ session = ..., store = { sqlite = <path> } }` and `knl.views`,
 as any block's log.
+
+## Stopping a run
+
+Ask the manager, not the process:
+
+```sh
+curl -sH "Authorization: Bearer $TOKEN" "http://127.0.0.1:7788/runs?job=drain&limit=1"   # the live run_id
+curl -sH "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:7788/runs/<run_id>     # run_stop
+curl -sH "Authorization: Bearer $TOKEN" "http://127.0.0.1:7788/runs?job=drain&limit=1"   # outcome = "stopped"
+```
+
+(`run_stop { run_id }` from the MCP server is the same route.) The request
+is recorded and answered at once; on its next tick the manager kills the
+run's **process group** and records `outcome = "stopped"`. Two things a
+`kill` from outside does not give you:
+
+- **The record.** A run killed by pid ends `failed` with whatever exit code
+  the signal left, and the log can no longer tell "it broke" from "someone
+  stopped it" — the distinction `ok` / `deferred` / `failed` / `stopped`
+  exists to keep. (Seen: a run killed by hand recorded as `failed`, exit 1,
+  800 s.)
+- **The whole tree.** A run is a tree — the block, the shell it ran, the
+  `cargo` under that — and the group is what takes the grandchildren with
+  it. A `pkill -f <pattern>` misses what the pattern does not name, and
+  matches the shell that typed it: a `pkill -f` from a script whose own
+  command line contains the pattern kills the script, and whatever it was
+  going to do next does not happen.
+
+When the run's endpoint is going away too (a pod being returned), the
+order is: `runs_list` → `run_stop` → read `stopped` back → take the endpoint
+down. The other way round leaves the verify running on a shared host
+against an endpoint that is gone.
+
+Stopping the schedule rather than a run: remove `every` from `job.toml`
+(the job becomes request-only), remove the file (the job is gone on the next
+start), or stop the unit (`systemctl --user stop agent-block-serve.service`,
+which takes its live runs with it — recorded `stopped`).
