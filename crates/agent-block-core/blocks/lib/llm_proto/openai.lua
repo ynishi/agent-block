@@ -874,4 +874,35 @@ function M.profile(spec)
     return { context_window = math.floor(window), max_output = spec.max_tokens or M.DEFAULT_MAX_TOKENS }, nil
 end
 
+--- Is the server behind `spec` up and serving: one GET, read as liveness.
+---
+--- The compatible servers publish a health route beside `/v1` — vLLM's
+--- `/health` (200, or 503 once the engine has died), llama.cpp's (503
+--- `Loading model`, then 200), TGI's (200 / 503) — and that is asked first,
+--- with no key: it costs no tokens and says "up and serving" or "up and
+--- not". A server without one (api.openai.com, Ollama) answers 404 there,
+--- and the question moves to `GET {base_url}/models` with the key, the
+--- lightest call the OpenAI surface has. What comes back is
+--- `llm_proto.health_of`'s reading of the answer.
+---
+--- @param spec table  the same spec `build` takes
+--- @return table  { alive, kind, status?, message? }
+function M.health(spec)
+    spec = spec or {}
+    local base_url = spec.base_url or DEFAULT_BASE_URL
+    local root = proto.server_root(base_url)
+    local headers = proto.merge_headers({}, spec.headers)
+    local api_key = spec.api_key or std.env.get(spec.api_key_env or "OPENAI_API_KEY")
+    if api_key then
+        headers["Authorization"] = "Bearer " .. api_key
+    end
+    if resolve_dialect(spec) ~= "openai" then
+        local answer, err = proto.ping(root .. "/health", nil, spec.timeout)
+        if not answer or answer.status ~= 404 then
+            return proto.health_of(answer, err)
+        end
+    end
+    return proto.health_of(proto.ping(base_url:gsub("/+$", "") .. "/models", headers, spec.timeout))
+end
+
 return M

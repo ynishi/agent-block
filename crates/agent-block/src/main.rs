@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
 use agent_block_core::sandbox::{self, SandboxConfig};
-use agent_block_core::{run_capture, BlockConfig};
+use agent_block_core::{run_capture, BlockConfig, BlockError};
 use agent_block_mcp::DEFAULT_RPC_TIMEOUT;
 
 #[derive(Parser, Debug)]
@@ -137,6 +137,15 @@ enum Command {
 // any worker thread exists (see `startup` below).
 fn main() {
     if let Err(err) = startup() {
+        // A block that looked at what it needs and did not start
+        // (`job.defer(reason)`): one line with the reason, and the exit
+        // code the job manager reads as `deferred` — `EX_TEMPFAIL` from
+        // sysexits(3), "temporary failure; the user is invited to retry".
+        // Not 1, which the manager reads as `failed`, and which this is not.
+        if let Some(BlockError::Deferred(reason)) = err.downcast_ref::<BlockError>() {
+            eprintln!("deferred: {reason}");
+            std::process::exit(EX_TEMPFAIL);
+        }
         // Human-readable one-line summary + cause chain, instead of anyhow's
         // default `{:?}` Debug dump. Keeps the non-zero exit code contract.
         eprintln!("error: {err}");
@@ -146,6 +155,10 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// sysexits(3) `EX_TEMPFAIL`. The same number `blocks/lib/job/init.lua`
+/// publishes as `job.DEFERRED_EXIT` and reads back as `outcome = "deferred"`.
+const EX_TEMPFAIL: i32 = 75;
 
 /// Synchronous startup path: parse → sandbox → build runtime → run.
 ///

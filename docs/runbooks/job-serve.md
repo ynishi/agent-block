@@ -24,6 +24,31 @@ outcome is the process's word (it returned, exit 0) and `result` is the
 block's. A block whose work could not be done should raise; a value is an
 answer.
 
+A block that runs unattended checks what it needs before it starts, and
+says so when it is not there — the manager keeps no health of its own, so
+the check is the block's first lines (the shape systemd calls
+`ExecCondition=`). `port:probe(conf)` asks the LLM endpoint one GET (its
+`/health` where it has one, the models list where it does not; no tokens),
+and `job.defer(reason)` ends the run with exit 75, which the manager records
+as `outcome = "deferred"` — neither `ok` nor `failed`, so `runs_list` shows
+a pod that was down as that and not as a block that broke:
+
+```lua
+local job = require("job")
+local adapter = require("knl_adapter")
+
+local h = adapter.openai:probe(conf)
+if h.alive == false then
+    job.defer("llm endpoint " .. h.kind .. ": " .. tostring(h.message))
+end
+-- the work
+```
+
+The manager does not count deferrals or back off on them; `every` stands,
+and each deferred run is one line in the record. How many in a row are too
+many, and what to do then, is the lane's or its service manager's
+(`StartLimitBurst=` and the like), not a number the block knows.
+
 The listener requires the bearer token in `$AGENT_BLOCK_HOME/serve.token` on
 every request, loopback included. Reaching it from another machine is a
 tunnel to the loopback port (`ssh -L 7788:127.0.0.1:7788 host`); a wider

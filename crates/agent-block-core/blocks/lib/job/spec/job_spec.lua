@@ -387,6 +387,28 @@ describe("job.run — a record, a process, a record", function()
         expect(s:events()[2].data.outcome).to.be("failed")
     end)
 
+    it("reads exit 75 as deferred: the block looked and did not start", function()
+        local s = fake_session()
+        local got = job.run(s, decl("a"), {
+            log = "/l",
+            exec = answering({ ok = true, code = job.DEFERRED_EXIT, stdout = "", stderr = "deferred: pod down" }),
+            now = function()
+                return 0
+            end,
+        })
+        expect(job.DEFERRED_EXIT).to.be(75)
+        expect(got.outcome).to.be("deferred")
+        expect(got.exit_code).to.be(75)
+        expect(s:events()[2].data.outcome).to.be("deferred")
+    end)
+
+    it("defer raises the prefix the host reads, with the reason after it", function()
+        local ok, raised = pcall(job.defer, "llm endpoint unreachable")
+        expect(ok).to.be(false)
+        expect(raised).to.be(job.DEFER_PREFIX .. "llm endpoint unreachable")
+        expect(job.DEFER_PREFIX).to.be("job.defer: ")
+    end)
+
     it("hands the process the block's root and its timeout", function()
         local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
         job.run(fake_session(), decl("a", { timeout = "30s" }), {

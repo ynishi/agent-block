@@ -475,4 +475,22 @@ function M.profile(spec)
         nil
 end
 
+--- Is the API behind `spec` up and taking this key: `GET /v1/models` with
+--- `limit=1`, the lightest call the surface has, read as liveness by
+--- `llm_proto.health_of`. There is no health route; a 401 is `down` (up,
+--- and not for this key), and no answer is `unreachable`.
+---
+--- @param spec table  the same spec `build` takes
+--- @return table  { alive, kind, status?, message? }
+function M.health(spec)
+    spec = spec or {}
+    local api_key = spec.api_key or std.env.get(spec.api_key_env or "ANTHROPIC_API_KEY")
+    local base = spec.base_url and (spec.base_url .. "/v1") or API_URL:gsub("/messages$", "")
+    local headers = proto.merge_headers({
+        ["x-api-key"] = api_key or "",
+        ["anthropic-version"] = API_VERSION,
+    }, spec.headers)
+    return proto.health_of(proto.ping(base .. "/models?limit=1", headers, spec.timeout))
+end
+
 return M
