@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.repeat_cap`: a wrapper over a device's `tools` that refuses the
+  same call — tool and arguments — past a count when nothing has changed in
+  between. A model whose window has dropped an old read asks for it again,
+  and again when that drops too, and never edits; measured against a file
+  larger than the window, one range was read eleven times. The count is read
+  off the log through a binder (`policy.repeat_cap{ max, resets }(session)`),
+  as `carry` reads its note, so a restarted process counts the same; a
+  successful call of a tool in `resets` (an edit) starts every count over.
+  The refusal is a return value the kernel records and the model reads.
+- `examples/coding_loop.lua`: the reference for a coding loop over the
+  kernel — edit the target files through path-locked `std.fs` tools until a
+  verify command passes, with the spec as the pinned seed, large files
+  entering as a structural map, and every part in a seam the kernel already
+  has (`window{fit}`, `result_cap`, `repeat_cap`, `carry`, `stagnation`,
+  `verdict{timeout}`). Runs against Anthropic or any OpenAI-compatible
+  server, returns one JSON string, and so runs under `agent-block serve` as
+  a block with a `job.toml`. Distilled from a lane that ran it unattended
+  against a real repository; `compile_loop` and `coding_agent`, which owned
+  a loop inside the product, went in 0.38.0 and this is what replaces them:
+  a loop the caller writes, and the seams to write it with.
 - A run's record carries the block's answer. `agent-block -s` gained
   `--result <FILE>` (`AGENT_BLOCK_RESULT_PATH`): the value the script
   returned, written verbatim — the CLI printed it nowhere, and stdout is the

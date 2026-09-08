@@ -15,7 +15,7 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The eight, and where each one plugs in
+--- The nine, and where each one plugs in
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
 ---                                         fit the model's window
@@ -32,12 +32,15 @@
 ---                                         tagged "tokens"
 ---     policy.result_cap  -> `tools`       one tool result may not outgrow a
 ---                                         share of the model's window
+---     policy.repeat_cap  -> `tools`       the same call, again, with nothing
+---                                         changed in between, is refused
+---                                         past a count
 ---     policy.verdict     -> a check       the loop runs it after every beat:
 ---                                         is the thing outside the
 ---                                         conversation true yet?
 ---
----   `window`, `carry`, `tokens` and `result_cap` are device fields
----   (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
+---   `window`, `carry`, `tokens`, `result_cap` and `repeat_cap` are device
+---   fields (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
 ---   `stagnation`, `retry`, `escalate` and `verdict` are the loop's own and
 ---   the kernel never sees them. That
 ---   split is the whole shape of this module: a policy either changes what
@@ -122,6 +125,8 @@
 ---     retry       reads NO log: the `Outcome` it is given, plus `attempt`,
 ---                 which is the caller's own count and is passed in
 ---     escalate    reads NO log: the `Outcome` it is given
+---     repeat_cap  reads the log — `session:events()`, through the binder,
+---                 on every call it is asked to answer
 ---     verdict     reads the log — `session:events()`, per call, and only
 ---                 when `timeout` is given: what the last check took is a
 ---                 gap between two of the kernel's stamps, not a number
@@ -258,6 +263,11 @@ local DEFAULT_MAX_ATTEMPTS = 3
 --- "verify" because that is what every consumer in this tree already
 --- appends, and a second name for one thing is a second thing to query.
 local DEFAULT_VERDICT_KIND = "verify"
+
+--- How many times one call may be made with nothing reset in between when
+--- `repeat_cap` is not told. Twice: once to see, once more in case the
+--- first answer fell out of the window; a third time is the loop.
+local DEFAULT_REPEAT_MAX = 2
 
 --- How many times what the last check took the next one may take, and the
 --- least it is ever given, when `verdict{ timeout }` is not told. Three
@@ -574,6 +584,18 @@ local RESULT_CAP_OPTS, RESULT_CAP_ARG = opts_contract({
     conf = T.table:describe("the conf the port is opened with"):is_optional(),
     share = T.number
         :describe("the most of the window one tool result may take, 0 < share <= 1; default 0.25")
+        :is_optional(),
+})
+
+--- What `policy.repeat_cap` is configured with. `resets` names the tools whose
+--- success makes an old call new again — an edit changes what a read would
+--- answer.
+local REPEAT_CAP_OPTS, REPEAT_CAP_ARG = opts_contract({
+    max = T.number
+        :describe("how many times one call (tool + arguments) may be made with nothing reset in between; default 2")
+        :is_optional(),
+    resets = T.table
+        :describe("tool names whose successful result starts the count over for every call; default none")
         :is_optional(),
 })
 
@@ -1036,6 +1058,178 @@ function M.tokens(opts)
             return 1
         end
         return n
+    end
+end
+
+-- ============================================================
+-- repeat_cap — the same call again, with nothing changed, is refused
+-- ============================================================
+
+--- The JSON a call's arguments render to: what "the same call" compares.
+--- Key order is not promised by every encoder, so the keys are sorted here
+--- before encoding — a table read back from the log and a table handed to a
+--- handler must key alike.
+local function call_key(name, args)
+    if type(args) ~= "table" then
+        return tostring(name) .. "\0" .. tostring(args)
+    end
+    local keys = {}
+    for k in pairs(args) do
+        keys[#keys + 1] = tostring(k)
+    end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+        local v = args[k]
+        parts[#parts + 1] = k .. "=" .. (type(v) == "table" and std.json.encode(v) or tostring(v))
+    end
+    return tostring(name) .. "\0" .. table.concat(parts, "\1")
+end
+
+--- Whether a `tool_result` says its tool did what it was asked. The kernel's
+--- `ok` is raise detection; a tool that refuses in its return value (`std.fs`
+--- does) says so with `result.ok == false`. Both are read.
+local function result_succeeded(data)
+    if data.ok == false then
+        return false
+    end
+    local result = data.result
+    if type(result) == "table" and result.ok == false then
+        return false
+    end
+    return true
+end
+
+--- Build a wrapper over a device's `tools` map that refuses a call already
+--- made `max` times since the last reset.
+---
+---     local tools = policy.repeat_cap({ max = 2, resets = { "fs_edit" } })(session)(raw_tools)
+---
+--- The model, its context window full, drops old reads out of the
+--- conversation and asks for them again — the same file, the same range —
+--- and asks again when those drop too, without ever editing. Measured on a
+--- vLLM-served model against a file larger than its window: the loop ran
+--- out of budget having read one range eleven times. Nothing in the
+--- kernel is wrong: every call was answered. The tool layer is where a
+--- repeated question can be told it is repeated, and the answer that helps
+--- is a refusal that says so, not the content again.
+---
+--- The count is read off the log, not kept. Like `carry`, the factory
+--- answers a BINDER: `policy.repeat_cap{...}(session)` is the value that
+--- wraps `tools`, and every call counts its own `tool_call` records since
+--- the last successful result of a tool in `resets` — an edit that landed
+--- makes an old read new, since the file it would read has changed. The
+--- kernel records the `tool_call` before it runs the handler, so the call
+--- being answered is in its own count: `max = 2` lets a call through twice
+--- and refuses the third. A process that restarted resumes the same count;
+--- two drivers on one log refuse alike.
+---
+--- The refusal is a return value, `{ ok = false, reason = "repeated", ... }`,
+--- so the kernel records the pair and the model reads why. `result_cap` is
+--- the sibling for the other way a tool result breaks a run; the two
+--- compose in either order.
+---
+--- @param opts table|nil  { max?, resets? }
+--- @return function binder  fn(session) -> fn(tools) -> tools
+function M.repeat_cap(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.repeat_cap: opts must be a table", 2)
+    end
+    only(opts, { max = true, resets = true }, "policy.repeat_cap")
+    if opts.max ~= nil and (type(opts.max) ~= "number" or opts.max < 1 or opts.max % 1 ~= 0) then
+        error("policy.repeat_cap: max must be a whole number >= 1, got " .. tostring(opts.max), 2)
+    end
+    if opts.resets ~= nil then
+        if type(opts.resets) ~= "table" then
+            error("policy.repeat_cap: resets must be an array of tool names", 2)
+        end
+        for i, name in ipairs(opts.resets) do
+            if type(name) ~= "string" or name == "" then
+                error("policy.repeat_cap: resets[" .. i .. "] must be a non-empty tool name", 2)
+            end
+        end
+    end
+    shape.assert_dev(opts, REPEAT_CAP_OPTS, "policy.repeat_cap opts")
+
+    local max = opts.max or DEFAULT_REPEAT_MAX
+    local resets = {}
+    for _, name in ipairs(opts.resets or {}) do
+        resets[name] = true
+    end
+
+    return function(session)
+        needs_session(session, "policy.repeat_cap")
+
+        --- How many times `key` has been called since the last reset, off
+        --- the log: every `tool_call` with that key after the newest
+        --- successful `tool_result` of a reset tool.
+        local function count(key)
+            local events = whole_log(session, "policy.repeat_cap")
+            local reset_tools_by_call = {}
+            local since = 0
+            for i, ev in ipairs(events) do
+                local data = type(ev.data) == "table" and ev.data or {}
+                if ev.kind == "tool_call" then
+                    if resets[data.name] and data.call_id ~= nil then
+                        reset_tools_by_call[data.call_id] = true
+                    end
+                elseif ev.kind == "tool_result" and data.call_id ~= nil and reset_tools_by_call[data.call_id] then
+                    if result_succeeded(data) then
+                        since = i
+                    end
+                end
+            end
+            local n = 0
+            for i = since + 1, #events do
+                local ev = events[i]
+                if ev.kind == "tool_call" then
+                    local data = type(ev.data) == "table" and ev.data or {}
+                    if call_key(data.name, data.args) == key then
+                        n = n + 1
+                    end
+                end
+            end
+            return n
+        end
+
+        return function(tools)
+            if type(tools) ~= "table" then
+                error("policy.repeat_cap: tools must be the device's map of name -> entry", 2)
+            end
+            local out = {}
+            for name, entry in pairs(tools) do
+                if type(entry) ~= "table" or type(entry.handler) ~= "function" then
+                    error("policy.repeat_cap: tool '" .. tostring(name) .. "' has no handler", 2)
+                end
+                local capped = {}
+                for k, v in pairs(entry) do
+                    capped[k] = v
+                end
+                local handler = entry.handler
+                capped.handler = function(args)
+                    local seen = count(call_key(name, args))
+                    if seen <= max then
+                        return handler(args)
+                    end
+                    return {
+                        ok = false,
+                        reason = "repeated",
+                        times = seen,
+                        max = max,
+                        error = string.format(
+                            "'%s' was already called with exactly these arguments %d times and nothing has "
+                                .. "changed since. The answer would be the same. Act on what you already saw "
+                                .. "instead of asking again.",
+                            tostring(name),
+                            seen - 1
+                        ),
+                    }
+                end
+                out[name] = capped
+            end
+            return out
+        end
     end
 end
 
@@ -2062,6 +2256,20 @@ M.shapes.api = {
             bind = {
                 args = { arg_of(T.table, "tools (the device's map of name -> entry)") },
                 returns = "table — the same map, each handler capped",
+            },
+        },
+    },
+    repeat_cap = {
+        args = { arg_of(REPEAT_CAP_ARG, "opts") },
+        returns = "bind — fn(session) -> fn(tools) -> tools",
+        members = {
+            bind = {
+                args = { SESSION_ARG },
+                returns = "wrap — fn(tools) -> tools",
+            },
+            wrap = {
+                args = { arg_of(T.table, "tools (the device's map of name -> entry)") },
+                returns = "table — the same map, each handler refusing a repeated call",
             },
         },
     },
