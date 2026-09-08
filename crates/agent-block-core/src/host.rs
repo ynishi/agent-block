@@ -30,7 +30,10 @@ use tokio_util::sync::CancellationToken;
 /// extra file distribution. The `require` name on the left is independent of
 /// the path on the right: `blocks/` is laid out by role (`agent/` runtime,
 /// `lib/`) while callers keep writing `require("agent")`.
-const EMBEDDED_BLOCKS: &[(&str, &str)] = &[("agent", include_str!("../blocks/agent/init.lua"))];
+const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
+    ("agent", include_str!("../blocks/agent/init.lua")),
+    ("coding", include_str!("../blocks/coding/init.lua")),
+];
 
 /// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]
 /// but not part of the block surface reported by [`inspect_tools`].
