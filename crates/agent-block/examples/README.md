@@ -16,7 +16,7 @@ Every script in this directory is listed here. A new one belongs in a table belo
 |---|---|---|
 | `knl_beat.lua` | The smallest real shell over `knl.beat`, in three sections: the plain kernel with a caller-written loop; the same run with the `policy` pack in the seams the device already has; the same again split across a `supervisor` tree. This is the reference for writing a loop of your own | `ANTHROPIC_API_KEY` |
 | `fcloop.lua` / `test_fcloop.lua` | A function-call loop built directly on `http.request`, below the kernel — what the layers above are saving you from | `ANTHROPIC_API_KEY` |
-| `coding_loop.lua` | A coding loop: edit the target files through path-locked `std.fs` tools until a verify command passes, with every part in a kernel seam — `policy.window{fit}` / `result_cap` / `repeat_cap` / `carry` / `stagnation` / `verdict{timeout}`. The spec is `--prompt`; runs against Anthropic or any OpenAI-compatible server. Registered as a block with a `job.toml`, `agent-block serve` runs it unattended | `ANTHROPIC_API_KEY`, or `AGENT_PROVIDER=openai` + `QWEN_BASE_URL`; `CODING_TARGETS`, `CODING_VERIFY?`, `CODING_REPO?` |
+| `coding_loop.lua` | `coding.run` (the embedded consumer beside `agent`) from the shell: edit the target files through path-locked `std.fs` tools until a verify command passes, every part in a kernel seam — `policy.window{fit}` / `result_cap` / `repeat_cap` / `carry` / `stagnation` / `verdict{timeout}`. The spec is `--prompt`; runs against Anthropic or any OpenAI-compatible server; returns one JSON string, so as a block with a `job.toml` beside it `agent-block serve` runs it unattended | `ANTHROPIC_API_KEY`, or `AGENT_PROVIDER=openai` + `QWEN_BASE_URL`; `CODING_TARGETS`, `CODING_VERIFY?`, `CODING_REPO?` |
 
 ## Agent basics
 
