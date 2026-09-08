@@ -295,6 +295,8 @@ end
 --                                            can take (llm_proto's `profile`)
 --     tokenize(spec) -> tokens | nil, err    count the request as the server
 --                                            would (llm_proto's `count`)
+--     health(spec)   -> { alive, kind, … }   is the server up and serving
+--                                            (llm_proto's `health`; see `probe`)
 --
 -- `spec` is the conf merged with the request, the same table `build` gets.
 -- What the shim adds around them is the part that does not change per
@@ -468,6 +470,45 @@ function LLMPort:profile(conf)
     end
     profile.discovered = true
     return profile
+end
+
+--- Is the server behind this Port up and serving: the question a block asks
+--- before it starts a run, and the one thing `open` cannot tell it — a
+--- closure that has not been called yet has seen nothing.
+---
+---     local h = port:probe(conf)
+---     if h.alive == false then
+---         job.defer("llm endpoint " .. h.kind .. ": " .. tostring(h.message))
+---     end
+---
+--- One GET, no tokens, read as liveness by the impl's `health` — a
+--- `/health` route where the server has one, the models list where it
+--- does not — and answered in one vocabulary: `alive` is true on 200 and
+--- false on everything else, with `kind` saying which everything-else it
+--- was (`unavailable` = up and not serving, `down` = up and not this,
+--- `unreachable` = nothing answered). A run that starts on `false` is
+--- spending its first beat to learn what this call already said.
+---
+--- Not kept and not cached: what the server is doing now is the question,
+--- and the answer a minute ago is not it. A Port whose impl has no
+--- `health` answers `{ kind = "unknown" }` with `alive` nil — not true,
+--- because nothing was asked, and not false, because nothing said no; a
+--- caller that wants to start anyway on unknown tests `alive == false`.
+---
+--- @param conf table|nil  the conf the Port is (or will be) opened with
+--- @return table  { alive = boolean|nil, kind, status?, message? }
+function LLMPort:probe(conf)
+    if type(self.health) ~= "function" then
+        return { alive = nil, kind = "unknown", message = "this port has no health check" }
+    end
+    local answered, health = pcall(self.health, self, spec_of(conf or {}, nil))
+    if not answered then
+        return { alive = false, kind = "unreachable", message = tostring(health) }
+    end
+    if type(health) ~= "table" or type(health.kind) ~= "string" then
+        error("knl_adapter: health must answer { alive, kind, ... }, got " .. tostring(health), 2)
+    end
+    return health
 end
 
 --- How many tokens a request is, as this Port would send it.
@@ -739,6 +780,9 @@ M.anthropic = LLMPort.new({
         end
         return proto_anthropic.profile(spec)
     end,
+    health = type(proto_anthropic.health) == "function" and function(_, spec)
+        return proto_anthropic.health(spec)
+    end or nil,
 })
 
 -- ============================================================
@@ -840,6 +884,9 @@ M.openai = LLMPort.new({
         end
         return proto_openai.profile(spec)
     end,
+    health = type(proto_openai.health) == "function" and function(_, spec)
+        return proto_openai.health(spec)
+    end or nil,
 })
 
 -- ============================================================

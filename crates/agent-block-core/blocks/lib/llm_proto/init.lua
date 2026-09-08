@@ -264,21 +264,38 @@ function M.classify_error(status, body, headers)
     }
 end
 
---- Backoff delay in seconds for attempt N (1-based), honouring `retry-after`.
---- Exponential with a small deterministic spread so parallel agents that hit
---- the same limit do not line up on the same retry instant.
+--- The backoff curve, as the SDKs have it: half a second doubling to a cap
+--- of eight, less a deterministic share so parallel callers do not line up.
+local RETRY_BASE_S = 0.5
+local RETRY_CAP_S = 8
+
+--- The longest a `retry-after` is believed. Past this the header is a
+--- statement about the provider's afternoon, not about the next attempt,
+--- and the curve stands (the Anthropic SDK draws the same line at 60s).
+local RETRY_AFTER_MAX_S = 60
+
+--- Backoff delay in seconds for attempt N (1-based), honouring `retry-after`
+--- up to `RETRY_AFTER_MAX_S`.
+---
+--- The SDKs' curve — `RETRY_BASE_S * 2^(N-1)` held to `RETRY_CAP_S`, then
+--- shortened by up to a quarter — with the shortening deterministic in
+--- `salt` rather than drawn at random, so parallel agents that hit the
+--- same limit do not line up on the same retry instant and a spec can say
+--- what the number is. Five steps: whole, and 1/16 less each step down to
+--- three quarters.
 ---
 --- @param attempt number
 --- @param classified table  Result of `classify_error`
 --- @param salt number|nil   Distinguishes concurrent callers (e.g. call index)
 --- @return number seconds
 function M.retry_delay(attempt, classified, salt)
-    if classified and classified.retry_after then
-        return classified.retry_after
+    local after = classified and classified.retry_after
+    if type(after) == "number" and after > 0 and after <= RETRY_AFTER_MAX_S then
+        return after
     end
-    local base = math.min(2 ^ (attempt - 1), 30)
-    local spread = ((salt or 0) % 5) / 10 -- 0.0 .. 0.4
-    return base + spread
+    local base = math.min(RETRY_BASE_S * 2 ^ (attempt - 1), RETRY_CAP_S)
+    local share = ((salt or 0) % 5) / 16 -- 0, 1/16 .. 4/16
+    return base * (1 - share)
 end
 
 -- ============================================================
@@ -352,7 +369,14 @@ end
 -- Backend
 -- ============================================================
 
---- Retries for transient API failures (rate limit / overload / 5xx).
+--- Retries for the failures worth asking again about: rate limit, overload,
+--- 5xx, and a transport failure (connect refused, name lookup, a deadline,
+--- a read cut) — the same set, and the same count, as the official SDKs'
+--- default (Anthropic / OpenAI: two retries, connection errors and timeouts
+--- included). Two, because the retry is held here and nowhere else: a
+--- loop that retried on top of this would multiply the attempts (three
+--- layers of three is twenty-seven), and the SRE reading is that the layer
+--- right above the one refusing is the one that asks again.
 local DEFAULT_MAX_RETRIES = 2
 
 --- Output cap when neither the request nor the conf names one.
@@ -377,26 +401,46 @@ local BACKEND_CONF = {
 ---
 --- Rate limits, overload and 5xx come back on their own; auth failures,
 --- malformed requests and exhausted spend never will, so the classification
---- decides rather than the status class.
+--- decides rather than the status class. A failure with no answer at all —
+--- the host's `http.request` raising on a refused connect, a name that
+--- would not resolve, a deadline, a read cut short — is retried the same
+--- way, as the SDKs do: a pod that is coming up answers the second time,
+--- and a run that gave up on the first refusal would be failing on
+--- something a second later is not true. When the retries are spent the
+--- raise is let out as it came, which keeps the contract `transport`
+--- states below (a transport failure RAISES).
+---
+--- What is not weighed here is whether the POST had side effects on the
+--- server before the read was cut. The general clients (urllib3, Go's
+--- net/http) refuse to retry a non-idempotent method past that point; the
+--- LLM SDKs retry it, and so does this, on the same reading: a generation
+--- the client never received cost a call and nothing else.
 local function post_with_retry(url, request_opts, max_retries)
     local attempt = 0
     while true do
-        local resp = http.request(url, request_opts)
-        if resp.status == 200 or attempt >= max_retries then
-            return resp
-        end
-        local classified = M.classify_error(resp.status, resp.body, resp.headers)
-        if not classified.retryable then
-            return resp
+        local sent, resp = pcall(http.request, url, request_opts)
+        local classified
+        if sent then
+            if resp.status == 200 or attempt >= max_retries then
+                return resp
+            end
+            classified = M.classify_error(resp.status, resp.body, resp.headers)
+            if not classified.retryable then
+                return resp
+            end
+        else
+            if attempt >= max_retries then
+                error(resp, 0)
+            end
+            classified = { kind = "transport", retryable = true, message = tostring(resp) }
         end
         attempt = attempt + 1
         local delay = M.retry_delay(attempt, classified, attempt)
         log.warn(
             "llm_proto: "
                 .. classified.kind
-                .. " (HTTP "
-                .. tostring(resp.status)
-                .. "); retry "
+                .. (sent and (" (HTTP " .. tostring(resp.status) .. ")") or (" (" .. classified.message .. ")"))
+                .. "; retry "
                 .. attempt
                 .. "/"
                 .. max_retries
@@ -673,6 +717,67 @@ function M.probe(method, url, headers, body, timeout)
         return nil, "probe " .. url .. ": response JSON decode failed"
     end
     return decoded, nil
+end
+
+--- One round trip, read as a liveness answer rather than as data: what the
+--- adapters' `health` is made of.
+---
+--- Unlike `probe`, nothing is decoded — a `/health` answers plain text or
+--- nothing — and a non-200 is an answer, not an error: the status is what
+--- says whether the server is up and not serving (503, loading or an engine
+--- that died) or up and not this (404 on a route it does not have, 401 on
+--- a key it does not take). Only a raise from the host's http device —
+--- refused connect, no such name, deadline — is `nil, err`: nothing
+--- answered.
+---
+--- @param url string
+--- @param headers table|nil
+--- @param timeout number|nil
+--- @return table|nil answer  { status, body, headers }
+--- @return string|nil err  when nothing answered
+function M.ping(url, headers, timeout)
+    local ok, resp = pcall(http.request, url, {
+        method = "GET",
+        headers = headers or {},
+        timeout = timeout or PROBE_TIMEOUT,
+    })
+    if not ok then
+        return nil, "ping " .. url .. ": " .. tostring(resp)
+    end
+    return { status = resp.status, body = resp.body, headers = resp.headers }, nil
+end
+
+--- What a `ping` answer says about the server, in the vocabulary every
+--- adapter's `health` answers in:
+---
+---   ok           answered 200: up, and serving this
+---   unavailable  answered 503: up, and not serving — a model still loading
+---                (llama.cpp, TGI), an engine that died (vLLM)
+---   down         answered anything else: reachable, and not usable as
+---                configured — no such route, a key it will not take, a 5xx
+---   unreachable  nothing answered: no process, no name, no route to it
+---
+--- `alive` is `kind == "ok"` and nothing subtler: a preflight asks one
+--- question. The status and the first of the body ride along for the
+--- record that says why a run was not started.
+---
+--- @param answer table|nil  from `ping`
+--- @param err string|nil  from `ping`
+--- @return table  { alive, kind, status?, message? }
+function M.health_of(answer, err)
+    if not answer then
+        return { alive = false, kind = "unreachable", message = tostring(err) }
+    end
+    local kind
+    if answer.status == 200 then
+        kind = "ok"
+    elseif answer.status == 503 then
+        kind = "unavailable"
+    else
+        kind = "down"
+    end
+    local body = type(answer.body) == "string" and answer.body:sub(1, 200) or nil
+    return { alive = kind == "ok", kind = kind, status = answer.status, message = body }
 end
 
 --- The server root a compatible server hangs its non-OpenAI endpoints off:

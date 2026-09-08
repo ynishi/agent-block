@@ -1808,12 +1808,42 @@ async fn execute_script(
                     info!("shutdown_token: cancelled by caller");
                     Err(BlockError::Cancelled)
                 }
-                res = &mut task => res.map_err(|e| BlockError::Script(format!("{e}"))),
+                res = &mut task => res.map_err(script_failure),
             }
         }
-        None => (&mut task)
-            .await
-            .map_err(|e| BlockError::Script(format!("{e}"))),
+        None => (&mut task).await.map_err(script_failure),
+    }
+}
+
+/// What a block says when it has looked at what it needs and is not
+/// starting: `job.defer(reason)` in `blocks/lib/job/init.lua` raises a
+/// string carrying this prefix, and it is the one contract between that
+/// module and this file. Kept in step by hand; the spec on the Lua side and
+/// the test below each pin their half.
+const DEFER_PREFIX: &str = "job.defer: ";
+
+/// The script's failure, as the error the caller is handed.
+///
+/// A raise that carries [`DEFER_PREFIX`] is [`BlockError::Deferred`] with
+/// the reason after it — the block did not start, and the CLI exits
+/// `EX_TEMPFAIL` on it so a job manager records the run as such. Anything
+/// else is [`BlockError::Script`] with the text as it came. The prefix is
+/// searched, not matched at the front, because a Lua raise reaches here
+/// wrapped in the runtime's own words (the chunk name, the line, a
+/// traceback in dev mode) ahead of the message.
+fn script_failure(e: impl std::fmt::Display) -> BlockError {
+    let text = e.to_string();
+    match text.find(DEFER_PREFIX) {
+        Some(at) => {
+            let reason = text[at + DEFER_PREFIX.len()..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            BlockError::Deferred(reason)
+        }
+        None => BlockError::Script(text),
     }
 }
 
@@ -1966,7 +1996,9 @@ async fn shutdown(
 /// Returns [`BlockError`] when any stage fails: source resolution / file reads
 /// ([`BlockError::Script`]), mesh connect ([`BlockError::Mesh`]), EventBus or
 /// Isle setup ([`BlockError::Bus`] / [`BlockError::Runtime`]), or a script
-/// runtime error ([`BlockError::Script`]). When a `shutdown_token` is supplied
+/// runtime error ([`BlockError::Script`]) — except the one raise a block
+/// makes on purpose, `job.defer(reason)`, which is [`BlockError::Deferred`]
+/// so the CLI can exit `EX_TEMPFAIL` on it. When a `shutdown_token` is supplied
 /// and fires before the script finishes, returns [`BlockError::Cancelled`]
 /// after the shutdown sequence completes.
 ///
@@ -2421,5 +2453,21 @@ mod tests {
         std::fs::write(agent.join("init.lua"), "return {}").expect("write");
 
         check_sealed_modules(&[tmp.path().to_path_buf()]).expect("`agent` is not sealed");
+    }
+
+    /// The one contract with `blocks/lib/job/init.lua`: a raise carrying
+    /// `job.defer: ` is the block not starting, with the reason after the
+    /// prefix, however the runtime wrapped it.
+    #[test]
+    fn a_defer_raise_is_deferred_with_its_reason() {
+        let wrapped = "runtime error: [string \"drain\"]:12: job.defer: llm endpoint unreachable\nstack traceback:\n\t...";
+        match script_failure(wrapped) {
+            BlockError::Deferred(reason) => assert_eq!(reason, "llm endpoint unreachable"),
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+        match script_failure("runtime error: attempt to index nil") {
+            BlockError::Script(text) => assert!(text.contains("attempt to index nil")),
+            other => panic!("expected Script, got {other:?}"),
+        }
     }
 }

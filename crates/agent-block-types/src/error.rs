@@ -20,6 +20,15 @@ pub enum BlockError {
     #[error("script error: {0}")]
     Script(String),
 
+    /// The script looked at what it needs and did not start — the raise a
+    /// block makes with `job.defer(reason)` (blocks/lib/job/init.lua), read
+    /// off the script failure by its prefix. The CLI exits 75 on it
+    /// (sysexits `EX_TEMPFAIL`) so the job manager records the run as
+    /// `deferred` rather than `failed`: nothing was done, and nothing was
+    /// wrong with the block. The payload is the reason.
+    #[error("deferred: {0}")]
+    Deferred(String),
+
     #[error("timeout: {0}")]
     Timeout(String),
 

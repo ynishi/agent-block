@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `job.defer(reason)` and `outcome = "deferred"`: a block that looks at what
+  it needs before it starts (an endpoint, a pod) and finds it not there
+  raises this, the process exits 75 (sysexits `EX_TEMPFAIL`), and the job
+  manager records the run as `deferred` — neither `ok` nor `failed`, so a
+  list of runs shows a pod that was down as that. The manager keeps no
+  count and no backoff: the check is the block's first lines, as systemd's
+  `ExecCondition=` is a unit's, and how many deferrals are too many is the
+  lane's question. Observed under a manager: six identical runs two
+  minutes apart, all recorded `ok` because the block reported the failure
+  in its value, and nothing in the list said the endpoint was gone.
+- `LLMPort:probe(conf)`: is the server behind a Port up and serving, in one
+  GET and no tokens — `/health` on the compatible servers (vLLM, llama.cpp,
+  TGI: 200 / 503), the models list on api.openai.com and Anthropic — read
+  as `{ alive, kind = ok | unavailable | down | unreachable, status?,
+  message? }`. The adapters' `health(spec)` behind it, `llm_proto.ping` and
+  `llm_proto.health_of` under that.
+
+### Changed
+
+- `llm_proto.transport` retries a failure that never answered — a refused
+  connect, a name that would not resolve, a deadline, a read cut — the way
+  it already retried a 429 or a 5xx, and the way the official SDKs do by
+  default. Before, the host's raise went straight out and a beat that hit a
+  pod still coming up failed on the first refusal. The backoff is now the
+  SDKs' curve (half a second doubling to a cap of eight, shortened by up to
+  a quarter, deterministic in the salt) instead of one second doubling to
+  thirty, and a `retry-after` past sixty seconds is no longer believed.
+  The retry is still held in this one layer: `policy.retry` remains a
+  predicate for a loop that wants one, and the coding block still does
+  not stack one on top.
+
 - `policy.repeat_cap`: a wrapper over a device's `tools` that refuses the
   same call — tool and arguments — past a count when nothing has changed in
   between. A model whose window has dropped an old read asks for it again,

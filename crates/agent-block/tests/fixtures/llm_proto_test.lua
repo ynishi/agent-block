@@ -510,20 +510,96 @@ describe("llm_proto error classification", function()
         expect(proto.classify_error(401, "").kind).to.equal("auth")
     end)
 
-    it("honours retry-after over the backoff curve", function()
+    it("honours retry-after over the backoff curve, up to a minute", function()
         local c = proto.classify_error(429, "", { ["Retry-After"] = "7" })
         expect(c.retry_after).to.equal(7)
         expect(proto.retry_delay(1, c)).to.equal(7)
+        -- Past the line the SDKs draw, the header is not about the next
+        -- attempt and the curve stands.
+        local far = proto.classify_error(429, "", { ["Retry-After"] = "3600" })
+        expect(proto.retry_delay(1, far, 0)).to.equal(0.5)
     end)
 
-    it("backs off exponentially when no header is given", function()
+    it("backs off on the SDKs' curve when no header is given: half a second doubling to eight", function()
         local c = proto.classify_error(529, "")
-        expect(proto.retry_delay(1, c, 0)).to.equal(1)
-        expect(proto.retry_delay(3, c, 0)).to.equal(4)
+        expect(proto.retry_delay(1, c, 0)).to.equal(0.5)
+        expect(proto.retry_delay(3, c, 0)).to.equal(2)
+        expect(proto.retry_delay(6, c, 0)).to.equal(8)
+        -- The spread is deterministic in the salt and shortens, never lengthens.
+        expect(proto.retry_delay(1, c, 4)).to.equal(0.375)
+        expect(proto.retry_delay(1, c, 5)).to.equal(0.5)
     end)
 
     it("survives a non-JSON body", function()
         expect(proto.classify_error(503, "<html>gateway</html>").kind).to.equal("overloaded")
+    end)
+end)
+
+describe("llm_proto.transport retries a failure that never answered", function()
+    -- The host's http device raises on a refused connect, a name that will
+    -- not resolve, a deadline. The transport asks again, as the SDKs do, and
+    -- lets the raise out only once the retries are spent.
+    local function with_http(answers, fn)
+        local saved_http, saved_task, saved_time = rawget(_G, "http"), std.task, std.time
+        local calls, slept = 0, {}
+        http = {
+            request = function()
+                calls = calls + 1
+                local answer = answers[calls] or answers[#answers]
+                if type(answer) == "string" then
+                    error(answer, 0)
+                end
+                return answer
+            end,
+        }
+        std.task = {
+            sleep = function(ms)
+                slept[#slept + 1] = ms
+            end,
+        }
+        std.time = {
+            now = function()
+                return 0
+            end,
+        }
+        local ok, err = pcall(fn, function()
+            return calls
+        end, slept)
+        http, std.task, std.time = saved_http, saved_task, saved_time
+        if not ok then
+            error(err, 0)
+        end
+    end
+
+    local wire = { url = "http://pod:8000/v1/chat/completions", headers = {}, body = { model = "m" } }
+
+    it("asks again after a refused connect and answers when the server comes up", function()
+        with_http({ "connect refused", { status = 200, body = '{"id":"ok"}', headers = {} } }, function(calls, slept)
+            local raw, err = proto.transport(wire, { max_retries = 2 })
+            expect(err).to.be(nil)
+            expect(raw.id).to.equal("ok")
+            expect(calls()).to.equal(2)
+            expect(#slept).to.equal(1)
+            expect(slept[1]).to.equal(0.5 * (1 - 1 / 16) * 1000)
+        end)
+    end)
+
+    it("lets the raise out as it came once the retries are spent", function()
+        with_http({ "connect refused" }, function(calls, slept)
+            local ok, err = pcall(proto.transport, wire, { max_retries = 2 })
+            expect(ok).to.be(false)
+            expect(tostring(err)).to.equal("connect refused")
+            expect(calls()).to.equal(3)
+            expect(#slept).to.equal(2)
+        end)
+    end)
+
+    it("does not ask again when told no retries", function()
+        with_http({ "connect refused" }, function(calls)
+            local ok = pcall(proto.transport, wire, { max_retries = 0 })
+            expect(ok).to.be(false)
+            expect(calls()).to.equal(1)
+        end)
     end)
 end)
 

@@ -43,11 +43,13 @@
 ---                           result?, result_path?, result_truncated? }
 ---     run_skipped         { job, reason, requested? }    a start that was asked for and refused
 ---
----   `outcome` is one of `ok` (exit 0) / `failed` (exit ≠ 0, or the process
----   could not be started) / `timeout` (the group was killed at `timeout`) /
----   `stopped` (ended by a signal: a stop request, or the manager leaving
----   and taking its runs with it) / `lost` (the manager that started it is
----   gone; written by `reconcile` on the next start). A request is PENDING
+---   `outcome` is one of `ok` (exit 0) / `deferred` (exit 75: the block
+---   looked and did not start, see `defer` below) / `failed` (any other
+---   exit ≠ 0, or the process could not be started) / `timeout` (the group
+---   was killed at `timeout`) / `stopped` (ended by a signal: a stop
+---   request, or the manager leaving and taking its runs with it) / `lost`
+---   (the manager that started it is gone; written by `reconcile` on the
+---   next start). A request is PENDING
 ---   until a `run_started` or a `run_skipped` for the same job follows it in
 ---   the log — either is its answer; a stop is pending until the run it
 ---   names has ended. Reading those as "the latest fact wins" is what lets a
@@ -540,6 +542,47 @@ function M.command(decl, log, opts)
     return table.concat(parts, " ")
 end
 
+--- The exit code a run ends with when the block looked and did not start:
+--- `EX_TEMPFAIL` from sysexits(3), "temporary failure; the user is invited
+--- to retry", which is what a mail transport has said for forty years
+--- about a delivery it will try again later. The one exit code the manager
+--- reads as a word of its own.
+M.DEFERRED_EXIT = 75
+
+--- What `defer` raises, and what the host reads the raise by. The text is
+--- the contract between this module and `main.rs`: a script whose failure
+--- carries it exits `DEFERRED_EXIT` instead of 1.
+M.DEFER_PREFIX = "job.defer: "
+
+--- Say, from inside a block, that this run is not starting — and why.
+---
+---     local h = port:probe(conf)
+---     if h.alive == false then
+---         job.defer("llm endpoint " .. h.kind .. ": " .. tostring(h.message))
+---     end
+---
+--- The block's `ExecCondition`: the check that runs before the work, at the
+--- top of the block, where the block knows what it needs (an endpoint, a
+--- pod, a queue with something in it) and the manager does not. A block
+--- that raises this ends the process with `DEFERRED_EXIT`, and the run is
+--- recorded `outcome = "deferred"` — not `ok` (nothing was done) and not
+--- `failed` (nothing went wrong; the world was not ready), so a list of
+--- runs shows the five deferred ones as what they were, and a supervisor
+--- reading the log can tell "the pod is down" from "the block is broken"
+--- without opening either. The manager keeps no count of them: how many
+--- deferrals in a row are too many is a question about the lane, and the
+--- log has the runs for whoever asks it.
+---
+--- A raise, not a return: a value is an answer and this is the absence of
+--- one, and a return would have to be recognised by shape on the way out
+--- where a raise is recognised by the one prefix `main.rs` knows. Called
+--- from anywhere below a `pcall` it is that pcall's to re-raise.
+---
+--- @param reason string  what was looked at and found not ready
+function M.defer(reason)
+    error(M.DEFER_PREFIX .. tostring(reason), 0)
+end
+
 --- What a `sh.exec` result means for a run.
 ---
 --- @param result table  `{ ok, code, stdout, stderr }` or `{ ok = false, error, timed_out? }`
@@ -566,6 +609,9 @@ local function outcome_of(result)
         -- a run someone stopped, not a run that said no.
         if type(result.code) == "number" and result.code < 0 then
             return "stopped", result.code, nil
+        end
+        if result.code == M.DEFERRED_EXIT then
+            return "deferred", result.code, nil
         end
         return "failed", result.code, nil
     end

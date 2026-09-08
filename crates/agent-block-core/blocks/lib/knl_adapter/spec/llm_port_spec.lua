@@ -858,3 +858,76 @@ describe("knl_adapter Port", function()
         expect(shape.check(resp2, knl_adapter.shapes.llm_result)).to.equal(true)
     end)
 end)
+
+describe("knl_adapter Port — probe (is the server up and serving)", function()
+    -- A port whose impl answers `health`: the shim hands it the conf as the
+    -- spec `build` would see, and passes the answer through as it came.
+    local function port_with_health(answer)
+        local seen = {}
+        local port = knl_adapter.LLMPort.new({
+            build = function() end,
+            parse = function() end,
+            classify = function() end,
+            health = function(_, spec)
+                seen.spec = spec
+                if type(answer) == "function" then
+                    return answer()
+                end
+                return answer
+            end,
+        })
+        return port, seen
+    end
+
+    it("answers the impl's health, handed the conf", function()
+        local port, seen = port_with_health({ alive = true, kind = "ok", status = 200 })
+        local h = port:probe({ base_url = "http://pod:8000/v1", model = "m" })
+        expect(h.alive).to.be(true)
+        expect(h.kind).to.equal("ok")
+        expect(seen.spec.base_url).to.equal("http://pod:8000/v1")
+        expect(seen.spec.model).to.equal("m")
+    end)
+
+    it("answers false with the kind when the server is not serving", function()
+        local port = port_with_health({ alive = false, kind = "unavailable", status = 503, message = "Loading model" })
+        local h = port:probe({})
+        expect(h.alive).to.be(false)
+        expect(h.kind).to.equal("unavailable")
+        expect(h.message).to.equal("Loading model")
+    end)
+
+    it("reads a health that raised as unreachable rather than letting it out", function()
+        local port = port_with_health(function()
+            error("connect refused", 0)
+        end)
+        local h = port:probe({})
+        expect(h.alive).to.be(false)
+        expect(h.kind).to.equal("unreachable")
+        expect(h.message).to.equal("connect refused")
+    end)
+
+    it("answers unknown, alive nil, for a port with no health to ask", function()
+        local port = make_test_port({})
+        local h = port:probe({})
+        expect(h.alive).to.be(nil)
+        expect(h.kind).to.equal("unknown")
+    end)
+
+    it("refuses a health that did not answer the shape", function()
+        local port = port_with_health("up")
+        expect(function()
+            port:probe({})
+        end).to.fail()
+    end)
+
+    it("is not cached: every probe asks", function()
+        local asked = 0
+        local port = port_with_health(function()
+            asked = asked + 1
+            return { alive = true, kind = "ok" }
+        end)
+        port:probe({})
+        port:probe({})
+        expect(asked).to.equal(2)
+    end)
+end)
