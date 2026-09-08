@@ -24,6 +24,21 @@ outcome is the process's word (it returned, exit 0) and `result` is the
 block's. A block whose work could not be done should raise; a value is an
 answer.
 
+The outcome is read off the exit code, and off nothing else:
+
+| The run | `outcome` |
+|---|---|
+| exit 0 | `ok` |
+| exit 75 (`job.defer`) | `deferred` |
+| any other non-zero, or a process that would not start | `failed` |
+| killed at `timeout` | `timeout` |
+| ended by a signal — a `run_stop`, or the manager leaving | `stopped` |
+| started by a manager that is gone | `lost`, written by the next start |
+
+A lane that runs a block from a shell reads the same codes by hand (README,
+"What the exit code says"), and one that tests only for non-zero reads a
+`deferred` run as a failure.
+
 A block that runs unattended checks what it needs before it starts, and
 says so when it is not there — the manager keeps no health of its own, so
 the check is the block's first lines (the shape systemd calls

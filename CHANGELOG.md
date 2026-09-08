@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Docs
 
+- What the exit code says, in the README: `0` ran and returned, `75` did not
+  start (`job.defer`), `1` raised or never got to run, `2` did not parse.
+  A block that reports failure in its return value exits `0`, so a caller
+  testing `$?` alone will not see it, and a caller testing only for non-zero
+  reads a `deferred` run as a failure. The runbook says which outcome the
+  manager reads off each of them.
 - How to stop a run, in the job-serve runbook and the MCP guide: `run_stop`
   (`DELETE /runs/<id>`), which kills the run's process group and records
   `stopped` — not a kill by pid, which records `failed` and loses the

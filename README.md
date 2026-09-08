@@ -126,6 +126,35 @@ Both flags also accept environment variables as fallback:
 | `--prompt` | `AGENT_BLOCK_PROMPT` |
 | `-c / --context` | `AGENT_BLOCK_CONTEXT` |
 
+### What the exit code says
+
+It says whether the process finished, not whether the work succeeded:
+
+| Exit | The script |
+|---|---|
+| `0` | ran and returned. Whatever it returned, including a value that says the work failed |
+| `75` | called `job.defer(reason)`: it looked at what it needs, did not find it, and did not start (sysexits `EX_TEMPFAIL`; the job manager records this run as `deferred`) |
+| `1` | raised, or never got to run — a source that could not be read, a mesh that would not connect, two flags that contradict each other |
+| `2` | was never named: the command line itself did not parse (clap's own code, printed as a usage error) |
+
+A block that reports failure in its return value exits `0`, so a caller
+testing `$?` alone will not see it. Two ways to be seen: raise (`error(...)`,
+which is exit `1`), or return the JSON and have the caller read `ok` out of
+the `--result` file. The file is written only when the script returns — a
+raise leaves it absent, so a caller that reads it must handle that.
+
+`75` is a value a shell testing "non-zero means broken" will get wrong. It
+is the one exit code that means nothing broke:
+
+```sh
+agent-block -s block.lua --result out.json
+case $? in
+  0)  ;;                        # ran; read `ok` out of out.json
+  75) exit 0 ;;                 # dependency was not there; nothing was done
+  *)  exit 1 ;;                 # it raised, or never got to run
+esac
+```
+
 ## Blocks and libraries
 
 Two directories, two jobs, at two tiers:
