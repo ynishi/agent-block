@@ -26,7 +26,7 @@
 //! removal, and it is not an env allowlist — everything else is still inherited.
 
 use mlua::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -45,18 +45,96 @@ use crate::host::HostContext;
 ///
 /// Process-global rather than per-host because a signal is delivered to the
 /// process, not to a host.
-static LIVE_GROUPS: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
+///
+/// Each group carries the `label` its `sh.exec` was given, if any, which is
+/// what `sh.kill(label)` looks up: a caller that wants to end a command it
+/// started has no pid (`sh.exec` answers only when the command has ended)
+/// and no future to drop (an awaiting coroutine cannot be reached from
+/// another), so the name it chose at start is the one handle it holds.
+static LIVE_GROUPS: Mutex<BTreeMap<i32, Group>> = Mutex::new(BTreeMap::new());
 
-fn remember_group(pgid: i32) {
+/// One live group: the name it was started under, and whether `sh.kill`
+/// has ended it — the latter is what the awaiting `sh.exec` reports as
+/// `killed`, so a caller tells "stopped by us" from "ended on its own"
+/// without reading exit codes, which differ by what the command was (a
+/// signalled process has none; a nested `agent-block` host that forwarded
+/// the signal exits 130).
+struct Group {
+    label: Option<String>,
+    killed: bool,
+}
+
+fn remember_group(pgid: i32, label: Option<String>) {
     if let Ok(mut g) = LIVE_GROUPS.lock() {
-        g.insert(pgid);
+        g.insert(
+            pgid,
+            Group {
+                label,
+                killed: false,
+            },
+        );
     }
 }
 
-fn forget_group(pgid: i32) {
-    if let Ok(mut g) = LIVE_GROUPS.lock() {
-        g.remove(&pgid);
+/// Drop the group from the registry and answer whether it had been killed.
+fn forget_group(pgid: i32) -> bool {
+    match LIVE_GROUPS.lock() {
+        Ok(mut g) => g.remove(&pgid).map(|group| group.killed).unwrap_or(false),
+        Err(_) => false,
     }
+}
+
+/// The group started under `label`, marked as killed, if it is still live.
+fn take_labelled(label: &str) -> Option<i32> {
+    let mut g = LIVE_GROUPS.lock().ok()?;
+    let (pgid, group) = g
+        .iter_mut()
+        .find(|(_, group)| group.label.as_deref() == Some(label))?;
+    group.killed = true;
+    Some(*pgid)
+}
+
+/// End the process group started with `label`, and answer whether there was
+/// one. Nothing to end — the label was never given, or the command has
+/// already ended — answers `false`.
+///
+/// SIGTERM first, SIGKILL after a grace: the command may be a host of its
+/// own (`agent-block -s <block>` under `agent-block serve`) whose commands
+/// are in groups of *their* own, and only a signal it can catch lets it
+/// forward the end to them — SIGKILL would leave a grandchild running under
+/// nobody, which is the leak the groups exist to close. The grace is the
+/// task grace window twice over: once for the child host to forward, once
+/// for it to leave.
+#[cfg(unix)]
+pub async fn kill_labelled(label: &str) -> bool {
+    let Some(pgid) = take_labelled(label) else {
+        return false;
+    };
+    // SAFETY: see `kill_live_groups`.
+    unsafe {
+        libc::killpg(pgid, libc::SIGTERM);
+    }
+    let grace = Duration::from_millis(super::config::task_grace_ms());
+    let deadline = tokio::time::Instant::now() + grace * 2;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Signal 0 asks whether the group still has a member.
+        // SAFETY: as above; a probe sends nothing.
+        let alive = unsafe { libc::killpg(pgid, 0) } == 0;
+        if !alive {
+            return true;
+        }
+    }
+    // SAFETY: as above.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+pub async fn kill_labelled(_label: &str) -> bool {
+    false
 }
 
 /// SIGKILL every process group still running under this bridge.
@@ -67,8 +145,23 @@ fn forget_group(pgid: i32) {
 /// binary running. On a shared machine it stays there.
 #[cfg(unix)]
 pub fn kill_live_groups() {
+    signal_live_groups(libc::SIGKILL, true);
+}
+
+/// SIGTERM every process group still running under this bridge, and keep
+/// them registered: the signal is forwarded, not the end. A command that is
+/// a host of its own catches it and forwards it on to its own groups, which
+/// a SIGKILL would have left running under nobody; [`kill_live_groups`]
+/// after a grace is the backstop for what did not leave.
+#[cfg(unix)]
+pub fn term_live_groups() {
+    signal_live_groups(libc::SIGTERM, false);
+}
+
+#[cfg(unix)]
+fn signal_live_groups(signal: i32, forget: bool) {
     let groups: Vec<i32> = match LIVE_GROUPS.lock() {
-        Ok(g) => g.iter().copied().collect(),
+        Ok(g) => g.keys().copied().collect(),
         Err(_) => return,
     };
     for pgid in groups {
@@ -76,14 +169,19 @@ pub fn kill_live_groups() {
         // uphold. A group that has already gone answers ESRCH, which is the
         // answer this wants anyway.
         unsafe {
-            libc::killpg(pgid, libc::SIGKILL);
+            libc::killpg(pgid, signal);
         }
-        forget_group(pgid);
+        if forget {
+            forget_group(pgid);
+        }
     }
 }
 
 #[cfg(not(unix))]
 pub fn kill_live_groups() {}
+
+#[cfg(not(unix))]
+pub fn term_live_groups() {}
 
 /// Forward a terminating signal to the process groups `sh.exec` started.
 ///
@@ -124,8 +222,12 @@ pub fn install_signal_cleanup() {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = term.recv() => {}
             }
-            kill_live_groups();
+            // Forwarded as received, then ended: a command that is a host
+            // of its own needs the signal it can catch to reach what it
+            // started; the kill after the grace is for what did not leave.
+            term_live_groups();
             tokio::time::sleep(Duration::from_millis(super::config::task_grace_ms())).await;
+            kill_live_groups();
             // `bus.serve` has a handler for the same signal and ends the
             // run through the script — it returns, what follows it runs,
             // the host shuts down, the process exits 0. That path is not
@@ -161,15 +263,22 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| default_cwd.clone());
 
-                let result = run_async(&cmd, &cwd, Duration::from_secs(timeout_secs)).await;
+                // The name `sh.kill` may later use for this command's group.
+                let label: Option<String> = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<Option<String>>("label").ok().flatten());
+
+                let result = run_async(&cmd, &cwd, Duration::from_secs(timeout_secs), label).await;
 
                 match result {
-                    Ok((code, stdout, stderr)) => {
+                    Ok((code, stdout, stderr, killed)) => {
                         let t = lua.create_table()?;
                         t.set("ok", true)?;
                         t.set("code", code)?;
                         t.set("stdout", stdout)?;
                         t.set("stderr", stderr)?;
+                        // Ended by `sh.kill`, whatever exit code that left.
+                        t.set("killed", killed)?;
                         Ok(t)
                     }
                     Err(failure) => {
@@ -185,6 +294,17 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                 }
             }
         })?,
+    )?;
+
+    // ── sh.kill ───────────────────────────────────────────────────────
+    // End a command another coroutine is awaiting, by the `label` its
+    // `sh.exec` was given. Reaches the whole group, as the timeout does,
+    // and gives a child host the chance to reach its own first.
+    sh_tbl.set(
+        "kill",
+        lua.create_async_function(
+            |_, label: String| async move { Ok(kill_labelled(&label).await) },
+        )?,
     )?;
 
     lua.globals().set("sh", sh_tbl)?;
@@ -220,7 +340,8 @@ async fn run_async(
     cmd: &str,
     cwd: &PathBuf,
     timeout: Duration,
-) -> Result<(i32, String, String), ExecFailure> {
+    label: Option<String>,
+) -> Result<(i32, String, String, bool), ExecFailure> {
     let mut command = tokio::process::Command::new("sh");
     command
         .arg("-c")
@@ -264,11 +385,12 @@ async fn run_async(
         None
     };
     if let Some(p) = pgid {
-        remember_group(p);
+        remember_group(p, label.clone());
     }
 
     let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
+    let mut killed = false;
     if let Some(p) = pgid {
         #[cfg(unix)]
         if waited.is_err() {
@@ -277,7 +399,7 @@ async fn run_async(
                 libc::killpg(p, libc::SIGKILL);
             }
         }
-        forget_group(p);
+        killed = forget_group(p);
     }
 
     let output = waited
@@ -294,5 +416,5 @@ async fn run_async(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    Ok((code, stdout, stderr))
+    Ok((code, stdout, stderr, killed))
 }

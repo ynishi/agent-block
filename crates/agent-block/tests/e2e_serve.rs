@@ -304,3 +304,96 @@ async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
     let log = manager.stop();
     assert!(log.contains("serve: stopped"), "log:\n{log}");
 }
+
+/// A block that sleeps, declared without `every`: it runs only when asked,
+/// and stays live long enough to be stopped.
+fn write_slow_project(root: &Path) {
+    let block_dir = root.join("blocks/slow");
+    std::fs::create_dir_all(&block_dir).expect("mkdir blocks/slow");
+    std::fs::write(
+        block_dir.join("init.lua"),
+        "-- slow: sleeps so a stop has something to stop.\n\
+         local r = sh.exec(\"sleep 30\", { timeout = 60 })\n\
+         return std.json.encode({ ok = r.ok, code = r.code })\n",
+    )
+    .expect("write block");
+    std::fs::write(block_dir.join("job.toml"), "timeout = \"60s\"\n").expect("write job.toml");
+}
+
+/// How many `sleep 30` processes are running, or `None` when `pgrep` is
+/// not there to ask.
+fn sleepers() -> Option<usize> {
+    let out = Command::new("pgrep")
+        .args(["-f", "^sleep 30$"])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).lines().count())
+}
+
+/// The two things the machine found that the first e2e did not: a stop that
+/// left the process running, and a listener that stopped answering once
+/// the collector had reclaimed the per-request session handles.
+#[tokio::test]
+async fn a_stop_ends_the_process_and_the_listener_outlives_the_collector() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&root).unwrap();
+    write_slow_project(&root);
+
+    let manager = Manager::start(&root, &home, free_port());
+    manager.wait_ready().await;
+
+    // Ask for a run and wait until it is live.
+    let (status, _) = manager.call(reqwest::Method::POST, "/jobs/slow/runs").await;
+    assert_eq!(status, 202);
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let run_id = loop {
+        let (_, body) = manager.get("/runs?job=slow").await;
+        if let Some(row) = body["runs"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["outcome"].is_null()))
+        {
+            break row["run_id"].as_str().expect("run_id").to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no live run: {body}; log:\n{}",
+            manager.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    if let Some(n) = sleepers() {
+        assert!(n >= 1, "the run's sleep is not running");
+    }
+
+    // Stop it: the record says stopped, and the process is gone.
+    let (status, body) = manager
+        .call(reqwest::Method::DELETE, &format!("/runs/{run_id}"))
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let row = manager.wait_run("slow", "stopped").await;
+    assert_eq!(row["run_id"], run_id);
+    if let Some(n) = sleepers() {
+        assert_eq!(
+            n,
+            0,
+            "the stopped run's sleep is still running; log:\n{}",
+            manager.log_text()
+        );
+    }
+
+    // More requests than a collector cycle: every one is answered.
+    for i in 0..40 {
+        let (status, body) = manager.get("/jobs").await;
+        assert_eq!(
+            status,
+            200,
+            "request {i}: {body}; log:\n{}",
+            manager.log_text()
+        );
+    }
+
+    let log = manager.stop();
+    assert!(log.contains("serve: stopped"), "log:\n{log}");
+}

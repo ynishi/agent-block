@@ -80,23 +80,33 @@ local function tick()
     local facts = job.read(s, span)
 
     -- Stops first, so a stopped job can be started again on this same tick.
+    -- The process is ended by its group, under the label `job.run` gave it:
+    -- the run's task is awaiting `sh.exec`, and aborting a task does not
+    -- reach a command that is already running. Once the group is gone the
+    -- exec answers `killed = true` and `job.run` records `stopped` itself.
     for _, st in ipairs(facts.stops) do
         local name, live = live_of(facts, st.run_id)
-        local h = handles[st.run_id]
-        if h ~= nil then
-            h:abort()
-            handles[st.run_id] = nil
-        end
-        if name ~= nil then
-            s:append({
-                kind = "run_ended",
-                data = {
-                    job = name,
-                    run_id = st.run_id,
-                    outcome = h ~= nil and "stopped" or "lost",
-                    took_s = now - live.started,
-                },
-            })
+        local killed = sh.kill(st.run_id)
+        if not killed then
+            -- Nothing of that name is running here: a run a previous manager
+            -- started (its end is `lost`), or one whose task never reached
+            -- the exec. Either way the record is closed by hand.
+            local h = handles[st.run_id]
+            if h ~= nil then
+                h:abort()
+                handles[st.run_id] = nil
+            end
+            if name ~= nil then
+                s:append({
+                    kind = "run_ended",
+                    data = {
+                        job = name,
+                        run_id = st.run_id,
+                        outcome = h ~= nil and "stopped" or "lost",
+                        took_s = now - live.started,
+                    },
+                })
+            end
         end
     end
     if #facts.stops > 0 then
@@ -162,7 +172,17 @@ bus.on("http", function(ev)
             ids[#ids + 1] = id
         end
     end
-    local session = knl_h.resume({ session = ids[#ids], store = { sqlite = conf.store } })
+    -- One handle for the life of this Isle, kept in a global: a handle that
+    -- is dropped records `session_closed` on its stream (the kernel's rule
+    -- for a handle going away), and a stream closed that way refuses to be
+    -- resumed. Resuming per request and letting the handle go was six
+    -- requests away from a manager no request could reach.
+    local cached = rawget(_G, "__serve_session")
+    if cached == nil or cached.id ~= ids[#ids] then
+        cached = { id = ids[#ids], session = knl_h.resume({ session = ids[#ids], store = { sqlite = conf.store } }) }
+        rawset(_G, "__serve_session", cached)
+    end
+    local session = cached.session
     local span = { sessions = ids }
 
     local decls = {}
@@ -248,10 +268,14 @@ end)
 
 bus.serve()
 
--- Leaving: what this process holds ends with it, and the log says so.
+-- Leaving: what this process holds ends with it, and the log says so. The
+-- groups are killed by label first, so nothing outlives the manager; a run
+-- whose exec answers in time records its own `stopped`, the rest are
+-- recorded here.
 loop:abort()
 local now = std.time.now()
-for _, h in pairs(handles) do
+for run_id, h in pairs(handles) do
+    sh.kill(run_id)
     h:abort()
 end
 local facts = job.read(s, span)

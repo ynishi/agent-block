@@ -365,6 +365,12 @@ describe("job.run — a record, a process, a record", function()
         got = outcome({ ok = true, code = -1, stdout = "", stderr = "" })
         expect(got.outcome).to.be("stopped")
         expect(got.exit_code).to.be(-1)
+        -- Ended by `sh.kill`: `killed` says so whatever the exit code, since
+        -- a nested host that forwarded the signal exits 130 rather than dying
+        -- of it.
+        got = outcome({ ok = true, code = 130, killed = true, stdout = "", stderr = "" })
+        expect(got.outcome).to.be("stopped")
+        expect(got.exit_code).to.be(130)
         local _, s = outcome({ ok = true, code = 3, stdout = "", stderr = "boom" })
         expect(s:events()[2].data.stderr).to.be("boom")
         expect(s:events()[2].data.outcome).to.be("failed")
@@ -381,6 +387,19 @@ describe("job.run — a record, a process, a record", function()
         })
         expect(seen[1].opts.cwd).to.be("/repo")
         expect(seen[1].opts.timeout).to.be(30)
+    end)
+
+    it("labels the process with the run id, which is what a stop reaches it by", function()
+        local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
+        job.run(fake_session(), decl("a"), {
+            log = "/l",
+            exec = exec,
+            run_id = "a-7",
+            now = function()
+                return 0
+            end,
+        })
+        expect(seen[1].opts.label).to.be("a-7")
     end)
 
     it("carries the request it answers", function()

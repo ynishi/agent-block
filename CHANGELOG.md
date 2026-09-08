@@ -53,6 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `agent-block serve`'s HTTP handler kept no session handle: it resumed the
+  manager's session on every request and let the handle go, and a handle
+  that goes away records `session_closed` on its stream — the kernel's rule
+  for a dropped handle — after which the stream refuses to be resumed. Six
+  requests in, every request answered 500. The handler now holds one handle
+  for the life of its Isle. Found on the machine, not by the e2e, which ran
+  out before the collector did; the e2e now makes enough requests to cross it.
+- A stop request was recorded as `stopped` while the run kept running. The
+  manager aborted the task awaiting `sh.exec`, and an abort does not reach a
+  command that is already running (nor would dropping the future reach past
+  the direct child). `sh.exec` takes `opts.label` and `sh.kill(label)` ends
+  that command's whole process group — SIGTERM first, so a run that is
+  itself an `agent-block` host forwards the end to the commands it started
+  (a SIGKILL would have left those running under nobody), SIGKILL after
+  twice the task grace. The manager labels each run with its id and stops
+  it by name, and the exec's answer says `killed = true`, which is what the
+  record says `stopped` from. The e2e now checks that the run's own child
+  process is gone.
 - A timed-out `sh.exec` takes what the command started with it. It killed the
   command and nothing below it: `kill_on_drop` reaches the direct child, and
   `sh -c "cargo test"` is one process with the test binary two below, so a
