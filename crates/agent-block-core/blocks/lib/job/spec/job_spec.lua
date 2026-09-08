@@ -67,7 +67,15 @@ local function fake_session()
             ends[ev.data.run_id] = ev
         end
         local out = {}
+        -- Newest first by time, as the SQL orders: a start from an earlier
+        -- stream may carry a larger seq than a later one.
         local starts = of_kind("run_started")
+        table.sort(starts, function(a, b)
+            if a.epoch_ms ~= b.epoch_ms then
+                return a.epoch_ms < b.epoch_ms
+            end
+            return a.seq < b.seq
+        end)
         for i = #starts, 1, -1 do
             local st = starts[i]
             local e = ends[st.data.run_id]
@@ -122,7 +130,7 @@ local function fake_session()
                 for _, ev in ipairs(s._events) do
                     if
                         (ev.kind == "run_started" or ev.kind == "run_skipped")
-                        and ev.seq > r.seq
+                        and ev.epoch_ms >= r.epoch_ms
                         and ev.data.job == r.data.job
                     then
                         answered = true
@@ -471,6 +479,23 @@ describe("job.read — the facts, off the log", function()
         expect(#job.read(s).requested).to.be(1)
         s:append({ kind = "run_started", data = { job = "a", run_id = "a-1" } })
         expect(#job.read(s).requested).to.be(0)
+    end)
+
+    it("is answered by time, not by seq: yesterday's start does not answer today's request", function()
+        -- What a record that spans two streams looks like when read as one:
+        -- the earlier stream's start comes later in this list (seq restarts
+        -- per stream) but earlier in time. Found on a machine after a
+        -- restart, where a requested run never began.
+        local s = fake_session()
+        s:append({ kind = "run_requested", epoch_ms = 5000, data = { job = "a", by = "http" } })
+        s:append({ kind = "run_started", epoch_ms = 1000, data = { job = "a", run_id = "a-old" } })
+        expect(#job.read(s).requested).to.be(1)
+        s:append({ kind = "run_started", epoch_ms = 6000, data = { job = "a", run_id = "a-new" } })
+        expect(#job.read(s).requested).to.be(0)
+        -- And the runs read newest by time, whatever their seq.
+        local rows = job.runs(s)
+        expect(rows[1].run_id).to.be("a-new")
+        expect(rows[2].run_id).to.be("a-old")
     end)
 
     it("takes a recorded skip as the answer to a request", function()
