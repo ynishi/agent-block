@@ -128,9 +128,10 @@
 ---     repeat_cap  reads the log — `session:events()`, through the binder,
 ---                 on every call it is asked to answer
 ---     verdict     reads the log — `session:events()`, per call, and only
----                 when `timeout` is given: what the last check took is a
----                 gap between two of the kernel's stamps, not a number
----                 the factory kept
+---                 when `timeout` is a table: what the checks took are gaps
+---                 between the kernel's stamps, read by the `measure` the
+---                 caller chose, not a number the factory kept. A number
+---                 for `timeout` reads nothing
 ---
 ---   The escape hatch the design allows — an explicit `run` table the CALLER
 ---   creates and owns for one shell run — is not used by any of the five,
@@ -269,13 +270,22 @@ local DEFAULT_VERDICT_KIND = "verify"
 --- first answer fell out of the window; a third time is the loop.
 local DEFAULT_REPEAT_MAX = 2
 
---- How many times what the last check took the next one may take, and the
---- least it is ever given, when `verdict{ timeout }` is not told. Three
---- covers a check that builds one more crate than the last did; a minute is
---- the smallest span in which "it is still compiling" and "it is hung" can
---- be told apart at all.
+--- How many times what a check took the next one may take, and the least
+--- it is ever given, when `verdict{ timeout }` is not told. Three covers a
+--- check that builds one more crate than the last did; a minute is the
+--- smallest span in which "it is still compiling" and "it is hung" can be
+--- told apart at all.
 local DEFAULT_TIMEOUT_FACTOR = 3
 local DEFAULT_TIMEOUT_FLOOR = 60
+
+--- Which check the next one's seconds are read off, when `verdict{ timeout
+--- }` does not say. The longest so far: it assumes nothing about which way
+--- a check's time moves. A failing check tends to be quick — a compile
+--- error stops it early — and a window read off the quick one cuts the
+--- slow, whole pass that follows; but that is a tendency of one kind of
+--- repository, and the opposite (a fast green, a slow red at link time)
+--- is as real. The longest is the one reading that neither can shrink.
+local DEFAULT_TIMEOUT_MEASURE = "longest"
 
 --- How much of the window one tool result may take when `result_cap` is not
 --- told. A quarter leaves room for three more of the same size beside the
@@ -571,8 +581,11 @@ local VERDICT_OPTS, VERDICT_ARG = opts_contract({
         :is_optional(),
     changed = FUNCTION:describe("fn(session) -> boolean; a green with nothing changed is not a pass"):is_optional(),
     kind = T.string:describe('the event kind the answer is recorded under; default "verify"'):is_optional(),
-    timeout = T.table
-        :describe("{ first, factor?, floor? } in seconds; the seconds handed to run, read off what the last check took")
+    timeout = T.any_of({ T.number, T.table })
+        :describe(
+            "the seconds handed to run: a number is handed whole every time; "
+                .. '{ first, factor?, floor?, measure? } reads them off the log, `measure` = "longest" | "last" | "last_ok" | "first" | fn(events, kind) -> seconds|nil'
+        )
         :is_optional(),
 })
 
@@ -1237,31 +1250,130 @@ end
 -- verdict — what ends a run, when the model's word is not enough
 -- ============================================================
 
---- How long the last check that answered took, in seconds, off the log.
+--- The checks in the log, each with what it took.
 ---
 --- The kernel stamps `epoch_ms` on every record, so a check's time is the
---- gap between its record and the one before it. Only checks that answered
---- count (`data.ran ~= false`; a record from before the field existed counts
---- as answered), and a record without a stamp on either side measures
---- nothing rather than something wrong. The latest one wins: what the
---- repository costs to check now is better read off the check that just ran
---- than off the one that ran first.
+--- gap between its record and the one before it; a record without a stamp
+--- on either side measures nothing rather than something wrong, and is left
+--- out. Each entry carries the check's answer — `ok`, and `ran` (a record
+--- from before the field existed counts as answered) — and, for a check
+--- that was cut off, `timeout_s`, the seconds it was given: not how long
+--- it takes, but a bound it exceeded, which a measure may or may not use.
 ---
 --- @param events table  a session's events, in seq order
 --- @param kind string  the kind checks are recorded under
---- @return number|nil  seconds, or nil when no check has answered
-local function last_check_seconds(events, kind)
-    local taken
+--- @return table  { { seconds, ok, ran, timeout_s? }, ... } in log order
+local function checks_of(events, kind)
+    local found = {}
     for i = 2, #events do
         local ev = events[i]
-        if ev.kind == kind and type(ev.data) == "table" and ev.data.ran ~= false then
+        if ev.kind == kind and type(ev.data) == "table" then
             local at, before = ev.epoch_ms, events[i - 1].epoch_ms
             if type(at) == "number" and type(before) == "number" and at >= before then
-                taken = (at - before) / 1000
+                found[#found + 1] = {
+                    seconds = (at - before) / 1000,
+                    ok = ev.data.ok == true,
+                    ran = ev.data.ran ~= false,
+                    timeout_s = type(ev.data.timeout_s) == "number" and ev.data.timeout_s or nil,
+                }
             end
         end
     end
+    return found
+end
+
+--- The ways a check's seconds are read off the log, by name. Each answers
+--- `fn(events, kind) -> seconds | nil` — nil when nothing it counts is
+--- there yet — which is also what a caller's own function must answer.
+---
+--- Which one is right is the caller's to say, because it depends on the
+--- repository. Whether a failing check is quicker than a passing one, and
+--- by how much, is a fact about what `run` runs — a compile error that
+--- stops the build early, or a link that takes as long either way — and
+--- nothing in the log says which repository this is. So the reading is
+--- chosen, not inferred, and the factory does not pick one on evidence it
+--- does not have.
+---
+---   last     the latest check that answered, pass or fail. What the
+---            repository costs to check now, if a failing check costs
+---            what a passing one does
+---   last_ok  the latest check that answered and passed. The whole check,
+---            if a failing one stops early and would under-read it
+---   longest  the longest reading there is: the latest answered check or
+---            any earlier one, whichever took longer, and a check that was
+---            cut off counts as the seconds it was given — it took at
+---            least that. Never shrinks, so a quick failure cannot cut the
+---            slow pass that follows it, and a cut-off widens the window
+---            rather than being forgotten
+---   first    the first check that answered, and that one for the rest of
+---            the run. A measurement taken once — a loop that checks
+---            before its first beat reads its baseline here
+local MEASURES = {}
+
+function MEASURES.last(events, kind)
+    local taken
+    for _, c in ipairs(checks_of(events, kind)) do
+        if c.ran then
+            taken = c.seconds
+        end
+    end
     return taken
+end
+
+function MEASURES.last_ok(events, kind)
+    local taken
+    for _, c in ipairs(checks_of(events, kind)) do
+        if c.ran and c.ok then
+            taken = c.seconds
+        end
+    end
+    return taken
+end
+
+function MEASURES.longest(events, kind)
+    local taken
+    for _, c in ipairs(checks_of(events, kind)) do
+        local reading = c.ran and c.seconds or c.timeout_s
+        if reading ~= nil and (taken == nil or reading > taken) then
+            taken = reading
+        end
+    end
+    return taken
+end
+
+function MEASURES.first(events, kind)
+    for _, c in ipairs(checks_of(events, kind)) do
+        if c.ran then
+            return c.seconds
+        end
+    end
+    return nil
+end
+
+--- The measure `verdict{ timeout }` names, as a function; a function is its
+--- own. Refuses a name this module does not know, loudly, at construction.
+local function measure_of(measure)
+    if measure == nil then
+        return MEASURES[DEFAULT_TIMEOUT_MEASURE]
+    end
+    if type(measure) == "function" then
+        return measure
+    end
+    if type(measure) == "string" and MEASURES[measure] then
+        return MEASURES[measure]
+    end
+    local names = {}
+    for name in pairs(MEASURES) do
+        names[#names + 1] = '"' .. name .. '"'
+    end
+    table.sort(names)
+    error(
+        "policy.verdict: timeout.measure must be one of "
+            .. table.concat(names, ", ")
+            .. " or fn(events, kind) -> seconds|nil, got "
+            .. tostring(measure),
+        3
+    )
 end
 
 --- Build the check a loop runs after every beat.
@@ -1303,7 +1415,8 @@ end
 ---
 --- The seconds a check may take, when the loop wants that decided here
 ---
----   `timeout = { first = <secs>, factor? = <n>, floor? = <secs> }`
+---   `timeout = <secs>`
+---   `timeout = { first = <secs>, factor? = <n>, floor? = <secs>, measure? = <how> }`
 ---
 --- Given one, `run` is called with a number of seconds and is expected to
 --- apply it — `sh.exec`'s own `timeout`, or whatever the check is made of;
@@ -1318,25 +1431,39 @@ end
 --- arithmetic and do not share a counter, and they do not share a word here
 --- either. `budget` in these opts is refused as the state key it is.
 ---
---- The number is read, not kept. Every record the kernel writes carries
---- `epoch_ms`, so what a check took is the gap between its own record and
---- the record before it — the beat it judged, in a loop that checks straight
---- after the beat; whatever the loop did in between is counted with it. The
---- last check that answered says how long the next may take: `taken *
---- factor`, held to `floor` below and `first` above. Until one has answered
---- there is nothing to read and `first` stands — it covers a check that has
---- to build from nothing. A check that never answered (`ran = false`, below)
---- is left out: a run cut off at a timeout says nothing about how long the
---- check takes. Defaults: `factor` 3, `floor` 60.
+--- A number is the whole of it: handed to every check as it is, nothing
+--- read. That is the form for a caller that has measured the check itself
+--- — run it once, whole, before the loop, and hand in a multiple of what it
+--- took — and it is the form that decides the number where it can be
+--- known, which is outside the loop; one beat does not know which files
+--- changed or what the check costs in this repository.
+---
+--- A table reads the number off the log. Every record the kernel writes
+--- carries `epoch_ms`, so what a check took is the gap between its own
+--- record and the record before it — the beat it judged, in a loop that
+--- checks straight after the beat; whatever the loop did in between is
+--- counted with it. `measure` says WHICH check's time is read (the names
+--- above `MEASURES`: `"longest"`, `"last"`, `"last_ok"`, `"first"`, or the
+--- caller's own `fn(events, kind) -> seconds | nil`), and the next check
+--- may take `taken * factor`, held to `floor` below and `first` above.
+--- Until the measure has something to read `first` stands — it covers a
+--- check that has to build from nothing. The measure is the caller's
+--- choice and not inferred here, because which reading is right is a fact
+--- about the repository the log does not carry: whether a failing check is
+--- quicker than a passing one is a tendency, not a rule, and a factory
+--- that assumed it would be wrong wherever it does not hold. Defaults:
+--- `factor` 3, `floor` 60, `measure` `"longest"`, the one reading that
+--- assumes nothing about direction.
 ---
 --- Read rather than kept for the reason the header gives: a factory closure
 --- holds only what it was configured with, so a resumed session does not
 --- start from `first` again and two loops on one session hand `run` the
---- same number. That makes `verdict{ timeout }` a log-reading policy — it
---- reads `session:events()` on every call and is refused a log that does not
---- fit in one read (`whole_log`), exactly as `stagnation` is. Without
---- `timeout` nothing is read. A record with no stamp — a stand-in session's,
---- or one appended by hand — measures nothing rather than something wrong.
+--- same number. That makes a table `timeout` a log-reading policy — it
+--- reads `session:events()` on every call and is refused a log that does
+--- not fit in one read (`whole_log`), exactly as `stagnation` is. Without
+--- `timeout`, or with a number, nothing is read. A record with no stamp — a
+--- stand-in session's, or one appended by hand — measures nothing rather
+--- than something wrong.
 ---
 --- A check that did not answer
 ---
@@ -1359,17 +1486,26 @@ function M.verdict(opts)
         error("policy.verdict: run must be a function (fn(timeout?) -> { ok, ... })", 2)
     end
     if opts.timeout ~= nil then
-        if type(opts.timeout) ~= "table" then
-            error("policy.verdict: timeout must be a table { first, factor?, floor? }", 2)
-        end
-        if type(opts.timeout.first) ~= "number" or opts.timeout.first <= 0 then
-            error("policy.verdict: timeout.first must be a positive number of seconds", 2)
-        end
-        for _, k in ipairs({ "factor", "floor" }) do
-            local v = opts.timeout[k]
-            if v ~= nil and (type(v) ~= "number" or v <= 0) then
-                error("policy.verdict: timeout." .. k .. " must be a positive number", 2)
+        if type(opts.timeout) == "number" then
+            if opts.timeout <= 0 then
+                error("policy.verdict: timeout must be a positive number of seconds", 2)
             end
+        elseif type(opts.timeout) == "table" then
+            only(opts.timeout, { first = true, factor = true, floor = true, measure = true }, "policy.verdict timeout")
+            if type(opts.timeout.first) ~= "number" or opts.timeout.first <= 0 then
+                error("policy.verdict: timeout.first must be a positive number of seconds", 2)
+            end
+            for _, k in ipairs({ "factor", "floor" }) do
+                local v = opts.timeout[k]
+                if v ~= nil and (type(v) ~= "number" or v <= 0) then
+                    error("policy.verdict: timeout." .. k .. " must be a positive number", 2)
+                end
+            end
+        else
+            error(
+                "policy.verdict: timeout must be a number of seconds or a table { first, factor?, floor?, measure? }",
+                2
+            )
         end
     end
     if opts.changed ~= nil and type(opts.changed) ~= "function" then
@@ -1383,12 +1519,16 @@ function M.verdict(opts)
     local run, changed = opts.run, opts.changed
     local kind = opts.kind or DEFAULT_VERDICT_KIND
     -- Frozen at construction, like every other factory's opts. Nothing about
-    -- a particular run lives here; what the last check took is in the log.
-    local first, factor, floor
-    if opts.timeout then
+    -- a particular run lives here; what the checks took is in the log. A
+    -- number is `first` with no measure: handed whole, nothing read.
+    local first, factor, floor, measure
+    if type(opts.timeout) == "number" then
+        first = opts.timeout
+    elseif opts.timeout then
         first = opts.timeout.first
         factor = opts.timeout.factor or DEFAULT_TIMEOUT_FACTOR
         floor = opts.timeout.floor or DEFAULT_TIMEOUT_FLOOR
+        measure = measure_of(opts.timeout.measure)
     end
 
     return function(session, out)
@@ -1397,12 +1537,13 @@ function M.verdict(opts)
         end
         needs_session(session, "policy.verdict")
 
-        local timeout
-        if first then
-            local taken = last_check_seconds(whole_log(session, "policy.verdict"), kind)
-            if taken == nil then
-                timeout = first
-            else
+        local timeout = first
+        if measure then
+            local taken = measure(whole_log(session, "policy.verdict"), kind)
+            if taken ~= nil then
+                if type(taken) ~= "number" or taken < 0 then
+                    error("policy.verdict: timeout.measure must answer seconds >= 0 or nil, got " .. tostring(taken), 2)
+                end
                 timeout = taken * factor
                 if timeout < floor then
                     timeout = floor
