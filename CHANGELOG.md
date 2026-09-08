@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A run's record carries the block's answer. `agent-block -s` gained
+  `--result <FILE>` (`AGENT_BLOCK_RESULT_PATH`): the value the script
+  returned, written verbatim — the CLI printed it nowhere, and stdout is the
+  logs. `agent-block serve` points each run at a file beside its log and
+  records what came back as `run_ended.result` (whole up to 64 KiB;
+  past that `result_path` and `result_truncated`), and `GET /runs`,
+  `GET /runs/<id>`, `runs_list` and `run_get` answer it, decoded when it is
+  JSON. The same block called through `run_block` already handed its value
+  to the caller; a run is not a second contract.
 - `agent-block mcp` carries the job manager's five verbs as tools —
   `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` — each one
   route of `agent-block serve`'s HTTP listener, sent over loopback with the
