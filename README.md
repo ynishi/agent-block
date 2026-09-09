@@ -272,12 +272,13 @@ agent-block serve --project .          # 127.0.0.1:7788, tick 5s, at most 4 live
 ```
 
 A run is `agent-block -s <block>` started in the block's project root, so it
-loads that project's `.env` and writes its own session log under
-`~/.agent-block/runs/<job>/`. The value the block returns — the same JSON
-string `run_block` hands an MCP caller — is written beside that log
-(`--result` / `AGENT_BLOCK_RESULT_PATH`, which any `agent-block -s` run can
-use) and is on the run's record as `result`, whole up to 64 KiB and pointed
-at past it. The manager itself decides nothing it cannot
+loads that project's `.env` and writes to that project's own session log —
+labelled `job=<name>` and `run=<run_id>` (`--label`), which is how one run is
+found among all of them (`knl.views.sessions`). The value the block returns —
+the same JSON string `run_block` hands an MCP caller — is written under
+`~/.agent-block/runs/<job>/` (`--result` / `AGENT_BLOCK_RESULT_PATH`, which
+any `agent-block -s` run can use) and is on the run's record as `result`,
+whole up to 64 KiB and pointed at past it. The manager itself decides nothing it cannot
 read back: every start and end is a record on its own log
 (`~/.agent-block/serve.sqlite`), `every` counts from the previous end, one
 run per job is live at a time, a run the manager did not survive is closed

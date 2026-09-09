@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -218,7 +218,10 @@ async fn the_job_tools_are_a_client_of_the_manager() {
     assert!(!is_error(&answer), "{}", text_of(&answer));
     let body: Value = serde_json::from_str(&text_of(&answer)).expect("json");
     assert_eq!(body["run"]["run_id"], run_id);
-    assert!(PathBuf::from(body["run"]["log"].as_str().unwrap()).starts_with(&home));
+    assert_eq!(body["run"]["outcome"], "ok");
+    // A run is not given a log of its own: it writes to its project's, with
+    // the labels it was started under saying which run it was.
+    assert!(body["run"]["log"].is_null(), "{}", body["run"]);
 
     let answer = call(&mgr, "run_stop", json!({ "run_id": "nope" })).await;
     assert!(is_error(&answer));

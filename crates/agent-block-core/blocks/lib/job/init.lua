@@ -252,14 +252,13 @@ SELECT json_extract(r.data, '$.job') AS job,
 ]]
 
 --- The runs, newest first, each start joined to its end if it has one:
---- `{ job, run_id, started_ms, log, ended_ms?, outcome?, exit_code?, took_s?, error? }`.
+--- `{ job, run_id, started_ms, ended_ms?, outcome?, exit_code?, took_s?, error? }`.
 --- Two statements rather than one with an optional filter, because a
 --- parameter that may be NULL is not a shape the binding promises.
 local RUNS_SQL = [[
 SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(s.data, '$.run_id')    AS run_id,
        s.epoch_ms                          AS started_ms,
-       json_extract(s.data, '$.log')       AS log,
        e.epoch_ms                          AS ended_ms,
        json_extract(e.data, '$.outcome')   AS outcome,
        json_extract(e.data, '$.exit_code') AS exit_code,
@@ -283,7 +282,6 @@ local RUNS_OF_JOB_SQL = [[
 SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(s.data, '$.run_id')    AS run_id,
        s.epoch_ms                          AS started_ms,
-       json_extract(s.data, '$.log')       AS log,
        e.epoch_ms                          AS ended_ms,
        json_extract(e.data, '$.outcome')   AS outcome,
        json_extract(e.data, '$.exit_code') AS exit_code,
@@ -308,7 +306,6 @@ local RUN_SQL = [[
 SELECT json_extract(s.data, '$.job')       AS job,
        json_extract(s.data, '$.run_id')    AS run_id,
        s.epoch_ms                          AS started_ms,
-       json_extract(s.data, '$.log')       AS log,
        e.epoch_ms                          AS ended_ms,
        json_extract(e.data, '$.outcome')   AS outcome,
        json_extract(e.data, '$.exit_code') AS exit_code,
@@ -509,7 +506,7 @@ local function tail(s, n)
 end
 
 --- The command a run is: the block's script in its own process, started in
---- the block's project root (where `.env` is), writing to its own session
+--- the block's project root (where `.env` is), writing to that project's own
 --- log. The prompt and context go as environment rather than arguments,
 --- since the CLI reads both from `AGENT_BLOCK_PROMPT` / `AGENT_BLOCK_CONTEXT`
 --- and a shell argument would have to survive the quoting twice.
@@ -518,13 +515,21 @@ end
 --- (`AGENT_BLOCK_RESULT_PATH`); the CLI prints nothing on a return, so this
 --- is the only way the answer leaves the process.
 ---
+--- `opts.run_id` becomes `--label run=<id>`, which is how a run is found in
+--- the log afterwards. It is an ARGUMENT and not an environment variable on
+--- purpose: it names one run, and an environment variable is inherited by
+--- every process the block starts — each of them then claiming to be the run
+--- its parent is. That was also the trouble with pointing each run at a
+--- database of its own (`AGENT_BLOCK_KNL_PATH`), which this replaces: the
+--- project's log went back to being many files, one per run, and stopped
+--- being one stream to read.
+---
 --- @param decl table  a decl
---- @param log string  the run's session log path
---- @param opts table|nil  { bin?, result? }
+--- @param opts table|nil  { bin?, result?, run_id? }
 --- @return string command
-function M.command(decl, log, opts)
+function M.command(decl, opts)
     opts = opts or {}
-    local parts = { "AGENT_BLOCK_KNL_PATH=" .. sq(log) }
+    local parts = {}
     if opts.result ~= nil then
         parts[#parts + 1] = "AGENT_BLOCK_RESULT_PATH=" .. sq(opts.result)
     end
@@ -539,6 +544,12 @@ function M.command(decl, log, opts)
     parts[#parts + 1] = sq(decl.path)
     parts[#parts + 1] = "-p"
     parts[#parts + 1] = sq(decl.cwd)
+    parts[#parts + 1] = "--label"
+    parts[#parts + 1] = sq("job=" .. decl.name)
+    if opts.run_id ~= nil then
+        parts[#parts + 1] = "--label"
+        parts[#parts + 1] = sq("run=" .. opts.run_id)
+    end
     return table.concat(parts, " ")
 end
 
@@ -636,13 +647,10 @@ end
 ---
 --- @param session userdata|table  the manager's session
 --- @param decl table  a decl
---- @param opts table  { log, exec?, now?, bin?, requested?, run_id? }
+--- @param opts table|nil  { exec?, now?, bin?, requested?, run_id?, result? }
 --- @return table  { run_id, outcome, exit_code?, took_s, error? }
 function M.run(session, decl, opts)
     opts = opts or {}
-    if type(opts.log) ~= "string" or opts.log == "" then
-        error("job.run: opts.log (the run's session log path) is required", 2)
-    end
     local exec = opts.exec or (rawget(_G, "sh") and sh.exec)
     if type(exec) ~= "function" then
         error("job.run: no exec: pass opts.exec, or run where `sh.exec` is registered", 2)
@@ -662,7 +670,6 @@ function M.run(session, decl, opts)
             run_id = run_id,
             block = decl.block,
             cwd = decl.cwd,
-            log = opts.log,
             timeout_s = decl.timeout,
             requested = opts.requested,
         },
@@ -672,7 +679,7 @@ function M.run(session, decl, opts)
     -- the run's whole group, and this call answers with no exit code, which
     -- is read as `stopped` below.
     local result = exec(
-        M.command(decl, opts.log, { bin = opts.bin, result = opts.result }),
+        M.command(decl, { bin = opts.bin, result = opts.result, run_id = run_id }),
         { cwd = decl.cwd, timeout = decl.timeout, label = run_id }
     )
     local took = now() - started

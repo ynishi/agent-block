@@ -332,7 +332,6 @@ describe("job.run — a record, a process, a record", function()
             return { ok = true, code = 0, stdout = "", stderr = "" }
         end
         local got = job.run(s, decl("a", { every = "1m" }), {
-            log = "/logs/a.db",
             exec = exec,
             now = function()
                 return 100
@@ -342,7 +341,6 @@ describe("job.run — a record, a process, a record", function()
         expect(#s:events()).to.be(2)
         expect(s:events()[1].kind).to.be("run_started")
         expect(s:events()[1].data.job).to.be("a")
-        expect(s:events()[1].data.log).to.be("/logs/a.db")
         expect(s:events()[1].data.timeout_s).to.be(600)
         expect(s:events()[2].kind).to.be("run_ended")
         expect(s:events()[2].data.run_id).to.be(got.run_id)
@@ -354,7 +352,6 @@ describe("job.run — a record, a process, a record", function()
         local function outcome(result)
             local s = fake_session()
             return job.run(s, decl("a"), {
-                log = "/l",
                 exec = answering(result),
                 now = function()
                     return 0
@@ -390,7 +387,6 @@ describe("job.run — a record, a process, a record", function()
     it("reads exit 75 as deferred: the block looked and did not start", function()
         local s = fake_session()
         local got = job.run(s, decl("a"), {
-            log = "/l",
             exec = answering({ ok = true, code = job.DEFERRED_EXIT, stdout = "", stderr = "deferred: pod down" }),
             now = function()
                 return 0
@@ -412,7 +408,6 @@ describe("job.run — a record, a process, a record", function()
     it("hands the process the block's root and its timeout", function()
         local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
         job.run(fake_session(), decl("a", { timeout = "30s" }), {
-            log = "/l",
             exec = exec,
             now = function()
                 return 0
@@ -426,7 +421,6 @@ describe("job.run — a record, a process, a record", function()
         local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
         local s = fake_session()
         local got = job.run(s, decl("a"), {
-            log = "/l",
             result = "/r/a-1.result",
             exec = exec,
             read = function(path)
@@ -449,7 +443,6 @@ describe("job.run — a record, a process, a record", function()
     it("leaves an answer past the cap in its file, and says so", function()
         local s = fake_session()
         local got = job.run(s, decl("a"), {
-            log = "/l",
             result = "/r/a-2.result",
             exec = answering({ ok = true, code = 0 }),
             read = function()
@@ -469,7 +462,6 @@ describe("job.run — a record, a process, a record", function()
     it("records no answer when the process left none, and asks for none without a path", function()
         local s = fake_session()
         job.run(s, decl("a"), {
-            log = "/l",
             result = "/r/a-3.result",
             exec = answering({ ok = true, code = 1 }),
             read = function()
@@ -483,7 +475,6 @@ describe("job.run — a record, a process, a record", function()
         expect(s:events()[2].data.result_path).to.be("/r/a-3.result")
         local exec, seen = answering({ ok = true, code = 0 })
         job.run(fake_session(), decl("a"), {
-            log = "/l",
             exec = exec,
             read = function()
                 error("must not be asked")
@@ -498,7 +489,6 @@ describe("job.run — a record, a process, a record", function()
     it("labels the process with the run id, which is what a stop reaches it by", function()
         local exec, seen = answering({ ok = true, code = 0, stdout = "", stderr = "" })
         job.run(fake_session(), decl("a"), {
-            log = "/l",
             exec = exec,
             run_id = "a-7",
             now = function()
@@ -511,7 +501,6 @@ describe("job.run — a record, a process, a record", function()
     it("carries the request it answers", function()
         local s = fake_session()
         job.run(s, decl("a"), {
-            log = "/l",
             exec = answering({ ok = true, code = 0 }),
             requested = 7,
             now = function()
@@ -521,26 +510,40 @@ describe("job.run — a record, a process, a record", function()
         expect(s:events()[1].data.requested).to.be(7)
     end)
 
-    it("refuses to run without a log path", function()
-        expect(function()
-            job.run(fake_session(), decl("a"), { exec = answering({ ok = true, code = 0 }) })
-        end).to.fail()
+    it("labels the process with the run it is, so the log can be read back", function()
+        local seen = {}
+        local exec = function(cmd)
+            seen[#seen + 1] = cmd
+            return { ok = true, code = 0, stdout = "", stderr = "" }
+        end
+        local got = job.run(fake_session(), decl("a"), { exec = exec })
+        expect(seen[1]:find("--label 'run=" .. got.run_id .. "'", 1, true) ~= nil).to.be(true)
+        expect(seen[1]:find("--label 'job=a'", 1, true) ~= nil).to.be(true)
+        -- The run does not get a database of its own: no store is named at
+        -- all, so the block writes to its project's log like any other run.
+        expect(seen[1]:find("AGENT_BLOCK_KNL_PATH", 1, true)).to.be(nil)
     end)
 end)
 
 describe("job.command — what a run is", function()
-    it("is the script in its project root with its own log, prompt through the environment", function()
+    it("is the script in its project root, labelled, prompt through the environment", function()
         local d = decl("a", { prompt = "it's due", context = "ctx" })
-        local cmd = job.command(d, "/logs/a-1.db", { bin = "/usr/bin/agent-block" })
+        local cmd = job.command(d, { bin = "/usr/bin/agent-block", run_id = "a-1" })
         expect(cmd).to.be(
-            "AGENT_BLOCK_KNL_PATH='/logs/a-1.db' AGENT_BLOCK_PROMPT='it'\\''s due' AGENT_BLOCK_CONTEXT='ctx' "
-                .. "'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo'"
+            "AGENT_BLOCK_PROMPT='it'\\''s due' AGENT_BLOCK_CONTEXT='ctx' "
+                .. "'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' "
+                .. "--label 'job=a' --label 'run=a-1'"
         )
     end)
 
     it("leaves prompt and context out when the declaration has none", function()
-        local cmd = job.command(decl("a"), "/l")
-        expect(cmd).to.be("AGENT_BLOCK_KNL_PATH='/l' 'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo'")
+        local cmd = job.command(decl("a"))
+        expect(cmd).to.be("'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --label 'job=a'")
+    end)
+
+    it("names no store, so a run writes to its project's log like any other", function()
+        local cmd = job.command(decl("a"), { run_id = "a-1" })
+        expect(cmd:find("AGENT_BLOCK_KNL_PATH", 1, true)).to.be(nil)
     end)
 end)
 
@@ -552,8 +555,8 @@ describe("job.read — the facts, off the log", function()
 
     it("answers the last end per job, and nothing for a job that never ran", function()
         local s = fake_session()
-        job.run(s, decl("a"), { log = "/l", exec = ok_exec, now = clock })
-        job.run(s, decl("a"), { log = "/l", exec = ok_exec, now = clock })
+        job.run(s, decl("a"), { exec = ok_exec, now = clock })
+        job.run(s, decl("a"), { exec = ok_exec, now = clock })
         local facts = job.read(s)
         expect(facts.ended.a).to.be(4)
         expect(facts.ended.b).to.be(nil)
@@ -608,15 +611,14 @@ describe("job.read — the facts, off the log", function()
 
     it("answers the runs newest first, each start joined to its end", function()
         local s = fake_session()
-        job.run(s, decl("a"), { log = "/l1", exec = ok_exec, now = clock })
-        s:append({ kind = "run_started", data = { job = "b", run_id = "b-1", log = "/l2" } })
+        job.run(s, decl("a"), { exec = ok_exec, now = clock })
+        s:append({ kind = "run_started", data = { job = "b", run_id = "b-1" } })
         local rows = job.runs(s)
         expect(#rows).to.be(2)
         expect(rows[1].run_id).to.be("b-1")
         expect(rows[1].outcome).to.be(nil)
         expect(rows[2].job).to.be("a")
         expect(rows[2].outcome).to.be("ok")
-        expect(rows[2].log).to.be("/l1")
         expect(#job.runs(s, { job = "a" })).to.be(1)
         expect(#job.runs(s, { limit = 1 })).to.be(1)
         expect(job.run_of(s, "b-1").job).to.be("b")
@@ -647,7 +649,7 @@ describe("job.read — the facts, off the log", function()
 
     it("gives a fresh reader the same facts", function()
         local s = fake_session()
-        job.run(s, decl("a"), { log = "/l", exec = ok_exec, now = clock })
+        job.run(s, decl("a"), { exec = ok_exec, now = clock })
         s:append({ kind = "run_started", data = { job = "b", run_id = "b-1" } })
         local one, two = job.read(s), job.read(s)
         expect(one.ended.a).to.be(two.ended.a)

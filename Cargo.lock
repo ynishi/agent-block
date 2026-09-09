@@ -55,6 +55,7 @@ dependencies = [
  "predicates",
  "reqwest 0.12.28",
  "rmcp",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
