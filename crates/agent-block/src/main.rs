@@ -109,6 +109,27 @@ struct Cli {
     /// Env: `AGENT_BLOCK_RESULT_PATH`.
     #[arg(long, value_name = "FILE", env = "AGENT_BLOCK_RESULT_PATH")]
     result: Option<PathBuf>,
+
+    /// Label every `knl` session this run opens: `--label run=r-7`, repeated
+    /// for more than one.
+    ///
+    /// What this run is, for a caller that runs the same block over and over
+    /// and has to tell the runs apart afterwards — a job manager, most of
+    /// all. The labels land on each session's opening (`meta`), so one
+    /// project database holds every run and a reader selects the one it
+    /// wants (`knl.views.sessions`). The alternative — a database per run —
+    /// answers the same question by breaking the one above it: the project's
+    /// log stops being one stream to read.
+    ///
+    /// Values are read as JSON when they parse as a scalar (`n=2`,
+    /// `retried=true`) and as text otherwise, which is the same vocabulary
+    /// `meta` takes everywhere else.
+    ///
+    /// **No env binding, deliberately.** This names one run, and an
+    /// environment variable would be inherited by every process the block
+    /// starts — each of them then claiming to be the run its parent is.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -298,6 +319,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     if let Some(context) = context {
         builder = builder.context(context);
     }
+    for (key, value) in parse_labels(&cli.labels)? {
+        builder = builder.session_label(key, value);
+    }
     let config = builder.build();
 
     let value = run_capture(config).await?;
@@ -306,4 +330,89 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             .with_context(|| format!("writing the script's result to '{}'", path.display()))?;
     }
     Ok(())
+}
+
+/// Read `--label key=value` pairs into the labels a session opens with.
+///
+/// The value is JSON when it parses as a scalar and text otherwise, so
+/// `n=2` and `retried=true` are a number and a flag while `run=r-7` and
+/// `note=2 items` are text. That is `meta`'s own vocabulary — a string, a
+/// number or a flag — and nothing here can produce anything deeper.
+///
+/// A pair with no `=` is a usage error rather than a label with an empty
+/// value: naming a key and forgetting the value is the likely mistake, and
+/// recording it as `""` would hide it in the log.
+fn parse_labels(pairs: &[String]) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--label takes key=value, got '{pair}' (no '=' in it)")
+            })?;
+            if key.is_empty() {
+                anyhow::bail!("--label takes key=value, got '{pair}' (the key is empty)");
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(value) {
+                Ok(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v,
+                _ => serde_json::Value::from(value),
+            };
+            Ok((key.to_string(), value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_labels;
+    use serde_json::Value;
+
+    /// A label is a string, a number or a flag — `meta`'s own vocabulary —
+    /// and which one it is comes from the text, not from a second flag the
+    /// caller has to remember.
+    #[test]
+    fn a_label_value_is_read_as_the_scalar_it_looks_like() {
+        let labels =
+            parse_labels(&["run=r-7".into(), "n=2".into(), "retried=true".into()]).expect("labels");
+        assert_eq!(
+            labels,
+            vec![
+                ("run".to_string(), Value::from("r-7")),
+                ("n".to_string(), Value::from(2)),
+                ("retried".to_string(), Value::from(true)),
+            ]
+        );
+    }
+
+    /// Anything that is not a scalar stays the text it was: a value that
+    /// happens to look like JSON structure is a label, not a shape, because
+    /// `meta` is shallow by rule.
+    #[test]
+    fn a_label_value_that_is_not_a_scalar_stays_text() {
+        let labels = parse_labels(&[
+            "note=2 items".into(),
+            "shape={\"a\":1}".into(),
+            "path=/tmp/x".into(),
+            "empty=".into(),
+        ])
+        .expect("labels");
+        assert_eq!(
+            labels,
+            vec![
+                ("note".to_string(), Value::from("2 items")),
+                ("shape".to_string(), Value::from("{\"a\":1}")),
+                ("path".to_string(), Value::from("/tmp/x")),
+                ("empty".to_string(), Value::from("")),
+            ]
+        );
+    }
+
+    /// A key with no value is the caller's mistake, said out loud: recording
+    /// it as an empty label would bury it in the log instead.
+    #[test]
+    fn a_pair_without_a_value_is_refused() {
+        let err = parse_labels(&["run".into()]).expect_err("no '=' in it");
+        assert!(err.to_string().contains("key=value"), "{err}");
+        let err = parse_labels(&["=r-7".into()]).expect_err("the key is empty");
+        assert!(err.to_string().contains("the key is empty"), "{err}");
+    }
 }

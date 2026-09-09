@@ -1914,6 +1914,28 @@ fn meta_map(
     }
 }
 
+/// The labels a session opens with: the host's, with the script's on top.
+///
+/// The host says what this process is (which run it is, when something is
+/// running the same block over and over); the script says what it is
+/// recording. They are the same vocabulary and the same key space, so a key
+/// both name is the script's — it is the one closer to what the session
+/// actually is, and a host label it did not want is a key it can take back.
+fn under_host_labels(
+    host: serde_json::Map<String, serde_json::Value>,
+    script: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match (host.is_empty(), script) {
+        (true, script) => script,
+        (false, None) => Some(host),
+        (false, Some(script)) => {
+            let mut merged = host;
+            merged.extend(script);
+            Some(merged)
+        }
+    }
+}
+
 /// The `params` of `s:query`, in the kernel's terms.
 ///
 /// A list is the values for the `?` parameters, in order; a table with names
@@ -2214,6 +2236,7 @@ async fn open_session(
     opts: LuaValue,
     drivers: knl::IsleDrivers,
     default_store: std::path::PathBuf,
+    session_labels: serde_json::Map<String, serde_json::Value>,
 ) -> LuaResult<LuaAnyUserData> {
     // The parent comes off the table first and by hand: it is a live session
     // handle, which serde cannot carry (see `parse_parent`).
@@ -2228,7 +2251,7 @@ async fn open_session(
     };
     let owner = owner_of(opts.owner)?;
     let budget = budget_source("open", opts.budget)?;
-    let meta = meta_map("open", opts.meta)?;
+    let meta = under_host_labels(session_labels, meta_map("open", opts.meta)?);
     // An absent `store` is *not* the default one here: a child with no store
     // goes where its parent already is, and a child that asked for "mem"
     // asked for a different database and is refused.  Telling the two apart
@@ -2591,6 +2614,7 @@ pub fn register(
     lua: &Lua,
     drivers: knl::IsleDrivers,
     default_store: std::path::PathBuf,
+    session_labels: serde_json::Map<String, serde_json::Value>,
 ) -> LuaResult<()> {
     let knl_tbl = lua.create_table()?;
 
@@ -2598,12 +2622,14 @@ pub fn register(
     {
         let drivers = drivers.clone();
         let default_store = default_store.clone();
+        let session_labels = session_labels.clone();
         knl_tbl.set(
             "open",
             lua.create_async_function(move |lua, opts: LuaValue| {
                 let drivers = drivers.clone();
                 let default_store = default_store.clone();
-                open_session(lua, opts, drivers, default_store)
+                let session_labels = session_labels.clone();
+                open_session(lua, opts, drivers, default_store, session_labels)
             })?,
         )?;
     }
@@ -2973,8 +2999,13 @@ mod generated_types {
     fn the_api_publishes_the_module_it_generated() {
         let lua = Lua::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        register(&lua, knl::IsleDrivers::new(), dir.path().join("knl.sqlite"))
-            .expect("register knl");
+        register(
+            &lua,
+            knl::IsleDrivers::new(),
+            dir.path().join("knl.sqlite"),
+            serde_json::Map::new(),
+        )
+        .expect("register knl");
         let published: String = lua
             .load(r#"return knl.api().types"#)
             .eval()
@@ -3034,10 +3065,22 @@ mod tests {
     impl Vm {
         /// Fresh VM with only the `knl` bridge registered.
         fn new() -> Self {
+            Self::labelled(serde_json::Map::new())
+        }
+
+        /// [`Vm::new`] with the host naming what this run is — the labels
+        /// every session opened in it is recorded with.
+        fn labelled(session_labels: serde_json::Map<String, serde_json::Value>) -> Self {
             let lua = Lua::new();
             let drivers = knl::IsleDrivers::new();
             let dir = tempfile::tempdir().expect("tempdir");
-            register(&lua, drivers.clone(), dir.path().join("knl.sqlite")).expect("register knl");
+            register(
+                &lua,
+                drivers.clone(),
+                dir.path().join("knl.sqlite"),
+                session_labels,
+            )
+            .expect("register knl");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -5398,6 +5441,46 @@ mod tests {
         "#,
         )
         .expect("the labelled opens and the selects on them");
+    }
+
+    /// The host names what this run is, and every session opened in it
+    /// carries that label — the script does not have to pass it along, which
+    /// is the whole point: a job manager labels the process, not each call.
+    ///
+    /// A key both name is the script's: it is the one closer to what the
+    /// session is recording, and a host label a script did not want is a key
+    /// it can take back.
+    #[test]
+    fn the_host_labels_every_session_and_the_script_wins_on_a_shared_key() {
+        let vm = Vm::labelled(serde_json::Map::from_iter([
+            ("run".to_string(), Value::from("r-7")),
+            ("job".to_string(), Value::from("nightly")),
+        ]));
+        vm.exec(
+            r#"
+            local plain = knl.open({ owner = "q" })
+            local own   = knl.open({ owner = "q", meta = { job = "mine", step = 2 } })
+
+            local function labels(s)
+                return s:query([[
+                    SELECT json_extract(meta, '$.run') AS run,
+                           json_extract(meta, '$.job') AS job,
+                           json_extract(meta, '$.step') AS step
+                    FROM events WHERE stream = $stream AND kind = 'session_opened']])[1]
+            end
+
+            local a = labels(plain)
+            assert(a.run == "r-7", "the host's run: " .. tostring(a.run))
+            assert(a.job == "nightly", "the host's job: " .. tostring(a.job))
+            assert(a.step == nil, "the script named none")
+
+            local b = labels(own)
+            assert(b.run == "r-7", "the host's run is still there: " .. tostring(b.run))
+            assert(b.job == "mine", "the script wins the shared key: " .. tostring(b.job))
+            assert(b.step == 2, "and keeps its own: " .. tostring(b.step))
+        "#,
+        )
+        .expect("the labelled opens");
     }
 
     // -- reading the log with SQL ------------------------------------------
