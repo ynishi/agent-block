@@ -30,6 +30,12 @@
 ---   a default parent is a tree in one database, and `knl.resume{ session = id }`
 ---   reopens it by id alone.
 ---
+---   Many sessions in one file is the shape, so what tells them apart is a
+---   label and not a file: `knl.open{ meta = { run = id } }` writes the
+---   caller's labels on the opening, and a supervisor selects on them. Giving
+---   each run a database of its own answers the same question by breaking the
+---   one above it — the project's log stops being one stream to read.
+---
 ---   `store = "mem"` is the other choice and has to be asked for by name: an
 ---   in-memory database, for TESTS AND MOCKS — one session, one process,
 ---   nothing shared. It is not a lighter version of the default. Two writers
@@ -980,10 +986,16 @@ local BUDGET_ALLOCATION = T.shape({
 --- `budget = { from_parent = n }` and with nothing else: an owner's grant on
 --- a child would be a quota nobody paid for, and `from_parent` with no parent
 --- has nowhere to take it from. The kernel refuses each with the other named.
+--- `meta` is the labels the opening is written with — the envelope's own
+--- key, the same vocabulary an `append` carries (shallow scalars). It is how
+--- a caller running many sessions in one log names them: a supervisor selects
+--- on `json_extract(meta, '$.<key>')` of `session_opened` without knowing what
+--- the kind records, and without giving each session a database of its own.
 local OPEN_OPTS = T.shape({
     owner = T.string:is_optional(),
     budget = T.any_of({ BUDGET_GRANT, BUDGET_ALLOCATION }):is_optional(),
     store = T.any:is_optional(),
+    meta = T.any:is_optional(),
     parent = SESSION_HANDLE:is_optional(),
 })
 

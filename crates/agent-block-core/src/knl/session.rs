@@ -345,6 +345,27 @@ fn allocation_refused_event(
     event
 }
 
+/// Put the caller's labels on a kernel-written event.
+///
+/// `meta` is the envelope key for what a reader groups or filters by, and a
+/// session's opening is the one event a supervisor has to find without
+/// knowing the kind's shape — the run a session belongs to goes here, not in
+/// `data`, so a view reads it the same way it reads a label on any other
+/// event. Absent writes nothing: an unlabelled opening gets no `meta` key
+/// here (the store reads the column back as an empty object), so a select on
+/// a label finds nothing either way.
+fn with_meta(
+    mut event: Map<String, Value>,
+    meta: Option<Map<String, Value>>,
+) -> Map<String, Value> {
+    if let Some(meta) = meta {
+        if !meta.is_empty() {
+            event.insert(super::event::FIELD_META.to_string(), Value::Object(meta));
+        }
+    }
+    event
+}
+
 /// A child's `session_opened`: the scope it opens under, and the stream it
 /// was opened from.
 ///
@@ -352,7 +373,12 @@ fn allocation_refused_event(
 /// written by the parent's store rather than the child's — the opening and
 /// the reservation that paid for it are one transaction, so the child's first
 /// event arrives before the child has a handle at all.
-fn child_opened_event(owner: &str, scope_id: &str, parent: &str) -> Map<String, Value> {
+fn child_opened_event(
+    owner: &str,
+    scope_id: &str,
+    parent: &str,
+    meta: Option<Map<String, Value>>,
+) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert(FIELD_OWNER.to_string(), Value::from(owner.to_string()));
     data.insert(
@@ -360,7 +386,7 @@ fn child_opened_event(owner: &str, scope_id: &str, parent: &str) -> Map<String, 
         Value::from(scope_id.to_string()),
     );
     data.insert(FIELD_PARENT.to_string(), Value::from(parent.to_string()));
-    kernel_event(KIND_SESSION_OPENED, data)
+    with_meta(kernel_event(KIND_SESSION_OPENED, data), meta)
 }
 
 /// A child's `budget_granted`: the units the parent moved, naming where they
@@ -540,11 +566,12 @@ impl Session {
     pub async fn new(
         owner: String,
         grant: Option<BudgetGrant>,
+        meta: Option<Map<String, Value>>,
         drivers: &IsleDrivers,
     ) -> KnlResult<Self> {
         let stream = uuid::Uuid::new_v4().to_string();
         let store = SqliteEventStore::open_memory(stream.clone(), drivers).await?;
-        let mut session = Self::open_on(owner, grant, Box::new(store)).await?;
+        let mut session = Self::open_on(owner, grant, meta, Box::new(store)).await?;
         session.adopt_id(stream);
         Ok(session)
     }
@@ -568,6 +595,7 @@ impl Session {
     pub async fn open_on(
         owner: String,
         grant: Option<BudgetGrant>,
+        meta: Option<Map<String, Value>>,
         store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
         // Wrap the chosen backend in the read-time upcasting seam, so every one
@@ -602,7 +630,7 @@ impl Session {
             FIELD_SCOPE_ID.to_string(),
             Value::from(session.scope.id().to_string()),
         );
-        let started = kernel_event(KIND_SESSION_OPENED, opened);
+        let started = with_meta(kernel_event(KIND_SESSION_OPENED, opened), meta);
 
         // The grant is its own fact, right after the boundary: what the
         // owner allowed is the first entry of the ledger the balance folds
@@ -892,6 +920,7 @@ impl Session {
         child_stream: String,
         owner: String,
         allocation: Allocation,
+        meta: Option<Map<String, Value>>,
         child_store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
         if self.closed {
@@ -1007,7 +1036,7 @@ impl Session {
                             &child_id,
                         )],
                         other: vec![
-                            child_opened_event(&owner, &child_scope_id, &parent_id),
+                            child_opened_event(&owner, &child_scope_id, &parent_id, meta.clone()),
                             child_granted_event(
                                 amount,
                                 child_tag.as_deref(),
@@ -1640,9 +1669,14 @@ mod tests {
     /// does, and the store keeps one.  What the discarded driver costs is the
     /// join at the end — which a test process does not need and a host does.
     async fn new_session(budget: Option<i64>) -> Session {
-        Session::new(ANON.to_string(), budget.map(grant), &IsleDrivers::new())
-            .await
-            .expect("open")
+        Session::new(
+            ANON.to_string(),
+            budget.map(grant),
+            None,
+            &IsleDrivers::new(),
+        )
+        .await
+        .expect("open")
     }
 
     /// The balance the log implies, for checking the counter against it.
@@ -1707,6 +1741,63 @@ mod tests {
     /// A `data` field of a recorded event, for the assertions below.
     fn field<'a>(event: &'a Current, name: &str) -> &'a Value {
         data_field(event, name).unwrap_or_else(|| panic!("data.{name} is missing: {event}"))
+    }
+
+    /// The labels a caller opens with land on the opening's envelope, where
+    /// a reader finds them without knowing what `session_opened` records.
+    ///
+    /// This is what lets many runs share one log: they are told apart by a
+    /// label, not by being given a database each.
+    #[tokio::test]
+    async fn opening_carries_the_labels_it_was_opened_with() {
+        let meta = obj(json!({ "run": "r-1", "attempt": 2, "retried": true }));
+        let s = Session::new(
+            ANON.to_string(),
+            None,
+            Some(meta.clone()),
+            &IsleDrivers::new(),
+        )
+        .await
+        .expect("open");
+
+        let events = s.events(0, usize::MAX).await.expect("events");
+        assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
+        assert_eq!(
+            events[0].get(crate::knl::event::FIELD_META),
+            Some(&Value::Object(meta)),
+            "the labels ride the envelope, verbatim"
+        );
+        assert_eq!(
+            data_field(&events[0], "run"),
+            None,
+            "a label is not a field of the kind: data stays the kernel's"
+        );
+    }
+
+    /// An opening nobody labelled carries no label — an empty `meta`, which
+    /// is what the store gives back for a column nothing was written to. A
+    /// reader selecting on a label finds nothing rather than an empty string,
+    /// and an empty table passed in is the same as passing none.
+    #[tokio::test]
+    async fn an_unlabelled_opening_carries_no_labels() {
+        for session in [
+            new_session(None).await,
+            Session::new(
+                ANON.to_string(),
+                None,
+                Some(Map::new()),
+                &IsleDrivers::new(),
+            )
+            .await
+            .expect("open"),
+        ] {
+            let events = session.events(0, usize::MAX).await.expect("events");
+            let meta = events[0]
+                .get(crate::knl::event::FIELD_META)
+                .and_then(Value::as_object)
+                .expect("the store gives every event a meta object");
+            assert!(meta.is_empty(), "nothing was named, so nothing is recorded");
+        }
     }
 
     #[tokio::test]
@@ -1806,14 +1897,14 @@ mod tests {
     async fn the_owner_is_total_and_read_back_verbatim() {
         assert_eq!(new_session(None).await.owner(), ANON);
         assert_eq!(
-            Session::new(SYSTEM.to_string(), None, &IsleDrivers::new())
+            Session::new(SYSTEM.to_string(), None, None, &IsleDrivers::new())
                 .await
                 .expect("open")
                 .owner(),
             SYSTEM
         );
         assert_eq!(
-            Session::new("user-42".to_string(), None, &IsleDrivers::new())
+            Session::new("user-42".to_string(), None, None, &IsleDrivers::new())
                 .await
                 .expect("open")
                 .owner(),
@@ -2039,7 +2130,7 @@ mod tests {
     async fn tail_reads_the_end_of_the_stream_and_not_the_whole_of_it() {
         let store = CountingStore::default();
         let (ranges, tails) = (Arc::clone(&store.ranges), Arc::clone(&store.tails));
-        let mut s = Session::open_on(ANON.to_string(), None, Box::new(store))
+        let mut s = Session::open_on(ANON.to_string(), None, None, Box::new(store))
             .await
             .expect("open");
         for i in 0..1_000 {
@@ -2190,6 +2281,7 @@ mod tests {
                 tag: Some("tokens".to_string()),
                 desc: Some("one nightly run".to_string()),
             }),
+            None,
             &IsleDrivers::new(),
         )
         .await
@@ -2592,9 +2684,14 @@ mod tests {
         let store = SqliteEventStore::open_memory("owner-stream", &IsleDrivers::new())
             .await
             .expect("open");
-        let s = Session::open_on("user-7".to_string(), Some(grant(100)), Box::new(store))
-            .await
-            .expect("open");
+        let s = Session::open_on(
+            "user-7".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store),
+        )
+        .await
+        .expect("open");
 
         let events = s.events(0, usize::MAX).await.expect("events");
         let opened = events.first().expect("session_opened");
@@ -2628,9 +2725,14 @@ mod tests {
             let store = SqliteEventStore::open(&path, stream, &drivers)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-42".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-42".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(30).await, Ok(true));
             s.append(response(30)).await.expect("first response");
             s.append(obj(
@@ -2724,9 +2826,14 @@ mod tests {
             let store = SqliteEventStore::open(&path, stream, &drivers)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-9".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-9".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(80).await, Ok(true));
             assert_eq!(remaining(&s).await, Some(20));
         }
@@ -2791,7 +2898,7 @@ mod tests {
         let store = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open");
-        let first = Session::open_on("user-1".to_string(), None, Box::new(store))
+        let first = Session::open_on("user-1".to_string(), None, None, Box::new(store))
             .await
             .expect("open");
         assert_eq!(
@@ -2857,9 +2964,10 @@ mod tests {
         let store = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open");
-        let mut opened_without = Session::open_on("user-1".to_string(), None, Box::new(store))
-            .await
-            .expect("open");
+        let mut opened_without =
+            Session::open_on("user-1".to_string(), None, None, Box::new(store))
+                .await
+                .expect("open");
 
         // The owner grants, through a handle it holds on the same stream.
         let reopened = SqliteEventStore::open(&path, stream, &drivers)
@@ -2992,9 +3100,14 @@ mod tests {
             let store = SqliteEventStore::open(&path, stream, &drivers)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-11".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-11".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(40).await, Ok(true));
             s.scope_id().to_string()
         };
@@ -3215,7 +3328,7 @@ mod tests {
             inner: MemEventStore::new(),
             injected: false,
         };
-        let mut s = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store))
+        let mut s = Session::open_on("user".to_string(), Some(grant(1000)), None, Box::new(store))
             .await
             .expect("open");
         assert_eq!(
@@ -3319,7 +3432,7 @@ mod tests {
             inner: MemEventStore::new(),
             armed: Arc::clone(&armed),
         };
-        let mut s = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store))
+        let mut s = Session::open_on("user".to_string(), Some(grant(10)), None, Box::new(store))
             .await
             .expect("open");
 
@@ -3416,7 +3529,7 @@ mod tests {
         let store = HeadlessStore {
             inner: MemEventStore::new(),
         };
-        let s = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store))
+        let s = Session::open_on("user".to_string(), Some(grant(100)), None, Box::new(store))
             .await
             .expect("the appends land; only the head read is down");
 
@@ -3479,9 +3592,14 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(1000)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
 
         // B resumes the SAME stream while it holds only those two, so both
         // handles have seen exactly head 2.  (It resumes before A closes: a
@@ -3538,7 +3656,7 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store_a))
+        let mut a = Session::open_on("user".to_string(), Some(grant(10)), None, Box::new(store_a))
             .await
             .expect("open A");
         let store_b = SqliteEventStore::open(&path, stream, &drivers)
@@ -3605,9 +3723,14 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
         // Both resume while the stream is open — a closed one is not
         // resumable — so both hold `closed = false` across A's close.
         let store_b = SqliteEventStore::open(&path, stream, &drivers)
@@ -3703,9 +3826,14 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
         let store_b = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open B");
@@ -3782,9 +3910,14 @@ mod tests {
         let store_a = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
         let store_b = SqliteEventStore::open(&path, stream, &drivers)
             .await
             .expect("open B");
@@ -4201,9 +4334,10 @@ mod tests {
         let store = SqliteEventStore::open(path, stream.clone(), drivers)
             .await
             .expect("open the stream");
-        let mut session = Session::open_on(ANON.to_string(), Some(grant(budget)), Box::new(store))
-            .await
-            .expect("open");
+        let mut session =
+            Session::open_on(ANON.to_string(), Some(grant(budget)), None, Box::new(store))
+                .await
+                .expect("open");
         session.adopt_id(stream);
         session
     }
@@ -4225,6 +4359,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(40),
+                None,
                 store,
             )
             .await
@@ -4299,6 +4434,7 @@ mod tests {
                     amount: 10,
                     tag: Some("turns".to_string()),
                 },
+                None,
                 store,
             )
             .await
@@ -4328,6 +4464,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(40),
+                None,
                 store,
             )
             .await
@@ -4370,7 +4507,13 @@ mod tests {
         let stream = stream_id();
         let store = store_beside(&parent, &stream).await;
         let child = parent
-            .open_child(stream, "user-42".to_string(), Allocation::new(7), store)
+            .open_child(
+                stream,
+                "user-42".to_string(),
+                Allocation::new(7),
+                None,
+                store,
+            )
             .await
             .expect("there is no balance to refuse against");
 
@@ -4394,6 +4537,7 @@ mod tests {
                 stranger,
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 Box::new(elsewhere),
             )
             .await
@@ -4411,6 +4555,7 @@ mod tests {
         let mut single = Session::open_on(
             ANON.to_string(),
             Some(grant(50)),
+            None,
             Box::new(MemEventStore::new()),
         )
         .await
@@ -4420,6 +4565,7 @@ mod tests {
                 stream_id(),
                 "user-42".to_string(),
                 Allocation::new(1),
+                None,
                 Box::new(MemEventStore::new()),
             )
             .await
@@ -4444,6 +4590,7 @@ mod tests {
                 taken.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4457,6 +4604,7 @@ mod tests {
                 taken.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4478,7 +4626,13 @@ mod tests {
         seeded.append(response(1)).await.expect("seed the stream");
         let store = store_beside(&parent, &stranger).await;
         let err = parent
-            .open_child(stranger, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                stranger,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect_err("something is written there already");
         assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
@@ -4496,7 +4650,13 @@ mod tests {
         let fresh = stream_id();
         let store = store_beside(&parent, &fresh).await;
         let child = parent
-            .open_child(fresh, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                fresh,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect("an empty stream is what a child opens on");
         assert_eq!(remaining(&child).await, Some(10));
@@ -4517,7 +4677,13 @@ mod tests {
         let stream = stream_id();
         let store = store_beside(&parent, &stream).await;
         let err = parent
-            .open_child(stream, "user-42".to_string(), Allocation::new(1), store)
+            .open_child(
+                stream,
+                "user-42".to_string(),
+                Allocation::new(1),
+                None,
+                store,
+            )
             .await
             .expect_err("this handle closed");
         assert_eq!(err.kind(), KnlError::CLOSED, "{err}");
@@ -4530,6 +4696,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(1),
+                None,
                 store,
             )
             .await
@@ -4553,6 +4720,7 @@ mod tests {
                 still_open.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4561,7 +4729,13 @@ mod tests {
         let ended = stream_id();
         let store = store_beside(&parent, &ended).await;
         let mut done = parent
-            .open_child(ended, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                ended,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect("the allocation");
         done.close(Some("done")).await.expect("close the child");
@@ -4627,12 +4801,14 @@ mod tests {
                 first,
                 "child-a".to_string(),
                 Allocation::new(60),
+                None,
                 first_store
             ),
             two.open_child(
                 second,
                 "child-b".to_string(),
                 Allocation::new(60),
+                None,
                 second_store
             ),
         );

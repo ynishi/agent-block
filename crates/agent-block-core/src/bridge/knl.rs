@@ -737,6 +737,15 @@ pub mod types {
         /// for a child, which goes where its parent already is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub store: Option<StoreSpec>,
+        /// Labels the session's opening is written with.
+        ///
+        /// The envelope's own key, and the same vocabulary an `append`
+        /// carries: shallow scalars a reader groups or filters by.  What a
+        /// caller running many sessions in one log names them by — the run
+        /// a session belongs to — goes here, so a supervisor selects on it
+        /// without knowing what the kind records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub meta: Option<Meta>,
         /// The session this one is opened *from*.
         ///
         /// Declared, never read here.  The value is the kernel's own
@@ -1272,9 +1281,10 @@ impl Session {
     async fn new(
         owner: String,
         grant: Option<knl::BudgetGrant>,
+        meta: Option<serde_json::Map<String, serde_json::Value>>,
         drivers: &knl::IsleDrivers,
     ) -> LuaResult<Self> {
-        let state = knl::Session::new(owner, grant, drivers)
+        let state = knl::Session::new(owner, grant, meta, drivers)
             .await
             .map_err(|e| knl_err("open", &e))?;
         Ok(Self::from_state(state))
@@ -1877,6 +1887,33 @@ fn owner_of(owner: Option<String>) -> LuaResult<String> {
     Ok(owner)
 }
 
+/// Read `opts.meta`: the labels the session's opening is written with.
+///
+/// The declared type already holds the shallow rule (`MetaValue` is a string,
+/// a number or a flag), so this is the step from the surface's vocabulary to
+/// the kernel's — a JSON object on the envelope. An empty table is no labels
+/// at all rather than an empty `meta`: what a reader selects on is a key
+/// being there.
+fn meta_map(
+    method: &str,
+    meta: Option<types::Meta>,
+) -> LuaResult<Option<serde_json::Map<String, serde_json::Value>>> {
+    let Some(meta) = meta else {
+        return Ok(None);
+    };
+    if meta.is_empty() {
+        return Ok(None);
+    }
+    match serde_json::to_value(meta) {
+        Ok(serde_json::Value::Object(map)) => Ok(Some(map)),
+        Ok(other) => Err(err(
+            method,
+            format!("meta must be a table of labels, got {other}"),
+        )),
+        Err(e) => Err(err(method, format!("meta: {e}"))),
+    }
+}
+
 /// The `params` of `s:query`, in the kernel's terms.
 ///
 /// A list is the values for the `?` parameters, in order; a table with names
@@ -2012,6 +2049,7 @@ fn parse_parent(opts: &LuaValue) -> LuaResult<Option<LuaAnyUserData>> {
 async fn open_sqlite(
     owner: String,
     grant: Option<knl::BudgetGrant>,
+    meta: Option<serde_json::Map<String, serde_json::Value>>,
     path: &std::path::Path,
     drivers: &knl::IsleDrivers,
 ) -> LuaResult<Session> {
@@ -2019,7 +2057,7 @@ async fn open_sqlite(
     let store = knl::SqliteEventStore::open(path, stream.clone(), drivers)
         .await
         .map_err(|e| knl_err("open", &e))?;
-    let mut state = knl::Session::open_on(owner, grant, Box::new(store))
+    let mut state = knl::Session::open_on(owner, grant, meta, Box::new(store))
         .await
         .map_err(|e| knl_err("open", &e))?;
     state.adopt_id(stream);
@@ -2112,6 +2150,7 @@ async fn open_child_session(
     parent: LuaAnyUserData,
     owner: String,
     allocation: knl::Allocation,
+    meta: Option<serde_json::Map<String, serde_json::Value>>,
     named_store: Option<StoreTarget>,
     drivers: knl::IsleDrivers,
 ) -> LuaResult<LuaAnyUserData> {
@@ -2147,7 +2186,7 @@ async fn open_child_session(
         let stream = uuid::Uuid::new_v4().to_string();
         let store = open_child_store(named_store, &parent_db, &stream, &drivers).await?;
         state
-            .open_child(stream, owner, allocation, store)
+            .open_child(stream, owner, allocation, meta, store)
             .await
             .map_err(|e| knl_err("open", &e))?
     };
@@ -2189,6 +2228,7 @@ async fn open_session(
     };
     let owner = owner_of(opts.owner)?;
     let budget = budget_source("open", opts.budget)?;
+    let meta = meta_map("open", opts.meta)?;
     // An absent `store` is *not* the default one here: a child with no store
     // goes where its parent already is, and a child that asked for "mem"
     // asked for a different database and is refused.  Telling the two apart
@@ -2213,10 +2253,10 @@ async fn open_session(
         // No store named: the host's database, which is where a real session
         // belongs.  `"mem"` is the other answer and it has to be asked for.
         let session = match named_store {
-            None => open_sqlite(owner, grant, &default_store, &drivers).await?,
-            Some(StoreTarget::Mem) => Session::new(owner, grant, &drivers).await?,
+            None => open_sqlite(owner, grant, meta, &default_store, &drivers).await?,
+            Some(StoreTarget::Mem) => Session::new(owner, grant, meta, &drivers).await?,
             Some(StoreTarget::Sqlite(path)) => {
-                open_sqlite(owner, grant, std::path::Path::new(&path), &drivers).await?
+                open_sqlite(owner, grant, meta, std::path::Path::new(&path), &drivers).await?
             }
         };
         return lua.create_userdata(session);
@@ -2232,7 +2272,7 @@ async fn open_session(
             ));
         }
     };
-    open_child_session(lua, parent, owner, allocation, named_store, drivers).await
+    open_child_session(lua, parent, owner, allocation, meta, named_store, drivers).await
 }
 
 /// Resume a persisted session — the body of `knl.resume`.
@@ -2711,6 +2751,10 @@ mod generated_types {
                         store: Some(StoreSpec::File(SqliteStore {
                             sqlite: "/tmp/knl.db".into(),
                         })),
+                        meta: Some(Meta::from([(
+                            "run".to_string(),
+                            MetaValue::Text("r-1".into()),
+                        )])),
                         parent: None,
                     },
                 ),
@@ -4237,10 +4281,14 @@ mod tests {
             let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
                 .await
                 .expect("open store");
-            let state =
-                crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
-                    .await
-                    .expect("open system session");
+            let state = crate::knl::Session::open_on(
+                crate::knl::SYSTEM.to_string(),
+                None,
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open system session");
             drop(state);
         });
 
@@ -4684,21 +4732,22 @@ mod tests {
         // Handed over once, from inside an async function like `knl.open`
         // itself: opening a session is a write, so it suspends.
         let store = std::sync::Arc::new(Mutex::new(Some(store)));
-        let open_failing =
-            vm.lua
-                .create_async_function(move |lua, ()| {
-                    let store = std::sync::Arc::clone(&store);
-                    async move {
-                        let store = store.lock().await.take().ok_or_else(|| {
+        let open_failing = vm
+            .lua
+            .create_async_function(move |lua, ()| {
+                let store = std::sync::Arc::clone(&store);
+                async move {
+                    let store =
+                        store.lock().await.take().ok_or_else(|| {
                             err("open", "the failing store can only be opened once")
                         })?;
-                        let state = knl::Session::open_on("t".to_string(), None, Box::new(store))
-                            .await
-                            .map_err(|e| knl_err("open", &e))?;
-                        lua.create_userdata(Session::from_state(state))
-                    }
-                })
-                .expect("create open_failing");
+                    let state = knl::Session::open_on("t".to_string(), None, None, Box::new(store))
+                        .await
+                        .map_err(|e| knl_err("open", &e))?;
+                    lua.create_userdata(Session::from_state(state))
+                }
+            })
+            .expect("create open_failing");
         vm.lua
             .globals()
             .set("open_failing", open_failing)
@@ -4785,6 +4834,7 @@ mod tests {
         let err = knl::Session::open_on(
             "t".to_string(),
             Some(knl::BudgetGrant::new(100)),
+            None,
             Box::new(store),
         )
         .await
@@ -4808,6 +4858,7 @@ mod tests {
         let session = knl::Session::open_on(
             "t".to_string(),
             Some(knl::BudgetGrant::new(100)),
+            None,
             Box::new(store),
         )
         .await
@@ -4936,10 +4987,14 @@ mod tests {
             let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
                 .await
                 .expect("open store");
-            let state =
-                crate::knl::Session::open_on(crate::knl::SYSTEM.to_string(), None, Box::new(store))
-                    .await
-                    .expect("open system session");
+            let state = crate::knl::Session::open_on(
+                crate::knl::SYSTEM.to_string(),
+                None,
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open system session");
             drop(state);
         });
         let before = persisted(&path, &stream).len();
@@ -5304,6 +5359,45 @@ mod tests {
             "the collector left the session open: {log:?}"
         );
         assert_eq!(last["data"]["reason"], Value::from("dropped"), "{last}");
+    }
+
+    /// `knl.open{ meta = … }` labels the session's opening, and a supervisor
+    /// selects sessions on that label — one database holding many runs, told
+    /// apart by what they were named rather than by a file each.
+    #[test]
+    fn open_labels_the_session_and_a_select_finds_it_by_label() {
+        let vm = vm();
+        vm.exec(
+            r#"
+            local a = knl.open({ owner = "q", meta = { run = "r-1", attempt = 1 } })
+            local b = knl.open({ owner = "q", meta = { run = "r-2" } })
+            local plain = knl.open({ owner = "q" })
+
+            -- The labels are on the opening's envelope, not under data.
+            local opened = a:query([[
+                SELECT json_extract(meta, '$.run')     AS run,
+                       json_extract(meta, '$.attempt') AS attempt
+                FROM events WHERE stream = $stream AND kind = 'session_opened']])
+            assert(opened[1].run == "r-1", "run: " .. tostring(opened[1].run))
+            assert(opened[1].attempt == 1, "attempt: " .. tostring(opened[1].attempt))
+
+            -- Every session opened without a store is in the same database,
+            -- so one statement selects the run out of all of them.
+            local found = a:query([[
+                SELECT stream FROM events
+                WHERE kind = 'session_opened' AND json_extract(meta, '$.run') = 'r-2']])
+            assert(#found == 1, "one session is named r-2, got " .. tostring(#found))
+            assert(found[1].stream == b:id(), "the label found the wrong stream")
+
+            -- An unlabelled session answers nothing rather than an empty
+            -- label, so a select on a run never picks it up.
+            local unlabelled = plain:query([[
+                SELECT json_extract(meta, '$.run') AS run
+                FROM events WHERE stream = $stream AND kind = 'session_opened']])
+            assert(unlabelled[1].run == nil, "an unlabelled opening carries no run")
+        "#,
+        )
+        .expect("the labelled opens and the selects on them");
     }
 
     // -- reading the log with SQL ------------------------------------------
