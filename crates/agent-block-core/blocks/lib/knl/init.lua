@@ -167,9 +167,9 @@
 ---   that is not one SELECT / WITH, and resolves `$stream` (this session)
 ---   and `$sessions` (`opts.sessions`, the set to read across). That is the
 ---   whole mechanism: no builder, no query object, no registration hook.
----   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `tree` are the
----   five this module ships, and a consumer's own view is a function of
----   exactly the same form — nothing about the five is privileged.
+---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `sessions` /
+---   `tree` are the six this module ships, and a consumer's own view is a
+---   function of exactly the same form — nothing about the six is privileged.
 ---
 ---   Token usage is a query view and not a built-in one, deliberately.
 ---   Every `llm_response` carries the counts its adapter normalized out of
@@ -1393,6 +1393,12 @@ local VIEWS = {
         returns = "{ { stream, calls, input_tokens, output_tokens, thinking_tokens }, ... }, truncated"
             .. " — one row per stream that answered, the counts the providers reported",
     },
+    sessions = {
+        args = view_args(),
+        returns = "{ { session, meta, parent, opened_epoch_ms, closed_epoch_ms? }, ... }, truncated"
+            .. " — one row per session in the log; `meta` is the JSON text of"
+            .. " the labels it was opened with",
+    },
     tree = {
         args = view_args(),
         returns = "{ { session, parent, opened_epoch_ms, closed_epoch_ms?, open_children? }, ... }, truncated"
@@ -1875,7 +1881,8 @@ end
 -- open / resume / session — the state half
 -- ============================================================
 
-local OPEN_STATE_KEYS = { owner = true, budget = true, store = true, parent = true }
+local OPEN_STATE_KEYS =
+    { owner = true, budget = true, store = true, meta = true, parent = true }
 local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 
 --- Reject anything that is not a state key. Policy has its own constructor
@@ -1907,7 +1914,12 @@ end
 --- a child needs none, because it goes where its parent already is — and a
 --- parent on `"mem"` is refused, since a tree needs a file store.
 ---
---- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, parent? }
+--- `meta` labels the opening, and it is what tells sessions apart in a
+--- database that holds many of them: `knl.views.sessions` reads the labels
+--- back, and a `session:query` selects on one. Shallow scalars, the same
+--- vocabulary `s:append{ meta = … }` takes.
+---
+--- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, meta?, parent? }
 --- @return userdata session
 function M.open(opts)
     opts = opts or {}
@@ -1917,6 +1929,7 @@ function M.open(opts)
         owner = opts.owner,
         budget = opts.budget,
         store = opts.store,
+        meta = opts.meta,
         parent = opts.parent,
     })
 end
@@ -2812,6 +2825,32 @@ SELECT t.session AS session,
  ORDER BY opened_epoch_ms, session
 ]]
 
+--- Every session the log holds, with the labels it was opened under.
+---
+--- The companion of `TREE_SQL`, and the other question a supervisor asks of
+--- a database that holds many runs: `tree` walks the sessions one opening
+--- descends from, this one lists them all. A caller that gave its runs a
+--- label (`knl.open{ meta = { run = id } }`) reads them back here without
+--- having given each one a database.
+---
+--- `meta` is the column's own JSON text, for the reason `open_children` is:
+--- the log holds it as written, and a view that re-encoded it into a Lua
+--- table would be inventing a shape the log does not have. The rest is read
+--- the same way `tree` reads it — correlated subqueries, so a stream that
+--- recorded two endings is still one row.
+local SESSIONS_SQL = [[
+SELECT o.stream    AS session,
+       o.meta      AS meta,
+       json_extract(o.data, '$.parent') AS parent,
+       MIN(o.epoch_ms) AS opened_epoch_ms,
+       (SELECT MIN(c.epoch_ms) FROM events AS c
+         WHERE c.stream = o.stream AND c.kind = 'session_closed') AS closed_epoch_ms
+  FROM events AS o
+ WHERE o.kind = 'session_opened'
+ GROUP BY o.stream
+ ORDER BY opened_epoch_ms, session
+]]
+
 --- Run one view's statement over `session`.
 ---
 --- The options are the caller's, passed through untouched: `sessions` is
@@ -2914,6 +2953,26 @@ end
 --- @return boolean truncated
 function M.views.tree(session, opts)
     return read_view(session, TREE_SQL, opts)
+end
+
+--- Every session in the log: `{ session, meta, parent, opened_epoch_ms,
+--- closed_epoch_ms }`, in the order they opened.
+---
+--- What tells one run from another when they share a database. `meta` is the
+--- JSON text of the labels the session was opened with — `{}` for a session
+--- nobody labelled — so a caller looking for one run decodes it, or asks for
+--- what it wants with a `session:query` of its own; a view takes no
+--- parameters, so the filtering is the caller's either way.
+---
+--- `closed_epoch_ms` is nil while a session is still running. `opts.sessions`
+--- widens which streams are in scope, as it does on any other view.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` / `timeout_ms` / `limit`)
+--- @return table rows
+--- @return boolean truncated
+function M.views.sessions(session, opts)
+    return read_view(session, SESSIONS_SQL, opts)
 end
 
 -- ============================================================

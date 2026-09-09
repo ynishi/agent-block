@@ -1225,6 +1225,35 @@ do
     assert(type(edge.opened_epoch_ms) == "number", "opened: " .. tostring(edge.opened_epoch_ms))
     assert(edge.closed_epoch_ms ~= nil, "the child closed and the tree says so")
 
+    -- (f) the sessions view: every session in the log, and the labels it was
+    -- opened under. This is what tells one run from another when they share a
+    -- database — the alternative being a database per run, which is what
+    -- breaks "one project, one log".
+    local labelled = kernel.open({ owner = "test", meta = { run = "r-1", attempt = 2 } })
+    local all = kernel.views.sessions(parent)
+    local seen = {}
+    for _, row in ipairs(all) do
+        seen[row.session] = row
+    end
+    assert(seen[parent:id()] ~= nil, "the parent is in the log")
+    assert(seen[child:id()] ~= nil, "so is the child")
+
+    local row = seen[labelled:id()]
+    assert(row ~= nil, "the labelled session is in the log")
+    assert(type(row.meta) == "string", "meta is the column's JSON text: " .. type(row.meta))
+    local labels = std.json.decode(row.meta)
+    assert(labels.run == "r-1", "run: " .. tostring(labels.run))
+    assert(labels.attempt == 2, "attempt: " .. tostring(labels.attempt))
+    assert(row.parent == nil, "it was opened from nothing")
+    assert(type(row.opened_epoch_ms) == "number", "opened: " .. tostring(row.opened_epoch_ms))
+    assert(row.closed_epoch_ms == nil, "it is still running")
+
+    -- The child closed above, and the view reports it.
+    assert(seen[child:id()].closed_epoch_ms ~= nil, "the child ended and the view says so")
+    -- A session nobody labelled carries no labels rather than a missing column.
+    assert(next(std.json.decode(seen[parent:id()].meta)) == nil, "the parent was not labelled")
+
+    labelled:close("done")
     parent:close("done")
 
     mark("inv14_session_tree")
