@@ -431,7 +431,6 @@ describe("job.run — a record, a process, a record", function()
                 return 0
             end,
         })
-        expect(seen[1].cmd:find("AGENT_BLOCK_RESULT_PATH='/r/a-1.result'", 1, true) ~= nil).to.be(true)
         expect(got.result).to.be('{"ok":true,"n":3}')
         local ended = s:events()[2].data
         expect(ended.result).to.be('{"ok":true,"n":3}')
@@ -483,7 +482,7 @@ describe("job.run — a record, a process, a record", function()
                 return 0
             end,
         })
-        expect(seen[1].cmd:find("AGENT_BLOCK_RESULT_PATH", 1, true)).to.be(nil)
+        expect(seen[1].cmd:find("--config", 1, true)).to.be(nil)
     end)
 
     it("labels the process with the run id, which is what a stop reaches it by", function()
@@ -510,40 +509,76 @@ describe("job.run — a record, a process, a record", function()
         expect(s:events()[1].data.requested).to.be(7)
     end)
 
-    it("labels the process with the run it is, so the log can be read back", function()
+    it("writes the run's config before the process that reads it", function()
         local seen = {}
         local exec = function(cmd)
             seen[#seen + 1] = cmd
             return { ok = true, code = 0, stdout = "", stderr = "" }
         end
-        local got = job.run(fake_session(), decl("a"), { exec = exec })
-        expect(seen[1]:find("--label 'run=" .. got.run_id .. "'", 1, true) ~= nil).to.be(true)
-        expect(seen[1]:find("--label 'job=a'", 1, true) ~= nil).to.be(true)
-        -- The run does not get a database of its own: no store is named at
-        -- all, so the block writes to its project's log like any other run.
-        expect(seen[1]:find("AGENT_BLOCK_KNL_PATH", 1, true)).to.be(nil)
+        local written = {}
+        local d = decl("a", { prompt = "it's due", context = "ctx" })
+        local got = job.run(fake_session(), d, {
+            exec = exec,
+            result = "/r/a-1.result",
+            config = "/r/a-1.config",
+            write = function(path, text)
+                written[#written + 1] = { path = path, text = text }
+            end,
+            -- The spec VM has no `std`: the encoder is a seam for the same
+            -- reason `exec` and `now` are, so the config can be read back
+            -- here as the table it was.
+            encode = function(value)
+                return value
+            end,
+        })
+        expect(#written).to.be(1)
+        expect(written[1].path).to.be("/r/a-1.config")
+        local cfg = written[1].text
+        expect(cfg.prompt).to.be("it's due")
+        expect(cfg.context).to.be("ctx")
+        expect(cfg.result).to.be("/r/a-1.result")
+        expect(cfg.labels.job).to.be("a")
+        expect(cfg.labels.run).to.be(got.run_id)
+
+        -- The command names the file and nothing else: no environment
+        -- prefix at all, so a process this block starts inherits none of it.
+        expect(seen[1]).to.be(
+            "'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'"
+        )
+        expect(seen[1]:find("AGENT_BLOCK_", 1, true)).to.be(nil)
     end)
 end)
 
 describe("job.command — what a run is", function()
-    it("is the script in its project root, labelled, prompt through the environment", function()
-        local d = decl("a", { prompt = "it's due", context = "ctx" })
-        local cmd = job.command(d, { bin = "/usr/bin/agent-block", run_id = "a-1" })
+    it("is the script in its project root, with the config file naming the rest", function()
+        local cmd = job.command(decl("a"), {
+            bin = "/usr/bin/agent-block",
+            config = "/r/a-1.config",
+        })
         expect(cmd).to.be(
-            "AGENT_BLOCK_PROMPT='it'\\''s due' AGENT_BLOCK_CONTEXT='ctx' "
-                .. "'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' "
-                .. "--label 'job=a' --label 'run=a-1'"
+            "'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'"
         )
     end)
 
-    it("leaves prompt and context out when the declaration has none", function()
+    it("is three arguments and no environment when there is no config", function()
         local cmd = job.command(decl("a"))
-        expect(cmd).to.be("'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --label 'job=a'")
+        expect(cmd).to.be("'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo'")
     end)
 
-    it("names no store, so a run writes to its project's log like any other", function()
-        local cmd = job.command(decl("a"), { run_id = "a-1" })
-        expect(cmd:find("AGENT_BLOCK_KNL_PATH", 1, true)).to.be(nil)
+    it("names no store and no environment, so nothing a run starts inherits its identity", function()
+        local d = decl("a", { prompt = "it's due", context = "ctx" })
+        local cmd = job.command(d, { config = "/r/a-1.config" })
+        expect(cmd:find("AGENT_BLOCK_", 1, true)).to.be(nil)
+    end)
+
+    it("carries the run's own inputs in the config, labels included", function()
+        local d = decl("a", { prompt = "p", context = "c" })
+        local cfg = job.config(d, "a-1", "/r/a-1.result")
+        expect(cfg.prompt).to.be("p")
+        expect(cfg.context).to.be("c")
+        expect(cfg.result).to.be("/r/a-1.result")
+        expect(cfg.labels.job).to.be("a")
+        expect(cfg.labels.run).to.be("a-1")
     end)
 end)
 

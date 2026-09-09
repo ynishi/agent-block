@@ -119,12 +119,27 @@ local result = agent.run({
 print(result.content)
 ```
 
-Both flags also accept environment variables as fallback:
+Neither takes an environment variable, and neither does `--result`. They are
+what ONE run is, and an environment variable is inherited: a block that starts
+another `agent-block` would be handing its child its own prompt and its own
+result file to write over.
 
-| Flag | Env var |
-|---|---|
-| `--prompt` | `AGENT_BLOCK_PROMPT` |
-| `-c / --context` | `AGENT_BLOCK_CONTEXT` |
+A caller with all of them to pass writes a file instead:
+
+```json
+{ "prompt": "…", "context": "…", "result": "/tmp/run.json",
+  "labels": { "job": "drain", "run": "drain-1757300000" } }
+```
+
+```sh
+agent-block -s block.lua --config run.json
+```
+
+The file is the lowest of three layers — **file, then environment (for the
+knobs that have one), then argument** — so a flag always wins over it. What
+belongs to the host rather than to a run (where the databases live, the
+sandbox, `AGENT_BLOCK_HOME`) stays an environment variable read from the
+project's `.env`, which is that half's config file already.
 
 ### What the exit code says
 
@@ -276,8 +291,8 @@ loads that project's `.env` and writes to that project's own session log —
 labelled `job=<name>` and `run=<run_id>` (`--label`), which is how one run is
 found among all of them (`knl.views.sessions`). The value the block returns —
 the same JSON string `run_block` hands an MCP caller — is written under
-`~/.agent-block/runs/<job>/` (`--result` / `AGENT_BLOCK_RESULT_PATH`, which
-any `agent-block -s` run can use) and is on the run's record as `result`,
+`~/.agent-block/runs/<job>/` (`--result`, which any `agent-block -s` run can
+use) and is on the run's record as `result`,
 whole up to 64 KiB and pointed at past it. The manager itself decides nothing it cannot
 read back: every start and end is a record on its own log
 (`~/.agent-block/serve.sqlite`), `every` counts from the previous end, one

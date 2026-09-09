@@ -9,7 +9,7 @@ mod serve;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
@@ -65,14 +65,16 @@ struct Cli {
 
     /// Prompt string injected as `_PROMPT` Lua global.
     /// Scripts can use it as `agent.run({prompt = _PROMPT, ...})`.
-    /// Env: `AGENT_BLOCK_PROMPT`.
-    #[arg(long, env = "AGENT_BLOCK_PROMPT")]
+    ///
+    /// One run's own input, so it has no env binding: see `--config`.
+    #[arg(long)]
     prompt: Option<String>,
 
     /// Context string injected as `_CONTEXT` Lua global.
     /// Typically used as a system prompt: `agent.run({system = _CONTEXT, ...})`.
-    /// Env: `AGENT_BLOCK_CONTEXT`.
-    #[arg(short = 'c', long, env = "AGENT_BLOCK_CONTEXT")]
+    ///
+    /// One run's own input, so it has no env binding: see `--config`.
+    #[arg(short = 'c', long)]
     context: Option<String>,
 
     /// Path to a file whose contents are injected as `_PROMPT` Lua global.
@@ -106,8 +108,8 @@ struct Cli {
     /// serve` does, has somewhere to read the answer back from. Written only
     /// when the script returns; a script that raises writes nothing.
     ///
-    /// Env: `AGENT_BLOCK_RESULT_PATH`.
-    #[arg(long, value_name = "FILE", env = "AGENT_BLOCK_RESULT_PATH")]
+    /// One run's own output, so it has no env binding: see `--config`.
+    #[arg(long, value_name = "FILE")]
     result: Option<PathBuf>,
 
     /// Label every `knl` session this run opens: `--label run=r-7`, repeated
@@ -130,6 +132,26 @@ struct Cli {
     /// starts — each of them then claiming to be the run its parent is.
     #[arg(long = "label", value_name = "KEY=VALUE")]
     labels: Vec<String>,
+
+    /// A JSON file holding this run's own inputs: `prompt`, `context`,
+    /// `result`, `labels`.
+    ///
+    /// One argument instead of four, for a caller that starts runs — a job
+    /// manager writes the file and names it here. Free text goes in it
+    /// unescaped, which a command line cannot promise: a prompt with quotes
+    /// or newlines in it survives a file and not a shell.
+    ///
+    /// The lowest layer of the three: a value in the file is used when
+    /// neither the flag nor (for the knobs that have one) the environment
+    /// gave one. So **file, then environment, then argument** — the later
+    /// one wins.
+    ///
+    /// It carries what belongs to ONE run, and nothing that belongs to the
+    /// host. Where the databases live, the sandbox, `AGENT_BLOCK_HOME` —
+    /// those stay environment variables read from the project's `.env`,
+    /// which is that half's config file already.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -275,11 +297,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         ),
     };
 
+    // The lowest of the three layers. Read before the argument shapes below
+    // so a value it carries stands in exactly where the command line gave
+    // none — the file loses to a flag, and never the other way round.
+    let file = read_run_config(cli.config.as_deref())?;
+    let cli_prompt = cli.prompt.or(file.prompt);
+    let cli_context = cli.context.or(file.context);
+    let result_path = cli.result.or(file.result);
+
     // Map the CLI argument shapes to the SDK `Source` enums. File-backed
     // variants are read eagerly here so the error message carries the
     // CLI flag name (`--prompt-file` / `--context-file`); the SDK side
     // sees the contents directly via `PromptSource::Inline`.
-    let prompt = match (cli.prompt, cli.prompt_file) {
+    let prompt = match (cli_prompt, cli.prompt_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
         (None, Some(p)) => {
@@ -292,7 +322,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("--prompt and --prompt-file are mutually exclusive");
         }
     };
-    let context = match (cli.context, cli.context_file) {
+    let context = match (cli_context, cli.context_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
         (None, Some(p)) => {
@@ -319,17 +349,59 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     if let Some(context) = context {
         builder = builder.context(context);
     }
+    for (key, value) in file.labels {
+        builder = builder.session_label(key, value);
+    }
     for (key, value) in parse_labels(&cli.labels)? {
         builder = builder.session_label(key, value);
     }
     let config = builder.build();
 
     let value = run_capture(config).await?;
-    if let Some(path) = cli.result {
+    if let Some(path) = result_path {
         std::fs::write(&path, &value)
             .with_context(|| format!("writing the script's result to '{}'", path.display()))?;
     }
     Ok(())
+}
+
+/// One run's own inputs, as a file: what `--config` names.
+///
+/// The three that used to be environment variables (`AGENT_BLOCK_PROMPT` /
+/// `_CONTEXT` / `_RESULT_PATH`) and the labels beside them. They belong
+/// together because they are all answers to "which run is this" — and they
+/// left the environment for the same reason: an environment variable is
+/// inherited, so a block that starts another `agent-block` handed its child
+/// its own prompt and its own result file to write over.
+///
+/// Closed (`deny_unknown_fields`): a misspelled key is a run that would have
+/// silently gone without its prompt.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunConfig {
+    /// `_PROMPT`.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// `_CONTEXT`.
+    #[serde(default)]
+    context: Option<String>,
+    /// Where the returned value is written.
+    #[serde(default)]
+    result: Option<PathBuf>,
+    /// What every session this run opens is labelled with.
+    #[serde(default)]
+    labels: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Read the `--config` file, or an empty config when none was named.
+fn read_run_config(path: Option<&Path>) -> anyhow::Result<RunConfig> {
+    let Some(path) = path else {
+        return Ok(RunConfig::default());
+    };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading --config '{}'", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing --config '{}' as JSON", path.display()))
 }
 
 /// Read `--label key=value` pairs into the labels a session opens with.

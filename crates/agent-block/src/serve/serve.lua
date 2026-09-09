@@ -123,9 +123,11 @@ local function tick()
         local decl, requested = item.decl, item.requested
         local run_id = string.format("%s-%d", decl.name, math.floor(now * 1000))
         local result_path = string.format("%s/%s/%s.result", S.runs_dir, decl.name, run_id)
+        local config_path = string.format("%s/%s/%s.config", S.runs_dir, decl.name, run_id)
         handles[run_id] = std.task.spawn(function()
             local ok, err = pcall(job.run, s, decl, {
                 result = result_path,
+                config = config_path,
                 run_id = run_id,
                 requested = requested,
                 bin = S.bin,

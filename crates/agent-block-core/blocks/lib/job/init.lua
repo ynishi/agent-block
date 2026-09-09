@@ -57,7 +57,7 @@
 ---
 ---   `result` is the block's answer — the JSON string it returned, read back
 ---   from the file the run was told to write it to (`opts.result` on `run`,
----   `AGENT_BLOCK_RESULT_PATH` in the process). The same block called through
+---   `result` in the run's config file). The same block called through
 ---   MCP hands that value to its caller; a run is not a second contract, so
 ---   the record carries it too. Whole or absent: a JSON string cut short is
 ---   nothing, so a value past the cap is left in its file and `result_path`
@@ -505,50 +505,58 @@ local function tail(s, n)
     return s:sub(-n)
 end
 
---- The command a run is: the block's script in its own process, started in
---- the block's project root (where `.env` is), writing to that project's own
---- log. The prompt and context go as environment rather than arguments,
---- since the CLI reads both from `AGENT_BLOCK_PROMPT` / `AGENT_BLOCK_CONTEXT`
---- and a shell argument would have to survive the quoting twice.
+--- What one run's process is given, as a value: `{ prompt?, context?,
+--- result?, labels }` — the file `--config` names.
 ---
---- `opts.result` names the file the block's returned value is written to
---- (`AGENT_BLOCK_RESULT_PATH`); the CLI prints nothing on a return, so this
---- is the only way the answer leaves the process.
+--- Everything here belongs to THIS run and to no other, which is why none of
+--- it is an environment variable any more. An environment variable is
+--- inherited, so a block that starts another `agent-block` used to hand its
+--- child its own prompt and its own result file to write over. A file the
+--- command line names is inherited by nothing.
 ---
---- `opts.run_id` becomes `--label run=<id>`, which is how a run is found in
---- the log afterwards. It is an ARGUMENT and not an environment variable on
---- purpose: it names one run, and an environment variable is inherited by
---- every process the block starts — each of them then claiming to be the run
---- its parent is. That was also the trouble with pointing each run at a
---- database of its own (`AGENT_BLOCK_KNL_PATH`), which this replaces: the
---- project's log went back to being many files, one per run, and stopped
---- being one stream to read.
+--- Free text goes in it as text: a prompt with quotes or newlines in it
+--- survives a file, and a command line cannot promise that.
 ---
 --- @param decl table  a decl
---- @param opts table|nil  { bin?, result?, run_id? }
+--- @param run_id string  the run this is
+--- @param result string|nil  where the returned value is written
+--- @return table  the config, ready for `std.json.encode`
+function M.config(decl, run_id, result)
+    return {
+        prompt = decl.prompt,
+        context = decl.context,
+        result = result,
+        -- What the run's sessions are recorded as, so one project log holds
+        -- every run of this block and a reader can still find this one.
+        labels = { job = decl.name, run = run_id },
+    }
+end
+
+--- The command a run is: the block's script in its own process, started in
+--- the block's project root (where `.env` is), writing to that project's own
+--- log, with `--config` naming the file that holds the rest ([`M.config`]).
+---
+--- Three arguments and no environment at all. What a run is told is what it
+--- was handed, and a process it starts is handed nothing — which is the
+--- whole difference from the shape this replaces (`AGENT_BLOCK_KNL_PATH` /
+--- `_PROMPT` / `_CONTEXT` / `_RESULT_PATH` as an environment prefix, every
+--- one of them inherited).
+---
+--- @param decl table  a decl
+--- @param opts table|nil  { bin?, config? }
 --- @return string command
 function M.command(decl, opts)
     opts = opts or {}
-    local parts = {}
-    if opts.result ~= nil then
-        parts[#parts + 1] = "AGENT_BLOCK_RESULT_PATH=" .. sq(opts.result)
-    end
-    if decl.prompt ~= nil then
-        parts[#parts + 1] = "AGENT_BLOCK_PROMPT=" .. sq(decl.prompt)
-    end
-    if decl.context ~= nil then
-        parts[#parts + 1] = "AGENT_BLOCK_CONTEXT=" .. sq(decl.context)
-    end
-    parts[#parts + 1] = sq(opts.bin or DEFAULT_BIN)
-    parts[#parts + 1] = "-s"
-    parts[#parts + 1] = sq(decl.path)
-    parts[#parts + 1] = "-p"
-    parts[#parts + 1] = sq(decl.cwd)
-    parts[#parts + 1] = "--label"
-    parts[#parts + 1] = sq("job=" .. decl.name)
-    if opts.run_id ~= nil then
-        parts[#parts + 1] = "--label"
-        parts[#parts + 1] = sq("run=" .. opts.run_id)
+    local parts = {
+        sq(opts.bin or DEFAULT_BIN),
+        "-s",
+        sq(decl.path),
+        "-p",
+        sq(decl.cwd),
+    }
+    if opts.config ~= nil then
+        parts[#parts + 1] = "--config"
+        parts[#parts + 1] = sq(opts.config)
     end
     return table.concat(parts, " ")
 end
@@ -645,9 +653,15 @@ end
 --- and so would a caller whose "process" is something else. `opts.now` is
 --- the clock (`std.time.now` unless told), for the same reason.
 ---
+--- `opts.config` is where this run's config file is written ([`M.config`]);
+--- with none, the process is started with no config at all, which is what a
+--- spec wants and what a block with no prompt and no result to write needs.
+--- `opts.write` / `opts.encode` are `std.fs.write` / `std.json.encode` unless
+--- a caller hands in others, for the reason `opts.exec` and `opts.now` are.
+---
 --- @param session userdata|table  the manager's session
 --- @param decl table  a decl
---- @param opts table|nil  { exec?, now?, bin?, requested?, run_id?, result? }
+--- @param opts table|nil  { exec?, now?, bin?, requested?, run_id?, result?, config?, write?, encode? }
 --- @return table  { run_id, outcome, exit_code?, took_s, error? }
 function M.run(session, decl, opts)
     opts = opts or {}
@@ -675,11 +689,27 @@ function M.run(session, decl, opts)
         },
     })
 
+    -- What this run is told, written before the process that reads it. A
+    -- file rather than an environment prefix, so nothing the block starts
+    -- inherits this run's prompt or its result file.
+    if opts.config ~= nil then
+        local std_g = rawget(_G, "std")
+        local write = opts.write or (std_g and std_g.fs and std_g.fs.write)
+        if type(write) ~= "function" then
+            error("job.run: no write: pass opts.write, or run where `std.fs.write` exists", 2)
+        end
+        local encode = opts.encode or (std_g and std_g.json and std_g.json.encode)
+        if type(encode) ~= "function" then
+            error("job.run: no encode: pass opts.encode, or run where `std.json.encode` exists", 2)
+        end
+        write(opts.config, encode(M.config(decl, run_id, opts.result)))
+    end
+
     -- `label` is what a stop reaches the process by: `sh.kill(run_id)` ends
     -- the run's whole group, and this call answers with no exit code, which
     -- is read as `stopped` below.
     local result = exec(
-        M.command(decl, { bin = opts.bin, result = opts.result, run_id = run_id }),
+        M.command(decl, { bin = opts.bin, config = opts.config }),
         { cwd = decl.cwd, timeout = decl.timeout, label = run_id }
     )
     local took = now() - started
