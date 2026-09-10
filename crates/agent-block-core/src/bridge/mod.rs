@@ -72,7 +72,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     llm::register(lua)?;
     knl::register(
         lua,
-        ctx.knl_drivers.clone(),
+        ctx.knl_logs.clone(),
         ctx.knl_store.clone(),
         ctx.session_labels.clone(),
     )?;

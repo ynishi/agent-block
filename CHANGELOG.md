@@ -34,9 +34,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `beat` at the top level is now refused, and the refusal says where it goes.
   The stored schema version is `2` for it, and a read-time upcaster moves a
   version-1 event's top-level `beat` into its `meta`: a log written before
-  this reads back in today's shape, with its bytes untouched. The `beat`
-  column and its index are unchanged — the value is lifted out of `meta` on
-  the way in — so a query grouping by beat reads as it did.
+  this reads back in today's shape, with its bytes untouched. There is no
+  `beat` column any more (see below): a query reaches the label with
+  `json_extract(meta, '$.beat')`, which the log carries an index for.
+
+- The kernel's event store is an `eventsdb` SQLite log. The kernel's own
+  `EventStore` is unchanged and so is everything above it — a session is still
+  a stream, an append still lands, a decision is still taken inside the write
+  — and what is underneath is now a store with a migration ladder for the
+  table's shape, a stored per-stream `seq` counter, a global `position`, a
+  pool of read-only connections, and a transaction hatch the two-stream write
+  and the close-time child scan go through. A log is opened **once per file
+  per process** and the sessions in it are streams of it, which is what makes
+  a session tree one transaction on one connection rather than two logs
+  racing for one file.
+
+- A `knl.sqlite` written by 0.36.0–0.38.0 is migrated on the first open,
+  automatically and once. Its events are imported keeping the time and the
+  schema version they were written under — so the upcaster written for them
+  still applies — with the old `beat` column moved into `meta`, and every
+  row's reassigned `seq` is checked to be the one it had before the
+  transaction commits. Nothing is asked of the operator, and a crash part-way
+  resumes on the next open.
+
+- The published event schema (`knl.api().schema`) gains `position` and loses
+  `beat`, and the key is `position` rather than `(stream, seq)` — which is
+  still unique beside it. `position` is the log's global order across every
+  stream of one database, so a read *across* sessions has an order to use;
+  a read within one session orders by `seq`, as before. The shell's
+  declaration of the same table (`knl.shapes.schema`) moves with it.
+
+- `store = "mem"` sessions can have children and can be resumed by name. The
+  ephemeral log is one database per run with one writer, so a `"mem"` session
+  is a stream of it like any other. It used to be a shared-cache database per
+  session, whose locks are per *table*: a child's first write met
+  `SQLITE_LOCKED` while its parent held the table and no busy timeout waited
+  that out, so a tree on `"mem"` was refused. There is nothing left to refuse.
 
 - `policy.verdict{ timeout }`: which check the next window is read off is
   now the caller's choice, `timeout.measure` — `"longest"` (the default),

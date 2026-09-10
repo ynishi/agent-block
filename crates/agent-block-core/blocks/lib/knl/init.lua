@@ -37,11 +37,11 @@
 ---   one above it — the project's log stops being one stream to read.
 ---
 ---   `store = "mem"` is the other choice and has to be asked for by name: an
----   in-memory database, for TESTS AND MOCKS — one session, one process,
----   nothing shared. It is not a lighter version of the default. Two writers
----   meet a per-table lock there that no busy timeout waits out, so opening a
----   child of a `mem` parent is refused rather than made to wait (the kernel's
----   own header says the same, and `supervisor` says it again for siblings).
+---   in-memory log, for TESTS AND MOCKS — one per host process, gone with it,
+---   never a lighter version of the default. It is the same event log the
+---   file is (one writer thread, the same schema), so a `mem` parent can open
+---   children and a `mem` stream can be resumed by name while the host lives;
+---   what it cannot do is outlive the process.
 ---   `store = { sqlite = <path> }` is a file the caller picked.
 ---
 --- Lifecycle belongs to the session
@@ -1194,22 +1194,26 @@ local QUERY_OPTS = T.shape({
 --- holds the shallow labels — the beat id among them — and `data` holds the
 --- one structured JSON value a kind is about.
 ---
---- `beat` is still a column here because it is still a column of the
---- backend's table, and this declaration's job is to say what the table has.
---- Nothing writes it: the id goes in `meta`, and the views reach a beat with
---- `json_extract(meta, '$.beat')`. The column goes when the backend it
---- mirrors does. There is no `payload` column any more: the whole-object
---- form it held is what this round split into the envelope and the one
---- structured field.
+--- `position` is the key, and it is the log's global order rather than one
+--- stream's: every event of the database in the order it committed, dense
+--- and gap-free as read. `(stream, seq)` is unique beside it, so a read
+--- within one session still orders by `seq`; a read ACROSS sessions orders
+--- by `position`, which is the one thing `seq` cannot answer.
+---
+--- There is no `beat` column. The id lives in `meta` and the views reach it
+--- with `json_extract(meta, '$.beat')`, which the log carries an index for.
+--- There is no `payload` column either: the whole-object form it held is
+--- what an earlier round split into the envelope and the one structured
+--- field.
 local EVENTS_SCHEMA = {
     table = "events",
     columns = {
-        { name = "stream", type = "TEXT", pk = true },
-        { name = "seq", type = "INTEGER", pk = true },
+        { name = "position", type = "INTEGER", pk = true },
+        { name = "stream", type = "TEXT", pk = false },
+        { name = "seq", type = "INTEGER", pk = false },
         { name = "epoch_ms", type = "INTEGER", pk = false },
         { name = "kind", type = "TEXT", pk = false },
         { name = "schema_version", type = "INTEGER", pk = false },
-        { name = "beat", type = "TEXT", pk = false },
         { name = "meta", type = "TEXT", pk = false },
         { name = "data", type = "TEXT", pk = false },
     },

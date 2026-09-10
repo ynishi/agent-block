@@ -756,13 +756,16 @@ describe("knl.shapes.schema — the read schema is published as data", function(
     end)
 
     it("declares the primary key the store's rows are ordered by", function()
+        -- `position` is the log's global order across every stream of one
+        -- database and the row's key; `(stream, seq)` stays unique beside
+        -- it, and a read within one session still orders by `seq`.
         local pk = {}
         for _, column in ipairs(schema.columns) do
             if column.pk then
                 pk[#pk + 1] = column.name
             end
         end
-        expect(listed(pk)).to.be("seq,stream")
+        expect(listed(pk)).to.be("position")
     end)
 
     it("carries the envelope as columns and the structure in one of them", function()
@@ -775,12 +778,12 @@ describe("knl.shapes.schema — the read schema is published as data", function(
         -- labels (the beat id among them, which is what `knl.views.beats`
         -- groups on) — and `data` is the one column a
         -- view has to reach into, which is what ties such a view to the
-        -- shape of the kind it reads. `beat` is still a column of the
-        -- backend's table and nothing writes it; it goes when that table
-        -- does.
-        for _, name in ipairs({ "kind", "beat", "meta", "data" }) do
+        -- shape of the kind it reads. There is no `beat` column: the beat
+        -- is a `meta` label, reached with `json_extract(meta, '$.beat')`.
+        for _, name in ipairs({ "position", "stream", "seq", "epoch_ms", "kind", "schema_version", "meta", "data" }) do
             expect(names[name]).to.be(true)
         end
+        expect(names.beat).to.be(nil)
         -- and the whole-object column they replaced is gone
         expect(names.payload).to.be(nil)
     end)

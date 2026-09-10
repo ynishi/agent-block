@@ -134,10 +134,19 @@ pub const CURRENT_SCHEMA_VERSION: u64 = 2;
 
 /// The upcaster chain every session reads through, newest step last.
 ///
-/// [`super::Session::open_on`] and [`super::Session::resume`] wrap their
-/// backend in a [`CurrentStore`] carrying this chain, so every read a
-/// session makes — the restore fold, the view folds, `events` — sees the
-/// current shape while the stored bytes stay exactly as they were written.
+/// **Registered on the log, not on the seam.**  [`super::Logs`] opens every
+/// database with this chain, and the durable backend applies it to everything
+/// it reads — a range read, a tail, and the events a decision is shown inside
+/// its own transaction.  So [`super::Session::open_on`] and
+/// [`super::Session::resume`] wrap their backend in a [`CurrentStore`] with an
+/// *empty* chain: running it a second time up there would put every event
+/// through every step twice.  What the seam still does is check
+/// ([`Current::from_upcasted`]), which is what keeps "only upcasted events
+/// reach the domain" a property of the types.
+///
+/// Either way every read a session makes — the restore fold, the view folds,
+/// `events` — sees the current shape while the stored bytes stay exactly as
+/// they were written.
 ///
 /// One step so far, and this is the one site a step is registered at:
 /// [`BeatIntoMeta`], the `1 → 2` move of `beat` into `meta`.  A log 0.36.0
@@ -222,22 +231,24 @@ pub(super) fn stamp_schema_version(event: &mut Map<String, Value>) {
 /// recognise passes through unchanged.  Upcasting happens on *read* — the
 /// stored bytes are never rewritten — so an old log stays readable by new
 /// code without a migration pass.
-pub trait Upcaster: Send + Sync {
-    /// Transform one event, or return it unchanged when it does not apply.
-    fn upcast(&self, event: Value) -> Value;
-}
+///
+/// **It is the store's own trait, re-exported rather than redeclared.**  The
+/// kernel had an identical one, and having two meant the chain
+/// [`kernel_upcasters`] registers could not be the chain the durable backend
+/// is opened with — which is where it has to run, since the backend applies it
+/// to everything it reads.  One trait, one chain, one application point.
+pub use eventsdb_core::upcast::Upcaster;
 
 /// Apply an upcaster `chain` to every event, in registration order.
 ///
-/// The read-time application point: each event is folded through the chain
-/// front to back, so a two-step migration (`1 → 2`, then `2 → 3`) composes.
-/// An empty chain is the identity, which is what a caller with a chain of its
-/// own (the tests below) gets when it passes none.
+/// The read-time application point *for a caller that holds raw events*: each
+/// event is folded through the chain front to back, so a two-step migration
+/// (`1 → 2`, then `2 → 3`) composes.  An empty chain is the identity, which is
+/// what a caller with a chain of its own (the tests below) gets when it passes
+/// none — and what [`CurrentStore`] carries, because the durable backend has
+/// already run the real one.
 pub fn apply_upcasters(chain: &[Arc<dyn Upcaster>], events: Vec<Value>) -> Vec<Value> {
-    events
-        .into_iter()
-        .map(|event| chain.iter().fold(event, |event, up| up.upcast(event)))
-        .collect()
+    eventsdb_core::upcast::apply_chain(chain, events)
 }
 
 /// An event as the current shape: read through the upcaster chain.
@@ -900,10 +911,13 @@ impl EventStore for MemEventStore {
 /// makes "the folds only ever see upcasted events" a property of the types
 /// instead of a rule someone has to remember.
 ///
-/// An empty chain is a functional no-op.  The chain a session carries is not
-/// empty — [`kernel_upcasters`] registers the `1 → 2` step — so a log written
-/// by an earlier release is projected on every read path there is, and a
-/// later shape change adds its `n → n+1` step at the same one site.
+/// An empty chain is a functional no-op, and the chain a session carries *is*
+/// empty: [`kernel_upcasters`] is registered on the log ([`super::Logs`]), so
+/// the projection has already happened by the time a read reaches here.  What
+/// is left is the check — [`Current::from_upcasted`] refuses an event the
+/// chain did not bring to [`CURRENT_SCHEMA_VERSION`] — which is the half that
+/// cannot be delegated, because it is about *this* kernel's shape.  A test
+/// that wants to drive the seam itself passes a chain of its own.
 pub struct CurrentStore {
     /// The wrapped backend that actually holds the events.
     inner: Box<dyn EventStore>,

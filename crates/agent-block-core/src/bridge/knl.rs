@@ -1280,9 +1280,9 @@ impl Session {
         owner: String,
         grant: Option<knl::BudgetGrant>,
         meta: Option<serde_json::Map<String, serde_json::Value>>,
-        drivers: &knl::IsleDrivers,
+        logs: &knl::Logs,
     ) -> LuaResult<Self> {
-        let state = knl::Session::new(owner, grant, meta, drivers)
+        let state = knl::Session::new(owner, grant, meta, logs)
             .await
             .map_err(|e| knl_err("open", &e))?;
         Ok(Self::from_state(state))
@@ -1297,9 +1297,9 @@ impl Session {
 /// on the VM's own thread inside a Lua collection cycle, where blocking on
 /// SQLite would stop every other coroutine, timer and cancellation that VM
 /// owns.  So the boundary is *submitted* rather than awaited
-/// ([`knl::Session::close_detached`]): the event goes to the connection
-/// thread, whose driver the host holds, and lands there while nothing waits
-/// for it.
+/// ([`knl::Session::close_detached`]): the event goes onto the log's own
+/// queue, which the host drains at shutdown, and lands there while nothing
+/// waits for it.
 ///
 /// The lock is taken with `try_lock`, not awaited: a session still borrowed by
 /// a suspended call has an owner, and this collection cycle is not it.  A
@@ -2072,10 +2072,10 @@ async fn open_sqlite(
     grant: Option<knl::BudgetGrant>,
     meta: Option<serde_json::Map<String, serde_json::Value>>,
     path: &std::path::Path,
-    drivers: &knl::IsleDrivers,
+    logs: &knl::Logs,
 ) -> LuaResult<Session> {
     let stream = uuid::Uuid::new_v4().to_string();
-    let store = knl::SqliteEventStore::open(path, stream.clone(), drivers)
+    let store = knl::SqliteEventStore::open(path, stream.clone(), logs)
         .await
         .map_err(|e| knl_err("open", &e))?;
     let mut state = knl::Session::open_on(owner, grant, meta, Box::new(store))
@@ -2132,22 +2132,27 @@ async fn resume_on(
 /// is; an absent `store` means the child goes where its parent already is,
 /// which is the only answer that always works.  A store the caller *did*
 /// name is opened as asked and handed to the kernel, which refuses it if it
-/// turns out to be a different database — the check belongs there, next to
-/// the transaction that would have to span both.
+/// turns out to be a different log — the check belongs there, next to the
+/// transaction that would have to span both.
+///
+/// The parent's own log is asked for by its identity ([`knl::Logs::database`])
+/// rather than opened again, which is what makes the child a stream of the
+/// same log — a file and the in-memory database alike.
 async fn open_child_store(
     named: Option<StoreTarget>,
     parent_db: &str,
     stream: &str,
-    drivers: &knl::IsleDrivers,
+    logs: &knl::Logs,
 ) -> LuaResult<Box<dyn knl::EventStore>> {
     let store = match named {
-        // The parent's database, addressed exactly as it was opened (a path,
-        // or the in-memory database's shared-cache URI).
-        None => knl::SqliteEventStore::open(std::path::Path::new(parent_db), stream, drivers).await,
+        None => logs
+            .database(parent_db)
+            .await
+            .map(|log| knl::SqliteEventStore::on(log, stream)),
         Some(StoreTarget::Sqlite(path)) => {
-            knl::SqliteEventStore::open(std::path::Path::new(&path), stream, drivers).await
+            knl::SqliteEventStore::open(std::path::Path::new(&path), stream, logs).await
         }
-        Some(StoreTarget::Mem) => knl::SqliteEventStore::open_memory(stream, drivers).await,
+        Some(StoreTarget::Mem) => knl::SqliteEventStore::open_memory(stream, logs).await,
     };
     Ok(Box::new(store.map_err(|e| knl_err("open", &e))?))
 }
@@ -2159,13 +2164,14 @@ async fn open_child_store(
 /// on the parent's store, so the parent's own calls wait for it exactly as
 /// they wait for any other syscall of its own.
 ///
-/// A parent on the in-memory database is refused before any of that
-/// ([`knl::is_memory_database`]).  A tree writes to one database and that one
-/// is addressed by a shared-cache URI, whose locks are per table: the child's
-/// first write while the parent holds the table meets `SQLITE_LOCKED`, which
-/// no busy timeout waits out.  So the refusal is the honest answer, and the
-/// alternative — teaching the kernel to wait on that lock — is machinery for a
-/// store that exists for tests and mocks.
+/// **A parent on the in-memory database is a parent like any other.**  The
+/// ephemeral log is one database with one writer, exactly as a file is, so a
+/// child opened on it is a second stream of that log and the allocation is one
+/// transaction like every other.  This used to be refused: each ephemeral
+/// session had a shared-cache database of its own, whose locks are per *table*,
+/// so the child's first write met `SQLITE_LOCKED` while the parent held it and
+/// no busy timeout waited that out.  There is one connection now, and nothing
+/// left to refuse.
 async fn open_child_session(
     lua: Lua,
     parent: LuaAnyUserData,
@@ -2173,7 +2179,7 @@ async fn open_child_session(
     allocation: knl::Allocation,
     meta: Option<serde_json::Map<String, serde_json::Value>>,
     named_store: Option<StoreTarget>,
-    drivers: knl::IsleDrivers,
+    logs: knl::Logs,
 ) -> LuaResult<LuaAnyUserData> {
     let handle = parent.borrow::<Session>().map_err(|_| {
         err(
@@ -2193,19 +2199,10 @@ async fn open_child_session(
                 )
             })?
             .to_string();
-        if knl::is_memory_database(&parent_db) {
-            return Err(err(
-                "open",
-                "a session tree needs a file store: the parent is on the in-memory database \
-                 (store = \"mem\"), whose shared cache locks per table, and the kernel does not \
-                 wait on that lock. Open the parent without a store (the host's database) or on \
-                 { sqlite = <path> }",
-            ));
-        }
         // Minted here and adopted by the child below, so the id `s:id()`
         // reports is the stream the parent's log names as its child.
         let stream = uuid::Uuid::new_v4().to_string();
-        let store = open_child_store(named_store, &parent_db, &stream, &drivers).await?;
+        let store = open_child_store(named_store, &parent_db, &stream, &logs).await?;
         state
             .open_child(stream, owner, allocation, meta, store)
             .await
@@ -2233,7 +2230,7 @@ async fn open_child_session(
 async fn open_session(
     lua: Lua,
     opts: LuaValue,
-    drivers: knl::IsleDrivers,
+    logs: knl::Logs,
     default_store: std::path::PathBuf,
     session_labels: serde_json::Map<String, serde_json::Value>,
 ) -> LuaResult<LuaAnyUserData> {
@@ -2275,10 +2272,10 @@ async fn open_session(
         // No store named: the host's database, which is where a real session
         // belongs.  `"mem"` is the other answer and it has to be asked for.
         let session = match named_store {
-            None => open_sqlite(owner, grant, meta, &default_store, &drivers).await?,
-            Some(StoreTarget::Mem) => Session::new(owner, grant, meta, &drivers).await?,
+            None => open_sqlite(owner, grant, meta, &default_store, &logs).await?,
+            Some(StoreTarget::Mem) => Session::new(owner, grant, meta, &logs).await?,
             Some(StoreTarget::Sqlite(path)) => {
-                open_sqlite(owner, grant, meta, std::path::Path::new(&path), &drivers).await?
+                open_sqlite(owner, grant, meta, std::path::Path::new(&path), &logs).await?
             }
         };
         return lua.create_userdata(session);
@@ -2294,7 +2291,7 @@ async fn open_session(
             ));
         }
     };
-    open_child_session(lua, parent, owner, allocation, meta, named_store, drivers).await
+    open_child_session(lua, parent, owner, allocation, meta, named_store, logs).await
 }
 
 /// Resume a persisted session — the body of `knl.resume`.
@@ -2314,7 +2311,7 @@ async fn open_session(
 async fn resume_session(
     lua: Lua,
     opts: LuaValue,
-    drivers: knl::IsleDrivers,
+    logs: knl::Logs,
     default_store: std::path::PathBuf,
 ) -> LuaResult<LuaAnyUserData> {
     if matches!(opts, LuaValue::Nil) {
@@ -2332,9 +2329,9 @@ async fn resume_session(
     let store = match store {
         // The host's database, as on open: a session that named no store
         // went there, so a resume that names none looks there.
-        None => knl::SqliteEventStore::open(&default_store, session_id.clone(), &drivers).await,
+        None => knl::SqliteEventStore::open(&default_store, session_id.clone(), &logs).await,
         Some(StoreTarget::Sqlite(path)) => {
-            knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone(), &drivers)
+            knl::SqliteEventStore::open(std::path::Path::new(&path), session_id.clone(), &logs)
                 .await
         }
         // An in-memory stream is reopenable too, for as long as it exists:
@@ -2343,7 +2340,7 @@ async fn resume_session(
         // does not pretend to — a name nobody is holding open resumes as an
         // empty stream, which is refused for having no session in it.
         Some(StoreTarget::Mem) => {
-            knl::SqliteEventStore::open_memory(session_id.clone(), &drivers).await
+            knl::SqliteEventStore::open_memory(session_id.clone(), &logs).await
         }
     }
     .map_err(|e| knl_err("resume", &e))?;
@@ -2579,8 +2576,8 @@ fn build_api_report() -> LuaResult<types::ApiReport> {
 }
 
 /// Register the `knl` global.  Two things come from the host and nothing else
-/// does: the connection threads, and the file a session with no `store` of its
-/// own lands in.  All session state stays inside the userdata.
+/// does: the open logs, and the file a session with no `store` of its own
+/// lands in.  All session state stays inside the userdata.
 ///
 /// The functions are exactly [`MODULE_API`]: `knl.open(opts?)` is the
 /// constructor (owner- and store-aware), `knl.resume(opts)` reopens a
@@ -2590,11 +2587,13 @@ fn build_api_report() -> LuaResult<types::ApiReport> {
 /// Each is bound by hand — a `create_function` needs its own signature — and
 /// a test below checks the set of bound names against the table.
 ///
-/// `drivers` is where the connection threads a session opens are kept.  They
-/// cannot belong to the session: the drop backstop hands its closing event to
-/// the thread *after* the handle is gone, so a thread the store had already
-/// stopped could not take it.  The host owns them for the length of a run and
-/// drains them once at the end of it ([`knl::IsleDrivers`]).
+/// `logs` is where the logs a session opens are kept.  They cannot belong to
+/// the session: the drop backstop hands its closing event to the log's queue
+/// *after* the handle is gone, so a log the store had already closed could not
+/// take it.  The host owns them for the length of a run and drains them once at
+/// the end of it ([`knl::Logs`]).  Opening a file once and sharing it is the
+/// other half of what that buys: one writer, one upcaster chain, and a tree
+/// that can be one transaction.
 ///
 /// `default_store` is that file — `{base_dir}/projects/<slug>/knl.sqlite`
 /// unless `AGENT_BLOCK_KNL_PATH` says otherwise
@@ -2611,7 +2610,7 @@ fn build_api_report() -> LuaResult<types::ApiReport> {
 /// chunk and every bus handler already are.
 pub fn register(
     lua: &Lua,
-    drivers: knl::IsleDrivers,
+    logs: knl::Logs,
     default_store: std::path::PathBuf,
     session_labels: serde_json::Map<String, serde_json::Value>,
 ) -> LuaResult<()> {
@@ -2619,16 +2618,16 @@ pub fn register(
 
     // knl.open(opts?) -> Session userdata
     {
-        let drivers = drivers.clone();
+        let logs = logs.clone();
         let default_store = default_store.clone();
         let session_labels = session_labels.clone();
         knl_tbl.set(
             "open",
             lua.create_async_function(move |lua, opts: LuaValue| {
-                let drivers = drivers.clone();
+                let logs = logs.clone();
                 let default_store = default_store.clone();
                 let session_labels = session_labels.clone();
-                open_session(lua, opts, drivers, default_store, session_labels)
+                open_session(lua, opts, logs, default_store, session_labels)
             })?,
         )?;
     }
@@ -2637,9 +2636,9 @@ pub fn register(
     knl_tbl.set(
         "resume",
         lua.create_async_function(move |lua, opts: LuaValue| {
-            let drivers = drivers.clone();
+            let logs = logs.clone();
             let default_store = default_store.clone();
-            resume_session(lua, opts, drivers, default_store)
+            resume_session(lua, opts, logs, default_store)
         })?,
     )?;
 
@@ -2999,7 +2998,7 @@ mod generated_types {
         let dir = tempfile::tempdir().expect("tempdir");
         register(
             &lua,
-            knl::IsleDrivers::new(),
+            knl::Logs::new(),
             dir.path().join("knl.sqlite"),
             serde_json::Map::new(),
         )
@@ -3049,7 +3048,7 @@ mod tests {
         lua: Lua,
         /// The connection threads of every session the chunks open, held for
         /// the test's lifetime exactly as the host holds them for a run's.
-        drivers: knl::IsleDrivers,
+        logs: knl::Logs,
         rt: tokio::runtime::Runtime,
         /// The default store's directory, held so it outlives the VM.
         ///
@@ -3070,11 +3069,11 @@ mod tests {
         /// every session opened in it is recorded with.
         fn labelled(session_labels: serde_json::Map<String, serde_json::Value>) -> Self {
             let lua = Lua::new();
-            let drivers = knl::IsleDrivers::new();
+            let logs = knl::Logs::new();
             let dir = tempfile::tempdir().expect("tempdir");
             register(
                 &lua,
-                drivers.clone(),
+                logs.clone(),
                 dir.path().join("knl.sqlite"),
                 session_labels,
             )
@@ -3085,12 +3084,7 @@ mod tests {
                 .expect("a runtime for the VM to yield into");
             rt.block_on(async { lua.load(FIXTURES).exec_async().await })
                 .expect("fixtures");
-            Self {
-                lua,
-                drivers,
-                rt,
-                dir,
-            }
+            Self { lua, logs, rt, dir }
         }
 
         /// The file a session with no `store` of its own lands in.
@@ -3127,7 +3121,7 @@ mod tests {
         ///
         /// Dropping the Lua state collects every session userdata, which is
         /// where a handle nobody closed submits its boundary without waiting;
-        /// shutting the drivers down is what waits for those writes to land.
+        /// shutting the logs down is what waits for those writes to land.
         /// A test that reads the database afterwards calls this first.
         fn finish(self) {
             drop(self.finish_keeping_the_store());
@@ -3139,14 +3133,9 @@ mod tests {
         /// is deleted when it drops, so a caller that wants to open the file
         /// afterwards has to hold it.
         fn finish_keeping_the_store(self) -> tempfile::TempDir {
-            let Self {
-                lua,
-                drivers,
-                rt,
-                dir,
-            } = self;
+            let Self { lua, logs, rt, dir } = self;
             drop(lua);
-            let failures = rt.block_on(drivers.shutdown());
+            let failures = rt.block_on(logs.shutdown());
             assert!(
                 failures.is_empty(),
                 "the connection threads did not shut down cleanly: {failures:?}"
@@ -4324,9 +4313,9 @@ mod tests {
         // The host side (Rust) legitimately opens a SYSTEM-owned stream, on
         // the same collection of connection threads the VM's sessions use.
         let stream = "system-stream".to_string();
-        let drivers = vm.drivers.clone();
+        let logs = vm.logs.clone();
         vm.block_on(async {
-            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
+            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &logs)
                 .await
                 .expect("open store");
             let state = crate::knl::Session::open_on(
@@ -4492,41 +4481,49 @@ mod tests {
         vm.finish();
     }
 
-    /// A tree needs a file store, so a parent on `"mem"` is refused — with a
-    /// message that says which store it is and what to open instead.
+    /// A parent on `"mem"` takes a child like any other parent.
     ///
-    /// The refusal is the whole answer: an in-memory database locks per table
-    /// under its shared cache, and the alternative to refusing would be
-    /// teaching the kernel to wait on that lock.
+    /// The ephemeral log is one database with one writer, so the child is a
+    /// second stream of it and the allocation is one transaction — the same
+    /// two facts a file parent records.  This used to be refused, because
+    /// every ephemeral session had a shared-cache database of its own whose
+    /// locks are per *table*: the child's first write met `SQLITE_LOCKED`
+    /// while the parent held it, and no busy timeout waits that out.
     #[test]
-    fn a_child_of_a_mem_parent_is_refused() {
+    fn a_child_of_a_mem_parent_is_a_stream_of_the_same_log() {
         let vm = vm();
         vm.exec(
             r#"
             local parent = knl.open({ store = "mem", owner = "u",
                                       budget = { amount = 100, tag = "tokens" } })
-            local refused = failure(knl.open, {
-                owner = "w", parent = parent, budget = { from_parent = 10 },
-            })
-            assert(refused.kind == "validation", refused.kind)
-            assert(refused.message:find("a session tree needs a file store", 1, true),
-                   refused.message)
-            assert(refused.message:find("mem", 1, true), refused.message)
-
-            -- Nothing was opened and nothing moved.
-            assert(parent:remaining() == 100, tostring(parent:remaining()))
-
-            -- The same parent on the host's database takes a child.
-            local ok_parent = knl.open({ owner = "u", budget = { amount = 100, tag = "tokens" } })
-            local child = knl.open({ owner = "w", parent = ok_parent,
+            local child = knl.open({ owner = "w", parent = parent,
                                      budget = { from_parent = 10 } })
-            assert(ok_parent:remaining() == 90, tostring(ok_parent:remaining()))
+
+            -- Both halves of the allocation landed.
+            assert(parent:remaining() == 90, tostring(parent:remaining()))
+            assert(child:remaining() == 10, tostring(child:remaining()))
+
+            -- The child's opening names its parent, which is the fact a tree
+            -- is read back from.
+            local opening = child:events(0)[1]
+            assert(opening.kind == "session_opened", opening.kind)
+            assert(opening.data.parent == parent:id(), tostring(opening.data.parent))
+
+            -- One statement reads both, which is only possible because they
+            -- are two streams of one database.
+            local rows = parent:query(
+                "SELECT stream, kind FROM events WHERE stream IN $sessions ORDER BY position",
+                nil, { sessions = { parent:id(), child:id() } })
+            local streams = {}
+            for _, row in ipairs(rows) do streams[row.stream] = true end
+            assert(streams[parent:id()] and streams[child:id()],
+                   "one read spans the tree: " .. tostring(#rows))
+
             child:close("done")
-            ok_parent:close("done")
             parent:close("done")
         "#,
         )
-        .expect("the refusal");
+        .expect("a mem parent takes a child");
         vm.finish();
     }
 
@@ -4549,13 +4546,13 @@ mod tests {
             .build()
             .expect("a runtime to read on");
         rt.block_on(async {
-            let drivers = knl::IsleDrivers::new();
-            let store = crate::knl::SqliteEventStore::open(path, stream, &drivers)
+            let logs = knl::Logs::new();
+            let store = crate::knl::SqliteEventStore::open(path, stream, &logs)
                 .await
                 .expect("reopen the stream");
             let log = store.read(0, usize::MAX).await.expect("read the stream");
             drop(store);
-            assert!(drivers.shutdown().await.is_empty(), "the reader joined");
+            assert!(logs.shutdown().await.is_empty(), "the reader joined");
             log
         })
     }
@@ -5030,9 +5027,9 @@ mod tests {
 
         // The host side legitimately opens a SYSTEM-owned stream.
         let stream = "system-grant-stream".to_string();
-        let drivers = vm.drivers.clone();
+        let logs = vm.logs.clone();
         vm.block_on(async {
-            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &drivers)
+            let store = crate::knl::SqliteEventStore::open(&path, stream.clone(), &logs)
                 .await
                 .expect("open store");
             let state = crate::knl::Session::open_on(
@@ -5517,13 +5514,14 @@ mod tests {
                 WHERE stream = $stream GROUP BY kind ORDER BY kind]])
             assert(#counted == 3, "kinds: " .. tostring(#counted))
 
-            -- The beat is lifted out of `meta` into a column, so grouping a
-            -- run by it is a GROUP BY rather than a json path…
+            -- The beat is a label of `meta`, so grouping a run by it is a
+            -- json path — the one the log carries an index for…
             local beats = s:query([[
-                SELECT beat, COUNT(*) AS n FROM events
-                WHERE stream = $stream AND beat IS NOT NULL GROUP BY beat]])
+                SELECT json_extract(meta, '$.beat') AS beat, COUNT(*) AS n FROM events
+                WHERE stream = $stream AND json_extract(meta, '$.beat') IS NOT NULL
+                GROUP BY json_extract(meta, '$.beat')]])
             assert(#beats == 1 and beats[1].beat == "b1" and beats[1].n == 1,
-                   "beat is a column of its own")
+                   "the beat is grouped by out of meta")
 
             -- …while a kind's own shape is read out of `data`, and `meta`
             -- can be read without knowing the kind at all.
@@ -5709,9 +5707,9 @@ mod tests {
                 if column.pk then table.insert(keyed, column.name) end
             end
             assert(table.concat(names, ",")
-                   == "stream,seq,epoch_ms,kind,schema_version,beat,meta,data",
+                   == "position,stream,seq,epoch_ms,kind,schema_version,meta,data",
                    "columns: " .. table.concat(names, ","))
-            assert(table.concat(keyed, ",") == "stream,seq",
+            assert(table.concat(keyed, ",") == "position",
                    "primary key: " .. table.concat(keyed, ","))
 
             -- Every published column is one a query may actually name.
@@ -5721,7 +5719,7 @@ mod tests {
             assert(#rows == 1, "the opening event: " .. tostring(#rows))
             assert(rows[1].kind == "session_opened")
             assert(rows[1].schema_version == 2, "the stored version is a column")
-            assert(rows[1].beat == nil, "an undeclared beat is NULL")
+            assert(type(rows[1].position) == "number", "the global order is a column")
             assert(type(rows[1].meta) == "string", "meta stays the stored text")
             assert(type(rows[1].data) == "string", "and so does data")
         "#,

@@ -721,7 +721,9 @@ local result = agent.run({
     history     = prior,                                -- optional prior messages (e.g. session.load)
     store       = "mem",                                -- optional; where the session log goes.
                                                         -- Omitted = the host's own database;
-                                                        -- "mem" or { sqlite = <path> } otherwise.
+                                                        -- "mem" (one in-memory database per run,
+                                                        -- gone with the process) or
+                                                        -- { sqlite = <path> } otherwise.
 })
 
 if result.ok then
@@ -894,6 +896,16 @@ view**: a named Lua function running one `SELECT` through `s:query(sql,
 params?, opts?)` over the published event table. `knl.views.beats` /
 `tool_pairs` / `ledger` / `usage` are the four shipped, and a consumer's own
 view is a function of the same form — nothing about the four is privileged.
+
+The event table is `events`, and its columns are what `knl.api().schema`
+publishes: `position` (the log's global order, and its key), `stream`, `seq`,
+`epoch_ms`, `kind`, `schema_version`, `meta` and `data`. A read within one
+session orders by `seq`; a read across sessions orders by `position`. The beat
+a fact belongs to is a `meta` label, reached with `json_extract(meta,
+'$.beat')`. The store underneath is an `eventsdb` SQLite log — one database
+per file, opened once per process, so the sessions in it are streams of one
+log and a session tree is one transaction. A `knl.sqlite` written by an
+earlier release is brought forward on the first open, once.
 
 The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
 (the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the

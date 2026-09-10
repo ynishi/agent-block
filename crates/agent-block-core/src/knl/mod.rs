@@ -182,15 +182,25 @@
 //! log that could not be queried would be a second, lesser kind of session.
 //! The `Vec`-backed store is `#[cfg(test)]`.
 //!
-//! **A real session is a file.**  A session a script opens is opened on the
-//! database the host owns — one file per project — and the in-memory database
-//! is for tests and mocks: one session, one process, nothing shared.  It is
-//! not a smaller version of the other one.  It is addressed by a shared-cache
-//! URI ([`is_memory_database`]) and shared cache locks per *table*, so a second
-//! writer meets `SQLITE_LOCKED` at once and no busy timeout waits that out —
-//! which is exactly what a session tree is (children write to their parent's
-//! database).  So the kernel does not offer a tree on one, and there is no
-//! lock-waiting machinery here to make it work.
+//! **The store is an adapter, and the log underneath it is not the kernel's.**
+//! [`SqliteEventStore`] translates this SPI onto `eventsdb` — a SQLite event
+//! log with a writer thread of its own, read-only connections beside it, a
+//! migration ladder for the *table's* shape and a transaction hatch for the
+//! two writes that span more than one stream.  What stays the kernel's is what
+//! only the kernel can say: which events are well formed
+//! ([`validate_event`]), which shape they are written under
+//! ([`CURRENT_SCHEMA_VERSION`]), and what a session *is*.
+//!
+//! **A log is opened once, and the sessions in it are streams.**  [`Logs`] is
+//! the host's collection of open logs: a file is opened once per process and
+//! shared, because the upcaster chain is per log and two logs on one file
+//! would be two chains and two write locks.  A session a script opens with no
+//! `store` of its own goes to the database the host owns — one file per
+//! project — and `store = "mem"` goes to the one in-memory log of the run.
+//! The in-memory one is not a lesser kind of session: it is a database with
+//! one writer like any other, so a tree works in it and a stream in it can be
+//! resumed by name, for as long as the host lives.  What it cannot do is
+//! survive the process.
 //!
 //! # Stored shape: envelope, meta, data
 //!
@@ -290,12 +300,13 @@
 //! read-time [`Upcaster`] ([`kernel_upcasters`]), which every session's reads
 //! pass through.
 //!
-//! Nothing has been released yet, so v1 is fixed until the first release:
-//! the chain is empty and the version is `1`.  The seam is in place and
-//! tested, and the first step that is owed has one site to be registered at.
-//! The seam is a type: a backend deals in raw `Value`s, [`CurrentStore`]
-//! reads through the chain and hands back [`Current`]s, and every fold takes
-//! those — so a read that went round the chain does not compile.
+//! The chain is registered on the log ([`Logs`]), because that is where it is
+//! applied: the backend runs it over everything it reads, including the events
+//! a decision is shown inside its own transaction.  The seam above it is a
+//! *type*: a backend deals in raw `Value`s, [`CurrentStore`] hands back
+//! [`Current`]s, and every fold takes those — so a read that went round the
+//! seam does not compile, and an event the chain did not bring to
+//! [`CURRENT_SCHEMA_VERSION`] does not get past it.
 //!
 //! # Async: everything that waits, yields
 //!
@@ -326,15 +337,16 @@
 //! Two things stay synchronous, and both are deliberate: the identity reads
 //! (`id` / `scope_id` / `owner`), which answer out of the value and touch no
 //! store, and [`Session::close_detached`], the drop backstop — `Drop` cannot
-//! await and must not block, so it hands its `session_closed` to the store's
-//! writer and lets go ([`EventStore::detach_append`]).  That works because the
-//! connection threads outlive the sessions: their drivers belong to an
-//! [`IsleDrivers`] the host holds and drains once, at shutdown.
+//! await and must not block, so it hands its `session_closed` to the log's
+//! own queue and lets go ([`EventStore::detach_append`]).  That works because
+//! the log outlives the sessions in it: the logs belong to a [`Logs`] the host
+//! holds and drains once, at shutdown.
 
 pub mod budget;
 pub mod event;
 pub mod event_store;
 pub mod history;
+pub mod logs;
 pub mod projection;
 pub mod query;
 pub mod scope;
@@ -355,15 +367,14 @@ pub use event_store::{
     SplitDecision, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
+pub use logs::Logs;
 pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
 pub use scope::{Scope, ScopeId};
 pub use session::{
     Session, ANON, CLOSE_REASON_DROPPED, CLOSE_REASON_ERROR, CLOSE_REASON_SCOPE_EXIT,
     DEFAULT_CLOSE_REASON, SYSTEM,
 };
-pub use sqlite_store::{
-    events_schema, is_memory_database, IsleDrivers, SchemaColumn, SqliteEventStore, EVENTS_TABLE,
-};
+pub use sqlite_store::{events_schema, SchemaColumn, SqliteEventStore, EVENTS_TABLE};
 
 /// What went wrong in the kernel core, classified.
 ///
@@ -418,11 +429,10 @@ pub enum KnlError {
     /// Both sites that raise it are [`EventStore`] trait *defaults* — the
     /// `query` a backend with no table cannot answer, and the two-stream
     /// `append_if_many` a backend with one stream cannot write — and the only
-    /// backend the product has ([`SqliteEventStore`]) overrides both.  The two
-    /// shapes a caller might expect here answer differently on purpose: a
-    /// child asked for on a `mem` parent is a [`KnlError::Validation`] (the
-    /// argument was wrong, and the message says which), and an unknown view
-    /// name is one too.
+    /// backend the product has ([`SqliteEventStore`]) overrides both.  The
+    /// shape a caller might expect here answers differently on purpose: an
+    /// unknown view name is a [`KnlError::Validation`], because the argument
+    /// was wrong and the message says which.
     ///
     /// It stays in the vocabulary all the same, and is published to Lua with
     /// the rest ([`KnlError::KINDS`]): a store *may* return it — the trait
