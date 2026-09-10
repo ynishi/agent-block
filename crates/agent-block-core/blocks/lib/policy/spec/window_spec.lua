@@ -399,6 +399,107 @@ describe("policy.window — the slice", function()
     end)
 end)
 
+describe("policy.window — the two ways it can fail to fit", function()
+    -- The fold raises when even the smallest candidate is too big, and the
+    -- number in that raise is of one of two things. Which one decides what a
+    -- reader is sent to look at, so the sentences are different.
+    it("says the newest beat does not fit when the history has beats", function()
+        local events = concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4))
+        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), events, {})
+        expect(ok).to.be(false)
+        expect(tostring(err):find("the newest beat does not fit", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("result_cap", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("says the whole history was counted as the seed when nothing carries a beat", function()
+        -- No `meta.beat` anywhere: there was no beat to keep, the number is
+        -- of the whole list, and telling this caller to cap a tool result
+        -- would send them after a beat that is not there.
+        local unmarked = concat(seed("first", 1), seed("second", 2))
+        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), unmarked, {})
+        expect(ok).to.be(false)
+        expect(tostring(err):find("no event in this history is marked with a beat", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("meta.beat", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("the newest beat", 1, true)).to.be(nil)
+    end)
+end)
+
+describe("policy.window — what the fold reports", function()
+    -- The fold answers a second value: what it left out to build the request
+    -- it just built. The request cannot say it — a windowed conversation
+    -- simply begins later — and `knl.beat` records the report on the
+    -- llm_request, so this is the fact that tells the two apart afterwards.
+    local events =
+        concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4), answered("b3", "three", 6))
+
+    it("reports nothing dropped when every beat fits the count", function()
+        local _, report = policy.window({ tail = 3 })(events, {})
+        expect(#report.dropped).to.be(0)
+        expect(report.kept).to.be(3)
+        expect(report.seed_kept).to.be(true)
+        -- A window of n beats counts no tokens, so it reports no numbers:
+        -- one invented here would be one nobody measured.
+        expect(report.before).to.be(nil)
+        expect(report.after).to.be(nil)
+        expect(report.limit).to.be(nil)
+    end)
+
+    it("names the beats it dropped, oldest first", function()
+        local _, report = policy.window({ tail = 1 })(events, {})
+        expect(#report.dropped).to.be(2)
+        expect(report.dropped[1]).to.be("b1")
+        expect(report.dropped[2]).to.be("b2")
+        expect(report.kept).to.be(1)
+        -- the seed went with them, which is what `seed_kept` says
+        expect(report.seed_kept).to.be(false)
+    end)
+
+    it("says the seed stayed when keep_seed asked for it", function()
+        local _, report = policy.window({ tail = 1, keep_seed = true })(events, {})
+        expect(report.seed_kept).to.be(true)
+        expect(report.dropped[1]).to.be("b1")
+    end)
+
+    it("tags the dropped list as an array, so an empty one crosses as []", function()
+        local _, report = policy.window({ tail = 3 })(events, {})
+        expect(getmetatable(report.dropped).__jsontype).to.be("array")
+    end)
+
+    it("counts what was sent and what it was held against (fit)", function()
+        local two = #rendered(kernel.fold({ events[4], events[5], events[6], events[7] }, {}))
+        local _, report = policy.window({ fit = { port = counting_port(two + 10, 10) } })(events, {})
+        expect(#report.dropped).to.be(1)
+        expect(report.dropped[1]).to.be("b1")
+        expect(report.kept).to.be(2)
+        expect(report.seed_kept).to.be(false)
+        -- the window less the answer's room, and what the kept beats cost
+        expect(report.limit).to.be(two)
+        expect(report.after).to.be(two)
+        -- `before` is the whole log, which is the number the dropping was
+        -- measured against
+        expect(report.before > report.after).to.be(true)
+    end)
+
+    it("reports before == after when the fitted window dropped nothing", function()
+        local whole = #rendered(kernel.fold(events, {}))
+        local _, report = policy.window({ fit = { port = counting_port(10000, 10) } })(events, {})
+        expect(#report.dropped).to.be(0)
+        expect(report.kept).to.be(3)
+        expect(report.before).to.be(whole)
+        expect(report.after).to.be(whole)
+        expect(report.limit).to.be(9990)
+    end)
+
+    it("is a SECOND value: a caller that takes one is unaffected", function()
+        local request = policy.window({ tail = 1 })(events, {})
+        expect(type(request.messages)).to.be("table")
+        -- and the kernel's own fold still answers exactly one
+        local folded, nothing = kernel.fold(events, {})
+        expect(type(folded.messages)).to.be("table")
+        expect(nothing).to.be(nil)
+    end)
+end)
+
 describe("policy.window — driving real beats", function()
     it("bounds what the third beat sends, and the record says so", function()
         local session = support.session()

@@ -764,10 +764,23 @@ M.shapes = {
 --- A log with `tail` beats or fewer is not cut at all, and the same list is
 --- handed back rather than copied.
 ---
+--- WHAT IT REPORTS, beside the slice. A window is a decision about what the
+--- model is not going to be told, and that decision leaves no trace in the
+--- request it produces — the request simply begins later. So the cut says
+--- what it did: which beats went (oldest first), how many stayed, and whether
+--- the seed is still ahead of them. `knl.beat` records it on the
+--- `llm_request` (`knl.shapes.window_report`), which is what turns "the model
+--- forgot" into a fact somebody can read back out of the log.
+---
+--- The three counted fields of that report (`before` / `after` / `limit`) are
+--- not this function's: a window of n beats counts nothing, and the tokens
+--- are `fit`'s to fill in.
+---
 --- @param events table|nil  a session's events, in seq order
 --- @param tail number  how many beats to keep
 --- @param keep_seed boolean|nil  keep the events before the first beat too
 --- @return table  the slice, in seq order
+--- @return table  what the cut did: { dropped, kept, seed_kept }
 local function window_slice(events, tail, keep_seed)
     events = events or {}
     local order, first_at = {}, {}
@@ -779,9 +792,16 @@ local function window_slice(events, tail, keep_seed)
         end
     end
     if #order <= tail then
-        return events
+        -- Nothing went, so nothing ahead of the window went either: the
+        -- whole log IS the request.
+        return events, { dropped = setmetatable({}, ARRAY_TAG), kept = #order, seed_kept = true }
     end
-    local from = first_at[order[#order - tail + 1]]
+    local cut = #order - tail
+    local dropped = setmetatable({}, ARRAY_TAG)
+    for i = 1, cut do
+        dropped[i] = order[i]
+    end
+    local from = first_at[order[cut + 1]]
     local slice = {}
     if keep_seed then
         for i = 1, first_at[order[1]] - 1 do
@@ -791,7 +811,7 @@ local function window_slice(events, tail, keep_seed)
     for i = from, #events do
         slice[#slice + 1] = events[i]
     end
-    return slice
+    return slice, { dropped = dropped, kept = tail, seed_kept = keep_seed == true }
 end
 
 --- How many beats `events` holds.
@@ -898,8 +918,26 @@ end
 --- costs the fold it was going to do anyway. Without `fit` the second value
 --- is nil: a window of n beats always fits something.
 ---
+--- What the fold reports
+---   The fold answers the request and, BESIDE IT, a report of what it left
+---   out — `knl.shapes.window_report`:
+---
+---       { dropped = { <beat id>, ... },  -- oldest first, empty when none
+---         kept = <beats kept>, seed_kept = <boolean>,
+---         before = <tokens>?, after = <tokens>?, limit = <tokens>? }
+---
+---   `before` is what the whole log cost (or the `tail` window, when `tail`
+---   caps it), `after` what was sent, `limit` the room the profile left. All
+---   three are absent for a window of n beats, which never counts anything.
+---
+---   A caller that takes one value is unaffected — Lua drops the extra
+---   return, and `knl.fold` itself answers nothing beside the request.
+---   `knl.beat` is the one reader: it records the report on the `llm_request`
+---   event as `data.window`, so what a run dropped is in the log rather than
+---   only in the moment. Nothing in the kernel decides anything on it.
+---
 --- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf? }? } — `tail` is required without `fit`
---- @return function fold  fn(events, device) -> request
+--- @return function fold  fn(events, device) -> request, report
 --- @return function|nil fits  fn(session, device) -> nil | "context" (with `fit` only)
 function M.window(opts)
     opts = opts or {}
@@ -926,7 +964,10 @@ function M.window(opts)
     local keep_seed = opts.keep_seed == true
     if port == nil then
         return function(events, device)
-            return kernel.fold(window_slice(events, tail, keep_seed), device)
+            local slice, report = window_slice(events, tail, keep_seed)
+            -- No `before` / `after` / `limit`: this form counts nothing, and
+            -- a number here would be one this fold never asked for.
+            return kernel.fold(slice, device), report
         end
     end
 
@@ -948,45 +989,68 @@ function M.window(opts)
     --- the walk in log candidates rather than all of them — which matters
     --- because each candidate is a fold and, on a Port with a server to ask,
     --- a count the first time it is seen.
+    ---
+    --- It answers in one of two forms, and the failing one says HOW the
+    --- number was reached — because the two ways of failing want two
+    --- different sentences. `"beat"` is the newest beat costing more than the
+    --- window; `"seed"` is a history with no `meta.beat` on any event, where
+    --- there was no beat to keep and the whole list was counted as the seed.
+    --- The second is a caller's mistake and not a model's limit, and a raise
+    --- that called it "the newest beat" would send them looking for a beat
+    --- that is not there.
+    ---
+    --- @return table|nil request  the fitted request, or nil when none fits
+    --- @return table|nil report  what it dropped to get there (with a request)
+    --- @return number|nil tokens  what the smallest candidate cost (with nil)
+    --- @return number|nil limit  the room the profile left (with nil)
+    --- @return string|nil counted  "beat" | "seed" — what those tokens are of
     local function largest_fitting(events, device)
         local limit = request_limit(port:profile(conf), "policy.window")
         local n = beat_count(events)
         local most = tail and math.min(tail, n) or n
 
         local function fold_at(k)
-            local request = kernel.fold(window_slice(events, k, keep_seed), device)
+            local slice, report = window_slice(events, k, keep_seed)
+            local request = kernel.fold(slice, device)
             local tokens = port:count(request, conf)
             if type(tokens) ~= "number" then
                 error("policy.window: port:count must answer a number, got " .. tostring(tokens), 3)
             end
-            return request, tokens
+            return request, tokens, report
+        end
+
+        --- The chosen candidate's report, with the counting written onto it.
+        local function counted(report, before, after)
+            report.before, report.after, report.limit = before, after, limit
+            return report
         end
 
         if most < floor then
             -- No beat yet: the seed alone is the whole conversation, and
             -- there is nothing to choose between.
-            local request, tokens = fold_at(0)
+            local request, tokens, report = fold_at(0)
             if tokens <= limit then
-                return request
+                return request, counted(report, tokens, tokens)
             end
-            return nil, tokens, limit
+            return nil, nil, tokens, limit, "seed"
         end
 
-        local whole, whole_tokens = fold_at(most)
+        local whole, whole_tokens, whole_report = fold_at(most)
         if whole_tokens <= limit then
-            return whole
+            return whole, counted(whole_report, whole_tokens, whole_tokens)
         end
 
         -- Everything fits at `lo` or below and nothing at `hi` or above;
         -- `floor` is the smallest window there is, and it has already failed
         -- when the loop ends without an answer.
         local lo, hi = floor, most
-        local best, smallest_tokens = nil, nil
+        local best, best_tokens, best_report = nil, nil, nil
+        local smallest_tokens = nil
         while lo <= hi do
             local mid = (lo + hi) // 2
-            local request, tokens = fold_at(mid)
+            local request, tokens, report = fold_at(mid)
             if tokens <= limit then
-                best = request
+                best, best_tokens, best_report = request, tokens, report
                 lo = mid + 1
             else
                 hi = mid - 1
@@ -996,19 +1060,34 @@ function M.window(opts)
             end
         end
         if best then
-            return best
+            -- `before` is the largest candidate's count — the whole log, or
+            -- the `tail` window when `tail` capped it — which is the number
+            -- the dropping was measured against.
+            return best, counted(best_report, whole_tokens, best_tokens)
         end
         if smallest_tokens == nil then
             local _, tokens = fold_at(floor)
             smallest_tokens = tokens
         end
-        return nil, smallest_tokens, limit
+        return nil, nil, smallest_tokens, limit, "beat"
     end
 
     local fold = function(events, device)
-        local request, tokens, limit = largest_fitting(events, device)
+        local request, report, tokens, limit, counted = largest_fitting(events, device)
         if request then
-            return request
+            return request, report
+        end
+        if counted == "seed" then
+            error(
+                string.format(
+                    "policy.window: no event in this history is marked with a beat, so the whole of it was "
+                        .. "counted as the seed: %d tokens > %d. Mark the events of each beat with meta.beat "
+                        .. "(knl.beat does), or pass the session so the window can see the beats.",
+                    tokens,
+                    limit
+                ),
+                2
+            )
         end
         error(
             string.format(
@@ -2370,11 +2449,14 @@ local OUTCOME_ARG = arg_of(kernel.shapes.outcome, "outcome")
 M.shapes.api = {
     window = {
         args = { arg_of(WINDOW_ARG, "opts") },
-        returns = 'fold — fn(events, device) -> request; and, with `fit`, fits — fn(session, device) -> nil | "context"',
+        returns = 'fold — fn(events, device) -> request, report; and, with `fit`, fits — fn(session, device) -> nil | "context"',
         members = {
             fold = {
+                -- Two values: the request, and what the window left out
+                -- (`knl.shapes.window_report`, which `knl.beat` records on
+                -- the llm_request). A caller taking one is unaffected.
                 args = { EVENTS_ARG, arg_of(T.table, "device (read for system / tools)") },
-                returns = kernel.shapes.request,
+                returns = "knl.shapes.request, knl.shapes.window_report",
             },
             fits = {
                 args = { SESSION_ARG, arg_of(T.table, "device (read for system / tools)") },

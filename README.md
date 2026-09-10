@@ -907,6 +907,27 @@ per file, opened once per process, so the sessions in it are streams of one
 log and a session tree is one transaction. A `knl.sqlite` written by an
 earlier release is brought forward on the first open, once.
 
+#### Reading a run from outside
+
+A run's facts land in a session in the project's kernel database, and the
+process that wants them back is usually not the one that wrote them — a job
+manager, a test, a person after the fact. `agent-block knl export` is that
+door: a session id in, JSON Lines out, one record per line, no Lua involved.
+
+```
+# The log as it is stored: every kind, upcast to today's shape
+agent-block knl export --session <ID> --as events
+
+# The conversation it holds: msg_user / llm_response / tool_call / tool_result,
+# one record each, carrying beat / seq / epoch_ms / kind
+agent-block knl export --session <ID> --as messages
+```
+
+`--store <PATH>` reads some other database; without it the project's own is
+used, resolved from `-p/--project` exactly as `knl.open{}` resolves it for a
+script that names no `store`. A session that is not there is a one-line
+`error:` on stderr and exit `1`, not an empty answer.
+
 The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
 (the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the
 syscall surface Lua sees) and

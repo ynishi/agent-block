@@ -221,6 +221,9 @@ describe("knl.shapes.api — every export is declared", function()
             "device",
             "beat",
             "fold",
+            -- The whole-log read: neither a view nor a syscall, and the one
+            -- reading a consumer outside this repo is meant to use.
+            "export",
             "new_beat_id",
             -- The bridge's two readers, re-exported: two tables answer to the
             -- name `knl`, and a script whose `local knl = require("knl")`
@@ -352,6 +355,15 @@ describe("knl.shapes.api — the registry is executed (dev mode)", function()
         expect(mentions(err, "knl.session arg 2")).to.be(true)
     end)
 
+    it("holds knl.export's opts to the registry, naming the argument", function()
+        -- The gate judges what was passed before the function sees it, so a
+        -- reading asked for as a number fails as a broken call to a declared
+        -- API rather than inside the read.
+        local ok, err = called(DEV.export, {}, 42)
+        expect(ok).to.be(false)
+        expect(mentions(err, "knl.export arg 2")).to.be(true)
+    end)
+
     it("holds an Outcome member too (the namespace's functions are exports)", function()
         local ok, err = called(DEV.Outcome.err, "not_a_stage", "boom")
         expect(ok).to.be(false)
@@ -405,6 +417,74 @@ describe("knl.shapes.api — the registry is absent in prod", function()
         expect(ok).to.be(false)
         expect(tostring(err):find("must be a function", 1, true) ~= nil).to.be(true)
         expect(tostring(err):find("arg 2", 1, true) ~= nil).to.be(false)
+    end)
+
+    it("reaches knl.export's own refusal of a reading it does not know", function()
+        -- Loud in prod as well: an option that quietly did nothing would
+        -- look exactly like the export answering what was asked for.
+        local ok, err = pcall(PROD.export, {}, { as = "sql" })
+        expect(ok).to.be(false)
+        expect(tostring(err):find('must be "events" or "messages"', 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("arg 2", 1, true) ~= nil).to.be(false)
+    end)
+end)
+
+describe("knl.shapes.export_opts — what a whole-log read may ask for", function()
+    it("is closed (an unknown option must not quietly do nothing)", function()
+        expect(is_shape(K.shapes.export_opts)).to.be(true)
+        expect(rawget(K.shapes.export_opts, "open")).to.be(false)
+    end)
+
+    it("takes a reading and a set of sessions, both optional", function()
+        expect(check.check({}, K.shapes.export_opts)).to.be(true)
+        expect(check.check({ as = "events" }, K.shapes.export_opts)).to.be(true)
+        expect(check.check({ as = "messages", sessions = { "sess-a" } }, K.shapes.export_opts)).to.be(true)
+        -- the two readings are a closed list: a third would be a fold
+        -- nobody wrote
+        expect(check.check({ as = "rows" }, K.shapes.export_opts)).to.be(false)
+        -- and a query option is not an export option
+        expect(check.check({ limit = 10 }, K.shapes.export_opts)).to.be(false)
+    end)
+
+    it("is the shape the registry holds the call to", function()
+        expect(api.export.args[1].shape).to.be(K.shapes.session_handle)
+        expect(api.export.args[2].shape).to.be(K.shapes.export_opts)
+    end)
+end)
+
+describe("knl.shapes.window_report — what a fold left out", function()
+    -- Produced by a fold (`policy.window`) and declared here, because the
+    -- kernel is what records it: `llm_request.data.window`.
+    it("is published, closed, and required on its three unconditional fields", function()
+        local report = K.shapes.window_report
+        expect(is_shape(report)).to.be(true)
+        expect(rawget(report, "open")).to.be(false)
+        expect(check.check({ dropped = {}, kept = 0, seed_kept = true }, report)).to.be(true)
+        expect(check.check({ dropped = { "b1", "b2" }, kept = 1, seed_kept = false }, report)).to.be(true)
+        expect(check.check({ kept = 1, seed_kept = false }, report)).to.be(false)
+        expect(check.check({ dropped = {}, seed_kept = false }, report)).to.be(false)
+        expect(check.check({ dropped = {}, kept = 1 }, report)).to.be(false)
+    end)
+
+    it("counts tokens only when the fold counted any", function()
+        -- A window of n beats never counts, and the three numbers are absent
+        -- together rather than defaulted to zero — a zero nobody measured is
+        -- a number somebody would read.
+        local report = K.shapes.window_report
+        expect(check.check({ dropped = {}, kept = 2, seed_kept = true, before = 10, after = 10, limit = 20 }, report)).to.be(
+            true
+        )
+        expect(check.check({ dropped = {}, kept = 2, seed_kept = true, before = "10" }, report)).to.be(false)
+    end)
+
+    it("is the shape the llm_request carries it under", function()
+        local fields = rawget(K.shapes.events.llm_request, "fields")
+        expect(fields.window).to.exist()
+        expect(check.check({ request = { messages = {} } }, K.shapes.events.llm_request)).to.be(true)
+        expect(check.check({
+            request = { messages = {} },
+            window = { dropped = { "b1" }, kept = 1, seed_kept = false },
+        }, K.shapes.events.llm_request)).to.be(true)
     end)
 end)
 
