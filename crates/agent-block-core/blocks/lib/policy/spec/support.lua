@@ -101,7 +101,13 @@ local function fake_session(opts)
     function s:append(ev)
         assert(not self.closed, "knl: append: closed: session is closed")
         assert(type(ev) == "table" and type(ev.kind) == "string", "knl: append: validation: kind is required")
-        assert(ev.beat == nil or type(ev.beat) == "string", "knl: append: validation: beat must be a string")
+        assert(ev.beat == nil, "knl: append: validation: unknown field: beat (the id is meta.beat)")
+        local meta = ev.meta
+        assert(meta == nil or type(meta) == "table", "knl: append: validation: meta must be a table")
+        assert(
+            meta == nil or meta.beat == nil or type(meta.beat) == "string",
+            "knl: append: validation: meta.beat must be a string"
+        )
         self._seq = self._seq + 1
         ev.seq = self._seq
         self._events[#self._events + 1] = ev
@@ -220,13 +226,14 @@ function M.kinds(session)
     return table.concat(names, ",")
 end
 
---- The distinct `beat` ids in the session, in first-seen order.
+--- The distinct `meta.beat` ids in the session, in first-seen order.
 function M.beat_ids(session)
     local seen, ids = {}, {}
     for _, ev in ipairs(session:events()) do
-        if ev.beat ~= nil and not seen[ev.beat] then
-            seen[ev.beat] = true
-            ids[#ids + 1] = ev.beat
+        local id = ev.meta ~= nil and ev.meta.beat or nil
+        if id ~= nil and not seen[id] then
+            seen[id] = true
+            ids[#ids + 1] = id
         end
     end
     return ids

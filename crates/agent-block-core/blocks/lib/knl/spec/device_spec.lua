@@ -274,11 +274,18 @@ local function echo_tools()
 end
 
 -- The `beat` field of every event that carries one, in seq order.
+-- The beat id an event was stamped with: a label in the envelope, so it is
+-- read off `meta` and an event need not carry one.
+local function beat_of(ev)
+    return ev.meta ~= nil and ev.meta.beat or nil
+end
+
 local function stamped_beats(s)
     local ids = {}
     for _, ev in ipairs(s:events()) do
-        if ev.beat ~= nil then
-            ids[#ids + 1] = ev.beat
+        local id = beat_of(ev)
+        if id ~= nil then
+            ids[#ids + 1] = id
         end
     end
     return ids
@@ -499,11 +506,11 @@ describe("knl.beat — the primitive", function()
 
         local evs = s:events()
         expect(evs[1].kind).to.be("msg_user")
-        expect(evs[1].beat).to.be(nil) -- the caller's seed is not part of a beat
+        expect(beat_of(evs[1])).to.be(nil) -- the caller's seed is not part of a beat
         expect(evs[2].kind).to.be("llm_request")
         expect(evs[3].kind).to.be("llm_response")
-        expect(evs[2].beat).to.be(o.out.beat)
-        expect(evs[3].beat).to.be(o.out.beat)
+        expect(beat_of(evs[2])).to.be(o.out.beat)
+        expect(beat_of(evs[3])).to.be(o.out.beat)
     end)
 
     it("stamps every event of one beat — model response and tool pair — with the same id", function()
@@ -895,15 +902,20 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
     end)
 
     it("holds the envelope to the rules this layer mirrors", function()
-        -- `beat` is an opaque string, `meta` is SHALLOW (labels, not a
-        -- second `data`), and the kernel refuses the same two at the
-        -- syscall — this is the copy that fails at the line that wrote it.
+        -- `meta` is SHALLOW (labels, not a second `data`), and the kernel
+        -- refuses a nested one at the syscall — this is the copy that fails
+        -- at the line that wrote it. The beat id is a label in there, not a
+        -- field of the envelope.
         expect(shape.check({ kind = "llm_response" }, K.shapes.event_base)).to.be(true)
-        expect(shape.check({ kind = "llm_response", beat = 42 }, K.shapes.event_base)).to.be(false)
+        expect(shape.check({ kind = "llm_response", meta = { beat = "b1" } }, K.shapes.event_base)).to.be(true)
         expect(shape.check({ kind = "msg_user", meta = { label = "seed", n = 1, on = true } }, K.shapes.event_base)).to.be(
             true
         )
         expect(shape.check({ kind = "msg_user", meta = { label = { deep = 1 } } }, K.shapes.event_base)).to.be(false)
+        -- The id's own type is the one rule this layer adds on top of the
+        -- shallow one, which a number would otherwise satisfy. It is
+        -- asserted at the append rather than published as a shape, and the
+        -- case below ("the beat stamp is checked") is what holds it.
     end)
 
     it("a beat's Outcome validates against the outcome shape", function()
@@ -924,8 +936,9 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             local s = K.open({})
             local d = K.device({ tools = echo_tools() })
             local out = { content = { { type = "tool_use", id = "c1", name = "echo", input = {} } } }
-            -- a numeric beat id: `beat` is an opaque STRING, and this is
-            -- the one thing this layer adds to the kernel's own validator
+            -- a numeric beat id: `meta.beat` is an opaque STRING, and this
+            -- is the one thing this layer adds to the kernel's own
+            -- validator — the shallow-label rule alone would take a number
             expect(function()
                 K._execute_tools(s, d, out, 42)
             end).to.fail()
@@ -1021,7 +1034,7 @@ describe("beat contract hardening (review findings)", function()
         -- the failure is noted in the history, under this beat's id
         local last = s:events()[#s:events()]
         expect(last.kind).to.be("llm_call_failed")
-        expect(type(last.beat)).to.be("string")
+        expect(type(beat_of(last))).to.be("string")
     end)
 
     it("an llm that answers a non-table is Error('call'), not a raise on resp.status", function()
@@ -1040,7 +1053,7 @@ describe("beat contract hardening (review findings)", function()
             -- other call failure
             local last = s:events()[#s:events()]
             expect(last.kind).to.be("llm_call_failed")
-            expect(type(last.beat)).to.be("string")
+            expect(type(beat_of(last))).to.be("string")
         end
     end)
 
@@ -1235,7 +1248,7 @@ describe("beat contract hardening (review findings)", function()
         expect(type(o.detail.beat)).to.be("string")
         local last = s:events()[#s:events()]
         expect(last.kind).to.be("llm_response")
-        expect(last.beat).to.be(o.detail.beat)
+        expect(beat_of(last)).to.be(o.detail.beat)
     end)
 
     it("a refusal with no refusal.kind is Error('call') — the llm broke llm_result", function()
@@ -1512,7 +1525,7 @@ describe("fold hardening (review findings)", function()
             { kind = "msg_user", data = { content = "go" }, seq = 1 },
             {
                 kind = "llm_response",
-                beat = "b1",
+                meta = { beat = "b1" },
                 data = {
                     content = {
                         { type = "text", text = "using tools" },
@@ -1524,7 +1537,12 @@ describe("fold hardening (review findings)", function()
                 seq = 2,
             },
             -- c1 was answered before the crash; c2 was not
-            { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 3 },
+            {
+                kind = "tool_result",
+                meta = { beat = "b1" },
+                data = { call_id = "c1", ok = true, result = "R" },
+                seq = 3,
+            },
         }
         local req = K.fold(events, {})
         -- user "go" / assistant / user [c1 result + synthetic c2 result]
@@ -1555,7 +1573,7 @@ describe("fold hardening (review findings)", function()
             { kind = "msg_user", data = { content = "go" }, seq = 1 },
             {
                 kind = "llm_response",
-                beat = "b1",
+                meta = { beat = "b1" },
                 data = { content = {}, usage = { input_tokens = 1, output_tokens = 0 } },
                 seq = 2,
             },
@@ -1585,14 +1603,19 @@ describe("fold hardening (review findings)", function()
         local events = {
             {
                 kind = "llm_response",
-                beat = "b1",
+                meta = { beat = "b1" },
                 data = { content = { { type = "tool_use", id = "c1", name = "t", input = {} } }, usage = {} },
                 seq = 1,
             },
-            { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 2 },
+            {
+                kind = "tool_result",
+                meta = { beat = "b1" },
+                data = { call_id = "c1", ok = true, result = "R" },
+                seq = 2,
+            },
             {
                 kind = "llm_response",
-                beat = "b2",
+                meta = { beat = "b2" },
                 data = { content = { { type = "text", text = "done" } }, usage = {} },
                 seq = 3,
             },

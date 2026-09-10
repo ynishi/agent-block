@@ -415,7 +415,9 @@ function M._run_impl(opts)
     local function edits_in(session, beat_id)
         local by_call, applied = {}, 0
         for _, ev in ipairs((session:events())) do
-            if ev.beat == beat_id then
+            -- The beat id is a label in the envelope (`meta.beat`), and an
+            -- event need not carry `meta` at all.
+            if ev.meta ~= nil and ev.meta.beat == beat_id then
                 local data = type(ev.data) == "table" and ev.data or {}
                 if ev.kind == "tool_call" and data.name == edit_spec.name then
                     by_call[data.call_id] = true

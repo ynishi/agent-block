@@ -771,11 +771,13 @@ describe("knl.shapes.schema — the read schema is published as data", function(
             names[column.name] = true
         end
         -- The envelope is the row: `kind` is the
-        -- indexed column a kind-filtered view uses, `beat` is the
-        -- correlation key `knl.views.beats` groups on without a JSON path,
-        -- `meta` holds the shallow labels — and `data` is the one column a
+        -- indexed column a kind-filtered view uses, `meta` holds the shallow
+        -- labels (the beat id among them, which is what `knl.views.beats`
+        -- groups on) — and `data` is the one column a
         -- view has to reach into, which is what ties such a view to the
-        -- shape of the kind it reads.
+        -- shape of the kind it reads. `beat` is still a column of the
+        -- backend's table and nothing writes it; it goes when that table
+        -- does.
         for _, name in ipairs({ "kind", "beat", "meta", "data" }) do
             expect(names[name]).to.be(true)
         end
@@ -881,7 +883,7 @@ describe("knl.shapes.events — the `data` shape of every kind this layer writes
     end)
 
     it("holds the envelope's own rules apart from them", function()
-        -- `event_base` is the envelope (kind / beat / meta / data) and
+        -- `event_base` is the envelope (kind / meta / data) and
         -- `event_meta` is the shallow-label rule inside it. Neither is a
         -- per-kind contract, and neither moves when a kind's shape does.
         expect(is_shape(K.shapes.event_base)).to.be(true)

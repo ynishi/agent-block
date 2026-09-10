@@ -400,20 +400,36 @@ local function whole_log(session, who)
     return events
 end
 
+--- The beat id a stored event carries, or nil when it is part of no beat.
+---
+--- The id is a label in the envelope — `meta.beat` — and not a field of its
+--- own, and an event need not carry `meta` at all, so every read of it goes
+--- through here rather than being spelled out three times.
+---
+--- @param ev table  a stored event
+--- @return string|nil  the id of the beat that wrote it
+local function beat_of(ev)
+    local meta = ev.meta
+    if meta == nil then
+        return nil
+    end
+    return meta.beat
+end
+
 --- The beats of an event list, in the order they first appear:
 --- `{ { id, events }, ... }` — `policy.shapes.beat_record`.
 ---
---- Events with no `beat` are part of no beat and are left out; the kernel's
---- own boundaries and the caller's seed are log, not beat. Grouping is by the
---- id rather than by adjacency, so a log whose beats were interleaved (two
---- drivers on one session) still reads back as whole beats.
+--- Events with no `meta.beat` are part of no beat and are left out; the
+--- kernel's own boundaries and the caller's seed are log, not beat. Grouping
+--- is by the id rather than by adjacency, so a log whose beats were
+--- interleaved (two drivers on one session) still reads back as whole beats.
 ---
 --- @param events table|nil  a session's events, in seq order
 --- @return table  an array of beat records
 local function beats_of(events)
     local order, by_id = {}, {}
     for _, ev in ipairs(events or {}) do
-        local id = ev.beat
+        local id = beat_of(ev)
         if id ~= nil then
             local record = by_id[id]
             if record == nil then
@@ -756,7 +772,7 @@ local function window_slice(events, tail, keep_seed)
     events = events or {}
     local order, first_at = {}, {}
     for i, ev in ipairs(events) do
-        local id = ev.beat
+        local id = beat_of(ev)
         if id ~= nil and first_at[id] == nil then
             first_at[id] = i
             order[#order + 1] = id
@@ -782,7 +798,7 @@ end
 local function beat_count(events)
     local seen, n = {}, 0
     for _, ev in ipairs(events or {}) do
-        local id = ev.beat
+        local id = beat_of(ev)
         if id ~= nil and not seen[id] then
             seen[id] = true
             n = n + 1
@@ -1565,9 +1581,13 @@ function M.verdict(opts)
         -- nothing is still a fact about the run. What the check took is not
         -- written here: the kernel's `epoch_ms` on this record and the one
         -- before it already say it, and a second copy could disagree.
+        -- Stamped with the beat it judges, in the envelope's label bag: the
+        -- id is `meta.beat`. A verdict that was handed no beat carries no
+        -- label rather than an empty one.
+        local judged = type(out) == "table" and out.beat or nil
         session:append({
             kind = kind,
-            beat = type(out) == "table" and out.beat or nil,
+            meta = judged ~= nil and { beat = judged } or nil,
             data = {
                 ok = result.ok,
                 ran = ran,

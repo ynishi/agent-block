@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The beat a fact belongs to is `meta.beat`, not a key of the envelope. An
+  event is `kind` / `meta` / `data` and the kernel's stamps at the top, and
+  nothing else — which is what the store itself keeps — so a correlation the
+  caller declares belongs with the other labels a reader groups by. Writing
+  `beat` at the top level is now refused, and the refusal says where it goes.
+  The stored schema version is `2` for it, and a read-time upcaster moves a
+  version-1 event's top-level `beat` into its `meta`: a log written before
+  this reads back in today's shape, with its bytes untouched. The `beat`
+  column and its index are unchanged — the value is lifted out of `meta` on
+  the way in — so a query grouping by beat reads as it did.
+
 - `policy.verdict{ timeout }`: which check the next window is read off is
   now the caller's choice, `timeout.measure` — `"longest"` (the default),
   `"last"`, `"last_ok"`, `"first"`, or the caller's own `fn(events, kind)

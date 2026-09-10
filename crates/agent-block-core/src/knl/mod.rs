@@ -50,9 +50,10 @@
 //! # A beat is declared, not numbered
 //!
 //! A `beat` is an opaque string the layer above mints and stamps on the
-//! facts that belong together.  The kernel never generates one and never
-//! requires one; it only insists that a present `beat` is a string.
-//! Grouping and ordering read it back, and nothing else does.
+//! facts that belong together, written as `meta.beat` — a label like any
+//! other, under the rule `meta` already has.  The kernel never generates one
+//! and never requires one.  Grouping and ordering read it back, and nothing
+//! else does.
 //!
 //! Numbering it here would put a cursor back into kernel state, and that
 //! number would then have to survive a resume, two handles, and a store that
@@ -193,15 +194,15 @@
 //!
 //! # Stored shape: envelope, meta, data
 //!
-//! An event is an envelope ([`FIELD_KIND`], an optional `beat`, the kernel's
-//! `seq` / `epoch_ms` / `_schema_version`), a shallow `meta`, and a `data`
-//! object holding the kind's own content.  Nothing else may sit at the top
-//! level.  The three levels are separated so that a reader can tell which of
-//! them it is reading:
+//! An event is an envelope ([`FIELD_KIND`] and the kernel's `seq` /
+//! `epoch_ms` / `_schema_version`), a shallow `meta`, and a `data` object
+//! holding the kind's own content.  Nothing else may sit at the top level.
+//! The three levels are separated so that a reader can tell which of them it
+//! is reading:
 //!
 //! ```text
-//! envelope   kind, beat, seq, epoch_ms, _schema_version   ← columns; never renamed
-//! meta       { label = "a", attempt = 2 }                 ← shallow by rule: scalars only
+//! envelope   kind, seq, epoch_ms, _schema_version         ← columns; never renamed
+//! meta       { label = "a", attempt = 2, beat = "b1" }    ← shallow by rule: scalars only
 //! data       { content = { … }, usage = { … } }           ← the kind's own, any depth
 //! ```
 //!

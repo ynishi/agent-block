@@ -142,7 +142,7 @@ describe("policy.carry — a read that was cut short", function()
         support.seed(session, "q")
         session:append({
             kind = "llm_call_failed",
-            beat = "b1",
+            meta = { beat = "b1" },
             data = { error = "an old failure", kind = "transport", retryable = true },
         })
         local filter = policy.carry({ max_bytes = 256 })(session)
@@ -334,8 +334,12 @@ describe("policy.carry — a tool that RETURNS its failure", function()
     --- of raising one, which no stub tool can produce by failing.
     local function answered(session, name, result, ok)
         local data = { call_id = "c1", name = name, args = { path = "a.txt", line = 300 } }
-        session:append({ kind = "tool_call", beat = "b-1", data = data })
-        session:append({ kind = "tool_result", beat = "b-1", data = { call_id = "c1", ok = ok, result = result } })
+        session:append({ kind = "tool_call", meta = { beat = "b-1" }, data = data })
+        session:append({
+            kind = "tool_result",
+            meta = { beat = "b-1" },
+            data = { call_id = "c1", ok = ok, result = result },
+        })
     end
 
     --- What an edit tool answers when the model asks to change a line that is
@@ -417,7 +421,11 @@ describe("policy.carry — a tool that RETURNS its failure", function()
         -- predicate to read, and the fold shows nothing of the event at all.
         local session = support.session()
         support.seed(session, "q")
-        session:append({ kind = "llm_call_failed", beat = "b-1", data = { error = "the provider said no" } })
+        session:append({
+            kind = "llm_call_failed",
+            meta = { beat = "b-1" },
+            data = { error = "the provider said no" },
+        })
         local filter = policy.carry({
             failed = function(_pair)
                 return false

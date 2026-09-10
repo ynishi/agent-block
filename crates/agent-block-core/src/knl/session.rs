@@ -1140,7 +1140,8 @@ impl Session {
     /// the shape its kind requires and is not one of the kernel's own
     /// ([`is_kernel_only`]).  The kernel-owned `seq` / `epoch_ms` are
     /// stamped here and overwrite any caller-supplied value; nothing else
-    /// is added, and a `beat` the caller declared is recorded as given.
+    /// is added, and the labels the caller declared — `meta.beat` among
+    /// them — are recorded as given.
     ///
     /// No append moves the budget, this one included.  A deduction is asked
     /// for before a call ([`Session::reserve`]) or taken after it
@@ -1635,7 +1636,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, FIELD_BEAT, FIELD_DATA};
+    use crate::knl::event::{kind_of, FIELD_BEAT, FIELD_DATA, FIELD_META};
     // The `Vec`-backed test store: the SPI, the seam and the folds are worth
     // exercising without a database underneath, and the failure injection
     // below is easier to build on a `Vec` than on a connection.
@@ -2230,7 +2231,7 @@ mod tests {
             .append(obj(json!({
                 "kind": "llm_response",
                 // The beat is the caller's word and the kernel keeps it.
-                "beat": "beat-7",
+                "meta": { "beat": "beat-7" },
                 "data": {
                     "content": [{ "type": "text", "text": "hi" }],
                     "usage": { "input_tokens": 20, "output_tokens": 10 }
@@ -2247,7 +2248,7 @@ mod tests {
             .expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(
-            recorded[FIELD_BEAT],
+            recorded[FIELD_META][FIELD_BEAT],
             json!("beat-7"),
             "the declared beat is recorded as given"
         );
@@ -2517,7 +2518,7 @@ mod tests {
 
     /// The beat belongs to the layer above: the kernel never mints one, so
     /// an event that declares none carries none, and one that declares a
-    /// beat carries exactly the string it was given — on any kind, and
+    /// `meta.beat` carries exactly the string it was given — on any kind, and
     /// repeated across the facts of one beat without the kernel objecting.
     #[tokio::test]
     async fn beats_are_the_callers_word_and_the_kernel_adds_none() {
@@ -2531,25 +2532,28 @@ mod tests {
             .pop()
             .expect("response");
         assert_eq!(
-            bare.get(FIELD_BEAT),
+            bare[FIELD_META].get(FIELD_BEAT),
             None,
             "the kernel must not invent a beat: {bare}"
         );
 
         for event in [
             json!({
-                "kind": "llm_response", "beat": "b-1",
+                "kind": "llm_response", "meta": { "beat": "b-1" },
                 "data": { "content": [], "usage": { "input_tokens": 1 } }
             }),
             json!({
-                "kind": "tool_call", "beat": "b-1",
+                "kind": "tool_call", "meta": { "beat": "b-1" },
                 "data": { "call_id": "c1", "name": "sh", "args": {} }
             }),
             json!({
-                "kind": "tool_result", "beat": "b-1",
+                "kind": "tool_result", "meta": { "beat": "b-1" },
                 "data": { "call_id": "c1", "ok": true, "result": "ok" }
             }),
-            json!({ "kind": "llm_call_failed", "beat": "b-1", "data": { "error": "boom" } }),
+            json!({
+                "kind": "llm_call_failed", "meta": { "beat": "b-1" },
+                "data": { "error": "boom" }
+            }),
         ] {
             let seq = s.append(obj(event.clone())).await.expect("declared beat");
             let recorded = s
@@ -2558,15 +2562,16 @@ mod tests {
                 .expect("events")
                 .pop()
                 .expect("recorded");
-            assert_eq!(recorded[FIELD_BEAT], json!("b-1"), "{event}");
+            assert_eq!(recorded[FIELD_META][FIELD_BEAT], json!("b-1"), "{event}");
         }
 
-        // A non-string beat is the one thing refused, on any kind.
+        // The beat is a label now, so writing one at the top level is a stray
+        // key — and the refusal says where it goes.
         let err = s
-            .append(obj(json!({ "kind": "note", "beat": 1 })))
+            .append(obj(json!({ "kind": "note", "beat": "b-1" })))
             .await
-            .expect_err("a numbered beat");
-        assert!(err.reason().contains("beat must be a string"), "{err}");
+            .expect_err("a beat at the top level");
+        assert!(err.reason().contains("meta.beat"), "{err}");
     }
 
     #[tokio::test]
@@ -3970,10 +3975,10 @@ mod tests {
     /// a hypothetical earlier shape used.  The kernel chain is empty until the
     /// first release, so the seam is exercised with a chain the test owns.
     ///
-    /// It leaves the version alone.  The version a step *produces* is
-    /// [`CURRENT_SCHEMA_VERSION`], which is still `1` — the same one these
-    /// rows were written under — and a `Current` is asserted to be at it, so
-    /// a fixture that stamped `2` would be claiming a version the kernel does
+    /// It leaves the version alone.  These rows are written by the store
+    /// itself, so they already carry [`CURRENT_SCHEMA_VERSION`] — the version
+    /// a step produces — and a `Current` is asserted to be at it, so a fixture
+    /// that stamped anything else would be claiming a version the kernel does
     /// not have.
     struct RenameLegacyKinds;
 
@@ -4034,7 +4039,7 @@ mod tests {
                 .expect("the grant");
             store
                 .append(obj(json!({
-                    "kind": "legacy_response", "beat": "b-1",
+                    "kind": "legacy_response", "meta": { "beat": "b-1" },
                     "data": {
                         "content": [{ "type": "text", "text": "ok" }],
                         "usage": { "input_tokens": 7 }

@@ -75,11 +75,11 @@
 //! an old log would be silently misread, which is the one failure an
 //! append-only store exists to prevent.
 //!
-//! That obligation starts at the first release.  Until then the stored shape
-//! is still being settled, there is no log anyone has to keep, and a rename
-//! is a rename — so [`kernel_upcasters`] returns an empty chain and
-//! [`CURRENT_SCHEMA_VERSION`] stays at `1`.  The seam is built and tested all
-//! the same, so the first step that is owed has one site to be registered at.
+//! That obligation started at the first release, and it is being met.  0.36.0
+//! shipped shape `1`, so there are logs written under it; moving `beat` out of
+//! the envelope and into `meta` is a change to what an event *is*, and it
+//! arrives as [`CURRENT_SCHEMA_VERSION`] `2` with [`BeatIntoMeta`] registered
+//! in [`kernel_upcasters`] to carry a version-1 event forward on read.
 //!
 //! # Only upcasted events reach the domain
 //!
@@ -116,10 +116,13 @@ pub const SCHEMA_VERSION_FIELD: &str = "_schema_version";
 
 /// The schema version new events are stamped with.
 ///
-/// `1`: the stored shape has never been released, so nothing has been
-/// written under an older one and there is no step to take.  A shape change
-/// *after* the first release bumps this and registers the matching
-/// [`Upcaster`] — see the module docs.
+/// `2`: `beat` is a key of `meta` rather than of the envelope
+/// ([`super::event`]).  Shape `1` — the one 0.36.0 released, with `beat` at
+/// the top level — is still on disk wherever a log was written then, and
+/// [`BeatIntoMeta`] brings such an event forward on read.
+///
+/// A shape change bumps this and registers the matching [`Upcaster`] in the
+/// same round — see the module docs.
 ///
 /// **What counts as a shape change** is what an event *is*: a kind renamed, a
 /// field added, moved, retyped or dropped.  How the rows are stored beside
@@ -127,7 +130,7 @@ pub const SCHEMA_VERSION_FIELD: &str = "_schema_version";
 /// — changes no event and bumps nothing: the same bytes read the same way
 /// afterwards, and a database an earlier build wrote picks the index up on
 /// the next open with nothing to upcast.
-pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+pub const CURRENT_SCHEMA_VERSION: u64 = 2;
 
 /// The upcaster chain every session reads through, newest step last.
 ///
@@ -136,19 +139,68 @@ pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 /// session makes — the restore fold, the view folds, `events` — sees the
 /// current shape while the stored bytes stay exactly as they were written.
 ///
-/// Empty until the first release: there is no released shape to read yet, so
-/// there is no step owed.  This is the one site a step is registered at, and
-/// the seam around it is exercised by the tests below with a chain of their
-/// own.
+/// One step so far, and this is the one site a step is registered at:
+/// [`BeatIntoMeta`], the `1 → 2` move of `beat` into `meta`.  A log 0.36.0
+/// wrote is read through it and comes back in today's shape, while its bytes
+/// stay exactly as they were written.
 ///
 /// A step registered here that *renames a kind* owes one thing more: the
 /// kind-filtered reads select on the stored name ([`EventStore::read_kinds`]),
 /// so every caller that names that kind — [`super::Session::reserve`] and the
 /// balance fold name the `budget_*` ones, a resume names `session_closed` —
 /// has to name the old spelling beside the new one, or the older events fall
-/// out of the fold.
+/// out of the fold.  The step below renames no kind, so no read of the log
+/// has to name two spellings for it.
 pub fn kernel_upcasters() -> Vec<Arc<dyn Upcaster>> {
-    Vec::new()
+    vec![Arc::new(BeatIntoMeta)]
+}
+
+/// `1 → 2`: the beat moves from the envelope into `meta`.
+///
+/// Shape `1` carried the beat as a top-level key, beside `kind` / `meta` /
+/// `data`; shape `2` carries it as `meta.beat`, because the envelope is the
+/// store's contract now and a correlation key a reader groups by is what
+/// `meta` is for ([`super::event`]).  An event written under `1` therefore
+/// reads back with its beat where today's readers look for it, and the row
+/// on disk is untouched.
+///
+/// Pure and infallible, as [`Upcaster`] requires: an event at any version
+/// but `1` — and a value that is not an object at all — comes back exactly
+/// as it went in.  A version-1 event that validated cannot already carry a
+/// `meta.beat` (the beat was an envelope key then), so there is nothing here
+/// to overwrite and no precedence to decide.
+pub struct BeatIntoMeta;
+
+impl Upcaster for BeatIntoMeta {
+    fn upcast(&self, mut event: Value) -> Value {
+        let Some(map) = event.as_object_mut() else {
+            return event;
+        };
+        if map.get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64) != Some(1) {
+            return event;
+        }
+        // An event with no beat is still a version-1 event: it has nothing to
+        // move, and the version it is stamped with still has to come forward.
+        if let Some(beat) = map.remove(super::event::FIELD_BEAT) {
+            let meta = map
+                .entry(super::event::FIELD_META)
+                .or_insert_with(|| Value::Object(Map::new()));
+            match meta.as_object_mut() {
+                Some(meta) => {
+                    meta.insert(super::event::FIELD_BEAT.to_string(), beat);
+                }
+                // A `meta` that is not an object never passed the validator,
+                // so this is a row nobody wrote through the kernel.  The beat
+                // goes back where it was found rather than being dropped on
+                // the way past.
+                None => {
+                    map.insert(super::event::FIELD_BEAT.to_string(), beat);
+                }
+            }
+        }
+        map.insert(SCHEMA_VERSION_FIELD.to_string(), Value::from(2_u64));
+        event
+    }
 }
 
 /// Stamp [`CURRENT_SCHEMA_VERSION`] onto an event, overwriting any
@@ -179,8 +231,8 @@ pub trait Upcaster: Send + Sync {
 ///
 /// The read-time application point: each event is folded through the chain
 /// front to back, so a two-step migration (`1 → 2`, then `2 → 3`) composes.
-/// An empty chain is the identity — the shape is fixed now even though no
-/// upcaster is registered yet.
+/// An empty chain is the identity, which is what a caller with a chain of its
+/// own (the tests below) gets when it passes none.
 pub fn apply_upcasters(chain: &[Arc<dyn Upcaster>], events: Vec<Value>) -> Vec<Value> {
     events
         .into_iter()
@@ -848,9 +900,10 @@ impl EventStore for MemEventStore {
 /// makes "the folds only ever see upcasted events" a property of the types
 /// instead of a rule someone has to remember.
 ///
-/// An empty chain is a functional no-op, which is the state today: v1 has no
-/// upcaster, so the projection changes nothing, but a later shape change
-/// registers its `n → n+1` step here and every read path picks it up.
+/// An empty chain is a functional no-op.  The chain a session carries is not
+/// empty — [`kernel_upcasters`] registers the `1 → 2` step — so a log written
+/// by an earlier release is projected on every read path there is, and a
+/// later shape change adds its `n → n+1` step at the same one site.
 pub struct CurrentStore {
     /// The wrapped backend that actually holds the events.
     inner: Box<dyn EventStore>,
@@ -1710,10 +1763,10 @@ mod tests {
         );
     }
 
-    /// A test-local `1 → 2` step, standing in for a real one: it renames a
-    /// kind and marks the projection with the version it produced.  The
-    /// kernel chain is empty until the first release, so the mechanism is
-    /// exercised with a chain the tests own.
+    /// A test-local step, standing in for a kind rename: the kernel's own
+    /// step moves a field rather than a name, so the rename case is exercised
+    /// with a chain the tests own.  It claims the same `2` the kernel is at,
+    /// which is what a step registered beside [`BeatIntoMeta`] would produce.
     struct RenameOldKind;
 
     impl Upcaster for RenameOldKind {
@@ -1739,21 +1792,115 @@ mod tests {
         }
     }
 
-    /// The chain a session reads through is empty until the first release,
-    /// so a stored event reads back exactly as it was written.
+    /// The chain a session reads through carries the step the released shape
+    /// owes: shape `1` is on disk, so `1 → 2` is registered and a stored
+    /// event of that shape does not read back verbatim.
     #[test]
-    fn the_kernel_chain_is_empty_and_the_current_version_is_one() {
-        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+    fn the_kernel_chain_carries_the_step_the_current_version_owes() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
         assert!(
-            kernel_upcasters().is_empty(),
-            "no shape has been released, so no step is owed"
+            !kernel_upcasters().is_empty(),
+            "shape 1 was released, so the step to 2 is owed"
         );
 
-        let stored = json!({ "kind": "note", "seq": 1, SCHEMA_VERSION_FIELD: 1 });
+        let stored = json!({ "kind": "note", "seq": 1, "beat": "b1", SCHEMA_VERSION_FIELD: 1 });
+        let read = apply_upcasters(&kernel_upcasters(), vec![stored.clone()]);
+        assert_ne!(read, vec![stored], "the chain is not the identity");
+        assert_eq!(read[0]["meta"]["beat"], json!("b1"));
+    }
+
+    /// The `1 → 2` step: a beat written at the top level reads back as a
+    /// label of `meta`, and the row it came from said `1` while what a fold
+    /// sees says `2`.
+    #[test]
+    fn the_beat_step_moves_a_version_one_beat_into_meta() {
+        let chain = kernel_upcasters();
+
+        let read = apply_upcasters(
+            &chain,
+            vec![json!({
+                "kind": "llm_response",
+                "beat": "b-1",
+                "meta": { "label": "a" },
+                "data": { "content": [] },
+                "seq": 3,
+                SCHEMA_VERSION_FIELD: 1
+            })],
+        );
         assert_eq!(
-            apply_upcasters(&kernel_upcasters(), vec![stored.clone()]),
-            vec![stored],
-            "an empty chain reads the log back verbatim"
+            read[0]["meta"],
+            json!({ "label": "a", "beat": "b-1" }),
+            "the beat joins the labels it now belongs with: {}",
+            read[0]
+        );
+        assert_eq!(read[0].get("beat"), None, "and leaves the top level");
+        assert_eq!(
+            read[0][SCHEMA_VERSION_FIELD],
+            json!(CURRENT_SCHEMA_VERSION),
+            "the step says which shape it produced"
+        );
+        // What it did not touch, it did not touch.
+        assert_eq!(read[0]["data"], json!({ "content": [] }));
+        assert_eq!(read[0]["seq"], json!(3));
+
+        // A `meta` the writer left out is created to receive the beat.
+        let read = apply_upcasters(
+            &chain,
+            vec![json!({ "kind": "note", "beat": "b-2", SCHEMA_VERSION_FIELD: 1 })],
+        );
+        assert_eq!(read[0]["meta"], json!({ "beat": "b-2" }));
+    }
+
+    /// The same step on an event with no beat: there is nothing to move, and
+    /// the version still comes forward — otherwise a version-1 row without a
+    /// beat would reach a fold still claiming the older shape.
+    #[test]
+    fn the_beat_step_carries_a_beatless_version_one_event_forward() {
+        let read = apply_upcasters(
+            &kernel_upcasters(),
+            vec![json!({ "kind": "note", "meta": { "label": "a" }, SCHEMA_VERSION_FIELD: 1 })],
+        );
+        assert_eq!(
+            read[0],
+            json!({
+                "kind": "note",
+                "meta": { "label": "a" },
+                SCHEMA_VERSION_FIELD: CURRENT_SCHEMA_VERSION
+            }),
+            "only the version moved"
+        );
+    }
+
+    /// An event already at `2` is not stepped again, and neither is a value
+    /// the step cannot read: the step is total, as [`Upcaster`] requires.
+    #[test]
+    fn the_beat_step_leaves_a_current_or_unreadable_event_alone() {
+        let chain = kernel_upcasters();
+
+        // Today's shape, beat and all: untouched.
+        let current = json!({
+            "kind": "note", "meta": { "beat": "b-1" },
+            SCHEMA_VERSION_FIELD: CURRENT_SCHEMA_VERSION
+        });
+        assert_eq!(
+            apply_upcasters(&chain, vec![current.clone()]),
+            vec![current]
+        );
+
+        // A stray top-level `beat` on a version-2 event is not the step's to
+        // tidy: the validator refuses one on the way in, so a row carrying it
+        // was never written through the kernel.
+        let odd = json!({ "kind": "note", "beat": "b-1", SCHEMA_VERSION_FIELD: 2 });
+        assert_eq!(apply_upcasters(&chain, vec![odd.clone()]), vec![odd]);
+
+        // Neither a value that is not an object, nor one with no version at
+        // all, is guessed at.
+        let out = apply_upcasters(&chain, vec![json!(42), json!({ "kind": "note", "seq": 1 })]);
+        assert_eq!(out[0], json!(42), "a non-object passes straight through");
+        assert_eq!(
+            out[1],
+            json!({ "kind": "note", "seq": 1 }),
+            "an unversioned event is not claimed by the step"
         );
     }
 

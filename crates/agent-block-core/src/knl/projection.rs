@@ -131,7 +131,7 @@ mod tests {
             &mut h,
             json!({
                 "kind": "llm_response",
-                "beat": "b1",
+                "meta": { "beat": "b1" },
                 "data": {
                     "content": [{ "type": "text", "text": "ok" }],
                     "usage": { "input_tokens": 10, "output_tokens": 3 }
@@ -141,14 +141,14 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "tool_call", "beat": "b1",
+                "kind": "tool_call", "meta": { "beat": "b1" },
                 "data": { "call_id": "c1", "name": "sh", "args": { "cmd": "ls" } }
             }),
         );
         append(
             &mut h,
             json!({
-                "kind": "tool_result", "beat": "b1",
+                "kind": "tool_result", "meta": { "beat": "b1" },
                 "data": { "call_id": "c1", "ok": false, "result": "boom" }
             }),
         );
@@ -194,7 +194,7 @@ mod tests {
         // The envelope stays on: an event read hands back the record, not
         // a row shaped for a particular reader.
         assert!(events[1].get("seq").is_some(), "{}", events[1]);
-        assert_eq!(events[3]["beat"], json!("b1"), "{}", events[3]);
+        assert_eq!(events[3]["meta"]["beat"], json!("b1"), "{}", events[3]);
     }
 
     /// A conversation the caller carried in is material like any other:
@@ -206,7 +206,7 @@ mod tests {
         append(
             &mut h,
             json!({
-                "kind": "llm_response", "beat": "b1",
+                "kind": "llm_response", "meta": { "beat": "b1" },
                 "data": {
                     "content": [{ "type": "text", "text": "said last time" }],
                     "usage": { "input_tokens": 9_000 }

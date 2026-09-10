@@ -70,9 +70,10 @@
 //! by the shape of the API rather than by convention:
 //!
 //! - **An event is envelope + meta + data.**  What you append is
-//!   `{ kind = …, beat? = …, meta? = { … }, data? = { … } }` and nothing
-//!   else: a top-level key outside that set is refused, because a kind's own
-//!   fields belong under `data`.  `meta` is shallow — string, number or
+//!   `{ kind = …, meta? = { … }, data? = { … } }` and nothing else: a
+//!   top-level key outside that set is refused, because a kind's own fields
+//!   belong under `data` and a label belongs under `meta` — the beat
+//!   included, as `meta.beat`.  `meta` is shallow — string, number or
 //!   boolean values — so a reader can group or filter on it without knowing
 //!   the kind; `data` is yours, at any depth, and the shape under it is
 //!   declared where the kind is written (`knl.shapes`).  The kernel checks
@@ -83,8 +84,9 @@
 //!   `replace`.  `events()` / `view()` hand back freshly built tables, so
 //!   a caller that mutates a returned value cannot reach recorded state.
 //!   `seq` and `epoch_ms` are assigned by the kernel and overwrite any
-//!   caller-supplied field of the same name.  Nothing else is added: a
-//!   `beat` the caller declared is stored exactly as given.
+//!   caller-supplied field of the same name.  Nothing else is added: the
+//!   labels the caller declared, `meta.beat` included, are stored exactly as
+//!   given.
 //! - **A session has a scope.**  The two are different things sharing one
 //!   lifetime: the session is the stream (`s:id()`), the scope is the
 //!   authority it is written under — a kernel-issued scope id (`s:scope_id()`)
@@ -97,10 +99,10 @@
 //!   an accounting of what a run consumed keys on the `kind` alone — every
 //!   `llm_response` in the log is a call this run made.
 //! - **Beats are yours.**  `knl.new_beat_id()` mints a time-ordered id; you
-//!   stamp it on the `llm_response`, `tool_call` and `tool_result` events
-//!   that belong to one beat.  The kernel does not number beats, does not
-//!   require the field, and asks only that a `beat` you do write is a
-//!   string.
+//!   stamp it as `meta.beat` on the `llm_response`, `tool_call` and
+//!   `tool_result` events that belong to one beat.  The kernel does not
+//!   number beats and does not require the label; it is a label of `meta`
+//!   like any other, and it is refused at the top level.
 //! - **I3 budget monotonicity.**  The budget is a quota an owner grants
 //!   the session, not a ledger of what it used.  Two deductions take from it
 //!   and neither holds anything for the other: `reserve(n)` is the deduction
@@ -168,7 +170,7 @@
 //! local beat = knl.new_beat_id()
 //! local ok, tag = s:reserve(est)
 //! if not ok then return { budget_stopped = true, tag = tag } end
-//! s:append({ kind = "llm_response", beat = beat,
+//! s:append({ kind = "llm_response", meta = { beat = beat },
 //!            data = { content = blocks, usage = u } })
 //! local events = s:events(from)          -- the record, from `from` on
 //! local tail   = s:view("tail", { n = 5 })  -- the last events, verbatim
@@ -310,14 +312,14 @@ pub const SESSION_API: &[(&str, &str)] = &[
     ),
     (
         "append",
-        "append(event) -> seq — record a fact: { kind, beat?, meta? (shallow), data? }; a key \
-         outside that envelope, a kernel-only kind and a nested meta are refused, and the budget \
-         does not move [raises: validation, closed, busy, storage]",
+        "append(event) -> seq — record a fact: { kind, meta? (shallow, the beat among its \
+         labels), data? }; a key outside that envelope, a kernel-only kind and a nested meta are \
+         refused, and the budget does not move [raises: validation, closed, busy, storage]",
     ),
     (
         "events",
         "events(from?) -> rows, truncated — the record from `from` on, as fresh tables in the \
-         shape it was written in (kind / beat / meta / data, plus the kernel's stamps), capped at \
+         shape it was written in (kind / meta / data, plus the kernel's stamps), capped at \
          the kernel's row limit; `truncated` says the cap cut the read short, and the rest is read \
          by paging on `from` [raises: busy, storage, corruption]",
     ),
@@ -391,7 +393,8 @@ pub const MODULE_API: &[(&str, &str)] = &[
     ),
     (
         "new_beat_id",
-        "new_beat_id() -> string — mint a time-ordered beat id for the caller to stamp",
+        "new_beat_id() -> string — mint a time-ordered beat id for the caller to stamp as \
+         meta.beat",
     ),
     (
         "error",
@@ -787,10 +790,8 @@ pub mod types {
     pub struct AppendEvent {
         /// What happened.
         pub kind: String,
-        /// The beat this event belongs to, when the caller declared one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub beat: Option<String>,
-        /// Shallow labels a view can group or filter on.
+        /// Shallow labels a view can group or filter on — the beat a fact
+        /// belongs to (`meta.beat`) among them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub meta: Option<Meta>,
         /// What the kind is about.  An empty table when none was written.
@@ -809,10 +810,7 @@ pub mod types {
         pub epoch_ms: u64,
         /// Which revision of the event vocabulary this was read through.
         pub _schema_version: u64,
-        /// The beat this event belongs to, when one was declared.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub beat: Option<String>,
-        /// The shallow labels it was written with.
+        /// The shallow labels it was written with, the beat included.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub meta: Option<Meta>,
         /// What the kind is about, as written.
@@ -1445,17 +1443,18 @@ impl LuaUserData for Session {
         //
         // K1: the only way to add to the history, and there is no way to
         // change what is already in it.  The event is the envelope
-        // (`kind` / `beat?` / `meta?` / `data?`) and nothing beside it; what
-        // is under `data` is recorded as written, `beat` included, and the
-        // kernel adds `seq` / `epoch_ms` and an empty `data` when there was
-        // none.  No append touches the budget — that is `reserve` before the
-        // call and `spend` after it — and the two `session_*` kinds are
-        // refused here, since only `knl.open` / `close` write those.
+        // (`kind` / `meta?` / `data?`) and nothing beside it; what is under
+        // `data` is recorded as written, and so are the labels under `meta`,
+        // the beat among them.  The kernel adds `seq` / `epoch_ms` and an
+        // empty `data` when there was none.  No append touches the budget —
+        // that is `reserve` before the call and `spend` after it — and the
+        // two `session_*` kinds are refused here, since only `knl.open` /
+        // `close` write those.
         methods.add_async_method("append", |lua, this, event: LuaValue| async move {
             // Two readings of one table, and they answer different questions.
             //
-            // The first is the type: `kind` is a string, `beat` is a string,
-            // `meta` holds labels and nothing deeper — the contract
+            // The first is the type: `kind` is a string and `meta` holds
+            // labels and nothing deeper — the contract
             // `knl_types.AppendEvent` publishes, checked here on every call in
             // both modes rather than only under the Lua dev gate, which a
             // direct `s:append(...)` never passes through.
@@ -2807,8 +2806,8 @@ mod generated_types {
                     lua,
                     AppendEvent {
                         kind: "msg_user".into(),
-                        beat: Some("beat-1".into()),
                         meta: Some(Meta::from([
+                            ("beat".to_string(), MetaValue::Text("beat-1".into())),
                             ("label".to_string(), MetaValue::Text("seed".into())),
                             ("n".to_string(), MetaValue::Number(1.0)),
                             ("on".to_string(), MetaValue::Flag(true)),
@@ -2826,8 +2825,7 @@ mod generated_types {
                             kind: "msg_user".into(),
                             seq: 2,
                             epoch_ms: 1_700_000_000_000,
-                            _schema_version: 1,
-                            beat: None,
+                            _schema_version: 2,
                             meta: None,
                             data: Json(json!({ "content": "hi" })),
                         }]),
@@ -3666,8 +3664,8 @@ mod tests {
     }
 
     /// The kernel checks the *envelope* of every event — the closed set of
-    /// top-level keys, a string beat, a shallow meta, a table data — and the
-    /// shape of a kind's own `data` is the writer's business, not its.
+    /// top-level keys, a shallow meta, a table data — and the shape of a
+    /// kind's own `data` is the writer's business, not its.
     #[test]
     fn the_envelope_is_validated_and_a_kinds_own_data_is_not() {
         let vm = vm();
@@ -3678,6 +3676,12 @@ mod tests {
         assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
         assert!(msg.contains("content"), "{msg}");
         assert!(msg.contains("under data"), "{msg}");
+
+        // The beat is a label now, so one written at the top level is a stray
+        // key like any other — and the message names where it went.
+        let msg = vm.expect_err(r#"knl.open():append({ kind = "note", beat = "b1" })"#);
+        assert!(msg.contains("knl: append:"), "missing attribution: {msg}");
+        assert!(msg.contains("meta.beat"), "{msg}");
 
         // `meta` is shallow: nesting belongs under `data`.
         let msg =
@@ -3698,15 +3702,15 @@ mod tests {
             -- Rust side takes whatever `data` says, at any depth.
             local beat = knl.new_beat_id()
             s:append({ kind = "msg_user", data = { content = "hi" } })
-            s:append({ kind = "tool_call", beat = beat,
+            s:append({ kind = "tool_call", meta = { beat = beat },
                        data = { call_id = "c1", name = "sh", args = { cmd = "ls" } } })
-            s:append({ kind = "tool_result", beat = beat,
+            s:append({ kind = "tool_result", meta = { beat = beat },
                        data = { call_id = "c1", ok = false, result = "boom" } })
             -- …including an empty one.
             s:append({ kind = "tool_call" })
             assert(s:len() == 5)
-            assert(s:events()[3].beat == beat, "the declared beat is recorded")
-            assert(s:events()[5].beat == nil, "an undeclared beat stays absent")
+            assert(s:events()[3].meta.beat == beat, "the declared beat is recorded")
+            assert(s:events()[5].meta.beat == nil, "an undeclared beat stays absent")
             assert(s:events()[3].data.args.cmd == "ls", "data comes back at any depth")
             assert(next(s:events()[5].data) == nil, "an absent data reads as empty")
 
@@ -3716,9 +3720,9 @@ mod tests {
             assert(m.label == "a" and m.attempt == 2 and m.retried == true,
                    "meta round-trips")
 
-            -- A numbered beat is refused, on any kind.
-            local ok = pcall(function() s:append({ kind = "note", beat = 1 }) end)
-            assert(not ok, "a numeric beat was accepted")
+            -- A beat at the top level is a stray key now: it goes in meta.
+            local ok = pcall(function() s:append({ kind = "note", beat = "b1" }) end)
+            assert(not ok, "a top-level beat was accepted")
         "#,
         )
         .expect("envelope chunk");
@@ -3921,7 +3925,8 @@ mod tests {
         .expect("session boundary kind chunk");
     }
 
-    /// `knl.new_beat_id()` mints the beat id the shell stamps on its events:
+    /// `knl.new_beat_id()` mints the beat id the shell stamps on its events
+    /// as `meta.beat`:
     /// a fresh non-empty string every call, needing no session, and ordered
     /// by the time it was minted (UUID v7) so a stream's beats sort the way
     /// they happened.
@@ -3944,11 +3949,11 @@ mod tests {
             local s = knl.open()
             assert(s.new_beat_id == nil, "the beat id is not the session's to mint")
 
-            -- And it is what the kernel accepts as a beat.
-            s:append({ kind = "llm_response", beat = a,
+            -- And it is what the kernel accepts as a beat, in meta.
+            s:append({ kind = "llm_response", meta = { beat = a },
                        data = { content = { { type = "text", text = "ok" } },
                                 usage = { input_tokens = 1 } } })
-            assert(s:events()[2].beat == a, "the minted beat is recorded verbatim")
+            assert(s:events()[2].meta.beat == a, "the minted beat is recorded verbatim")
         "#,
         )
         .expect("new_beat_id chunk");
@@ -4285,7 +4290,7 @@ mod tests {
 
             -- The record and the ledger continue on the resumed session.
             r:reserve(5)
-            r:append({{ kind = "llm_response", beat = knl.new_beat_id(),
+            r:append({{ kind = "llm_response", meta = {{ beat = knl.new_beat_id() }},
                         data = {{ content = {{ {{ type = "text", text = "c" }} }},
                                   usage = {{ input_tokens = 5 }} }} }})
             assert(#responses(r) == 3, "continued responses: " .. tostring(#responses(r)))
@@ -5494,7 +5499,7 @@ mod tests {
         vm.exec(
             r#"
             local s = knl.open({ owner = "q" })
-            s:append({ kind = "msg_user", beat = "b1", data = { content = "hi" } })
+            s:append({ kind = "msg_user", meta = { beat = "b1" }, data = { content = "hi" } })
             s:append({ kind = "note", meta = { label = "a" }, data = { text = "a note" } })
 
             local rows, truncated = s:query(
@@ -5512,8 +5517,8 @@ mod tests {
                 WHERE stream = $stream GROUP BY kind ORDER BY kind]])
             assert(#counted == 3, "kinds: " .. tostring(#counted))
 
-            -- The envelope is columns, so grouping a run by beat is a
-            -- GROUP BY rather than a json path…
+            -- The beat is lifted out of `meta` into a column, so grouping a
+            -- run by it is a GROUP BY rather than a json path…
             local beats = s:query([[
                 SELECT beat, COUNT(*) AS n FROM events
                 WHERE stream = $stream AND beat IS NOT NULL GROUP BY beat]])
@@ -5715,7 +5720,7 @@ mod tests {
                                  " FROM " .. schema.table .. " WHERE stream = $stream")
             assert(#rows == 1, "the opening event: " .. tostring(#rows))
             assert(rows[1].kind == "session_opened")
-            assert(rows[1].schema_version == 1, "the stored version is a column")
+            assert(rows[1].schema_version == 2, "the stored version is a column")
             assert(rows[1].beat == nil, "an undeclared beat is NULL")
             assert(type(rows[1].meta) == "string", "meta stays the stored text")
             assert(type(rows[1].data) == "string", "and so does data")

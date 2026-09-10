@@ -33,11 +33,12 @@
 //! # The stored shape is columns, and one of them is the kind's own
 //!
 //! The event's envelope is columns — `stream` / `seq` / `epoch_ms` / `kind` /
-//! `schema_version` / `beat` — and the two objects it carries are one column
-//! each: `meta`, a shallow table of scalars, and `data`, the kind's own
-//! content at any depth ([`super::event`]).  A read rebuilds exactly the
-//! object that was written, so a caller sees no difference between this and a
-//! log kept in memory.
+//! `schema_version` — and the two objects it carries are one column each:
+//! `meta`, a shallow table of scalars, and `data`, the kind's own content at
+//! any depth ([`super::event`]).  `beat` is a column beside them, lifted out
+//! of `meta` so the by-beat read has an index to walk.  A read rebuilds
+//! exactly the object that was written, so a caller sees no difference
+//! between this and a log kept in memory.
 //!
 //! The whole event used to go into a single `payload` column, which put an
 //! envelope key and a kind's own field at the same level for anything reading
@@ -58,7 +59,9 @@
 //! `beat` has a column and a `(stream, beat, seq)` index of its own, because
 //! it is the one correlation the log itself is grouped by: the events of one
 //! beat are a range of that index rather than a scan with a `json_extract`
-//! in the predicate.
+//! in the predicate.  The value is `meta.beat` ([`super::event`]) — the
+//! column is a projection of the stored `meta` for the index's sake, and a
+//! read takes the beat back out of `meta` rather than out of the column.
 //!
 //! # The read side is a second connection, and it cannot write
 //!
@@ -276,8 +279,9 @@ pub const EVENTS_TABLE: &str = "events";
 /// obliges a version bump and an upcaster is a change to what an event *is* —
 /// see the [`super::event_store`] module docs.
 ///
-/// `beat` is the one nullable column: it is the caller's to declare and most
-/// events do not belong to a beat.  `meta` and `data` are `NOT NULL` because
+/// `beat` is the one nullable column: it is the caller's to declare
+/// (`meta.beat`) and most events do not belong to a beat, so most rows have
+/// nothing to lift into it.  `meta` and `data` are `NOT NULL` because
 /// they are filled in with `{}` on the way in ([`stamp`]), so a reader never
 /// has to tell an empty object from a missing one.
 const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS events ( \
@@ -1338,7 +1342,7 @@ fn append_if_in(
 }
 
 /// The columns a read selects, in the order [`read_row`] takes them.
-const READ_COLUMNS: &str = "seq, epoch_ms, kind, schema_version, beat, meta, data";
+const READ_COLUMNS: &str = "seq, epoch_ms, kind, schema_version, meta, data";
 
 /// One stored row, as its columns come back from SQLite.
 ///
@@ -1354,8 +1358,6 @@ struct StoredRow {
     kind: String,
     /// The shape the event was written under.
     schema_version: i64,
-    /// The beat the caller declared, if it declared one.
-    beat: Option<String>,
     /// The shallow `meta` object, as stored text.
     meta: String,
     /// The kind's own `data` object, as stored text.
@@ -1369,27 +1371,23 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
         epoch_ms: row.get(1)?,
         kind: row.get(2)?,
         schema_version: row.get(3)?,
-        beat: row.get(4)?,
-        meta: row.get(5)?,
-        data: row.get(6)?,
+        meta: row.get(4)?,
+        data: row.get(5)?,
     })
 }
 
 /// Rebuild the event object a row was written from.
 ///
 /// The inverse of [`insert_row`], and exactly that: the same keys in the same
-/// envelope, so a caller reading a durable log sees what it wrote.  An absent
-/// `beat` is an absent key rather than a null — the kernel's rule is that a
-/// beat is a string when it is there at all.
+/// envelope, so a caller reading a durable log sees what it wrote.  The beat
+/// is not read back out of its column — it is already inside the stored
+/// `meta`, and the column is the copy the index walks.
 fn event_of(row: StoredRow) -> KnlResult<Value> {
     let meta = decode_object(&row.meta, FIELD_META)?;
     let data = decode_object(&row.data, FIELD_DATA)?;
 
     let mut event = Map::new();
     event.insert(FIELD_KIND.to_string(), Value::from(row.kind));
-    if let Some(beat) = row.beat {
-        event.insert(FIELD_BEAT.to_string(), Value::from(beat));
-    }
     event.insert(FIELD_META.to_string(), meta);
     event.insert(FIELD_DATA.to_string(), data);
     event.insert(FIELD_SEQ.to_string(), Value::from(row.seq as u64));
@@ -1554,10 +1552,16 @@ fn insert_row(
         .get(SCHEMA_VERSION_FIELD)
         .and_then(Value::as_u64)
         .unwrap_or(CURRENT_SCHEMA_VERSION);
-    // The beat is the caller's and most events have none: an undeclared one
-    // is a NULL in its column, which is what the read gives back as an
-    // absent key.
-    let beat = event.get(FIELD_BEAT).and_then(Value::as_str);
+    // The beat is a label of `meta` and most events have none: an undeclared
+    // one is a NULL in its column.  The column is a projection for the index
+    // to walk — the value itself stays in the stored `meta` — so a beat that
+    // is not a string leaves the column empty rather than being coerced into
+    // it; `meta` takes any scalar, and the index is for the strings.
+    let beat = event
+        .get(FIELD_META)
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(FIELD_BEAT))
+        .and_then(Value::as_str);
     let meta = encode_object(event.get(FIELD_META), FIELD_META)?;
     let data = encode_object(event.get(FIELD_DATA), FIELD_DATA)?;
     conn.execute(
@@ -2350,16 +2354,15 @@ mod tests {
     }
 
     /// A read rebuilds the object that was written: the envelope out of its
-    /// columns, `meta` and `data` out of theirs, and the beat back as an
-    /// absent key when there was none.
+    /// columns, `meta` and `data` out of theirs, and the beat inside the
+    /// `meta` it was written in.
     #[tokio::test]
     async fn read_reconstructs_the_written_event_out_of_its_columns() {
         let (mut store, _drivers) = mem_store().await;
         store
             .append(obj(json!({
                 "kind": "note",
-                "beat": "b1",
-                "meta": { "label": "a", "attempt": 2, "retried": true },
+                "meta": { "label": "a", "attempt": 2, "retried": true, "beat": "b1" },
                 "data": { "text": "hi", "nested": { "deep": [1, 2] } }
             })))
             .await
@@ -2371,10 +2374,15 @@ mod tests {
 
         let stored = store.read(0, usize::MAX).await.expect("read");
         assert_eq!(kind_of(&stored[0]), "note");
-        assert_eq!(stored[0]["beat"], json!("b1"));
+        assert_eq!(
+            stored[0].get("beat"),
+            None,
+            "the beat is not put back at the top level: {}",
+            stored[0]
+        );
         assert_eq!(
             stored[0]["meta"],
-            json!({ "label": "a", "attempt": 2, "retried": true })
+            json!({ "label": "a", "attempt": 2, "retried": true, "beat": "b1" })
         );
         assert_eq!(
             stored[0]["data"],
@@ -2388,20 +2396,21 @@ mod tests {
             Some(CURRENT_SCHEMA_VERSION)
         );
 
-        // An event with nothing declared: no beat key at all, and the two
-        // objects empty rather than missing.
+        // An event with nothing declared: the two objects empty rather than
+        // missing, and no beat among the labels.
         assert_eq!(stored[1].get("beat"), None, "{}", stored[1]);
         assert_eq!(stored[1]["meta"], json!({}));
         assert_eq!(stored[1]["data"], json!({}));
     }
 
-    /// The beat lands in its own column — a plain `SELECT beat` sees it —
-    /// and the index that makes a by-beat read a range is on the table.
+    /// A `meta.beat` is lifted into a column of its own — a plain
+    /// `SELECT beat` sees it — and the index that makes a by-beat read a
+    /// range is on the table.
     #[tokio::test]
     async fn the_beat_is_a_column_of_its_own_with_an_index() {
         let (mut store, _drivers) = mem_store().await;
         store
-            .append(obj(json!({ "kind": "e1", "beat": "b1" })))
+            .append(obj(json!({ "kind": "e1", "meta": { "beat": "b1" } })))
             .await
             .expect("append");
         store.append(ev(2)).await.expect("append with no beat");
