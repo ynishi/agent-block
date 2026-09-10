@@ -4,6 +4,7 @@
 //! the Host. The binary is intentionally thin — all logic lives in Lua scripts.
 
 mod blocks;
+mod knl;
 mod mcp_serve;
 mod serve;
 
@@ -174,6 +175,16 @@ enum Command {
     /// manager holds is this one, and a lane adds or removes a job by adding
     /// or removing a file beside its block.
     Serve(serve::ServeArgs),
+    /// Read the kernel's log from outside the process that wrote it.
+    ///
+    /// A run's facts land in the project's kernel database, and every reader
+    /// so far has been Lua running inside the host. This is the door for the
+    /// reader that is not: a session id in, JSON Lines out.
+    ///
+    /// ```text
+    /// agent-block knl export --session <ID> --as events|messages
+    /// ```
+    Knl(knl::KnlArgs),
 }
 
 // Deliberately *not* `#[tokio::main]`: the sandbox has to be installed before
@@ -220,8 +231,12 @@ fn startup() -> anyhow::Result<()> {
     // is a protocol violation, not noise. Nothing logs before this point.
     let cli = Cli::parse();
     // stdio MCP owns stdout; a long-lived manager's logs are what a service
-    // manager collects, and stderr is where it looks.
-    let log_to_stderr = matches!(cli.command, Some(Command::Mcp(_)) | Some(Command::Serve(_)));
+    // manager collects, and stderr is where it looks; and `knl export` writes
+    // JSON Lines there, where a log line would be a malformed record.
+    let log_to_stderr = matches!(
+        cli.command,
+        Some(Command::Mcp(_)) | Some(Command::Serve(_)) | Some(Command::Knl(_))
+    );
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -266,6 +281,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Some(Command::Serve(args)) => {
             return serve::serve(args, &cli.project, mcp_rpc_timeout).await;
+        }
+        Some(Command::Knl(args)) => {
+            return knl::run(args, &cli.project).await;
         }
         None => {}
     }

@@ -629,6 +629,91 @@ describe("knl.beat — the primitive", function()
     end)
 end)
 
+describe("knl.beat — what the fold reported about the window", function()
+    -- A fold may answer a second value: what it dropped to build the request.
+    -- beat writes it onto the llm_request and reads it nowhere — the request
+    -- itself cannot say a conversation was cut, and this is the fact that
+    -- says so afterwards.
+    local function llm_request_of(s)
+        for _, ev in ipairs(s:events()) do
+            if ev.kind == "llm_request" then
+                return ev
+            end
+        end
+        return nil
+    end
+
+    local REPORT = { dropped = { "b-old" }, kept = 2, seed_kept = true, before = 120, after = 40, limit = 90 }
+
+    local function beat_with_fold(fold)
+        local s = K.open({})
+        s:append({ kind = "msg_user", data = { content = "q" } })
+        local o = K.beat(s, K.device({ llm = stub_llm("x"), fold = fold }))
+        expect(Outcome.is_ok(o)).to.be(true)
+        return s
+    end
+
+    it("records the report on the llm_request when the fold hands one back", function()
+        local s = beat_with_fold(function(events, device)
+            return K.fold(events, device), REPORT
+        end)
+        local recorded = llm_request_of(s)
+        expect(recorded).to.exist()
+        expect(type(recorded.data.window)).to.be("table")
+        expect(recorded.data.window.kept).to.be(2)
+        expect(recorded.data.window.seed_kept).to.be(true)
+        expect(recorded.data.window.dropped[1]).to.be("b-old")
+        expect(recorded.data.window.before).to.be(120)
+        expect(recorded.data.window.after).to.be(40)
+        expect(recorded.data.window.limit).to.be(90)
+        -- and the request is on the same event, unchanged by any of it
+        expect(#recorded.data.request.messages).to.be(1)
+    end)
+
+    it("leaves it off when the fold reported nothing (the default fold)", function()
+        local s = beat_with_fold(K.fold)
+        expect(llm_request_of(s).data.window).to.be(nil)
+    end)
+
+    it("takes only a table: a stray second value does not become a record", function()
+        -- A fold answering something else beside the request has not made a
+        -- report, and the durable event must not carry one that was never
+        -- meant.
+        local s = beat_with_fold(function(events, device)
+            return K.fold(events, device), "dropped two beats"
+        end)
+        expect(llm_request_of(s).data.window).to.be(nil)
+    end)
+
+    it("dev mode: a report that breaks the shape stops the beat at the append", function()
+        -- The report goes into a durable record, so the closed `llm_request`
+        -- shape judges it there — and the append is inside beat's contract,
+        -- which is why this is an Outcome and not a raise.
+        local shape = require("lshape").check
+        local saved = shape.is_dev_mode
+        shape.is_dev_mode = function()
+            return true
+        end
+        local s = K.open({})
+        local ok, o = pcall(
+            K.beat,
+            s,
+            K.device({
+                llm = stub_llm("x"),
+                fold = function(events, device)
+                    return K.fold(events, device), { kept = "two" }
+                end,
+            })
+        )
+        shape.is_dev_mode = saved
+        expect(ok).to.be(true)
+        expect(o.status).to.be("error")
+        expect(o.kind).to.be("state")
+        -- nothing landed: the write-ahead record is where it stopped
+        expect(#s:events()).to.be(0)
+    end)
+end)
+
 describe("knl.session — the canonical bracket", function()
     it("opens, runs the body, and closes with scope_exit on the way out", function()
         local seen
@@ -899,6 +984,40 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             false
         )
         expect(shape.check({ call_id = "c1", ok = "yes", result = "R" }, K.shapes.events.tool_result)).to.be(false)
+    end)
+
+    it("takes the window report a fold may hand back, on the llm_request and nowhere else", function()
+        -- What a fold left out is recorded beside the request it built. The
+        -- field is optional (most folds window nothing) and the report is
+        -- closed like every other `data` shape.
+        local request = { messages = {} }
+        expect(shape.check({ request = request }, K.shapes.events.llm_request)).to.be(true)
+        expect(shape.check({
+            request = request,
+            window = { dropped = { "b1" }, kept = 2, seed_kept = true, before = 100, after = 40, limit = 50 },
+        }, K.shapes.events.llm_request)).to.be(true)
+        -- the three counted fields are optional together: a window of n
+        -- beats counts nothing
+        expect(shape.check({
+            request = request,
+            window = { dropped = {}, kept = 3, seed_kept = false },
+        }, K.shapes.events.llm_request)).to.be(true)
+        -- the three that are not: a report has to say what it dropped
+        expect(
+            shape.check({ request = request, window = { kept = 3, seed_kept = false } }, K.shapes.events.llm_request)
+        ).to.be(false)
+        -- and a key nobody declared is a column somebody would select
+        expect(shape.check({
+            request = request,
+            window = { dropped = {}, kept = 3, seed_kept = false, extra = 1 },
+        }, K.shapes.events.llm_request)).to.be(false)
+        -- the ids are strings, not the beats themselves
+        expect(shape.check({
+            request = request,
+            window = { dropped = { { id = "b1" } }, kept = 1, seed_kept = false },
+        }, K.shapes.events.llm_request)).to.be(false)
+        -- published under its own name, for the packs that produce one
+        expect(K.shapes.window_report).to.exist()
     end)
 
     it("holds the envelope to the rules this layer mirrors", function()
@@ -1695,6 +1814,49 @@ describe("knl.views — the query views the module ships", function()
         expect(truncated).to.be(false)
     end)
 
+    it("reads what each beat's window dropped off its own llm_request", function()
+        -- Three columns beside the beat's extent, and they are the one place
+        -- this view reaches into `data`. What the statement SELECTS is a
+        -- question for a database (knl_beat_test.lua inv11); what is this
+        -- layer's own is which paths it names and that it names them for one
+        -- kind only.
+        local s = K.open({})
+        local sql = (function()
+            K.views.beats(s)
+            return last_query(s).sql
+        end)()
+        for _, path in ipairs({ "$.window.dropped", "$.window.before", "$.window.after" }) do
+            expect(sql:find(path, 1, true) ~= nil).to.be(true)
+        end
+        -- a count of beats, not the ids: a row is one beat
+        expect(sql:find("json_array_length", 1, true) ~= nil).to.be(true)
+        -- and tied to the one kind that carries a report, so no other kind's
+        -- `data` can ever answer these columns
+        expect(sql:find("kind = 'llm_request'", 1, true) ~= nil).to.be(true)
+        expect(sql:find("json_extract(data", 1, true) ~= nil).to.be(true)
+
+        -- and the row comes back with them on it
+        s._query_rows = {
+            {
+                beat = "b-1",
+                seq_from = 3,
+                seq_to = 6,
+                kinds = "llm_request,llm_response",
+                dropped = 2,
+                before = 900,
+                after = 400,
+            },
+            { beat = "b-2", seq_from = 7, seq_to = 8, kinds = "llm_request,llm_response" },
+        }
+        local rows = K.views.beats(s)
+        expect(rows[1].dropped).to.be(2)
+        expect(rows[1].before).to.be(900)
+        expect(rows[1].after).to.be(400)
+        -- a beat whose request carried no report answers nothing for them
+        expect(rows[2].dropped).to.be(nil)
+        expect(rows[2].before).to.be(nil)
+    end)
+
     it("reads tool_pairs' `ok` back as a boolean (SQLite has none)", function()
         local s = K.open({})
         s._query_rows = {
@@ -1743,5 +1905,171 @@ describe("knl.views — the query views the module ships", function()
             expect(type(K.views[name])).to.be("function")
         end
         expect(K.shapes.api.views.members).to.be(K.shapes.views)
+    end)
+end)
+
+describe("knl.export — the whole log, without the table's shape", function()
+    -- The read a consumer outside this repo makes: no SQL, no column, no
+    -- path into `data`. It goes through `session:events(from)` and pages to
+    -- the end, and answers either what it was given or the conversation the
+    -- default fold reads out of it.
+
+    -- A long result, so "never cut" is a claim with something to cut.
+    local BIG = string.rep("x", 5000)
+
+    local function logged()
+        local s = K.open({})
+        s:append({ kind = "msg_user", data = { content = "hi" } })
+        s:append({ kind = "llm_request", meta = { beat = "b1" }, data = { request = { messages = {} } } })
+        s:append({
+            kind = "llm_response",
+            meta = { beat = "b1" },
+            data = {
+                content = { { type = "tool_use", id = "c1", name = "echo", input = { s = "hi" } } },
+                usage = { input_tokens = 11, output_tokens = 3 },
+                stop_reason = "tool_use",
+            },
+        })
+        s:append({
+            kind = "tool_call",
+            meta = { beat = "b1" },
+            data = { call_id = "c1", name = "echo", args = { s = "hi" } },
+        })
+        s:append({
+            kind = "tool_result",
+            meta = { beat = "b1" },
+            data = { call_id = "c1", ok = true, result = BIG },
+        })
+        return s
+    end
+
+    it("answers the stored events, whole and in seq order", function()
+        local s = logged()
+        local events = K.export(s)
+        expect(#events).to.be(5)
+        local kinds = {}
+        for i, ev in ipairs(events) do
+            kinds[i] = ev.kind
+        end
+        expect(table.concat(kinds, ",")).to.be("msg_user,llm_request,llm_response,tool_call,tool_result")
+        -- the objects the kernel handed back, not a selection out of them:
+        -- the envelope is all there, `meta` and `data` included
+        expect(events[3].meta.beat).to.be("b1")
+        expect(events[3].data.usage.input_tokens).to.be(11)
+        expect(events[1].seq).to.be(1)
+        -- and `as = "events"` is the default
+        expect(#K.export(s, { as = "events" })).to.be(#events)
+    end)
+
+    it("answers one entry per message-bearing event, carrying beat and seq", function()
+        local entries = K.export(logged(), { as = "messages" })
+        -- the llm_request is not a message and is not one here
+        expect(#entries).to.be(4)
+        local kinds = {}
+        for i, entry in ipairs(entries) do
+            kinds[i] = entry.kind
+            expect(entry.seq).to.exist()
+        end
+        expect(table.concat(kinds, ",")).to.be("msg_user,llm_response,tool_call,tool_result")
+        expect(entries[1].role).to.be("user")
+        expect(entries[1].content).to.be("hi")
+        expect(entries[1].beat).to.be(nil) -- the seed is part of no beat
+        expect(entries[2].role).to.be("assistant")
+        expect(entries[2].beat).to.be("b1")
+        expect(entries[4].role).to.be("user")
+    end)
+
+    it("carries usage and stop_reason on the entries that came from an answer", function()
+        local entries = K.export(logged(), { as = "messages" })
+        expect(entries[2].usage.input_tokens).to.be(11)
+        expect(entries[2].usage.output_tokens).to.be(3)
+        expect(entries[2].stop_reason).to.be("tool_use")
+        -- and nowhere else: they are the answer's facts, not a message's
+        expect(entries[1].usage).to.be(nil)
+        expect(entries[4].stop_reason).to.be(nil)
+    end)
+
+    it("never cuts a tool_result", function()
+        -- The default fold trims nothing, and a `policy.result_cap` capped
+        -- what a handler answered before the log ever saw it. What is
+        -- recorded is what comes back.
+        local entries = K.export(logged(), { as = "messages" })
+        local result = entries[4]
+        expect(result.kind).to.be("tool_result")
+        expect(#result.content.content).to.be(#BIG)
+        expect(result.content.tool_use_id).to.be("c1")
+        expect(result.content.is_error).to.be(nil)
+    end)
+
+    it("speaks the fold's own content shapes (one implementation, two readers)", function()
+        -- The tool_result block an entry carries is the one `knl.fold` puts
+        -- in a request: same type, same id, same rendering of the result.
+        local s = logged()
+        local folded = K.fold(s:events(), {})
+        local from_fold
+        for _, message in ipairs(folded.messages) do
+            if
+                type(message.content) == "table"
+                and message.content[1] ~= nil
+                and message.content[1].type == "tool_result"
+            then
+                from_fold = message.content[1]
+            end
+        end
+        local from_export = K.export(s, { as = "messages" })[4].content
+        expect(from_export.type).to.be(from_fold.type)
+        expect(from_export.tool_use_id).to.be(from_fold.tool_use_id)
+        expect(from_export.content).to.be(from_fold.content)
+    end)
+
+    it("pages until the read says there is no more", function()
+        -- One read is bounded by the kernel's row cap, so a log longer than
+        -- it comes back as a prefix — which is a shorter conversation and
+        -- looks like nothing at all went wrong. Here the stand-in answers
+        -- two rows at a time and says so.
+        local s = logged()
+        local all = s:events()
+        local reads = 0
+        s.events = function(_self, from)
+            reads = reads + 1
+            from = from or 1
+            local page = {}
+            for i = from, math.min(from + 1, #all) do
+                page[#page + 1] = all[i]
+            end
+            local last = page[#page]
+            return page, last ~= nil and last.seq < #all
+        end
+        local events = K.export(s)
+        expect(#events).to.be(#all)
+        expect(reads > 1).to.be(true)
+        expect(events[#events].kind).to.be("tool_result")
+    end)
+
+    it("refuses a sessions list naming anything but this session", function()
+        local s = logged()
+        -- its own id is the one thing it may name
+        expect(#K.export(s, { sessions = { s:id() } })).to.be(5)
+        local ok, err = pcall(K.export, s, { sessions = { "sess-other" } })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("only this session", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("session:query", 1, true) ~= nil).to.be(true)
+        -- and its own id beside another's is still another's
+        expect(pcall(K.export, s, { sessions = { s:id(), "sess-other" } })).to.be(false)
+    end)
+
+    it("refuses an option or a reading it does not know, loudly", function()
+        local s = logged()
+        expect(pcall(K.export, s, { as = "sql" })).to.be(false)
+        expect(pcall(K.export, s, { tail = 2 })).to.be(false)
+        expect(pcall(K.export, "not a session")).to.be(false)
+    end)
+
+    it("tags what it answers as an array, so an empty log crosses as []", function()
+        local s = K.open({})
+        local events = K.export(s)
+        expect(#events).to.be(0)
+        expect(getmetatable(events).__jsontype).to.be("array")
+        expect(getmetatable(K.export(s, { as = "messages" })).__jsontype).to.be("array")
     end)
 end)

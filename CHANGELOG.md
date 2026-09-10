@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `agent-block knl export --session <ID> --as events|messages`: one session's
+  log, as JSON Lines on stdout, one record per line. The reader that wants a
+  run's facts most is not the process that wrote them — a job manager, a test,
+  a person after the fact — and until now every way to read them was Lua
+  running inside the host. `--as events` is the stored log, read through the
+  kernel's own store so the upcaster chain runs and a stream written under an
+  older schema version comes back in the current shape; `--as messages` folds
+  it to the conversation it holds (`msg_user` / `llm_response` / `tool_call` /
+  `tool_result`, one record each, carrying `beat` / `seq` / `epoch_ms` /
+  `kind`), mirroring the Lua kernel's `knl.export`. `--store` reads another
+  database; without it the project's own is used, resolved from `-p/--project`
+  the same way `knl.open{}` resolves it. A missing session or an unreadable
+  store is a one-line `error:` on stderr and exit `1`.
+
+- `knl.export(session, { as = "events" | "messages" })`: the same two forms
+  from inside a script, read through `session:events(from)` page by page
+  until the log ends — never one bounded read — so the length of the log and
+  the shape of the table underneath are not the caller's to know. A
+  `messages` entry carries `beat`, `seq`, `epoch_ms` and `kind` beside `role`
+  and `content`, an `llm_response`'s `usage` and `stop_reason` stay on it, and
+  a `tool_result`'s content is never cut. This is the read a consumer should
+  build on; `session:query` stays for the questions only SQL can ask.
+
+- What the window dropped is on the record. `policy.window`'s fold answers a
+  second value beside the request — `{ dropped, kept, seed_kept, before,
+  after, limit }`: the beat ids it left out (oldest first), how many it kept,
+  whether the seed stayed, and the token count before and after against the
+  limit it fitted to (the three counts only with `fit`) — and `knl.beat`
+  writes it as `llm_request.data.window`, in the same event as the request it
+  describes. A fold that answers one value is unchanged. `knl.views.beats`
+  gains `dropped`, `before` and `after`, NULL for a beat whose request carried
+  no report, so "what did this run forget, and when" is a view rather than a
+  guess from the size of the tool results.
+
+### Changed
+
+- `policy.window`'s raise says which number it counted. When no event in the
+  history carries `meta.beat` the whole of it is the seed and that is what
+  does not fit; the message used to call that "the newest beat", which reads
+  as a window regression. It now says the history is unmarked, what it
+  counted, and the two ways to mark it.
+
+### Fixed
+
+- A query whose statement does not compile is a `validation` error again, not
+  a `storage` one. The store underneath has no statement class and files a
+  misspelled column or a syntax error with the disk faults, so a reader that
+  asked for a column the schema no longer has was told the store was unwell
+  rather than that its statement was — and a fallback that branches on the
+  class took the wrong branch. The query path now reads SQLite's own wording
+  back (`no such column`, `no such table`, `no such function`, `syntax error`,
+  `near "`, `wrong number of arguments`, `ambiguous column name`) and answers
+  `validation: sql: <reason>` for those, leaving every other failure — busy,
+  timeout, a real store fault — exactly where it was. A statement class in the
+  store itself is asked for separately; this stands in until it lands.
+
 ### Docs
 
 - What the exit code says, in the README: `0` ran and returned, `75` did not

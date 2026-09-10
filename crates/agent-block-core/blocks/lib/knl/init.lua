@@ -71,12 +71,14 @@
 ---         the device — any of the three missing is `Outcome.err("conf")`
 ---   [0.5] the beat names itself (`knl.new_beat_id`)
 ---   [1]   request = `device.fold(session:events(), device)` — a read that
----         hit the row cap is refused here rather than folded
+---         hit the row cap is refused here rather than folded. A fold may
+---         answer a report beside the request (see [4])
 ---   [2]   the filter chain, each `fn(request) -> request`
 ---   [3]   `session:reserve(device.cost(request))` — the beat's whole
 ---         deduction, taken before the call; a refusal stops here, with
 ---         nothing recorded and no call made
----   [4]   append `llm_request`
+---   [4]   append `llm_request`, carrying what the fold left out as
+---         `data.window` when it reported any (`knl.shapes.window_report`)
 ---   [5]   `device.llm(request)`
 ---   [6]   append `llm_response`, or `llm_call_failed` with the failure's
 ---         classification on it
@@ -172,6 +174,14 @@
 ---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `sessions` /
 ---   `tree` are the six this module ships, and a consumer's own view is a
 ---   function of exactly the same form — nothing about the six is privileged.
+---
+---   `knl.export(session, opts?)` is neither a third tier nor a view: it is
+---   the FIRST tier, paged to the end, plus the two readings a consumer
+---   outside this repo actually asks for — the stored events whole
+---   (`as = "events"`) or the conversation they carry (`as = "messages"`).
+---   It is here rather than in every consumer because the paging is the part
+---   that gets left out, and a log read once is a log that ends where the row
+---   cap did. Nothing about it depends on the table's columns.
 ---
 ---   Token usage is a query view and not a built-in one, deliberately.
 ---   Every `llm_response` carries the counts its adapter normalized out of
@@ -483,6 +493,28 @@ local function result_text(result)
     return std.json.encode(result)
 end
 
+--- A stored `tool_result`'s `data`, as the content block that answers the
+--- call it names.
+---
+--- One place, two readers: the fold builds a request out of these, and
+--- `knl.export{ as = "messages" }` builds a reading out of the same events.
+--- The alternative was the second reader spelling out `tool_use_id` /
+--- `is_error` / the rendering of a non-string result for itself, which is one
+--- content shape with two versions waiting to disagree.
+---
+--- Nothing is cut here, and nothing ever was: a result is rendered whole. A
+--- cap on what a tool may ANSWER is `policy.result_cap`, and it acts on the
+--- handler's return before the log ever sees it — so what the log holds is
+--- what both readers hand on.
+local function tool_result_block(data)
+    return {
+        type = "tool_result",
+        tool_use_id = data.call_id,
+        content = result_text(data.result),
+        is_error = (data.ok == false) or nil,
+    }
+end
+
 --- The wire declarations for `tools` (name -> { description, input_schema,
 --- handler }), handler stripped: the request carries what the model may
 --- call, not how to call it. Sorted by name so fold stays deterministic
@@ -622,12 +654,7 @@ function M.fold(events, device)
             if data.call_id ~= nil then
                 answered[data.call_id] = true
             end
-            batch[#batch + 1] = {
-                type = "tool_result",
-                tool_use_id = data.call_id,
-                content = result_text(data.result),
-                is_error = (data.ok == false) or nil,
-            }
+            batch[#batch + 1] = tool_result_block(data)
         end
         -- everything else (tool_call / session_* / budget_* /
         -- llm_call_failed / llm_request) is not part of a request: skip it.
@@ -742,6 +769,42 @@ local REQUEST = T.shape({
     system = T.any:is_optional(),
     tools = T.array_of(WIRE_TOOL):is_optional(),
 })
+
+--- What a fold left out of the request it just built.
+---
+--- A fold that windows the history takes a decision the request itself cannot
+--- express — it simply begins later, and a reader of the log cannot tell a
+--- conversation that started there from one that was cut. So the fold may
+--- answer this beside the request and `knl.beat` records it on the
+--- `llm_request` event; nothing in the kernel reads it back. It is a fact for
+--- the log, in the terms the decision was taken in: BEATS dropped, not events
+--- or bytes.
+---
+---   dropped    the beat ids that went, oldest first; empty when none did
+---   kept       how many beats the request carries
+---   seed_kept  whether the events ahead of the first kept beat (the caller's
+---              seed) are in the request — always so when nothing was
+---              dropped, and the fold's own `keep_seed` when something was
+---   before     what the whole log cost, in the unit the fold counted in
+---   after      what was sent
+---   limit      the room the count was held against
+---
+--- The last three are optional together: a fold that windows by a count of
+--- beats never counts tokens at all, and a number invented there would be one
+--- nobody measured. `policy.window` is the fold that fills them
+--- (`fit = { port }`); the plain `tail` form leaves all three out.
+---
+--- Closed, like every other `data` shape: this is a path `knl.views.beats`
+--- selects, and a key that arrived by accident is a column somebody will
+--- eventually read.
+local WINDOW_REPORT = T.shape({
+    dropped = T.array_of(T.string):describe("the beat ids the fold left out, oldest first"),
+    kept = T.number:describe("how many beats the request carries"),
+    seed_kept = T.boolean:describe("the events ahead of the window are in the request"),
+    before = T.number:describe("what the whole log counted"):is_optional(),
+    after = T.number:describe("what was sent"):is_optional(),
+    limit = T.number:describe("the room the profile left for a request"):is_optional(),
+}, { open = false })
 
 --- An event's `meta`: labels, and only labels.
 ---
@@ -909,8 +972,13 @@ local EVENT_DATA = {
     msg_user = T.shape({
         content = T.any,
     }, { open = false }),
+    -- The request as it was sent, and — when the device's fold answered one
+    -- — what that fold left out to arrive at it (`WINDOW_REPORT`). The
+    -- report is optional because most folds do not window: the default one
+    -- sends the whole history and has nothing to report.
     llm_request = T.shape({
         request = REQUEST,
+        window = WINDOW_REPORT:is_optional(),
     }, { open = false }),
     llm_response = T.shape({
         content = T.array_of(T.table),
@@ -1178,6 +1246,24 @@ local QUERY_OPTS = T.shape({
     limit = T.number:is_optional(),
 }, { open = false })
 
+--- What `knl.export` is asked for.
+---
+--- `as` names the reading — the stored events as they came back, or the
+--- messages they fold to — and defaults to `"events"`, the plainest of the
+--- two. `sessions` is the same word `query_opts` uses and is held to a
+--- narrower promise here: this round exports the session's own stream, so a
+--- list naming anything else is refused rather than half-honoured (see
+--- `knl.export`).
+---
+--- Closed, like `query_opts`: an option the reader does not know must not
+--- quietly do nothing.
+local EXPORT_OPTS = T.shape({
+    as = T.one_of({ "events", "messages" }):describe('the reading; default "events"'):is_optional(),
+    sessions = T.array_of(T.string)
+        :describe("the streams to export; only this session's own id, this round")
+        :is_optional(),
+}, { open = false })
+
 --- The read schema, as data: the kernel's table and its columns, published
 --- as the contract a caller writes SQL against.
 ---
@@ -1236,6 +1322,12 @@ M.shapes = {
     call_error_kinds = CALL_ERROR_KINDS,
     call_error_retryable = CALL_ERROR_RETRYABLE,
     request = REQUEST,
+    -- What a fold answers BESIDE the request when it left something out.
+    -- Published here rather than in the pack that produces it (`policy.window`)
+    -- for the reason every other event shape is: the kernel is what records
+    -- it, on the `llm_request`, so the kernel owns the declaration.
+    window_report = WINDOW_REPORT,
+    export_opts = EXPORT_OPTS,
     event_base = EVENT_BASE,
     event_meta = EVENT_META,
     -- The `data` shapes of the kinds this layer writes, by kind, plus the
@@ -1403,7 +1495,10 @@ end
 local VIEWS = {
     beats = {
         args = view_args(),
-        returns = "{ { beat, seq_from, seq_to, kinds }, ... }, truncated — one row per beat, in first-seq order",
+        returns = "{ { beat, seq_from, seq_to, kinds, dropped, before, after }, ... }, truncated"
+            .. " — one row per beat, in first-seq order; the last three come off that beat's own"
+            .. " `llm_request` (`data.window`, what its fold left out: how many beats it dropped and"
+            .. " what the request cost before and after) and are nil when the request carried no report",
     },
     tool_pairs = {
         args = view_args(),
@@ -1469,6 +1564,12 @@ M.shapes.api = {
     fold = {
         args = { arg_of(T.array_of(EVENT_BASE), "events"), arg_of(T.table, "device (read for system / tools)") },
         returns = REQUEST,
+    },
+    export = {
+        args = { arg_of(SESSION_HANDLE, "session"), arg_of(EXPORT_OPTS, "opts?") },
+        returns = 'table — the whole log, paged to the end: the stored events in seq order (as = "events"),'
+            .. ' or one entry per message-bearing event (as = "messages": { role, content, beat, seq,'
+            .. " epoch_ms, kind }, plus usage / stop_reason where the entry came from an llm_response)",
     },
     new_beat_id = {
         args = {},
@@ -2419,6 +2520,16 @@ end
 --- Re-entrant and stateless: a beat is decided entirely by its two
 --- arguments, so it can be called from any driver, resumed, or interleaved.
 ---
+--- What the fold left out is recorded, not decided on
+---   A fold may answer a second value beside the request — a report of what
+---   it dropped to build it (`knl.shapes.window_report`: the beat ids, how
+---   many stayed, whether the seed did, and the token counts when it counted
+---   any). beat writes it onto the `llm_request` event as `data.window` and
+---   reads it nowhere: a windowed request is indistinguishable from a short
+---   conversation once it is in the log, and this is the fact that tells them
+---   apart afterwards. Nothing branches on it, no policy is applied to it, and
+---   a fold that answers one value (the default one does) leaves it absent.
+---
 --- Every syscall it makes is pcall'd and every failure comes back as an
 --- Outcome — `err("state")`, carrying the kernel's own reading of the raise
 --- (`detail.kind` / `detail.retryable`, `knl.shapes.error`). beat does NOT
@@ -2488,7 +2599,13 @@ function M.beat(session, device)
         }))
     end
     -- The fold is the caller's code, so its failures are traced (dev mode).
-    local folded_ok, request = xpcall(device.fold, traced, events, device)
+    --
+    -- A fold may answer a SECOND value: a report of what it left out
+    -- (`knl.shapes.window_report`). It is carried to [4] and written on the
+    -- `llm_request` and read nowhere else — the beat decides nothing on it.
+    -- The default fold answers one value, and so does a caller's own unless
+    -- it windows; `report` is simply nil then.
+    local folded_ok, request, report = xpcall(device.fold, traced, events, device)
     if not folded_ok then
         return emit(Outcome.err("conf", raised_detail("fold failed: " .. raised_text(request), request)))
     end
@@ -2553,9 +2670,22 @@ function M.beat(session, device)
     -- can fail (closed session, an unavailable store, validation) — beat's
     -- contract is an Outcome, so a state failure is Error("state"), never
     -- a raw raise.
+    --
+    -- What the fold left out to build that request goes on the same event, as
+    -- `data.window`, when the fold answered one: the request itself cannot
+    -- say it — a windowed conversation just begins later — and the beat that
+    -- sent it is the only moment the fact exists. It is written and never
+    -- read back here; `knl.views.beats` is what reads it, and a caller may.
+    -- Only a table is taken: a fold answering something else beside the
+    -- request has not made a report, and a stray second value must not become
+    -- a durable one.
+    local request_data = { request = request }
+    if type(report) == "table" then
+        request_data.window = report
+    end
     local rec_ok, rec_err = pcall(record, session, with_beat({
         kind = "llm_request",
-        data = { request = request },
+        data = request_data,
     }, beat_id))
     if not rec_ok then
         return emit(Outcome.err("state", read_error(rec_err)))
@@ -2729,17 +2859,45 @@ M._execute_tools = execute_tools
 ---
 --- Events with no `meta.beat` — the session's own boundaries, the ledger, a
 --- caller's seed message — are not part of any beat and are left out. The
---- grouping key is a `meta` label, so this view reads nothing out of any
---- kind's `data` and no change to one can reach it.
+--- grouping key is a `meta` label, so the grouping itself reads nothing out
+--- of any kind's `data` and no change to one can reach it.
+---
+--- Three columns do reach into `data`, and into exactly one kind's:
+--- `dropped` / `before` / `after` come off the beat's own `llm_request`,
+--- where `knl.beat` records what the fold left out (`data.window`,
+--- `knl.shapes.window_report`). `dropped` is the LENGTH of the id list
+--- rather than the ids — a row is one beat, and the ids of the beats it
+--- dropped are a list inside it that a caller reads off the event when it
+--- wants them.
+---
+--- The `CASE WHEN kind = 'llm_request'` is what keeps that tie to one kind:
+--- without it the paths would be selected out of every event of the beat, and
+--- a future kind carrying a `window` key would silently join in. So this view
+--- moves with the shape of `llm_request` and with nothing else. A beat whose
+--- request carried no report answers NULL — `json_extract` of a missing path
+--- is NULL, and `json_array_length` of NULL is NULL — which is the honest
+--- answer for a fold that windowed nothing, and not a zero it never reported.
 local BEATS_SQL = [[
 SELECT beat,
        MIN(seq)           AS seq_from,
        MAX(seq)           AS seq_to,
-       group_concat(kind) AS kinds
+       group_concat(kind) AS kinds,
+       MAX(dropped)       AS dropped,
+       MAX(counted_before) AS "before",
+       MAX(counted_after)  AS "after"
   FROM (SELECT json_extract(meta, '$.beat') AS beat,
                stream,
                seq,
-               kind
+               kind,
+               CASE WHEN kind = 'llm_request'
+                    THEN json_array_length(json_extract(data, '$.window.dropped'))
+               END AS dropped,
+               CASE WHEN kind = 'llm_request'
+                    THEN json_extract(data, '$.window.before')
+               END AS counted_before,
+               CASE WHEN kind = 'llm_request'
+                    THEN json_extract(data, '$.window.after')
+               END AS counted_after
           FROM events
          WHERE stream IN $sessions
            AND json_extract(meta, '$.beat') IS NOT NULL
@@ -2931,7 +3089,16 @@ end
 
 M.views = {}
 
---- One row per beat: `{ beat, seq_from, seq_to, kinds }`.
+--- One row per beat: `{ beat, seq_from, seq_to, kinds, dropped, before,
+--- after }`.
+---
+--- The first four are the beat's own extent, read off the envelope. The last
+--- three are what its fold left out, read off that beat's `llm_request`
+--- (`data.window`): how many beats it dropped, and what the request counted
+--- before and after the dropping. All three are nil for a beat whose request
+--- carried no report — a fold that windows nothing reports nothing — and
+--- `before` / `after` are nil as well for a fold that windowed by a count of
+--- beats and never counted tokens.
 ---
 --- @param session userdata|table  a knl session
 --- @param opts table|nil  query opts (`sessions` to span a set of streams)
@@ -3026,6 +3193,217 @@ end
 --- @return boolean truncated
 function M.views.sessions(session, opts)
     return read_view(session, SESSIONS_SQL, opts)
+end
+
+-- ============================================================
+-- export — the whole log, without the table's shape
+-- ============================================================
+--
+-- The third way of reading a log, and the one that asks the kernel for it
+-- rather than the database. A view is SQL over columns, and SQL over columns
+-- is a reader that knows the schema: `data` is JSON in a column, a path into
+-- it is a claim about a kind's shape, and a consumer outside this repo that
+-- wants "the conversation" should not have to make either claim. So this
+-- reads through `session:events(from)` — the kernel's own read, whose
+-- contract is a list of stored events — and hands back what it was given, or
+-- what the default fold makes of it.
+--
+-- It is not a third TIER of read (the header's two are the kernel's built-in
+-- reads and the query views). It is a caller-side composition of the first
+-- one, written here because every consumer that needed it was about to write
+-- the same paging loop, and one of them was going to write it without the
+-- loop — which is the bug this exists to not have.
+
+--- Every event of `session`'s own stream, read to the end.
+---
+--- `session:events(from)` is bounded: it answers at most the kernel's row cap
+--- and says so with `truncated` beside the rows (the header). A single read
+--- is therefore a PREFIX of a log that is long enough, and an export built on
+--- one would silently end where the cap did — which is the failure mode that
+--- looks exactly like a shorter conversation. `policy`'s `whole_log` refuses a
+--- truncated read for the same reason; the difference is that a policy is
+--- asking about the END of a run and cannot page to it usefully, while an
+--- export wants all of it and pages until the kernel says there is no more.
+---
+--- Paging is by `seq`, from one past the last row of the page. A truncated
+--- read with no rows to page from would be an unbounded loop, so it raises
+--- instead: the kernel does not do that, and if it ever did, a hang is the
+--- one way of reporting it that helps nobody.
+---
+--- @param session userdata|table  a knl session
+--- @param who string  the caller's name, for the message
+--- @return table  every stored event of the stream, in seq order
+local function whole_stream(session, who)
+    local out, from = tag_array({}), nil
+    while true do
+        local rows, truncated = session:events(from)
+        rows = rows or {}
+        for _, ev in ipairs(rows) do
+            out[#out + 1] = ev
+        end
+        if not truncated then
+            return out
+        end
+        local last = rows[#rows]
+        if last == nil or type(last.seq) ~= "number" then
+            error(who .. ": a read that reported itself cut short answered no seq to page from", 0)
+        end
+        from = last.seq + 1
+    end
+end
+
+--- One stored event as a message entry, or nil for an event that is not one.
+---
+--- The four kinds a conversation is made of, in the same content vocabulary
+--- the fold speaks — `tool_result_block` is the fold's own, shared rather
+--- than restated, and an `llm_response`'s blocks are handed on verbatim the
+--- way `knl.fold` hands them on. What is added is the envelope a reader
+--- outside this process cannot reconstruct: which beat wrote it, where it sits
+--- in the log, and when.
+---
+--- `tool_call` is here although the default fold SKIPS it: the call is
+--- already inside its beat's `llm_response` as a `tool_use` block, so an
+--- entry for it repeats a fact rather than inventing one, and a consumer
+--- rebuilding a plain conversation drops the entries whose `kind` is
+--- `tool_call`. What it buys is a reading in which the calls are events with
+--- their own seq and their own place in time, which is what an export of a
+--- log is for.
+---
+--- Nothing is trimmed, and there is nothing to switch off: the default fold
+--- trims no content at all, and a `policy.result_cap` capped what a handler
+--- ANSWERED, before the log. A `tool_result` here carries what was recorded.
+local function message_entry(ev)
+    local kind = ev.kind
+    -- An event with no `data` reads as an empty one, exactly as in `fold`: a
+    -- malformed record is skipped rather than raising inside a read.
+    local data = type(ev.data) == "table" and ev.data or {}
+    local role, content
+    if kind == "msg_user" then
+        role, content = "user", data.content
+    elseif kind == "llm_response" then
+        role, content = "assistant", data.content
+    elseif kind == "tool_call" then
+        -- The same block this beat's `llm_response` already carries for the
+        -- call (`knl.shapes.tool_use_block`), read back off the record the
+        -- kernel wrote when it made it — not a shape invented here.
+        role = "assistant"
+        content = { type = "tool_use", id = data.call_id, name = data.name, input = data.args }
+    elseif kind == "tool_result" then
+        role, content = "user", tool_result_block(data)
+    else
+        return nil
+    end
+    local entry = {
+        role = role,
+        content = content,
+        kind = kind,
+        seq = ev.seq,
+        epoch_ms = ev.epoch_ms,
+        beat = ev.meta ~= nil and ev.meta.beat or nil,
+    }
+    if kind == "llm_response" then
+        -- The two facts an answer carries that a message does not: what the
+        -- call cost and why it stopped. They ride on the entry they belong
+        -- to rather than in a parallel list nobody can align.
+        entry.usage = data.usage
+        entry.stop_reason = data.stop_reason
+    end
+    return entry
+end
+
+--- The session's whole log, as events or as messages.
+---
+---     knl.export(s)                        -- the stored events, in seq order
+---     knl.export(s, { as = "messages" })   -- the conversation they fold to
+---
+--- `as = "events"` (the default) hands back the objects `session:events`
+--- answered, whole and unedited: `kind`, `meta`, `data`, plus the kernel's
+--- stamps (`seq`, `epoch_ms`, `_schema_version`). Nothing is selected out of
+--- them, which is the point — a consumer that reads a path this module does
+--- not know about is reading the log, not an interface.
+---
+--- `as = "messages"` is one entry per event that carries a message —
+--- `msg_user`, `llm_response`, `tool_call`, `tool_result` — as `{ role,
+--- content, beat, seq, epoch_ms, kind }`, plus `usage` and `stop_reason` on
+--- the entries that came from an `llm_response` (`message_entry`). A
+--- `tool_result`'s content is never cut: the default fold trims nothing, and
+--- what capped a result capped it before it was recorded.
+---
+--- IT IS NOT A FOLD. `knl.fold` builds one REQUEST — the messages batched and
+--- ordered as a provider takes them, with a dangling `tool_use` repaired —
+--- and this builds a READING, one entry per event, in seq order, repairing
+--- nothing. Handing an export to a provider is not what it is for.
+---
+--- `sessions` names the streams to export and, this round, may name only this
+--- session's own id. Reading another stream whole would mean either resuming
+--- a session this call was not given (`knl.resume` is refused on a closed
+--- one) or selecting the log out of the events table by hand — which is the
+--- schema this reader exists not to depend on. So it is refused rather than
+--- half-answered: open or resume that session and export it, or read across
+--- streams with a `session:query` of your own.
+---
+--- The read is paged to the end (`whole_stream`), so a log longer than the
+--- kernel's row cap exports whole. The session must be open; a closed one
+--- raises out of the read like any other.
+---
+--- @param session userdata|table  a knl session (knl.open / knl.resume)
+--- @param opts table|nil  `knl.shapes.export_opts` — { as?, sessions? }
+--- @return table  the events, or the message entries, in seq order
+function M.export(session, opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("knl.export: opts must be a table", 2)
+    end
+    -- Loud in prod too, like every other option this module reads: a
+    -- misspelled option that quietly did nothing would look exactly like the
+    -- export answering what was asked for.
+    for key in pairs(opts) do
+        if key ~= "as" and key ~= "sessions" then
+            error("knl.export: unknown option '" .. tostring(key) .. "'", 2)
+        end
+    end
+    local as = opts.as
+    if as == nil then
+        as = "events"
+    end
+    if as ~= "events" and as ~= "messages" then
+        error('knl.export: `as` must be "events" or "messages", got ' .. tostring(as), 2)
+    end
+    if not is_session(session) then
+        error("knl.export takes a knl session first (from knl.open / knl.resume)", 2)
+    end
+    if opts.sessions ~= nil then
+        if type(opts.sessions) ~= "table" then
+            error("knl.export: sessions must be an array of session ids", 2)
+        end
+        local own = session:id()
+        for _, id in ipairs(opts.sessions) do
+            if id ~= own then
+                error(
+                    "knl.export: sessions may name only this session ("
+                        .. tostring(own)
+                        .. ") and it named "
+                        .. tostring(id)
+                        .. ": exporting another stream is not in this round — open or resume that session "
+                        .. "and export it, or read across streams with session:query",
+                    2
+                )
+            end
+        end
+    end
+
+    local events = whole_stream(session, "knl.export")
+    if as == "events" then
+        return events
+    end
+    local out = tag_array({})
+    for _, ev in ipairs(events) do
+        local entry = message_entry(ev)
+        if entry ~= nil then
+            out[#out + 1] = entry
+        end
+    end
+    return out
 end
 
 -- ============================================================

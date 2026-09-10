@@ -73,6 +73,10 @@
 //! the row here, so the Lua side reads an absent key as `nil`, which is what a
 //! missing column means there.
 //!
+//! A statement that does not compile is the caller's, not the store's, and is
+//! answered as [`KnlError::Validation`] even though eventsdb classes it with
+//! the disk faults ([`SQLITE_STATEMENT_ERRORS`]).
+//!
 //! [`TxnContext`]: eventsdb_sqlite::TxnContext
 
 use std::path::Path;
@@ -528,7 +532,7 @@ impl EventStore for SqliteEventStore {
             .log
             .query_timeout(&sql, plan.values.clone(), plan.timeout)
             .await
-            .map_err(KnlError::from)?;
+            .map_err(query_error)?;
 
         let truncated = rows.len() > plan.limit;
         Ok(QueryRows {
@@ -682,6 +686,56 @@ impl From<eventsdb_core::Error> for KnlError {
             Failure::Unsupported(reason) => KnlError::Unsupported(reason),
             other => KnlError::Storage(other.to_string()),
         }
+    }
+}
+
+/// SQLite's own words for a statement that did not compile.
+///
+/// A stand-in for a class the store does not have yet.  eventsdb sorts a
+/// statement that fails to *prepare* — a misspelled column, a syntax error —
+/// into `Storage` along with a disk fault, because its classification has no
+/// statement class to put it in.  The two are not the same answer: `storage`
+/// says the store is not well, `validation` says the caller's statement is,
+/// and a reader branches on which.  So the query path — and only the query
+/// path, since it is the only one that runs a statement the caller wrote —
+/// reads the message back for these phrases and returns the statement errors
+/// to the class they belong to.
+///
+/// The ask for a statement class upstream is filed separately; when it lands,
+/// this table and [`query_error`] go with it.  Until then, matching the text
+/// is what is left, and it is kept to the phrases SQLite itself produces:
+/// rusqlite renders them as `… : <sqlite message>`, so the test is
+/// `contains`, not a prefix of the whole string.
+const SQLITE_STATEMENT_ERRORS: [&str; 7] = [
+    "no such column",
+    "no such table",
+    "no such function",
+    "syntax error",
+    "near \"",
+    "wrong number of arguments",
+    "ambiguous column name",
+];
+
+/// Whether `message` is SQLite refusing to compile the caller's statement.
+fn is_statement_error(message: &str) -> bool {
+    SQLITE_STATEMENT_ERRORS
+        .iter()
+        .any(|phrase| message.contains(phrase))
+}
+
+/// [`From<eventsdb_core::Error>`] for the query path: a `Storage` failure that
+/// is really the caller's statement comes back as [`KnlError::Validation`],
+/// prefixed `sql:` so the reason names which half of the request was wrong.
+///
+/// Everything else travels unchanged — a busy read is still `busy`, a
+/// deadline is still `timeout`, and a fault that is the store's is still
+/// `storage`.
+fn query_error(error: eventsdb_core::Error) -> KnlError {
+    match KnlError::from(error) {
+        KnlError::Storage(reason) if is_statement_error(&reason) => {
+            KnlError::Validation(format!("sql: {reason}"))
+        }
+        other => other,
     }
 }
 
@@ -1763,6 +1817,57 @@ mod tests {
             let err = ask(&store, sql).await.expect_err("must be refused");
             assert_eq!(err.kind(), KnlError::VALIDATION, "{sql:?}: {err}");
         }
+    }
+
+    /// A statement that does not compile is the caller's mistake, and says so
+    /// in the class a reader branches on.
+    ///
+    /// The store underneath has no statement class and files these with the
+    /// disk faults ([`SQLITE_STATEMENT_ERRORS`]); the query path puts them
+    /// back. One statement per phrase, run against a real log, so the list is
+    /// held to what SQLite actually says rather than to what it said once.
+    #[tokio::test]
+    async fn a_statement_that_does_not_compile_is_the_callers() {
+        let (store, _logs) = mem_store().await;
+        for (sql, phrase) in [
+            // The one the change is about: `beat` stopped being a column.
+            ("SELECT beat FROM events", "no such column"),
+            ("SELECT * FROM chronicle", "no such table"),
+            ("SELECT nonesuch(1) AS x", "no such function"),
+            ("SELECT 1 + FROM events", "syntax error"),
+            ("SELECT * FROM events ORDER seq", "near \""),
+            ("SELECT abs(1, 2) AS x", "wrong number of arguments"),
+            (
+                "SELECT seq FROM events AS a, events AS b",
+                "ambiguous column name",
+            ),
+        ] {
+            let err = ask(&store, sql).await.expect_err("must not compile");
+            assert_eq!(err.kind(), KnlError::VALIDATION, "{sql:?}: {err}");
+            assert!(
+                err.reason().contains(phrase),
+                "{sql:?}: expected SQLite to say {phrase:?}, got {err}"
+            );
+            assert!(
+                err.reason().starts_with("sql: "),
+                "{sql:?}: the reason names which half was wrong: {err}"
+            );
+        }
+    }
+
+    /// And a fault that really is the store's stays `storage`: the phrases are
+    /// a filter for the caller's mistakes, not a reclassification of the
+    /// failures underneath.
+    #[tokio::test]
+    async fn a_real_store_fault_is_still_storage() {
+        let (store, _logs) = mem_store().await;
+        // Compiles, then fails at run time against SQLite's own length limit
+        // — the store failing to produce the row, which is what `storage`
+        // says. (Nothing is allocated: the limit is checked first.)
+        let err = ask(&store, "SELECT zeroblob(1000000001) AS huge")
+            .await
+            .expect_err("over SQLITE_MAX_LENGTH");
+        assert_eq!(err.kind(), KnlError::STORAGE, "{err}");
     }
 
     /// Every SQLite type comes back as itself, and a NULL comes back as an

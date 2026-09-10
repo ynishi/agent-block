@@ -35,8 +35,10 @@
 --        shallow (a nested one is refused the same way), and a label given
 --        in `meta` comes back verbatim
 --  inv13 `policy` is reachable as an embedded lib, its `window` fold bounds
---        what a beat sends, and its `stagnation` predicate stops a caller's
---        loop that would otherwise run to the budget
+--        what a beat sends and REPORTS what it dropped — recorded on the
+--        llm_request as `data.window` and read back by `knl.views.beats` —
+--        and its `stagnation` predicate stops a caller's loop that would
+--        otherwise run to the budget
 --  inv14 a session opened from a session: the allocation moves units out of
 --        the parent's balance in one write, the child beats on its own, and
 --        `knl.views.tree` reads the edge back out of the log
@@ -871,6 +873,13 @@ do
     assert(kinds:find("llm_request", 1, true) ~= nil, "kinds: " .. kinds)
     assert(kinds:find("llm_response", 1, true) ~= nil, "kinds: " .. kinds)
     assert(beat_rows[1].seq_from <= beat_rows[1].seq_to, "seq range: " .. kinds)
+    -- The three window columns come off the beat's own llm_request, and this
+    -- beat folded with the DEFAULT fold — which windows nothing and reports
+    -- nothing. NULL is the honest answer there, and not a zero nobody
+    -- reported (a beat that windowed is inv13).
+    assert(beat_rows[1].dropped == nil, "no report, no count: " .. tostring(beat_rows[1].dropped))
+    assert(beat_rows[1].before == nil, "before: " .. tostring(beat_rows[1].before))
+    assert(beat_rows[1].after == nil, "after: " .. tostring(beat_rows[1].after))
 
     -- tool_pairs: the call and the result that answered it, joined on the
     -- call id, with `ok` read back as a boolean (SQLite has no such type)
@@ -1098,6 +1107,39 @@ do
     assert(windowed.messages[1].role == "assistant", "the seed is outside the window")
     -- the unwindowed request the first beat sent still had it
     assert(sent[1].messages[1].content == "go", "the first beat saw the whole log")
+
+    -- What the window left out is a FACT in the log and not only in the
+    -- moment: the fold reports it beside the request and the beat writes it
+    -- onto the same event (`llm_request.data.window`). A windowed request
+    -- otherwise looks exactly like a conversation that began where it began.
+    local reports = {}
+    for _, e in ipairs(s:events()) do
+        if e.kind == "llm_request" then
+            reports[#reports + 1] = e.data.window
+        end
+    end
+    assert(#reports == 4, "every request carries a report, got " .. #reports)
+    assert(type(reports[1]) == "table", "the first beat reports too, having dropped nothing")
+    assert(#reports[1].dropped == 0, "the first beat had nothing to drop")
+    assert(reports[1].kept == 0, "the first beat folded a log with no beat in it")
+    assert(reports[1].seed_kept == true, "nothing was cut, so the seed is in the request")
+    assert(reports[1].before == nil, "a window of beats counts no tokens")
+    -- The fourth folded a log holding three beats with tail = 2: the oldest
+    -- went, whole, and the report names it.
+    assert(#reports[4].dropped == 1, "the fourth beat dropped one, got " .. #reports[4].dropped)
+    assert(reports[4].kept == 2, "kept: " .. tostring(reports[4].kept))
+    assert(reports[4].seed_kept == false, "keep_seed was not asked for")
+    local ids = distinct_beats(s)
+    assert(reports[4].dropped[1] == ids[1], "the dropped id is the oldest beat's: " .. tostring(reports[4].dropped[1]))
+
+    -- And `knl.views.beats` reads it back out of the store, one number per
+    -- beat, off that beat's own llm_request and no other kind's data.
+    local window_rows = kernel.views.beats(s)
+    assert(#window_rows == 4, "four beats, " .. #window_rows .. " rows")
+    assert(window_rows[1].dropped == 0, "the first beat dropped nothing: " .. tostring(window_rows[1].dropped))
+    assert(window_rows[4].dropped == 1, "the fourth dropped one: " .. tostring(window_rows[4].dropped))
+    assert(window_rows[4].before == nil, "a window of beats counts nothing: " .. tostring(window_rows[4].before))
+    assert(window_rows[4].after == nil, "after: " .. tostring(window_rows[4].after))
 
     s:close("done")
 
