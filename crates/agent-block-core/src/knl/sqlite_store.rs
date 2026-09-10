@@ -846,7 +846,7 @@ fn query_error(error: rusqlite::Error) -> KnlError {
         }
     }
     match error {
-        rusqlite::Error::Utf8Error(_)
+        rusqlite::Error::Utf8Error(..)
         | rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::IntegralValueOutOfRange(..) => {
             KnlError::Corruption(format!("sqlite: query: {error}"))
