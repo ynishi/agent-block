@@ -8,7 +8,7 @@
 --   agent-block --prompt "What time is it?" -c "You are a helpful assistant." -s examples/test_agent.lua
 --
 -- The _PROMPT and _CONTEXT globals are set by the host when
--- --prompt / -c flags (or AGENT_BLOCK_PROMPT / AGENT_BLOCK_CONTEXT env vars) are provided.
+-- --prompt / -c flags (or the `prompt` / `context` of --config) are provided.
 --
 -- This is a sample script; it is NOT part of `cargo test`.
 

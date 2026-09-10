@@ -2,13 +2,12 @@
 //!
 //! # The stored shape is envelope + meta + data
 //!
-//! An event is a JSON object with four caller-facing keys and three the
+//! An event is a JSON object with three caller-facing keys and three the
 //! kernel stamps, **and no others**:
 //!
 //! | key                     | written by | what it is                                                            |
 //! |-------------------------|------------|-----------------------------------------------------------------------|
 //! | [`FIELD_KIND`]          | the caller | required, a string: what happened                                      |
-//! | [`FIELD_BEAT`]          | the caller | optional, a string: the beat this fact belongs to                      |
 //! | [`FIELD_META`]          | the caller | optional, a **shallow** object: string / number / boolean values only   |
 //! | [`FIELD_DATA`]          | the caller | optional (default `{}`), an object: the kind's own content, any depth   |
 //! | [`FIELD_SEQ`]           | the kernel | `u64`, starts at 1, strictly increasing                                |
@@ -112,19 +111,25 @@
 //! All six are written through the same append, so they carry the same
 //! `seq` / `epoch_ms` guarantees as everything else.
 //!
-//! # `beat` is the caller's word
+//! # `meta.beat` is the caller's word
 //!
 //! [`FIELD_BEAT`] is an opaque, caller-declared string — the id of the beat
 //! a fact belongs to, minted by the layer above (`knl.new_beat_id()` on the
-//! Lua side).  The kernel neither requires it nor generates it: no kind lists
-//! it among its required fields, and no append stamps it.  It is validated in
-//! one respect only, and on every kind: when present it must be a string, so
-//! a stream cannot mix a number and a string under one name.
+//! Lua side) — and it is a key of [`FIELD_META`], not of the envelope.  The
+//! kernel neither requires it nor generates it: no kind lists it among its
+//! required fields, and no append stamps it.
 //!
-//! It is an envelope key rather than a `meta` entry because it is the one
-//! correlation the log itself is indexed by — it has a column and an index of
-//! its own ([`super::sqlite_store`]), so grouping a run by beat is a plain
-//! `GROUP BY` and not a `json_extract`.
+//! It sat at the top level while the envelope was the kernel's own idea of an
+//! event.  It is the store's contract now — `kind` / `meta` / `data` and
+//! nothing else above them — so a key the log does not define cannot stay up
+//! there, and `meta` is exactly where a correlation key belongs: a shallow
+//! scalar a reader groups by without knowing the kind.  A `beat` written at
+//! the top level is refused like any other stray key, and the refusal says
+//! where it goes.
+//!
+//! It carries no type check of its own inside `meta`: the rule there is the
+//! one every label has — a string, a number or a boolean — so a caller that
+//! numbers its beats is writing a legal label rather than breaking one.
 //!
 //! The literal request/response bytes are not stored: they are derivable
 //! from these facts by a projection, and byte-level fidelity is the dump
@@ -143,11 +148,12 @@ pub const FIELD_SEQ: &str = "seq";
 pub const FIELD_EPOCH_MS: &str = "epoch_ms";
 /// Caller-owned envelope key that every event must carry.
 pub const FIELD_KIND: &str = "kind";
-/// Caller-owned envelope key: which beat the fact belongs to.
+/// Caller-owned [`FIELD_META`] key: which beat the fact belongs to.
 ///
 /// An opaque string the caller declares (`knl.new_beat_id()` mints a
-/// time-ordered one).  The kernel never requires it and never generates it;
-/// it only insists that a present `beat` is a string — see the module docs.
+/// time-ordered one).  The kernel never requires it and never generates it,
+/// and inside `meta` it is a label like any other — see the module docs.
+/// Written at the top level it is a stray key, and refused as one.
 pub const FIELD_BEAT: &str = "beat";
 /// Caller-owned envelope key: a shallow object of scalars.
 ///
@@ -164,13 +170,12 @@ pub const FIELD_DATA: &str = "data";
 
 /// Every key an event may carry at the top level.
 ///
-/// The closed list the stray-key check reads.  Four are the caller's
-/// ([`FIELD_KIND`] / [`FIELD_BEAT`] / [`FIELD_META`] / [`FIELD_DATA`]) and
-/// three are stamped by the kernel; anything else is a kind's own field that
-/// belongs under `data`.
+/// The closed list the stray-key check reads.  Three are the caller's
+/// ([`FIELD_KIND`] / [`FIELD_META`] / [`FIELD_DATA`]) and three are stamped
+/// by the kernel; anything else is a kind's own field that belongs under
+/// `data`, or a label that belongs under `meta` ([`FIELD_BEAT`] is one).
 pub const ENVELOPE_FIELDS: &[&str] = &[
     FIELD_KIND,
-    FIELD_BEAT,
     FIELD_META,
     FIELD_DATA,
     FIELD_SEQ,
@@ -392,9 +397,10 @@ pub fn data_field<'a>(event: &'a Map<String, Value>, name: &str) -> Option<&'a V
 ///
 /// Two checks, in this order:
 ///
-/// 1. **the envelope**, on every kind — `kind` is a string, a present `beat`
-///    is a string, a present `meta` is an object of scalars, a present `data`
-///    is an object, and there is no other top-level key;
+/// 1. **the envelope**, on every kind — `kind` is a string, a present `meta`
+///    is an object of scalars, a present `data` is an object, and there is no
+///    other top-level key (a `beat` written up there is one, and the refusal
+///    names `meta.beat`);
 /// 2. **the `data` of a kernel kind** — the table in the module docs.  Every
 ///    other kind's `data` is its writer's, and passes through untouched.
 pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
@@ -418,27 +424,20 @@ pub fn validate_event(obj: &Map<String, Value>) -> KnlResult<()> {
     // reader can tell them apart from the log's own vocabulary, and where a
     // change to them cannot be mistaken for a change to the envelope.
     for key in obj.keys() {
-        if !ENVELOPE_FIELDS.contains(&key.as_str()) {
-            return Err(KnlError::Validation(format!(
-                "{key:?} is not part of the envelope (kind / beat / meta / data); a kind's own \
-                 fields go under data"
-            )));
+        if ENVELOPE_FIELDS.contains(&key.as_str()) {
+            continue;
         }
-    }
-
-    // The beat is the caller's to declare and never the kernel's to mint,
-    // but it is one name across the whole stream: a present `beat` is a
-    // string on every kind, so a reader never has to ask whether this one is
-    // a number.
-    match obj.get(FIELD_BEAT) {
-        None => {}
-        Some(Value::String(_)) => {}
-        Some(other) => {
-            return Err(KnlError::Validation(format!(
-                "beat must be a string, got {}",
-                json_type_name(other)
-            )));
-        }
+        // The beat used to live up here and is the one stray key a caller
+        // writes out of habit, so the refusal names where it went rather
+        // than sending it under `data` with everything else.
+        let goes = if key == FIELD_BEAT {
+            "the beat is a correlation key, so it goes under meta.beat"
+        } else {
+            "a kind's own fields go under data"
+        };
+        return Err(KnlError::Validation(format!(
+            "{key:?} is not part of the envelope (kind / meta / data); {goes}"
+        )));
     }
 
     // `meta` is shallow by rule, which is what lets a reader group or filter
@@ -602,8 +601,7 @@ mod tests {
         // included: those are reserved, not stray.
         validate_event(&obj(json!({
             "kind": "note",
-            "beat": "b1",
-            "meta": { "tag": "a" },
+            "meta": { "tag": "a", "beat": "b1" },
             "data": { "text": "hi" },
             "seq": 1,
             "epoch_ms": 0,
@@ -776,30 +774,51 @@ mod tests {
         }
     }
 
-    /// A declared beat is a string on every kind — the kernel's own or a
-    /// caller's — so a reader never has to ask whether this one is a number.
+    /// A declared beat rides in `meta`, on every kind — the kernel's own or
+    /// a caller's — under the rule every label there has.
     #[test]
-    fn a_declared_beat_must_be_a_string_on_any_kind() {
+    fn a_declared_beat_rides_in_meta() {
+        for event in [
+            json!({ "kind": "note", "meta": { "beat": "b1" } }),
+            json!({
+                "kind": "llm_response", "meta": { "beat": "b1" },
+                "data": { "content": [] }
+            }),
+            json!({
+                "kind": "budget_spent", "meta": { "beat": "b1" },
+                "data": { "amount": 1 }
+            }),
+            // `meta` takes scalars, so a numbered beat is a legal label:
+            // the beat carries no type of its own in there.
+            json!({ "kind": "note", "meta": { "beat": 1 } }),
+        ] {
+            validate_event(&obj(event.clone()))
+                .unwrap_or_else(|e| panic!("{event}: a beat in meta must be accepted: {e}"));
+        }
+
+        // …and a nested one is refused by `meta`'s own rule, not by a check
+        // the beat brought with it.
+        let err = validate_event(&obj(
+            json!({ "kind": "note", "meta": { "beat": { "id": "b1" } } }),
+        ))
+        .expect_err("a nested beat");
+        assert!(err.reason().contains("meta is shallow"), "{err}");
+    }
+
+    /// The beat left the envelope when the envelope became the store's
+    /// contract, so writing one at the top level is a stray key — and the
+    /// refusal says where it went.
+    #[test]
+    fn a_beat_at_the_top_level_is_refused_and_told_where_it_goes() {
         for event in [
             json!({ "kind": "note", "beat": "b1" }),
             json!({ "kind": "llm_response", "beat": "b1", "data": { "content": [] } }),
-            json!({ "kind": "budget_spent", "beat": "b1", "data": { "amount": 1 } }),
-        ] {
-            validate_event(&obj(event.clone()))
-                .unwrap_or_else(|e| panic!("{event}: a string beat must be accepted: {e}"));
-        }
-
-        for event in [
             json!({ "kind": "note", "beat": 1 }),
-            json!({ "kind": "llm_response", "beat": 1, "data": {} }),
-            json!({ "kind": "tool_call", "beat": [], "data": {} }),
         ] {
             let err =
-                validate_event(&obj(event.clone())).expect_err("a non-string beat must be refused");
-            assert!(
-                err.reason().contains("beat must be a string"),
-                "{event}: {err}"
-            );
+                validate_event(&obj(event.clone())).expect_err("a top-level beat must be refused");
+            assert!(err.reason().contains("\"beat\""), "{event}: {err}");
+            assert!(err.reason().contains("meta.beat"), "{event}: {err}");
         }
     }
 

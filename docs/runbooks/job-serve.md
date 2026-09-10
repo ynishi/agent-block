@@ -163,9 +163,21 @@ curl -sH "Authorization: Bearer $TOKEN" "http://127.0.0.1:7788/runs?limit=5"
 curl -sH "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:7788/jobs/drain/runs
 ```
 
-A run's own session log is the `log` path on its record; read it with
-`knl.resume{ session = ..., store = { sqlite = <path> } }` and `knl.views`,
-as any block's log.
+A run's session is in its project's own log, labelled with the run it was:
+
+```lua
+local rows = knl.views.sessions(s)          -- s: a session on that project's log
+for _, row in ipairs(rows) do
+    local labels = std.json.decode(row.meta)
+    if labels.run == "<run_id>" then
+        local run = knl.resume({ session = row.session })
+        -- knl.views.beats(run) / tool_pairs(run) / usage(run), as any block's log
+    end
+end
+```
+
+Runs are not given a log each: they share their project's, which is what
+keeps that log one stream to read.
 
 ## Stopping a run
 

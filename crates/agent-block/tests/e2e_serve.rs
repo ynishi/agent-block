@@ -237,6 +237,28 @@ fn write_project(root: &Path) -> PathBuf {
     mark
 }
 
+/// The `job` label of every session on `log` that was opened for `run_id`.
+///
+/// The read the runbook tells a person to do, in SQL: a run's sessions are in
+/// its project's log with the labels the process was started with, and `meta`
+/// is the envelope key a reader can select on without knowing what the kind
+/// records.
+fn labelled_sessions(log: &Path, run_id: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(log).expect("the project's log opens");
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(meta, '$.job') FROM events \
+             WHERE kind = 'session_opened' AND json_extract(meta, '$.run') = ?1",
+        )
+        .expect("prepare");
+    let rows = stmt
+        .query_map([run_id], |row| row.get::<_, Option<String>>(0))
+        .expect("query")
+        .map(|r| r.expect("row").unwrap_or_default())
+        .collect();
+    rows
+}
+
 #[tokio::test]
 async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -255,20 +277,36 @@ async fn serve_runs_a_declared_job_records_it_and_answers_over_http() {
     assert_eq!(body["jobs"][0]["name"], "echo");
     assert_eq!(body["jobs"][0]["every"], 1);
 
-    // A run happened in its own process: the mark it left, its record, its log.
+    // A run happened in its own process: the mark it left, its record, and a
+    // session on the PROJECT's log — not one of its own. A run is told apart
+    // by the labels it was started with, which is what keeps that log one
+    // stream to read however many runs go through it.
     let run = manager.wait_run("echo", "ok").await;
     assert_eq!(run["exit_code"], 0);
     assert_eq!(std::fs::read_to_string(&mark).expect("mark"), "ran hello");
-    let run_log = PathBuf::from(run["log"].as_str().expect("log path"));
     assert!(
-        run_log.starts_with(home.join("runs/echo")),
-        "{}",
-        run_log.display()
+        run.get("log").is_none_or(serde_json::Value::is_null),
+        "a run is not given a log of its own: {run}"
     );
-    assert!(run_log.is_file(), "run log {} missing", run_log.display());
+    let project_log = home
+        .join("projects")
+        .join(agent_block_core::bridge::config::project_slug(
+            &root.canonicalize().expect("the project root exists"),
+        ))
+        .join("knl.sqlite");
+    assert!(
+        project_log.is_file(),
+        "the run wrote to its project's log, {} missing",
+        project_log.display()
+    );
+    let run_id = run["run_id"].as_str().expect("run_id");
+    assert!(
+        labelled_sessions(&project_log, run_id).contains(&"echo".to_string()),
+        "no session on {} is labelled run={run_id}",
+        project_log.display()
+    );
 
     // One run by id, with the tail of its stderr.
-    let run_id = run["run_id"].as_str().expect("run_id");
     let (status, body) = manager.get(&format!("/runs/{run_id}")).await;
     assert_eq!(status, 200);
     assert_eq!(body["run"]["run_id"], run_id);

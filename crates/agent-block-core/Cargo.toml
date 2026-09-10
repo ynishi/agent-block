@@ -65,14 +65,18 @@ agent-mesh-sdk = { workspace = true, optional = true }
 llm-extract.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-# Not optional: the kernel's event store is a SQLite table in every build
-# (see the `sqlite` feature note above). `rusqlite-isle` owns that connection
-# and the `std.ts` one — each on its own thread, with the transaction, retry
-# and cancellation behaviour the store used to hand-roll — and `rusqlite`
-# supplies the types its closures are written in, plus the `Connection` /
+# Not optional: the kernel's event log is a SQLite database in every build
+# (see the `sqlite` feature note above). `eventsdb-sqlite` owns that database
+# — one writer thread per file, the transaction hatch the kernel's two-stream
+# writes go through, and the read-only connections its SQL views run on — and
+# `eventsdb-core` is the contract the kernel's SPI is written against.
+# `rusqlite-isle` owns the `std.ts` connection thread, and `rusqlite` supplies
+# the types those closures are written in, plus the `Connection` /
 # `InterruptHandle` the host opens for `std.sql` / `std.kv` and hands to the
-# batteries. Both come from the cluster `mlua-batteries-sqlite` builds on, so
-# there is one libsqlite3-sys in the graph.
+# batteries. All of them come from one cluster (see the workspace manifest),
+# so there is one libsqlite3-sys in the graph.
+eventsdb-core = { workspace = true }
+eventsdb-sqlite = { workspace = true }
 rusqlite = { workspace = true }
 rusqlite-isle = { workspace = true }
 reqwest.workspace = true

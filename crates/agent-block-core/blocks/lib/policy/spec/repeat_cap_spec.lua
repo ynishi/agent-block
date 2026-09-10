@@ -55,10 +55,14 @@ local policy = require("policy")
 local function called(session, name, args, n, result)
     for i = 1, n do
         local id = name .. "-" .. tostring(#session:events() + i)
-        session:append({ kind = "tool_call", beat = "b", data = { call_id = id, name = name, args = args } })
+        session:append({
+            kind = "tool_call",
+            meta = { beat = "b" },
+            data = { call_id = id, name = name, args = args },
+        })
         session:append({
             kind = "tool_result",
-            beat = "b",
+            meta = { beat = "b" },
             data = { call_id = id, ok = true, result = result or { ok = true } },
         })
     end
@@ -89,9 +93,13 @@ end
 --- The kernel's order, in miniature: record the call, then run the handler.
 local function invoke(session, tools, name, args)
     local id = name .. "-" .. tostring(#session:events() + 1)
-    session:append({ kind = "tool_call", beat = "b", data = { call_id = id, name = name, args = args } })
+    session:append({ kind = "tool_call", meta = { beat = "b" }, data = { call_id = id, name = name, args = args } })
     local result = tools[name].handler(args)
-    session:append({ kind = "tool_result", beat = "b", data = { call_id = id, ok = true, result = result } })
+    session:append({
+        kind = "tool_result",
+        meta = { beat = "b" },
+        data = { call_id = id, ok = true, result = result },
+    })
     return result
 end
 

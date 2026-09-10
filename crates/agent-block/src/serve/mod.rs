@@ -51,9 +51,14 @@
 //! and end is a record on it, and every decision is read back off it. The
 //! host closes a session when its process ends and a closed session cannot
 //! be resumed, so each start opens a session of its own and reads across all
-//! of them — their ids are the lines of `serve.session`, newest last. Each
-//! run writes its own log under `$AGENT_BLOCK_HOME/runs/<job>/<run_id>.sqlite`.
-//! Nothing else is state.
+//! of them — their ids are the lines of `serve.session`, newest last.
+//!
+//! A run does NOT get a log of its own: it is started with `--label job=<name>
+//! --label run=<run_id>`, so its sessions land in its project's own database
+//! like every other run of that block, labelled with which run they were.
+//! `knl.views.sessions` reads them back. A file per run answered the same
+//! question by breaking the one above it — the project's log stopped being one
+//! stream to read. Nothing else is state.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

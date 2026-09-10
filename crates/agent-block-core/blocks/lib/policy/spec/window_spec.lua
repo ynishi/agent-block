@@ -35,10 +35,10 @@ local policy = require("policy")
 --- One beat that answered with text.
 local function answered(id, body, seq)
     return {
-        { kind = "llm_request", beat = id, data = { request = { messages = {} } }, seq = seq },
+        { kind = "llm_request", meta = { beat = id }, data = { request = { messages = {} } }, seq = seq },
         {
             kind = "llm_response",
-            beat = id,
+            meta = { beat = id },
             data = { content = { { type = "text", text = body } }, usage = {} },
             seq = seq + 1,
         },
@@ -48,10 +48,10 @@ end
 --- One beat that called a tool and recorded the pair.
 local function called(id, call_id, seq)
     return {
-        { kind = "llm_request", beat = id, data = { request = { messages = {} } }, seq = seq },
+        { kind = "llm_request", meta = { beat = id }, data = { request = { messages = {} } }, seq = seq },
         {
             kind = "llm_response",
-            beat = id,
+            meta = { beat = id },
             data = {
                 content = { { type = "tool_use", id = call_id, name = "t", input = {} } },
                 usage = {},
@@ -60,13 +60,13 @@ local function called(id, call_id, seq)
         },
         {
             kind = "tool_call",
-            beat = id,
+            meta = { beat = id },
             data = { call_id = call_id, name = "t", args = {} },
             seq = seq + 2,
         },
         {
             kind = "tool_result",
-            beat = id,
+            meta = { beat = id },
             data = { call_id = call_id, ok = true, result = "R-" .. call_id },
             seq = seq + 3,
         },

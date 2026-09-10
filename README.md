@@ -119,12 +119,27 @@ local result = agent.run({
 print(result.content)
 ```
 
-Both flags also accept environment variables as fallback:
+Neither takes an environment variable, and neither does `--result`. They are
+what ONE run is, and an environment variable is inherited: a block that starts
+another `agent-block` would be handing its child its own prompt and its own
+result file to write over.
 
-| Flag | Env var |
-|---|---|
-| `--prompt` | `AGENT_BLOCK_PROMPT` |
-| `-c / --context` | `AGENT_BLOCK_CONTEXT` |
+A caller with all of them to pass writes a file instead:
+
+```json
+{ "prompt": "…", "context": "…", "result": "/tmp/run.json",
+  "labels": { "job": "drain", "run": "drain-1757300000" } }
+```
+
+```sh
+agent-block -s block.lua --config run.json
+```
+
+The file is the lowest of three layers — **file, then environment (for the
+knobs that have one), then argument** — so a flag always wins over it. What
+belongs to the host rather than to a run (where the databases live, the
+sandbox, `AGENT_BLOCK_HOME`) stays an environment variable read from the
+project's `.env`, which is that half's config file already.
 
 ### What the exit code says
 
@@ -272,12 +287,13 @@ agent-block serve --project .          # 127.0.0.1:7788, tick 5s, at most 4 live
 ```
 
 A run is `agent-block -s <block>` started in the block's project root, so it
-loads that project's `.env` and writes its own session log under
-`~/.agent-block/runs/<job>/`. The value the block returns — the same JSON
-string `run_block` hands an MCP caller — is written beside that log
-(`--result` / `AGENT_BLOCK_RESULT_PATH`, which any `agent-block -s` run can
-use) and is on the run's record as `result`, whole up to 64 KiB and pointed
-at past it. The manager itself decides nothing it cannot
+loads that project's `.env` and writes to that project's own session log —
+labelled `job=<name>` and `run=<run_id>` (`--label`), which is how one run is
+found among all of them (`knl.views.sessions`). The value the block returns —
+the same JSON string `run_block` hands an MCP caller — is written under
+`~/.agent-block/runs/<job>/` (`--result`, which any `agent-block -s` run can
+use) and is on the run's record as `result`,
+whole up to 64 KiB and pointed at past it. The manager itself decides nothing it cannot
 read back: every start and end is a record on its own log
 (`~/.agent-block/serve.sqlite`), `every` counts from the previous end, one
 run per job is live at a time, a run the manager did not survive is closed
@@ -705,7 +721,9 @@ local result = agent.run({
     history     = prior,                                -- optional prior messages (e.g. session.load)
     store       = "mem",                                -- optional; where the session log goes.
                                                         -- Omitted = the host's own database;
-                                                        -- "mem" or { sqlite = <path> } otherwise.
+                                                        -- "mem" (one in-memory database per run,
+                                                        -- gone with the process) or
+                                                        -- { sqlite = <path> } otherwise.
 })
 
 if result.ok then
@@ -878,6 +896,16 @@ view**: a named Lua function running one `SELECT` through `s:query(sql,
 params?, opts?)` over the published event table. `knl.views.beats` /
 `tool_pairs` / `ledger` / `usage` are the four shipped, and a consumer's own
 view is a function of the same form — nothing about the four is privileged.
+
+The event table is `events`, and its columns are what `knl.api().schema`
+publishes: `position` (the log's global order, and its key), `stream`, `seq`,
+`epoch_ms`, `kind`, `schema_version`, `meta` and `data`. A read within one
+session orders by `seq`; a read across sessions orders by `position`. The beat
+a fact belongs to is a `meta` label, reached with `json_extract(meta,
+'$.beat')`. The store underneath is an `eventsdb` SQLite log — one database
+per file, opened once per process, so the sessions in it are streams of one
+log and a session tree is one transaction. A `knl.sqlite` written by an
+earlier release is brought forward on the first open, once.
 
 The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
 (the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the

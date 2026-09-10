@@ -125,14 +125,21 @@ local function count_of(s, kind)
     return n
 end
 
--- The distinct `beat` ids in the session, in first-seen order. The kernel
+-- The beat id an event was stamped with: a label in the envelope, so it is
+-- read off `meta`, and an event need not carry one at all.
+local function beat_of(e)
+    return e.meta ~= nil and e.meta.beat or nil
+end
+
+-- The distinct `meta.beat` ids in the session, in first-seen order. The kernel
 -- numbers nothing: an id is an opaque string the shell declared.
 local function distinct_beats(s)
     local seen, ids = {}, {}
     for _, e in ipairs(s:events()) do
-        if e.beat ~= nil and not seen[e.beat] then
-            seen[e.beat] = true
-            ids[#ids + 1] = e.beat
+        local id = beat_of(e)
+        if id ~= nil and not seen[id] then
+            seen[id] = true
+            ids[#ids + 1] = id
         end
     end
     return ids
@@ -207,22 +214,32 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-    -- The stored shape: one envelope (kind / beat / meta / data) with the
-    -- kind's own content under `data`.
+    -- The stored shape: one envelope (kind / meta / data) with the kind's own
+    -- content under `data`, and the beat id a label in `meta`.
     local events = {
         { kind = "session_opened", seq = 1 },
         { kind = "msg_user", data = { content = "hi" }, seq = 2 },
         {
             kind = "llm_response",
-            beat = "b1",
+            meta = { beat = "b1" },
             data = { content = { { type = "text", text = "a" }, tool_use("c1", "t", {}) }, usage = {} },
             seq = 3,
         },
-        { kind = "tool_call", beat = "b1", data = { call_id = "c1", name = "t", args = {} }, seq = 4 },
-        { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = "R" }, seq = 5 },
+        {
+            kind = "tool_call",
+            meta = { beat = "b1" },
+            data = { call_id = "c1", name = "t", args = {} },
+            seq = 4,
+        },
+        {
+            kind = "tool_result",
+            meta = { beat = "b1" },
+            data = { call_id = "c1", ok = true, result = "R" },
+            seq = 5,
+        },
         {
             kind = "llm_response",
-            beat = "b2",
+            meta = { beat = "b2" },
             data = { content = { { type = "text", text = "done" } }, usage = {} },
             seq = 6,
         },
@@ -244,8 +261,13 @@ do
 
     -- a non-string tool_result is JSON-encoded
     local encoded = kernel.fold({
-        { kind = "llm_response", beat = "b1", data = { content = {}, usage = {} }, seq = 1 },
-        { kind = "tool_result", beat = "b1", data = { call_id = "c1", ok = true, result = { x = 1 } }, seq = 2 },
+        { kind = "llm_response", meta = { beat = "b1" }, data = { content = {}, usage = {} }, seq = 1 },
+        {
+            kind = "tool_result",
+            meta = { beat = "b1" },
+            data = { call_id = "c1", ok = true, result = { x = 1 } },
+            seq = 2,
+        },
     }, {})
     assert(type(encoded.messages[2].content[1].content) == "string", "non-string result must be encoded")
 
@@ -302,9 +324,9 @@ do
     -- caller's own seed carries none.
     local resp = first_of(s, "llm_response")
     assert(type(o.out.beat) == "string", "beat id: " .. tostring(o.out.beat))
-    assert(resp ~= nil and resp.beat == o.out.beat, "response beat: " .. tostring(resp and resp.beat))
-    assert(req_ev.beat == o.out.beat, "request beat: " .. tostring(req_ev.beat))
-    assert(first_of(s, "msg_user").beat == nil, "the caller's seed is not part of a beat")
+    assert(resp ~= nil and beat_of(resp) == o.out.beat, "response beat: " .. tostring(resp and beat_of(resp)))
+    assert(beat_of(req_ev) == o.out.beat, "request beat: " .. tostring(beat_of(req_ev)))
+    assert(beat_of(first_of(s, "msg_user")) == nil, "the caller's seed is not part of a beat")
 
     -- The accounting is a query view now (`knl.views.usage`), and it counts
     -- the same thing the kernel's built-in used to: the responses this
@@ -377,7 +399,7 @@ do
     assert(#o.out.tools == 1 and o.out.tools[1].ok == true and o.out.tools[1].name == "echo")
     -- one beat, one id: the pair belongs to the response that asked for it
     assert(#distinct_beats(s) == 1 and distinct_beats(s)[1] == o.out.beat)
-    assert(first_of(s, "tool_call").beat == o.out.beat and tr.beat == o.out.beat)
+    assert(beat_of(first_of(s, "tool_call")) == o.out.beat and beat_of(tr) == o.out.beat)
 
     -- unknown tool: the pair is still closed, ok=false, machine-minimal error
     local s2 = kernel.open({ owner = "test", budget = { amount = 100, tag = "beats" } })
@@ -448,7 +470,7 @@ do
     assert(first_of(se, "llm_response") == nil, "a failed call must record no response")
     local failed = first_of(se, "llm_call_failed")
     assert(failed ~= nil, "a failed call is noted as a failed call")
-    assert(type(failed.beat) == "string", "the note belongs to the beat that made the call")
+    assert(type(beat_of(failed)) == "string", "the note belongs to the beat that made the call")
 
     -- and an answer that is not an llm_result at all is the same ending: a
     -- third status is a broken adapter, not a branch the kernel reads.
@@ -964,10 +986,11 @@ end
 do
     local s = kernel.open({ owner = "test" })
 
-    -- (a) `{ kind, beat?, meta?, data? }` and nothing else. The old form —
-    -- a kind's own fields sitting at the top level — is not stored under a
-    -- different name, it is refused: the caller's argument did not hold up,
-    -- which is the "validation" class.
+    -- (a) `{ kind, meta?, data? }` and nothing else — `beat` included, which
+    -- is a label in `meta` now and a stray top-level key like any other. The
+    -- old form — a kind's own fields sitting at the top level — is not stored
+    -- under a different name, it is refused: the caller's argument did not
+    -- hold up, which is the "validation" class.
     local stray, stray_raise = pcall(s.append, s, { kind = "msg_user", content = "x" })
     assert(not stray, "a stray top-level key must not be stored")
     assert(
@@ -1156,7 +1179,7 @@ do
     for _, e in ipairs(s:events()) do
         if e.kind == "verify" then
             verifies = verifies + 1
-            assert(e.beat == out.out.beat, "the verify is stamped with the beat it judges")
+            assert(beat_of(e) == out.out.beat, "the verify is stamped with the beat it judges")
             assert(e.data.ok == true, "the verify records what the check answered")
         end
     end
@@ -1225,6 +1248,35 @@ do
     assert(type(edge.opened_epoch_ms) == "number", "opened: " .. tostring(edge.opened_epoch_ms))
     assert(edge.closed_epoch_ms ~= nil, "the child closed and the tree says so")
 
+    -- (f) the sessions view: every session in the log, and the labels it was
+    -- opened under. This is what tells one run from another when they share a
+    -- database — the alternative being a database per run, which is what
+    -- breaks "one project, one log".
+    local labelled = kernel.open({ owner = "test", meta = { run = "r-1", attempt = 2 } })
+    local all = kernel.views.sessions(parent)
+    local seen = {}
+    for _, row in ipairs(all) do
+        seen[row.session] = row
+    end
+    assert(seen[parent:id()] ~= nil, "the parent is in the log")
+    assert(seen[child:id()] ~= nil, "so is the child")
+
+    local row = seen[labelled:id()]
+    assert(row ~= nil, "the labelled session is in the log")
+    assert(type(row.meta) == "string", "meta is the column's JSON text: " .. type(row.meta))
+    local labels = std.json.decode(row.meta)
+    assert(labels.run == "r-1", "run: " .. tostring(labels.run))
+    assert(labels.attempt == 2, "attempt: " .. tostring(labels.attempt))
+    assert(row.parent == nil, "it was opened from nothing")
+    assert(type(row.opened_epoch_ms) == "number", "opened: " .. tostring(row.opened_epoch_ms))
+    assert(row.closed_epoch_ms == nil, "it is still running")
+
+    -- The child closed above, and the view reports it.
+    assert(seen[child:id()].closed_epoch_ms ~= nil, "the child ended and the view says so")
+    -- A session nobody labelled carries no labels rather than a missing column.
+    assert(next(std.json.decode(seen[parent:id()].meta)) == nil, "the parent was not labelled")
+
+    labelled:close("done")
     parent:close("done")
 
     mark("inv14_session_tree")

@@ -11,43 +11,54 @@
 //! 1. the statement is **one** statement and it **reads** — it starts with
 //!    `SELECT` or `WITH`, and nothing follows the `;` if there is one, so
 //!    `INSERT` / `PRAGMA` / `ATTACH` / `a; b` never reach the connection
-//!    ([`plan`]).  The reader connection refuses a write on its own too
-//!    ([`super::sqlite_store`]), and the prepared statement is asked whether
-//!    it is read-only before it runs: three answers to one question, because
-//!    the cost of being wrong is a caller writing through a view;
+//!    ([`plan`]).  The connection a query runs on is read-only, and the
+//!    prepared statement is asked whether it writes before it runs: three
+//!    answers to one question, because the cost of being wrong is a caller
+//!    writing through a view;
 //! 2. values are **bound, never interpolated**.  Nothing a caller passes as a
-//!    parameter is spliced into the text.  The one rewrite this module makes
-//!    inserts *placeholders* — never a value — which is what keeps "the
-//!    kernel does not build SQL out of data" true;
-//! 3. the two reserved parameters are resolved: `$stream` is the session's
-//!    own stream, and `$sessions` is the set the caller asked to read across.
+//!    parameter is spliced into the text.  The rewrite below inserts
+//!    *placeholders* — never a value — which is what keeps "the kernel does
+//!    not build SQL out of data" true;
+//! 3. every parameter is resolved *here*, into one list of values in the
+//!    order the statement will bind them: `$stream` is the session's own
+//!    stream, `$sessions` is the set the caller asked to read across, and a
+//!    `?` or a `:name` is answered out of what the caller passed.
 //!
-//! # The `$sessions` rewrite, exactly
+//! # One pass, and it ends in `?`
 //!
-//! `$sessions` is the one token in a caller's SQL the kernel rewrites, and
-//! this is the whole of the rule:
+//! The backend binds **positional** parameters and nothing else, so this
+//! module hands it a statement whose every parameter is a bare `?` and a
+//! `Vec<Value>` in the same order ([`QueryPlan::values`]).  Resolution used to
+//! be split — the text rewritten here, the values matched to SQLite's own
+//! parameter names in the store — and that split is what a positional binder
+//! removes: there is one walk over the statement, and the value pushed for a
+//! token is the value that token gets.
 //!
-//! * the rewritten token is the exact text `$sessions`, found while walking
-//!   the statement as SQL — so an occurrence inside a string literal, a
-//!   quoted identifier (`"…"`, `[…]`, `` `…` ``) or a comment is left alone,
-//!   as is a longer name that merely starts with it (`$sessions2`);
-//! * each occurrence is replaced by `(:knl_sessions_0, :knl_sessions_1, …)`,
-//!   one named placeholder per id in the set, in order.  `WHERE stream IN
-//!   $sessions` therefore compiles as `WHERE stream IN (:knl_sessions_0,
-//!   :knl_sessions_1)` for a set of two;
+//! The rule for the walk is the whole of the contract:
+//!
+//! * a parameter is found while walking the statement *as SQL*, so an
+//!   occurrence inside a string literal, a quoted identifier (`"…"`, `[…]`,
+//!   `` `…` ``) or a comment is left alone, as is a longer name that merely
+//!   starts with a reserved one (`$sessions2`);
+//! * `$sessions` becomes `(?, ?, …)`, one placeholder per id in the set, and
+//!   the ids are pushed in order.  `WHERE stream IN $sessions` therefore
+//!   compiles as `WHERE stream IN (?, ?)` for a set of two;
+//! * `$stream` becomes `?` and pushes the session's own stream;
+//! * a bare `?` becomes `?` and takes the next value of
+//!   [`QueryParams::Positional`], in the order they were given;
+//! * `:name` / `@name` / `$name` becomes `?` and takes
+//!   [`QueryParams::Named`]`[name]` — the prefix character is SQLite's, so
+//!   `:kind` is answered by `kind` (the full spelling is accepted too);
+//! * `?NNN` is refused: a numbered parameter says where its value goes, and
+//!   this walk is the thing that decides that.  Number your parameters by
+//!   position or name them;
 //! * every other byte of the statement is handed to SQLite exactly as the
-//!   caller wrote it;
-//! * the ids themselves are *bound* to those placeholders by the backend.
-//!   They are never written into the text, so a session id containing a
-//!   quote is a value like any other.
+//!   caller wrote it.
 //!
-//! The placeholders are **named**, not anonymous `?`.  SQLite numbers an
-//! anonymous parameter "one greater than the largest index used so far",
-//! which means the index an inserted `?` receives depends on what the caller
-//! wrote around it; a named slot is looked up by name, so the kernel's own
-//! bindings cannot be confused with the caller's however the two are mixed.
-//! `:knl_sessions_*` and `$stream` are therefore reserved: a parameter a
-//! caller names in that shape is the kernel's, not theirs.
+//! A parameter nobody answered, and a value nobody asked for, are both
+//! errors: a silent NULL is how a query quietly stops meaning what it says.
+//! `$stream` and `$sessions` are reserved — a parameter a caller names in
+//! that shape is the kernel's, not theirs.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -75,9 +86,6 @@ pub const STREAM_PARAM: &str = "$stream";
 /// The reserved token that expands to the set of streams being read.
 pub const SESSIONS_TOKEN: &str = "$sessions";
 
-/// The prefix of the named placeholders [`SESSIONS_TOKEN`] expands to.
-pub const SESSION_SLOT_PREFIX: &str = ":knl_sessions_";
-
 /// The statements a query may be.
 ///
 /// A closed list, checked on the text before SQLite ever sees it.  It is not
@@ -85,11 +93,6 @@ pub const SESSION_SLOT_PREFIX: &str = ":knl_sessions_";
 /// asked whether it writes — but it is the one that can say *why* in the
 /// caller's terms.
 const READ_KEYWORDS: [&str; 2] = ["SELECT", "WITH"];
-
-/// The name of the `n`-th session placeholder, as SQLite reports it.
-pub fn session_slot(index: usize) -> String {
-    format!("{SESSION_SLOT_PREFIX}{index}")
-}
 
 /// The values a caller bound to its own parameters.
 ///
@@ -134,17 +137,20 @@ impl Default for QueryOpts {
 
 /// A validated query, ready for a backend to prepare and bind.
 ///
-/// The SQL here is the caller's, with `$sessions` expanded — the only
-/// difference between this text and what was passed in.
+/// The SQL here is the caller's with every parameter rewritten to a bare `?`,
+/// and [`QueryPlan::values`] is what those placeholders bind to, in order —
+/// the only difference between this text and what was passed in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPlan {
-    /// The statement to prepare.
+    /// The statement to prepare.  Every parameter in it is a bare `?`.
     pub sql: String,
-    /// What `$stream` binds to: the session's own stream.
+    /// What the `?` placeholders bind to, in the order they appear.
+    pub values: Vec<Value>,
+    /// What `$stream` resolved to: the session's own stream.
     pub stream: String,
-    /// What the `:knl_sessions_*` placeholders bind to, in order.
+    /// What `$sessions` expanded to, in order.
     pub sessions: Vec<String>,
-    /// The caller's own values.
+    /// The caller's own values, as they were given.
     pub params: QueryParams,
     /// The deadline for the whole query.
     pub timeout: Duration,
@@ -162,9 +168,10 @@ pub struct QueryRows {
     pub truncated: bool,
 }
 
-/// Validate `sql`, expand `$sessions`, and settle what everything binds to.
+/// Validate `sql`, rewrite every parameter to `?`, and settle what each of
+/// them binds to.
 ///
-/// `stream` is the session's own stream: what `$stream` binds to, and the
+/// `stream` is the session's own stream: what `$stream` resolves to, and the
 /// default set `$sessions` expands to.
 pub fn plan(
     sql: &str,
@@ -197,8 +204,11 @@ pub fn plan(
         )));
     }
 
+    let (rewritten, values) = resolve(sql, &scanned.params, &params, stream, &sessions)?;
+
     Ok(QueryPlan {
-        sql: expand_sessions(sql, &scanned.sessions, sessions.len()),
+        sql: rewritten,
+        values,
         stream: stream.to_string(),
         sessions,
         params,
@@ -207,15 +217,163 @@ pub fn plan(
     })
 }
 
+/// What answers one parameter token of a caller's statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Param {
+    /// `$stream`: the session's own stream.
+    Stream,
+    /// `$sessions`: the whole set, as one parenthesised list.
+    Sessions,
+    /// A bare `?`: the next of [`QueryParams::Positional`].
+    Positional,
+    /// `?NNN`: refused, because the number says where the value goes and
+    /// that is what this walk decides.
+    Numbered,
+    /// `:name` / `@name` / `$name`, prefix included.
+    Named(String),
+}
+
+/// One parameter token, and where it sits in the caller's text.
+struct Token {
+    /// The byte range the token occupies.
+    at: Range<usize>,
+    /// What is bound in its place.
+    param: Param,
+}
+
 /// What the walk over a statement found.
 struct Scanned {
     /// The first word, upper-cased — the statement's kind.
     keyword: String,
-    /// Where each `$sessions` token is, in byte offsets.
-    sessions: Vec<Range<usize>>,
+    /// Every parameter token, in the order they appear.
+    params: Vec<Token>,
 }
 
-/// Walk `sql` as SQL: find its first word, find the `$sessions` tokens, and
+/// Rewrite `sql` so every parameter is a bare `?`, and collect what those
+/// placeholders bind to, in order.
+///
+/// The one place a value and a placeholder are matched up.  Everything
+/// outside a token's range is copied byte for byte, so the only edit this
+/// makes is a parameter becoming a `?` — never a value going into the text.
+fn resolve(
+    sql: &str,
+    tokens: &[Token],
+    params: &QueryParams,
+    stream: &str,
+    sessions: &[String],
+) -> KnlResult<(String, Vec<Value>)> {
+    const NO_VALUES: &[Value] = &[];
+    let given: &[Value] = match params {
+        QueryParams::Positional(values) => values,
+        _ => NO_VALUES,
+    };
+
+    let mut out = String::with_capacity(sql.len());
+    let mut values: Vec<Value> = Vec::with_capacity(tokens.len());
+    let mut cursor = 0;
+    let mut taken = 0;
+
+    for token in tokens {
+        out.push_str(&sql[cursor..token.at.start]);
+        cursor = token.at.end;
+        match &token.param {
+            Param::Stream => {
+                out.push('?');
+                values.push(Value::from(stream));
+            }
+            Param::Sessions => {
+                out.push('(');
+                for (index, id) in sessions.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push('?');
+                    values.push(Value::from(id.as_str()));
+                }
+                out.push(')');
+            }
+            Param::Positional => {
+                let value = given.get(taken).ok_or_else(|| {
+                    KnlError::Validation(format!(
+                        "the query has more `?` parameters than the {} value(s) given",
+                        given.len()
+                    ))
+                })?;
+                taken += 1;
+                out.push('?');
+                values.push(scalar(value)?.clone());
+            }
+            Param::Numbered => {
+                return Err(KnlError::Validation(format!(
+                    "{:?} is a numbered parameter, and the kernel assigns the positions: \
+                     number your parameters by position (a bare `?`) or name them",
+                    &sql[token.at.clone()]
+                )));
+            }
+            Param::Named(name) => {
+                let QueryParams::Named(named) = params else {
+                    return Err(KnlError::Validation(format!(
+                        "the query names the parameter {name:?}, so params must be a table of \
+                         names to values"
+                    )));
+                };
+                // The prefix character is SQLite's, not the caller's: `:kind`
+                // is answered by `kind`.  The full spelling is accepted too,
+                // for a caller that writes what it sees.
+                let value = named
+                    .get(&name[1..])
+                    .or_else(|| named.get(name.as_str()))
+                    .ok_or_else(|| {
+                        KnlError::Validation(format!(
+                            "no value was given for the parameter {name:?}"
+                        ))
+                    })?;
+                out.push('?');
+                values.push(scalar(value)?.clone());
+            }
+        }
+    }
+    out.push_str(&sql[cursor..]);
+
+    if given.len() > taken {
+        return Err(KnlError::Validation(format!(
+            "{} value(s) were given for {taken} `?` parameter(s)",
+            given.len()
+        )));
+    }
+    Ok((out, values))
+}
+
+/// A caller's value, if it is one SQLite has.
+///
+/// The four types a JSON value maps onto without inventing anything: null,
+/// boolean, number, string.  A composite — an array or an object — is not a
+/// SQLite value, and encoding one as its JSON text would be the kernel
+/// guessing what the caller meant, so it is refused here, where the refusal
+/// can still say which parameter it was about.
+fn scalar(value: &Value) -> KnlResult<&Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(value),
+        other => Err(KnlError::Validation(format!(
+            "a {} is not a SQLite value",
+            type_name_of(other)
+        ))),
+    }
+}
+
+/// What kind of JSON value this is, for a refusal message.
+fn type_name_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "table",
+    }
+}
+
+/// Walk `sql` as SQL: find its first word, find every parameter token, and
 /// refuse a second statement.
 ///
 /// It is a scanner and not a parser.  All it has to tell apart is code from
@@ -227,7 +385,7 @@ fn scan(sql: &str) -> KnlResult<Scanned> {
     let bytes = sql.as_bytes();
     let mut at = 0;
     let mut keyword: Option<String> = None;
-    let mut sessions: Vec<Range<usize>> = Vec::new();
+    let mut params: Vec<Token> = Vec::new();
     // Set by a `;`.  Anything but whitespace and comments after it is a
     // second statement, which is the shape a caller would smuggle a write in
     // as — and rusqlite's `prepare` compiles only the first statement, so an
@@ -269,10 +427,35 @@ fn scan(sql: &str) -> KnlResult<Scanned> {
                 at += 1;
             }
             b'\'' | b'"' | b'`' | b'[' => at = skip_quoted(bytes, at),
-            b'$' => {
+            b'?' => {
+                // `?NNN` is digits and nothing else, which is SQLite's own
+                // rule: anything after a `?` that is not a digit is a
+                // separate token and the `?` stands alone.
+                let mut end = at + 1;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let param = if end == at + 1 {
+                    Param::Positional
+                } else {
+                    Param::Numbered
+                };
+                params.push(Token { at: at..end, param });
+                at = end;
+            }
+            b'$' | b':' | b'@' => {
                 let end = ident_end(bytes, at + 1);
-                if &sql[at..end] == SESSIONS_TOKEN {
-                    sessions.push(at..end);
+                // A lone prefix character names nothing — SQLite would refuse
+                // it when it compiles, which is the right place for a syntax
+                // error to be reported from.
+                if end > at + 1 {
+                    let name = &sql[at..end];
+                    let param = match name {
+                        STREAM_PARAM => Param::Stream,
+                        SESSIONS_TOKEN => Param::Sessions,
+                        other => Param::Named(other.to_string()),
+                    };
+                    params.push(Token { at: at..end, param });
                 }
                 at = end;
             }
@@ -295,7 +478,7 @@ fn scan(sql: &str) -> KnlResult<Scanned> {
     let keyword = keyword.ok_or_else(|| {
         KnlError::Validation("a query needs a statement; the SQL is empty".to_string())
     })?;
-    Ok(Scanned { keyword, sessions })
+    Ok(Scanned { keyword, params })
 }
 
 /// The offset just past the quoted run starting at `start`.
@@ -331,28 +514,6 @@ fn ident_end(bytes: &[u8], from: usize) -> usize {
         at += 1;
     }
     at
-}
-
-/// Replace each `$sessions` token with `n` named placeholders.
-///
-/// The one edit the kernel makes to a caller's SQL.  Everything outside the
-/// given ranges is copied byte for byte.
-fn expand_sessions(sql: &str, tokens: &[Range<usize>], count: usize) -> String {
-    if tokens.is_empty() {
-        return sql.to_string();
-    }
-    let slots = (0..count).map(session_slot).collect::<Vec<_>>().join(", ");
-    let slots = format!("({slots})");
-
-    let mut out = String::with_capacity(sql.len() + tokens.len() * slots.len());
-    let mut cursor = 0;
-    for token in tokens {
-        out.push_str(&sql[cursor..token.start]);
-        out.push_str(&slots);
-        cursor = token.end;
-    }
-    out.push_str(&sql[cursor..]);
-    out
 }
 
 #[cfg(test)]
@@ -451,7 +612,7 @@ mod tests {
     /// `$sessions` becomes one placeholder per id, and the ids are bound
     /// rather than written into the text.
     #[test]
-    fn sessions_expands_to_one_named_placeholder_per_id() {
+    fn sessions_expands_to_one_placeholder_per_id() {
         let plan = plan_over(
             "SELECT * FROM events WHERE stream IN $sessions ORDER BY seq",
             &["stream-one", "stream-two"],
@@ -459,9 +620,10 @@ mod tests {
         .expect("plan");
         assert_eq!(
             plan.sql,
-            "SELECT * FROM events WHERE stream IN (:knl_sessions_0, :knl_sessions_1) ORDER BY seq"
+            "SELECT * FROM events WHERE stream IN (?, ?) ORDER BY seq"
         );
         assert_eq!(plan.sessions, ["stream-one", "stream-two"]);
+        assert_eq!(plan.values, [json!("stream-one"), json!("stream-two")]);
         for id in &plan.sessions {
             assert!(
                 !plan.sql.contains(id.as_str()),
@@ -473,32 +635,32 @@ mod tests {
         // Omitted, the set is the session's own stream — so the same SQL
         // reads one stream by default.
         let plan = plan_of("SELECT * FROM events WHERE stream IN $sessions").expect("plan");
-        assert_eq!(
-            plan.sql,
-            "SELECT * FROM events WHERE stream IN (:knl_sessions_0)"
-        );
+        assert_eq!(plan.sql, "SELECT * FROM events WHERE stream IN (?)");
         assert_eq!(plan.sessions, ["s-1"]);
         assert_eq!(plan.stream, "s-1");
+        assert_eq!(plan.values, [json!("s-1")]);
     }
 
-    /// The rewrite touches the token and nothing else: an occurrence inside a
-    /// literal, an identifier or a comment is left exactly as written, and so
-    /// is a longer name that starts the same way.
+    /// The rewrite touches the tokens and nothing else: an occurrence inside
+    /// a literal, an identifier or a comment is left exactly as written.
     #[test]
-    fn only_the_token_itself_is_rewritten() {
+    fn only_a_token_outside_quotes_and_comments_is_rewritten() {
         for sql in [
             r#"SELECT '$sessions' AS literal"#,
             r#"SELECT "$sessions" FROM events"#,
             "SELECT 1 -- $sessions in a comment\n",
             "SELECT /* $sessions */ 1",
-            "SELECT $sessions2",
+            r#"SELECT 'a ? b' AS literal"#,
+            r#"SELECT ':kind' AS literal"#,
+            "SELECT 1 -- :kind ? @who\n",
         ] {
             let plan = plan_over(sql, &["a", "b"]).expect("plan");
             assert_eq!(plan.sql, sql, "the text must be untouched: {sql:?}");
+            assert!(plan.values.is_empty(), "{sql:?}: {:?}", plan.values);
         }
 
         // Two occurrences are both expanded, and the rest of the statement is
-        // copied byte for byte.
+        // copied byte for byte — and each pushes its own values.
         let plan = plan_over(
             "SELECT * FROM events WHERE stream IN $sessions UNION \
              SELECT * FROM events WHERE stream IN $sessions",
@@ -507,9 +669,160 @@ mod tests {
         .expect("plan");
         assert_eq!(
             plan.sql,
-            "SELECT * FROM events WHERE stream IN (:knl_sessions_0) UNION \
-             SELECT * FROM events WHERE stream IN (:knl_sessions_0)"
+            "SELECT * FROM events WHERE stream IN (?) UNION \
+             SELECT * FROM events WHERE stream IN (?)"
         );
+        assert_eq!(plan.values, [json!("a"), json!("a")]);
+    }
+
+    /// A longer name that merely starts with a reserved one is the caller's,
+    /// and is answered out of the caller's own table.
+    #[test]
+    fn a_name_that_starts_like_a_reserved_one_is_the_callers() {
+        let opts = QueryOpts::default();
+        let mut named = Map::new();
+        named.insert("sessions2".to_string(), json!("x"));
+        let plan =
+            plan("SELECT $sessions2", QueryParams::Named(named), &opts, "s-1").expect("plan");
+        assert_eq!(plan.sql, "SELECT ?");
+        assert_eq!(plan.values, [json!("x")]);
+    }
+
+    /// `$stream` is the session's own stream, resolved in the same pass.
+    #[test]
+    fn stream_resolves_to_the_sessions_own_stream() {
+        let plan =
+            plan_of("SELECT * FROM events WHERE stream = $stream ORDER BY seq").expect("plan");
+        assert_eq!(
+            plan.sql,
+            "SELECT * FROM events WHERE stream = ? ORDER BY seq"
+        );
+        assert_eq!(plan.values, [json!("s-1")]);
+    }
+
+    /// The caller's own parameters are rewritten in the order they appear,
+    /// and each pushes exactly the value that answers it — a named one by
+    /// its name without the prefix, or with it.
+    #[test]
+    fn the_callers_parameters_are_resolved_in_order() {
+        let opts = QueryOpts::default();
+
+        let positional = plan(
+            "SELECT * FROM events WHERE stream = $stream AND kind = ? AND seq > ?",
+            QueryParams::Positional(vec![json!("note"), json!(3)]),
+            &opts,
+            "s-1",
+        )
+        .expect("plan");
+        assert_eq!(
+            positional.sql,
+            "SELECT * FROM events WHERE stream = ? AND kind = ? AND seq > ?"
+        );
+        assert_eq!(positional.values, [json!("s-1"), json!("note"), json!(3)]);
+
+        let mut named = Map::new();
+        named.insert("kind".to_string(), json!("note"));
+        named.insert("@who".to_string(), json!("me"));
+        let by_name = plan(
+            "SELECT * FROM events WHERE kind = :kind AND stream = @who AND kind = $kind",
+            QueryParams::Named(named),
+            &opts,
+            "s-1",
+        )
+        .expect("plan");
+        assert_eq!(
+            by_name.sql,
+            "SELECT * FROM events WHERE kind = ? AND stream = ? AND kind = ?"
+        );
+        assert_eq!(by_name.values, [json!("note"), json!("me"), json!("note")]);
+    }
+
+    /// A parameter nobody answered, and a value nobody asked for, are both
+    /// errors: a silent NULL is how a query quietly stops meaning what it
+    /// says.
+    #[test]
+    fn every_parameter_is_answered_and_every_value_is_used() {
+        let opts = QueryOpts::default();
+
+        let err = plan_of("SELECT * FROM events WHERE kind = :kind")
+            .expect_err("an unanswered parameter must be refused");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains(":kind"), "{}", err.reason());
+
+        let err = plan(
+            "SELECT * FROM events WHERE kind = :kind",
+            QueryParams::Named(Map::new()),
+            &opts,
+            "s-1",
+        )
+        .expect_err("a name with no value must be refused");
+        assert!(err.reason().contains(":kind"), "{}", err.reason());
+
+        let err = plan(
+            "SELECT * FROM events WHERE kind = ?",
+            QueryParams::Positional(vec![json!("a"), json!("b")]),
+            &opts,
+            "s-1",
+        )
+        .expect_err("a value with no parameter must be refused");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+
+        let err = plan(
+            "SELECT * FROM events WHERE kind = ? AND seq = ?",
+            QueryParams::Positional(vec![json!("a")]),
+            &opts,
+            "s-1",
+        )
+        .expect_err("a parameter with no value must be refused");
+        assert!(err.reason().contains("more `?`"), "{}", err.reason());
+    }
+
+    /// A numbered parameter says where its value goes, and that is what the
+    /// walk decides — so it is refused rather than silently renumbered.
+    #[test]
+    fn a_numbered_parameter_is_refused() {
+        let opts = QueryOpts::default();
+        let err = plan(
+            "SELECT * FROM events WHERE kind = ?1",
+            QueryParams::Positional(vec![json!("a")]),
+            &opts,
+            "s-1",
+        )
+        .expect_err("a numbered parameter must be refused");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains("?1"), "{}", err.reason());
+    }
+
+    /// A composite is not a SQLite value, and encoding one as its JSON text
+    /// would be the kernel guessing what the caller meant.
+    #[test]
+    fn a_list_or_a_table_is_not_a_value() {
+        let opts = QueryOpts::default();
+        for value in [json!([1, 2]), json!({ "a": 1 })] {
+            let err = plan(
+                "SELECT ?",
+                QueryParams::Positional(vec![value.clone()]),
+                &opts,
+                "s-1",
+            )
+            .expect_err("a composite must be refused");
+            assert_eq!(err.kind(), KnlError::VALIDATION, "{value}: {err}");
+            assert!(
+                err.reason().contains("not a SQLite value"),
+                "{}",
+                err.reason()
+            );
+        }
+
+        // The four scalars are values, and NULL is one of them.
+        let plan = plan(
+            "SELECT ?, ?, ?, ?",
+            QueryParams::Positional(vec![Value::Null, json!(true), json!(1.5), json!("text")]),
+            &opts,
+            "s-1",
+        )
+        .expect("plan");
+        assert_eq!(plan.values.len(), 4);
     }
 
     /// An empty set is refused: it is a mistake in the caller's own code, and

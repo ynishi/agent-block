@@ -9,7 +9,7 @@ mod serve;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_block_core::host::{PromptSource, ScriptSource, SecretKeySource};
@@ -65,14 +65,16 @@ struct Cli {
 
     /// Prompt string injected as `_PROMPT` Lua global.
     /// Scripts can use it as `agent.run({prompt = _PROMPT, ...})`.
-    /// Env: `AGENT_BLOCK_PROMPT`.
-    #[arg(long, env = "AGENT_BLOCK_PROMPT")]
+    ///
+    /// One run's own input, so it has no env binding: see `--config`.
+    #[arg(long)]
     prompt: Option<String>,
 
     /// Context string injected as `_CONTEXT` Lua global.
     /// Typically used as a system prompt: `agent.run({system = _CONTEXT, ...})`.
-    /// Env: `AGENT_BLOCK_CONTEXT`.
-    #[arg(short = 'c', long, env = "AGENT_BLOCK_CONTEXT")]
+    ///
+    /// One run's own input, so it has no env binding: see `--config`.
+    #[arg(short = 'c', long)]
     context: Option<String>,
 
     /// Path to a file whose contents are injected as `_PROMPT` Lua global.
@@ -106,9 +108,50 @@ struct Cli {
     /// serve` does, has somewhere to read the answer back from. Written only
     /// when the script returns; a script that raises writes nothing.
     ///
-    /// Env: `AGENT_BLOCK_RESULT_PATH`.
-    #[arg(long, value_name = "FILE", env = "AGENT_BLOCK_RESULT_PATH")]
+    /// One run's own output, so it has no env binding: see `--config`.
+    #[arg(long, value_name = "FILE")]
     result: Option<PathBuf>,
+
+    /// Label every `knl` session this run opens: `--label run=r-7`, repeated
+    /// for more than one.
+    ///
+    /// What this run is, for a caller that runs the same block over and over
+    /// and has to tell the runs apart afterwards — a job manager, most of
+    /// all. The labels land on each session's opening (`meta`), so one
+    /// project database holds every run and a reader selects the one it
+    /// wants (`knl.views.sessions`). The alternative — a database per run —
+    /// answers the same question by breaking the one above it: the project's
+    /// log stops being one stream to read.
+    ///
+    /// Values are read as JSON when they parse as a scalar (`n=2`,
+    /// `retried=true`) and as text otherwise, which is the same vocabulary
+    /// `meta` takes everywhere else.
+    ///
+    /// **No env binding, deliberately.** This names one run, and an
+    /// environment variable would be inherited by every process the block
+    /// starts — each of them then claiming to be the run its parent is.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
+
+    /// A JSON file holding this run's own inputs: `prompt`, `context`,
+    /// `result`, `labels`.
+    ///
+    /// One argument instead of four, for a caller that starts runs — a job
+    /// manager writes the file and names it here. Free text goes in it
+    /// unescaped, which a command line cannot promise: a prompt with quotes
+    /// or newlines in it survives a file and not a shell.
+    ///
+    /// The lowest layer of the three: a value in the file is used when
+    /// neither the flag nor (for the knobs that have one) the environment
+    /// gave one. So **file, then environment, then argument** — the later
+    /// one wins.
+    ///
+    /// It carries what belongs to ONE run, and nothing that belongs to the
+    /// host. Where the databases live, the sandbox, `AGENT_BLOCK_HOME` —
+    /// those stay environment variables read from the project's `.env`,
+    /// which is that half's config file already.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -254,11 +297,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         ),
     };
 
+    // The lowest of the three layers. Read before the argument shapes below
+    // so a value it carries stands in exactly where the command line gave
+    // none — the file loses to a flag, and never the other way round.
+    let file = read_run_config(cli.config.as_deref())?;
+    let cli_prompt = cli.prompt.or(file.prompt);
+    let cli_context = cli.context.or(file.context);
+    let result_path = cli.result.or(file.result);
+
     // Map the CLI argument shapes to the SDK `Source` enums. File-backed
     // variants are read eagerly here so the error message carries the
     // CLI flag name (`--prompt-file` / `--context-file`); the SDK side
     // sees the contents directly via `PromptSource::Inline`.
-    let prompt = match (cli.prompt, cli.prompt_file) {
+    let prompt = match (cli_prompt, cli.prompt_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
         (None, Some(p)) => {
@@ -271,7 +322,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("--prompt and --prompt-file are mutually exclusive");
         }
     };
-    let context = match (cli.context, cli.context_file) {
+    let context = match (cli_context, cli.context_file) {
         (None, None) => None,
         (Some(s), None) => Some(PromptSource::Inline(s)),
         (None, Some(p)) => {
@@ -298,12 +349,142 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     if let Some(context) = context {
         builder = builder.context(context);
     }
+    for (key, value) in file.labels {
+        builder = builder.session_label(key, value);
+    }
+    for (key, value) in parse_labels(&cli.labels)? {
+        builder = builder.session_label(key, value);
+    }
     let config = builder.build();
 
     let value = run_capture(config).await?;
-    if let Some(path) = cli.result {
+    if let Some(path) = result_path {
         std::fs::write(&path, &value)
             .with_context(|| format!("writing the script's result to '{}'", path.display()))?;
     }
     Ok(())
+}
+
+/// One run's own inputs, as a file: what `--config` names.
+///
+/// The three that used to be environment variables (`AGENT_BLOCK_PROMPT` /
+/// `_CONTEXT` / `_RESULT_PATH`) and the labels beside them. They belong
+/// together because they are all answers to "which run is this" — and they
+/// left the environment for the same reason: an environment variable is
+/// inherited, so a block that starts another `agent-block` handed its child
+/// its own prompt and its own result file to write over.
+///
+/// Closed (`deny_unknown_fields`): a misspelled key is a run that would have
+/// silently gone without its prompt.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunConfig {
+    /// `_PROMPT`.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// `_CONTEXT`.
+    #[serde(default)]
+    context: Option<String>,
+    /// Where the returned value is written.
+    #[serde(default)]
+    result: Option<PathBuf>,
+    /// What every session this run opens is labelled with.
+    #[serde(default)]
+    labels: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Read the `--config` file, or an empty config when none was named.
+fn read_run_config(path: Option<&Path>) -> anyhow::Result<RunConfig> {
+    let Some(path) = path else {
+        return Ok(RunConfig::default());
+    };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading --config '{}'", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("parsing --config '{}' as JSON", path.display()))
+}
+
+/// Read `--label key=value` pairs into the labels a session opens with.
+///
+/// The value is JSON when it parses as a scalar and text otherwise, so
+/// `n=2` and `retried=true` are a number and a flag while `run=r-7` and
+/// `note=2 items` are text. That is `meta`'s own vocabulary — a string, a
+/// number or a flag — and nothing here can produce anything deeper.
+///
+/// A pair with no `=` is a usage error rather than a label with an empty
+/// value: naming a key and forgetting the value is the likely mistake, and
+/// recording it as `""` would hide it in the log.
+fn parse_labels(pairs: &[String]) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--label takes key=value, got '{pair}' (no '=' in it)")
+            })?;
+            if key.is_empty() {
+                anyhow::bail!("--label takes key=value, got '{pair}' (the key is empty)");
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(value) {
+                Ok(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v,
+                _ => serde_json::Value::from(value),
+            };
+            Ok((key.to_string(), value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_labels;
+    use serde_json::Value;
+
+    /// A label is a string, a number or a flag — `meta`'s own vocabulary —
+    /// and which one it is comes from the text, not from a second flag the
+    /// caller has to remember.
+    #[test]
+    fn a_label_value_is_read_as_the_scalar_it_looks_like() {
+        let labels =
+            parse_labels(&["run=r-7".into(), "n=2".into(), "retried=true".into()]).expect("labels");
+        assert_eq!(
+            labels,
+            vec![
+                ("run".to_string(), Value::from("r-7")),
+                ("n".to_string(), Value::from(2)),
+                ("retried".to_string(), Value::from(true)),
+            ]
+        );
+    }
+
+    /// Anything that is not a scalar stays the text it was: a value that
+    /// happens to look like JSON structure is a label, not a shape, because
+    /// `meta` is shallow by rule.
+    #[test]
+    fn a_label_value_that_is_not_a_scalar_stays_text() {
+        let labels = parse_labels(&[
+            "note=2 items".into(),
+            "shape={\"a\":1}".into(),
+            "path=/tmp/x".into(),
+            "empty=".into(),
+        ])
+        .expect("labels");
+        assert_eq!(
+            labels,
+            vec![
+                ("note".to_string(), Value::from("2 items")),
+                ("shape".to_string(), Value::from("{\"a\":1}")),
+                ("path".to_string(), Value::from("/tmp/x")),
+                ("empty".to_string(), Value::from("")),
+            ]
+        );
+    }
+
+    /// A key with no value is the caller's mistake, said out loud: recording
+    /// it as an empty label would bury it in the log instead.
+    #[test]
+    fn a_pair_without_a_value_is_refused() {
+        let err = parse_labels(&["run".into()]).expect_err("no '=' in it");
+        assert!(err.to_string().contains("key=value"), "{err}");
+        let err = parse_labels(&["=r-7".into()]).expect_err("the key is empty");
+        assert!(err.to_string().contains("the key is empty"), "{err}");
+    }
 }

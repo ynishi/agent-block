@@ -30,12 +30,18 @@
 ---   a default parent is a tree in one database, and `knl.resume{ session = id }`
 ---   reopens it by id alone.
 ---
+---   Many sessions in one file is the shape, so what tells them apart is a
+---   label and not a file: `knl.open{ meta = { run = id } }` writes the
+---   caller's labels on the opening, and a supervisor selects on them. Giving
+---   each run a database of its own answers the same question by breaking the
+---   one above it — the project's log stops being one stream to read.
+---
 ---   `store = "mem"` is the other choice and has to be asked for by name: an
----   in-memory database, for TESTS AND MOCKS — one session, one process,
----   nothing shared. It is not a lighter version of the default. Two writers
----   meet a per-table lock there that no busy timeout waits out, so opening a
----   child of a `mem` parent is refused rather than made to wait (the kernel's
----   own header says the same, and `supervisor` says it again for siblings).
+---   in-memory log, for TESTS AND MOCKS — one per host process, gone with it,
+---   never a lighter version of the default. It is the same event log the
+---   file is (one writer thread, the same schema), so a `mem` parent can open
+---   children and a `mem` stream can be resumed by name while the host lives;
+---   what it cannot do is outlive the process.
 ---   `store = { sqlite = <path> }` is a file the caller picked.
 ---
 --- Lifecycle belongs to the session
@@ -56,8 +62,8 @@
 ---   The kernel does not count beats. `knl.beat` mints one id per beat with
 ---   `knl.new_beat_id()` (time-ordered, session-free) and stamps it on every
 ---   event that beat writes — llm_request, llm_response, the tool pair, and
----   a failed call's note. The kernel stores a `beat` it is given and asks
----   only that it be a string; grouping and ordering read it back, nothing
+---   a failed call's note. It is stamped as `meta.beat`, a label in the
+---   envelope like any other; grouping and ordering read it back, nothing
 ---   more. `resp.beat` carries the same id out to the caller.
 ---
 --- The steps of a beat
@@ -114,16 +120,18 @@
 ---   `detail.kind` is the field both answer in, so one predicate reads both.
 ---
 --- What a stored event looks like
----   One envelope, one place for structure. An event is `{ kind, beat?,
----   meta?, data? }` and nothing else at the top level — a stray key is
+---   One envelope, one place for structure. An event is `{ kind, meta?,
+---   data? }` and nothing else at the top level — a stray key is
 ---   refused, not stored — and the kernel stamps `seq` / `epoch_ms` /
 ---   `_schema_version` on it and keeps the envelope as columns (stream,
----   seq, epoch_ms, kind, schema_version, beat, meta, data).
+---   seq, epoch_ms, kind, schema_version, meta, data).
 ---
----   The envelope is the half that does not move. `beat` is the correlation
----   key this layer stamps, `meta` is a SHALLOW map of labels (string /
----   number / boolean values; a nested one is refused), and everything a
----   kind is actually ABOUT is structured JSON under `data`, whose shape
+---   The envelope is the half that does not move. `meta` is a SHALLOW map of
+---   labels (string / number / boolean values; a nested one is refused) and
+---   it is the envelope's correlation bag: the beat id this layer stamps on
+---   the events of one beat lives there, as `meta.beat`, and not as a field
+---   of its own. Everything a kind is actually ABOUT is structured JSON
+---   under `data`, whose shape
 ---   belongs to whoever writes that kind. The kernel validates the envelope
 ---   and the `data` of its own kinds (`session_*`, `budget_*`) and nothing
 ---   else; the shapes for the kinds a beat writes are declared here, in
@@ -161,9 +169,9 @@
 ---   that is not one SELECT / WITH, and resolves `$stream` (this session)
 ---   and `$sessions` (`opts.sessions`, the set to read across). That is the
 ---   whole mechanism: no builder, no query object, no registration hook.
----   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `tree` are the
----   five this module ships, and a consumer's own view is a function of
----   exactly the same form — nothing about the five is privileged.
+---   `knl.views.beats` / `tool_pairs` / `ledger` / `usage` / `sessions` /
+---   `tree` are the six this module ships, and a consumer's own view is a
+---   function of exactly the same form — nothing about the six is privileged.
 ---
 ---   Token usage is a query view and not a built-in one, deliberately.
 ---   Every `llm_response` carries the counts its adapter normalized out of
@@ -743,23 +751,40 @@ local REQUEST = T.shape({
 --- second `data` with none of that promise. The kernel refuses a nested one
 --- at the syscall; this is the same rule as data, so dev mode says it at
 --- the line that wrote it rather than at the boundary.
+---
+--- `meta.beat` is a label like any other, and the one this layer stamps:
+--- the id of the beat that wrote the event, an opaque string. It is not
+--- named in the shape — a map of labels is what it is, and `beat` is a
+--- string like the rest. The views group on it; that does not make it a
+--- field.
 local EVENT_META = T.map_of(T.string, T.any_of({ T.string, T.number, T.boolean }))
 
---- The envelope, in the terms this layer owns: a `kind` string, the `beat`
---- id stamped on the events a beat wrote (an opaque string and nothing
---- more), the shallow `meta` labels, and the `data` a kind carries.
+--- The one label this layer stamps, held to its type.
+---
+--- `EVENT_META` says every value is a scalar, which a NUMBER satisfies — so
+--- the shallow-label rule alone would take a numeric beat id, and a
+--- correlation key that is not a string is one no view can group on. Open,
+--- because every other label in there is the caller's and is already
+--- covered by `EVENT_META`. Asserted beside it at the append sites
+--- (`assert_event_dev`), which is where the kernel's own envelope rules are
+--- mirrored.
+local EVENT_BEAT_LABEL = T.shape({
+    beat = T.string:is_optional(),
+})
+
+--- The envelope, in the terms this layer owns: a `kind` string, the shallow
+--- `meta` labels (`meta.beat` among them), and the `data` a kind carries.
 ---
 --- Open, and deliberately: the kernel stamps `seq` / `epoch_ms` /
 --- `_schema_version` on a stored event, so the value that comes back out of
 --- `events()` carries more keys than the one that went in. The closure —
 --- "no other top-level key" — is the kernel's, enforced at the syscall
---- where the stamps are known; what this shape holds is the four fields a
+--- where the stamps are known; what this shape holds is the three fields a
 --- caller writes.
 ---
 --- What is inside `data` is per-kind and is `EVENT_DATA` below.
 local EVENT_BASE = T.shape({
     kind = T.string,
-    beat = T.string:is_optional(),
     meta = EVENT_META:is_optional(),
     data = T.table:is_optional(),
 })
@@ -980,10 +1005,16 @@ local BUDGET_ALLOCATION = T.shape({
 --- `budget = { from_parent = n }` and with nothing else: an owner's grant on
 --- a child would be a quota nobody paid for, and `from_parent` with no parent
 --- has nowhere to take it from. The kernel refuses each with the other named.
+--- `meta` is the labels the opening is written with — the envelope's own
+--- key, the same vocabulary an `append` carries (shallow scalars). It is how
+--- a caller running many sessions in one log names them: a supervisor selects
+--- on `json_extract(meta, '$.<key>')` of `session_opened` without knowing what
+--- the kind records, and without giving each session a database of its own.
 local OPEN_OPTS = T.shape({
     owner = T.string:is_optional(),
     budget = T.any_of({ BUDGET_GRANT, BUDGET_ALLOCATION }):is_optional(),
     store = T.any:is_optional(),
+    meta = T.any:is_optional(),
     parent = SESSION_HANDLE:is_optional(),
 })
 
@@ -1159,24 +1190,30 @@ local QUERY_OPTS = T.shape({
 --- footing as changing a stored event's shape.
 ---
 --- The envelope IS the column list (see the header). `stream` / `seq` /
---- `epoch_ms` / `kind` / `schema_version` are the kernel's stamps, `beat` is
---- the correlation key a view groups by, `meta` holds the shallow labels and
---- `data` holds the one structured JSON value a kind is about.
+--- `epoch_ms` / `kind` / `schema_version` are the kernel's stamps, `meta`
+--- holds the shallow labels — the beat id among them — and `data` holds the
+--- one structured JSON value a kind is about.
 ---
---- So a view reaches a beat with the `beat` column rather than a JSON path,
---- and the only `json_extract` any of them needs is into `data` — which is
---- exactly the reading that has to change when a kind's shape does. There is
---- no `payload` column any more: the whole-object form it held is what this
---- round split into the envelope and the one structured field.
+--- `position` is the key, and it is the log's global order rather than one
+--- stream's: every event of the database in the order it committed, dense
+--- and gap-free as read. `(stream, seq)` is unique beside it, so a read
+--- within one session still orders by `seq`; a read ACROSS sessions orders
+--- by `position`, which is the one thing `seq` cannot answer.
+---
+--- There is no `beat` column. The id lives in `meta` and the views reach it
+--- with `json_extract(meta, '$.beat')`, which the log carries an index for.
+--- There is no `payload` column either: the whole-object form it held is
+--- what an earlier round split into the envelope and the one structured
+--- field.
 local EVENTS_SCHEMA = {
     table = "events",
     columns = {
-        { name = "stream", type = "TEXT", pk = true },
-        { name = "seq", type = "INTEGER", pk = true },
+        { name = "position", type = "INTEGER", pk = true },
+        { name = "stream", type = "TEXT", pk = false },
+        { name = "seq", type = "INTEGER", pk = false },
         { name = "epoch_ms", type = "INTEGER", pk = false },
         { name = "kind", type = "TEXT", pk = false },
         { name = "schema_version", type = "INTEGER", pk = false },
-        { name = "beat", type = "TEXT", pk = false },
         { name = "meta", type = "TEXT", pk = false },
         { name = "data", type = "TEXT", pk = false },
     },
@@ -1381,6 +1418,12 @@ local VIEWS = {
         returns = "{ { stream, calls, input_tokens, output_tokens, thinking_tokens }, ... }, truncated"
             .. " — one row per stream that answered, the counts the providers reported",
     },
+    sessions = {
+        args = view_args(),
+        returns = "{ { session, meta, parent, opened_epoch_ms, closed_epoch_ms? }, ... }, truncated"
+            .. " — one row per session in the log; `meta` is the JSON text of"
+            .. " the labels it was opened with",
+    },
     tree = {
         args = view_args(),
         returns = "{ { session, parent, opened_epoch_ms, closed_epoch_ms?, open_children? }, ... }, truncated"
@@ -1492,8 +1535,11 @@ M.shapes.api = {
 ---
 --- Two halves, and they have different owners. The ENVELOPE rules are the
 --- ones the kernel also enforces and this layer mirrors so they fail at the
---- line that wrote them rather than at the syscall: a `kind`, a `beat` that
---- is a string when present, and a `meta` that is shallow. The `data` is
+--- line that wrote them rather than at the syscall: a `kind`, and a `meta`
+--- that is shallow — plus the one label this layer stamps, `meta.beat`,
+--- held to a string where the shallow rule alone would take any scalar
+--- (`EVENT_BEAT_LABEL`; this is what the layer adds to the kernel's own
+--- validator). The `data` is
 --- this layer's own — `knl.shapes.events` holds the shape of each kind it
 --- writes, and the kernel stopped judging them — so an unknown kind is
 --- simply not checked here, which is what leaves the vocabulary open.
@@ -1504,6 +1550,9 @@ M.shapes.api = {
 local function assert_event_dev(ev)
     shape.assert_dev(ev, EVENT_BASE, "knl_event")
     if type(ev) == "table" then
+        if ev.meta ~= nil then
+            shape.assert_dev(ev.meta, EVENT_BEAT_LABEL, "knl_event meta")
+        end
         local declared = EVENT_DATA[ev.kind]
         if declared ~= nil then
             shape.assert_dev(ev.data, declared, "knl_event data (" .. tostring(ev.kind) .. ")")
@@ -1863,7 +1912,8 @@ end
 -- open / resume / session — the state half
 -- ============================================================
 
-local OPEN_STATE_KEYS = { owner = true, budget = true, store = true, parent = true }
+local OPEN_STATE_KEYS =
+    { owner = true, budget = true, store = true, meta = true, parent = true }
 local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 
 --- Reject anything that is not a state key. Policy has its own constructor
@@ -1895,7 +1945,12 @@ end
 --- a child needs none, because it goes where its parent already is — and a
 --- parent on `"mem"` is refused, since a tree needs a file store.
 ---
---- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, parent? }
+--- `meta` labels the opening, and it is what tells sessions apart in a
+--- database that holds many of them: `knl.views.sessions` reads the labels
+--- back, and a `session:query` selects on one. Shallow scalars, the same
+--- vocabulary `s:append{ meta = … }` takes.
+---
+--- @param opts table  { owner?, budget? = { amount, tag?, desc? } | { from_parent, tag? }, store?, meta?, parent? }
 --- @return userdata session
 function M.open(opts)
     opts = opts or {}
@@ -1905,6 +1960,7 @@ function M.open(opts)
         owner = opts.owner,
         budget = opts.budget,
         store = opts.store,
+        meta = opts.meta,
         parent = opts.parent,
     })
 end
@@ -2142,6 +2198,30 @@ local function record(session, ev)
     return session:append(assert_event_dev(ev))
 end
 
+--- Stamp the beat id on an event about to be written.
+---
+--- The id lives in `meta` — it is a label, `meta.beat`, and not a field of
+--- its own — so stamping it is a merge and not an assignment: an event that
+--- already carries labels keeps them and `beat` joins them. The kernel's id
+--- wins over one already under that key, because the kernel is what mints
+--- it. `meta` values stay scalars either way; the id is a string.
+---
+--- `ev` is written into rather than copied: every call site is a literal
+--- built on the spot for the append that follows.
+---
+--- @param ev table  the event this beat is writing
+--- @param beat_id string  the id of the beat writing it
+--- @return table ev  the same event, with `meta.beat` set
+local function with_beat(ev, beat_id)
+    local meta = {}
+    for k, v in pairs(ev.meta or {}) do
+        meta[k] = v
+    end
+    meta.beat = beat_id
+    ev.meta = meta
+    return ev
+end
+
 --- What is wrong with an llm's answer, or nil when nothing is.
 ---
 --- `device.llm` promises one of two things: an `llm_result` (`knl.shapes`),
@@ -2277,15 +2357,14 @@ local function execute_tools(session, device, out, beat_id)
 
         -- Record the call before running it: a run that dies mid-tool
         -- leaves a history that says a call was made.
-        record(session, {
+        record(session, with_beat({
             kind = "tool_call",
-            beat = beat_id,
             data = {
                 call_id = call_id,
                 name = name,
                 args = args,
             },
-        })
+        }, beat_id))
 
         local ok, result
         if item.action == "deny" then
@@ -2316,15 +2395,14 @@ local function execute_tools(session, device, out, beat_id)
             result = ""
         end
 
-        record(session, {
+        record(session, with_beat({
             kind = "tool_result",
-            beat = beat_id,
             data = {
                 call_id = call_id,
                 ok = ok,
                 result = result,
             },
-        })
+        }, beat_id))
 
         summary[#summary + 1] = { call_id = call_id, name = name, ok = ok }
     end
@@ -2475,11 +2553,10 @@ function M.beat(session, device)
     -- can fail (closed session, an unavailable store, validation) — beat's
     -- contract is an Outcome, so a state failure is Error("state"), never
     -- a raw raise.
-    local rec_ok, rec_err = pcall(record, session, {
+    local rec_ok, rec_err = pcall(record, session, with_beat({
         kind = "llm_request",
-        beat = beat_id,
         data = { request = request },
-    })
+    }, beat_id))
     if not rec_ok then
         return emit(Outcome.err("state", read_error(rec_err)))
     end
@@ -2524,9 +2601,8 @@ function M.beat(session, device)
         -- log says the same thing the Outcome does.
         local classified = call_error(reason, raised)
         shape.assert_dev(classified, CALL_ERROR, "knl_call_error")
-        local noted_ok, note_err = pcall(record, session, {
+        local noted_ok, note_err = pcall(record, session, with_beat({
             kind = "llm_call_failed",
-            beat = beat_id,
             data = {
                 error = classified.message,
                 kind = classified.kind,
@@ -2534,7 +2610,7 @@ function M.beat(session, device)
                 retry_after = classified.retry_after,
                 status = classified.status,
             },
-        })
+        }, beat_id))
         if not noted_ok then
             -- Two failures, one Outcome. The state is the one reported:
             -- the call failing is a fact this beat could not write down,
@@ -2554,15 +2630,14 @@ function M.beat(session, device)
     -- deduction was taken at [3]).  The counts go in as they came: the adapter
     -- normalized them to three numbers on its way out, so there is nothing
     -- here to default and nothing to invent.
-    local resp_ok, resp_err = pcall(record, session, {
+    local resp_ok, resp_err = pcall(record, session, with_beat({
         kind = "llm_response",
-        beat = beat_id,
         data = {
             content = resp.content,
             usage = resp.usage,
             stop_reason = resp.stop_reason,
         },
-    })
+    }, beat_id))
     if not resp_ok then
         return emit(Outcome.err("state", read_error(resp_err)))
     end
@@ -2633,10 +2708,13 @@ M._execute_tools = execute_tools
 --     nothing that came from a caller.
 --
 -- Which half of the stored event a statement reads decides what can break
--- it. `beat` is a COLUMN — the envelope's
--- correlation key — so `beats` groups on it and is untouched by any change
--- to what a kind carries. The rest reach into `data`, and each of those
--- paths is tied to one kind's shape: `tool_pairs` to the tool pair,
+-- it. `beat` is a `meta` key — `meta` is the envelope's correlation bag, and
+-- the beat id is a label in it — so `beats` groups on
+-- `json_extract(meta, '$.beat')` and is untouched by any change to what a
+-- kind carries. That the reach is a JSON path does not change the argument:
+-- what it reaches into is the envelope, whose keys are labels this layer
+-- stamps, and not some kind's `data`. The rest do reach into `data`, and
+-- each of those paths is tied to one kind's shape: `tool_pairs` to the tool pair,
 -- `ledger` to `budget_*`, `usage` to `llm_response`. A kind's shape and the
 -- view that reads it change together, which is the whole reason the
 -- structured half lives in one column instead of being spread over the row.
@@ -2649,22 +2727,22 @@ M._execute_tools = execute_tools
 --- not flatten a subquery with an ORDER BY into an aggregating outer query,
 --- so the rows reach the aggregate in the order the subquery put them.
 ---
---- Events with no `beat` — the session's own boundaries, the ledger, a
+--- Events with no `meta.beat` — the session's own boundaries, the ledger, a
 --- caller's seed message — are not part of any beat and are left out. The
---- grouping key is the `beat` COLUMN, so this view reads nothing out of any
+--- grouping key is a `meta` label, so this view reads nothing out of any
 --- kind's `data` and no change to one can reach it.
 local BEATS_SQL = [[
 SELECT beat,
        MIN(seq)           AS seq_from,
        MAX(seq)           AS seq_to,
        group_concat(kind) AS kinds
-  FROM (SELECT beat,
+  FROM (SELECT json_extract(meta, '$.beat') AS beat,
                stream,
                seq,
                kind
           FROM events
          WHERE stream IN $sessions
-           AND beat IS NOT NULL
+           AND json_extract(meta, '$.beat') IS NOT NULL
          ORDER BY stream, seq)
  GROUP BY beat
  ORDER BY seq_from, beat
@@ -2681,11 +2759,11 @@ SELECT beat,
 --- point of the view: what it lists is the calls that were answered, and a
 --- call left open by a run that died mid-tool is visible as its absence
 --- (`beats` still shows the `tool_call` in its `kinds`).
---- The `beat` comes off the column and the rest out of `data`: this view is
---- tied to the shape of `tool_call` / `tool_result` (`knl.shapes.events`)
---- and moves with it.
+--- The `beat` comes off the envelope's labels and the rest out of `data`:
+--- this view is tied to the shape of `tool_call` / `tool_result`
+--- (`knl.shapes.events`) and moves with it.
 local TOOL_PAIRS_SQL = [[
-SELECT c.beat                            AS beat,
+SELECT json_extract(c.meta, '$.beat')    AS beat,
        json_extract(c.data, '$.call_id') AS call_id,
        json_extract(c.data, '$.name')    AS name,
        json_extract(r.data, '$.ok')      AS ok
@@ -2800,6 +2878,32 @@ SELECT t.session AS session,
  ORDER BY opened_epoch_ms, session
 ]]
 
+--- Every session the log holds, with the labels it was opened under.
+---
+--- The companion of `TREE_SQL`, and the other question a supervisor asks of
+--- a database that holds many runs: `tree` walks the sessions one opening
+--- descends from, this one lists them all. A caller that gave its runs a
+--- label (`knl.open{ meta = { run = id } }`) reads them back here without
+--- having given each one a database.
+---
+--- `meta` is the column's own JSON text, for the reason `open_children` is:
+--- the log holds it as written, and a view that re-encoded it into a Lua
+--- table would be inventing a shape the log does not have. The rest is read
+--- the same way `tree` reads it — correlated subqueries, so a stream that
+--- recorded two endings is still one row.
+local SESSIONS_SQL = [[
+SELECT o.stream    AS session,
+       o.meta      AS meta,
+       json_extract(o.data, '$.parent') AS parent,
+       MIN(o.epoch_ms) AS opened_epoch_ms,
+       (SELECT MIN(c.epoch_ms) FROM events AS c
+         WHERE c.stream = o.stream AND c.kind = 'session_closed') AS closed_epoch_ms
+  FROM events AS o
+ WHERE o.kind = 'session_opened'
+ GROUP BY o.stream
+ ORDER BY opened_epoch_ms, session
+]]
+
 --- Run one view's statement over `session`.
 ---
 --- The options are the caller's, passed through untouched: `sessions` is
@@ -2902,6 +3006,26 @@ end
 --- @return boolean truncated
 function M.views.tree(session, opts)
     return read_view(session, TREE_SQL, opts)
+end
+
+--- Every session in the log: `{ session, meta, parent, opened_epoch_ms,
+--- closed_epoch_ms }`, in the order they opened.
+---
+--- What tells one run from another when they share a database. `meta` is the
+--- JSON text of the labels the session was opened with — `{}` for a session
+--- nobody labelled — so a caller looking for one run decodes it, or asks for
+--- what it wants with a `session:query` of its own; a view takes no
+--- parameters, so the filtering is the caller's either way.
+---
+--- `closed_epoch_ms` is nil while a session is still running. `opts.sessions`
+--- widens which streams are in scope, as it does on any other view.
+---
+--- @param session userdata|table  a knl session
+--- @param opts table|nil  query opts (`sessions` / `timeout_ms` / `limit`)
+--- @return table rows
+--- @return boolean truncated
+function M.views.sessions(session, opts)
+    return read_view(session, SESSIONS_SQL, opts)
 end
 
 -- ============================================================

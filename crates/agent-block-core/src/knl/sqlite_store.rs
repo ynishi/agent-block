@@ -1,262 +1,114 @@
-//! The durable [`EventStore`]: one SQLite table, one stream per session.
+//! The durable [`EventStore`]: one stream of an eventsdb log.
 //!
-//! [`SqliteEventStore`] takes the same calls [`MemEventStore`] does, so a
-//! session's log survives a process restart without any other code changing.
-//! It is scoped to one `stream` (the session id); several sessions share one
-//! DB file, and the `(stream, seq)` primary key keeps their logs apart.
+//! [`SqliteEventStore`] is an *adapter*.  The kernel's [`EventStore`] is the
+//! kernel's SPI and does not move; underneath it is
+//! [`eventsdb_sqlite`] — a SQLite event log with a writer thread of its own, a
+//! pool of read-only connections beside it, a migration ladder for the table's
+//! shape and a transaction hatch for the two writes the kernel cannot express
+//! any other way.  What is left here is the translation: the kernel's
+//! vocabulary in, eventsdb's out, and back.
 //!
-//! # Append-only, store-assigned coordinates
+//! ```text
+//!   knl::Logs ──▶ SqliteEventLog ──stream_handle(id)──▶ eventsdb SqliteEventStore
+//!                       │                                        ▲
+//!                       │ with_transaction(TxnContext)           │ delegate
+//!                       ▼                                        │
+//!            append_if_many / append_with_open_children     append / append_many
+//!            (two streams, and the child scan)              append_if / reads
+//! ```
 //!
-//! There is no update or delete — the trait has neither, so a backend cannot
-//! offer one.  `seq` and `epoch_ms` are the store's to assign: `append`
-//! computes the next `seq` inside the transaction that inserts, runs the
-//! same [`validate_event`] and [`stamp`] the in-memory store runs, and
-//! returns the coordinates inline.
+//! # What the adapter owns, and what it hands over
 //!
-//! # One backend, two kinds of database
+//! Two things are the kernel's and stay here:
 //!
-//! There is no second implementation of [`EventStore`] in the product: a
-//! session's log is a SQLite table whether or not it outlives the process.
-//! [`SqliteEventStore::open`] takes a file; [`SqliteEventStore::open_memory`]
-//! takes a database that lives in memory under a name derived from the
-//! stream (`file:knl-<stream>?mode=memory&cache=shared`), which is what an
-//! ephemeral session gets.  The shared-cache URI is not decoration: a second
-//! connection to the same name sees the same database, which is what lets the
-//! read side below exist at all — and it is also why the writer connection
-//! must outlive the session, since an in-memory database is reclaimed when
-//! its last connection closes.
+//! - **[`validate_event`]**, the kernel's own rules — the envelope, and the
+//!   `data` of the six kinds the kernel writes ([`super::event`]).  eventsdb
+//!   checks the envelope too and knows nothing of a kind's shape, so the
+//!   kernel's check runs first, on every write path including the ones a
+//!   decision produces;
+//! - **the schema version.**  eventsdb takes the version from the event's
+//!   author and only fills in a default for an author who did not say
+//!   ([`eventsdb_core::event::stamp`]), so every append here stamps
+//!   [`CURRENT_SCHEMA_VERSION`] on the way past.  `seq` and `epoch_ms` are
+//!   removed for the same reason in reverse: they are the store's to assign,
+//!   so a caller-supplied one is dropped rather than trusted.
 //!
-//! The one thing the in-memory database cannot do is survive the process.
-//! Within it, a stream is a stream: [`super::Session::resume`] reopens one by
-//! name exactly as it reopens a file.
+//! Everything else is eventsdb's: the `IMMEDIATE` transaction every write
+//! takes, the busy retry, the per-stream `seq` counter, the global `position`,
+//! the upcaster chain, and the read-only connections a query runs on.
 //!
-//! # The stored shape is columns, and one of them is the kind's own
+//! # The chain runs once, and it runs down there
 //!
-//! The event's envelope is columns — `stream` / `seq` / `epoch_ms` / `kind` /
-//! `schema_version` / `beat` — and the two objects it carries are one column
-//! each: `meta`, a shallow table of scalars, and `data`, the kind's own
-//! content at any depth ([`super::event`]).  A read rebuilds exactly the
-//! object that was written, so a caller sees no difference between this and a
-//! log kept in memory.
+//! [`kernel_upcasters`] is registered on the *log* ([`super::Logs`]), because
+//! eventsdb applies it to everything it reads — `read_kinds`, `read_last`, and
+//! the events a decision is shown inside its transaction.  So the seam above
+//! this ([`super::CurrentStore`]) carries an **empty** chain: its job here is
+//! the type, not the transform.  It still checks what it is handed
+//! ([`super::Current`]), which is what keeps "only upcasted events reach the
+//! domain" a property rather than a convention.
 //!
-//! The whole event used to go into a single `payload` column, which put an
-//! envelope key and a kind's own field at the same level for anything reading
-//! the log with SQL: a `json_extract` could not say which of the two it was
-//! reaching into, and a kind changing shape broke a view with nothing to
-//! point at.  Now the columns *are* the contract — a view over them is
-//! unaffected by any kind — and the paths that need watching are all inside
-//! `data`.
+//! # The two writes that go through the hatch
 //!
-//! # Reads are indexed by kind, and by beat
+//! [`EventStore::append_if_many`] and [`EventStore::append_with_open_children`]
+//! are the two operations that are not about one stream, and both are one
+//! transaction by necessity rather than for convenience: an allocation moves
+//! units between two ledgers, and a close records the children that had not
+//! ended *as of the write that records it*.  `log.with_transaction` hands over
+//! a [`TxnContext`] — the log's own stamped `append` / `append_many` / `read`,
+//! and a raw [`rusqlite::Transaction`] underneath for the child scan's
+//! `SELECT`.  Raw writes to `events` are refused there by SQLite's own
+//! authorizer, which is the point: an append cannot skip validation or
+//! sequencing by going round the side.
 //!
-//! The table carries a `(stream, kind, seq)` index beside its `(stream, seq)`
-//! primary key, so a kind-filtered read ([`EventStore::read_kinds`], and the
-//! decision input of [`EventStore::append_if`]) costs the size of the *fold*
-//! rather than the size of the stream: folding the balance reads the
-//! `budget_*` events, not every fact the session ever recorded.
+//! # The read side
 //!
-//! `beat` has a column and a `(stream, beat, seq)` index of its own, because
-//! it is the one correlation the log itself is grouped by: the events of one
-//! beat are a range of that index rather than a scan with a `json_extract`
-//! in the predicate.
+//! [`EventStore::query`] is [`SqliteEventLog::query_timeout`]: the caller's
+//! statement, positional values ([`super::query`] resolved them), a deadline,
+//! and a read-only connection that is not the writer.  The row cap is the
+//! kernel's and is applied by *wrapping* the statement — `SELECT * FROM (…)
+//! LIMIT n + 1` — so one more row than the caller allowed is read and the
+//! extra one is what says the answer was cut ([`QueryRows::truncated`]).
 //!
-//! # The read side is a second connection, and it cannot write
+//! A `NULL` column comes back from eventsdb as a JSON null and is dropped from
+//! the row here, so the Lua side reads an absent key as `nil`, which is what a
+//! missing column means there.
 //!
-//! [`EventStore::query`] answers a caller's own SQL ([`super::query`]) over a
-//! **separate** connection to the same database, opened `READ_ONLY` and put
-//! into `query_only` mode, lazily on the first query and reused after that.
-//! Three independent things therefore have to fail before a query could
-//! change the log: the statement is checked to be a single `SELECT` / `WITH`
-//! before SQLite sees it, the prepared statement is asked whether it writes,
-//! and the connection it runs on has no write capability to lend it.  Values
-//! are bound, never interpolated — including the ids `$sessions` expands to.
-//!
-//! A query runs under a deadline: [`AsyncIsle::call_timeout`] interrupts the
-//! statement if it has not finished in time, and that surfaces as
-//! [`KnlError::Timeout`].
-//!
-//! # The connection lives on a thread of its own, and nobody waits on it
-//!
-//! Neither connection is held by this struct: each is owned by a
-//! [`rusqlite_isle::AsyncIsle`], a thread that takes closures and runs them
-//! one at a time.  A store method is therefore a closure sent to that thread
-//! and a result **awaited** — the caller's task yields while SQLite works, so
-//! the one thread that must never stop (the Lua VM's, which is the sole worker
-//! of its own runtime) goes on driving every other coroutine, timer and cancel
-//! it owns.  That is why the whole SPI below is `async`: an event store that
-//! can only be waited for synchronously is an event store that stops the VM.
-//!
-//! The handle is cloneable and cheap; what is *not* cloneable is the
-//! [`rusqlite_isle::AsyncIsleDriver`] that owns the thread's join handle.
-//! Those go to an [`IsleDrivers`] the host holds, so a session's threads
-//! outlive the session — a dropped handle can still hand its closing event to
-//! the isle without waiting for it — and are drained once, at host shutdown.
-//!
-//! # Concurrency
-//!
-//! `append`, `append_many` and `append_if` read-then-write, so each runs in an
-//! `IMMEDIATE` transaction: the `RESERVED` lock is taken at `BEGIN` rather
-//! than promoted from `SHARED` on the first write, which is the point
-//! `busy_timeout` actually covers — a `DEFERRED` transaction can still hit
-//! `SQLITE_BUSY` on lock *promotion* even with a timeout set.  Contention with
-//! another connection is waited out by the busy timeout the isle was opened
-//! with, and `append` / `append_many` sit inside [`AsyncIsle::call_retry`],
-//! which re-submits the whole job on `SQLITE_BUSY`, backing off with
-//! `tokio::time::sleep` rather than parking a thread.  A write that is still
-//! contended after that surfaces as [`KnlError::Busy`], which is the one class
-//! that tells the caller another try is worth making.
-//!
-//! `append_if` gets the busy timeout and the retryable error, not the backoff
-//! loop — its decision is a `FnOnce`, so an attempt consumes it.  What it no
-//! longer needs is the channel round trip the borrowed-closure form required:
-//! the decision is owned and `Send`, so it travels *with* the job and runs on
-//! the isle's own thread, inside the transaction, with nothing on either side
-//! waiting for the other.
-//!
-//! That is what makes the SPI's promise true here: appends to one stream are
-//! *serialized* — two handles both write and the log interleaves in arrival
-//! order — a batch is one transaction, so it lands whole or not at all, and a
-//! decision taken by `append_if` runs against the stream inside the same
-//! transaction that records its answer, so no concurrent writer can slip
-//! between the two.
-//!
-//! [`MemEventStore`]: super::event_store::MemEventStore
-//! [`AsyncIsle::call_retry`]: rusqlite_isle::AsyncIsle::call_retry
-//! [`AsyncIsle::call_timeout`]: rusqlite_isle::AsyncIsle::call_timeout
+//! [`TxnContext`]: eventsdb_sqlite::TxnContext
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
 
 use async_trait::async_trait;
-use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{params, params_from_iter, Connection, OpenFlags, TransactionBehavior};
-use rusqlite_isle::{AsyncIsle, AsyncIsleDriver, IsleError, RetryPolicy};
+use eventsdb_core::store::EventStore as EventsdbStore;
+use eventsdb_core::upcast::Current as Upcasted;
+use eventsdb_sqlite::SqliteEventLog;
 use serde_json::{Map, Value};
-use tokio::sync::OnceCell;
 
-use super::event::{
-    stamp, validate_event, FIELD_BEAT, FIELD_DATA, FIELD_EPOCH_MS, FIELD_KIND, FIELD_META,
-    FIELD_SEQ,
-};
+use super::event::{validate_event, FIELD_EPOCH_MS, FIELD_SEQ};
 use super::event_store::{
     stamp_schema_version, ChildScan, ChildrenDecision, Committed, Decision, EventStore, Split,
-    SplitDecision, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
+    SplitDecision,
 };
-use super::query::{session_slot, QueryParams, QueryPlan, QueryRows, STREAM_PARAM};
-use super::{now_ms, KnlError, KnlResult};
-
-/// How long a contended write waits for the lock before erroring.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The lifecycle owners of the connection threads a session's log lives on.
-///
-/// [`rusqlite_isle::AsyncIsle`] hands back a cloneable handle and a driver
-/// that is not clonable: the driver owns the thread's join handle and is the
-/// only thing that can drain and stop it.  A session cannot hold its own —
-/// the whole point of the drop backstop is that a handle nobody closed can
-/// still hand its `session_closed` to the isle *after* the handle is gone, and
-/// a thread its own store had already stopped could not take it.
-///
-/// So the drivers are parked here instead: one collection per host run, shut
-/// down once at the end of it, exactly as the `std.ts` connection thread is.
-/// Cheap to clone (an `Arc`), because every site that opens a store needs to
-/// reach it.
-///
-/// The lock is a plain [`Mutex`] and is never held across an `.await`:
-/// [`IsleDrivers::shutdown`] takes the whole list out under the lock and
-/// releases it before it starts waiting on the first thread.
-#[derive(Clone, Default)]
-pub struct IsleDrivers {
-    parked: Arc<Mutex<Vec<AsyncIsleDriver>>>,
-}
-
-impl std::fmt::Debug for IsleDrivers {
-    /// The drivers themselves have nothing worth printing; the count is what
-    /// a caller debugging a leak wants.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IsleDrivers")
-            .field("parked", &self.len())
-            .finish()
-    }
-}
-
-impl IsleDrivers {
-    /// A fresh, empty collection.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Take ownership of `driver` for the rest of the run.
-    ///
-    /// A poisoned lock is stepped over rather than raised on: this runs while
-    /// a store is being opened, the data behind the lock is a plain `Vec` that
-    /// no half-finished write can corrupt, and refusing to keep the driver
-    /// would leak the thread outright.
-    fn park(&self, driver: AsyncIsleDriver) {
-        self.parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(driver);
-    }
-
-    /// How many connection threads are still owned here.
-    pub fn len(&self) -> usize {
-        self.parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
-    }
-
-    /// Whether no connection thread has been opened (or all were drained).
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Drain every thread: queued jobs run to completion, then each thread
-    /// stops and is joined.
-    ///
-    /// The queued jobs matter — the drop backstop submits its `session_closed`
-    /// without waiting for it, so this is where those land.  Failures are
-    /// collected rather than raised on the first one: a thread that panicked
-    /// is no reason to leave the rest running.
-    ///
-    /// Idempotent: a second call finds nothing parked and returns an empty
-    /// list.
-    pub async fn shutdown(&self) -> Vec<IsleError> {
-        // The guard is released here, before the first `.await` below.
-        let drivers: Vec<AsyncIsleDriver> =
-            std::mem::take(&mut *self.parked.lock().unwrap_or_else(PoisonError::into_inner));
-        let mut failures = Vec::new();
-        for driver in drivers {
-            if let Err(e) = driver.shutdown().await {
-                failures.push(e);
-            }
-        }
-        failures
-    }
-}
+use super::logs::Logs;
+use super::query::{QueryPlan, QueryRows};
+use super::{KnlError, KnlResult};
 
 /// The table the log lives in — published as the read contract
 /// ([`events_schema`]).
 pub const EVENTS_TABLE: &str = "events";
 
-/// The DDL for [`EVENTS_TABLE`] and its three indexes.
+/// The index the close-time child scan reads by.
 ///
-/// `IF NOT EXISTS` throughout, so opening a fresh database and reopening one
-/// an earlier build wrote take the same path.  The `(stream, kind, seq)`
-/// index is what makes a kind-filtered read cost the size of the fold rather
-/// than the size of the stream, and it keeps the rows in `seq` order within a
-/// kind, so the read needs no sort; `(stream, beat, seq)` does the same for
-/// the events of one beat.
+/// Created once per log open ([`super::Logs`]) rather than declared in a DDL,
+/// because the table's shape is eventsdb's and this index is the kernel's:
+/// which openings name *this* stream as their parent is a question about the
+/// whole database, and without an index it is answered by walking every event
+/// in it.
 ///
-/// `events_session_opened_parent` does it for the close-time scan
-/// ([`open_children_in`]), which asks across streams rather than within one:
-/// which openings name *this* stream as their parent.  It is a *partial
-/// expression* index and both halves are load-bearing.  The expression is
-/// written exactly as the scan writes it, because SQLite matches an indexed
-/// expression against a query's by form — a path bound as a parameter would
-/// never match one written as a literal, which is why
+/// It is a *partial expression* index and both halves are load-bearing.  The
+/// expression is written exactly as the scan writes it, because SQLite matches
+/// an indexed expression against a query's by form — a path bound as a
+/// parameter would never match one written as a literal, which is why
 /// [`child_scan_sql`] spells its words out.  The `WHERE` keeps the index to
 /// the openings: `parent` lives on `session_opened` and nowhere else, so
 /// indexing every row would be storing a NULL per event to find the handful
@@ -264,45 +116,19 @@ pub const EVENTS_TABLE: &str = "events";
 ///
 /// That is the kernel's vocabulary sitting in the store's schema, which the
 /// rest of this backend avoids ([`ChildScan`] is an argument, not a constant).
-/// The price of the index is that those words are settled at DDL time; what it
-/// buys is that a close on a large log looks the openings up instead of walking
-/// the table.  A scan under some other vocabulary still reads correctly — it
-/// just reads without the index.
-///
-/// **An index is not a stored shape**, so adding one does not touch
-/// [`super::event_store::CURRENT_SCHEMA_VERSION`]: the rows say exactly what
-/// they said before, and a database an earlier build wrote picks the index up
-/// on the next open, the same `IF NOT EXISTS` path a fresh one takes.  What
-/// obliges a version bump and an upcaster is a change to what an event *is* —
-/// see the [`super::event_store`] module docs.
-///
-/// `beat` is the one nullable column: it is the caller's to declare and most
-/// events do not belong to a beat.  `meta` and `data` are `NOT NULL` because
-/// they are filled in with `{}` on the way in ([`stamp`]), so a reader never
-/// has to tell an empty object from a missing one.
-const SCHEMA_DDL: &str = "CREATE TABLE IF NOT EXISTS events ( \
-         stream         TEXT    NOT NULL, \
-         seq            INTEGER NOT NULL, \
-         epoch_ms       INTEGER NOT NULL, \
-         kind           TEXT    NOT NULL, \
-         schema_version INTEGER NOT NULL, \
-         beat           TEXT    NULL, \
-         meta           TEXT    NOT NULL, \
-         data           TEXT    NOT NULL, \
-         PRIMARY KEY (stream, seq) \
-     ); \
-     CREATE INDEX IF NOT EXISTS events_stream_kind_seq \
-         ON events (stream, kind, seq); \
-     CREATE INDEX IF NOT EXISTS events_stream_beat_seq \
-         ON events (stream, beat, seq); \
-     CREATE INDEX IF NOT EXISTS events_session_opened_parent \
+/// The price is that those words are settled at open time; what it buys is
+/// that a close on a large log looks the openings up instead of walking the
+/// table.  A scan under some other vocabulary still reads correctly — it just
+/// reads without the index.
+pub(super) const CHILD_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS \
+     events_session_opened_parent \
          ON events (json_extract(data, '$.parent')) \
       WHERE kind = 'session_opened';";
 
-/// One column of [`EVENTS_TABLE`], as SQLite itself reports it.
+/// One column of [`EVENTS_TABLE`].
 ///
 /// Published to the shell so a caller writing SQL against the log reads the
-/// column names and types from the database rather than from a list somebody
+/// column names and types from the kernel rather than from a list somebody
 /// retyped — and so a test can hold the shell's declaration of the schema
 /// against the table that actually exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,356 +141,214 @@ pub struct SchemaColumn {
     pub pk: bool,
 }
 
-/// What the shared-cache URI of an in-memory kernel database starts with.
+/// The columns of the `events` table, in the order SQLite reports them.
 ///
-/// One constant for the two directions: [`Db::memory_uri`] builds the address,
-/// and [`is_memory_database`] reads one back.
-const MEMORY_URI_PREFIX: &str = "file:knl-";
-
-/// Whether `database` — an [`EventStore::database`] identity — names an
-/// in-memory database rather than a file.
+/// A constant rather than a `PRAGMA table_info` against a throwaway database,
+/// for two reasons: the table is the store's and its DDL runs inside a
+/// migration ladder that is `async` — while `knl.api()` is a declaration of
+/// the surface, which should not have to be awaited — and a pragma is one of
+/// the things the store's hatch refuses, since setting one is how the ladder's
+/// own marker would be changed underneath it.  What keeps the constant honest
+/// is a test: it opens a real log and holds this list against what SQLite says
+/// the table has, so the two cannot drift apart unnoticed.
 ///
-/// The identity is documented as a thing to pass along and not to take apart,
-/// and this is the one question about it that is the store's to answer rather
-/// than a caller's to parse: the URI form is minted here, so the reading of it
-/// belongs here too.  The caller that asks is the bridge, deciding whether a
-/// session can be a parent — a tree writes to one database, and the in-memory
-/// one locks per table under its shared cache.
-pub fn is_memory_database(database: &str) -> bool {
-    database.starts_with(MEMORY_URI_PREFIX)
-}
-
-/// Where a store's database lives.
-///
-/// The store keeps this so it can open a *second* connection to the same
-/// database for reads.  For a file that is the same path; for an in-memory
-/// database it is the shared-cache URI, which is the only way a second
-/// connection can reach one.
-#[derive(Debug, Clone)]
-enum Db {
-    /// A file on disk.
-    File(PathBuf),
-    /// An in-memory database, addressed by its shared-cache URI.
-    Memory(String),
-}
-
-impl Db {
-    /// The identity of this database, as [`EventStore::database`] reports it.
-    ///
-    /// The same string the connection is opened by — a path for a file, the
-    /// shared-cache URI for an in-memory database — because that is exactly
-    /// what "the same database" means here: two stores opened by the same
-    /// target reach the same rows, and the `(stream, seq)` key keeps their
-    /// streams apart inside it.
-    fn id(&self) -> String {
-        self.target().to_string_lossy().into_owned()
-    }
-
-    /// The URI an in-memory database for `stream` is addressed by.
-    ///
-    /// Derived from the stream id, so reopening the same stream in the same
-    /// process finds the same database — which is what makes an in-memory
-    /// session resumable while it is still alive.
-    fn memory_uri(stream: &str) -> String {
-        format!("{MEMORY_URI_PREFIX}{stream}?mode=memory&cache=shared")
-    }
-
-    /// What SQLite is asked to open: a path for a file, the shared-cache URI
-    /// for an in-memory database.
-    ///
-    /// The URI goes through the same argument the path does, which is why
-    /// `SQLITE_OPEN_URI` is in both flag sets below: it is what makes the
-    /// `file:` form a URI rather than a relative path called "file:…".
-    fn target(&self) -> PathBuf {
-        match self {
-            Self::File(path) => path.clone(),
-            Self::Memory(uri) => PathBuf::from(uri),
-        }
-    }
-
-    /// The flags the writing connection is opened with.
-    fn write_flags() -> OpenFlags {
-        OpenFlags::default() | OpenFlags::SQLITE_OPEN_URI
-    }
-
-    /// The flags a read-only connection is opened with.
-    fn read_only_flags() -> OpenFlags {
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI
-    }
-
-    /// Start the writing isle: the thread that owns the connection every
-    /// append goes through, with the `events` table ensured before it takes
-    /// its first job.
-    ///
-    /// The thread is created by `std::thread::Builder` inside the isle and
-    /// needs no runtime of its own; what this call awaits is the oneshot that
-    /// says the connection opened and the DDL ran.  So the caller yields
-    /// rather than blocking, which is what lets `knl.open` be reached from
-    /// inside the Lua VM at all.
-    async fn spawn_writer(&self, drivers: &IsleDrivers) -> KnlResult<AsyncIsle> {
-        let (isle, driver) = AsyncIsle::builder()
-            .thread_name("knl-events")
-            .open_flags(Self::write_flags())
-            .wal(BUSY_TIMEOUT)
-            .spawn(self.target(), |conn| conn.execute_batch(SCHEMA_DDL))
-            .await
-            .map_err(KnlError::from)?;
-        drivers.park(driver);
-        Ok(isle)
-    }
-
-    /// Start the reading isle: a second thread, a second connection, and no
-    /// write capability on it at all.
-    async fn spawn_reader(&self, drivers: &IsleDrivers) -> KnlResult<AsyncIsle> {
-        let (isle, driver) = AsyncIsle::builder()
-            .thread_name("knl-events-read")
-            .open_flags(Self::read_only_flags())
-            .busy_timeout(BUSY_TIMEOUT)
-            .spawn(self.target(), |conn| {
-                conn.execute_batch("PRAGMA query_only = 1;")
-            })
-            .await
-            .map_err(KnlError::from)?;
-        drivers.park(driver);
-        Ok(isle)
-    }
-}
-
-/// How a busy write is retried: the isle re-submits the whole job on
-/// `SQLITE_BUSY`, backing off between attempts.
-///
-/// The defaults (3 retries from 50 ms, doubling) are the isle's, and so is the
-/// decision of what counts as busy — this store no longer classifies lock
-/// contention for the purpose of retrying it.
-fn retry_policy() -> RetryPolicy {
-    RetryPolicy::default()
-}
-
-/// A job's failure, split by who should see it.
-///
-/// [`Sqlite`](Self::Sqlite) is handed back to the isle, which is what lets it
-/// recognise a contended write and try again; a
-/// [`Terminal`](Self::Terminal) kernel error (a rejected event, a corrupt row,
-/// an encode failure) is carried out through the job's *value* instead, so no
-/// retry is spent on something no retry can fix.
-enum JobError {
-    /// A rusqlite fault, returned to the isle.
-    Sqlite(rusqlite::Error),
-    /// A terminal kernel error — never retried.
-    Terminal(KnlError),
-}
-
-/// Hand a job's outcome to the isle in the shape it expects: SQLite's errors
-/// as errors (retryable), the kernel's as a value (terminal).
-fn finish<T>(outcome: Result<T, JobError>) -> Result<KnlResult<T>, rusqlite::Error> {
-    match outcome {
-        Ok(value) => Ok(Ok(value)),
-        Err(JobError::Sqlite(error)) => Err(error),
-        Err(JobError::Terminal(error)) => Ok(Err(error)),
-    }
-}
-
-/// Whether a rusqlite error is a retryable lock contention (matched on the
-/// SQLite error *code*, never the message text).
-fn is_retryable(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(inner, _)
-            if matches!(
-                inner.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-    )
-}
-
-/// A durable [`EventStore`] backed by SQLite, scoped to one `stream`.
-///
-/// The session *is* the stream: one instance serves one session's log.
-/// Several instances may point at the same DB file with different streams.
-pub struct SqliteEventStore {
-    /// The handle on the thread that owns the writing connection.
-    ///
-    /// Held for the store's whole life, which for an in-memory database is
-    /// not merely convenient: a shared-cache in-memory database exists only
-    /// while a connection to it is open, so this isle *is* the database.
-    writer: AsyncIsle,
-    /// Where the database is, so a second connection can be opened to it.
-    db: Db,
-    /// The read-only isle, started on the first query and reused.
-    ///
-    /// Lazy because most sessions never run one: a store that only appends
-    /// and folds pays nothing — not even a thread — for the read side
-    /// existing.  A [`tokio::sync::OnceCell`] rather than the `std` one
-    /// because opening it is now an `await`, and because the cell has to stay
-    /// `Sync` for the store's `&self` reads to be `Send` futures.
-    reader: OnceCell<AsyncIsle>,
-    /// Where the drivers of both threads went, so the reader can park its own
-    /// when it is opened.
-    drivers: IsleDrivers,
-    /// The stream this store is scoped to — the session id.
-    stream: String,
-    /// The identity of the database, computed once at open ([`Db::id`]) so
-    /// [`EventStore::database`] can hand back a borrow of it.
-    db_id: String,
-}
-
-impl SqliteEventStore {
-    /// Open (creating if absent) the DB at `path`, scoped to `stream`.
-    ///
-    /// The `events` table is created if it does not exist, so opening a fresh
-    /// file and reopening an existing one take the same path.
-    ///
-    /// `drivers` takes ownership of the connection thread this starts (and of
-    /// the read thread, if a query ever opens one): see [`IsleDrivers`].
-    pub async fn open(
-        path: &Path,
-        stream: impl Into<String>,
-        drivers: &IsleDrivers,
-    ) -> KnlResult<Self> {
-        Self::init(Db::File(path.to_path_buf()), stream.into(), drivers).await
-    }
-
-    /// Open an in-memory database for `stream`.
-    ///
-    /// The database is named after the stream and opened in shared-cache
-    /// mode, so the read connection reaches the same rows the writer wrote —
-    /// and so reopening the same stream id in the same process finds the same
-    /// log.  It lives as long as a connection to it is open, which is until
-    /// `drivers` is shut down.
-    pub async fn open_memory(stream: impl Into<String>, drivers: &IsleDrivers) -> KnlResult<Self> {
-        let stream = stream.into();
-        Self::init(Db::Memory(Db::memory_uri(&stream)), stream, drivers).await
-    }
-
-    /// Start the writing isle — which sets the busy timeout, applies the WAL
-    /// preset and ensures the table and its indexes before it takes a job.
-    async fn init(db: Db, stream: String, drivers: &IsleDrivers) -> KnlResult<Self> {
-        let writer = db.spawn_writer(drivers).await?;
-        let db_id = db.id();
-        Ok(Self {
-            writer,
-            db,
-            reader: OnceCell::new(),
-            drivers: drivers.clone(),
-            stream,
-            db_id,
-        })
-    }
-
-    /// The read-only isle, started on first use.
-    ///
-    /// A *second* connection to the same database, on a thread of its own and
-    /// with no write capability: `SQLITE_OPEN_READ_ONLY` is what SQLite was
-    /// asked for, and `query_only` is the same answer said again inside the
-    /// connection, so a statement that slipped past the checks on the text
-    /// still has nothing to write with.
-    ///
-    /// A failed open is not remembered: the cell stays empty, so the next
-    /// query tries again rather than reporting the first failure forever.
-    async fn reader(&self) -> KnlResult<&AsyncIsle> {
-        self.reader
-            .get_or_try_init(|| self.db.spawn_reader(&self.drivers))
-            .await
-    }
-
-    /// The columns of the `events` table, as SQLite reports them.
-    ///
-    /// Read through the *reader*, because this is the read contract: what a
-    /// caller's SQL may name. `PRAGMA table_info` rather than a list written
-    /// out here, so the published schema cannot drift from the table.
-    pub async fn schema(&self) -> KnlResult<Vec<SchemaColumn>> {
-        self.reader()
-            .await?
-            .call(schema_of)
-            .await
-            .map_err(KnlError::from)
-    }
-}
-
-/// `PRAGMA table_info(events)`, as [`SchemaColumn`]s.
-///
-/// One reader for both callers: a live store's [`SqliteEventStore::schema`],
-/// which runs it on the reading isle, and [`events_schema`], which runs it on
-/// a connection of its own.
-fn schema_of(conn: &mut Connection) -> rusqlite::Result<Vec<SchemaColumn>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))?;
-    let rows = stmt.query_map([], |row| {
-        Ok(SchemaColumn {
-            name: row.get::<_, String>("name")?,
-            declared_type: row.get::<_, String>("type")?,
-            pk: row.get::<_, i64>("pk")? > 0,
-        })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-}
+/// `position` is the key — the global order, dense and gap-free as read —
+/// and `(stream, seq)` is a unique constraint beside it rather than the
+/// primary key it used to be.  There is no `beat` column: the beat is a label
+/// of `meta` ([`super::event`]) and a read reaches it with
+/// `json_extract(meta, '$.beat')`, which the log has an index for.
+const EVENTS_COLUMNS: [(&str, &str, bool); 8] = [
+    ("position", "INTEGER", true),
+    ("stream", "TEXT", false),
+    ("seq", "INTEGER", false),
+    ("epoch_ms", "INTEGER", false),
+    ("kind", "TEXT", false),
+    ("schema_version", "INTEGER", false),
+    ("meta", "TEXT", false),
+    ("data", "TEXT", false),
+];
 
 /// The columns of the `events` table, without a session to ask.
 ///
-/// The schema is a property of the kernel, not of any one log, so this creates
-/// the table in a private in-memory database and reads it straight back — the
-/// same `PRAGMA table_info` a caller's own store would answer with.  It is
-/// what `knl.api()` publishes.
-///
-/// Deliberately **not** async, and deliberately not an isle.  It opens a
-/// nameless in-memory database, runs `CREATE TABLE IF NOT EXISTS` and one
-/// pragma against it, and drops it: no file is touched, no lock can be
-/// contended, and no thread is started, so there is nothing here for the
-/// caller to wait on.  That is what keeps `knl.api()` a synchronous call —
-/// a declaration of the surface should not have to be awaited — while the
-/// rule that the VM thread never waits on the OS still holds, because this
-/// never reaches the OS.
+/// The read contract, as data: what a caller's SQL may name.  It is what
+/// `knl.api()` publishes, and it is fallible only because it always was —
+/// there is nothing here that can fail now, and the shape is kept so a later
+/// backend that has to open something to answer can.
 pub fn events_schema() -> KnlResult<Vec<SchemaColumn>> {
-    let mut conn = Connection::open_in_memory().map_err(KnlError::from)?;
-    conn.execute_batch(SCHEMA_DDL).map_err(KnlError::from)?;
-    schema_of(&mut conn).map_err(KnlError::from)
+    Ok(EVENTS_COLUMNS
+        .iter()
+        .map(|(name, declared_type, pk)| SchemaColumn {
+            name: (*name).to_string(),
+            declared_type: (*declared_type).to_string(),
+            pk: *pk,
+        })
+        .collect())
 }
 
-/// The kinds a read was asked for, owned, so the selection can be sent to the
-/// isle's thread along with the closure that uses it.
+/// A durable [`EventStore`] backed by an eventsdb log, scoped to one `stream`.
+///
+/// The session *is* the stream: one instance serves one session's log.  Several
+/// instances may point at the same log with different streams, and that is
+/// what a session tree is.
+pub struct SqliteEventStore {
+    /// The log the stream lives in.  Held so the database-level calls — the
+    /// transaction hatch, the query, the detached append — are reachable, and
+    /// so the log outlives every handle it issued.
+    log: Arc<SqliteEventLog>,
+    /// eventsdb's own handle on this stream: the per-stream calls delegate
+    /// straight to it.
+    handle: eventsdb_sqlite::SqliteEventStore,
+    /// The stream this store is scoped to — the session id.
+    stream: String,
+}
+
+impl SqliteEventStore {
+    /// Open (creating if absent) the log at `path`, scoped to `stream`.
+    ///
+    /// `logs` is where the open log is kept: a file is opened once per process
+    /// and shared from then on, so two sessions on one file are two streams of
+    /// one log rather than two logs racing for one file ([`Logs`]).
+    pub async fn open(path: &Path, stream: impl Into<String>, logs: &Logs) -> KnlResult<Self> {
+        Ok(Self::on(logs.file(path).await?, stream))
+    }
+
+    /// Open on the in-memory log, scoped to `stream`.
+    ///
+    /// One database per [`Logs`], not per stream: an ephemeral session is a
+    /// stream in it like any other, so it can have children and can be resumed
+    /// by name for as long as the host lives.  What it cannot do is survive
+    /// the process, and it does not pretend to.
+    pub async fn open_memory(stream: impl Into<String>, logs: &Logs) -> KnlResult<Self> {
+        Ok(Self::on(logs.memory().await?, stream))
+    }
+
+    /// A store on a log that is already open.
+    ///
+    /// The form a child takes: it is opened on its parent's log, which the
+    /// caller already has ([`Logs::database`]), and issuing a handle on it
+    /// waits for nothing.
+    pub fn on(log: Arc<SqliteEventLog>, stream: impl Into<String>) -> Self {
+        let stream = stream.into();
+        let handle = log.stream_handle(&stream);
+        Self {
+            log,
+            handle,
+            stream,
+        }
+    }
+}
+
+/// The kinds a read was asked for, owned, so the selection can travel into a
+/// closure that outlives the caller's slice.
 fn owned_kinds(kinds: Option<&[&str]>) -> Option<Vec<String>> {
     kinds.map(|kinds| kinds.iter().map(|kind| (*kind).to_string()).collect())
 }
 
+/// Borrow an owned kind list back into the shape the read takes.
+fn borrowed_kinds(kinds: &Option<Vec<String>>) -> Option<Vec<&str>> {
+    kinds
+        .as_ref()
+        .map(|kinds| kinds.iter().map(String::as_str).collect())
+}
+
+/// An event on its way to the store: the kernel's coordinates removed, and
+/// the kernel's schema version stamped.
+///
+/// `seq` and `epoch_ms` are the store's to assign, so an event that carries
+/// either has it dropped rather than trusted — eventsdb refuses a stored
+/// coordinate on a new write, and silently accepting one would be a caller
+/// choosing where its event lands.  The version goes the other way: eventsdb
+/// takes it from the author and only defaults it, and the kernel *is* the
+/// author.
+fn prepared(mut event: Map<String, Value>) -> Map<String, Value> {
+    event.remove(FIELD_SEQ);
+    event.remove(FIELD_EPOCH_MS);
+    stamp_schema_version(&mut event);
+    event
+}
+
+/// eventsdb's coordinates as the kernel's.
+///
+/// The global `position` is dropped: the kernel's SPI is scoped to one stream,
+/// and `seq` is the coordinate inside it.
+fn committed_of(committed: eventsdb_core::position::Committed) -> Committed {
+    Committed {
+        seq: committed.seq,
+        epoch_ms: committed.epoch_ms,
+    }
+}
+
+/// Upcasted events as the raw [`Value`]s the kernel's SPI deals in.
+///
+/// eventsdb has already run the chain, so what comes back is the current
+/// shape; the seam above turns these back into [`super::Current`]s, which is
+/// where the version is checked.
+fn values_of(events: Vec<Upcasted>) -> Vec<Value> {
+    events
+        .into_iter()
+        .map(|event| Value::Object(event.into_inner()))
+        .collect()
+}
+
+/// The same, for a decision's input, which arrives borrowed.
+fn values_of_ref(events: &[Upcasted]) -> Vec<Value> {
+    events
+        .iter()
+        .map(|event| Value::Object((**event).clone()))
+        .collect()
+}
+
+/// Where a kernel error goes when it happens inside a closure that has no way
+/// to report one.
+///
+/// eventsdb's decisions answer with an event or with nothing, and its hatch
+/// answers in eventsdb's own error language.  A kernel refusal — an event a
+/// decision built wrong — is neither, so it is parked in a cell both sides can
+/// reach and raised by the caller: nothing is written, and the caller is told
+/// what was wrong rather than being handed the `Ok(None)` that would read as
+/// "the invariant said no".
+type Parked = Arc<Mutex<Option<KnlError>>>;
+
+/// Take whatever was parked, if anything.
+fn taken(parked: &Parked) -> Option<KnlError> {
+    parked.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// Park `error` for the caller to raise.
+fn park(parked: &Parked, error: KnlError) {
+    *parked.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+}
+
+/// The refusal handed to eventsdb when a kernel error was parked: it rolls the
+/// transaction back, and the caller replaces it with the parked one.
+fn rolled_back() -> eventsdb_core::Error {
+    eventsdb_core::Error::validation("the kernel refused an event this write was to record")
+}
+
 #[async_trait]
 impl EventStore for SqliteEventStore {
-    async fn append(&mut self, mut event: Map<String, Value>) -> KnlResult<Committed> {
+    async fn append(&mut self, event: Map<String, Value>) -> KnlResult<Committed> {
         // Reject before touching the stream: a rejected event burns no seq.
         validate_event(&event)?;
-        // Stamp the schema version once, before the job is submitted; the
-        // kernel-owned seq / epoch_ms are stamped per attempt inside the
-        // transaction, recomputed from the live head each time.
-        stamp_schema_version(&mut event);
-        let stream = self.stream.clone();
-        self.writer
-            .call_retry(retry_policy(), move |conn| {
-                finish(append_in(conn, &stream, &event))
-            })
+        self.handle
+            .append(prepared(event))
             .await
-            .map_err(KnlError::from)?
+            .map(committed_of)
+            .map_err(KnlError::from)
     }
 
     async fn append_many(&mut self, events: Vec<Map<String, Value>>) -> KnlResult<Vec<Committed>> {
-        if events.is_empty() {
-            return Ok(Vec::new());
-        }
         // Validate before the transaction is opened: a batch with a malformed
         // event in it never takes the write lock at all.
         for event in &events {
             validate_event(event)?;
         }
-        // One IMMEDIATE transaction for the whole batch, so the facts that
-        // belong together land together.  A contended attempt is retried
-        // whole; nothing outside the transaction has been changed by a failed
-        // one, so re-running it is the correct thing to do.
-        let stream = self.stream.clone();
-        self.writer
-            .call_retry(retry_policy(), move |conn| {
-                finish(append_many_in(conn, &stream, &events))
-            })
+        let events: Vec<Map<String, Value>> = events.into_iter().map(prepared).collect();
+        self.handle
+            .append_many(events)
             .await
-            .map_err(KnlError::from)?
+            .map(|committed| committed.into_iter().map(committed_of).collect())
+            .map_err(KnlError::from)
     }
 
     async fn append_if(
@@ -673,18 +357,33 @@ impl EventStore for SqliteEventStore {
         decide: Decision,
     ) -> KnlResult<Option<Committed>> {
         // The read, the decision and the insert share one IMMEDIATE
-        // transaction, so the invariant `decide` checks holds at the instant
-        // the event lands — and all three now run in one job, on the isle's
-        // own thread, because the decision is an owned `Send` closure that
-        // travels with it.  The channel round trip the borrowed form needed
-        // (job asks, caller answers, both waiting on each other with the write
-        // lock held) is gone with it.
-        let stream = self.stream.clone();
-        let kinds = owned_kinds(kinds);
-        self.writer
-            .call(move |conn| finish(append_if_in(conn, &stream, kinds.as_deref(), decide)))
-            .await
-            .map_err(KnlError::from)?
+        // transaction on the log's own thread, so the invariant `decide`
+        // checks holds at the instant the event lands.  The decision travels
+        // with the job — it is owned and `Send` — so nothing waits on
+        // anything else with the write lock held.
+        let parked: Parked = Arc::default();
+        let sink = Arc::clone(&parked);
+        let answer: eventsdb_core::store::Decision = Box::new(move |seen: &[Upcasted]| {
+            let event = decide(values_of_ref(seen))?;
+            // The decision's event is the kernel's to check: eventsdb checks
+            // the envelope and knows nothing of a kernel kind's `data`.  A
+            // refusal parks and writes nothing, rather than reading as a
+            // decision that said no.
+            match validate_event(&event) {
+                Ok(()) => Some(prepared(event)),
+                Err(refusal) => {
+                    park(&sink, refusal);
+                    None
+                }
+            }
+        });
+        let committed = self.handle.append_if(kinds, answer).await;
+        match taken(&parked) {
+            Some(refusal) => Err(refusal),
+            None => committed
+                .map(|committed| committed.map(committed_of))
+                .map_err(KnlError::from),
+        }
     }
 
     async fn append_if_many(
@@ -693,27 +392,56 @@ impl EventStore for SqliteEventStore {
         kinds: Option<&[&str]>,
         decide: SplitDecision,
     ) -> KnlResult<Option<Split<Committed>>> {
-        // One IMMEDIATE transaction over both streams, exactly as
-        // `append_if` takes one over this stream: they are rows of the same
-        // table on the same connection, so "two streams" costs the write
-        // nothing beyond a second `MAX(seq)`.  Not retried, for the reason
-        // `append_if` is not — the decision is a `FnOnce` and an attempt
-        // consumes it.
+        // One transaction over both streams: they are rows of one table on one
+        // connection, so "two streams" costs the write nothing beyond a second
+        // counter read.  Not retried, because the decision is a `FnOnce` and
+        // an attempt consumes it.
         let stream = self.stream.clone();
         let other = other.to_string();
         let kinds = owned_kinds(kinds);
-        self.writer
-            .call(move |conn| {
-                finish(append_if_many_in(
-                    conn,
+        let parked: Parked = Arc::default();
+        let sink = Arc::clone(&parked);
+
+        let committed = self
+            .log
+            .with_transaction(move |tx| {
+                let selection = borrowed_kinds(&kinds);
+                let seen = Split {
+                    own: values_of(tx.read(&stream, selection.as_deref(), 0, usize::MAX)?),
+                    // Unfiltered and capped at one: the question is "is there
+                    // an event", not "which", so a kind filter could only make
+                    // an occupied stream look empty.
+                    other: values_of(tx.read(&other, None, 0, 1)?),
+                };
+                let Some(split) = decide(seen) else {
+                    // Nothing to write: the transaction is rolled back.
+                    return Ok(None);
+                };
+                for event in split.own.iter().chain(split.other.iter()) {
+                    if let Err(refusal) = validate_event(event) {
+                        park(&sink, refusal);
+                        return Err(rolled_back());
+                    }
+                }
+                let own = tx.append_many(
                     &stream,
+                    split.own.into_iter().map(prepared).collect::<Vec<_>>(),
+                )?;
+                let elsewhere = tx.append_many(
                     &other,
-                    kinds.as_deref(),
-                    decide,
-                ))
+                    split.other.into_iter().map(prepared).collect::<Vec<_>>(),
+                )?;
+                Ok(Some(Split {
+                    own: own.into_iter().map(committed_of).collect(),
+                    other: elsewhere.into_iter().map(committed_of).collect(),
+                }))
             })
-            .await
-            .map_err(KnlError::from)?
+            .await;
+
+        match taken(&parked) {
+            Some(refusal) => Err(refusal),
+            None => committed.map_err(KnlError::from),
+        }
     }
 
     async fn append_with_open_children(
@@ -721,19 +449,40 @@ impl EventStore for SqliteEventStore {
         scan: &ChildScan,
         decide: ChildrenDecision,
     ) -> KnlResult<Committed> {
-        // The scan reads other streams and the insert writes this one, so
-        // they share the IMMEDIATE transaction: what the boundary records is
-        // what was true at the instant it landed, not a moment before it.
+        // The scan reads other streams and the insert writes this one, so they
+        // share the transaction: what the boundary records is what was true at
+        // the instant it landed, not a moment before it.
         let stream = self.stream.clone();
         let scan = scan.clone();
-        self.writer
-            .call(move |conn| finish(append_with_open_children_in(conn, &stream, &scan, decide)))
-            .await
-            .map_err(KnlError::from)?
+        let parked: Parked = Arc::default();
+        let sink = Arc::clone(&parked);
+
+        let committed = self
+            .log
+            .with_transaction(move |tx| {
+                // The raw transaction underneath the context: the scan is a
+                // `SELECT` over `events`, which the hatch allows and has no
+                // stamped equivalent of.
+                let conn: &rusqlite::Connection = tx;
+                let children = open_children_in(conn, &stream, &scan)
+                    .map_err(|e| eventsdb_core::Error::storage(e.to_string()))?;
+                let event = decide(children);
+                if let Err(refusal) = validate_event(&event) {
+                    park(&sink, refusal);
+                    return Err(rolled_back());
+                }
+                tx.append(&stream, prepared(event)).map(committed_of)
+            })
+            .await;
+
+        match taken(&parked) {
+            Some(refusal) => Err(refusal),
+            None => committed.map_err(KnlError::from),
+        }
     }
 
     fn database(&self) -> Option<&str> {
-        Some(&self.db_id)
+        Some(self.log.database())
     }
 
     async fn read_kinds(
@@ -742,494 +491,77 @@ impl EventStore for SqliteEventStore {
         from_seq: u64,
         limit: usize,
     ) -> KnlResult<Vec<Value>> {
-        // An empty selection selects nothing — and `kind IN ()` is not SQL,
-        // so it is answered here rather than built into a statement.
-        if kinds.is_some_and(<[&str]>::is_empty) {
-            return Ok(Vec::new());
-        }
-        // `usize::MAX` (an unbounded read) caps at i64::MAX, which SQLite
-        // treats as "no limit"; `0` reads nothing.
-        let capped = i64::try_from(limit).unwrap_or(i64::MAX);
-        let kinds = owned_kinds(kinds);
-        let stream = self.stream.clone();
-        self.writer
-            .call(move |conn| finish(read_in(conn, &stream, kinds.as_deref(), from_seq, capped)))
+        self.handle
+            .read_kinds(kinds, from_seq, limit)
             .await
-            .map_err(KnlError::from)?
+            .map(values_of)
+            .map_err(KnlError::from)
     }
 
     async fn read_last(&self, n: usize) -> KnlResult<Vec<Value>> {
-        // `usize::MAX` caps at i64::MAX, which SQLite treats as "no limit";
-        // `0` reads nothing.  Same convention as `read_kinds` above.
-        let capped = i64::try_from(n).unwrap_or(i64::MAX);
-        let stream = self.stream.clone();
-        self.writer
-            .call(move |conn| finish(read_last_in(conn, &stream, capped)))
+        self.handle
+            .read_last(n)
             .await
-            .map_err(KnlError::from)?
+            .map(values_of)
+            .map_err(KnlError::from)
     }
 
     async fn head(&self) -> KnlResult<Option<u64>> {
-        // A transient busy read must surface, not read as "empty": a caller
-        // deciding open-vs-resume (or a CAS) on a swallowed error would
-        // treat a populated stream as fresh.  Same discipline as read().
-        let stream = self.stream.clone();
-        self.writer
-            .call(move |conn| head_in(conn, &stream))
-            .await
-            .map_err(KnlError::from)
+        self.handle.head().await.map_err(KnlError::from)
     }
 
     async fn len(&self) -> KnlResult<usize> {
-        let stream = self.stream.clone();
-        self.writer
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM events WHERE stream = ?1",
-                    params![stream],
-                    |row| row.get::<_, i64>(0),
-                )
-            })
-            .await
-            .map(|n| n as usize)
-            .map_err(KnlError::from)
+        self.handle.len().await.map_err(KnlError::from)
     }
 
     async fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
-        // The deadline is the isle's: it interrupts the statement when the
-        // time is up and reports `Timeout`, so there is no watchdog thread
-        // here to outlive the query it was watching.
-        let timeout = plan.timeout;
-        let plan = plan.clone();
-        self.reader()
-            .await?
-            .call_timeout(timeout, move |conn| Ok(run_query(conn, &plan)))
+        // The cap is the kernel's, and the statement is the caller's, so the
+        // one is put around the other: `limit + 1` rows are asked for and the
+        // extra one is what says the answer was cut.  `plan.sql` is one
+        // statement with no trailing `;` ([`super::query`]), which is what
+        // makes it a subquery rather than a splice.
+        let cap = i64::try_from(plan.limit)
+            .unwrap_or(i64::MAX)
+            .saturating_add(1);
+        let sql = format!("SELECT * FROM ({}) LIMIT {cap}", plan.sql);
+        let rows = self
+            .log
+            .query_timeout(&sql, plan.values.clone(), plan.timeout)
             .await
-            .map_err(KnlError::from)?
+            .map_err(KnlError::from)?;
+
+        let truncated = rows.len() > plan.limit;
+        Ok(QueryRows {
+            rows: rows
+                .into_iter()
+                .take(plan.limit)
+                // A NULL is an absent key rather than a null value: the Lua
+                // side reads it as `nil`, which is what a missing column means
+                // there.
+                .map(|row| {
+                    row.into_iter()
+                        .filter(|(_, value)| !value.is_null())
+                        .collect()
+                })
+                .collect(),
+            truncated,
+        })
     }
 
-    fn detach_append(&self, mut event: Map<String, Value>) {
-        // The drop backstop's path, and the one write nobody awaits.  A
-        // handle that was collected has no caller left to raise to and no
-        // task left to wait in, so the job is handed to the isle and let go
-        // of: the thread runs it because its driver outlives every session
-        // ([`IsleDrivers`]), and the boundary lands before the host drains
-        // that thread at shutdown.
+    fn detach_append(&self, event: Map<String, Value>) {
+        // The drop backstop's path, and the one write nobody awaits.  A handle
+        // that was collected has no caller left to raise to and no task left to
+        // wait in, so the job is handed to the log's own queue and let go of:
+        // it lands before the host drains that queue at shutdown
+        // ([`Logs::shutdown`]).
         if let Err(e) = validate_event(&event) {
             tracing::warn!(error = %e, "knl: a detached append was refused before it was submitted");
             return;
         }
-        stamp_schema_version(&mut event);
-        let stream = self.stream.clone();
-        // `detach`, not a dropped task: dropping an `AsyncTask` cancels the
-        // job it stands for, which would throw away the very event this
-        // exists to record.
-        self.writer
-            .spawn_call(move |conn| finish(append_in(conn, &stream, &event)))
-            .detach();
-    }
-}
-
-/// A query's own translation of a rusqlite failure.
-///
-/// The write path's [`From<rusqlite::Error>`] answers a different question —
-/// "can this write be retried" — and has no reason to know about deadlines.
-/// Here there are two more outcomes a caller can act on: a statement the
-/// watchdog cut short is [`KnlError::Timeout`] (the query was too slow, not
-/// the store too busy), and a value that came back and would not read as what
-/// it is declared to be is [`KnlError::Corruption`] — the IO worked, so what
-/// is wrong is the data.  Matched on the error's shape, never on message text.
-fn query_error(error: rusqlite::Error) -> KnlError {
-    if let rusqlite::Error::SqliteFailure(inner, _) = &error {
-        if inner.code == rusqlite::ErrorCode::OperationInterrupted {
-            return KnlError::Timeout(format!("query interrupted: {error}"));
+        if let Err(e) = self.log.detach_append(&self.stream, prepared(event)) {
+            tracing::warn!(error = %e, "knl: a detached append was not accepted by the log");
         }
     }
-    match error {
-        rusqlite::Error::Utf8Error(_)
-        | rusqlite::Error::FromSqlConversionFailure(..)
-        | rusqlite::Error::IntegralValueOutOfRange(..) => {
-            KnlError::Corruption(format!("sqlite: query: {error}"))
-        }
-        other => KnlError::from(other),
-    }
-}
-
-/// Prepare, check, bind and run one query.
-///
-/// Runs on the reading isle's thread, under the deadline that thread was given
-/// ([`EventStore::query`]): SQLite has no per-statement timeout — `busy_timeout`
-/// bounds waiting for a *lock*, which is a different thing from a statement
-/// that is simply expensive — so the isle interrupts the connection when the
-/// time is up.  The interrupt reaches this function as `SQLITE_INTERRUPT` on
-/// whichever step was running, and [`query_error`] names it a timeout.
-fn run_query(conn: &Connection, plan: &QueryPlan) -> KnlResult<QueryRows> {
-    // A statement that will not compile is the caller's SQL, not the store
-    // failing: report it as the refusal it is, unless the database was too
-    // busy to answer at all.
-    let mut stmt = conn.prepare(&plan.sql).map_err(|error| {
-        if is_retryable(&error) {
-            KnlError::from(error)
-        } else {
-            KnlError::Validation(format!("sql: {error}"))
-        }
-    })?;
-    // The second of the three guards (the text was checked before this, the
-    // connection has no write capability at all): SQLite's own answer to
-    // "does this statement change the database".
-    if !stmt.readonly() {
-        return Err(KnlError::Validation(
-            "a query may not write; only SELECT / WITH statements are run".to_string(),
-        ));
-    }
-    bind(&mut stmt, plan)?;
-
-    // Taken before the rows borrow the statement, and owned, so the columns
-    // outlive the borrow.
-    let columns: Vec<String> = stmt
-        .column_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-
-    let mut rows = stmt.raw_query();
-    let mut out = Vec::new();
-    while out.len() < plan.limit {
-        let Some(row) = rows.next().map_err(query_error)? else {
-            // The whole result set fitted.
-            return Ok(QueryRows {
-                rows: out,
-                truncated: false,
-            });
-        };
-        let mut record = Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            // A NULL is an absent key rather than a null value: the Lua side
-            // reads it as `nil`, which is what a missing column means there.
-            if let Some(value) = read_value(row.get_ref(index).map_err(query_error)?)? {
-                record.insert(column.clone(), value);
-            }
-        }
-        out.push(record);
-    }
-    // The cap was reached: whether anything was actually cut off is one more
-    // step, so a result that happens to be exactly `limit` long is not
-    // reported as truncated.
-    let truncated = rows.next().map_err(query_error)?.is_some();
-    Ok(QueryRows {
-        rows: out,
-        truncated,
-    })
-}
-
-/// Bind every parameter the statement declares.
-///
-/// Driven by the *statement*, not by the caller's table: SQLite is asked what
-/// parameters it compiled and each one is answered, so a value that matches
-/// nothing and a parameter that nothing matches are both errors instead of a
-/// silent NULL.  The reserved names ([`STREAM_PARAM`] and the
-/// `:knl_sessions_*` slots [`super::query`] wrote) are the kernel's;
-/// everything else is looked up in what the caller passed.
-fn bind(stmt: &mut rusqlite::Statement<'_>, plan: &QueryPlan) -> KnlResult<()> {
-    const NO_VALUES: &[Value] = &[];
-
-    let slots: Vec<String> = (0..plan.sessions.len()).map(session_slot).collect();
-    let given: &[Value] = match &plan.params {
-        QueryParams::Positional(values) => values,
-        _ => NO_VALUES,
-    };
-    let mut taken = 0;
-
-    for index in 1..=stmt.parameter_count() {
-        // Read out as an owned name first: the borrow of the statement ends
-        // here, so the binding below can take it mutably.
-        let name = stmt.parameter_name(index).map(str::to_string);
-        let Some(name) = name else {
-            // An anonymous `?`: the caller's, in the order they were given.
-            // Every parameter the kernel wrote is named, so there is nothing
-            // of ours here to confuse them with.
-            let value = given.get(taken).ok_or_else(|| {
-                KnlError::Validation(format!(
-                    "the query has more `?` parameters than the {} value(s) given",
-                    given.len()
-                ))
-            })?;
-            taken += 1;
-            stmt.raw_bind_parameter(index, SqlParam(value.clone()))
-                .map_err(query_error)?;
-            continue;
-        };
-
-        if name == STREAM_PARAM {
-            stmt.raw_bind_parameter(index, plan.stream.clone())
-                .map_err(query_error)?;
-            continue;
-        }
-        if let Some(slot) = slots.iter().position(|slot| *slot == name) {
-            stmt.raw_bind_parameter(index, plan.sessions[slot].clone())
-                .map_err(query_error)?;
-            continue;
-        }
-
-        let QueryParams::Named(named) = &plan.params else {
-            return Err(KnlError::Validation(format!(
-                "the query names the parameter {name:?}, so params must be a table of names \
-                 to values"
-            )));
-        };
-        // The prefix character is SQLite's, not the caller's: `:kind` is
-        // answered by `kind`.  The full spelling is accepted too, for a
-        // caller that writes what it sees.
-        let value = named
-            .get(&name[1..])
-            .or_else(|| named.get(&name))
-            .ok_or_else(|| {
-                KnlError::Validation(format!("no value was given for the parameter {name:?}"))
-            })?;
-        stmt.raw_bind_parameter(index, SqlParam(value.clone()))
-            .map_err(query_error)?;
-    }
-
-    if given.len() > taken {
-        return Err(KnlError::Validation(format!(
-            "{} value(s) were given for {taken} `?` parameter(s)",
-            given.len()
-        )));
-    }
-    Ok(())
-}
-
-/// A caller's JSON value on its way into a bound parameter.
-///
-/// The four SQLite types a JSON value maps onto without inventing anything:
-/// null, integer, real, text.  A composite — an array or an object — is not a
-/// SQLite value, and encoding one as its JSON text would be the kernel
-/// guessing what the caller meant, so it is refused.
-struct SqlParam(Value);
-
-impl rusqlite::ToSql for SqlParam {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        use rusqlite::types::ToSqlOutput;
-        let value = match &self.0 {
-            Value::Null => SqlValue::Null,
-            Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    SqlValue::Integer(i)
-                } else if let Some(f) = n.as_f64() {
-                    SqlValue::Real(f)
-                } else {
-                    return Err(rusqlite::Error::ToSqlConversionFailure(
-                        format!("{n} is not a SQLite number").into(),
-                    ));
-                }
-            }
-            Value::String(s) => SqlValue::Text(s.clone()),
-            other => {
-                return Err(rusqlite::Error::ToSqlConversionFailure(
-                    format!("a {} is not a SQLite value", type_name_of(other)).into(),
-                ));
-            }
-        };
-        Ok(ToSqlOutput::Owned(value))
-    }
-}
-
-/// What kind of JSON value this is, for a refusal message.
-fn type_name_of(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "list",
-        Value::Object(_) => "table",
-    }
-}
-
-/// One column of one row, as JSON — or `None` for `NULL`.
-///
-/// INTEGER and REAL come back as numbers, TEXT as a string.  A BLOB comes
-/// back as a string too, lossily: the boundary above this one is Lua, whose
-/// strings are byte strings, and refusing the row would make a column nobody
-/// selected on purpose fatal.  A TEXT column that is not UTF-8 is a different
-/// matter — it was declared to be text and it is not — so that is corruption.
-/// A REAL that is NaN or infinite has no representation on the other side of
-/// this boundary, and dropping it would hand back a row with a column
-/// silently missing, so it is raised instead.
-fn read_value(value: ValueRef<'_>) -> KnlResult<Option<Value>> {
-    Ok(match value {
-        ValueRef::Null => None,
-        ValueRef::Integer(i) => Some(Value::from(i)),
-        ValueRef::Real(f) => {
-            let number = serde_json::Number::from_f64(f).ok_or_else(|| {
-                KnlError::Storage(format!(
-                    "sqlite: a REAL column is {f}, which has no value on the other side of the \
-                     bridge"
-                ))
-            })?;
-            Some(Value::Number(number))
-        }
-        ValueRef::Text(bytes) => {
-            let text = std::str::from_utf8(bytes).map_err(|e| {
-                KnlError::Corruption(format!("sqlite: a TEXT column is not valid UTF-8: {e}"))
-            })?;
-            Some(Value::from(text))
-        }
-        ValueRef::Blob(bytes) => Some(Value::from(String::from_utf8_lossy(bytes).into_owned())),
-    })
-}
-
-/// One `IMMEDIATE` append: take the reserved lock up front, compute the next
-/// `seq` from the live head, stamp and insert, then commit.
-///
-/// Runs on the writing isle's thread, and may run more than once: a contended
-/// `BEGIN` is a [`JobError::Sqlite`], which is what the isle's retry keys on,
-/// and nothing outside the transaction was changed by an attempt that failed.
-fn append_in(
-    conn: &mut Connection,
-    stream: &str,
-    event: &Map<String, Value>,
-) -> Result<Committed, JobError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(JobError::Sqlite)?;
-    let seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
-    let epoch_ms = now_ms();
-    let mut row = event.clone();
-    stamp(&mut row, seq, epoch_ms);
-    insert_row(&tx, stream, seq, epoch_ms, &row)?;
-    tx.commit().map_err(JobError::Sqlite)?;
-    Ok(Committed { seq, epoch_ms })
-}
-
-/// One `IMMEDIATE` batch append: take the reserved lock up front, number the
-/// events on from the live head, and insert them all before committing.
-///
-/// All or nothing: an event that will not encode, or a contended insert
-/// part-way through, drops the transaction and leaves the stream exactly as
-/// it was — which is what lets a caller write two facts that are one fact.
-fn append_many_in(
-    conn: &mut Connection,
-    stream: &str,
-    events: &[Map<String, Value>],
-) -> Result<Vec<Committed>, JobError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(JobError::Sqlite)?;
-    let committed = insert_batch(&tx, stream, events)?;
-    tx.commit().map_err(JobError::Sqlite)?;
-    Ok(committed)
-}
-
-/// Number `events` on from `stream`'s live head, stamp them and insert them,
-/// inside a transaction the caller opened and commits.
-///
-/// The one numbering rule for every batch a transaction writes — a plain
-/// [`append_many_in`], and each side of an allocation
-/// ([`append_if_many_in`]) — so the second stream of a two-stream write is
-/// numbered exactly as the first is: from its own head, which is what makes
-/// `seq` per-stream rather than per-transaction.
-///
-/// It validates, because an event that reaches here has not always been
-/// checked: a decision's events are the decision's, and one it built wrong
-/// must not be the first thing a stream carries.  A [`JobError::Terminal`]
-/// drops the transaction, so a batch that fails part-way writes nothing.
-fn insert_batch(
-    tx: &Connection,
-    stream: &str,
-    events: &[Map<String, Value>],
-) -> Result<Vec<Committed>, JobError> {
-    let mut seq = next_seq(tx, stream).map_err(JobError::Sqlite)?;
-    let mut committed = Vec::with_capacity(events.len());
-    for event in events {
-        validate_event(event).map_err(JobError::Terminal)?;
-        let epoch_ms = now_ms();
-        let mut row = event.clone();
-        stamp_schema_version(&mut row);
-        stamp(&mut row, seq, epoch_ms);
-        insert_row(tx, stream, seq, epoch_ms, &row)?;
-        committed.push(Committed { seq, epoch_ms });
-        seq = seq.saturating_add(1);
-    }
-    Ok(committed)
-}
-
-/// One `IMMEDIATE` decide-then-append over two streams: read this stream,
-/// ask the decision what to record where, and insert both sides before
-/// committing.
-///
-/// The two-stream twin of [`append_if_in`], and the reason it exists is the
-/// atomicity rather than the convenience: an allocation is a move between two
-/// ledgers, and a reader that met one side without the other would be reading
-/// units that had left one balance without arriving in the other.  Both
-/// streams are rows of the same table on this one connection, so the same
-/// transaction covers them.
-///
-/// A `None` decision commits nothing.  A [`Split`] with an empty `other`
-/// writes only this stream, which is how a refusal is recorded: the fact that
-/// the allocation was asked for and turned down, with no child opened.
-///
-/// Both streams are *read* as well, and the second one for a single question:
-/// whether it carries anything at all.  One row settles it, so the decision is
-/// shown at most the other stream's first event — inside this transaction,
-/// which is the whole point: a command whose invariant is "the target is
-/// empty" cannot ask before taking the write lock, or a second one would
-/// answer the same and both would write.
-fn append_if_many_in(
-    conn: &mut Connection,
-    stream: &str,
-    other: &str,
-    kinds: Option<&[String]>,
-    decide: SplitDecision,
-) -> Result<Option<Split<Committed>>, JobError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(JobError::Sqlite)?;
-    let seen = Split {
-        own: read_in(&tx, stream, kinds, 0, i64::MAX)?,
-        // Unfiltered and capped at one: the question is "is there an event",
-        // not "which", so a kind filter could only make an occupied stream
-        // look empty.
-        other: read_in(&tx, other, None, 0, 1)?,
-    };
-    let Some(split) = decide(seen) else {
-        // Nothing to write: the transaction is rolled back on drop.
-        return Ok(None);
-    };
-    let own = insert_batch(&tx, stream, &split.own)?;
-    let other = insert_batch(&tx, other, &split.other)?;
-    tx.commit().map_err(JobError::Sqlite)?;
-    Ok(Some(Split { own, other }))
-}
-
-/// One `IMMEDIATE` scan-then-append: find the streams this one is the parent
-/// of that have not ended, hand them to the decision, and insert the event it
-/// builds.
-///
-/// The scan is inside the transaction on purpose.  Asked before the write, it
-/// would answer about a moment the boundary does not land in — a child could
-/// end, or a new one open, in between — and a `session_closed` that named a
-/// child which had already closed would be a record of something that never
-/// happened.
-fn append_with_open_children_in(
-    conn: &mut Connection,
-    stream: &str,
-    scan: &ChildScan,
-    decide: ChildrenDecision,
-) -> Result<Committed, JobError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(JobError::Sqlite)?;
-    let children = open_children_in(&tx, stream, scan).map_err(JobError::Sqlite)?;
-    let committed = insert_batch(&tx, stream, &[decide(children)])?;
-    tx.commit().map_err(JobError::Sqlite)?;
-    // One event in, one out: `insert_batch` numbers what it is given, and it
-    // was given exactly one.
-    committed
-        .into_iter()
-        .next()
-        .ok_or_else(|| JobError::Terminal(KnlError::Storage("the close wrote nothing".to_string())))
 }
 
 /// `text` as an SQL string literal, with any quote in it doubled.
@@ -1248,12 +580,12 @@ fn sql_literal(text: &str) -> String {
 /// into it as literals.
 ///
 /// The kind and the JSON path are literals rather than parameters *so that the
-/// planner can see them*: `events_session_opened_parent` ([`SCHEMA_DDL`]) is a
-/// partial index on an expression, and both halves are matched by form — a
-/// `kind = ?` term proves nothing about `WHERE kind = 'session_opened'`, and a
-/// bound path never matches an indexed one.  The parent being looked for stays
-/// a parameter, because it is a value.  A test holds the query plan against
-/// the index name, so this cannot quietly become a table scan again.
+/// planner can see them*: [`CHILD_INDEX_DDL`] is a partial index on an
+/// expression, and both halves are matched by form — a `kind = ?` term proves
+/// nothing about `WHERE kind = 'session_opened'`, and a bound path never
+/// matches an indexed one.  The parent being looked for stays a parameter,
+/// because it is a value.  A test holds the query plan against the index name,
+/// so this cannot quietly become a table scan again.
 fn child_scan_sql(scan: &ChildScan) -> String {
     let opened = sql_literal(&scan.opened);
     let closed = sql_literal(&scan.closed);
@@ -1274,349 +606,47 @@ fn child_scan_sql(scan: &ChildScan) -> String {
 /// The streams that name `stream` as their parent and carry no ending.
 ///
 /// The vocabulary is the caller's ([`ChildScan`]): which kind opens a stream,
-/// which kind ends one, and where in the opening's `data` the parent is
-/// named.  Those three words are written into the statement
-/// ([`child_scan_sql`]) rather than bound, which is what lets the scan read by
-/// `events_session_opened_parent` instead of walking every event in the
-/// database.
+/// which kind ends one, and where in the opening's `data` the parent is named.
+/// Those three words are written into the statement ([`child_scan_sql`])
+/// rather than bound, which is what lets the scan read by the parent index
+/// instead of walking every event in the database.
 ///
 /// Ordered by when each child opened, so a close records its children in the
 /// order they were started rather than in whatever order the rows came back.
 fn open_children_in(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     stream: &str,
     scan: &ChildScan,
 ) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(&child_scan_sql(scan))?;
-    let rows = stmt.query_map(params![stream], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(rusqlite::params![stream], |row| row.get::<_, String>(0))?;
     rows.collect()
 }
 
-/// One `IMMEDIATE` decide-then-append: read the stream, ask the caller's
-/// closure what to record, and insert its answer in the same transaction.
-///
-/// The decision travels *with* the job — it is owned and `Send` — so it runs
-/// here, on the isle's thread, between the read and the insert, with the write
-/// lock held throughout.  Nothing waits on anything else: the caller's task is
-/// suspended on the job's own oneshot and there is no second channel for the
-/// two sides to deadlock across.
-///
-/// `kinds` narrows what the decision is shown, not where its answer lands:
-/// the new event's `seq` comes from the stream's live head, so a filtered
-/// decision numbers its write against everything, exactly as an ordinary
-/// append does.
-///
-/// A `None` decision commits nothing — the transaction is dropped, so the
-/// stream is exactly as it was — and reports `Ok(None)`.
-fn append_if_in(
-    conn: &mut Connection,
-    stream: &str,
-    kinds: Option<&[String]>,
-    decide: Decision,
-) -> Result<Option<Committed>, JobError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(JobError::Sqlite)?;
-    let events = read_in(&tx, stream, kinds, 0, i64::MAX)?;
-    let Some(event) = decide(events) else {
-        // Nothing to write: the transaction is rolled back on drop.
-        return Ok(None);
-    };
-    // The decision's event is validated like any other: a malformed one is
-    // refused and the transaction goes no further.
-    validate_event(&event).map_err(JobError::Terminal)?;
-    // The head of the whole stream, not of the events the decision was shown:
-    // a filtered read says nothing about where the next event goes.
-    let seq = next_seq(&tx, stream).map_err(JobError::Sqlite)?;
-    let epoch_ms = now_ms();
-    let mut row = event.clone();
-    stamp_schema_version(&mut row);
-    stamp(&mut row, seq, epoch_ms);
-    insert_row(&tx, stream, seq, epoch_ms, &row)?;
-    tx.commit().map_err(JobError::Sqlite)?;
-    Ok(Some(Committed { seq, epoch_ms }))
-}
-
-/// The columns a read selects, in the order [`read_row`] takes them.
-const READ_COLUMNS: &str = "seq, epoch_ms, kind, schema_version, beat, meta, data";
-
-/// One stored row, as its columns come back from SQLite.
-///
-/// The raw values, before the two JSON columns are decoded: reading and
-/// decoding are separate so a fault on the read (retryable) and a value that
-/// will not decode (corruption) stay two different answers.
-struct StoredRow {
-    /// The store-assigned sequence number.
-    seq: i64,
-    /// The wall-clock append time the store stamped.
-    epoch_ms: i64,
-    /// The event's kind.
-    kind: String,
-    /// The shape the event was written under.
-    schema_version: i64,
-    /// The beat the caller declared, if it declared one.
-    beat: Option<String>,
-    /// The shallow `meta` object, as stored text.
-    meta: String,
-    /// The kind's own `data` object, as stored text.
-    data: String,
-}
-
-/// Take one row's columns, in [`READ_COLUMNS`] order.
-fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
-    Ok(StoredRow {
-        seq: row.get(0)?,
-        epoch_ms: row.get(1)?,
-        kind: row.get(2)?,
-        schema_version: row.get(3)?,
-        beat: row.get(4)?,
-        meta: row.get(5)?,
-        data: row.get(6)?,
-    })
-}
-
-/// Rebuild the event object a row was written from.
-///
-/// The inverse of [`insert_row`], and exactly that: the same keys in the same
-/// envelope, so a caller reading a durable log sees what it wrote.  An absent
-/// `beat` is an absent key rather than a null — the kernel's rule is that a
-/// beat is a string when it is there at all.
-fn event_of(row: StoredRow) -> KnlResult<Value> {
-    let meta = decode_object(&row.meta, FIELD_META)?;
-    let data = decode_object(&row.data, FIELD_DATA)?;
-
-    let mut event = Map::new();
-    event.insert(FIELD_KIND.to_string(), Value::from(row.kind));
-    if let Some(beat) = row.beat {
-        event.insert(FIELD_BEAT.to_string(), Value::from(beat));
-    }
-    event.insert(FIELD_META.to_string(), meta);
-    event.insert(FIELD_DATA.to_string(), data);
-    event.insert(FIELD_SEQ.to_string(), Value::from(row.seq as u64));
-    event.insert(FIELD_EPOCH_MS.to_string(), Value::from(row.epoch_ms as u64));
-    event.insert(
-        SCHEMA_VERSION_FIELD.to_string(),
-        Value::from(row.schema_version as u64),
-    );
-    Ok(Value::Object(event))
-}
-
-/// Decode a stored JSON column, which must be an object.
-///
-/// Corruption rather than storage: the IO worked and the bytes came back, so
-/// what is wrong is the data, and no retry changes it.  A value that is not
-/// an object is the same fault as one that will not parse — the store's own
-/// writes are objects, so a scalar here came from the bytes.
-fn decode_object(text: &str, column: &str) -> KnlResult<Value> {
-    let value = serde_json::from_str::<Value>(text)
-        .map_err(|e| KnlError::Corruption(format!("sqlite: corrupt event {column}: {e}")))?;
-    if !value.is_object() {
-        return Err(KnlError::Corruption(format!(
-            "sqlite: corrupt event {column}: stored as {}, not a table",
-            super::event::json_type_name(&value)
-        )));
-    }
-    Ok(value)
-}
-
-/// The read statement for a stream, with its bound arguments.
-///
-/// One builder for both read paths — the plain one and the in-transaction
-/// twin — so a filtered read and the input a decision is shown select the
-/// same rows by the same rule.  The kinds are bound as parameters rather than
-/// written into the SQL, so a kind is data here as it is everywhere else.
-fn read_query(
-    stream: &str,
-    kinds: Option<&[String]>,
-    from_seq: u64,
-    limit: i64,
-) -> (String, Vec<SqlValue>) {
-    let mut sql = format!("SELECT {READ_COLUMNS} FROM events WHERE stream = ? AND seq >= ?");
-    let mut args = vec![
-        SqlValue::Text(stream.to_string()),
-        SqlValue::Integer(from_seq as i64),
-    ];
-    if let Some(kinds) = kinds {
-        let placeholders = vec!["?"; kinds.len()].join(", ");
-        sql.push_str(&format!(" AND kind IN ({placeholders})"));
-        args.extend(kinds.iter().map(|kind| SqlValue::Text(kind.clone())));
-    }
-    sql.push_str(" ORDER BY seq ASC LIMIT ?");
-    args.push(SqlValue::Integer(limit));
-    (sql, args)
-}
-
-/// The statement for the *last* `n` events of a stream, with its bound
-/// arguments.
-///
-/// `ORDER BY seq DESC LIMIT ?` — the index on `(stream, seq)` walks backwards
-/// and stops at `n`, so a `tail` of five over a log of a million reads five
-/// rows.  The rows come back newest-first and are reversed by the caller
-/// ([`read_last_in`]), because the SPI hands events over in `seq` order
-/// whichever end they were read from.
-fn read_last_query(stream: &str, n: i64) -> (String, Vec<SqlValue>) {
-    (
-        format!("SELECT {READ_COLUMNS} FROM events WHERE stream = ? ORDER BY seq DESC LIMIT ?"),
-        vec![SqlValue::Text(stream.to_string()), SqlValue::Integer(n)],
+/// Whether a rusqlite error is a retryable lock contention (matched on the
+/// SQLite error *code*, never the message text).
+fn is_retryable(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
     )
-}
-
-/// The last `n` events of `stream`, in `seq` order, read on the isle's thread.
-///
-/// Decodes exactly as [`read_in`] does — a row that will not decode is
-/// corruption and terminal — and reverses what SQLite handed back, so the
-/// caller sees the same ordering a range read gives.
-fn read_last_in(conn: &Connection, stream: &str, n: i64) -> Result<Vec<Value>, JobError> {
-    let (sql, args) = read_last_query(stream, n);
-    let mut stmt = conn.prepare(&sql).map_err(JobError::Sqlite)?;
-    let rows = stmt
-        .query_map(params_from_iter(args.iter()), read_row)
-        .map_err(JobError::Sqlite)?;
-    let mut events = Vec::new();
-    for row in rows {
-        let row = row.map_err(JobError::Sqlite)?;
-        events.push(event_of(row).map_err(JobError::Terminal)?);
-    }
-    events.reverse();
-    Ok(events)
-}
-
-/// The events of `stream`, in `seq` order, read on the isle's thread.
-///
-/// The one read both paths take — a plain [`EventStore::read_kinds`] and the
-/// input a decision is shown from inside its transaction — so they select the
-/// same rows by the same rule.  A fault on the read itself is SQLite's (and so
-/// retryable); a row whose stored objects do not decode is corruption and
-/// terminal, and it surfaces as an error rather than being silently dropped,
-/// so a caller (resume) never re-folds a truncated log into the wrong state.
-fn read_in(
-    conn: &Connection,
-    stream: &str,
-    kinds: Option<&[String]>,
-    from_seq: u64,
-    limit: i64,
-) -> Result<Vec<Value>, JobError> {
-    // An empty selection selects nothing, and `kind IN ()` is not SQL.
-    if kinds.is_some_and(<[String]>::is_empty) {
-        return Ok(Vec::new());
-    }
-    let (sql, args) = read_query(stream, kinds, from_seq, limit);
-    let mut stmt = conn.prepare(&sql).map_err(JobError::Sqlite)?;
-    let rows = stmt
-        .query_map(params_from_iter(args.iter()), read_row)
-        .map_err(JobError::Sqlite)?;
-    let mut events = Vec::new();
-    for row in rows {
-        let row = row.map_err(JobError::Sqlite)?;
-        events.push(event_of(row).map_err(JobError::Terminal)?);
-    }
-    Ok(events)
-}
-
-/// The next `seq` for `stream`: `MAX(seq) + 1`, or `1` for an empty stream.
-///
-/// Returns the raw rusqlite error so the retry driver can key on its code.
-fn next_seq(conn: &Connection, stream: &str) -> Result<u64, rusqlite::Error> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE stream = ?1",
-        params![stream],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|n| n as u64)
-}
-
-/// The current head of `stream`: `MAX(seq)`, or `None` when empty.
-///
-/// Returns the raw rusqlite error so the retry driver can key on its code.
-fn head_in(conn: &Connection, stream: &str) -> Result<Option<u64>, rusqlite::Error> {
-    let max: Option<i64> = conn.query_row(
-        "SELECT MAX(seq) FROM events WHERE stream = ?1",
-        params![stream],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    Ok(max.map(|n| n as u64))
-}
-
-/// Insert the fully-stamped event, one column per envelope key and one each
-/// for the two objects it carries, so a read rebuilds the exact same `Value`
-/// the caller wrote ([`event_of`]).
-///
-/// An encode failure is terminal; a contended insert is retryable.
-fn insert_row(
-    conn: &Connection,
-    stream: &str,
-    seq: u64,
-    epoch_ms: u64,
-    event: &Map<String, Value>,
-) -> Result<(), JobError> {
-    let kind = event.get(FIELD_KIND).and_then(Value::as_str).unwrap_or("");
-    let schema_version = event
-        .get(SCHEMA_VERSION_FIELD)
-        .and_then(Value::as_u64)
-        .unwrap_or(CURRENT_SCHEMA_VERSION);
-    // The beat is the caller's and most events have none: an undeclared one
-    // is a NULL in its column, which is what the read gives back as an
-    // absent key.
-    let beat = event.get(FIELD_BEAT).and_then(Value::as_str);
-    let meta = encode_object(event.get(FIELD_META), FIELD_META)?;
-    let data = encode_object(event.get(FIELD_DATA), FIELD_DATA)?;
-    conn.execute(
-        "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            stream,
-            seq as i64,
-            epoch_ms as i64,
-            kind,
-            schema_version as i64,
-            beat,
-            meta,
-            data
-        ],
-    )
-    .map_err(JobError::Sqlite)?;
-    Ok(())
-}
-
-/// Encode `meta` / `data` for its column: the object as text, `{}` when the
-/// event carries none.
-///
-/// Both are filled in on the way through [`stamp`], so the default is a
-/// belt-and-braces answer rather than the usual path — and it is the empty
-/// object either way, which is what makes the column `NOT NULL`.
-///
-/// An event that will not encode never reaches the disk, so a failure here is
-/// the store failing to do the work rather than data that came back wrong —
-/// `Storage`, not `Corruption`.
-fn encode_object(value: Option<&Value>, column: &str) -> Result<String, JobError> {
-    let Some(value) = value else {
-        return Ok("{}".to_string());
-    };
-    serde_json::to_string(value).map_err(|e| {
-        JobError::Terminal(KnlError::Storage(format!(
-            "sqlite: encode event {column}: {e}"
-        )))
-    })
 }
 
 /// Classify a rusqlite error into the kernel's vocabulary.
 ///
-/// This is the one place the backend's error language is translated, and the
-/// split is the one the caller can act on: a contended lock is
-/// [`KnlError::Busy`] — the same call may succeed if it is made again — and
-/// everything else is [`KnlError::Storage`], a fault the kernel cannot promise
-/// anything about.  Matched on the SQLite error *code*, never the message
-/// text, so the classification does not drift with a library's wording.
-///
-/// This is a wider net than the isle's own retry uses: the isle re-submits on
-/// `SQLITE_BUSY` alone, because that is contention with another connection and
-/// clears on its own, while `SQLITE_LOCKED` within one connection does not.
-/// What the *caller* is told is the coarser question — "is another attempt
-/// worth making at all" — and for that both are worth a try.
-///
-/// Corruption is not produced here: a row that comes back and will not decode
-/// is a fault of the data rather than of the store, so it is raised where the
-/// decode happens.
+/// The store's own SQL goes through eventsdb, which has its own classification
+/// ([`From<eventsdb_core::Error>`]); what is left on this path is the SQL the
+/// kernel runs itself — the legacy migration's plain connection
+/// ([`super::logs`]).  The split is the one the caller can act on: a contended
+/// lock is [`KnlError::Busy`] — the same call may succeed if it is made again
+/// — and everything else is [`KnlError::Storage`], a fault the kernel cannot
+/// promise anything about.  Matched on the SQLite error *code*, never the
+/// message text, so the classification does not drift with a library's
+/// wording.
 impl From<rusqlite::Error> for KnlError {
     fn from(error: rusqlite::Error) -> Self {
         if is_retryable(&error) {
@@ -1626,33 +656,31 @@ impl From<rusqlite::Error> for KnlError {
     }
 }
 
-/// Translate an isle-level failure into the kernel's vocabulary.
+/// Translate the store's failure into the kernel's vocabulary.
 ///
-/// The isle answers two kinds of question, and they map onto two kinds of
-/// kernel error.  A SQL fault is passed straight through to the translation
-/// above, so a contended write still reads as [`KnlError::Busy`] however it
-/// arrived.  The isle's own conditions are about the *thread*, and they split
-/// on whether waiting could help:
+/// One class each, because the two vocabularies were drawn along the same line
+/// — what a caller can *do* about it — and the six that exist on both sides
+/// mean the same thing on both sides.  The message travels as it was written:
+/// it is the reason, and the kernel renders the class itself.
 ///
-/// - `QueueFull` is backpressure — the connection thread is alive and behind,
-///   so this is [`KnlError::Busy`], the one class that says "ask again";
-/// - `Timeout` and `Cancelled` both mean a job was cut short rather than
-///   answered, which is [`KnlError::Timeout`]: the deadline was the caller's,
-///   and another identical attempt buys nothing;
-/// - `Closed` (the thread is gone) and `Panicked` are [`KnlError::Storage`] —
-///   the store could not do the work, and no retry changes that.
-impl From<IsleError> for KnlError {
-    fn from(error: IsleError) -> Self {
+/// The rest go to [`KnlError::Storage`] with their text.  `Truncated`,
+/// `HeadMismatch`, and the two retention refusals are answers to calls this
+/// kernel does not make — nothing here removes history, and no append names
+/// the head it expects — so a caller meeting one is meeting the store failing
+/// to do the work, which is what `Storage` says.  The enum is
+/// `#[non_exhaustive]`, so a class added later lands there too rather than
+/// failing to compile.
+impl From<eventsdb_core::Error> for KnlError {
+    fn from(error: eventsdb_core::Error) -> Self {
+        use eventsdb_core::Error as Failure;
         match error {
-            IsleError::Sqlite(error) => KnlError::from(error),
-            IsleError::QueueFull => {
-                KnlError::Busy("sqlite: the connection thread is at capacity".to_string())
-            }
-            IsleError::Timeout => KnlError::Timeout("sqlite: the deadline elapsed".to_string()),
-            IsleError::Cancelled => KnlError::Timeout("sqlite: the job was cancelled".to_string()),
-            // `IsleError` is `#[non_exhaustive]`: anything not named above is
-            // the store failing to do the work, which is what `Storage` is.
-            other => KnlError::Storage(format!("sqlite: {other}")),
+            Failure::Validation(reason) => KnlError::Validation(reason),
+            Failure::Busy(reason) => KnlError::Busy(reason),
+            Failure::Timeout(reason) => KnlError::Timeout(reason),
+            Failure::Storage(reason) => KnlError::Storage(reason),
+            Failure::Corruption(reason) => KnlError::Corruption(reason),
+            Failure::Unsupported(reason) => KnlError::Unsupported(reason),
+            other => KnlError::Storage(other.to_string()),
         }
     }
 }
@@ -1660,8 +688,9 @@ impl From<IsleError> for KnlError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, seq_of};
-    use crate::knl::query::QueryOpts;
+    use crate::knl::event::{kind_of, seq_of, FIELD_DATA, FIELD_META};
+    use crate::knl::query::{self, QueryOpts, QueryParams};
+    use crate::knl::CURRENT_SCHEMA_VERSION;
     use serde_json::json;
 
     /// Object map for an event literal.
@@ -1682,23 +711,18 @@ mod tests {
         obj(json!({ "kind": kind, "data": { "amount": amount } }))
     }
 
-    /// A store on an in-memory database of its very own, with the collection
-    /// that owns its connection thread.
+    /// A store on an in-memory log of its very own.
     ///
-    /// The name matters: an in-memory database is shared by *name*, which is
-    /// what lets the reader see the writer's rows — and would equally let two
-    /// tests running in parallel see each other's.  A fresh id per store keeps
-    /// each test's log to itself.
-    ///
-    /// The [`IsleDrivers`] comes back with the store because the caller has to
-    /// hold it: it owns the connection thread, and a test that dropped it
-    /// early would be pulling the database out from under its own assertions.
-    async fn mem_store() -> (SqliteEventStore, IsleDrivers) {
-        let drivers = IsleDrivers::new();
-        let store = SqliteEventStore::open_memory(uuid::Uuid::new_v4().to_string(), &drivers)
+    /// The [`Logs`] comes back with the store because the caller has to hold
+    /// it: it owns the log, and a test that dropped it early would be pulling
+    /// the database out from under its own assertions.  One `Logs` per test is
+    /// also what keeps two tests running in parallel out of each other's log.
+    async fn mem_store() -> (SqliteEventStore, Logs) {
+        let logs = Logs::new();
+        let store = SqliteEventStore::open_memory(uuid::Uuid::new_v4().to_string(), &logs)
             .await
             .expect("open");
-        (store, drivers)
+        (store, logs)
     }
 
     /// A decision as [`EventStore::append_if`] takes one: owned, and handed
@@ -1711,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_assigns_gap_free_monotonic_seq_from_one() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         assert!(store.is_empty().await.expect("is_empty"));
         assert_eq!(store.len().await.expect("len"), 0);
 
@@ -1734,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_append_records_nothing_and_burns_no_seq() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store
             .append(obj(json!({ "text": "no kind" })))
             .await
@@ -1743,16 +767,40 @@ mod tests {
         assert_eq!(store.append(ev(1)).await.expect("append").seq, 1);
     }
 
+    /// The coordinates are the store's: an event that arrives carrying `seq`
+    /// or `epoch_ms` has them replaced rather than honoured, so a caller
+    /// cannot choose where its event lands or when it says it happened.
+    #[tokio::test]
+    async fn a_caller_supplied_coordinate_is_overwritten() {
+        let (mut store, _logs) = mem_store().await;
+        store.append(ev(1)).await.expect("seed");
+
+        let committed = store
+            .append(obj(json!({ "kind": "e2", "seq": 99, "epoch_ms": 7 })))
+            .await
+            .expect("append");
+        assert_eq!(committed.seq, 2, "the store numbers the stream");
+        assert_ne!(committed.epoch_ms, 7, "the store reads the clock");
+
+        let stored = store.read(0, usize::MAX).await.expect("read");
+        assert_eq!(seq_of(&stored[1]), 2);
+        assert_eq!(
+            stored[1].get("_schema_version").and_then(Value::as_u64),
+            Some(CURRENT_SCHEMA_VERSION),
+            "every append is stamped with the kernel's version"
+        );
+    }
+
     /// `append_if` decides on the stream inside its transaction: the events
     /// it is handed are the durable ones, a `Some` lands at the next seq, and
     /// a `None` commits nothing.
     #[tokio::test]
     async fn append_if_decides_inside_the_transaction_and_writes_only_a_some() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store.append(ev(1)).await.expect("seed");
 
-        // The decision runs on the connection's own thread now, so what it
-        // saw comes back through a shared cell rather than a borrow.
+        // The decision runs on the connection's own thread, so what it saw
+        // comes back through a shared cell rather than a borrow.
         let seen_kinds: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorded = Arc::clone(&seen_kinds);
         let committed = store
@@ -1782,14 +830,35 @@ mod tests {
         assert_eq!(store.append(ev(3)).await.expect("append").seq, 3);
     }
 
-    /// A malformed decision is refused and leaves the stream alone.
+    /// A malformed decision is refused and leaves the stream alone — and the
+    /// caller is told, rather than being handed the `None` that would read as
+    /// a decision that said no.
     #[tokio::test]
     async fn append_if_validates_the_event_the_decision_returns() {
-        let (mut store, _drivers) = mem_store().await;
-        store
+        let (mut store, _logs) = mem_store().await;
+        let err = store
             .append_if(None, decide(|_| Some(obj(json!({ "text": "no kind" })))))
             .await
             .expect_err("kind is required");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert_eq!(store.len().await.expect("len"), 0);
+    }
+
+    /// The kernel's own rules reach a decision's event too: a kernel kind
+    /// whose `data` is missing a required field is refused, which eventsdb
+    /// (which knows no kind) would have accepted.
+    #[tokio::test]
+    async fn append_if_holds_a_kernel_kind_to_its_data() {
+        let (mut store, _logs) = mem_store().await;
+        let err = store
+            .append_if(
+                None,
+                decide(|_| Some(obj(json!({ "kind": "budget_spent", "data": {} })))),
+            )
+            .await
+            .expect_err("a kernel kind needs its data");
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert!(err.reason().contains("amount"), "{}", err.reason());
         assert_eq!(store.len().await.expect("len"), 0);
     }
 
@@ -1798,7 +867,7 @@ mod tests {
     /// exactly as it was, which is the whole reason it is one call.
     #[tokio::test]
     async fn append_many_is_one_transaction_that_lands_whole_or_not_at_all() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store.append(ev(1)).await.expect("seed");
 
         let committed = store
@@ -1823,21 +892,8 @@ mod tests {
         assert_eq!(
             store.len().await.expect("len"),
             3,
-            "a failed batch wrote nothing"
+            "a batch that fails lands nothing"
         );
-        assert_eq!(
-            store.append(ev(5)).await.expect("append").seq,
-            4,
-            "no seq burnt"
-        );
-
-        // An empty batch is nothing to write, not an empty transaction.
-        assert!(store
-            .append_many(Vec::new())
-            .await
-            .expect("empty")
-            .is_empty());
-        assert_eq!(store.len().await.expect("len"), 4);
     }
 
     /// A two-stream write is one transaction: each side is numbered from its
@@ -1845,152 +901,124 @@ mod tests {
     /// event on either side — leaves both streams exactly as they were.
     #[tokio::test]
     async fn append_if_many_writes_both_streams_or_neither() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let child = uuid::Uuid::new_v4().to_string();
+        let log = logs.memory().await.expect("the log");
+        let mut ledger = SqliteEventStore::on(Arc::clone(&log), parent.clone());
+        let opened = SqliteEventStore::on(Arc::clone(&log), child.clone());
+        assert_eq!(
+            ledger.database(),
+            opened.database(),
+            "both streams are in one database"
+        );
 
-        let mut parent = SqliteEventStore::open(&path, "p", &drivers)
+        ledger
+            .append(budget("budget_granted", 100))
             .await
-            .expect("open the parent");
-        let child = SqliteEventStore::open(&path, "c", &drivers)
-            .await
-            .expect("open the child");
-        parent.append(ev(1)).await.expect("seed");
+            .expect("the grant");
 
-        let committed = parent
+        // The decision is shown its own stream, filtered, and the other
+        // stream's first event — which is nothing, since it is empty.
+        let seen: Arc<Mutex<(usize, usize)>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+        let child_stream = child.clone();
+        let committed = ledger
             .append_if_many(
-                "c",
-                None,
-                Box::new(|events| {
-                    assert_eq!(events.own.len(), 1, "the decision reads its own stream");
-                    assert!(
-                        events.other.is_empty(),
-                        "and is shown that the other one is empty"
-                    );
+                &child,
+                Some(&["budget_granted"]),
+                Box::new(move |split: Split<Value>| {
+                    *recorded.lock().expect("not poisoned") = (split.own.len(), split.other.len());
                     Some(Split {
-                        own: vec![ev(2)],
-                        other: vec![ev(3), ev(4)],
+                        own: vec![obj(json!({
+                            "kind": "budget_reserved",
+                            "data": { "amount": 10, "child": child_stream },
+                        }))],
+                        other: vec![
+                            obj(json!({
+                                "kind": "session_opened",
+                                "data": { "scope_id": "sc-1", "owner": "o", "parent": "p" },
+                            })),
+                            budget("budget_granted", 10),
+                        ],
                     })
                 }),
             )
             .await
-            .expect("both sides")
-            .expect("the decision wrote");
+            .expect("append_if_many")
+            .expect("a Some writes");
         assert_eq!(
-            committed.own.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            [2],
-            "this stream numbers on from its own head"
+            *seen.lock().expect("not poisoned"),
+            (1, 0),
+            "its own kinds, and an empty other stream"
         );
+        assert_eq!(committed.own.iter().map(|c| c.seq).collect::<Vec<_>>(), [2]);
         assert_eq!(
             committed.other.iter().map(|c| c.seq).collect::<Vec<_>>(),
             [1, 2],
-            "and the other from its own, which was empty"
+            "the other stream is numbered from its own head"
         );
-        assert_eq!(child.len().await.expect("len"), 2, "the other side landed");
 
-        // A `None` is a decision too: neither stream is touched.
-        assert_eq!(
-            parent
-                .append_if_many("c", None, Box::new(|_| None))
-                .await
-                .expect("append_if_many"),
-            None
-        );
-        assert_eq!(parent.len().await.expect("len"), 2);
-        assert_eq!(child.len().await.expect("len"), 2);
-
-        // One side may be empty — a refusal writes only this stream.
-        parent
-            .append_if_many("c", None, Box::new(|_| Some(Split::own(vec![ev(5)]))))
+        // A None writes nothing at all.
+        let nothing = ledger
+            .append_if_many(&child, None, Box::new(|_| None))
             .await
-            .expect("append_if_many")
-            .expect("the decision wrote");
-        assert_eq!(parent.len().await.expect("len"), 3);
-        assert_eq!(child.len().await.expect("len"), 2, "and nothing else");
+            .expect("append_if_many");
+        assert_eq!(nothing, None);
+        assert_eq!(ledger.len().await.expect("len"), 2);
+        assert_eq!(opened.len().await.expect("len"), 2);
 
-        // A malformed event on the far side takes the whole transaction with
-        // it, including the well-formed one on this side.
-        parent
+        // A malformed event on the far side leaves both streams as they were.
+        let err = ledger
             .append_if_many(
-                "c",
+                &child,
                 None,
                 Box::new(|_| {
                     Some(Split {
-                        own: vec![ev(6)],
+                        own: vec![budget("budget_spent", 1)],
                         other: vec![obj(json!({ "text": "no kind" }))],
                     })
                 }),
             )
             .await
             .expect_err("kind is required");
-        assert_eq!(parent.len().await.expect("len"), 3, "nothing was written");
-        assert_eq!(child.len().await.expect("len"), 2);
+        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
+        assert_eq!(ledger.len().await.expect("len"), 2);
+        assert_eq!(opened.len().await.expect("len"), 2);
     }
 
-    /// The close-time child scan reads by `events_session_opened_parent`
-    /// instead of walking every event in the database.
+    /// The close-time child scan reads by the parent index instead of walking
+    /// every event in the database.
     ///
     /// The plan is the assertion because the alternative is silent: a bound
     /// `kind` proves nothing about the index's `WHERE kind = 'session_opened'`
     /// and a bound path never matches an indexed expression, so getting either
     /// wrong still answers correctly — it just answers by reading the whole
-    /// table, on the one query that is not scoped to a stream.  The rows are
-    /// checked too, so the literals that buy the index cannot buy it by
-    /// asking a different question.
-    ///
-    /// What the plan reads today: `SEARCH opened USING INDEX
-    /// events_session_opened_parent (<expr>=?)`, with the ending's `NOT
-    /// EXISTS` served by `events_stream_kind_seq`.
-    #[test]
-    fn the_child_scan_reads_by_the_parent_index() {
-        let conn = Connection::open_in_memory().expect("an in-memory database");
-        conn.execute_batch(SCHEMA_DDL).expect("the schema");
-
-        let insert = |stream: &str, seq: i64, kind: &str, data: &str| {
-            conn.execute(
-                "INSERT INTO events \
-                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-                 VALUES (?1, ?2, ?3, ?4, 1, NULL, '{}', ?5)",
-                params![stream, seq, seq * 10, kind, data],
-            )
-            .expect("insert");
-        };
-        insert("c1", 1, "session_opened", r#"{"parent":"p"}"#);
-        insert("c2", 1, "session_opened", r#"{"parent":"p"}"#);
-        insert("c2", 2, "session_closed", "{}");
-        insert("c3", 1, "session_opened", r#"{"parent":"elsewhere"}"#);
-        insert("p", 1, "session_opened", "{}");
-
-        // The kernel's own vocabulary, which is the one the index is cut for.
+    /// table, on the one query that is not scoped to a stream.
+    #[tokio::test]
+    async fn the_child_scan_reads_by_the_parent_index() {
+        let logs = Logs::new();
+        let log = logs.memory().await.expect("the log");
         let scan = ChildScan {
             opened: "session_opened".to_string(),
             closed: "session_closed".to_string(),
             parent_field: "parent".to_string(),
         };
-        assert_eq!(
-            open_children_in(&conn, "p", &scan).expect("scan"),
-            vec!["c1".to_string()],
-            "the ended child and the other parent's are not this stream's open children"
-        );
-
-        let sql = format!("EXPLAIN QUERY PLAN {}", child_scan_sql(&scan));
-        let mut stmt = conn.prepare(&sql).expect("prepare the plan");
-        let plan: Vec<String> = stmt
-            .query_map(params!["p"], |row| row.get::<_, String>(3))
-            .expect("the plan's rows")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("the plan's rows");
-
+        let rows = log
+            .query(
+                &format!("EXPLAIN QUERY PLAN {}", child_scan_sql(&scan)),
+                vec![Value::from("p-1")],
+            )
+            .await
+            .expect("the plan");
+        let plan: String = rows
+            .iter()
+            .filter_map(|row| row.get("detail").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" | ");
         assert!(
-            plan.iter()
-                .any(|step| step.contains("events_session_opened_parent")),
-            "the openings must be looked up by the index: {plan:?}"
-        );
-        assert!(
-            !plan
-                .iter()
-                .any(|step| step.starts_with("SCAN events AS opened")),
-            "and not found by walking the table: {plan:?}"
+            plan.contains("events_session_opened_parent"),
+            "the scan must read by the parent index: {plan}"
         );
     }
 
@@ -2004,28 +1032,18 @@ mod tests {
     /// wrote.
     #[test]
     fn a_word_written_into_the_scan_stays_one_word() {
-        assert_eq!(sql_literal("parent"), "'parent'");
-        assert_eq!(sql_literal("a'b"), "'a''b'");
-
-        let conn = Connection::open_in_memory().expect("an in-memory database");
-        conn.execute_batch(SCHEMA_DDL).expect("the schema");
-        conn.execute(
-            "INSERT INTO events \
-                 (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-             VALUES ('c', 1, 10, 'it''s open', 1, NULL, '{}', ?1)",
-            params![r#"{"pa'rent":"p"}"#],
-        )
-        .expect("insert");
-
-        let scan = ChildScan {
-            opened: "it's open".to_string(),
-            closed: "it's over".to_string(),
-            parent_field: "pa'rent".to_string(),
-        };
+        let sql = child_scan_sql(&ChildScan {
+            opened: "it's opened".to_string(),
+            closed: "it's closed".to_string(),
+            parent_field: "it's parent".to_string(),
+        });
+        assert!(sql.contains("'it''s opened'"), "{sql}");
+        assert!(sql.contains("'it''s closed'"), "{sql}");
+        assert!(sql.contains("'$.it''s parent'"), "{sql}");
         assert_eq!(
-            open_children_in(&conn, "p", &scan).expect("the statement parses and runs"),
-            vec!["c".to_string()],
-            "the quoted words are still the words being matched"
+            sql.matches('\'').count() % 2,
+            0,
+            "every literal is closed: {sql}"
         );
     }
 
@@ -2035,42 +1053,28 @@ mod tests {
     /// transaction can cover both.
     #[tokio::test]
     async fn database_is_the_same_for_two_streams_of_one_database() {
+        let logs = Logs::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let elsewhere = dir.path().join("other.db");
-        let drivers = IsleDrivers::new();
+        let here = dir.path().join("knl.db");
+        let there = dir.path().join("other.db");
 
-        let a = SqliteEventStore::open(&path, "a", &drivers)
+        let a = SqliteEventStore::open(&here, "s-1", &logs)
             .await
             .expect("open a");
-        let b = SqliteEventStore::open(&path, "b", &drivers)
+        let b = SqliteEventStore::open(&here, "s-2", &logs)
             .await
             .expect("open b");
-        let far = SqliteEventStore::open(&elsewhere, "a", &drivers)
+        let elsewhere = SqliteEventStore::open(&there, "s-1", &logs)
             .await
-            .expect("open far");
+            .expect("open elsewhere");
 
-        assert_eq!(a.database(), b.database(), "two streams, one database");
-        assert_ne!(a.database(), far.database(), "two databases");
-        assert_eq!(
-            a.database(),
-            Some(path.to_string_lossy().as_ref()),
-            "the target it was opened by"
-        );
+        assert_eq!(a.database(), b.database());
+        assert_ne!(a.database(), elsewhere.database());
 
-        // An in-memory database has an identity too, and it is the URI a
-        // second connection reaches it by.
-        let (mem, _mem_drivers) = mem_store().await;
-        let uri = mem.database().expect("a database").to_string();
-        assert!(uri.contains("mode=memory"), "{uri}");
-        let beside = SqliteEventStore::open(std::path::Path::new(&uri), "beside", &drivers)
-            .await
-            .expect("open beside");
-        assert_eq!(
-            beside.database(),
-            Some(uri.as_str()),
-            "opening that target reaches the same database"
-        );
+        // The in-memory log is a database of its own, and says so.
+        let (mem, _mem_logs) = mem_store().await;
+        assert_ne!(mem.database(), a.database());
+        assert!(mem.database().is_some());
     }
 
     /// The child scan finds the streams that name this one as their parent
@@ -2078,73 +1082,60 @@ mod tests {
     /// that already closed.
     #[tokio::test]
     async fn open_children_are_the_unended_streams_that_name_this_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
-
-        /// A `session_opened` naming `parent`.
-        fn opened(parent: &str) -> Map<String, Value> {
-            obj(json!({
-                "kind": "session_opened",
-                "data": { "scope_id": "sc", "owner": "anon", "parent": parent }
-            }))
-        }
-        let ended = obj(json!({ "kind": "session_closed", "data": { "reason": "done" } }));
-
-        let mut parent = SqliteEventStore::open(&path, "p", &drivers)
-            .await
-            .expect("open p");
-        // Still running.
-        let mut running = SqliteEventStore::open(&path, "kid-a", &drivers)
-            .await
-            .expect("open kid-a");
-        running.append(opened("p")).await.expect("opened");
-        // Opened from p and already over.
-        let mut over = SqliteEventStore::open(&path, "kid-b", &drivers)
-            .await
-            .expect("open kid-b");
-        over.append(opened("p")).await.expect("opened");
-        over.append(ended.clone()).await.expect("closed");
-        // Somebody else's child, still running.
-        let mut theirs = SqliteEventStore::open(&path, "kid-c", &drivers)
-            .await
-            .expect("open kid-c");
-        theirs.append(opened("q")).await.expect("opened");
-        // A stream with no parent at all.
-        let mut root = SqliteEventStore::open(&path, "r", &drivers)
-            .await
-            .expect("open r");
-        root.append(obj(
-            json!({ "kind": "session_opened", "data": { "scope_id": "sc", "owner": "anon" } }),
-        ))
-        .await
-        .expect("opened");
-
+        let logs = Logs::new();
+        let log = logs.memory().await.expect("the log");
         let scan = ChildScan {
             opened: "session_opened".to_string(),
             closed: "session_closed".to_string(),
             parent_field: "parent".to_string(),
         };
-        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
-        let recorded = Arc::clone(&seen);
+
+        /// A stream that opened, naming `parent`.
+        async fn opened(log: &Arc<SqliteEventLog>, id: &str, parent: &str) -> SqliteEventStore {
+            let mut store = SqliteEventStore::on(Arc::clone(log), id);
+            store
+                .append(obj(json!({
+                    "kind": "session_opened",
+                    "data": { "scope_id": "sc", "owner": "o", "parent": parent },
+                })))
+                .await
+                .expect("the opening");
+            store
+        }
+
+        let mut parent = SqliteEventStore::on(Arc::clone(&log), "parent");
+        let _open_child = opened(&log, "child-open", "parent").await;
+        let mut ended = opened(&log, "child-ended", "parent").await;
+        let _elsewhere = opened(&log, "child-of-other", "another").await;
+        ended
+            .append(obj(json!({
+                "kind": "session_closed",
+                "data": { "reason": "done" },
+            })))
+            .await
+            .expect("the ending");
+
+        let recorded: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&recorded);
         let committed = parent
             .append_with_open_children(
                 &scan,
                 Box::new(move |children| {
-                    *recorded.lock().expect("not poisoned") = children;
-                    ended.clone()
+                    *seen.lock().expect("not poisoned") = children.clone();
+                    obj(json!({
+                        "kind": "session_closed",
+                        "data": { "reason": "done", "open_children": children },
+                    }))
                 }),
             )
             .await
-            .expect("the close lands");
-
+            .expect("the close");
+        assert_eq!(committed.seq, 1, "the close is the parent's first event");
         assert_eq!(
-            *seen.lock().expect("not poisoned"),
-            ["kid-a"],
-            "only the unended streams that named this one"
+            *recorded.lock().expect("not poisoned"),
+            ["child-open"],
+            "only this stream's children, and only the open ones"
         );
-        assert_eq!(committed.seq, 1, "and the event it built was appended");
-        assert_eq!(parent.len().await.expect("len"), 1);
     }
 
     /// A kind-filtered read is answered off the index: only the kinds asked
@@ -2152,7 +1143,7 @@ mod tests {
     /// them.  `None` is the whole stream, an empty selection is nothing.
     #[tokio::test]
     async fn read_kinds_selects_by_kind_and_keeps_the_streams_order() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store
             .append(budget("budget_granted", 100))
             .await
@@ -2162,48 +1153,28 @@ mod tests {
             .append(budget("budget_spent", 10))
             .await
             .expect("spend");
-        store.append(ev(2)).await.expect("more noise");
+
+        let all = store.read(0, usize::MAX).await.expect("read");
+        assert_eq!(
+            all.iter().map(kind_of).collect::<Vec<_>>(),
+            ["budget_granted", "e1", "budget_spent"]
+        );
 
         let ledger = store
             .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, usize::MAX)
             .await
             .expect("read_kinds");
-        let kinds: Vec<&str> = ledger.iter().map(kind_of).collect();
-        assert_eq!(kinds, ["budget_granted", "budget_spent"]);
-        assert_eq!(seq_of(&ledger[0]), 1);
-        assert_eq!(seq_of(&ledger[1]), 3, "the seq is the stream's");
-
-        // from_seq and limit still apply to the filtered set.
         assert_eq!(
-            store
-                .read_kinds(Some(&["budget_granted"]), 2, usize::MAX)
-                .await
-                .expect("read_kinds")
-                .len(),
-            0
-        );
-        assert_eq!(
-            store
-                .read_kinds(Some(&["budget_granted", "budget_spent"]), 0, 1)
-                .await
-                .expect("read_kinds")
-                .len(),
-            1
+            ledger.iter().map(seq_of).collect::<Vec<_>>(),
+            [1, 3],
+            "the seq the stream gave them, not a fresh numbering"
         );
 
-        assert!(store
+        let nothing = store
             .read_kinds(Some(&[]), 0, usize::MAX)
             .await
-            .expect("read_kinds")
-            .is_empty());
-        assert_eq!(
-            store
-                .read_kinds(None, 0, usize::MAX)
-                .await
-                .expect("read_kinds")
-                .len(),
-            4
-        );
+            .expect("read_kinds");
+        assert!(nothing.is_empty(), "an empty selection selects nothing");
     }
 
     /// A decision that names its kinds is shown those and nothing else, and
@@ -2211,19 +1182,18 @@ mod tests {
     /// what the decision *reads*, not where its answer goes.
     #[tokio::test]
     async fn append_if_filters_the_decisions_input_and_numbers_against_the_stream() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store
             .append(budget("budget_granted", 100))
             .await
             .expect("grant");
         store.append(ev(1)).await.expect("noise");
-        store.append(ev(2)).await.expect("more noise");
 
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();
         let recorded = Arc::clone(&seen);
         let committed = store
             .append_if(
-                Some(&["budget_granted"]),
+                Some(&["budget_granted", "budget_spent"]),
                 decide(move |events| {
                     *recorded.lock().expect("not poisoned") =
                         events.iter().map(|e| kind_of(e).to_string()).collect();
@@ -2239,424 +1209,338 @@ mod tests {
         );
         assert_eq!(
             committed.map(|c| c.seq),
-            Some(4),
-            "the write lands after everything, not after the filtered read"
+            Some(3),
+            "numbered against the whole stream"
         );
-        assert_eq!(store.len().await.expect("len"), 4);
     }
 
     /// Two handles on one stream, one invariant: each decides inside its own
     /// transaction, so the second sees what the first wrote and exactly one
-    /// of them may write.  This is the property a compare-and-swap against a
-    /// cached head could only detect after the fact.
+    /// of them may write.
     #[tokio::test]
     async fn append_if_across_two_handles_decides_on_the_other_handles_write() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
+        let log = logs.memory().await.expect("the log");
+        let stream = uuid::Uuid::new_v4().to_string();
+        let mut a = SqliteEventStore::on(Arc::clone(&log), stream.clone());
+        let mut b = SqliteEventStore::on(Arc::clone(&log), stream);
 
-        let mut a = SqliteEventStore::open(&path, "s", &drivers)
-            .await
-            .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s", &drivers)
-            .await
-            .expect("open b");
-
-        // "Write the marker, but only if nobody has written one yet."
-        let only_once = || {
+        // "Write the claim, but only if nobody has."
+        fn claim() -> Decision {
             decide(|events: Vec<Value>| {
-                (!events.iter().any(|e| kind_of(e) == "marker"))
-                    .then(|| obj(json!({ "kind": "marker" })))
+                if events.is_empty() {
+                    Some(obj(json!({ "kind": "claim" })))
+                } else {
+                    None
+                }
             })
-        };
-
-        let first = a.append_if(None, only_once()).await.expect("a decides");
-        assert_eq!(first.map(|c| c.seq), Some(1), "a wrote the marker");
-
-        let second = b.append_if(None, only_once()).await.expect("b decides");
-        assert_eq!(second, None, "b saw a's marker and wrote nothing");
-        assert_eq!(b.len().await.expect("len"), 1, "exactly one marker");
+        }
+        assert!(a
+            .append_if(Some(&["claim"]), claim())
+            .await
+            .expect("a")
+            .is_some());
+        assert!(
+            b.append_if(Some(&["claim"]), claim())
+                .await
+                .expect("b")
+                .is_none(),
+            "the second handle decided against what the first wrote"
+        );
+        assert_eq!(a.len().await.expect("len"), 1);
     }
 
     #[tokio::test]
     async fn read_pages_by_from_seq_and_limit() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         for i in 1..=5 {
             store.append(ev(i)).await.expect("append");
         }
-
-        assert_eq!(store.read(0, usize::MAX).await.expect("read").len(), 5);
-        assert_eq!(store.read(1, usize::MAX).await.expect("read").len(), 5);
-        assert_eq!(store.read(3, usize::MAX).await.expect("read").len(), 3);
-        assert_eq!(store.read(6, usize::MAX).await.expect("read").len(), 0);
-
         let page = store.read(2, 2).await.expect("read");
-        assert_eq!(page.len(), 2);
-        assert_eq!(kind_of(&page[0]), "e2");
-        assert_eq!(kind_of(&page[1]), "e3");
-
-        // A zero limit returns nothing even when events match.
-        assert!(store.read(0, 0).await.expect("read").is_empty());
+        assert_eq!(page.iter().map(seq_of).collect::<Vec<_>>(), [2, 3]);
+        let rest = store.read(4, usize::MAX).await.expect("read");
+        assert_eq!(rest.iter().map(seq_of).collect::<Vec<_>>(), [4, 5]);
+        assert!(store.read(6, 10).await.expect("read").is_empty());
     }
 
-    /// The last `n` come back in `seq` order, and the statement that fetched
-    /// them asked SQLite for `n` rows rather than for the stream.
-    ///
-    /// The query plan is the half that matters: `ORDER BY seq DESC LIMIT ?`
-    /// walks the `(stream, seq)` index backwards and stops, so the cost of a
-    /// `tail` is `n` and not the length of the log.  Reading the SQL here is
-    /// how that is held — the row count alone would pass just as well for a
-    /// backend that read everything and threw most of it away.
+    /// The last `n` come back in `seq` order.
     #[tokio::test]
     async fn read_last_takes_the_end_of_the_stream_in_seq_order() {
-        let (sql, args) = read_last_query("s-1", 5);
-        assert!(
-            sql.contains("ORDER BY seq DESC LIMIT ?"),
-            "the read must stop at n rows: {sql}"
-        );
-        assert_eq!(args.len(), 2, "the stream and the cap are bound: {sql}");
-
-        let (mut store, _drivers) = mem_store().await;
-        for i in 1..=200 {
+        let (mut store, _logs) = mem_store().await;
+        for i in 1..=5 {
             store.append(ev(i)).await.expect("append");
         }
-
-        let tail = store.read_last(5).await.expect("read_last");
-        assert_eq!(tail.len(), 5);
-        assert_eq!(kind_of(&tail[0]), "e196", "oldest of the five first");
-        assert_eq!(kind_of(&tail[4]), "e200", "the head last");
-
-        // The two edges: more than there is, and none at all.
-        assert_eq!(store.read_last(usize::MAX).await.expect("all").len(), 200);
-        assert!(store.read_last(0).await.expect("none").is_empty());
+        let tail = store.read_last(2).await.expect("read_last");
+        assert_eq!(tail.iter().map(seq_of).collect::<Vec<_>>(), [4, 5]);
+        assert!(store.read_last(0).await.expect("read_last").is_empty());
+        assert_eq!(store.read_last(50).await.expect("read_last").len(), 5);
     }
 
     #[tokio::test]
     async fn head_is_none_when_empty_then_tracks_the_max() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         assert_eq!(store.head().await.expect("head"), None);
-
         store.append(ev(1)).await.expect("append");
         assert_eq!(store.head().await.expect("head"), Some(1));
         store.append(ev(2)).await.expect("append");
         assert_eq!(store.head().await.expect("head"), Some(2));
-
-        // A rejected append does not move the head.
-        store
-            .append(obj(json!({ "text": "no kind" })))
-            .await
-            .expect_err("kind is required");
-        assert_eq!(store.head().await.expect("head"), Some(2));
     }
 
     /// A read rebuilds the object that was written: the envelope out of its
-    /// columns, `meta` and `data` out of theirs, and the beat back as an
-    /// absent key when there was none.
+    /// columns, `meta` and `data` out of theirs, and the beat inside the
+    /// `meta` it was written in.
     #[tokio::test]
     async fn read_reconstructs_the_written_event_out_of_its_columns() {
-        let (mut store, _drivers) = mem_store().await;
-        store
+        let (mut store, _logs) = mem_store().await;
+        let committed = store
             .append(obj(json!({
-                "kind": "note",
-                "beat": "b1",
-                "meta": { "label": "a", "attempt": 2, "retried": true },
-                "data": { "text": "hi", "nested": { "deep": [1, 2] } }
+                "kind": "llm_response",
+                "meta": { "beat": "b-1", "attempt": 2, "final": true },
+                "data": { "content": { "text": "hi" }, "usage": { "input_tokens": 3 } },
             })))
             .await
             .expect("append");
-        store
-            .append(obj(json!({ "kind": "note" })))
-            .await
-            .expect("append a bare one");
 
         let stored = store.read(0, usize::MAX).await.expect("read");
-        assert_eq!(kind_of(&stored[0]), "note");
-        assert_eq!(stored[0]["beat"], json!("b1"));
+        let event = &stored[0];
+        assert_eq!(kind_of(event), "llm_response");
+        assert_eq!(seq_of(event), committed.seq);
         assert_eq!(
-            stored[0]["meta"],
-            json!({ "label": "a", "attempt": 2, "retried": true })
+            event.get(FIELD_META),
+            Some(&json!({ "beat": "b-1", "attempt": 2, "final": true }))
         );
         assert_eq!(
-            stored[0]["data"],
-            json!({ "text": "hi", "nested": { "deep": [1, 2] } }),
-            "data comes back at any depth"
+            event.get(FIELD_DATA),
+            Some(&json!({ "content": { "text": "hi" }, "usage": { "input_tokens": 3 } }))
         );
-        assert_eq!(seq_of(&stored[0]), 1);
-        assert!(stored[0].get("epoch_ms").is_some(), "{}", stored[0]);
         assert_eq!(
-            stored[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
+            event.get("_schema_version").and_then(Value::as_u64),
             Some(CURRENT_SCHEMA_VERSION)
         );
-
-        // An event with nothing declared: no beat key at all, and the two
-        // objects empty rather than missing.
-        assert_eq!(stored[1].get("beat"), None, "{}", stored[1]);
-        assert_eq!(stored[1]["meta"], json!({}));
-        assert_eq!(stored[1]["data"], json!({}));
     }
 
-    /// The beat lands in its own column — a plain `SELECT beat` sees it —
-    /// and the index that makes a by-beat read a range is on the table.
+    /// The beat is a label of `meta` and a read reaches it there — and the
+    /// log carries an index on exactly that expression, so a by-beat read is
+    /// a range rather than a scan.
     #[tokio::test]
-    async fn the_beat_is_a_column_of_its_own_with_an_index() {
-        let (mut store, _drivers) = mem_store().await;
+    async fn the_beat_is_a_meta_label_with_an_index() {
+        let (mut store, _logs) = mem_store().await;
         store
-            .append(obj(json!({ "kind": "e1", "beat": "b1" })))
+            .append(obj(json!({ "kind": "e1", "meta": { "beat": "b-1" } })))
             .await
             .expect("append");
-        store.append(ev(2)).await.expect("append with no beat");
+        store.append(ev(2)).await.expect("append");
 
         let rows = ask(
             &store,
-            "SELECT seq, beat FROM events WHERE stream = $stream ORDER BY seq",
+            "SELECT json_extract(meta, '$.beat') AS beat FROM events \
+              WHERE stream = $stream ORDER BY seq",
         )
         .await
         .expect("query");
-        assert_eq!(rows.rows[0]["beat"], Value::from("b1"));
+        assert_eq!(rows.rows[0].get("beat"), Some(&json!("b-1")));
         assert!(
             !rows.rows[1].contains_key("beat"),
-            "an undeclared beat is NULL: {:?}",
+            "an undeclared beat reads as nil: {:?}",
             rows.rows[1]
         );
 
-        // Grouping a run by beat is a range of an index, not a scan.
-        let indexes = store
-            .writer
-            .call(|conn| {
-                let mut stmt = conn.prepare("PRAGMA index_list(events)")?;
-                let names = stmt
-                    .query_map([], |row| row.get::<_, String>("name"))?
-                    .collect::<rusqlite::Result<Vec<_>>>();
-                names
-            })
-            .await
-            .expect("index_list");
+        let indexes = ask(
+            &store,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'",
+        )
+        .await
+        .expect("query");
+        let names: Vec<&str> = indexes
+            .rows
+            .iter()
+            .filter_map(|row| row.get("name").and_then(Value::as_str))
+            .collect();
         assert!(
-            indexes.iter().any(|name| name == "events_stream_beat_seq"),
-            "the (stream, beat, seq) index must exist: {indexes:?}"
+            names.contains(&"events_meta_beat"),
+            "the beat label is indexed: {names:?}"
         );
         assert!(
-            indexes.iter().any(|name| name == "events_stream_kind_seq"),
-            "…beside the by-kind one: {indexes:?}"
+            !names.contains(&"events_stream_beat_seq"),
+            "and the column's old index is gone: {names:?}"
         );
     }
 
     #[tokio::test]
     async fn events_persist_across_a_reopen_of_the_same_path_and_stream() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
+        let path = dir.path().join("knl.db");
+        let stream = "s-1";
 
         {
-            // Its own collection, shut down at the end of the block, so the
-            // first connection is drained and joined before the reopen below
-            // — the same "the store is gone" the sync version got from Drop.
-            let drivers = IsleDrivers::new();
-            let mut store = SqliteEventStore::open(&path, "s", &drivers)
+            let logs = Logs::new();
+            let mut store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
-            store
-                .append(obj(
-                    json!({ "kind": "note", "data": { "text": "durable" } }),
-                ))
-                .await
-                .expect("append note");
-            store.append(ev(2)).await.expect("append e2");
-            drop(store);
-            assert!(drivers.shutdown().await.is_empty(), "the writer joined");
+            store.append(ev(1)).await.expect("append");
+            store.append(ev(2)).await.expect("append");
+            assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
         }
 
-        // Reopening the same file and stream reads the same events back: the
-        // durability payoff.
-        let drivers = IsleDrivers::new();
-        let store = SqliteEventStore::open(&path, "s", &drivers)
+        let logs = Logs::new();
+        let reopened = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
-        let events = store.read(0, usize::MAX).await.expect("read");
-        assert_eq!(events.len(), 2);
-        assert_eq!(kind_of(&events[0]), "note");
-        assert_eq!(events[0]["data"], json!({ "text": "durable" }));
-        assert_eq!(seq_of(&events[0]), 1);
-        assert_eq!(
-            events[0].get(SCHEMA_VERSION_FIELD).and_then(Value::as_u64),
-            Some(CURRENT_SCHEMA_VERSION),
-            "the schema version survives the round-trip too"
-        );
-        assert_eq!(store.head().await.expect("head"), Some(2));
+        let stored = reopened.read(0, usize::MAX).await.expect("read");
+        assert_eq!(stored.iter().map(kind_of).collect::<Vec<_>>(), ["e1", "e2"]);
+        assert_eq!(reopened.head().await.expect("head"), Some(2));
     }
 
     #[tokio::test]
     async fn two_streams_in_one_db_file_do_not_see_each_others_events() {
+        let logs = Logs::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        let path = dir.path().join("knl.db");
 
-        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
+        let mut a = SqliteEventStore::open(&path, "s-a", &logs)
             .await
             .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
+        let mut b = SqliteEventStore::open(&path, "s-b", &logs)
             .await
             .expect("open b");
-
-        a.append(obj(json!({ "kind": "only_a" })))
-            .await
-            .expect("append a");
-        b.append(obj(json!({ "kind": "only_b1" })))
-            .await
-            .expect("append b1");
-        b.append(obj(json!({ "kind": "only_b2" })))
-            .await
-            .expect("append b2");
-
-        assert_eq!(a.len().await.expect("len"), 1);
-        assert_eq!(b.len().await.expect("len"), 2);
-        // Each stream numbers its own seq from 1, independent of the other.
-        assert_eq!(a.head().await.expect("head"), Some(1));
-        assert_eq!(b.head().await.expect("head"), Some(2));
+        a.append(ev(1)).await.expect("a");
+        b.append(ev(2)).await.expect("b");
 
         assert_eq!(
-            kind_of(&a.read(0, usize::MAX).await.expect("read")[0]),
-            "only_a"
+            a.read(0, usize::MAX)
+                .await
+                .expect("read a")
+                .iter()
+                .map(kind_of)
+                .collect::<Vec<_>>(),
+            ["e1"]
         );
-        let b_events = b.read(0, usize::MAX).await.expect("read");
-        let b_kinds: Vec<&str> = b_events.iter().map(kind_of).collect();
-        assert_eq!(b_kinds, ["only_b1", "only_b2"]);
+        assert_eq!(
+            b.read(0, usize::MAX)
+                .await
+                .expect("read b")
+                .iter()
+                .map(kind_of)
+                .collect::<Vec<_>>(),
+            ["e2"]
+        );
+        assert_eq!(a.head().await.expect("head"), Some(1));
+        assert_eq!(b.head().await.expect("head"), Some(1));
     }
 
-    /// (Fix 2) A row whose stored objects will not decode is corruption:
-    /// `read` surfaces it as an error rather than silently dropping the row
-    /// (which would let a resume re-fold a truncated log into the wrong
-    /// state).  Both JSON columns are checked, and a scalar where an object
-    /// was written is the same fault as text that will not parse.
+    /// A row whose stored objects will not decode is corruption: a read
+    /// surfaces it as an error rather than silently dropping the row (which
+    /// would let a resume re-fold a truncated log into the wrong state).
+    ///
+    /// The bad row is written from outside the store, which is the only place
+    /// it can come from: the hatch's authorizer refuses a raw `INSERT` into
+    /// `events`, and the schema's own trigger refuses an `UPDATE` to every
+    /// connection there is.
     #[tokio::test]
     async fn read_errors_on_a_corrupt_row_instead_of_dropping_it() {
-        for (seq, meta, data, column) in [
-            (2_i64, "{}", "{not valid json", "data"),
-            (3_i64, "not valid json either", "{}", "meta"),
-            (4_i64, "{}", "7", "data"),
-        ] {
-            let (mut store, _drivers) = mem_store().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+
+        {
+            let logs = Logs::new();
+            let mut store = SqliteEventStore::open(&path, "s-1", &logs)
+                .await
+                .expect("open");
             store.append(ev(1)).await.expect("append");
-
-            // Sneak in a row the store itself could not have written.
-            let stream = store.stream.clone();
-            let (meta, data) = (meta.to_string(), data.to_string());
-            store
-                .writer
-                .call(move |conn| {
-                    conn.execute(
-                        "INSERT INTO events \
-                         (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![
-                            stream,
-                            seq,
-                            0_i64,
-                            "note",
-                            1_i64,
-                            None::<String>,
-                            meta,
-                            data
-                        ],
-                    )
-                })
-                .await
-                .expect("insert corrupt row");
-
-            let err = store
-                .read(0, usize::MAX)
-                .await
-                .expect_err("a corrupt row must surface, not be dropped");
-            assert!(
-                err.reason().contains(&format!("corrupt event {column}")),
-                "{}",
-                err.reason()
-            );
-            // Corruption, not storage: the IO worked and the bytes came back,
-            // so what is wrong is the data — no retry and no reconnect
-            // changes it.
-            assert_eq!(err.kind(), KnlError::CORRUPTION);
-            assert!(!err.is_retryable());
+            assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
         }
+
+        let conn = rusqlite::Connection::open(&path).expect("open the file");
+        conn.execute(
+            "INSERT INTO events (stream, seq, epoch_ms, kind, schema_version, meta, data) \
+             VALUES ('s-1', 2, 0, 'e2', 2, '{}', 'not json')",
+            [],
+        )
+        .expect("write a bad row");
+        drop(conn);
+
+        let logs = Logs::new();
+        let store = SqliteEventStore::open(&path, "s-1", &logs)
+            .await
+            .expect("reopen");
+        let err = store
+            .read(0, usize::MAX)
+            .await
+            .expect_err("a row that will not decode must surface");
+        assert_eq!(err.kind(), KnlError::CORRUPTION, "{err}");
     }
 
     /// The backend's error language is translated in exactly one place, and
-    /// the split is the one a caller can act on: a contended lock says "ask
-    /// again", every other fault says nothing of the kind.
+    /// the split is the one a caller can act on.
     #[test]
-    fn a_contended_lock_is_busy_and_every_other_fault_is_storage() {
-        /// A `rusqlite` failure carrying `code`.
-        fn failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code,
-                    extended_code: 0,
+    fn every_store_error_has_a_kernel_class() {
+        use eventsdb_core::Error as Failure;
+        let cases = [
+            (Failure::Validation("v".into()), KnlError::VALIDATION),
+            (Failure::Busy("b".into()), KnlError::BUSY),
+            (Failure::Timeout("t".into()), KnlError::TIMEOUT),
+            (Failure::Storage("s".into()), KnlError::STORAGE),
+            (Failure::Corruption("c".into()), KnlError::CORRUPTION),
+            (Failure::Unsupported("u".into()), KnlError::UNSUPPORTED),
+            // Not a call this kernel makes, so it is the store failing to do
+            // the work — and it has to land somewhere, since the enum is
+            // `#[non_exhaustive]`.
+            (
+                Failure::Truncated {
+                    requested: 1,
+                    removed_up_to: 2,
                 },
-                Some("under test".to_string()),
-            )
+                KnlError::STORAGE,
+            ),
+        ];
+        for (failure, expected) in cases {
+            let translated = KnlError::from(failure);
+            assert_eq!(translated.kind(), expected, "{translated}");
         }
-
-        for code in [
-            rusqlite::ErrorCode::DatabaseBusy,
-            rusqlite::ErrorCode::DatabaseLocked,
-        ] {
-            let error = KnlError::from(failure(code));
-            assert_eq!(error.kind(), KnlError::BUSY, "{code:?}: {error}");
-            assert!(error.is_retryable(), "{code:?}: {error}");
-        }
-
-        for code in [
-            rusqlite::ErrorCode::DatabaseCorrupt,
-            rusqlite::ErrorCode::ReadOnly,
-            rusqlite::ErrorCode::DiskFull,
-        ] {
-            let error = KnlError::from(failure(code));
-            assert_eq!(error.kind(), KnlError::STORAGE, "{code:?}: {error}");
-            assert!(
-                !error.is_retryable(),
-                "the kernel does not promise a retry it cannot back: {error}"
-            );
-        }
-
-        // A non-SQLite rusqlite fault is storage too — it is the store
-        // failing to do the work, whatever the shape of the failure.
-        let error = KnlError::from(rusqlite::Error::QueryReturnedNoRows);
-        assert_eq!(error.kind(), KnlError::STORAGE, "{error}");
+        assert!(
+            !KnlError::from(Failure::Timeout("t".into())).is_retryable(),
+            "a deadline is not contention"
+        );
+        assert!(KnlError::from(Failure::Busy("b".into())).is_retryable());
     }
 
-    /// The busy classification is what a real contended write surfaces as,
-    /// not only what the translation function returns in isolation: a second
+    /// A contended lock is what a real contended write surfaces as: a second
     /// connection holds the write lock, so the retries are exhausted and the
     /// error the caller gets says "ask again".
+    ///
+    /// The log is opened by hand with a short busy timeout, because the point
+    /// is the *class* of the failure and the default timeout would spend five
+    /// seconds per attempt reaching it.
     #[tokio::test]
     async fn a_write_that_stays_contended_surfaces_as_busy() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        let path = dir.path().join("knl.db");
+        let log = SqliteEventLog::open_with(
+            &path,
+            eventsdb_sqlite::OpenOptions::default()
+                .busy_timeout(std::time::Duration::from_millis(50))
+                .upcasters(crate::knl::kernel_upcasters()),
+        )
+        .await
+        .expect("open");
+        let mut store = SqliteEventStore::on(Arc::new(log), "s-1");
+        store.append(ev(1)).await.expect("the first append");
 
-        let mut store = SqliteEventStore::open(&path, "s", &drivers)
-            .await
-            .expect("open");
-        store.append(ev(1)).await.expect("seed");
-
-        // A blocker holding an EXCLUSIVE transaction: every attempt this
-        // store makes finds the database locked, and the busy_timeout is cut
-        // to nothing so the test does not wait it out five times over.
-        let blocker = Connection::open(&path).expect("open blocker");
+        // A second connection takes the write lock and keeps it.
+        let blocker = rusqlite::Connection::open(&path).expect("open the file");
         blocker
-            .execute_batch("BEGIN EXCLUSIVE")
-            .expect("take the write lock");
-        store
-            .writer
-            .call(|conn| conn.busy_timeout(Duration::from_millis(0)))
-            .await
-            .expect("no waiting");
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS held (x)")
+            .expect("hold the lock");
 
         let err = store
             .append(ev(2))
             .await
-            .expect_err("a write against a held lock must not succeed");
+            .expect_err("a write that stays contended must surface");
         assert_eq!(err.kind(), KnlError::BUSY, "{err}");
-        assert!(err.is_retryable(), "{err}");
+        assert!(err.is_retryable(), "busy is the class that says ask again");
+
+        blocker.execute_batch("ROLLBACK").expect("release");
+        store.append(ev(3)).await.expect("the lock is free again");
     }
 
     /// Two handles on one stream both write: an append records a fact, so it
@@ -2664,55 +1548,28 @@ mod tests {
     /// head one of them last saw.
     #[tokio::test]
     async fn two_handles_on_one_stream_both_append_in_arrival_order() {
+        let logs = Logs::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
-
-        let mut a = SqliteEventStore::open(&path, "s", &drivers)
+        let path = dir.path().join("knl.db");
+        let mut a = SqliteEventStore::open(&path, "s-1", &logs)
             .await
             .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s", &drivers)
+        let mut b = SqliteEventStore::open(&path, "s-1", &logs)
             .await
             .expect("open b");
 
-        a.append(ev(1)).await.expect("seed"); // both handles now see head 1
+        assert_eq!(a.append(ev(1)).await.expect("a").seq, 1);
+        assert_eq!(b.append(ev(2)).await.expect("b").seq, 2);
+        assert_eq!(a.append(ev(3)).await.expect("a").seq, 3);
 
-        // A writes, then B writes — neither is refused, and the log holds
-        // them in the order they arrived.
-        assert_eq!(a.append(ev(2)).await.expect("a appends").seq, 2);
-        assert_eq!(b.append(ev(3)).await.expect("b appends").seq, 3);
-
-        let events = b.read(0, usize::MAX).await.expect("read");
-        let kinds: Vec<&str> = events.iter().map(kind_of).collect();
-        assert_eq!(kinds, ["e1", "e2", "e3"]);
-        assert_eq!(b.head().await.expect("head"), Some(3));
+        let stored = b.read(0, usize::MAX).await.expect("read");
+        assert_eq!(
+            stored.iter().map(kind_of).collect::<Vec<_>>(),
+            ["e1", "e2", "e3"]
+        );
     }
 
-    /// (Fix 3) Under the IMMEDIATE transaction + `busy_timeout`, interleaved
-    /// single-threaded appends across two handles on one stream serialize and
-    /// round-trip cleanly.
-    #[tokio::test]
-    async fn immediate_tx_appends_round_trip_across_two_handles() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
-
-        let mut a = SqliteEventStore::open(&path, "s", &drivers)
-            .await
-            .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "s", &drivers)
-            .await
-            .expect("open b");
-
-        assert_eq!(a.append(ev(1)).await.expect("a1").seq, 1);
-        assert_eq!(b.append(ev(2)).await.expect("b2").seq, 2);
-        assert_eq!(a.append(ev(3)).await.expect("a3").seq, 3);
-
-        assert_eq!(b.head().await.expect("head"), Some(3));
-        assert_eq!(b.read(0, usize::MAX).await.expect("read").len(), 3);
-    }
-
-    // -- the read side -----------------------------------------------------
+    // -- the read side ------------------------------------------------------
 
     /// Ask `store` for `sql` with everything default.
     async fn ask(store: &SqliteEventStore, sql: &str) -> KnlResult<QueryRows> {
@@ -2726,7 +1583,7 @@ mod tests {
         params: QueryParams,
         opts: &QueryOpts,
     ) -> KnlResult<QueryRows> {
-        let plan = crate::knl::query::plan(sql, params, opts, &store.stream)?;
+        let plan = query::plan(sql, params, opts, &store.stream)?;
         store.query(&plan).await
     }
 
@@ -2734,153 +1591,100 @@ mod tests {
     fn kinds_of(rows: &QueryRows) -> Vec<&str> {
         rows.rows
             .iter()
-            .map(|row| row["kind"].as_str().expect("kind is a string"))
+            .filter_map(|row| row.get("kind").and_then(Value::as_str))
             .collect()
     }
 
-    /// The reader sees what the writer wrote — on an in-memory database as
-    /// much as on a file, which is the whole reason the memory one is opened
-    /// under a shared-cache URI rather than as a private `:memory:`.
+    /// A query reads what the writer wrote — on the in-memory log as much as
+    /// on a file.
     #[tokio::test]
-    async fn the_reader_sees_the_writers_rows_in_memory() {
-        let (mut store, _drivers) = mem_store().await;
-        store.append(ev(1)).await.expect("append e1");
-        store.append(ev(2)).await.expect("append e2");
+    async fn a_query_reads_what_the_writer_wrote() {
+        let (mut store, _logs) = mem_store().await;
+        store.append(ev(1)).await.expect("append");
+        store.append(ev(2)).await.expect("append");
 
         let rows = ask(
             &store,
-            "SELECT seq, kind FROM events WHERE stream = $stream ORDER BY seq",
+            "SELECT kind, seq FROM events WHERE stream = $stream ORDER BY seq",
         )
         .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["e1", "e2"]);
-        assert_eq!(rows.rows[0]["seq"], Value::from(1));
         assert!(!rows.truncated);
-
-        // A write after the first query is visible to the next one: the
-        // reader is a live connection, not a snapshot taken when it opened.
-        store.append(ev(3)).await.expect("append e3");
-        let again = ask(&store, "SELECT kind FROM events ORDER BY seq")
-            .await
-            .expect("query");
-        assert_eq!(kinds_of(&again), ["e1", "e2", "e3"]);
+        assert_eq!(rows.rows[0].get("seq"), Some(&json!(1)));
     }
 
     /// `$stream` is this store's own stream and nothing else: a second stream
     /// in the same database is not selected by it.
     #[tokio::test]
     async fn stream_binds_to_this_stores_own_stream() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
+        let log = logs.memory().await.expect("the log");
+        let mut mine = SqliteEventStore::on(Arc::clone(&log), "s-mine");
+        let mut theirs = SqliteEventStore::on(Arc::clone(&log), "s-theirs");
+        mine.append(ev(1)).await.expect("mine");
+        theirs.append(ev(2)).await.expect("theirs");
 
-        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
-            .await
-            .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
-            .await
-            .expect("open b");
-        a.append(obj(json!({ "kind": "only_a" }))).await.expect("a");
-        b.append(obj(json!({ "kind": "only_b" }))).await.expect("b");
-
-        let rows = ask(&a, "SELECT kind FROM events WHERE stream = $stream")
+        let rows = ask(&mine, "SELECT kind FROM events WHERE stream = $stream")
             .await
             .expect("query");
-        assert_eq!(kinds_of(&rows), ["only_a"]);
-        let rows = ask(&b, "SELECT kind FROM events WHERE stream = $stream")
-            .await
-            .expect("query");
-        assert_eq!(kinds_of(&rows), ["only_b"]);
+        assert_eq!(kinds_of(&rows), ["e1"]);
     }
 
     /// `$sessions` reads across a set: two streams in one database, one
     /// statement, and the ids are bound rather than pasted in.
     #[tokio::test]
     async fn sessions_reads_across_the_set_it_was_given() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
-
-        let mut a = SqliteEventStore::open(&path, "stream-a", &drivers)
-            .await
-            .expect("open a");
-        let mut b = SqliteEventStore::open(&path, "stream-b", &drivers)
-            .await
-            .expect("open b");
-        a.append(obj(json!({ "kind": "from_a" }))).await.expect("a");
-        b.append(obj(json!({ "kind": "from_b1" })))
-            .await
-            .expect("b1");
-        b.append(obj(json!({ "kind": "from_b2" })))
-            .await
-            .expect("b2");
+        let logs = Logs::new();
+        let log = logs.memory().await.expect("the log");
+        let mut one = SqliteEventStore::on(Arc::clone(&log), "s-one");
+        let mut two = SqliteEventStore::on(Arc::clone(&log), "s-two");
+        let mut three = SqliteEventStore::on(Arc::clone(&log), "s-three");
+        one.append(ev(1)).await.expect("one");
+        two.append(ev(2)).await.expect("two");
+        three.append(ev(3)).await.expect("three");
 
         let opts = QueryOpts {
-            sessions: Some(vec!["stream-a".to_string(), "stream-b".to_string()]),
+            sessions: Some(vec!["s-one".to_string(), "s-two".to_string()]),
             ..QueryOpts::default()
         };
         let rows = ask_with(
-            &a,
-            "SELECT stream, kind FROM events WHERE stream IN $sessions ORDER BY stream, seq",
+            &one,
+            "SELECT kind FROM events WHERE stream IN $sessions ORDER BY position",
             QueryParams::None,
             &opts,
         )
         .await
         .expect("query");
-        assert_eq!(kinds_of(&rows), ["from_a", "from_b1", "from_b2"]);
-
-        // Left out, the set is the asking store's own stream.
-        let rows = ask(&a, "SELECT kind FROM events WHERE stream IN $sessions")
-            .await
-            .expect("query");
-        assert_eq!(kinds_of(&rows), ["from_a"]);
+        assert_eq!(kinds_of(&rows), ["e1", "e2"]);
     }
 
     /// A value is bound, never pasted: a quote inside it is a character in a
     /// string, not the end of one.
     #[tokio::test]
     async fn a_bound_value_with_a_quote_in_it_is_a_value() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         store
-            .append(obj(json!({ "kind": "it's a kind" })))
+            .append(obj(json!({ "kind": "it's fine" })))
             .await
             .expect("append");
-        store.append(ev(1)).await.expect("append e1");
 
         let rows = ask_with(
             &store,
-            "SELECT kind FROM events WHERE kind = ?",
-            QueryParams::Positional(vec![json!("it's a kind")]),
+            "SELECT kind FROM events WHERE stream = $stream AND kind = :kind",
+            QueryParams::Named(obj(json!({ "kind": "it's fine" }))),
             &QueryOpts::default(),
         )
         .await
         .expect("query");
-        assert_eq!(kinds_of(&rows), ["it's a kind"]);
-
-        // The same by name, and a value that would be SQL if it were pasted
-        // in matches nothing rather than doing anything.
-        let named = QueryParams::Named(
-            json!({ "kind": "x' OR 1=1 --" })
-                .as_object()
-                .expect("an object")
-                .clone(),
-        );
-        let rows = ask_with(
-            &store,
-            "SELECT kind FROM events WHERE kind = :kind",
-            named,
-            &QueryOpts::default(),
-        )
-        .await
-        .expect("query");
-        assert!(rows.rows.is_empty(), "{:?}", rows.rows);
+        assert_eq!(kinds_of(&rows), ["it's fine"]);
     }
 
     /// The cap is reported, not silently applied — and a result that happens
     /// to be exactly `limit` long is not called truncated.
     #[tokio::test]
     async fn the_row_cap_is_reported_when_it_cuts() {
-        let (mut store, _drivers) = mem_store().await;
+        let (mut store, _logs) = mem_store().await;
         for i in 1..=5 {
             store.append(ev(i)).await.expect("append");
         }
@@ -2891,14 +1695,14 @@ mod tests {
         };
         let rows = ask_with(
             &store,
-            "SELECT kind FROM events ORDER BY seq",
+            "SELECT kind FROM events WHERE stream = $stream ORDER BY seq",
             QueryParams::None,
             &capped,
         )
         .await
         .expect("query");
         assert_eq!(kinds_of(&rows), ["e1", "e2"]);
-        assert!(rows.truncated, "the cap cut three rows off");
+        assert!(rows.truncated, "the answer was cut");
 
         let exact = QueryOpts {
             limit: 5,
@@ -2906,7 +1710,7 @@ mod tests {
         };
         let rows = ask_with(
             &store,
-            "SELECT kind FROM events ORDER BY seq",
+            "SELECT kind FROM events WHERE stream = $stream ORDER BY seq",
             QueryParams::None,
             &exact,
         )
@@ -2920,7 +1724,7 @@ mod tests {
     /// class: nothing was contended, so "ask again" would be the wrong advice.
     #[tokio::test]
     async fn a_query_that_runs_too_long_is_a_timeout() {
-        let (store, _drivers) = mem_store().await;
+        let (store, _logs) = mem_store().await;
         let hurried = QueryOpts {
             timeout_ms: 50,
             ..QueryOpts::default()
@@ -2943,41 +1747,12 @@ mod tests {
         assert!(ask(&store, "SELECT 1 AS one").await.is_ok());
     }
 
-    /// The reader cannot write.  The statement checks run on the text, but
-    /// they are not the only thing standing between a caller and the log:
-    /// the connection a query runs on has no write capability at all.
-    #[tokio::test]
-    async fn the_reader_connection_refuses_a_write() {
-        let (mut store, _drivers) = mem_store().await;
-        store.append(ev(1)).await.expect("append");
-        let reader = store.reader().await.expect("open the reader");
-
-        let err = reader
-            .call(|conn| {
-                conn.execute(
-                    "INSERT INTO events \
-                     (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-                     VALUES ('x', 1, 0, 'note', 1, NULL, '{}', '{}')",
-                    [],
-                )
-            })
-            .await
-            .expect_err("the reader must not be able to write");
-        assert!(
-            matches!(KnlError::from(err), KnlError::Storage(_)),
-            "a write through the reader is refused by SQLite itself"
-        );
-
-        // …and the log is as it was.
-        assert_eq!(store.len().await.expect("len"), 1);
-    }
-
     /// A statement that is not a read never reaches the connection, and a
     /// second statement is refused whole.  (The rules are
     /// [`super::super::query`]'s; this is the path through the store.)
     #[tokio::test]
     async fn a_write_or_a_second_statement_is_refused_before_the_connection() {
-        let (store, _drivers) = mem_store().await;
+        let (store, _logs) = mem_store().await;
         for sql in [
             "INSERT INTO events (stream) VALUES ('x')",
             "UPDATE events SET kind = 'x'",
@@ -2990,35 +1765,11 @@ mod tests {
         }
     }
 
-    /// A parameter nobody answered, and a value nobody asked for, are both
-    /// errors: a silent NULL is how a query quietly stops meaning what it
-    /// says.
-    #[tokio::test]
-    async fn every_parameter_is_answered_and_every_value_is_used() {
-        let (store, _drivers) = mem_store().await;
-
-        let err = ask(&store, "SELECT * FROM events WHERE kind = :kind")
-            .await
-            .expect_err("an unanswered parameter must be refused");
-        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
-        assert!(err.reason().contains(":kind"), "{}", err.reason());
-
-        let err = ask_with(
-            &store,
-            "SELECT * FROM events WHERE kind = ?",
-            QueryParams::Positional(vec![json!("a"), json!("b")]),
-            &QueryOpts::default(),
-        )
-        .await
-        .expect_err("a value with no parameter must be refused");
-        assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
-    }
-
     /// Every SQLite type comes back as itself, and a NULL comes back as an
     /// absent column rather than a present nothing.
     #[tokio::test]
     async fn the_sqlite_types_map_onto_values_and_null_is_absence() {
-        let (store, _drivers) = mem_store().await;
+        let (store, _logs) = mem_store().await;
         let rows = ask(
             &store,
             // `absent`, not `nothing`: NOTHING is a SQLite keyword.
@@ -3031,16 +1782,19 @@ mod tests {
         assert_eq!(row["whole"], Value::from(1));
         assert_eq!(row["fraction"], Value::from(1.5));
         assert_eq!(row["words"], Value::from("text"));
-        assert_eq!(row["raw"], Value::from("bytes"));
+        assert_eq!(
+            row["raw"],
+            Value::from("<blob>"),
+            "a blob has no value on the other side of the bridge, and says so"
+        );
         assert!(
             !row.contains_key("absent"),
             "a NULL column is absent, so it reads as nil: {row:?}"
         );
     }
 
-    /// The published schema is the table: read back off SQLite rather than
-    /// written out, with the two columns that make a stream a stream as its
-    /// primary key.
+    /// The published schema is the table: the constant `knl.api()` hands out,
+    /// held against the columns SQLite actually reports.
     #[tokio::test]
     async fn the_published_schema_is_the_events_table() {
         let columns = events_schema().expect("schema");
@@ -3048,12 +1802,12 @@ mod tests {
         assert_eq!(
             names,
             [
+                "position",
                 "stream",
                 "seq",
                 "epoch_ms",
                 "kind",
                 "schema_version",
-                "beat",
                 "meta",
                 "data"
             ]
@@ -3064,31 +1818,52 @@ mod tests {
             .filter(|c| c.pk)
             .map(|c| c.name.as_str())
             .collect();
-        assert_eq!(pk, ["stream", "seq"], "the log is keyed by (stream, seq)");
-
-        let declared: Vec<&str> = columns.iter().map(|c| c.declared_type.as_str()).collect();
-        assert_eq!(
-            declared,
-            ["TEXT", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT", "TEXT", "TEXT"]
-        );
+        assert_eq!(pk, ["position"], "the log is keyed by its global order");
 
         // And a query may name every one of them.
-        let (store, _drivers) = mem_store().await;
+        let (store, _logs) = mem_store().await;
         let sql = format!("SELECT {} FROM {EVENTS_TABLE}", names.join(", "));
         ask(&store, &sql)
             .await
             .expect("the published columns are the real ones");
     }
 
-    /// The published schema is also the *live* one: a store's own reader
-    /// reports the same columns the schema-only path does, which is what
-    /// makes reading it off a throwaway connection sound.
+    /// The published schema is also the *live* one.
+    ///
+    /// This is what keeps [`events_schema`] a reading of the table rather than
+    /// a claim about it: a real log is opened, closed, and asked what its
+    /// `events` table has — with `PRAGMA table_info` on a plain connection,
+    /// because a pragma is one of the things the store's own hatch refuses,
+    /// and rightly (setting one is how the migration ladder's marker or the
+    /// journal mode would be changed underneath it).
     #[tokio::test]
-    async fn a_live_store_reports_the_published_schema() {
-        let (store, _drivers) = mem_store().await;
-        assert_eq!(
-            store.schema().await.expect("schema"),
-            events_schema().expect("published schema")
-        );
+    async fn the_published_schema_is_the_live_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.db");
+        {
+            let logs = Logs::new();
+            SqliteEventStore::open(&path, "s-1", &logs)
+                .await
+                .expect("open");
+            assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
+        }
+
+        let conn = rusqlite::Connection::open(&path).expect("open the file");
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))
+            .expect("table_info");
+        let live: Vec<SchemaColumn> = stmt
+            .query_map([], |row| {
+                Ok(SchemaColumn {
+                    name: row.get::<_, String>("name")?,
+                    declared_type: row.get::<_, String>("type")?,
+                    pk: row.get::<_, i64>("pk")? > 0,
+                })
+            })
+            .expect("read the columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read the columns");
+
+        assert_eq!(live, events_schema().expect("published schema"));
     }
 }

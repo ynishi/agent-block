@@ -98,13 +98,19 @@ local function fake_session(opts)
     end
 
     -- The one write path. Nothing is numbered here and the budget does not
-    -- move (mirrors the Rust Session::append): a `beat` the caller declared
-    -- is stored exactly as given, and the kernel only insists it be a string.
+    -- move (mirrors the Rust Session::append): the `meta` labels a caller
+    -- declared are stored exactly as given, `meta.beat` among them, and a
+    -- top-level `beat` is refused rather than stored.
     function s:append(event)
         assert(not closed, "knl: append: session is closed")
         assert(type(event) == "table", "knl: append: event must be a table")
         assert(type(event.kind) == "string", "knl: append: kind is required")
-        assert(event.beat == nil or type(event.beat) == "string", "knl: append: beat must be a string")
+        assert(event.beat == nil, "knl: append: unknown field: beat (the id is meta.beat)")
+        assert(event.meta == nil or type(event.meta) == "table", "knl: append: meta must be a table")
+        assert(
+            event.meta == nil or event.meta.beat == nil or type(event.meta.beat) == "string",
+            "knl: append: meta.beat must be a string"
+        )
         return store(event)
     end
 
@@ -236,12 +242,17 @@ local function tool_use(id, name, input)
     return { type = "tool_use", id = id, name = name, input = input or {} }
 end
 
+-- The beat id an event was stamped with: a label in the envelope.
+local function beat_of(ev)
+    return ev.meta ~= nil and ev.meta.beat or nil
+end
+
 -- Every llm_response's declared beat id, in seq order.
 local function response_beats(s)
     local ids = {}
     for _, ev in ipairs(s:events()) do
         if ev.kind == "llm_response" then
-            ids[#ids + 1] = ev.beat
+            ids[#ids + 1] = beat_of(ev)
         end
     end
     return ids
@@ -343,11 +354,11 @@ describe("knl beat (session-scope model)", function()
         local call_beats, result_beats = {}, {}
         for _, ev in ipairs(s:events()) do
             if ev.kind == "llm_response" then
-                model_beat = ev.beat
+                model_beat = beat_of(ev)
             elseif ev.kind == "tool_call" then
-                call_beats[#call_beats + 1] = ev.beat
+                call_beats[#call_beats + 1] = beat_of(ev)
             elseif ev.kind == "tool_result" then
-                result_beats[#result_beats + 1] = ev.beat
+                result_beats[#result_beats + 1] = beat_of(ev)
             end
         end
 

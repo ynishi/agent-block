@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 use mlua_isle::{AsyncIsle, AsyncIsleDriver};
+use serde_json::{Map, Value};
 use tracing::{info, info_span, warn};
 
 use crate::bridge;
@@ -576,6 +577,22 @@ pub struct BlockConfig {
     /// Override path for the `std.ts` SQLite database file. Same
     /// semantics as [`Self::sql_path`].
     pub ts_path: Option<PathBuf>,
+    /// What this run is, as labels every `knl` session opened here is
+    /// recorded with — the `meta` of its `session_opened`.
+    ///
+    /// For a caller that runs the same block over and over and needs to tell
+    /// the runs apart afterwards. The alternative it replaces is giving each
+    /// run a database of its own (`AGENT_BLOCK_KNL_PATH` per run), which
+    /// answers the same question by breaking the one above it: a project's
+    /// log stops being one stream to read.
+    ///
+    /// Shallow by the same rule `meta` is everywhere — a string, a number or
+    /// a flag — and a nested value is refused when the session opens. A
+    /// script's own `knl.open{ meta = … }` wins on a key both name.
+    ///
+    /// Defaults to empty: a script nobody is running on a schedule is not a
+    /// run of anything.
+    pub session_labels: Map<String, Value>,
     /// Extra Lua globals injected into both the main Isle and the
     /// handler Isle before the user script runs. Each entry
     /// `(name, value)` results in `_G[name] = json_to_lua(value)`.
@@ -692,6 +709,7 @@ pub struct BlockConfigBuilder {
     sql_path: Option<PathBuf>,
     kv_path: Option<PathBuf>,
     ts_path: Option<PathBuf>,
+    session_labels: Map<String, Value>,
     extra_globals: HashMap<String, serde_json::Value>,
     auto_serve_bus: bool,
     shutdown_token: Option<CancellationToken>,
@@ -715,6 +733,7 @@ impl BlockConfigBuilder {
             sql_path: None,
             kv_path: None,
             ts_path: None,
+            session_labels: Map::new(),
             extra_globals: HashMap::new(),
             auto_serve_bus: false,
             shutdown_token: None,
@@ -818,6 +837,17 @@ impl BlockConfigBuilder {
         self
     }
 
+    /// Label every `knl` session this run opens
+    /// ([`BlockConfig::session_labels`]).
+    ///
+    /// What a caller running the same block repeatedly uses to tell the runs
+    /// apart in one log. Called more than once, the labels accumulate; the
+    /// same key twice keeps the last.
+    pub fn session_label(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.session_labels.insert(key.into(), value.into());
+        self
+    }
+
     /// Set the extra Lua globals injected before the script runs
     /// (`BlockConfig::extra_globals`). Defaults to an empty map.
     pub fn extra_globals(mut self, extra_globals: HashMap<String, serde_json::Value>) -> Self {
@@ -863,6 +893,7 @@ impl BlockConfigBuilder {
             sql_path: self.sql_path,
             kv_path: self.kv_path,
             ts_path: self.ts_path,
+            session_labels: self.session_labels,
             extra_globals: self.extra_globals,
             auto_serve_bus: self.auto_serve_bus,
             shutdown_token: self.shutdown_token,
@@ -957,19 +988,19 @@ pub struct HostContext {
     /// edit, which is what a build-and-fix loop needs when it decides an
     /// iteration made things worse.
     pub fs_snapshots: crate::bridge::fs::SnapshotStore,
-    /// The connection threads every `knl` session's event log lives on.
+    /// The event logs every `knl` session's stream lives in.
     ///
-    /// A kernel session opens its own SQLite thread (and a second, read-only
-    /// one the first time it is queried), and hands the *driver* — the only
-    /// thing that can drain and join that thread — here rather than keeping
-    /// it. That is what lets the drop backstop work: a handle nobody closed
-    /// submits its `session_closed` from `Drop`, without waiting, and the
-    /// thread is still there to run it because its lifetime is the host's
-    /// rather than the session's.
+    /// A log is a database — one writer thread, read-only connections beside
+    /// it — and it is opened once per file per process, so two sessions on one
+    /// file are two streams of one log. A session holds a handle on the log
+    /// rather than the log itself, which is what lets the drop backstop work:
+    /// a handle nobody closed submits its `session_closed` from `Drop`,
+    /// without waiting, and the log is still there to run it because its
+    /// lifetime is the host's rather than the session's.
     ///
     /// Cloneable and shared, like the isle handles beside it; the run loop
     /// drains it once, in [`shutdown`], after the Lua VM is gone.
-    pub knl_drivers: crate::knl::IsleDrivers,
+    pub knl_logs: crate::knl::Logs,
     /// The database a `knl` session opened without a `store` lands in.
     ///
     /// `{base_dir}/projects/<slug>/knl.sqlite`, resolved by
@@ -987,6 +1018,18 @@ pub struct HostContext {
     /// The directory is created at start, beside the other three; the file
     /// itself is SQLite's to create, on the first session that needs it.
     pub knl_store: PathBuf,
+    /// What this process is, as labels every session it opens is recorded
+    /// with ([`BlockConfig::session_labels`]).
+    ///
+    /// The host's half of `knl.open{ meta = … }`: a caller that runs the same
+    /// block many times over — a job manager, most of all — says which run
+    /// this process is, and every session opened here carries it. A script's
+    /// own labels win on a key they both name, because the script is the one
+    /// naming what it is recording.
+    ///
+    /// Empty is the ordinary case: a script run by hand is not a run of
+    /// anything, and its sessions carry no label.
+    pub session_labels: Map<String, Value>,
 }
 
 impl HostContext {
@@ -1886,16 +1929,15 @@ async fn drain_auto_serve(auto_serve_state: AutoServeState) {
 /// for the same reason as before — a worker-thread panic must not poison the
 /// process exit when the script's own result is what the caller asked for.
 ///
-/// The kernel's threads go *after* the Isles on purpose. Dropping a VM runs
-/// its collector, which is where a session nobody closed submits its
-/// `session_closed` without waiting for it — so those threads have to be
-/// alive to take that write, and drained only once nothing can still be
-/// handed to them.
+/// The kernel's logs go *after* the Isles on purpose. Dropping a VM runs its
+/// collector, which is where a session nobody closed submits its
+/// `session_closed` without waiting for it — so those logs have to be alive to
+/// take that write, and drained only once nothing can still be handed to them.
 async fn shutdown(
     mcp_manager: &Arc<RwLock<McpManager>>,
     driver: AsyncIsleDriver,
     handler_driver: AsyncIsleDriver,
-    knl_drivers: crate::knl::IsleDrivers,
+    knl_logs: crate::knl::Logs,
     #[cfg(feature = "sqlite")] sqlite_drivers: SqliteDrivers,
 ) -> BlockResult<()> {
     let _shutdown_span = info_span!("shutdown");
@@ -1937,20 +1979,20 @@ async fn shutdown(
         ),
     }
 
-    // The kernel's session threads. Both Isles are gone by now, so every Lua
+    // The kernel's event logs. Both Isles are gone by now, so every Lua
     // session userdata has been collected and every drop backstop has
     // submitted its boundary; a graceful shutdown is what runs those queued
-    // writes before the threads exit.
+    // writes before the connection threads exit.
     {
-        let count = knl_drivers.len();
-        let failures = knl_drivers.shutdown().await;
+        let count = knl_logs.len().await;
+        let failures = knl_logs.shutdown().await;
         if failures.is_empty() {
             if count > 0 {
-                info!(count, "knl session connection threads shut down");
+                info!(count, "knl event logs shut down");
             }
         } else {
             for e in &failures {
-                tracing::error!(error = %e, "knl session connection thread shutdown failed");
+                tracing::error!(error = %e, "knl event log shutdown failed");
             }
         }
     }
@@ -2204,12 +2246,13 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         bus_tx: bus_tx.clone(),
         event_bus: Arc::clone(&event_bus),
         fs_snapshots: Default::default(),
-        knl_drivers: crate::knl::IsleDrivers::new(),
+        knl_logs: crate::knl::Logs::new(),
         knl_store,
+        session_labels: config.session_labels.clone(),
     };
     // Kept out of the context clone the bridges get: the run loop needs its
-    // own reference to drain the threads after the VM has gone.
-    let knl_drivers = ctx.knl_drivers.clone();
+    // own reference to drain the logs after the VM has gone.
+    let knl_logs = ctx.knl_logs.clone();
 
     register_bridges(&ctx, &isle, &handler_isle).await?;
 
@@ -2247,7 +2290,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         &mcp_manager,
         driver,
         handler_driver,
-        knl_drivers,
+        knl_logs,
         #[cfg(feature = "sqlite")]
         sqlite_drivers,
     )

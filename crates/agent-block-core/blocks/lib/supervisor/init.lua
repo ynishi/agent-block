@@ -513,16 +513,14 @@ end
 ---
 --- ONE DATABASE, AND WHAT SIMULTANEOUS WRITERS MEET THERE. Siblings are
 --- children of one parent, so they write to the parent's database, and the
---- store decides what that costs. The default store is a FILE — the one the
---- host owns — where two writers contend and the kernel's busy timeout waits
---- it out. A tree on a `mem` parent is refused rather than run: the in-memory
---- database is addressed by a shared-cache URI, shared cache locks per TABLE
---- and a second writer gets SQLITE_LOCKED immediately, which no busy timeout
---- covers. The beat fixture's parallel case showed it: the same two children
---- failed nondeterministically with `Outcome.err("state")` /
---- `detail.kind == "busy"` on the in-memory store and passed on a file one,
---- which is why `knl.open{ parent = <mem session> }` raises `validation`
---- instead.
+--- store decides what that costs. Every store is one event log with one
+--- writer thread — the file the host owns, a file the caller named, or the
+--- host's in-memory log for `mem` — so siblings' writes are serialized by
+--- construction rather than contended, and a tree on a `mem` parent runs the
+--- same as one on a file. (An earlier backend addressed the in-memory
+--- database by a shared-cache URI whose per-table lock made a second writer
+--- fail with SQLITE_LOCKED at once, which is why a `mem` parent used to be
+--- refused; that backend is gone.)
 ---
 --- Contention on the file is still contention, and nothing here retries it.
 --- `busy` is the one class the kernel calls

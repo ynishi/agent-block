@@ -364,8 +364,8 @@ describe("bound tools drive a beat (kernel contract end-to-end)", function()
         local last = session:events()[#session:events()]
         expect(last.kind).to.be("tool_result")
         expect(last.data.result).to.be("fs_read:9")
-        -- both halves of the pair carry the beat's declared id
-        expect(last.beat).to.be(o.out.beat)
+        -- both halves of the pair carry the beat's declared id, as a label
+        expect(last.meta.beat).to.be(o.out.beat)
         expect(type(o.out.beat)).to.be("string")
     end)
 

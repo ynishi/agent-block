@@ -192,11 +192,12 @@ use super::event::{
     FIELD_REMAINING, FIELD_SCOPE_ID, FIELD_TAG, KIND_BUDGET_GRANTED, KIND_BUDGET_REFUSED,
     KIND_BUDGET_RESERVED, KIND_BUDGET_SPENT, KIND_SESSION_CLOSED, KIND_SESSION_OPENED,
 };
-use super::event_store::{kernel_upcasters, ChildScan, Current, CurrentStore, EventStore, Split};
+use super::event_store::{ChildScan, Current, CurrentStore, EventStore, Split};
+use super::logs::Logs;
 use super::projection::{tail_count, VIEW_TAIL};
 use super::query::{self, QueryOpts, QueryParams, QueryRows};
 use super::scope::{Scope, ScopeId};
-use super::sqlite_store::{IsleDrivers, SqliteEventStore};
+use super::sqlite_store::SqliteEventStore;
 use super::{projection, KnlError, KnlResult};
 
 /// Reason recorded by `close()` when the caller does not give one.
@@ -345,6 +346,27 @@ fn allocation_refused_event(
     event
 }
 
+/// Put the caller's labels on a kernel-written event.
+///
+/// `meta` is the envelope key for what a reader groups or filters by, and a
+/// session's opening is the one event a supervisor has to find without
+/// knowing the kind's shape — the run a session belongs to goes here, not in
+/// `data`, so a view reads it the same way it reads a label on any other
+/// event. Absent writes nothing: an unlabelled opening gets no `meta` key
+/// here (the store reads the column back as an empty object), so a select on
+/// a label finds nothing either way.
+fn with_meta(
+    mut event: Map<String, Value>,
+    meta: Option<Map<String, Value>>,
+) -> Map<String, Value> {
+    if let Some(meta) = meta {
+        if !meta.is_empty() {
+            event.insert(super::event::FIELD_META.to_string(), Value::Object(meta));
+        }
+    }
+    event
+}
+
 /// A child's `session_opened`: the scope it opens under, and the stream it
 /// was opened from.
 ///
@@ -352,7 +374,12 @@ fn allocation_refused_event(
 /// written by the parent's store rather than the child's — the opening and
 /// the reservation that paid for it are one transaction, so the child's first
 /// event arrives before the child has a handle at all.
-fn child_opened_event(owner: &str, scope_id: &str, parent: &str) -> Map<String, Value> {
+fn child_opened_event(
+    owner: &str,
+    scope_id: &str,
+    parent: &str,
+    meta: Option<Map<String, Value>>,
+) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert(FIELD_OWNER.to_string(), Value::from(owner.to_string()));
     data.insert(
@@ -360,7 +387,7 @@ fn child_opened_event(owner: &str, scope_id: &str, parent: &str) -> Map<String, 
         Value::from(scope_id.to_string()),
     );
     data.insert(FIELD_PARENT.to_string(), Value::from(parent.to_string()));
-    kernel_event(KIND_SESSION_OPENED, data)
+    with_meta(kernel_event(KIND_SESSION_OPENED, data), meta)
 }
 
 /// A child's `budget_granted`: the units the parent moved, naming where they
@@ -527,11 +554,12 @@ impl Session {
     /// so a fresh session already has one event.
     ///
     /// "In-memory" is an in-memory *database*, not a different kind of store:
-    /// the same SQLite backend a durable session uses, on a database that is
-    /// reclaimed when this session lets go of it
-    /// ([`SqliteEventStore::open_memory`]).  There is one backend, because
-    /// the log is read with SQL and a log that cannot be queried would be a
-    /// second, lesser kind of session.
+    /// the same backend a durable session uses, on the one in-memory log the
+    /// host holds ([`SqliteEventStore::open_memory`]), which is reclaimed when
+    /// the run ends.  There is one backend, because the log is read with SQL
+    /// and a log that cannot be queried would be a second, lesser kind of
+    /// session — and because a stream in it is a stream like any other, so a
+    /// child can be opened from one and a resume can find it by name.
     ///
     /// The stream is minted here and adopted as the session's id, so
     /// [`Session::id`] names the stream this session writes — the same
@@ -540,11 +568,12 @@ impl Session {
     pub async fn new(
         owner: String,
         grant: Option<BudgetGrant>,
-        drivers: &IsleDrivers,
+        meta: Option<Map<String, Value>>,
+        logs: &Logs,
     ) -> KnlResult<Self> {
         let stream = uuid::Uuid::new_v4().to_string();
-        let store = SqliteEventStore::open_memory(stream.clone(), drivers).await?;
-        let mut session = Self::open_on(owner, grant, Box::new(store)).await?;
+        let store = SqliteEventStore::open_memory(stream.clone(), logs).await?;
+        let mut session = Self::open_on(owner, grant, meta, Box::new(store)).await?;
         session.adopt_id(stream);
         Ok(session)
     }
@@ -568,14 +597,17 @@ impl Session {
     pub async fn open_on(
         owner: String,
         grant: Option<BudgetGrant>,
+        meta: Option<Map<String, Value>>,
         store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
-        // Wrap the chosen backend in the read-time upcasting seam, so every one
-        // of this session's reads (view folds, `events`, the balance fold, the
-        // decision a `reserve` takes inside the store) passes through it by
-        // construction.  The chain is empty until the first release; a shape
-        // change after it registers its step at that one site.
-        let store = CurrentStore::new(store, kernel_upcasters());
+        // Wrap the chosen backend in the upcasting seam, so every one of this
+        // session's reads (view folds, `events`, the balance fold, the decision
+        // a `reserve` takes inside the store) is checked to be the current
+        // shape by construction.  The chain here is *empty* on purpose: the
+        // durable backend is opened with `kernel_upcasters()` and applies it
+        // to everything it reads, so a second copy up here would run every
+        // step twice (see `event_store::kernel_upcasters`).
+        let store = CurrentStore::new(store, Vec::new());
         let mut session = Self {
             id: uuid::Uuid::new_v4().to_string(),
             // The scope is issued here, before the first event: the
@@ -602,7 +634,7 @@ impl Session {
             FIELD_SCOPE_ID.to_string(),
             Value::from(session.scope.id().to_string()),
         );
-        let started = kernel_event(KIND_SESSION_OPENED, opened);
+        let started = with_meta(kernel_event(KIND_SESSION_OPENED, opened), meta);
 
         // The grant is its own fact, right after the boundary: what the
         // owner allowed is the first entry of the ledger the balance folds
@@ -662,8 +694,9 @@ impl Session {
         // The upcasting seam goes on first, so the restore below reads the
         // same projected shape every other read of this session gets: a log
         // written under an older shape resumes as what it means today, and the
-        // stored bytes stay as they were written.
-        Self::resume_on(grant, CurrentStore::new(store, kernel_upcasters())).await
+        // stored bytes stay as they were written.  The chain is the backend's
+        // ([`Session::open_on`]), so what the seam adds here is the check.
+        Self::resume_on(grant, CurrentStore::new(store, Vec::new())).await
     }
 
     /// [`Session::resume`] on a store that is already behind the seam.
@@ -892,6 +925,7 @@ impl Session {
         child_stream: String,
         owner: String,
         allocation: Allocation,
+        meta: Option<Map<String, Value>>,
         child_store: Box<dyn EventStore>,
     ) -> KnlResult<Self> {
         if self.closed {
@@ -1007,7 +1041,7 @@ impl Session {
                             &child_id,
                         )],
                         other: vec![
-                            child_opened_event(&owner, &child_scope_id, &parent_id),
+                            child_opened_event(&owner, &child_scope_id, &parent_id, meta.clone()),
                             child_granted_event(
                                 amount,
                                 child_tag.as_deref(),
@@ -1111,7 +1145,8 @@ impl Session {
     /// the shape its kind requires and is not one of the kernel's own
     /// ([`is_kernel_only`]).  The kernel-owned `seq` / `epoch_ms` are
     /// stamped here and overwrite any caller-supplied value; nothing else
-    /// is added, and a `beat` the caller declared is recorded as given.
+    /// is added, and the labels the caller declared — `meta.beat` among
+    /// them — are recorded as given.
     ///
     /// No append moves the budget, this one included.  A deduction is asked
     /// for before a call ([`Session::reserve`]) or taken after it
@@ -1522,7 +1557,7 @@ impl Session {
     /// is reported to the log rather than to a caller.
     ///
     /// The connection thread outlives this handle — its driver belongs to the
-    /// host, not to the session ([`super::IsleDrivers`]) — so the submitted
+    /// host, not to the session ([`super::Logs`]) — so the submitted
     /// event is still executed, and the host's shutdown drains it.
     ///
     /// Idempotent per handle, like [`Session::close`]: a session this handle
@@ -1606,7 +1641,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knl::event::{kind_of, FIELD_BEAT, FIELD_DATA};
+    use crate::knl::event::{kind_of, FIELD_BEAT, FIELD_DATA, FIELD_META};
     // The `Vec`-backed test store: the SPI, the seam and the folds are worth
     // exercising without a database underneath, and the failure injection
     // below is easier to build on a `Vec` than on a connection.
@@ -1630,17 +1665,25 @@ mod tests {
         }
     }
 
+    /// The logs every ephemeral test session opens against.
+    ///
+    /// One collection for the whole test binary, because that is the shape a
+    /// host has: an in-memory log belongs to a [`Logs`], so a store opened
+    /// *beside* a session — a child's, or a second handle on its stream — has
+    /// to be opened against the same collection to find the same database.
+    /// Each session is a stream under a fresh id, so sharing the log shares
+    /// nothing else.
+    fn test_logs() -> Logs {
+        static LOGS: std::sync::OnceLock<Logs> = std::sync::OnceLock::new();
+        LOGS.get_or_init(Logs::new).clone()
+    }
+
     /// A session owned by the reserved anonymous principal.
     ///
     /// With a budget it opens with two events, not one: `session_opened` and
     /// the `budget_granted` that records what the owner allowed.
-    ///
-    /// The [`IsleDrivers`] it opens against is thrown away on the spot, and
-    /// that is safe here: the connection thread lives while *any* handle on it
-    /// does, and the store keeps one.  What the discarded driver costs is the
-    /// join at the end — which a test process does not need and a host does.
     async fn new_session(budget: Option<i64>) -> Session {
-        Session::new(ANON.to_string(), budget.map(grant), &IsleDrivers::new())
+        Session::new(ANON.to_string(), budget.map(grant), None, &test_logs())
             .await
             .expect("open")
     }
@@ -1707,6 +1750,53 @@ mod tests {
     /// A `data` field of a recorded event, for the assertions below.
     fn field<'a>(event: &'a Current, name: &str) -> &'a Value {
         data_field(event, name).unwrap_or_else(|| panic!("data.{name} is missing: {event}"))
+    }
+
+    /// The labels a caller opens with land on the opening's envelope, where
+    /// a reader finds them without knowing what `session_opened` records.
+    ///
+    /// This is what lets many runs share one log: they are told apart by a
+    /// label, not by being given a database each.
+    #[tokio::test]
+    async fn opening_carries_the_labels_it_was_opened_with() {
+        let meta = obj(json!({ "run": "r-1", "attempt": 2, "retried": true }));
+        let s = Session::new(ANON.to_string(), None, Some(meta.clone()), &Logs::new())
+            .await
+            .expect("open");
+
+        let events = s.events(0, usize::MAX).await.expect("events");
+        assert_eq!(events[0].kind(), KIND_SESSION_OPENED);
+        assert_eq!(
+            events[0].get(crate::knl::event::FIELD_META),
+            Some(&Value::Object(meta)),
+            "the labels ride the envelope, verbatim"
+        );
+        assert_eq!(
+            data_field(&events[0], "run"),
+            None,
+            "a label is not a field of the kind: data stays the kernel's"
+        );
+    }
+
+    /// An opening nobody labelled carries no label — an empty `meta`, which
+    /// is what the store gives back for a column nothing was written to. A
+    /// reader selecting on a label finds nothing rather than an empty string,
+    /// and an empty table passed in is the same as passing none.
+    #[tokio::test]
+    async fn an_unlabelled_opening_carries_no_labels() {
+        for session in [
+            new_session(None).await,
+            Session::new(ANON.to_string(), None, Some(Map::new()), &Logs::new())
+                .await
+                .expect("open"),
+        ] {
+            let events = session.events(0, usize::MAX).await.expect("events");
+            let meta = events[0]
+                .get(crate::knl::event::FIELD_META)
+                .and_then(Value::as_object)
+                .expect("the store gives every event a meta object");
+            assert!(meta.is_empty(), "nothing was named, so nothing is recorded");
+        }
     }
 
     #[tokio::test]
@@ -1806,14 +1896,14 @@ mod tests {
     async fn the_owner_is_total_and_read_back_verbatim() {
         assert_eq!(new_session(None).await.owner(), ANON);
         assert_eq!(
-            Session::new(SYSTEM.to_string(), None, &IsleDrivers::new())
+            Session::new(SYSTEM.to_string(), None, None, &Logs::new())
                 .await
                 .expect("open")
                 .owner(),
             SYSTEM
         );
         assert_eq!(
-            Session::new("user-42".to_string(), None, &IsleDrivers::new())
+            Session::new("user-42".to_string(), None, None, &Logs::new())
                 .await
                 .expect("open")
                 .owner(),
@@ -2039,7 +2129,7 @@ mod tests {
     async fn tail_reads_the_end_of_the_stream_and_not_the_whole_of_it() {
         let store = CountingStore::default();
         let (ranges, tails) = (Arc::clone(&store.ranges), Arc::clone(&store.tails));
-        let mut s = Session::open_on(ANON.to_string(), None, Box::new(store))
+        let mut s = Session::open_on(ANON.to_string(), None, None, Box::new(store))
             .await
             .expect("open");
         for i in 0..1_000 {
@@ -2139,7 +2229,7 @@ mod tests {
             .append(obj(json!({
                 "kind": "llm_response",
                 // The beat is the caller's word and the kernel keeps it.
-                "beat": "beat-7",
+                "meta": { "beat": "beat-7" },
                 "data": {
                     "content": [{ "type": "text", "text": "hi" }],
                     "usage": { "input_tokens": 20, "output_tokens": 10 }
@@ -2156,7 +2246,7 @@ mod tests {
             .expect("llm_response");
         assert_eq!(recorded.kind(), "llm_response");
         assert_eq!(
-            recorded[FIELD_BEAT],
+            recorded[FIELD_META][FIELD_BEAT],
             json!("beat-7"),
             "the declared beat is recorded as given"
         );
@@ -2190,7 +2280,8 @@ mod tests {
                 tag: Some("tokens".to_string()),
                 desc: Some("one nightly run".to_string()),
             }),
-            &IsleDrivers::new(),
+            None,
+            &Logs::new(),
         )
         .await
         .expect("open");
@@ -2425,7 +2516,7 @@ mod tests {
 
     /// The beat belongs to the layer above: the kernel never mints one, so
     /// an event that declares none carries none, and one that declares a
-    /// beat carries exactly the string it was given — on any kind, and
+    /// `meta.beat` carries exactly the string it was given — on any kind, and
     /// repeated across the facts of one beat without the kernel objecting.
     #[tokio::test]
     async fn beats_are_the_callers_word_and_the_kernel_adds_none() {
@@ -2439,25 +2530,28 @@ mod tests {
             .pop()
             .expect("response");
         assert_eq!(
-            bare.get(FIELD_BEAT),
+            bare[FIELD_META].get(FIELD_BEAT),
             None,
             "the kernel must not invent a beat: {bare}"
         );
 
         for event in [
             json!({
-                "kind": "llm_response", "beat": "b-1",
+                "kind": "llm_response", "meta": { "beat": "b-1" },
                 "data": { "content": [], "usage": { "input_tokens": 1 } }
             }),
             json!({
-                "kind": "tool_call", "beat": "b-1",
+                "kind": "tool_call", "meta": { "beat": "b-1" },
                 "data": { "call_id": "c1", "name": "sh", "args": {} }
             }),
             json!({
-                "kind": "tool_result", "beat": "b-1",
+                "kind": "tool_result", "meta": { "beat": "b-1" },
                 "data": { "call_id": "c1", "ok": true, "result": "ok" }
             }),
-            json!({ "kind": "llm_call_failed", "beat": "b-1", "data": { "error": "boom" } }),
+            json!({
+                "kind": "llm_call_failed", "meta": { "beat": "b-1" },
+                "data": { "error": "boom" }
+            }),
         ] {
             let seq = s.append(obj(event.clone())).await.expect("declared beat");
             let recorded = s
@@ -2466,15 +2560,16 @@ mod tests {
                 .expect("events")
                 .pop()
                 .expect("recorded");
-            assert_eq!(recorded[FIELD_BEAT], json!("b-1"), "{event}");
+            assert_eq!(recorded[FIELD_META][FIELD_BEAT], json!("b-1"), "{event}");
         }
 
-        // A non-string beat is the one thing refused, on any kind.
+        // The beat is a label now, so writing one at the top level is a stray
+        // key — and the refusal says where it goes.
         let err = s
-            .append(obj(json!({ "kind": "note", "beat": 1 })))
+            .append(obj(json!({ "kind": "note", "beat": "b-1" })))
             .await
-            .expect_err("a numbered beat");
-        assert!(err.reason().contains("beat must be a string"), "{err}");
+            .expect_err("a beat at the top level");
+        assert!(err.reason().contains("meta.beat"), "{err}");
     }
 
     #[tokio::test]
@@ -2589,12 +2684,17 @@ mod tests {
     async fn open_on_records_the_owner_on_session_opened() {
         use crate::knl::SqliteEventStore;
 
-        let store = SqliteEventStore::open_memory("owner-stream", &IsleDrivers::new())
+        let store = SqliteEventStore::open_memory("owner-stream", &Logs::new())
             .await
             .expect("open");
-        let s = Session::open_on("user-7".to_string(), Some(grant(100)), Box::new(store))
-            .await
-            .expect("open");
+        let s = Session::open_on(
+            "user-7".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store),
+        )
+        .await
+        .expect("open");
 
         let events = s.events(0, usize::MAX).await.expect("events");
         let opened = events.first().expect("session_opened");
@@ -2621,16 +2721,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "resume-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         // A durable session: two beats that reserved and settled.
         let before_close = {
-            let store = SqliteEventStore::open(&path, stream, &drivers)
+            let store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-42".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-42".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(30).await, Ok(true));
             s.append(response(30)).await.expect("first response");
             s.append(obj(
@@ -2650,7 +2755,7 @@ mod tests {
 
         // Reopen the same stream and resume — no new session_opened is
         // written, and no new grant either.
-        let store = SqliteEventStore::open(&path, stream, &drivers)
+        let store = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let mut resumed = Session::resume(None, Box::new(store))
@@ -2718,20 +2823,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "regrant-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         {
-            let store = SqliteEventStore::open(&path, stream, &drivers)
+            let store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-9".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-9".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(80).await, Ok(true));
             assert_eq!(remaining(&s).await, Some(20));
         }
 
-        let store = SqliteEventStore::open(&path, stream, &drivers)
+        let store = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let mut resumed = Session::resume(
@@ -2784,14 +2894,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "ungranted-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         // Opened with no budget, and still open: the handle is held for the
         // whole test, so nothing has written an ending.
-        let store = SqliteEventStore::open(&path, stream, &drivers)
+        let store = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open");
-        let first = Session::open_on("user-1".to_string(), None, Box::new(store))
+        let first = Session::open_on("user-1".to_string(), None, None, Box::new(store))
             .await
             .expect("open");
         assert_eq!(
@@ -2800,7 +2910,7 @@ mod tests {
             "session_opened, and no grant beside it"
         );
 
-        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+        let reopened = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let err = Session::resume(Some(grant(100)), Box::new(reopened))
@@ -2827,7 +2937,7 @@ mod tests {
         assert_eq!(remaining(&first).await, None, "and still has no ledger");
 
         // Resuming it *without* a grant is what a second handle does.
-        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+        let reopened = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let second = Session::resume(None, Box::new(reopened))
@@ -2852,17 +2962,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "late-grant-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
-        let store = SqliteEventStore::open(&path, stream, &drivers)
+        let store = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open");
-        let mut opened_without = Session::open_on("user-1".to_string(), None, Box::new(store))
-            .await
-            .expect("open");
+        let mut opened_without =
+            Session::open_on("user-1".to_string(), None, None, Box::new(store))
+                .await
+                .expect("open");
 
         // The owner grants, through a handle it holds on the same stream.
-        let reopened = SqliteEventStore::open(&path, stream, &drivers)
+        let reopened = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let mut owner_handle = Session::resume(None, Box::new(reopened))
@@ -2932,21 +3043,31 @@ mod tests {
         // Open once so the table is there, then write past the validator.
         // The collection is shut down rather than dropped, so the connection
         // has actually finished before the direct write below.
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
         drop(
-            SqliteEventStore::open(path, stream, &drivers)
+            SqliteEventStore::open(path, stream, &logs)
                 .await
                 .expect("open"),
         );
-        assert!(drivers.shutdown().await.is_empty(), "the writer joined");
+        assert!(logs.shutdown().await.is_empty(), "the writer joined");
         let conn = rusqlite::Connection::open(path).expect("open the database directly");
         conn.execute(
             "INSERT INTO events \
-             (stream, seq, epoch_ms, kind, schema_version, beat, meta, data) \
-             VALUES (?1, 1, 0, ?2, 1, NULL, '{}', '{}')",
+             (stream, seq, epoch_ms, kind, schema_version, meta, data) \
+             VALUES (?1, 1, 0, ?2, 2, '{}', '{}')",
             rusqlite::params![stream, KIND_SESSION_OPENED],
         )
         .expect("seed the opening");
+        // The stream's next `seq` is a stored counter, not `MAX(seq)` — which
+        // is what stops a number being handed out twice after history is
+        // removed — so a row written behind the store has to move it, or the
+        // next real append would be numbered 1 again.
+        conn.execute(
+            "INSERT INTO stream_seq (stream, next_seq) VALUES (?1, 2) \
+             ON CONFLICT(stream) DO UPDATE SET next_seq = excluded.next_seq",
+            rusqlite::params![stream],
+        )
+        .expect("seed the counter");
     }
 
     /// A log whose `session_opened` carries no `owner` resumes as [`ANON`]
@@ -2961,7 +3082,7 @@ mod tests {
         let stream = "legacy-stream";
         seed_an_opening_with_no_scope(&path, stream).await;
 
-        let store = SqliteEventStore::open(&path, stream, &IsleDrivers::new())
+        let store = SqliteEventStore::open(&path, stream, &Logs::new())
             .await
             .expect("reopen");
         let resumed = Session::resume(None, Box::new(store))
@@ -2986,20 +3107,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "scope-resume-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         let opened_scope = {
-            let store = SqliteEventStore::open(&path, stream, &drivers)
+            let store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
-            let mut s = Session::open_on("user-11".to_string(), Some(grant(100)), Box::new(store))
-                .await
-                .expect("open");
+            let mut s = Session::open_on(
+                "user-11".to_string(),
+                Some(grant(100)),
+                None,
+                Box::new(store),
+            )
+            .await
+            .expect("open");
             assert_eq!(s.reserve(40).await, Ok(true));
             s.scope_id().to_string()
         };
 
-        let store = SqliteEventStore::open(&path, stream, &drivers)
+        let store = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen");
         let mut resumed = Session::resume(None, Box::new(store))
@@ -3041,7 +3167,7 @@ mod tests {
         let stream = "legacy-scope-stream";
         seed_an_opening_with_no_scope(&path, stream).await;
 
-        let store = SqliteEventStore::open(&path, stream, &IsleDrivers::new())
+        let store = SqliteEventStore::open(&path, stream, &Logs::new())
             .await
             .expect("reopen");
         // Resumed with no grant, because a resume cannot give a stream one it
@@ -3215,7 +3341,7 @@ mod tests {
             inner: MemEventStore::new(),
             injected: false,
         };
-        let mut s = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store))
+        let mut s = Session::open_on("user".to_string(), Some(grant(1000)), None, Box::new(store))
             .await
             .expect("open");
         assert_eq!(
@@ -3319,7 +3445,7 @@ mod tests {
             inner: MemEventStore::new(),
             armed: Arc::clone(&armed),
         };
-        let mut s = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store))
+        let mut s = Session::open_on("user".to_string(), Some(grant(10)), None, Box::new(store))
             .await
             .expect("open");
 
@@ -3416,7 +3542,7 @@ mod tests {
         let store = HeadlessStore {
             inner: MemEventStore::new(),
         };
-        let s = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store))
+        let s = Session::open_on("user".to_string(), Some(grant(100)), None, Box::new(store))
             .await
             .expect("the appends land; only the head read is down");
 
@@ -3447,7 +3573,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         // A stream that was never opened as a session: its log is empty.
-        let store = SqliteEventStore::open(&path, "ghost-stream", &IsleDrivers::new())
+        let store = SqliteEventStore::open(&path, "ghost-stream", &Logs::new())
             .await
             .expect("open");
         let err = Session::resume(Some(grant(100)), Box::new(store))
@@ -3472,21 +3598,26 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "interleave-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         // A opens the session on the shared stream: `session_opened` at seq 1
         // and its `budget_granted` at seq 2, so A has seen head 2.
-        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+        let store_a = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(1000)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(1000)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
 
         // B resumes the SAME stream while it holds only those two, so both
         // handles have seen exactly head 2.  (It resumes before A closes: a
         // closed session is not resumable.)
-        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+        let store_b = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open B");
         let mut b = Session::resume(None, Box::new(store_b))
@@ -3510,7 +3641,7 @@ mod tests {
         assert_eq!(a.append(response(30)).await.expect("A appends again"), 5);
 
         // The durable log holds all three, in arrival order.
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
@@ -3533,15 +3664,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "reserve-race-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
-        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+        let store_a = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(10)), Box::new(store_a))
+        let mut a = Session::open_on("user".to_string(), Some(grant(10)), None, Box::new(store_a))
             .await
             .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+        let store_b = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open B");
         let mut b = Session::resume(None, Box::new(store_b))
@@ -3560,7 +3691,7 @@ mod tests {
 
         // The ledger is the answer: 10 granted − 6 reserved = 4, with the
         // refusal recorded and moving nothing.
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
@@ -3600,23 +3731,28 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "close-race-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
-        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+        let store_a = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
         // Both resume while the stream is open — a closed one is not
         // resumable — so both hold `closed = false` across A's close.
-        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+        let store_b = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open B");
         let mut b = Session::resume(None, Box::new(store_b))
             .await
             .expect("resume B");
-        let store_c = SqliteEventStore::open(&path, stream, &drivers)
+        let store_c = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open C");
         let mut c = Session::resume(None, Box::new(store_c))
@@ -3655,7 +3791,7 @@ mod tests {
             .await
             .expect("A is idempotent per handle");
 
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
@@ -3698,15 +3834,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "spend-race-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
-        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+        let store_a = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open B");
         let mut b = Session::resume(None, Box::new(store_b))
@@ -3734,7 +3875,7 @@ mod tests {
         assert_eq!(b.spend(20).await, Ok(()), "B settles 20");
         assert_eq!(remaining(&b).await, Some(50), "both settlements are in it");
 
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         let log = as_current(verify.read(0, usize::MAX).await.expect("read log"));
@@ -3754,7 +3895,7 @@ mod tests {
         assert_eq!(b.spend(1).await, Ok(()));
         assert_eq!(remaining(&a).await, Some(0));
         assert_eq!(remaining(&b).await, Some(0));
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         assert_eq!(
@@ -3777,15 +3918,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "shared-balance-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
-        let store_a = SqliteEventStore::open(&path, stream, &drivers)
+        let store_a = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open A");
-        let mut a = Session::open_on("user".to_string(), Some(grant(100)), Box::new(store_a))
-            .await
-            .expect("open A");
-        let store_b = SqliteEventStore::open(&path, stream, &drivers)
+        let mut a = Session::open_on(
+            "user".to_string(),
+            Some(grant(100)),
+            None,
+            Box::new(store_a),
+        )
+        .await
+        .expect("open A");
+        let store_b = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("open B");
         // Not `mut`: reading a balance is a read, and B does nothing else.
@@ -3822,7 +3968,7 @@ mod tests {
         assert!(exhausted(&b).await);
 
         // And the log is the whole of the story: nothing B holds was needed.
-        let verify = SqliteEventStore::open(&path, stream, &drivers)
+        let verify = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen to verify");
         assert_eq!(
@@ -3837,10 +3983,10 @@ mod tests {
     /// a hypothetical earlier shape used.  The kernel chain is empty until the
     /// first release, so the seam is exercised with a chain the test owns.
     ///
-    /// It leaves the version alone.  The version a step *produces* is
-    /// [`CURRENT_SCHEMA_VERSION`], which is still `1` — the same one these
-    /// rows were written under — and a `Current` is asserted to be at it, so
-    /// a fixture that stamped `2` would be claiming a version the kernel does
+    /// It leaves the version alone.  These rows are written by the store
+    /// itself, so they already carry [`CURRENT_SCHEMA_VERSION`] — the version
+    /// a step produces — and a `Current` is asserted to be at it, so a fixture
+    /// that stamped anything else would be claiming a version the kernel does
     /// not have.
     struct RenameLegacyKinds;
 
@@ -3876,13 +4022,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "seam-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         // Seeded under the older kind names, through the store itself: the
         // rows are ordinary appends, so they carry the version they were
         // written under.
         {
-            let mut store = SqliteEventStore::open(&path, stream, &drivers)
+            let mut store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
             store
@@ -3901,7 +4047,7 @@ mod tests {
                 .expect("the grant");
             store
                 .append(obj(json!({
-                    "kind": "legacy_response", "beat": "b-1",
+                    "kind": "legacy_response", "meta": { "beat": "b-1" },
                     "data": {
                         "content": [{ "type": "text", "text": "ok" }],
                         "usage": { "input_tokens": 7 }
@@ -3917,7 +4063,7 @@ mod tests {
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
         let seamed = CurrentStore::new(
             Box::new(
-                SqliteEventStore::open(&path, stream, &drivers)
+                SqliteEventStore::open(&path, stream, &logs)
                     .await
                     .expect("reopen"),
             ),
@@ -3964,7 +4110,7 @@ mod tests {
         // The stored rows were not rewritten: read them without the seam and
         // the old names are still there, under the version they were written
         // with.
-        let raw = SqliteEventStore::open(&path, stream, &drivers)
+        let raw = SqliteEventStore::open(&path, stream, &logs)
             .await
             .expect("reopen raw");
         let stored = raw.read(0, usize::MAX).await.expect("read raw");
@@ -3999,10 +4145,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
         let stream = "seam-closed-stream";
-        let drivers = IsleDrivers::new();
+        let logs = Logs::new();
 
         {
-            let mut store = SqliteEventStore::open(&path, stream, &drivers)
+            let mut store = SqliteEventStore::open(&path, stream, &logs)
                 .await
                 .expect("open");
             store
@@ -4023,7 +4169,7 @@ mod tests {
         let chain: Vec<Arc<dyn Upcaster>> = vec![Arc::new(RenameLegacyKinds)];
         let seamed = CurrentStore::new(
             Box::new(
-                SqliteEventStore::open(&path, stream, &drivers)
+                SqliteEventStore::open(&path, stream, &logs)
                     .await
                     .expect("reopen"),
             ),
@@ -4044,18 +4190,25 @@ mod tests {
     /// An in-memory session is a session, not a lesser one: it is a stream in
     /// a real database, so a second handle on its name finds the same log and
     /// resuming it restores the state.  What it cannot do is outlive the
-    /// process — the database is reclaimed when the last handle on it goes —
-    /// and nothing here pretends otherwise.
+    /// process — the database goes with the [`Logs`] that opened it — and
+    /// nothing here pretends otherwise.
+    ///
+    /// Two ephemeral sessions of one host are two *streams* of one database,
+    /// which is what lets one be opened from the other; they do not see each
+    /// other's events, for the reason two streams never do.
     #[tokio::test]
     async fn an_in_memory_stream_is_resumable_while_it_is_open() {
-        let mut s = new_session(Some(100)).await;
+        let logs = Logs::new();
+        let mut s = Session::new(ANON.to_string(), Some(grant(100)), None, &logs)
+            .await
+            .expect("open");
         assert_eq!(s.reserve(30).await, Ok(true));
         s.append(obj(json!({ "kind": "note", "data": { "text": "hi" } })))
             .await
             .expect("append");
 
         // The session id *is* the stream, so it is what a resume names.
-        let store = SqliteEventStore::open_memory(s.id(), &IsleDrivers::new())
+        let store = SqliteEventStore::open_memory(s.id(), &logs)
             .await
             .expect("reopen the stream");
         let resumed = Session::resume(None, Box::new(store))
@@ -4073,9 +4226,13 @@ mod tests {
             ]
         );
 
-        // Two sessions are two databases: neither name is the other's.
-        let other = new_session(Some(100)).await;
+        // Another session of the same host is another stream of the same
+        // database, and neither is the other's.
+        let other = Session::new(ANON.to_string(), Some(grant(100)), None, &logs)
+            .await
+            .expect("open");
         assert_ne!(other.id(), s.id());
+        assert_eq!(other.database(), s.database(), "one database, two streams");
         assert_eq!(
             other.len().await.expect("len"),
             2,
@@ -4158,17 +4315,17 @@ mod tests {
     /// A store for `stream` on the database `parent` is already on.
     ///
     /// What [`Session::open_child`] requires, built the way the bridge builds
-    /// it: the parent is asked where it is, and the child's store is opened
-    /// there.  The drivers are thrown away on the spot for the same reason
-    /// the rest of these tests throw them away — the connection thread lives
-    /// as long as the store holding its handle does.
+    /// it: the parent is asked where it is, and the log that identity names is
+    /// asked for ([`Logs::database`]) rather than opened again — which is what
+    /// makes the child's stream a stream of the *same* log, and its half of
+    /// the allocation part of the same transaction.
     async fn store_beside(parent: &Session, stream: &str) -> Box<dyn EventStore> {
         let db = parent.database().expect("the parent is on a database");
-        Box::new(
-            SqliteEventStore::open(std::path::Path::new(db), stream, &IsleDrivers::new())
-                .await
-                .expect("a store on the parent's database"),
-        )
+        let log = test_logs()
+            .database(db)
+            .await
+            .expect("the parent's own log");
+        Box::new(SqliteEventStore::on(log, stream))
     }
 
     /// A fresh stream id, as the layer that opens a child mints one.
@@ -4184,9 +4341,8 @@ mod tests {
     /// from one parent at the same time.
     async fn another_handle(of: &Session) -> Session {
         let db = of.database().expect("a database");
-        let store = SqliteEventStore::open(std::path::Path::new(db), of.id(), &IsleDrivers::new())
-            .await
-            .expect("reopen the stream");
+        let log = test_logs().database(db).await.expect("the session's log");
+        let store = SqliteEventStore::on(log, of.id());
         let mut handle = Session::resume(None, Box::new(store))
             .await
             .expect("resume");
@@ -4196,14 +4352,15 @@ mod tests {
 
     /// A session with `budget` on the file at `path`, so two handles can
     /// contend for one balance through two real connections.
-    async fn file_session(path: &std::path::Path, budget: i64, drivers: &IsleDrivers) -> Session {
+    async fn file_session(path: &std::path::Path, budget: i64, logs: &Logs) -> Session {
         let stream = stream_id();
-        let store = SqliteEventStore::open(path, stream.clone(), drivers)
+        let store = SqliteEventStore::open(path, stream.clone(), logs)
             .await
             .expect("open the stream");
-        let mut session = Session::open_on(ANON.to_string(), Some(grant(budget)), Box::new(store))
-            .await
-            .expect("open");
+        let mut session =
+            Session::open_on(ANON.to_string(), Some(grant(budget)), None, Box::new(store))
+                .await
+                .expect("open");
         session.adopt_id(stream);
         session
     }
@@ -4225,6 +4382,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(40),
+                None,
                 store,
             )
             .await
@@ -4299,6 +4457,7 @@ mod tests {
                     amount: 10,
                     tag: Some("turns".to_string()),
                 },
+                None,
                 store,
             )
             .await
@@ -4328,6 +4487,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(40),
+                None,
                 store,
             )
             .await
@@ -4370,7 +4530,13 @@ mod tests {
         let stream = stream_id();
         let store = store_beside(&parent, &stream).await;
         let child = parent
-            .open_child(stream, "user-42".to_string(), Allocation::new(7), store)
+            .open_child(
+                stream,
+                "user-42".to_string(),
+                Allocation::new(7),
+                None,
+                store,
+            )
             .await
             .expect("there is no balance to refuse against");
 
@@ -4386,7 +4552,7 @@ mod tests {
         let mut parent = new_session(Some(100)).await;
 
         let stranger = stream_id();
-        let elsewhere = SqliteEventStore::open_memory(stranger.clone(), &IsleDrivers::new())
+        let elsewhere = SqliteEventStore::open_memory(stranger.clone(), &Logs::new())
             .await
             .expect("another in-memory database");
         let err = parent
@@ -4394,6 +4560,7 @@ mod tests {
                 stranger,
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 Box::new(elsewhere),
             )
             .await
@@ -4411,6 +4578,7 @@ mod tests {
         let mut single = Session::open_on(
             ANON.to_string(),
             Some(grant(50)),
+            None,
             Box::new(MemEventStore::new()),
         )
         .await
@@ -4420,6 +4588,7 @@ mod tests {
                 stream_id(),
                 "user-42".to_string(),
                 Allocation::new(1),
+                None,
                 Box::new(MemEventStore::new()),
             )
             .await
@@ -4444,6 +4613,7 @@ mod tests {
                 taken.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4457,6 +4627,7 @@ mod tests {
                 taken.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4478,7 +4649,13 @@ mod tests {
         seeded.append(response(1)).await.expect("seed the stream");
         let store = store_beside(&parent, &stranger).await;
         let err = parent
-            .open_child(stranger, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                stranger,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect_err("something is written there already");
         assert_eq!(err.kind(), KnlError::VALIDATION, "{err}");
@@ -4496,7 +4673,13 @@ mod tests {
         let fresh = stream_id();
         let store = store_beside(&parent, &fresh).await;
         let child = parent
-            .open_child(fresh, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                fresh,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect("an empty stream is what a child opens on");
         assert_eq!(remaining(&child).await, Some(10));
@@ -4517,7 +4700,13 @@ mod tests {
         let stream = stream_id();
         let store = store_beside(&parent, &stream).await;
         let err = parent
-            .open_child(stream, "user-42".to_string(), Allocation::new(1), store)
+            .open_child(
+                stream,
+                "user-42".to_string(),
+                Allocation::new(1),
+                None,
+                store,
+            )
             .await
             .expect_err("this handle closed");
         assert_eq!(err.kind(), KnlError::CLOSED, "{err}");
@@ -4530,6 +4719,7 @@ mod tests {
                 stream.clone(),
                 "user-42".to_string(),
                 Allocation::new(1),
+                None,
                 store,
             )
             .await
@@ -4553,6 +4743,7 @@ mod tests {
                 still_open.clone(),
                 "user-42".to_string(),
                 Allocation::new(10),
+                None,
                 store,
             )
             .await
@@ -4561,7 +4752,13 @@ mod tests {
         let ended = stream_id();
         let store = store_beside(&parent, &ended).await;
         let mut done = parent
-            .open_child(ended, "user-42".to_string(), Allocation::new(10), store)
+            .open_child(
+                ended,
+                "user-42".to_string(),
+                Allocation::new(10),
+                None,
+                store,
+            )
             .await
             .expect("the allocation");
         done.close(Some("done")).await.expect("close the child");
@@ -4612,9 +4809,12 @@ mod tests {
     async fn two_children_allocating_at_once_never_over_allocate() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.db");
-        let drivers = IsleDrivers::new();
+        // The same collection every helper below reaches for, so both handles
+        // and both child stores are on one log — which is where the decision
+        // and the write share a transaction.
+        let logs = test_logs();
 
-        let mut one = file_session(&path, 100, &drivers).await;
+        let mut one = file_session(&path, 100, &logs).await;
         let mut two = another_handle(&one).await;
 
         let first = stream_id();
@@ -4627,12 +4827,14 @@ mod tests {
                 first,
                 "child-a".to_string(),
                 Allocation::new(60),
+                None,
                 first_store
             ),
             two.open_child(
                 second,
                 "child-b".to_string(),
                 Allocation::new(60),
+                None,
                 second_store
             ),
         );
