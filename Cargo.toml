@@ -76,7 +76,7 @@ mlua-pkg     = "0.9"
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38
 # (SQLite 3.53.2, past the WAL-reset corruption bug present through 3.51.2),
 # with `rusqlite-isle` 0.6, `mlua-batteries-sqlite` 0.8 and `eventsdb-sqlite`
-# 0.5 all on that track. Moving any one of them means moving all four.
+# 0.6 all on that track. Moving any one of them means moving all four.
 #
 # `rusqlite-isle` is what `std.ts` talks to — the connection lives on its own
 # thread — and plain `rusqlite` is here for the types (`Connection`, `Error`,
@@ -97,8 +97,30 @@ rusqlite-isle = { version = "0.6", features = ["tokio"] }
 # where it used to fail at once, and it refuses at open a file that already
 # holds an `events` table it did not create (which is why the legacy migration
 # renames one before the open — see `knl::logs`).
-eventsdb-core   = "0.5"
-eventsdb-sqlite = "0.5"
+#
+# 0.6 is additive throughout — nothing in it breaks a caller — and two of its
+# additions are what `agent-block knl backup` and `agent-block knl sessions`
+# are made of: `backup_to` takes a consistent physical copy of a log that is
+# open and being written to (`cp` of a WAL database with a writer open can
+# carry half a transaction), and `streams` lists a store's streams off the
+# `stream_seq` counter, which is the only way to learn a session id from
+# outside the host process.
+#
+# `tracing` is on because it is `dep:tracing` and nothing else: the spans are
+# at `debug` and the events at `trace`/`warn`, and this binary's subscriber
+# defaults to `info` (`crates/agent-block/src/main.rs`), so at the default
+# level it costs nothing. What it buys is a view of the store that a caller
+# cannot wrap from outside — how long the write lock was held, which batch a
+# projection took, whether a subscription woke on the commit channel or on the
+# poll — and reading it takes both halves, because most of those paths are a
+# span with no event inside it and a span is not a line:
+#
+#     AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug agent-block …
+#
+# The filter names the crate (`eventsdb_sqlite`); `eventsdb` is the facade and
+# nothing here goes through it.
+eventsdb-core   = "0.6"
+eventsdb-sqlite = { version = "0.6", features = ["tracing"] }
 # The syscall surface's single source of truth. `schema-bridge` derives the
 # `Schema` IR off the Rust argument / return types of `bridge/knl.rs` and
 # `schema-bridge-lshape` renders that IR as an lshape Lua module. Not

@@ -992,6 +992,43 @@ used, resolved from `-p/--project` exactly as `knl.open{}` resolves it for a
 script that names no `store`. A session that is not there is a one-line
 `error:` on stderr and exit `1`, not an empty answer.
 
+Which sessions are in this store is its own question, and `knl.views.sessions`
+answers it only for Lua running inside the host. `agent-block knl sessions` is
+that listing for everyone else — one record a line, `{ "session": <id>,
+"head_seq": <n> }`, in id order — and the ids it prints are what `--session`
+takes.
+
+```
+# The sessions in the project's database, a page at a time (1000 by default)
+agent-block knl sessions --limit 100
+
+# The next page: --after is exclusive, so it is the last id the call printed
+agent-block knl sessions --after <ID>
+```
+
+`agent-block knl backup --to <PATH>` copies a store, including one a run is
+writing to at that moment. `cp` is not that: the database is in WAL mode, so
+the `-wal` file holds committed pages the main file does not yet, and a copy
+taken between two writes can carry half a transaction. This takes the whole
+file in one step under one read transaction — events, counters, the retention
+ledger, the read-model tables — so the copy opens as an ordinary kernel
+database and `knl export --store <copy>` reads it. The destination must not
+exist; a path that already holds something is refused rather than overwritten.
+
+What the store did, rather than what it holds, is a log line:
+
+```
+AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug agent-block -s run.lua
+```
+
+The store reports each append, decision, projection batch, open and hatch
+statement as a span — its fields and its duration are the whole of it, and a
+span with no event inside it is not a line to the default formatter, which is
+what the first half switches on (every span in the process, so it is off by
+default). The second half is the filter, and it names the crate: `eventsdb` is
+the facade and nothing here goes through it. It costs nothing when unset: the
+spans are at `debug` and this binary logs at `info`.
+
 The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
 (the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the
 syscall surface Lua sees) and

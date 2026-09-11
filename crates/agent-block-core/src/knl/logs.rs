@@ -196,6 +196,66 @@ impl Logs {
         self.file(Path::new(database)).await
     }
 
+    /// Copy the whole log at `database` to `to`, while it is open and being
+    /// written to.
+    ///
+    /// The copy comes from the *live* log: the open goes through
+    /// [`Logs::file`], so a log this host already has open for that path is
+    /// the one copied rather than a second handle on the same file.  That is
+    /// the point of taking a backup from here at all — a consistent copy of
+    /// what a running process has committed.
+    ///
+    /// It runs on a reader connection under one read transaction, so a write
+    /// in flight is neither waited for nor refused: the copy holds what had
+    /// committed when it started and the transaction in flight lands in the
+    /// source afterwards.  This is the *physical* copy — the whole file, the
+    /// counters and the read-model tables included — where
+    /// [`super::EventStore::read`] and `knl.export` are the logical one.
+    ///
+    /// **`to` must not exist.**  It is taken with an exclusive create, so a
+    /// path that already holds anything comes back as
+    /// [`KnlError::Validation`] rather than being overwritten, and a failed
+    /// copy removes the file it created so a retry to the same path is not
+    /// refused by the leftover of the attempt before it.
+    pub async fn backup(&self, database: &Path, to: &Path) -> KnlResult<()> {
+        let log = self.file(database).await?;
+        log.backup_to(to).await.map_err(KnlError::from)
+    }
+
+    /// The sessions in the log at `database`, a page at a time.
+    ///
+    /// A session *is* a stream, so this is the store's stream listing in the
+    /// kernel's own words.  It reads the `stream_seq` counter rather than the
+    /// events, which is what makes it the answer to "which sessions are in
+    /// here": the counter is the truth of a stream's existence, so a session
+    /// whose events retention has removed still lists, with the head it
+    /// reached.
+    ///
+    /// `after` is an exclusive cursor — the last id of the previous page —
+    /// and `None` starts at the beginning; a `limit` of 0 is an empty page.
+    /// There is no prefix axis here on purpose: this kernel mints session ids
+    /// as UUIDs, so selecting them by a name prefix would be a knob with
+    /// nothing to select.
+    pub async fn sessions(
+        &self,
+        database: &Path,
+        after: Option<&str>,
+        limit: usize,
+    ) -> KnlResult<Vec<SessionInfo>> {
+        let log = self.file(database).await?;
+        let streams = log
+            .streams(after, None, limit)
+            .await
+            .map_err(KnlError::from)?;
+        Ok(streams
+            .into_iter()
+            .map(|info| SessionInfo {
+                session: info.stream,
+                head_seq: info.head_seq,
+            })
+            .collect())
+    }
+
     /// How many logs are open.
     pub async fn len(&self) -> usize {
         let files = self.inner.files.lock().await.len();
@@ -232,6 +292,24 @@ impl Logs {
         }
         failures
     }
+}
+
+/// One session in a log, and where its stream got to.
+///
+/// The kernel's own vocabulary for what the store calls a stream: a session
+/// *is* a stream (see the module doc of [`super`]), so a listing of one is a
+/// listing of the other, and a caller of [`Logs::sessions`] never has to hold
+/// the store's name for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// The session id — the stream `knl.open` minted for it, which is what
+    /// `--session` names and what a run's own `s:id()` reports.
+    pub session: String,
+    /// The `seq` of the last event appended to this session.
+    ///
+    /// Where the stream *got to*, not how many events are in it now: the next
+    /// append is `head_seq + 1`, and a removal does not move it back.
+    pub head_seq: u64,
 }
 
 /// The key a file is held under: the canonicalised parent, then the name.
@@ -542,7 +620,7 @@ fn decode_object(text: &str) -> rusqlite::Result<Map<String, Value>> {
 mod tests {
     use super::*;
     use crate::knl::event::kind_of;
-    use crate::knl::{EventStore, SqliteEventStore, CURRENT_SCHEMA_VERSION};
+    use crate::knl::{EventStore, Session, SqliteEventStore, CURRENT_SCHEMA_VERSION};
     use serde_json::json;
 
     /// The schema an earlier release wrote, copied here rather than referred
@@ -877,6 +955,133 @@ mod tests {
     fn a_path_with_no_file_is_not_a_legacy_log() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(!prepare_legacy(&dir.path().join("absent.sqlite")).expect("look at the path"));
+    }
+
+    /// Write one event into `stream` of the store at `path`, through a
+    /// session — so the log carries the opening the kernel writes as well as
+    /// the caller's own fact.
+    async fn write_one(logs: &Logs, path: &Path, stream: &str, text: &str) {
+        let store = SqliteEventStore::open(path, stream, logs)
+            .await
+            .expect("open the store");
+        let mut session = Session::open_on("u".to_string(), None, None, Box::new(store))
+            .await
+            .expect("open the session");
+        session
+            .append(
+                json!({ "kind": "note", "data": { "text": text } })
+                    .as_object()
+                    .expect("an object")
+                    .clone(),
+            )
+            .await
+            .expect("append");
+        // Closed here rather than left to the drop backstop, which submits
+        // without waiting: what is asserted below is how far the stream got,
+        // and a write still on the queue would make that a race.
+        session.close(None).await.expect("close the session");
+    }
+
+    /// A backup is a copy of the live log: the events read back out of it,
+    /// and the destination is claimed rather than overwritten.
+    #[tokio::test]
+    async fn a_backup_is_the_live_log_and_the_destination_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.sqlite");
+        let copy = dir.path().join("copy.sqlite");
+
+        let logs = Logs::new();
+        write_one(&logs, &path, "s-a", "kept").await;
+
+        // Taken while the log is open — which is the case this exists for —
+        // and from that same log rather than a second handle on the file.
+        logs.backup(&path, &copy).await.expect("take the backup");
+        assert!(copy.exists(), "the copy is at the path that was asked for");
+
+        // A second backup to the same path is refused rather than silently
+        // replacing what is there.
+        let refused = logs
+            .backup(&path, &copy)
+            .await
+            .expect_err("a path that already holds something is refused");
+        assert_eq!(
+            refused.kind(),
+            KnlError::VALIDATION,
+            "the refusal is the caller's argument, not the store being unwell: {refused}"
+        );
+        assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
+
+        // And the copy is a log: opened on its own, it reads back what the
+        // source held when it was taken.
+        let reader = Logs::new();
+        let events = read_back(&reader, &copy, "s-a").await;
+        assert_eq!(
+            events.iter().map(kind_of).collect::<Vec<_>>(),
+            ["session_opened", "note", "session_closed"],
+            "{events:?}"
+        );
+        assert_eq!(events[1]["data"]["text"], json!("kept"));
+        assert!(
+            reader.shutdown().await.is_empty(),
+            "the copy closed cleanly"
+        );
+    }
+
+    /// The sessions of a store are listed off the counter, in id order, and
+    /// the listing pages: `after` is exclusive and a `limit` of 0 is an empty
+    /// page.
+    #[tokio::test]
+    async fn the_sessions_of_a_store_are_listed_and_paged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.sqlite");
+
+        let logs = Logs::new();
+        for stream in ["s-a", "s-b", "s-c"] {
+            write_one(&logs, &path, stream, stream).await;
+        }
+
+        let all = logs.sessions(&path, None, 10).await.expect("list");
+        assert_eq!(
+            all.iter().map(|s| s.session.as_str()).collect::<Vec<_>>(),
+            ["s-a", "s-b", "s-c"]
+        );
+        for session in &all {
+            // The opening, the one note, the closing: where the stream got
+            // to, which is the seq the next append carries on from.
+            assert_eq!(session.head_seq, 3, "{session:?}");
+        }
+
+        // A page, then the rest after its last id.
+        let first = logs.sessions(&path, None, 2).await.expect("the first page");
+        assert_eq!(
+            first.iter().map(|s| s.session.as_str()).collect::<Vec<_>>(),
+            ["s-a", "s-b"]
+        );
+        let next = logs
+            .sessions(&path, Some(&first[1].session), 10)
+            .await
+            .expect("the next page");
+        assert_eq!(
+            next.iter().map(|s| s.session.as_str()).collect::<Vec<_>>(),
+            ["s-c"],
+            "the cursor is exclusive"
+        );
+        assert!(
+            logs.sessions(&path, Some("s-c"), 10)
+                .await
+                .expect("past the end")
+                .is_empty(),
+            "a cursor past the last id is an empty page"
+        );
+        assert!(
+            logs.sessions(&path, None, 0)
+                .await
+                .expect("no room")
+                .is_empty(),
+            "a limit of 0 is an empty page"
+        );
+
+        assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
     }
 
     /// A file is opened once and shared: two stores on one path are two

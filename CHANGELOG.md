@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agent-block knl sessions [--after <ID>] [--limit <N>] [--store <PATH>]` and
+  `agent-block knl backup --to <PATH> [--store <PATH>]`: the two questions a
+  reader outside the host could not ask of a kernel store. `export --session`
+  needs an id, and the only listing of a store's sessions was
+  `knl.views.sessions`, which is Lua running inside the host; `sessions` is
+  that listing as JSON Lines, `{ "session": <id>, "head_seq": <n> }` one
+  record a line, paged by an exclusive cursor (the last id printed is the next
+  call's `--after`, and the default limit is 1000). It reads the stream
+  counter rather than the events, so it is the truth of which sessions exist
+  rather than of which still hold rows. `backup` copies a store that something
+  is writing to, which `cp` is not: in WAL mode the `-wal` file holds
+  committed pages the main file does not yet, and a copy taken between two
+  writes can carry half a transaction. The copy is the whole file taken in one
+  step under one read transaction, so it opens as an ordinary kernel database
+  and `export --store <copy>` reads it; the destination must not exist, and a
+  path that already holds something is refused rather than overwritten. Both
+  resolve `--store` the way `export` does and fail the same way — one line on
+  stderr and exit 1 — except that an empty listing is an answer rather than a
+  failure.
+
+  Three other additions of the release are deliberately not taken.
+  `archive_then_retain` and its `Sink` would need a retention policy this
+  project has not decided — when a run's log may go, and where it goes first —
+  and the door stays open upstream for when it does. `ProjectionRunner::follow`
+  has nothing to run: the kernel builds no eventsdb projections. And
+  `Filter::stream_prefix` selects nothing meaningful here, because this
+  kernel's session ids are UUIDs.
+
 - A project's own `.agent-block/` is the first tier of both lookups:
   `<project>/.agent-block/blocks/` before `<project>/blocks/` before
   `$AGENT_BLOCK_HOME/blocks/`, and `<project>/.agent-block/lib/` before
@@ -77,6 +105,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guess from the size of the tool results.
 
 ### Changed
+
+- The kernel's event store is eventsdb 0.6.0, and nothing in that release
+  breaks a caller — every entry is an addition, and the one type that grew a
+  field is `#[non_exhaustive]` — so the move is a version and the two
+  subcommands above. What it gives us is the two things a caller could not
+  build from outside: a log that is open and being written to can be copied
+  consistently, and the store itself can now be watched. The `tracing` feature
+  is on, which is `dep:tracing` and nothing else — the spans are at `debug`
+  and the events at `trace`/`warn`, and this binary's subscriber defaults to
+  `info`, so it costs nothing at the default level. What it shows is what a
+  wrapper around the call cannot see, because it is inside the call: how long
+  the write lock was held, which batch a projection took, whether a
+  subscription woke on the commit channel or on the poll.
+
+- `AGENT_BLOCK_LOG_SPANS=1` turns every span's close into a log line. Most of
+  what the store reports is a span with no event inside it — the fields and
+  the duration are the whole of it — and the default formatter prints events
+  only, showing the spans around them as context, so those paths were silent
+  at any filter level. With the switch on they read as
+  `eventsdb.append{stream=… count=1 position=42}: close time.busy=27µs`, so
+  the two halves together are
+  `AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug`. It is off by
+  default because it is every span in the process, this binary's own
+  included.
 
 - The kernel's event store is eventsdb 0.5.0. Two things change for a caller.
   Opening a store file another process is holding now waits the busy timeout
