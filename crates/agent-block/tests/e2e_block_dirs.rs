@@ -1,12 +1,13 @@
 //! The `blocks/` / `lib/` split and its tiers, from the outside.
 //!
-//! `blocks/` holds entry points and `lib/` holds modules, at two levels each:
-//! the project root and `$AGENT_BLOCK_HOME`. These tests pin the three facts
-//! the split rests on — a block resolves by name from either tier, a module
-//! resolves by `require` from either tier with the project winning, and the
-//! two never cross (a file in `blocks/` cannot be required, a file in `lib/`
-//! cannot be run by name). The MCP server is driven through the same tiers
-//! so that a block is the same block on both surfaces without a `--block-dir`.
+//! `blocks/` holds entry points and `lib/` holds modules, at three levels each:
+//! the project's own `.agent-block/` (what `agent-block vendor` writes to), the
+//! project root, and `$AGENT_BLOCK_HOME`. These tests pin the facts the split
+//! rests on — a block resolves by name from any tier, a module resolves by
+//! `require` from any tier with the nearer one winning, and the two never cross
+//! (a file in `blocks/` cannot be required, a file in `lib/` cannot be run by
+//! name). The MCP server is driven through the same tiers so that a block is
+//! the same block on both surfaces without a `--block-dir`.
 
 mod common;
 
@@ -85,6 +86,33 @@ fn the_project_tier_shadows_the_user_tier_by_name() {
         .assert()
         .success()
         .stdout(predicate::str::contains("BLOCK_FROM=project"));
+}
+
+/// The project's own `.agent-block/` is the first tier: a vendored block is
+/// what the name runs, over the project's `blocks/` and over the user's.
+#[test]
+fn the_vendored_tier_shadows_the_project_and_the_user() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+    write(home.path(), "blocks/hello.lua", &block_printing("user"));
+    write(
+        project.path(),
+        "blocks/hello.lua",
+        &block_printing("project"),
+    );
+    write(
+        project.path(),
+        ".agent-block/blocks/hello.lua",
+        &block_printing("vendored"),
+    );
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["-b", "hello"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BLOCK_FROM=vendored"));
 }
 
 #[test]
@@ -182,6 +210,34 @@ fn the_project_lib_shadows_the_user_lib() {
         .assert()
         .success()
         .stdout(predicate::str::contains("MYLIB_FROM=project"));
+}
+
+/// The same order on the require path: a module under the project's
+/// `.agent-block/lib/` wins over the project's `lib/`, which wins over the
+/// user's. A vendored copy is the one the project resolves.
+#[test]
+fn the_vendored_lib_shadows_the_project_lib_and_the_user_lib() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+    write(home.path(), "lib/mylib.lua", "return { from = \"user\" }\n");
+    write(
+        project.path(),
+        "lib/mylib.lua",
+        "return { from = \"project\" }\n",
+    );
+    write(
+        project.path(),
+        ".agent-block/lib/mylib/init.lua",
+        "return { from = \"vendored\" }\n",
+    );
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["-s", &common::fixture("lib_require.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MYLIB_FROM=vendored"));
 }
 
 /// The other half of the split: a file in `blocks/` is an entry point, not a

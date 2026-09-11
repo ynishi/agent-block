@@ -4,9 +4,10 @@
 //! A block is an entry point: a Lua script the host runs to completion for the
 //! one value it returns. The registry is the set of `<name>.lua` files and
 //! `<name>/init.lua` directories directly under the block roots, which are
-//! `project_root/blocks/` and `$AGENT_BLOCK_HOME/blocks/` (see
-//! [`agent_block_core::host::block_roots`]) plus whatever `--block-dir` adds.
-//! The file stem, or the directory name, is the block name.
+//! `project_root/.agent-block/blocks/`, `project_root/blocks/` and
+//! `$AGENT_BLOCK_HOME/blocks/` (see [`agent_block_core::host::block_roots`])
+//! plus whatever `--block-dir` adds. The file stem, or the directory name, is
+//! the block name.
 //!
 //! What is deliberately not here: `require`. Block roots are never on the
 //! module path, and `lib/` roots are never scanned for blocks. A helper
@@ -38,6 +39,11 @@ pub struct Block {
 /// [`agent_block_core::host::block_roots`] (only the ones that exist) followed
 /// by `extra` in the order given. `extra` is not filtered — a caller that
 /// named a directory wants to hear if it is missing, and `scan` logs that.
+///
+/// The tiers come from the host rather than being rebuilt here, so `-b <name>`,
+/// `agent-block mcp` and `require` all agree on where a project's own files
+/// begin: `.agent-block/`, whose `blocks/` holds entry points and whose `lib/`
+/// holds modules.
 pub fn dirs(project_root: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = agent_block_core::host::block_roots(project_root);
     out.extend(extra.iter().cloned());
@@ -227,12 +233,13 @@ mod tests {
         assert_eq!(blocks[0].doc, "kept");
     }
 
-    /// `dirs` puts the project tier first and the user tier second, and
-    /// leaves out a tier whose directory does not exist — so a project with no
-    /// `blocks/` still sees the user's blocks, and a project that has one
-    /// shadows them by name.
+    /// `dirs` puts the project's vendored tier first, the project's own
+    /// `blocks/` second and the user tier third, and leaves out a tier whose
+    /// directory does not exist — so a project with no `blocks/` still sees the
+    /// user's blocks, a project that has one shadows them by name, and a
+    /// vendored copy shadows both.
     #[test]
-    fn dirs_orders_project_before_user_before_extra_and_skips_missing_tiers() {
+    fn dirs_orders_vendored_before_project_before_user_before_extra_and_skips_missing_tiers() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
@@ -253,6 +260,18 @@ mod tests {
         assert_eq!(
             with_project,
             [project.path().join("blocks"), home.path().join("blocks")]
+        );
+
+        let vendored = project.path().join(".agent-block/blocks");
+        std::fs::create_dir_all(&vendored).unwrap();
+        let with_vendored = dirs(project.path(), &[]);
+        assert_eq!(
+            with_vendored,
+            [
+                vendored,
+                project.path().join("blocks"),
+                home.path().join("blocks"),
+            ]
         );
     }
 

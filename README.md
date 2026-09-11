@@ -172,9 +172,11 @@ esac
 
 ## Blocks and libraries
 
-Two directories, two jobs, at two tiers:
+Two directories, two jobs, at three tiers:
 
 ```text
+<project>/.agent-block/blocks/…                  the project's own, kept out of the way
+<project>/.agent-block/lib/…                     (`agent-block vendor` writes here)
 <project>/blocks/<name>.lua | <name>/init.lua   entry points — run by name
 <project>/lib/<name>.lua    | <name>/init.lua   modules     — require("<name>")
 ~/.agent-block/blocks/…                          the user's blocks, every project
@@ -184,12 +186,21 @@ Two directories, two jobs, at two tiers:
 
 A **block** is a script the host runs for the one value it returns. It is
 callable by name — `agent-block --block <name>` from a shell, `run_block` over
-MCP — and the two surfaces share one registry: `<project>/blocks/` then
-`$AGENT_BLOCK_HOME/blocks/`, the project winning a clash. A **module** is what
-a block `require`s: `script_dir` → `<project>/lib/` → `$AGENT_BLOCK_HOME/lib/`
-→ embedded, first hit wins. Nothing crosses: a file in `blocks/` cannot be
-required, a file in `lib/` is never run by name, so a helper dropped beside a
-block does not become a callable block by accident.
+MCP — and the two surfaces share one registry:
+`<project>/.agent-block/blocks/`, then `<project>/blocks/`, then
+`$AGENT_BLOCK_HOME/blocks/`, the nearer tier winning a clash. A **module** is
+what a block `require`s: `script_dir` → `<project>/.agent-block/lib/` →
+`<project>/lib/` → `$AGENT_BLOCK_HOME/lib/` → embedded, first hit wins.
+Nothing crosses: a file in `blocks/` cannot be required, a file in `lib/` is
+never run by name, so a helper dropped beside a block does not become a
+callable block by accident.
+
+The ends of that order are the two halves of one rule. `.agent-block/` is the
+project's own directory — versioned with it, beside its `.gitignore` — and is
+where `agent-block vendor` puts a copy of something embedded, so it is searched
+first. `~/.agent-block/` is last because a file there changes **every project
+on the machine**: it is the shared fallback for what every project should have,
+and never the place to make one project behave.
 
 The working shape is a script that grows a library:
 
@@ -199,6 +210,10 @@ lib/summarize_util.lua            pull the reusable part out; require("summarize
 ~/.agent-block/lib/summarize_util.lua   mv it here when a second project wants it
 crates/agent-block-core/blocks/lib/…    upstream, once it is general (EMBEDDED_LIBS)
 ```
+
+Going the other way — starting from something embedded and making it the
+project's — is [Overriding a block or a
+module](#overriding-a-block-or-a-module).
 
 The file and its `require` name never change on the way up; each tier
 resolves the same name. `--project` names the project root only (`.env`, the
@@ -225,8 +240,9 @@ agent-block mcp --project .
 }
 ```
 
-That serves `<project>/blocks/` and `~/.agent-block/blocks/`; `--block-dir
-<dir>` (repeatable) adds a directory that lives elsewhere.
+That serves `<project>/.agent-block/blocks/`, `<project>/blocks/` and
+`~/.agent-block/blocks/`; `--block-dir <dir>` (repeatable) adds a directory
+that lives elsewhere.
 
 A block runs against its own model with its own credentials, so its LLM turns
 never enter the calling agent's context — only its return value does. That is
@@ -256,9 +272,11 @@ carry the tool's `prompt` / `context` arguments, exactly as the CLI flags do.
 | resource `agent-block://blocks/<name>` | one block's source |
 
 A block is `<name>.lua` or `<name>/init.lua` directly inside a block root;
-nothing deeper, and nothing under `lib/`, is callable. The roots are re-scanned
-per request — a new block is callable as soon as the file lands, without
-restarting the server. A block's leading `--` comment is what the caller reads
+nothing deeper, and nothing under `lib/`, is callable. The roots themselves are
+resolved and re-scanned per request — a new block is callable as soon as the
+file lands, without restarting the server, and that includes a file dropped into
+`<project>/.agent-block/blocks/` while the server is up: it is served on the
+next request. A block's leading `--` comment is what the caller reads
 as its description, so it is worth writing.
 
 A Lua error comes back as a failed tool call carrying the message. A block that
@@ -642,14 +660,15 @@ whether that is the intended way to change them.
 |---|---|---|
 | kernel + declaration | `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | **Sealed** — a filesystem copy fails the run rather than replacing the module. The kernel is one thing across Rust and Lua, held together by declaration tests a Lua-side replacement would pass while meaning something else. Change it upstream. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning, for work on the kernel itself and not for shipping. |
 | shell packs | `policy`, `supervisor` | Do not shadow: a pack is a value you hand to `knl.device` or consult in your own loop, not a registry the host reads. The two are one set — a loop is composed from both — and a model's limits are not a third pack: they go into the seams the kernel already has (`fold` / `filters` / `cost` / `tool_policy`, the loop's predicates, the supervisor's tree) and into what the Port declares (`LLMPort:profile`); see the `policy` module header. For a partial change, delegate through `embedded.<name>`. |
-| consumers | `agent`, `coding` | Copy-on-write is the intended way — drop your own `lib/agent/init.lua` (or `lib/coding/init.lua`) in the project root (or `~/.agent-block/lib/`) and it is the module your scripts get. For a partial change, delegate through `embedded.<name>`. `coding.run` is the loop that edits files until a verify command passes; `examples/coding_loop.lua` is a block over it. |
+| consumers | `agent`, `coding` | Copy-on-write is the intended way — `agent-block vendor agent` (or `vendor coding`) writes the file the idiom used to have you write by hand, into `.agent-block/lib/`, and it is the module your scripts get. A hand-written `lib/agent/init.lua` in the project root still works and still wins over the user tier. For a partial change, delegate through `embedded.<name>`. `coding.run` is the loop that edits files until a verify command passes; `examples/coding_loop.lua` is a block over it. |
 | utilities | `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Shadowing works, but `knl_adapter` requires `llm_proto` and `mcp_tools`, so replacing either replaces a sealed module's dependency. Prefer delegation. |
 
 Resolution order, highest priority first: the script's own directory →
-`project_root/lib/` → `$AGENT_BLOCK_HOME/lib/` → embedded. `blocks/` directories are
-not on it (see [Blocks and libraries](#blocks-and-libraries)). The seal is checked once
-at start over those filesystem roots, before the script runs; the error names the module
-and the file that would have replaced it.
+`project_root/.agent-block/lib/` → `project_root/lib/` → `$AGENT_BLOCK_HOME/lib/` →
+embedded. `blocks/` directories are not on it (see
+[Blocks and libraries](#blocks-and-libraries)). The seal is checked once at start over
+those filesystem roots, before the script runs; the error names the module and the file
+that would have replaced it.
 
 Delegation — a shadowing module reaching the one it replaced:
 
@@ -674,6 +693,51 @@ moves to `~/.agent-block/lib/` when a second project wants it, and becomes an em
 lib by a change upstream once it proves general — the same file, moved under
 `crates/agent-block-core/blocks/` and listed in `EMBEDDED_LIBS`. Projects still carrying
 their own copy keep resolving to it until they delete it.
+
+### Overriding a block or a module
+
+Three steps, and the middle one is the only one that is yours:
+
+```sh
+agent-block vendor agent          # 1. the embedded source, written into this project
+$EDITOR .agent-block/lib/agent/init.lua   # 2. change it; it is the project's now
+                                  # 3. when it proves general, send it upstream
+```
+
+`vendor` writes `<project>/.agent-block/lib/<name>/init.lua`, the first tier of the
+require path — so the copy is what `require("session")` resolves, in this project
+and nowhere else. Every embedded entry goes there, `agent` and `coding` included:
+they are modules the scripts that use them `require`, so a copy has to land where
+`require` looks. Nothing vendors into `.agent-block/blocks/`, which is for the
+project's own entry-point scripts. A module is written whole,
+sub-modules included
+(`vendor llm_proto` writes `openai.lua` and `anthropic.lua` beside its `init.lua`); you
+cannot vendor `llm_proto.openai` on its own, because half a module on disk and half in
+memory is two versions of it under one name. Step 3 is a change upstream — a pull request —
+and **not** a move to `~/.agent-block/`: a file there answers for every project on the
+machine, which is the opposite of what "this project needs it different" means.
+
+```text
+agent-block vendor --list         what can be vendored, and what this project already has
+agent-block vendor --path <dir>   write somewhere other than the project root
+agent-block vendor --force        overwrite a copy that is already there
+```
+
+`--list` prints one line per embedded root — name, `lib` (everything the binary
+carries is a module to a project), whether it is
+`sealed` or a `pack`, and `vendored` when this project has a copy — with sub-modules
+folded under the root they belong to (`lshape (+t, check, reflect, luacats)`). An
+existing copy is never overwritten without `--force`, because by then it is the
+project's own and likely edited.
+
+Two layers answer back. A **sealed** module is refused outright (`knl` is sealed: a
+project cannot shadow it) — the copy would only fail the next run; read it with
+`require("embedded.knl")`. A **pack** (`policy`, `supervisor`) is written, but with a
+warning, because a pack is a value you hand to `knl.device` and not a registry the host
+reads, so a whole copy is rarely the change that was meant.
+
+For a partial change — keeping the embedded behaviour and adding to it — do not vendor
+at all: shadow and delegate through `embedded.<name>`, as above.
 
 ### agent (StdPkg — `require("agent")`)
 

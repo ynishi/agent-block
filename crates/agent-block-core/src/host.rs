@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 /// extra file distribution. The `require` name on the left is independent of
 /// the path on the right: `blocks/` is laid out by role (`agent/` runtime,
 /// `lib/`) while callers keep writing `require("agent")`.
-const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     ("agent", include_str!("../blocks/agent/init.lua")),
     ("coding", include_str!("../blocks/coding/init.lua")),
 ];
@@ -43,7 +43,7 @@ const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 /// `llm_proto` is the provider-neutral LLM wire format, `session` persists a
 /// messages array through `std.kv`, and `lshape` is a schema validator.
 /// Listing them as tools would be misleading.
-const EMBEDDED_LIBS: &[(&str, &str)] = &[
+pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     ("session", include_str!("../blocks/lib/session/init.lua")),
     (
         "llm_proto",
@@ -111,7 +111,7 @@ const EMBEDDED_LIBS: &[(&str, &str)] = &[
 /// The README section "Embedded blocks: four layers" names this same set;
 /// `sealed_list_matches_the_readme` in this module's tests is the assertion
 /// that keeps the two from drifting.
-const SEALED: &[&str] = &[
+pub(crate) const SEALED: &[&str] = &[
     "knl",
     "knl_adapter",
     "knl_types",
@@ -319,12 +319,34 @@ pub fn inspect_tools(config: &BlockConfig) -> Vec<ToolMeta> {
     out
 }
 
+/// The directory a project keeps its own copies of agent-block's own files in:
+/// `blocks/` and `lib/` under `<project>/.agent-block/`.
+///
+/// Beside the project's `.gitignore`, dotted like the rest of a repository's
+/// tooling, and the first tier of both lookups — which is what makes its `lib/`
+/// the place [`crate::embedded`]'s consumer (`agent-block vendor`) writes to. A
+/// project that has never vendored anything never has the directory, and the
+/// tier costs it nothing: only existing directories are searched.
+pub const PROJECT_DIR: &str = ".agent-block";
+
 /// Filesystem roots that `require` searches for libraries, highest priority
 /// first. Only existing directories are returned.
 ///
-/// 1. `project_root/lib/` — the project's own modules
-/// 2. `$AGENT_BLOCK_HOME/lib/` (default `~/.agent-block/lib/`) — the user's
+/// 1. `project_root/.agent-block/lib/` — the project's vendored copies
+/// 2. `project_root/lib/` — the project's own modules
+/// 3. `$AGENT_BLOCK_HOME/lib/` (default `~/.agent-block/lib/`) — the user's
 ///    modules, shared by every project on the machine
+///
+/// The order is not arbitrary at either end. [`PROJECT_DIR`] is first because
+/// it is the project's own — versioned with it, visible in its diff — and
+/// because what lands there is a copy of an embedded module that the project
+/// means to have taken over (`agent-block vendor`); a tier below `lib/` would
+/// make vendoring a thing that silently does nothing when the project already
+/// has a hand-written module of that name. The user's home is last because a
+/// file under `~/.agent-block/` changes **every project on the machine**: it is
+/// the right place for what every project should share and the wrong place to
+/// make one project behave, and being the last tier is what keeps it from
+/// quietly answering for a project that never asked it to.
 ///
 /// The embedded sources come after these, and the script's own directory
 /// before them; both are wired in [`build_isle_init`].
@@ -344,6 +366,11 @@ pub fn inspect_tools(config: &BlockConfig) -> Vec<ToolMeta> {
 pub fn lib_roots(project_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
+    let vendored_lib = project_root.join(PROJECT_DIR).join("lib");
+    if vendored_lib.is_dir() {
+        out.push(vendored_lib);
+    }
+
     let project_lib = project_root.join("lib");
     if project_lib.is_dir() {
         out.push(project_lib);
@@ -362,8 +389,18 @@ pub fn lib_roots(project_root: &Path) -> Vec<PathBuf> {
 /// Filesystem roots that hold entry points — blocks run by name — highest
 /// priority first. Only existing directories are returned.
 ///
-/// 1. `project_root/blocks/`
-/// 2. `$AGENT_BLOCK_HOME/blocks/` (default `~/.agent-block/blocks/`)
+/// 1. `project_root/.agent-block/blocks/` — entry points kept with the
+///    project's other agent-block files
+/// 2. `project_root/blocks/`
+/// 3. `$AGENT_BLOCK_HOME/blocks/` (default `~/.agent-block/blocks/`)
+///
+/// First and last for the reasons [`lib_roots`] gives: [`PROJECT_DIR`] is the
+/// project's own directory, beside its `.gitignore`. Nothing writes tier 1 for
+/// a caller — `agent-block vendor` only ever writes modules, because every
+/// embedded entry is reached by `require` — so a file here is a script the
+/// project put there itself. The user's home is last because a
+/// file under `~/.agent-block/` answers for every project on the machine and so
+/// is the shared fallback rather than the place to specialise one project.
 ///
 /// The tiers mirror [`lib_roots`] so that a script and the modules it needs
 /// live side by side at each level: `blocks/summarize.lua` next to
@@ -374,6 +411,11 @@ pub fn lib_roots(project_root: &Path) -> Vec<PathBuf> {
 /// these roots, so the same file is the same block on both surfaces.
 pub fn block_roots(project_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
+
+    let vendored_blocks = project_root.join(PROJECT_DIR).join("blocks");
+    if vendored_blocks.is_dir() {
+        out.push(vendored_blocks);
+    }
 
     let project_blocks = project_root.join("blocks");
     if project_blocks.is_dir() {
@@ -1239,7 +1281,9 @@ fn build_isle_init(
         }
 
         // ── package.path ──────────────────────────────────────────────
-        // Priority: script_dir > project_root/lib/ > $AGENT_BLOCK_HOME/lib/ > default
+        // Priority: script_dir > project_root/.agent-block/lib/ >
+        // project_root/lib/ > $AGENT_BLOCK_HOME/lib/ > default — the roots
+        // `lib_roots` returned, in the order it returned them.
         let package: mlua::Table = lua.globals().get("package")?;
         let current_path: String = package.get("path")?;
         let new_path =
@@ -1249,7 +1293,8 @@ fn build_isle_init(
         // ── require resolution — mlua-pkg Registry ────────────────────
         // One priority chain instead of two parallel mechanisms:
         //
-        //   script_dir/  >  project_root/lib/  >  $AGENT_BLOCK_HOME/lib/  >  embedded
+        //   script_dir/  >  project_root/.agent-block/lib/  >  project_root/lib/
+        //     >  $AGENT_BLOCK_HOME/lib/  >  embedded
         //
         // with one name space held out of it: `embedded.<name>` resolves from
         // memory and only from memory (see below). `blocks/` directories are
