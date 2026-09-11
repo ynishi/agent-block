@@ -76,7 +76,7 @@ mlua-pkg     = "0.9"
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38
 # (SQLite 3.53.2, past the WAL-reset corruption bug present through 3.51.2),
 # with `rusqlite-isle` 0.6, `mlua-batteries-sqlite` 0.8 and `eventsdb-sqlite`
-# 0.4 all on that track. Moving any one of them means moving all four.
+# 0.5 all on that track. Moving any one of them means moving all four.
 #
 # `rusqlite-isle` is what `std.ts` talks to — the connection lives on its own
 # thread — and plain `rusqlite` is here for the types (`Connection`, `Error`,
@@ -89,8 +89,16 @@ rusqlite-isle = { version = "0.6", features = ["tokio"] }
 # versioning, the store SPI, upcasters) and `eventsdb-sqlite` the durable
 # backend: one file, one writer thread, WAL, a global position, and the
 # transaction hatch the kernel's two-stream writes and SQL reads go through.
-eventsdb-core   = "0.4"
-eventsdb-sqlite = "0.4"
+#
+# 0.5 is strict where it used to substitute: a query cell with no JSON value —
+# a BLOB, a non-finite REAL, TEXT that is not UTF-8 — is refused with the
+# column named instead of coming back as a marker string or a null. It also
+# waits `busy_timeout` when it opens a file another connection is holding,
+# where it used to fail at once, and it refuses at open a file that already
+# holds an `events` table it did not create (which is why the legacy migration
+# renames one before the open — see `knl::logs`).
+eventsdb-core   = "0.5"
+eventsdb-sqlite = "0.5"
 # The syscall surface's single source of truth. `schema-bridge` derives the
 # `Schema` IR off the Rust argument / return types of `bridge/knl.rs` and
 # `schema-bridge-lshape` renders that IR as an lshape Lua module. Not
