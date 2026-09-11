@@ -184,7 +184,9 @@ enum Command {
     /// reader that is not: a session id in, JSON Lines out.
     ///
     /// ```text
-    /// agent-block knl export --session <ID> --as events|messages
+    /// agent-block knl export   --session <ID> --as events|messages
+    /// agent-block knl sessions [--after <ID>] [--limit <N>]
+    /// agent-block knl backup   --to <PATH>
     /// ```
     Knl(knl::KnlArgs),
     /// Write an embedded module into the project, to edit as its own.
@@ -257,13 +259,33 @@ fn startup() -> anyhow::Result<()> {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // A span is not a line. The default `fmt` subscriber prints events and
+    // shows the spans around them as context, so a span that contains no
+    // event — which is most of the instrumented store paths, whose whole
+    // content is their own fields and their duration — prints nothing at any
+    // filter level. `AGENT_BLOCK_LOG_SPANS=1` turns each span's close into a
+    // line, which is how the numbers inside a call are read from here:
+    //
+    //     AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug agent-block …
+    //
+    // Off by default because it is every span in the process, this binary's
+    // own included, and at the default `info` level that is noise nobody
+    // asked for.
+    let span_events = match std::env::var("AGENT_BLOCK_LOG_SPANS").as_deref() {
+        Ok("1") | Ok("close") => tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+        _ => tracing_subscriber::fmt::format::FmtSpan::NONE,
+    };
     if log_to_stderr {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_span_events(span_events)
             .with_writer(std::io::stderr)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_span_events(span_events)
+            .init();
     }
 
     // The SDK host loads `{project}/.env` as well, but that happens far too late
