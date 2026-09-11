@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The kernel's event store is eventsdb 0.5.0. Two things change for a caller.
+  Opening a store file another process is holding now waits the busy timeout
+  instead of failing at once, so two hosts starting on one project no longer
+  race to a `busy` that arrived in under a millisecond whatever timeout was
+  set. And a `session:query` that selects a cell JSON has no value for — a
+  `BLOB`, an infinite `REAL`, `TEXT` that is not UTF-8 — is refused with the
+  column named and the SQL that reads it (`hex(col)`, `CAST(col AS TEXT)`),
+  where it used to hand back the string `"<blob>"` or nothing at all. No
+  column of the log produces any of the three; a statement that builds one in
+  an expression now says so instead of answering with a value that cannot be
+  told from a real one.
+
 - `policy.window`'s raise says which number it counted. When no event in the
   history carries `meta.beat` the whole of it is the seed and that is what
   does not fit; the message used to call that "the newest beat", which reads

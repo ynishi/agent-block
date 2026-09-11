@@ -37,7 +37,15 @@
 //! Three things, in this order, and each of them is idempotent:
 //!
 //! 1. **the legacy migration** ([`migrate_legacy`]), for a `knl.sqlite` an
-//!    earlier release wrote — before eventsdb sees the file at all;
+//!    earlier release wrote — before eventsdb sees the file at all.  The
+//!    "before" is the whole of it: a file at `user_version` 0 that already
+//!    holds an `events` table is one eventsdb **refuses to open**, since it
+//!    did not create that table and will not run its ladder over somebody
+//!    else's.  So [`prepare_legacy`] renames the table and drops the indexes
+//!    whose names the ladder uses ([`LEGACY_INDEXES`]) on a plain connection
+//!    first, and the open below meets a file with nothing of its own in it.
+//!    A user who has an un-migrated log and no migration would otherwise be
+//!    told the store does not support their file, which is true and useless;
 //! 2. **`index_meta("beat")`**, so a read that filters on the beat label is
 //!    an index range rather than a scan of every row's `meta`;
 //! 3. **the parent index** ([`CHILD_INDEX_DDL`]), which is what makes the
@@ -56,7 +64,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use eventsdb_core::position::Position;
 use eventsdb_core::transfer::ExportedEvent;
 use eventsdb_sqlite::{OpenOptions, SqliteEventLog};
 use serde_json::{Map, Value};
@@ -79,8 +86,10 @@ const LEGACY_TABLE: &str = "knl_legacy_events";
 ///
 /// `events_stream_kind_seq` is the one that has to go: eventsdb's own ladder
 /// creates an index of that name, and a leftover would make the first step
-/// fail on a name that already exists.  The other two are dropped in the same
-/// breath because nothing reads them any more.
+/// fail on a name that already exists.  A rename does not move them out of the
+/// way — an index follows its table under `ALTER TABLE … RENAME TO` and keeps
+/// the name it had — so dropping is what there is.  The other two are dropped
+/// in the same breath because nothing reads them any more.
 const LEGACY_INDEXES: [&str; 3] = [
     "events_stream_kind_seq",
     "events_stream_beat_seq",
@@ -366,6 +375,15 @@ fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> KnlResu
 /// One transaction: the import and the drop land together, so the table is
 /// there exactly while the migration has not committed.
 ///
+/// **The check is the per-row one, and it has to be.**  A record adopted from
+/// the old table carries no position — [`ExportedEvent::position`] is `None`,
+/// because the earlier backend had no global order to have recorded one in.
+/// The store's own `ImportReport::reproduced_coordinates` is therefore `false`
+/// for this import and says nothing about whether it went well: a record with
+/// no witness cannot be said to have landed back on it.  What is asserted
+/// instead is each row's reassigned `seq` against the `seq` it had, below —
+/// the coordinate this kernel reads a stream by.
+///
 /// **The events keep everything but their coordinates.**  `epoch_ms` and the
 /// version they were written under survive ([`eventsdb_core::event::restamp`]),
 /// because re-stamping an old event as current would put it out of reach of
@@ -499,8 +517,10 @@ fn legacy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, ExportedEvent)>
         ExportedEvent {
             stream,
             // A witness, not an instruction: the earlier backend had no
-            // global position to record, so there is none to carry.
-            position: Position::BEGINNING,
+            // global position to record, so there is none to carry.  `None`
+            // is that said outright — the field was required once, and
+            // `Position::BEGINNING` was standing in for it.
+            position: None,
             event,
         },
     ))
@@ -678,6 +698,68 @@ mod tests {
                 .seq,
             4
         );
+    }
+
+    /// The indexes are what make the rename a *migration* rather than a
+    /// rename, and the open is what proves it.
+    ///
+    /// eventsdb refuses at open a file that already holds an `events` table it
+    /// did not create, so the table has to be moved aside first — and moving it
+    /// does not move its indexes, which keep their names and sit on the renamed
+    /// table.  One of those names is the ladder's own
+    /// (`events_stream_kind_seq`), so a file carrying it would fail the first
+    /// ladder step instead.  This is the fixture that carries all three: the
+    /// open has to succeed, and afterwards that name has to belong to the
+    /// ladder's index on `events` rather than to the leftover.
+    #[tokio::test]
+    async fn a_legacy_file_with_the_old_indexes_still_opens() {
+        /// The indexes in the file, by name and by the table they sit on.
+        fn indexes(path: &Path) -> Vec<(String, String)> {
+            let conn = rusqlite::Connection::open(path).expect("open the file");
+            let mut stmt = conn
+                .prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'")
+                .expect("read the indexes");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("read the indexes")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("read the indexes")
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("knl.sqlite");
+        write_legacy(&path, &[("s-a", 1, 100, "session_opened", None)]);
+
+        let before: Vec<String> = indexes(&path).into_iter().map(|(name, _)| name).collect();
+        for index in LEGACY_INDEXES {
+            assert!(
+                before.contains(&index.to_string()),
+                "the fixture is a file that carries the old indexes: {before:?}"
+            );
+        }
+
+        let logs = Logs::new();
+        assert_eq!(
+            read_back(&logs, &path, "s-a").await.len(),
+            1,
+            "a file carrying the old indexes opens, and its events come with it"
+        );
+        assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
+
+        let after = indexes(&path);
+        assert_eq!(
+            after
+                .iter()
+                .find(|(name, _)| name == "events_stream_kind_seq")
+                .map(|(_, table)| table.as_str()),
+            Some("events"),
+            "the colliding name belongs to the ladder's index now: {after:?}"
+        );
+        for gone in ["events_stream_beat_seq", "events_session_opened_parent"] {
+            let on_legacy = after
+                .iter()
+                .any(|(name, table)| name == gone && table == LEGACY_TABLE);
+            assert!(!on_legacy, "no leftover index on the old table: {after:?}");
+        }
     }
 
     /// The migration is idempotent, and it is idempotent *by construction*:

@@ -71,7 +71,14 @@
 //!
 //! A `NULL` column comes back from eventsdb as a JSON null and is dropped from
 //! the row here, so the Lua side reads an absent key as `nil`, which is what a
-//! missing column means there.
+//! missing column means there.  That is the one conversion this adapter makes.
+//! The rest are eventsdb's, and it is **strict** about the three cells JSON has
+//! no value for — a `BLOB`, a non-finite `REAL`, and `TEXT` that is not UTF-8
+//! — refusing each as [`KnlError::Unsupported`] with the column named and the
+//! SQL that gets the value through (`hex(col)`, `CAST(col AS TEXT)`).  The
+//! store can be asked to substitute instead; it is not asked to, because a
+//! substitute is a value the caller cannot tell from one that was really in
+//! the row, and the log has no column that produces any of the three.
 //!
 //! A statement that does not compile is the caller's, not the store's, and is
 //! answered as [`KnlError::Validation`] even though eventsdb classes it with
@@ -518,6 +525,17 @@ impl EventStore for SqliteEventStore {
         self.handle.len().await.map_err(KnlError::from)
     }
 
+    /// The caller's statement, on a read-only connection that is not the
+    /// writer.
+    ///
+    /// A `NULL` column is dropped rather than carried as a null, so it reads
+    /// as `nil` where a missing column does.  A cell JSON has no value for —
+    /// a `BLOB`, a non-finite `REAL`, `TEXT` that is not UTF-8 — is not
+    /// carried either, but it is *refused*, as [`KnlError::Unsupported`]
+    /// naming the column and the SQL that gets it through.  Those are the two
+    /// answers a row can end in, and they are different on purpose: absence is
+    /// something the caller can read, while a stand-in for a value the bridge
+    /// could not carry is something they would read as a value.
     async fn query(&self, plan: &QueryPlan) -> KnlResult<QueryRows> {
         // The cap is the kernel's, and the statement is the caller's, so the
         // one is put around the other: `limit + 1` rows are asked for and the
@@ -702,10 +720,20 @@ impl From<eventsdb_core::Error> for KnlError {
 /// to the class they belong to.
 ///
 /// The ask for a statement class upstream is filed separately; when it lands,
-/// this table and [`query_error`] go with it.  Until then, matching the text
-/// is what is left, and it is kept to the phrases SQLite itself produces:
-/// rusqlite renders them as `… : <sqlite message>`, so the test is
-/// `contains`, not a prefix of the whole string.
+/// this table and [`query_error`] go with it.  It has not landed: eventsdb
+/// 0.5.0 moved a *parameter* fault — a name the statement does not declare, a
+/// positional count that does not match — from `Storage` to `Validation`, and
+/// that is a fault rusqlite raises before SQLite compiles anything.  A
+/// statement that does not compile is still `Storage`, so every phrase below
+/// is still load-bearing and none of them was about a parameter.  (A parameter
+/// mismatch cannot reach here anyway: [`super::query`] resolves every
+/// parameter to a `?` and a value in the same order at plan time, so the count
+/// is right by construction and there are no names left to miss.)
+///
+/// Until a statement class exists, matching the text is what is left, and it
+/// is kept to the phrases SQLite itself produces: rusqlite renders them as
+/// `… : <sqlite message>`, so the test is `contains`, not a prefix of the
+/// whole string.
 const SQLITE_STATEMENT_ERRORS: [&str; 7] = [
     "no such column",
     "no such table",
@@ -1878,8 +1906,7 @@ mod tests {
         let rows = ask(
             &store,
             // `absent`, not `nothing`: NOTHING is a SQLite keyword.
-            "SELECT 1 AS whole, 1.5 AS fraction, 'text' AS words, NULL AS absent, \
-             CAST('bytes' AS BLOB) AS raw",
+            "SELECT 1 AS whole, 1.5 AS fraction, 'text' AS words, NULL AS absent",
         )
         .await
         .expect("query");
@@ -1887,15 +1914,42 @@ mod tests {
         assert_eq!(row["whole"], Value::from(1));
         assert_eq!(row["fraction"], Value::from(1.5));
         assert_eq!(row["words"], Value::from("text"));
-        assert_eq!(
-            row["raw"],
-            Value::from("<blob>"),
-            "a blob has no value on the other side of the bridge, and says so"
-        );
         assert!(
             !row.contains_key("absent"),
             "a NULL column is absent, so it reads as nil: {row:?}"
         );
+    }
+
+    /// A cell JSON has no value for is refused, by name.
+    ///
+    /// The three are a `BLOB`, a non-finite `REAL` and `TEXT` that is not
+    /// UTF-8.  A substitute — the string `"<blob>"`, or the absent key a null
+    /// would have become — is a value the caller cannot tell from one that was
+    /// really there, which is the whole reason this is an error and not a
+    /// reading.  The refusal names the column and the SQL that gets the value
+    /// through, so the answer is one edit to the statement away.
+    #[tokio::test]
+    async fn a_cell_with_no_json_value_is_refused_and_the_refusal_names_it() {
+        let (store, _logs) = mem_store().await;
+        for (sql, column, advice) in [
+            ("SELECT CAST('bytes' AS BLOB) AS raw", "raw", "hex(raw)"),
+            // A literal SQLite keeps as `real` infinity. NaN is not one of
+            // these: SQLite stores it as NULL, which is absence and reads as
+            // nil.
+            ("SELECT 9e999 AS boundless", "boundless", "CAST(boundless"),
+            ("SELECT CAST(x'ff' AS TEXT) AS garbled", "garbled", "UTF-8"),
+        ] {
+            let err = ask(&store, sql).await.expect_err("must be refused");
+            assert_eq!(err.kind(), KnlError::UNSUPPORTED, "{sql:?}: {err}");
+            assert!(
+                err.reason().contains(column),
+                "{sql:?}: the refusal names the column: {err}"
+            );
+            assert!(
+                err.reason().contains(advice),
+                "{sql:?}: expected {advice:?} in the refusal: {err}"
+            );
+        }
     }
 
     /// The published schema is the table: the constant `knl.api()` hands out,
@@ -1936,39 +1990,35 @@ mod tests {
     /// The published schema is also the *live* one.
     ///
     /// This is what keeps [`events_schema`] a reading of the table rather than
-    /// a claim about it: a real log is opened, closed, and asked what its
-    /// `events` table has — with `PRAGMA table_info` on a plain connection,
-    /// because a pragma is one of the things the store's own hatch refuses,
-    /// and rightly (setting one is how the migration ladder's marker or the
-    /// journal mode would be changed underneath it).
+    /// a claim about it: a real log is opened and asked what its `events`
+    /// table has, through the store's own hatch.  `PRAGMA table_info` is one
+    /// of the introspection pragmas the hatch allows — *setting* a pragma is
+    /// what it refuses, since that is how the migration ladder's marker or the
+    /// journal mode would be changed underneath it — so the reading needs no
+    /// connection of its own.  [`events_schema`] stays a constant: `knl.api()`
+    /// is synchronous, and this is what keeps the constant honest.
     #[tokio::test]
     async fn the_published_schema_is_the_live_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("knl.db");
-        {
-            let logs = Logs::new();
-            SqliteEventStore::open(&path, "s-1", &logs)
-                .await
-                .expect("open");
-            assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
-        }
+        let logs = Logs::new();
+        let log = logs.file(&path).await.expect("open");
 
-        let conn = rusqlite::Connection::open(&path).expect("open the file");
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({EVENTS_TABLE})"))
+        let rows = log
+            .query(&format!("PRAGMA table_info({EVENTS_TABLE})"), vec![])
+            .await
             .expect("table_info");
-        let live: Vec<SchemaColumn> = stmt
-            .query_map([], |row| {
-                Ok(SchemaColumn {
-                    name: row.get::<_, String>("name")?,
-                    declared_type: row.get::<_, String>("type")?,
-                    pk: row.get::<_, i64>("pk")? > 0,
-                })
+        let live: Vec<SchemaColumn> = rows
+            .iter()
+            .map(|row| SchemaColumn {
+                name: row["name"].as_str().expect("a column name").to_string(),
+                declared_type: row["type"].as_str().expect("a declared type").to_string(),
+                pk: row["pk"].as_i64().expect("a pk flag") > 0,
             })
-            .expect("read the columns")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("read the columns");
+            .collect();
 
         assert_eq!(live, events_schema().expect("published schema"));
+        drop(log);
+        assert!(logs.shutdown().await.is_empty(), "the log closed cleanly");
     }
 }

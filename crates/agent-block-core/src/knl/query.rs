@@ -26,13 +26,24 @@
 //!
 //! # One pass, and it ends in `?`
 //!
-//! The backend binds **positional** parameters and nothing else, so this
-//! module hands it a statement whose every parameter is a bare `?` and a
-//! `Vec<Value>` in the same order ([`QueryPlan::values`]).  Resolution used to
-//! be split — the text rewritten here, the values matched to SQLite's own
-//! parameter names in the store — and that split is what a positional binder
-//! removes: there is one walk over the statement, and the value pushed for a
-//! token is the value that token gets.
+//! This module hands the backend a statement whose every parameter is a bare
+//! `?` and a `Vec<Value>` in the same order ([`QueryPlan::values`]).
+//! Resolution used to be split — the text rewritten here, the values matched
+//! to SQLite's own parameter names in the store — and that split is what one
+//! positional list removes: there is one walk over the statement, and the
+//! value pushed for a token is the value that token gets.
+//!
+//! **The backend can bind by name now, and the rewrite still stays.**  A
+//! parameter set is one thing or the other — positional, or named — and a
+//! statement here is routinely both: `$stream` and the `$sessions` expansion
+//! are the kernel's slots, the `?` and `:name` in the same text are the
+//! caller's, and there is no one set that binds them together.  Naming the
+//! kernel's slots and requiring the caller to name theirs would be a different
+//! contract, not a simpler one — a caller could then collide with `$stream`,
+//! and `$sessions` is not a slot at all but a list whose length only this walk
+//! knows.  Resolving everything to `?` here is what makes both halves one
+//! ordered list, so this is not a workaround for a binder that could not do
+//! names.
 //!
 //! The rule for the walk is the whole of the contract:
 //!

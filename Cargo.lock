@@ -847,9 +847,9 @@ dependencies = [
 
 [[package]]
 name = "eventsdb-core"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f2c0582941e9fb9947d5827b541077d8c5bad58a9b5763d341c56deff33c474"
+checksum = "76d1bf04c5e0bd20d0c2704c7a5015fe0df1e803b75d44e8671c8e24cc091b67"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "eventsdb-sqlite"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07281073915064e43b1480f25798887e63abc71c606aa6b384652d0600a383b5"
+checksum = "42c64504c4d7dece0c3828fb2fae60b4e934b227184e73761bf9a8d9455eb0a2"
 dependencies = [
  "async-stream",
  "async-trait",
