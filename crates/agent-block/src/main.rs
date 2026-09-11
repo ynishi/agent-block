@@ -7,6 +7,7 @@ mod blocks;
 mod knl;
 mod mcp_serve;
 mod serve;
+mod vendor;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -35,10 +36,11 @@ struct Cli {
 
     /// Run a registered block by name instead of a script by path.
     ///
-    /// Resolved against `<project>/blocks/` then `$AGENT_BLOCK_HOME/blocks/`
-    /// (`<name>.lua` or `<name>/init.lua`), the same registry `agent-block
-    /// mcp` serves — so `--block summarize` here and `run_block` with
-    /// `block = "summarize"` there run the same file.
+    /// Resolved against `<project>/.agent-block/blocks/`, then
+    /// `<project>/blocks/`, then `$AGENT_BLOCK_HOME/blocks/` (`<name>.lua` or
+    /// `<name>/init.lua`), the same registry `agent-block mcp` serves — so
+    /// `--block summarize` here and `run_block` with `block = "summarize"`
+    /// there run the same file.
     #[arg(short = 'b', long, value_name = "NAME")]
     block: Option<String>,
 
@@ -185,6 +187,17 @@ enum Command {
     /// agent-block knl export --session <ID> --as events|messages
     /// ```
     Knl(knl::KnlArgs),
+    /// Write an embedded module into the project, to edit as its own.
+    ///
+    /// The copy lands in `<project>/.agent-block/lib/`, the first tier the
+    /// require path searches, so it is what `require("<name>")` resolves from
+    /// then on. The original stays reachable as `require("embedded.<name>")`.
+    ///
+    /// ```text
+    /// agent-block vendor [--path <dir>] [--force] <name>...
+    /// agent-block vendor --list
+    /// ```
+    Vendor(vendor::VendorArgs),
 }
 
 // Deliberately *not* `#[tokio::main]`: the sandbox has to be installed before
@@ -231,11 +244,15 @@ fn startup() -> anyhow::Result<()> {
     // is a protocol violation, not noise. Nothing logs before this point.
     let cli = Cli::parse();
     // stdio MCP owns stdout; a long-lived manager's logs are what a service
-    // manager collects, and stderr is where it looks; and `knl export` writes
-    // JSON Lines there, where a log line would be a malformed record.
+    // manager collects, and stderr is where it looks; `knl export` writes JSON
+    // Lines there, where a log line would be a malformed record; and `vendor`
+    // writes the paths it wrote, which a caller may well read as a list.
     let log_to_stderr = matches!(
         cli.command,
-        Some(Command::Mcp(_)) | Some(Command::Serve(_)) | Some(Command::Knl(_))
+        Some(Command::Mcp(_))
+            | Some(Command::Serve(_))
+            | Some(Command::Knl(_))
+            | Some(Command::Vendor(_))
     );
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -285,6 +302,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Knl(args)) => {
             return knl::run(args, &cli.project).await;
         }
+        Some(Command::Vendor(args)) => {
+            return vendor::run(args, &cli.project);
+        }
         None => {}
     }
 
@@ -300,8 +320,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .map(|b| b.path.clone())
                 .with_context(|| {
                     format!(
-                        "unknown block '{name}'; registered: [{}] (looked in <project>/blocks/ \
-                         and $AGENT_BLOCK_HOME/blocks/)",
+                        "unknown block '{name}'; registered: [{}] (looked in \
+                         <project>/.agent-block/blocks/, <project>/blocks/ and \
+                         $AGENT_BLOCK_HOME/blocks/)",
                         blocks::names(&registered)
                     )
                 })?

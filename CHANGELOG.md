@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A project's own `.agent-block/` is the first tier of both lookups:
+  `<project>/.agent-block/blocks/` before `<project>/blocks/` before
+  `$AGENT_BLOCK_HOME/blocks/`, and `<project>/.agent-block/lib/` before
+  `<project>/lib/` before `$AGENT_BLOCK_HOME/lib/` (with `script_dir` still
+  ahead of all of them and the embedded sources behind). Only directories that
+  exist are searched, so a project that has never made a copy is unaffected.
+  The order has a reason at each end: the dot directory is the project's own,
+  versioned with it and beside its `.gitignore`, while a file under
+  `~/.agent-block/` answers for every project on the machine — the shared
+  fallback for what every project should have, and the wrong place to make one
+  project behave. The CLI's `-b <name>`, the MCP server's registry and
+  `require` all read the same roots, and the seal is checked over them.
+
+- `agent-block vendor [--path <dir>] [--force] <name>...` and `agent-block
+  vendor --list`: write an embedded module into the project, to edit as its
+  own. Changing an embedded module was already possible — a file of the same
+  name in a `lib/` tier wins — but getting the original out of the binary meant
+  finding the crate's source tree and copying by hand, and such a copy records
+  nothing about where it came from. The copy lands at
+  `<dir>/.agent-block/lib/<name>/init.lua` (`<dir>` defaults to `-p/--project`),
+  `agent` and `coding` with the rest because every embedded entry is reached by
+  `require`, and opens with a
+  header naming the version it came from, what it now answers for, and the
+  `require("embedded.<name>")` that still reaches the original; nothing keeps
+  the two in step afterwards, and the header says so. A module is written
+  whole, sub-modules included, and a dotted name on its own is refused. A
+  sealed module is refused — a copy of the kernel would only fail the next run
+  — and a pack (`policy`, `supervisor`) is written with a warning, because a
+  pack is a value handed to `knl.device` rather than a registry the host reads.
+  An existing copy is left alone unless `--force` says otherwise. `--list`
+  prints what there is: name, `sealed` / `pack`, and `vendored` when this
+  project already has a copy.
+
 - `agent-block knl export --session <ID> --as events|messages`: one session's
   log, as JSON Lines on stdout, one record per line. The reader that wants a
   run's facts most is not the process that wrote them — a job manager, a test,

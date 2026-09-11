@@ -26,10 +26,12 @@
 //! # Where the blocks come from
 //!
 //! The same registry the CLI's `--block <name>` uses (see [`crate::blocks`]):
-//! `<project>/blocks/` and `$AGENT_BLOCK_HOME/blocks/` whenever they exist,
-//! plus any `--block-dir`. So an MCP client configured with just `mcp` and
-//! `--project` serves the project's blocks and the user's, with nothing
-//! spelled out per block and no absolute path in the client config.
+//! `<project>/.agent-block/blocks/`, `<project>/blocks/` and
+//! `$AGENT_BLOCK_HOME/blocks/` whenever they exist, plus any `--block-dir`. So
+//! an MCP client configured with just `mcp` and `--project` serves the
+//! project's blocks and the user's, with nothing spelled out per block and no
+//! absolute path in the client config. The roots are resolved per request, so a
+//! block vendored or written while the server is up is served on the next one.
 //!
 //! # stdout
 //!
@@ -77,7 +79,8 @@ const BLOCK_MIME: &str = "text/x-lua";
 /// `agent-block mcp` arguments.
 #[derive(Debug, Args)]
 pub struct McpArgs {
-    /// Extra directory of blocks to expose, on top of `<project>/blocks/` and
+    /// Extra directory of blocks to expose, on top of
+    /// `<project>/.agent-block/blocks/`, `<project>/blocks/` and
     /// `$AGENT_BLOCK_HOME/blocks/`, which are served whenever they exist.
     /// Repeatable. A block is `<name>.lua` or `<name>/init.lua` directly
     /// inside the directory.
