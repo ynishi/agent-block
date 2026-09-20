@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-09-20
+
 ### Added
 
 - A project's own `.agent-block/` is the first tier of both lookups:
@@ -76,6 +78,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no report, so "what did this run forget, and when" is a view rather than a
   guess from the size of the tool results.
 
+- `job.defer(reason)` and `outcome = "deferred"`: a block that looks at what
+  it needs before it starts (an endpoint, a pod) and finds it not there
+  raises this, the process exits 75 (sysexits `EX_TEMPFAIL`), and the job
+  manager records the run as `deferred` — neither `ok` nor `failed`, so a
+  list of runs shows a pod that was down as that. The manager keeps no
+  count and no backoff: the check is the block's first lines, as systemd's
+  `ExecCondition=` is a unit's, and how many deferrals are too many is the
+  lane's question. Observed under a manager: six identical runs two
+  minutes apart, all recorded `ok` because the block reported the failure
+  in its value, and nothing in the list said the endpoint was gone.
+- `LLMPort:probe(conf)`: is the server behind a Port up and serving, in one
+  GET and no tokens — `/health` on the compatible servers (vLLM, llama.cpp,
+  TGI: 200 / 503), the models list on api.openai.com and Anthropic — read
+  as `{ alive, kind = ok | unavailable | down | unreachable, status?,
+  message? }`. The adapters' `health(spec)` behind it, `llm_proto.ping` and
+  `llm_proto.health_of` under that.
+
+- `policy.repeat_cap`: a wrapper over a device's `tools` that refuses the
+  same call — tool and arguments — past a count when nothing has changed in
+  between. A model whose window has dropped an old read asks for it again,
+  and again when that drops too, and never edits; measured against a file
+  larger than the window, one range was read eleven times. The count is read
+  off the log through a binder (`policy.repeat_cap{ max, resets }(session)`),
+  as `carry` reads its note, so a restarted process counts the same; a
+  successful call of a tool in `resets` (an edit) starts every count over.
+  The refusal is a return value the kernel records and the model reads.
+- `coding` (`require("coding")`), an embedded consumer beside `agent`:
+  `coding.run{ spec, targets, verify, repo?, llm = { port, conf }, iters?,
+  turns?, timeout?, store? }` edits the target files through path-locked
+  `std.fs` tools until the verify command passes, with the spec as the
+  pinned seed, large files entering as a structural map of their
+  declaration lines, and every part in a seam the kernel already has —
+  `window{fit, keep_seed}`, `result_cap`, `repeat_cap`, `carry`,
+  `stagnation`, `verdict{timeout}` — plus the grant of beats on the session.
+  It answers `{ ok, iters, summary, session, baseline_ok?, failure_reason?,
+  last_error? }` and holds nothing the seams do not: no retry policy, no
+  branch on a model's name, no commit or branch of its own. The verify runs
+  once before the first beat (`baseline = false` opts out), so the record
+  has the run's starting point, `timeout` takes its first measurement from
+  it, and a repository that was red before the model touched it says so in
+  the seed and in every failure after — a continuation run over an earlier
+  attempt's worktree is red this way as a matter of course, and a model
+  that cannot tell "still failing" from "you broke it" edits the wrong
+  thing. `failure_reason = "no_edits"` names three iterations with no edit
+  landed, which a caller retries differently from a build that stays red. `compile_loop` sold the same
+  job as a block with a loop and a fold of its own and went in 0.38.0 when
+  the seams could carry every part; this is the wiring, promoted the way
+  the four-layer table says a module is — proven in a lane that ran it
+  unattended against a real repository, then a second consumer wanted it.
+  Copy-on-write like `agent`: a project's `lib/coding/init.lua` shadows it.
+- `examples/coding_loop.lua`: `coding.run` from the shell — the spec is
+  `--prompt`, targets / verify / repo the environment, the provider Anthropic
+  or any OpenAI-compatible server — returning one JSON string, so as a block
+  with a `job.toml` beside it `agent-block serve` runs it unattended.
+- A run's record carries the block's answer. `agent-block -s` gained
+  `--result <FILE>` (or `result` in `--config`; no env binding, see below):
+  the value the script returned, written verbatim — the CLI printed it
+  nowhere, and stdout is the logs. `agent-block serve` points each run at
+  `runs/<job>/<run_id>.result` under its home and
+  records what came back as `run_ended.result` (whole up to 64 KiB;
+  past that `result_path` and `result_truncated`), and `GET /runs`,
+  `GET /runs/<id>`, `runs_list` and `run_get` answer it, decoded when it is
+  JSON. The same block called through `run_block` already handed its value
+  to the caller; a run is not a second contract.
+- `agent-block mcp` carries the job manager's five verbs as tools —
+  `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` — each one
+  route of `agent-block serve`'s HTTP listener, sent over loopback with the
+  token the manager minted (`--serve-url` names the manager; the default is
+  the manager's default bind). The MCP server is a client of the manager and
+  nothing more: it neither starts it nor waits on a run, and when the manager
+  is not running the tool says so.
+- `agent-block serve`: a thin job manager. A block that has a `job.toml`
+  beside it (`every = "2m"`, `timeout = "10m"`, `prompt`, `context`) is run
+  on that interval, each run in a process of its own — `agent-block -s
+  <block>` in the block's project root, with its own `.env`, labelled
+  `job=<name>` / `run=<run_id>` on its project's log — and the manager
+  records every start and end on a session log
+  of its own (`$AGENT_BLOCK_HOME/serve.sqlite`), which is the only thing it
+  reads to decide: one live run per job, `every` counted from the previous
+  end, a manager-wide `--max-runs`, a run that never ended closed as `lost`
+  on the next start. The manager holds no state of its own; a restart
+  continues the same record (each start opens a session of its own and reads
+  across all of them with the kernel's `$sessions`). It answers over a
+  loopback HTTP listener (`--bind`,
+  default `127.0.0.1:7788`; a bearer token minted into
+  `$AGENT_BLOCK_HOME/serve.token` is required on every request): `GET /jobs`,
+  `GET /runs`, `GET /runs/<id>`, `POST /jobs/<name>/runs` (run now),
+  `DELETE /runs/<id>` (stop). The unit a service manager holds is this one
+  process; a lane adds or removes a job by adding or removing a file.
+  `docs/runbooks/job-serve.md` has the systemd and launchd units.
+- `job` (`require("job")`): the manager's Lua — `decl` / `read` / `tick` /
+  `run` / `reconcile` / `runs` / `request` / `stop`. `tick` is a pure
+  function of the declarations, the facts read off the log, and the time, so
+  the decision is specified without a clock or a process; `run` is a record,
+  a `sh.exec`, and a record.
+- `bus.on("http", ...)` has a source: `BlockConfig::http_source` starts an
+  axum listener whose every request becomes an event (`{ method, path,
+  query, body }`) and whose handler's `{ status?, body? }` is the response.
+  `Host` and `Origin` must name a loopback host or the bound address (a 403
+  otherwise — a loopback bind alone does not stop DNS rebinding), and a
+  configured bearer token is required (401). Nothing that fails those checks
+  reaches Lua.
+- `sh.exec` says `timed_out = true` on a result that hit its `timeout`,
+  beside the `error` message it already carried, so a caller can tell a
+  command that did not answer from one that could not start without reading
+  prose.
+- `agent-block -s --label key=value` (repeatable): every `knl` session this
+  run opens is labelled with it, under the `meta` of its `session_opened`. A
+  value is read as JSON when it parses as a scalar (`n=2`, `retried=true`)
+  and as text otherwise — `meta`'s own vocabulary. This is what a caller
+  running the same block over and over needs to tell the runs apart
+  afterwards, and it replaces giving each run a database of its own: one
+  project, one log, runs told apart by what they were labelled. No env
+  binding, deliberately — it names one run, and an environment variable is
+  inherited by every process the block starts.
+- `agent-block -s --config <FILE>`: one run's own inputs as a JSON file —
+  `{ prompt, context, result, labels }` — read before the environment and
+  the flags, later winning. One argument instead of four for a caller that
+  starts runs, and free text stops going through shell quoting on the way.
+  A misspelled key is refused rather than a run that silently went without
+  its prompt. `job.run` writes the file beside the run's result
+  (`runs/<job>/<run_id>.config`) and `job.command` names it, so a run's
+  command line is three arguments and no environment.
+- `knl.open{ meta = … }`: a session opened with labels, written on its
+  `session_opened` and carried through `open_child`. A script's
+  own `meta` wins on a key `--label` also names. `knl.views.sessions` lists
+  every session in the log with the `meta` it was opened with, as the
+  column's own JSON text, so "which run was this" is
+  `json_extract(meta, '$.run')` on one database rather than a path to a
+  database per run.
+
 ### Changed
 
 - The kernel's event store is eventsdb 0.5.0. Two things change for a caller.
@@ -95,40 +228,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not fit; the message used to call that "the newest beat", which reads
   as a window regression. It now says the history is unmarked, what it
   counted, and the two ways to mark it.
-
-### Fixed
-
-- A query whose statement does not compile is a `validation` error again, not
-  a `storage` one. The store underneath has no statement class and files a
-  misspelled column or a syntax error with the disk faults, so a reader that
-  asked for a column the schema no longer has was told the store was unwell
-  rather than that its statement was — and a fallback that branches on the
-  class took the wrong branch. The query path now reads SQLite's own wording
-  back (`no such column`, `no such table`, `no such function`, `syntax error`,
-  `near "`, `wrong number of arguments`, `ambiguous column name`) and answers
-  `validation: sql: <reason>` for those, leaving every other failure — busy,
-  timeout, a real store fault — exactly where it was. A statement class in the
-  store itself is asked for separately; this stands in until it lands.
-
-### Docs
-
-- What the exit code says, in the README: `0` ran and returned, `75` did not
-  start (`job.defer`), `1` raised or never got to run, `2` did not parse.
-  A block that reports failure in its return value exits `0`, so a caller
-  testing `$?` alone will not see it, and a caller testing only for non-zero
-  reads a `deferred` run as a failure. The runbook says which outcome the
-  manager reads off each of them.
-- How to stop a run, in the job-serve runbook and the MCP guide: `run_stop`
-  (`DELETE /runs/<id>`), which kills the run's process group and records
-  `stopped` — not a kill by pid, which records `failed` and loses the
-  difference between a run that broke and one somebody stopped, and not a
-  `pkill -f`, which misses the grandchildren and matches the shell that
-  issued it. The order when the run's endpoint is going away too:
-  `runs_list` → `run_stop` → read `stopped` back → take the endpoint down.
-  `runs_list` and `run_stop` say the same in their tool descriptions, and
-  `deferred` joins the outcome vocabulary they list.
-
-### Changed
 
 - The beat a fact belongs to is `meta.beat`, not a key of the envelope. An
   event is `kind` / `meta` / `data` and the kernel's stamps at the top, and
@@ -203,115 +302,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predicate for a loop that wants one, and the coding block still does
   not stack one on top.
 
-### Added
-
-- `job.defer(reason)` and `outcome = "deferred"`: a block that looks at what
-  it needs before it starts (an endpoint, a pod) and finds it not there
-  raises this, the process exits 75 (sysexits `EX_TEMPFAIL`), and the job
-  manager records the run as `deferred` — neither `ok` nor `failed`, so a
-  list of runs shows a pod that was down as that. The manager keeps no
-  count and no backoff: the check is the block's first lines, as systemd's
-  `ExecCondition=` is a unit's, and how many deferrals are too many is the
-  lane's question. Observed under a manager: six identical runs two
-  minutes apart, all recorded `ok` because the block reported the failure
-  in its value, and nothing in the list said the endpoint was gone.
-- `LLMPort:probe(conf)`: is the server behind a Port up and serving, in one
-  GET and no tokens — `/health` on the compatible servers (vLLM, llama.cpp,
-  TGI: 200 / 503), the models list on api.openai.com and Anthropic — read
-  as `{ alive, kind = ok | unavailable | down | unreachable, status?,
-  message? }`. The adapters' `health(spec)` behind it, `llm_proto.ping` and
-  `llm_proto.health_of` under that.
-
-- `policy.repeat_cap`: a wrapper over a device's `tools` that refuses the
-  same call — tool and arguments — past a count when nothing has changed in
-  between. A model whose window has dropped an old read asks for it again,
-  and again when that drops too, and never edits; measured against a file
-  larger than the window, one range was read eleven times. The count is read
-  off the log through a binder (`policy.repeat_cap{ max, resets }(session)`),
-  as `carry` reads its note, so a restarted process counts the same; a
-  successful call of a tool in `resets` (an edit) starts every count over.
-  The refusal is a return value the kernel records and the model reads.
-- `coding` (`require("coding")`), an embedded consumer beside `agent`:
-  `coding.run{ spec, targets, verify, repo?, llm = { port, conf }, iters?,
-  turns?, timeout?, store? }` edits the target files through path-locked
-  `std.fs` tools until the verify command passes, with the spec as the
-  pinned seed, large files entering as a structural map of their
-  declaration lines, and every part in a seam the kernel already has —
-  `window{fit, keep_seed}`, `result_cap`, `repeat_cap`, `carry`,
-  `stagnation`, `verdict{timeout}` — plus the grant of beats on the session.
-  It answers `{ ok, iters, summary, session, baseline_ok?, failure_reason?,
-  last_error? }` and holds nothing the seams do not: no retry policy, no
-  branch on a model's name, no commit or branch of its own. The verify runs
-  once before the first beat (`baseline = false` opts out), so the record
-  has the run's starting point, `timeout` takes its first measurement from
-  it, and a repository that was red before the model touched it says so in
-  the seed and in every failure after — a continuation run over an earlier
-  attempt's worktree is red this way as a matter of course, and a model
-  that cannot tell "still failing" from "you broke it" edits the wrong
-  thing. `failure_reason = "no_edits"` names three iterations with no edit
-  landed, which a caller retries differently from a build that stays red. `compile_loop` sold the same
-  job as a block with a loop and a fold of its own and went in 0.38.0 when
-  the seams could carry every part; this is the wiring, promoted the way
-  the four-layer table says a module is — proven in a lane that ran it
-  unattended against a real repository, then a second consumer wanted it.
-  Copy-on-write like `agent`: a project's `lib/coding/init.lua` shadows it.
-- `examples/coding_loop.lua`: `coding.run` from the shell — the spec is
-  `--prompt`, targets / verify / repo the environment, the provider Anthropic
-  or any OpenAI-compatible server — returning one JSON string, so as a block
-  with a `job.toml` beside it `agent-block serve` runs it unattended.
-- A run's record carries the block's answer. `agent-block -s` gained
-  `--result <FILE>` (`AGENT_BLOCK_RESULT_PATH`): the value the script
-  returned, written verbatim — the CLI printed it nowhere, and stdout is the
-  logs. `agent-block serve` points each run at a file beside its log and
-  records what came back as `run_ended.result` (whole up to 64 KiB;
-  past that `result_path` and `result_truncated`), and `GET /runs`,
-  `GET /runs/<id>`, `runs_list` and `run_get` answer it, decoded when it is
-  JSON. The same block called through `run_block` already handed its value
-  to the caller; a run is not a second contract.
-- `agent-block mcp` carries the job manager's five verbs as tools —
-  `jobs_list` / `runs_list` / `run_get` / `job_run` / `run_stop` — each one
-  route of `agent-block serve`'s HTTP listener, sent over loopback with the
-  token the manager minted (`--serve-url` names the manager; the default is
-  the manager's default bind). The MCP server is a client of the manager and
-  nothing more: it neither starts it nor waits on a run, and when the manager
-  is not running the tool says so.
-- `agent-block serve`: a thin job manager. A block that has a `job.toml`
-  beside it (`every = "2m"`, `timeout = "10m"`, `prompt`, `context`) is run
-  on that interval, each run in a process of its own — `agent-block -s
-  <block>` in the block's project root, with its own `.env` and its own
-  session log — and the manager records every start and end on a session log
-  of its own (`$AGENT_BLOCK_HOME/serve.sqlite`), which is the only thing it
-  reads to decide: one live run per job, `every` counted from the previous
-  end, a manager-wide `--max-runs`, a run that never ended closed as `lost`
-  on the next start. The manager holds no state of its own; a restart
-  continues the same record (each start opens a session of its own and reads
-  across all of them with the kernel's `$sessions`). It answers over a
-  loopback HTTP listener (`--bind`,
-  default `127.0.0.1:7788`; a bearer token minted into
-  `$AGENT_BLOCK_HOME/serve.token` is required on every request): `GET /jobs`,
-  `GET /runs`, `GET /runs/<id>`, `POST /jobs/<name>/runs` (run now),
-  `DELETE /runs/<id>` (stop). The unit a service manager holds is this one
-  process; a lane adds or removes a job by adding or removing a file.
-  `docs/runbooks/job-serve.md` has the systemd and launchd units.
-- `job` (`require("job")`): the manager's Lua — `decl` / `read` / `tick` /
-  `run` / `reconcile` / `runs` / `request` / `stop`. `tick` is a pure
-  function of the declarations, the facts read off the log, and the time, so
-  the decision is specified without a clock or a process; `run` is a record,
-  a `sh.exec`, and a record.
-- `bus.on("http", ...)` has a source: `BlockConfig::http_source` starts an
-  axum listener whose every request becomes an event (`{ method, path,
-  query, body }`) and whose handler's `{ status?, body? }` is the response.
-  `Host` and `Origin` must name a loopback host or the bound address (a 403
-  otherwise — a loopback bind alone does not stop DNS rebinding), and a
-  configured bearer token is required (401). Nothing that fails those checks
-  reaches Lua.
-- `sh.exec` says `timed_out = true` on a result that hit its `timeout`,
-  beside the `error` message it already carried, so a caller can tell a
-  command that did not answer from one that could not start without reading
-  prose.
-
-### Changed
-
 - The `serve` runbook's systemd and launchd units set `PATH`. A run inherits
   the manager's environment, and a service manager's is the system default
   without the user's toolchains: a block that runs `agent-block` or `cargo`
@@ -321,7 +311,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports failure in its return value ends `ok`, and a block whose work could
   not be done should raise.
 
+- The MCP guide says what this surface is for, and what it is not. A stdio
+  server is a subprocess of its client, so a run still going when the client's
+  session ends goes with it, and the environment is the one the client launched
+  the server with rather than the caller's shell — `AGENT_BLOCK_KNL_PATH` set
+  per run reaches the shell that set it and nothing else, so every run through
+  this server writes to the one session log resolved at startup. Both are
+  properties of the transport, not gaps to close: a stdio server outliving its
+  client would be the bug. What the guide adds is the consequence — the blocks
+  that belong here are the ones whose answer belongs in the conversation, long
+  work gets its own process through the CLI owned by whatever schedules it, and
+  a block that wants its own log takes the path as an argument and opens with
+  `store = { sqlite = <path> }`. Long blocks still run; they are not refused.
+
+### Removed
+
+- `AGENT_BLOCK_PROMPT`, `AGENT_BLOCK_CONTEXT` and `AGENT_BLOCK_RESULT_PATH`
+  are no longer read. The three name one run, and an environment variable is
+  inherited: a block that started another `agent-block` handed its child its
+  own prompt and its own result file to write over, and the child took them
+  by just not passing the flags. They are `--prompt` / `--context` /
+  `--result`, or the same keys in `--config`. What belongs to the host rather
+  than to a run — where the databases live, the sandbox, `AGENT_BLOCK_HOME` —
+  stays in the environment, read from the project's `.env`.
+- A run under `agent-block serve` no longer gets a database of its own.
+  `job.command` starts it with `--label job=<name> --label run=<run_id>` and
+  names no store, so the block writes to its project's log like every other
+  run of it; `AGENT_BLOCK_KNL_PATH` is gone from the command, and with it the
+  `log` field on `run_started` and the `log` column on the run views. The
+  per-run database answered "which run was this?" by breaking the rule above
+  it — the project's log stopped being one stream to read. The label answers
+  the same question inside that one log (`knl.views.sessions`, or
+  `json_extract(meta, '$.run')`). The manager still keeps
+  `runs/<job>/<run_id>.result`: that is the block's answer, not a log.
+
 ### Fixed
+
+- A query whose statement does not compile is a `validation` error again, not
+  a `storage` one. The store underneath has no statement class and files a
+  misspelled column or a syntax error with the disk faults, so a reader that
+  asked for a column the schema no longer has was told the store was unwell
+  rather than that its statement was — and a fallback that branches on the
+  class took the wrong branch. The query path now reads SQLite's own wording
+  back (`no such column`, `no such table`, `no such function`, `syntax error`,
+  `near "`, `wrong number of arguments`, `ambiguous column name`) and answers
+  `validation: sql: <reason>` for those, leaving every other failure — busy,
+  timeout, a real store fault — exactly where it was. A statement class in the
+  store itself is asked for separately; this stands in until it lands.
 
 - After a restart, a requested run never began. Whether a request had been
   answered was read by `seq` — a later `run_started` of the same job — and
@@ -372,20 +408,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux-only dependency to a Unix one, because `killpg` is POSIX and the macOS
   builds need it too.
 
-### Changed
+### Docs
 
-- The MCP guide says what this surface is for, and what it is not. A stdio
-  server is a subprocess of its client, so a run still going when the client's
-  session ends goes with it, and the environment is the one the client launched
-  the server with rather than the caller's shell — `AGENT_BLOCK_KNL_PATH` set
-  per run reaches the shell that set it and nothing else, so every run through
-  this server writes to the one session log resolved at startup. Both are
-  properties of the transport, not gaps to close: a stdio server outliving its
-  client would be the bug. What the guide adds is the consequence — the blocks
-  that belong here are the ones whose answer belongs in the conversation, long
-  work gets its own process through the CLI owned by whatever schedules it, and
-  a block that wants its own log takes the path as an argument and opens with
-  `store = { sqlite = <path> }`. Long blocks still run; they are not refused.
+- What the exit code says, in the README: `0` ran and returned, `75` did not
+  start (`job.defer`), `1` raised or never got to run, `2` did not parse.
+  A block that reports failure in its return value exits `0`, so a caller
+  testing `$?` alone will not see it, and a caller testing only for non-zero
+  reads a `deferred` run as a failure. The runbook says which outcome the
+  manager reads off each of them.
+- How to stop a run, in the job-serve runbook and the MCP guide: `run_stop`
+  (`DELETE /runs/<id>`), which kills the run's process group and records
+  `stopped` — not a kill by pid, which records `failed` and loses the
+  difference between a run that broke and one somebody stopped, and not a
+  `pkill -f`, which misses the grandchildren and matches the shell that
+  issued it. The order when the run's endpoint is going away too:
+  `runs_list` → `run_stop` → read `stopped` back → take the endpoint down.
+  `runs_list` and `run_stop` say the same in their tool descriptions, and
+  `deferred` joins the outcome vocabulary they list.
 
 ## [0.38.0] - 2026-09-06
 
