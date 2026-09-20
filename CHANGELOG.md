@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.39.0] - 2026-09-20
-
 ### Added
 
 - `agent-block knl sessions [--after <ID>] [--limit <N>] [--store <PATH>]` and
@@ -38,6 +36,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has nothing to run: the kernel builds no eventsdb projections. And
   `Filter::stream_prefix` selects nothing meaningful here, because this
   kernel's session ids are UUIDs.
+
+### Changed
+
+- The kernel's event store is eventsdb 0.6.0, and nothing in that release
+  breaks a caller — every entry is an addition, and the one type that grew a
+  field is `#[non_exhaustive]` — so the move is a version and the two
+  subcommands above. What it gives us is the two things a caller could not
+  build from outside: a log that is open and being written to can be copied
+  consistently, and the store itself can now be watched. The `tracing` feature
+  is on, which is `dep:tracing` and nothing else — the spans are at `debug`
+  and the events at `trace`/`warn`, and this binary's subscriber defaults to
+  `info`, so it costs nothing at the default level. What it shows is what a
+  wrapper around the call cannot see, because it is inside the call: how long
+  the write lock was held, which batch a projection took, whether a
+  subscription woke on the commit channel or on the poll.
+
+- `AGENT_BLOCK_LOG_SPANS=1` turns every span's close into a log line. Most of
+  what the store reports is a span with no event inside it — the fields and
+  the duration are the whole of it — and the default formatter prints events
+  only, showing the spans around them as context, so those paths were silent
+  at any filter level. With the switch on they read as
+  `eventsdb.append{stream=… count=1 position=42}: close time.busy=27µs`, so
+  the two halves together are
+  `AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug`. It is off by
+  default because it is every span in the process, this binary's own
+  included.
+
+## [0.39.0] - 2026-09-20
+
+### Added
 
 - A project's own `.agent-block/` is the first tier of both lookups:
   `<project>/.agent-block/blocks/` before `<project>/blocks/` before
@@ -238,30 +266,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database per run.
 
 ### Changed
-
-- The kernel's event store is eventsdb 0.6.0, and nothing in that release
-  breaks a caller — every entry is an addition, and the one type that grew a
-  field is `#[non_exhaustive]` — so the move is a version and the two
-  subcommands above. What it gives us is the two things a caller could not
-  build from outside: a log that is open and being written to can be copied
-  consistently, and the store itself can now be watched. The `tracing` feature
-  is on, which is `dep:tracing` and nothing else — the spans are at `debug`
-  and the events at `trace`/`warn`, and this binary's subscriber defaults to
-  `info`, so it costs nothing at the default level. What it shows is what a
-  wrapper around the call cannot see, because it is inside the call: how long
-  the write lock was held, which batch a projection took, whether a
-  subscription woke on the commit channel or on the poll.
-
-- `AGENT_BLOCK_LOG_SPANS=1` turns every span's close into a log line. Most of
-  what the store reports is a span with no event inside it — the fields and
-  the duration are the whole of it — and the default formatter prints events
-  only, showing the spans around them as context, so those paths were silent
-  at any filter level. With the switch on they read as
-  `eventsdb.append{stream=… count=1 position=42}: close time.busy=27µs`, so
-  the two halves together are
-  `AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug`. It is off by
-  default because it is every span in the process, this binary's own
-  included.
 
 - The kernel's event store is eventsdb 0.5.0. Two things change for a caller.
   Opening a store file another process is holding now waits the busy timeout
