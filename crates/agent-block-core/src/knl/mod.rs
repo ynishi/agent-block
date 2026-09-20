@@ -367,7 +367,7 @@ pub use event_store::{
     SplitDecision, Upcaster, CURRENT_SCHEMA_VERSION, SCHEMA_VERSION_FIELD,
 };
 pub use history::History;
-pub use logs::Logs;
+pub use logs::{Logs, SessionInfo};
 pub use query::{QueryOpts, QueryParams, QueryPlan, QueryRows, DEFAULT_LIMIT, DEFAULT_TIMEOUT_MS};
 pub use scope::{Scope, ScopeId};
 pub use session::{

@@ -9,10 +9,21 @@
 //! one record per line, and nothing to install.
 //!
 //! ```text
-//! agent-block knl export --session <ID> --as events|messages [--store <PATH>]
+//! agent-block knl export   --session <ID> --as events|messages [--store <PATH>]
+//! agent-block knl sessions [--after <ID>] [--limit <N>]         [--store <PATH>]
+//! agent-block knl backup   --to <PATH>                          [--store <PATH>]
 //! ```
 //!
-//! Two forms, and the difference is who the answer is for:
+//! `export` needs an id, and from outside the process there is no way to
+//! learn one — the only listing of a store's sessions has been
+//! `knl.views.sessions`, which is Lua running inside the host. `sessions` is
+//! that listing on the command line. `backup` is the other thing a reader
+//! outside the process cannot do for itself: copy a store that something is
+//! writing to, which `cp` of a WAL database with a writer open is not (the
+//! `-wal` file holds committed pages the main file does not yet, so a copy
+//! taken between two writes can carry half a transaction).
+//!
+//! Two forms of `export`, and the difference is who the answer is for:
 //!
 //! - `--as events` is the log as it is stored, upcast to today's shape on the
 //!   way out — the whole record, every kind, nothing folded away. What a
@@ -34,7 +45,10 @@
 //! `0` and the records on stdout, or a one-line `error:` on stderr and `1` —
 //! the binary's ordinary failure path. A session that is not in the store is
 //! that failure and not an empty answer: a reader asking for a run by id and
-//! silently getting nothing back cannot tell a finished run from a typo.
+//! silently getting nothing back cannot tell a finished run from a typo. A
+//! *listing* that comes back empty is not the same thing and is not a
+//! failure: `sessions` was asked which ones are there, and "none" is an
+//! answer to that question.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -57,6 +71,14 @@ use agent_block_core::knl::{EventStore, Logs, SqliteEventStore};
 /// ordinary run is one round trip.
 const PAGE: usize = 512;
 
+/// How many sessions `knl sessions` lists when `--limit` is not given.
+///
+/// A listing of a store has no bound either — a machine that has run the same
+/// block ten thousand times has ten thousand sessions in one database — so
+/// this is a page and says so: the last id printed is the next call's
+/// `--after`.  Large enough that an ordinary project is one call.
+const SESSIONS_PAGE: usize = 1000;
+
 /// `agent-block knl` arguments.
 #[derive(Debug, Args)]
 pub struct KnlArgs {
@@ -73,6 +95,21 @@ pub enum KnlCommand {
     /// agent-block knl export --session s-7 --as messages
     /// ```
     Export(ExportArgs),
+    /// List the sessions in a kernel database as JSON Lines.
+    ///
+    /// What `export --session` needs and a reader outside the host has no
+    /// other way to get.
+    ///
+    /// ```text
+    /// agent-block knl sessions --limit 100
+    /// ```
+    Sessions(SessionsArgs),
+    /// Copy a kernel database, including one that is being written to.
+    ///
+    /// ```text
+    /// agent-block knl backup --to /var/backups/knl-2026-09-11.sqlite
+    /// ```
+    Backup(BackupArgs),
 }
 
 /// `agent-block knl export` arguments.
@@ -98,6 +135,46 @@ pub struct ExportArgs {
     pub form: Form,
 }
 
+/// `agent-block knl sessions` arguments.
+#[derive(Debug, Args)]
+pub struct SessionsArgs {
+    /// The kernel database to list.
+    ///
+    /// Defaults to the project's own, resolved exactly as `export`'s does.
+    #[arg(long, value_name = "PATH")]
+    pub store: Option<PathBuf>,
+
+    /// List the sessions after this id: the last id of the previous call.
+    ///
+    /// Exclusive, so paging is calling again with the id the last line
+    /// printed.
+    #[arg(long, value_name = "ID")]
+    pub after: Option<String>,
+
+    /// How many to list. The last id printed is the next call's `--after`.
+    #[arg(long, value_name = "N", default_value_t = SESSIONS_PAGE)]
+    pub limit: usize,
+    // No `--prefix`, though the store's listing takes one: this kernel mints
+    // session ids as UUIDs, so selecting them by a name prefix would be a
+    // knob with nothing to select. A store whose ids are meaningful names is
+    // not the shape this command reads.
+}
+
+/// `agent-block knl backup` arguments.
+#[derive(Debug, Args)]
+pub struct BackupArgs {
+    /// The kernel database to copy.
+    ///
+    /// Defaults to the project's own, resolved exactly as `export`'s does.
+    #[arg(long, value_name = "PATH")]
+    pub store: Option<PathBuf>,
+
+    /// Where to write the copy. Must not exist: a path that already holds
+    /// anything is refused rather than overwritten.
+    #[arg(long, value_name = "PATH")]
+    pub to: PathBuf,
+}
+
 /// What `--as` selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Form {
@@ -112,23 +189,33 @@ pub enum Form {
 pub async fn run(args: KnlArgs, project: &Path) -> anyhow::Result<()> {
     match args.command {
         KnlCommand::Export(export) => self::export(export, project).await,
+        KnlCommand::Sessions(sessions) => self::sessions(sessions, project).await,
+        KnlCommand::Backup(backup) => self::backup(backup, project).await,
     }
 }
 
-/// `agent-block knl export`: read one session and print it.
-async fn export(args: ExportArgs, project: &Path) -> anyhow::Result<()> {
-    let path = match args.store {
+/// Which database a verb was pointed at: the one `--store` named, or the
+/// project's own.
+///
+/// The existence check is here rather than at the open, because opening
+/// *creates*: a mistyped path would otherwise leave an empty database behind
+/// and then answer out of it, which is true and useless.
+fn store_path(store: Option<PathBuf>, project: &Path) -> anyhow::Result<PathBuf> {
+    let path = match store {
         Some(path) => path,
         None => knl_path(project).map_err(|reason| {
             anyhow::anyhow!("the project's kernel database could not be located: {reason}")
         })?,
     };
-    // Checked before opening, because opening *creates*: a mistyped path
-    // would otherwise leave an empty database behind and report the session
-    // missing from it, which is true and useless.
     if !path.exists() {
         anyhow::bail!("no kernel database at '{}'", path.display());
     }
+    Ok(path)
+}
+
+/// `agent-block knl export`: read one session and print it.
+async fn export(args: ExportArgs, project: &Path) -> anyhow::Result<()> {
+    let path = store_path(args.store, project)?;
 
     // The logs outlive the store and are shut down either way: the reader
     // threads the open started have to be joined before the process leaves,
@@ -139,6 +226,68 @@ async fn export(args: ExportArgs, project: &Path) -> anyhow::Result<()> {
         tracing::warn!(error = %failure, "knl export: a log did not close cleanly");
     }
     printed
+}
+
+/// `agent-block knl sessions`: list what is in the store, one record a line.
+async fn sessions(args: SessionsArgs, project: &Path) -> anyhow::Result<()> {
+    let path = store_path(args.store, project)?;
+
+    let logs = Logs::new();
+    let listed = list_and_print(&path, args.after.as_deref(), args.limit, &logs).await;
+    for failure in logs.shutdown().await {
+        tracing::warn!(error = %failure, "knl sessions: a log did not close cleanly");
+    }
+    listed
+}
+
+/// Read the listing and write it to stdout.
+///
+/// An empty store prints nothing and exits `0`: the question was which
+/// sessions are there, and "none" answers it.
+async fn list_and_print(
+    path: &Path,
+    after: Option<&str>,
+    limit: usize,
+    logs: &Logs,
+) -> anyhow::Result<()> {
+    let sessions = logs
+        .sessions(path, after, limit)
+        .await
+        .with_context(|| format!("listing the sessions in '{}'", path.display()))?;
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for session in &sessions {
+        let record = json!({ "session": session.session, "head_seq": session.head_seq });
+        let line = serde_json::to_string(&record).context("rendering a record as JSON")?;
+        writeln!(out, "{line}").context("writing to stdout")?;
+    }
+    out.flush().context("writing to stdout")
+}
+
+/// `agent-block knl backup`: copy the store, open or not, to a fresh path.
+async fn backup(args: BackupArgs, project: &Path) -> anyhow::Result<()> {
+    let path = store_path(args.store, project)?;
+
+    let logs = Logs::new();
+    let taken = logs.backup(&path, &args.to).await.with_context(|| {
+        format!(
+            "copying the kernel database at '{}' to '{}'",
+            path.display(),
+            args.to.display()
+        )
+    });
+    for failure in logs.shutdown().await {
+        tracing::warn!(error = %failure, "knl backup: a log did not close cleanly");
+    }
+    taken?;
+
+    // One line naming what was written, on stdout, so a caller that took the
+    // backup as part of something else can read the path back.
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    writeln!(out, "wrote {}", args.to.display()).context("writing to stdout")?;
+    out.flush().context("writing to stdout")
 }
 
 /// Open the stream, read it whole, and write the chosen form to stdout.
