@@ -12,12 +12,9 @@
 --   1 targets: an array or a comma / newline string, trimmed, made absolute
 --     under the repo, an absolute path left alone, an empty list refused;
 --   2 numbered: 1-based numbers, a trailing newline does not add a line;
---   3 structural_map: the declaration lines with their numbers and the
---     total line count, the caller's own anchors honoured;
---   4 seed: a small file goes in whole and numbered, a large one as a map
---     naming the read and edit tools, a missing one is left out, and the
---     spec comes first;
---   5 run: the opts it refuses — no spec, no verify, no targets, an llm
+--   3 seed: every file goes in whole and numbered, however large, a missing
+--     one is left out, and the spec comes first;
+--   4 run: the opts it refuses — no spec, no verify, no targets, an llm
 --     without port and conf, a non-integer iteration count.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
@@ -56,20 +53,6 @@ describe("coding.numbered", function()
     end)
 end)
 
-describe("coding.structural_map", function()
-    it("keeps declaration lines with their numbers and counts every line", function()
-        local text = "use x;\n\npub fn a() {}\n    let y = 1;\n#[test]\nfn t() {}\n"
-        local map, total = coding.structural_map(text)
-        expect(map).to.be("3\tpub fn a() {}\n5\t#[test]\n6\tfn t() {}")
-        expect(total).to.be(6)
-    end)
-
-    it("takes the caller's anchors", function()
-        local map = coding.structural_map("alpha\nbeta\ngamma\n", { "^b" })
-        expect(map).to.be("2\tbeta")
-    end)
-end)
-
 describe("coding.seed", function()
     local files = {
         ["/r/small.rs"] = "pub fn a() {}\n",
@@ -87,18 +70,12 @@ describe("coding.seed", function()
         expect(seed:find("none.rs", 1, true)).to.be(nil)
     end)
 
-    it("maps a file past seed_full_max and names the tools", function()
-        local seed = coding.seed("Do it.", { "/r/big.rs" }, {
-            read = read,
-            seed_full_max = 50,
-            read_tool = "fs_read",
-            edit_tool = "fs_search_replace",
-        })
-        expect(seed:find("## Structural map of /r/big.rs (101 lines)", 1, true) ~= nil).to.be(true)
+    it("puts a large file in whole as well — nothing stands in for it", function()
+        local seed = coding.seed("Do it.", { "/r/big.rs" }, { read = read })
+        expect(seed:find("## Current content of /r/big.rs", 1, true) ~= nil).to.be(true)
+        expect(seed:find("1\tx", 1, true) ~= nil).to.be(true)
         expect(seed:find("101\tpub fn big() {}", 1, true) ~= nil).to.be(true)
-        expect(seed:find("fs_read", 1, true) ~= nil).to.be(true)
-        expect(seed:find("fs_search_replace", 1, true) ~= nil).to.be(true)
-        expect(seed:find("1\tx", 1, true)).to.be(nil)
+        expect(seed:find("Structural map", 1, true)).to.be(nil)
     end)
 end)
 
@@ -138,7 +115,7 @@ describe("coding.run — what it refuses", function()
         ).to.be(true)
         expect(
             check.check(
-                { ok = false, iters = 3, summary = "give-up", failure_reason = "no_edits" },
+                { ok = false, iters = 0, summary = "give-up", failure_reason = "seed_overflow" },
                 coding.shapes.run_result
             )
         ).to.be(true)

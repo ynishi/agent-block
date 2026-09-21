@@ -234,7 +234,13 @@ describe("policy.window — fit", function()
     it('the predicate answers "context" where the fold would have raised', function()
         local port = counting_port(12, 10)
         local fold, fits = policy.window({ fit = { port = port }, keep_seed = true })
-        expect(fits(log_of(events), {})).to.be("context")
+        local answer, tokens, limit = fits(log_of(events), {})
+        expect(answer).to.be("context")
+        -- By how much: the smallest candidate's count and the room the
+        -- profile left, so a caller can say it instead of "context".
+        expect(type(tokens)).to.be("number")
+        expect(limit).to.be(2)
+        expect(tokens > limit).to.be(true)
         -- The same question, and the fold is still the one that fails loudly
         -- for a loop that did not ask.
         expect(function()

@@ -38,8 +38,7 @@
 --
 --     the task            `spec`, pinned as the seed the fold keeps
 --     the files           `std.fs.tool_specs` read / search_replace, path-locked
---                         to the targets; a large file enters the spec as a map
---                         of its declaration lines, a small one whole
+--                         to the targets; every target enters the seed whole
 --     what one beat sends `policy.window{ fit, keep_seed }`
 --     what a tool answers `policy.result_cap` (a result may not outgrow a share
 --                         of the window) and `policy.repeat_cap` (the same read
@@ -83,7 +82,6 @@ local M = {}
 
 local DEFAULT_ITERS = 5
 local DEFAULT_TURNS = 8
-local DEFAULT_SEED_FULL_MAX = 16000
 local DEFAULT_TIMEOUT = { first = 900, factor = 3, floor = 60 }
 local DEFAULT_RESULT_SHARE = 0.25
 local DEFAULT_REPEAT_MAX = 2
@@ -91,25 +89,6 @@ local STAGNATION_WINDOW = 3
 local VERIFY_TAIL = 6000
 local FEEDBACK_TAIL = 2000
 local ERROR_TAIL = 800
-
---- Lines that stand for a file's structure when the file is too large to
---- seed whole: declarations, attributes, and their Lua equivalents.
-local DEFAULT_ANCHORS = {
-    "^%s*pub[%s(]",
-    "^%s*fn%s",
-    "^%s*impl[%s<]",
-    "^%s*struct%s",
-    "^%s*enum%s",
-    "^%s*trait%s",
-    "^%s*mod%s",
-    "^%s*const%s",
-    "^%s*static%s",
-    "^%s*type%s",
-    "^%s*macro_rules!",
-    "^%s*#%[",
-    "^%s*local%s+function",
-    "^%s*function%s",
-}
 
 -- ============================================================
 -- Shapes
@@ -139,12 +118,6 @@ local RUN_OPTS = T.shape({
     store = T.any:describe("the session's store, as knl.session takes it; default the host's"):is_optional(),
     owner = T.string:describe('the session\'s owner; default "coding"'):is_optional(),
     system = T.string:describe("the system line; default: the one below, naming the two tools"):is_optional(),
-    anchors = T.table
-        :describe("Lua patterns for the lines a large file is mapped by; default: declarations and attributes")
-        :is_optional(),
-    seed_full_max = T.number
-        :describe("a file up to this many bytes is seeded whole; larger ones as a map; default 16000")
-        :is_optional(),
     result_share = T.number
         :describe("policy.result_cap's share of the window per tool result; default 0.25")
         :is_optional(),
@@ -163,7 +136,7 @@ local RUN_RESULT = T.shape({
         :describe("whether the verify passed before any edit; absent when the baseline was not run")
         :is_optional(),
     failure_reason = T.string
-        :describe("max_iters | no_edits | stagnation | context | stopped | llm_call, when not ok")
+        :describe("seed_overflow | max_iters | no_edits | stagnation | context | stopped | llm_call, when not ok")
         :is_optional(),
     last_error = T.string:describe("the tail of the last verify output or model error, when not ok"):is_optional(),
 })
@@ -232,33 +205,16 @@ function M.numbered(text)
     return table.concat(out, "\n")
 end
 
---- The lines of `text` that match one of `anchors`, numbered, and the
---- total line count — a map of a file too large to seed whole.
-function M.structural_map(text, anchors)
-    anchors = anchors or DEFAULT_ANCHORS
-    local out, n = {}, 0
-    for line in (text .. "\n"):gmatch("(.-)\n") do
-        n = n + 1
-        for _, pat in ipairs(anchors) do
-            if line:match(pat) then
-                out[#out + 1] = string.format("%d\t%s", n, line)
-                break
-            end
-        end
-    end
-    if text:sub(-1) == "\n" then
-        n = n - 1
-    end
-    return table.concat(out, "\n"), n
-end
-
---- The seed: `spec`, then each target as the model should first see it —
---- whole and numbered when small, a structural map when large, absent when
---- it does not exist yet.
+--- The seed: `spec`, then each target whole and line-numbered, absent when
+--- it does not exist yet. A target is not compacted here: the caller wrote
+--- the spec and chose the targets, and one too big to hand over whole is a
+--- narrower target's job, not a lossy substitute made in this module. A
+--- seed that does not fit the window fails the run before its first beat
+--- (`failure_reason = "seed_overflow"`).
 ---
 --- @param spec string
 --- @param targets table  absolute paths
---- @param opts table|nil  { read?, seed_full_max?, anchors?, read_tool?, edit_tool? }
+--- @param opts table|nil  { read? }
 --- @return string seed
 function M.seed(spec, targets, opts)
     opts = opts or {}
@@ -272,35 +228,16 @@ function M.seed(spec, targets, opts)
             f:close()
             return content
         end
-    local full_max = opts.seed_full_max or DEFAULT_SEED_FULL_MAX
-    local read_tool = opts.read_tool or "the read tool"
-    local edit_tool = opts.edit_tool or "the edit tool"
     local out = spec
     for _, path in ipairs(targets) do
         local content = read(path)
         if content ~= nil then
-            if #content <= full_max then
-                out = out
-                    .. "\n\n## Current content of "
-                    .. path
-                    .. "\n(line-numbered as it is NOW; after an edit shifts lines, read the range again "
-                    .. "before editing near it)\n\n"
-                    .. M.numbered(content)
-            else
-                local map, total = M.structural_map(content, opts.anchors)
-                out = out
-                    .. "\n\n## Structural map of "
-                    .. path
-                    .. " ("
-                    .. tostring(total)
-                    .. " lines)\nDeclaration lines with their line numbers — not the file. Pick the region, "
-                    .. "read it with "
-                    .. read_tool
-                    .. " (start_line / end_line, under ~150 lines), then edit with "
-                    .. edit_tool
-                    .. " using the exact text you saw.\n\n"
-                    .. map
-            end
+            out = out
+                .. "\n\n## Current content of "
+                .. path
+                .. "\n(line-numbered as it is NOW; after an edit shifts lines, read the range again "
+                .. "before editing near it)\n\n"
+                .. M.numbered(content)
         end
     end
     return out
@@ -377,12 +314,7 @@ function M._run_impl(opts)
     local size_cap = policy.result_cap({ port = port, conf = conf, share = opts.result_share or DEFAULT_RESULT_SHARE })
     local repeat_cap = policy.repeat_cap({ max = opts.repeat_max or DEFAULT_REPEAT_MAX, resets = { edit_spec.name } })
 
-    local seed = M.seed(opts.spec, targets, {
-        seed_full_max = opts.seed_full_max,
-        anchors = opts.anchors,
-        read_tool = read_spec.name,
-        edit_tool = edit_spec.name,
-    })
+    local seed = M.seed(opts.spec, targets)
     local system = opts.system or M.system(read_spec.name, edit_spec.name)
 
     -- Verify, as a verdict: `timeout` hands the seconds to the run, `changed`
@@ -520,10 +452,27 @@ function M._run_impl(opts)
             -- model said.
             local applied_here, answer, halted = 0, nil, false
             for turn = 1, max_turns do
-                if fits and fits(s, device) ~= nil then
-                    stop("context", "the newest beat does not fit the model's window")
-                    halted = true
-                    break
+                if fits then
+                    local over, tokens, limit = fits(s, device)
+                    if over ~= nil then
+                        -- Before any beat the request is the seed alone, and
+                        -- a seed that does not fit is the caller's targets,
+                        -- not the loop's history: it fails here, at once.
+                        if iters == 0 and turn == 1 then
+                            stop(
+                                "seed_overflow",
+                                string.format(
+                                    "the seed alone is %d tokens and the window leaves %d; name narrower targets",
+                                    tokens,
+                                    limit
+                                )
+                            )
+                        else
+                            stop("context", "the newest beat does not fit the model's window")
+                        end
+                        halted = true
+                        break
+                    end
                 end
                 local sink = {}
                 if not Outcome.match(kernel.beat(s, device), arms(sink)) then

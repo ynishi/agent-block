@@ -938,7 +938,7 @@ end
 ---
 --- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf? }? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request, report
---- @return function|nil fits  fn(session, device) -> nil | "context" (with `fit` only)
+--- @return function|nil fits  fn(session, device) -> nil | "context", tokens, limit (with `fit` only)
 function M.window(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
@@ -1102,12 +1102,14 @@ function M.window(opts)
         )
     end
 
-    --- The same question, asked before the beat rather than inside it.
+    --- The same question, asked before the beat rather than inside it. When
+    --- the answer is `"context"`, the tokens the smallest candidate cost and
+    --- the limit come beside it, so the caller can say by how much.
     local fits = function(session, device)
         needs_session(session, "policy.window fits")
-        local request = largest_fitting(whole_log(session, "policy.window fits"), device or {})
+        local request, _, tokens, limit = largest_fitting(whole_log(session, "policy.window fits"), device or {})
         if request == nil then
-            return "context"
+            return "context", tokens, limit
         end
         return nil
     end
