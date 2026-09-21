@@ -713,9 +713,23 @@ project's own entry-point scripts. A module is written whole,
 sub-modules included
 (`vendor llm_proto` writes `openai.lua` and `anthropic.lua` beside its `init.lua`); you
 cannot vendor `llm_proto.openai` on its own, because half a module on disk and half in
-memory is two versions of it under one name. Step 3 is a change upstream — a pull request —
+memory is two versions of it under one name. A module's **specs go with it**: `vendor
+policy` also writes `.agent-block/lib/policy/spec/*.lua`, the same mlua-lspec specs
+that check the embedded module, so the copy you edit is a copy you can check
+(`just test-lua-project <dir>` runs them with the project's `.agent-block/lib/` first
+on the require path). Step 3 is a change upstream — a pull request —
 and **not** a move to `~/.agent-block/`: a file there answers for every project on the
 machine, which is the opposite of what "this project needs it different" means.
+
+The copy is a plain file, and **git is its history**. `vendor` records where it came
+from (the header names the version) and nothing else; commit the vendor run on its
+own, then edit in later commits, and the three questions a copy raises later all
+have answers in the log: what you changed is `git log -p` on the file, what a newer
+agent-block changed is `git diff` after a `vendor --force` on a clean tree, and
+merging the two is `git merge-file <copy> <the copy at the vendor commit> <the fresh
+copy>`. The patch you would send upstream is `git diff <vendor commit> HEAD --
+.agent-block/lib/<name>/`. There is no `--diff`, no backup file and no hash in the
+header because every one of those is a weaker copy of something git already keeps.
 
 ```text
 agent-block vendor --list         what can be vendored, and what this project already has
@@ -726,9 +740,15 @@ agent-block vendor --force        overwrite a copy that is already there
 `--list` prints one line per embedded root — name, `lib` (everything the binary
 carries is a module to a project), whether it is
 `sealed` or a `pack`, and `vendored` when this project has a copy — with sub-modules
-folded under the root they belong to (`lshape (+t, check, reflect, luacats)`). An
+folded under the root they belong to (`lshape (+t, check, reflect, luacats)`) and the
+spec count beside it (`policy (spec/: 11)`). An
 existing copy is never overwritten without `--force`, because by then it is the
-project's own and likely edited.
+project's own and likely edited; with it the copy is replaced outright, and the edits
+it had are wherever you committed them.
+
+To run the binary's own fixture suite against a project's copies rather than the
+embedded modules, set `AGENT_BLOCK_PROJECT=<dir>`: `-p/--project` reads it, and an
+explicit `-p` still wins.
 
 Two layers answer back. A **sealed** module is refused outright (`knl` is sealed: a
 project cannot shadow it) — the copy would only fail the next run; read it with

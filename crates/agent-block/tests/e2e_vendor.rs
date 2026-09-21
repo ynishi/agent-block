@@ -295,3 +295,67 @@ fn vendoring_a_pack_warns_and_writes_it() {
         .join(".agent-block/lib/policy/init.lua")
         .is_file());
 }
+
+/// A module vendors with its specs: they land under `spec/` beside the copy,
+/// each with a header that says what it is, the listing counts them, and a
+/// spec's `require` of its support file resolves from the copy. A module with
+/// no `spec/` writes only itself.
+#[test]
+fn a_module_vendors_with_its_specs_beside_it() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+    let lib = project.path().join(".agent-block/lib");
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["vendor", "policy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("policy/init.lua"))
+        .stdout(predicate::str::contains("policy/spec/api_spec.lua"))
+        .stdout(predicate::str::contains("policy/spec/support.lua"));
+
+    let spec = std::fs::read_to_string(lib.join("policy/spec/api_spec.lua")).expect("the spec");
+    let mut lines = spec.lines();
+    assert_eq!(
+        lines.next().expect("a header"),
+        format!(
+            "-- vendored from agent-block {} (spec policy/spec/api_spec.lua)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "{spec}"
+    );
+    assert!(
+        lines
+            .next()
+            .expect("a second line")
+            .contains("checks the vendored module"),
+        "{spec}"
+    );
+    assert!(
+        spec.contains("require(\"policy.spec.support\")"),
+        "the spec still reaches its support file by the name it always used"
+    );
+
+    // The listing counts the specs beside the module that has them.
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["vendor", "--list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"(?m)^policy \(spec/: \d+\).*vendored$").expect("re"));
+
+    // `session` has no spec/: only the module itself is written.
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["vendor", "session"])
+        .assert()
+        .success();
+    assert!(
+        !lib.join("session/spec").exists(),
+        "session vendors no spec/"
+    );
+}

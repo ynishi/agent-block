@@ -1,6 +1,17 @@
-//! Runs the repository's mlua-lspec specs: the fixtures in
-//! `crates/agent-block/tests/fixtures/`, and each block's own
-//! `crates/agent-block-core/blocks/lib/<block>/spec/`.
+//! Runs the repository's mlua-lspec specs: each module's own
+//! `crates/agent-block-core/blocks/{,lib/}<module>/spec/`, plus any lspec
+//! fixture left in `crates/agent-block/tests/fixtures/`.
+//!
+//! ```text
+//! lua-spec-runner [<filter>]                 # the repository's specs
+//! lua-spec-runner --project <dir> [<filter>] # a project's vendored specs,
+//!                                            # against its vendored modules
+//! ```
+//!
+//! `--project` is the other half of `agent-block vendor`: a vendored module
+//! is written with its `spec/`, and this runs those specs with the project's
+//! `.agent-block/lib/` first on the require path — the same order the host
+//! uses — so the copy the project edited is the one they check.
 //!
 //! Both are Lua unit tests for the Lua side of the runtime (`blocks/agent`,
 //! `blocks/lib/llm_proto`, `blocks/lib/knl`, `blocks/lib/policy`).
@@ -65,14 +76,19 @@ fn is_spec(source: &str) -> bool {
 fn spec_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![root.join("crates/agent-block/tests/fixtures")];
 
-    let lib = root.join("crates/agent-block-core/blocks/lib");
-    let entries = std::fs::read_dir(&lib).unwrap_or_else(|e| panic!("{}: {e}", lib.display()));
-    let mut block_specs: Vec<PathBuf> = entries
-        .filter_map(|entry| {
+    // Both places a module lives: `blocks/<name>/` (the blocks, `agent` and
+    // `coding`) and `blocks/lib/<name>/` (the libraries). A spec sits in the
+    // `spec/` of whichever its module is in.
+    let blocks = root.join("crates/agent-block-core/blocks");
+    let mut block_specs: Vec<PathBuf> = Vec::new();
+    for parent in [blocks.clone(), blocks.join("lib")] {
+        let entries =
+            std::fs::read_dir(&parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
+        block_specs.extend(entries.filter_map(|entry| {
             let spec = entry.expect("readable directory entry").path().join("spec");
             spec.is_dir().then_some(spec)
-        })
-        .collect();
+        }));
+    }
     // read_dir order is the filesystem's; sort so a run is reproducible.
     block_specs.sort();
 
@@ -105,21 +121,102 @@ fn discover(dir: &Path, filter: Option<&str>) -> Vec<(PathBuf, String)> {
     found
 }
 
+/// The command line: an optional `--project <dir>`, and an optional filter.
+struct Cli {
+    project: Option<PathBuf>,
+    filter: Option<String>,
+}
+
+fn parse_args() -> Result<Cli, String> {
+    let mut args = std::env::args().skip(1);
+    let mut cli = Cli {
+        project: None,
+        filter: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--project" | "-p" => {
+                let dir = args.next().ok_or("--project needs a directory")?;
+                cli.project = Some(PathBuf::from(dir));
+            }
+            s if s.starts_with("--project=") => {
+                cli.project = Some(PathBuf::from(&s["--project=".len()..]));
+            }
+            s if s.starts_with('-') => return Err(format!("unknown option `{s}`")),
+            _ => {
+                if cli.filter.is_some() {
+                    return Err("one filter at most".to_string());
+                }
+                cli.filter = Some(arg);
+            }
+        }
+    }
+    Ok(cli)
+}
+
+/// With `--project <dir>`: the specs a project vendored, each `spec/` under
+/// `<dir>/.agent-block/lib/<module>/`, sorted. Only those — a project's run is
+/// about its copies, and a module it did not vendor is checked by the plain
+/// run against the repository.
+fn project_spec_dirs(project: &Path) -> Vec<PathBuf> {
+    let lib = project.join(".agent-block").join("lib");
+    let Ok(entries) = std::fs::read_dir(&lib) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| {
+            let spec = entry.ok()?.path().join("spec");
+            spec.is_dir().then_some(spec)
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 fn main() -> ExitCode {
+    let cli = match parse_args() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{err}");
+            eprintln!("usage: lua-spec-runner [--project <dir>] [<filter>]");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let root = repo_root();
     let blocks = root.join("crates/agent-block-core/blocks");
-    let dirs = spec_dirs(&root);
 
     // `require("llm_proto")` / `require("knl")` / `require("agent")` resolve
     // against the two directories blocks are laid out in — the same paths for
-    // a fixture and for a spec sitting inside the block it covers.
-    let search: Vec<String> = ["lib", ""]
-        .iter()
-        .map(|sub| blocks.join(sub).display().to_string())
-        .collect();
+    // a fixture and for a spec sitting inside the block it covers. With
+    // `--project`, the project's vendored copies come first, in the same order
+    // the host searches at runtime (`.agent-block/lib/` ahead of embedded), so
+    // a vendored `policy` is the one its vendored spec checks, and a module the
+    // project did not vendor still resolves to the repository's — the closest
+    // stand-in this runner has for the embedded one.
+    let mut search: Vec<String> = Vec::new();
+    if let Some(project) = &cli.project {
+        search.push(
+            project
+                .join(".agent-block")
+                .join("lib")
+                .display()
+                .to_string(),
+        );
+    }
+    search.extend(
+        ["lib", ""]
+            .iter()
+            .map(|sub| blocks.join(sub).display().to_string()),
+    );
     let search: Vec<&str> = search.iter().map(String::as_str).collect();
 
-    let filter = std::env::args().nth(1);
+    let dirs = match &cli.project {
+        Some(project) => project_spec_dirs(project),
+        None => spec_dirs(&root),
+    };
+
+    let filter = cli.filter;
     let mut specs = Vec::new();
     for dir in &dirs {
         specs.extend(discover(dir, filter.as_deref()));
@@ -127,15 +224,29 @@ fn main() -> ExitCode {
 
     if specs.is_empty() {
         // Silence here would read as success. It means the filter matched
-        // nothing, or the specs moved.
-        eprintln!("no specs found under any of:");
-        for dir in &dirs {
-            eprintln!("  {}", dir.display());
+        // nothing, or the specs moved — or, with `--project`, that the
+        // project has vendored nothing that carries a spec.
+        match &cli.project {
+            Some(project) if dirs.is_empty() => eprintln!(
+                "no vendored specs under {}: `agent-block vendor <name>` writes a module \
+                 with its spec/",
+                project.join(".agent-block/lib").display()
+            ),
+            _ => {
+                eprintln!("no specs found under any of:");
+                for dir in &dirs {
+                    eprintln!("  {}", dir.display());
+                }
+            }
         }
         if let Some(f) = filter {
             eprintln!("(filter: {f})");
         }
         return ExitCode::FAILURE;
+    }
+
+    if let Some(project) = &cli.project {
+        println!("project: {} ({} spec dirs)", project.display(), dirs.len());
     }
 
     let mut total_passed = 0;

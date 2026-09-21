@@ -103,6 +103,39 @@ pub fn is_sealed(name: &str) -> bool {
     SEALED.iter().any(|s| *s == name || *s == root)
 }
 
+// `EMBEDDED_SPECS`: every `blocks/**/spec/*.lua`, listed by `build.rs`.
+include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
+
+/// One spec file the binary carries beside a module: the module it checks,
+/// its file name under that module's `spec/`, and the Lua source.
+///
+/// A spec is not `require`d by name and is not on the require path; it is
+/// part of the module the way a test is part of a crate. It is here so a copy
+/// of the module can be written with its specs, and checked by them.
+#[derive(Debug, Clone, Copy)]
+pub struct Spec {
+    /// The root module the spec belongs to (`policy`, `agent`, …).
+    pub module: &'static str,
+    /// The file name under `spec/` (`api_spec.lua`).
+    pub file: &'static str,
+    /// The source, verbatim.
+    pub source: &'static str,
+}
+
+/// The specs of the root module `name`, in file-name order. Empty for a module
+/// that has none, and for a name that is not embedded.
+pub fn specs_of(name: &str) -> Vec<Spec> {
+    EMBEDDED_SPECS
+        .iter()
+        .filter(|(module, _, _)| *module == name)
+        .map(|(module, file, source)| Spec {
+            module,
+            file,
+            source,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +174,29 @@ mod tests {
         assert!(is_sealed("lshape.whatever_comes_next"));
         assert!(!is_sealed("agent"));
         assert!(!is_sealed("llm_proto.openai"));
+    }
+
+    /// The specs come from the tree, not a hand list: a module with a `spec/`
+    /// directory has them, one without has none, and each carries its source.
+    #[test]
+    fn a_module_carries_the_specs_beside_it() {
+        let policy = specs_of("policy");
+        assert!(
+            policy.iter().any(|s| s.file == "api_spec.lua"),
+            "{:?}",
+            policy.iter().map(|s| s.file).collect::<Vec<_>>()
+        );
+        assert!(policy.iter().all(|s| s.module == "policy"));
+        assert!(policy
+            .iter()
+            .find(|s| s.file == "api_spec.lua")
+            .expect("api_spec")
+            .source
+            .contains("lust."));
+        assert!(specs_of("session").is_empty(), "session has no spec/");
+        assert!(specs_of("no_such_module").is_empty());
+        // `agent` and `coding` are blocks, not under `lib/`, and are listed too.
+        assert!(!specs_of("agent").is_empty());
+        assert!(!specs_of("coding").is_empty());
     }
 }

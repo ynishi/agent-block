@@ -58,7 +58,19 @@ struct Cli {
     /// `global` so it can be written on either side of a subcommand: it means
     /// the same thing for a single script and for a served block, and having to
     /// remember which side it goes on is a usage error waiting to happen.
-    #[arg(short = 'p', long, default_value = ".", global = true)]
+    ///
+    /// `AGENT_BLOCK_PROJECT` is the same setting from the environment, for the
+    /// caller that is not this process's own command line: a test suite run
+    /// against a project's vendored copies (`AGENT_BLOCK_PROJECT=<dir> cargo
+    /// test -p agent-block`), a service manager's unit. The flag wins when
+    /// both are given.
+    #[arg(
+        short = 'p',
+        long,
+        default_value = ".",
+        env = "AGENT_BLOCK_PROJECT",
+        global = true
+    )]
     project: PathBuf,
 
     /// Per-RPC timeout for MCP round-trips (seconds). Must be > 0.

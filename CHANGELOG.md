@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A module vendors with its specs. `vendor policy` writes
+  `.agent-block/lib/policy/spec/*.lua` beside `init.lua` — the same mlua-lspec
+  specs that check the embedded module — and `lua-spec-runner --project <dir>`
+  (`just test-lua-project <dir>`) runs a project's vendored specs with its
+  `.agent-block/lib/` first on the require path, so the copy that was edited is
+  the one they check. `--list` shows the count (`policy (spec/: 11)`). The
+  specs are listed by `build.rs` from the tree (`blocks/{,lib/}<module>/spec/`),
+  not by hand; the lspec fixtures for `agent`, `coding` and `llm_proto` moved
+  from `tests/fixtures/` into those `spec/` directories, and `lua-spec-runner`
+  looks in both `blocks/<name>/spec/` and `blocks/lib/<name>/spec/`.
+- `-p/--project` reads `AGENT_BLOCK_PROJECT` from the environment, so a fixture
+  suite (`AGENT_BLOCK_PROJECT=<dir> cargo test -p agent-block`) can be pointed at
+  a project's vendored copies. An explicit `-p` still wins.
+
 - `agent-block knl sessions [--after <ID>] [--limit <N>] [--store <PATH>]` and
   `agent-block knl backup --to <PATH> [--store <PATH>]`: the two questions a
   reader outside the host could not ask of a kernel store. `export --session`
@@ -62,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug`. It is off by
   default because it is every span in the process, this binary's own
   included.
+
+### Docs
+
+- The README's "Overriding a block or a module" says what a vendored copy's
+  history is: git. `vendor` writes a plain file with the version in its
+  header and keeps nothing else — no hash, no `--diff`, no backup on
+  `--force` — because the log of the project the copy lives in answers every
+  question those would (what was edited, what upstream changed, how to merge
+  the two, what to send upstream).
 
 ## [0.39.0] - 2026-09-20
 

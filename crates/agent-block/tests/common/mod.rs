@@ -3,6 +3,14 @@ pub mod openai_mock;
 use assert_cmd::Command;
 
 /// Build and return a Command pointing at the `agent-block` binary.
+///
+/// The project root is not set here. A test that needs one of its own passes
+/// `-p` itself; the rest run with the binary's default (the current
+/// directory, which under `cargo test` is this crate), and the binary reads
+/// `AGENT_BLOCK_PROJECT` for a caller who wants every fixture resolved
+/// against another project's `.agent-block/lib/` — the vendored copies a
+/// project has edited, checked by the same fixtures that check the embedded
+/// modules. An explicit `-p` still wins over the variable.
 #[allow(dead_code)] // used by some integration tests, not all
 pub fn agent_block_cmd() -> Command {
     Command::cargo_bin("agent-block").expect("agent-block binary should exist")
