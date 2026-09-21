@@ -61,7 +61,9 @@
 ---   seam for it, and by what the Port already knows:
 ---
 ---     the window            the Port declares it (`LLMPort:profile`), and
----                           `window{ fit }` / `tokens` ask it
+---                           `window{ fit }` / `tokens` ask it; `fit.reserve`
+---                           is the reply's room, for a wire that sends no
+---                           cap of its own
 ---     what a tool may do    `tool_policy` on the device, reading the log
 ---     what a request says   `fold` (what is sent) and `filters` (a note)
 ---     when to stop          a predicate the loop asks (`stagnation`, and
@@ -959,6 +961,12 @@ end
 --- window is the same one it was. It is a whole number of tokens; a reserve
 --- that would leave the request less than one token raises, naming the three
 --- numbers it was reached from.
+---
+--- A number, and not the largest reply seen so far. That largest is a peak
+--- and not a choice: it holds nothing back until a reply has already been cut
+--- off once, and half the window afterwards [measured 2026-09-14 in the same
+--- lane]. How much room the reply needs is the caller's to say, and a number
+--- is how it is said.
 ---
 ---     policy.window({ fit = { port = port, conf = conf, reserve = 4096 }, keep_seed = true })
 ---
