@@ -15,9 +15,39 @@
 --   3 seed: every file goes in whole and numbered, however large, a missing
 --     one is left out, and the spec comes first;
 --   4 run: the opts it refuses — no spec, no verify, no targets, an llm
---     without port and conf, a non-integer iteration count.
+--     without port and conf, a non-integer iteration count, a `done` that is
+--     neither mode, and `done = "plan"` with no `check_timeout`;
+--   5 decide: what ends a run — the model answering with no tool call while an
+--     edit has landed and the verify is green, and, in plan mode, every check
+--     it filed passing; a green verify alone never ends one;
+--   6 plan_of: the plan tool's input, as an array or as a JSON string, and
+--     what it refuses;
+--   7 plan_report: the counts, the failing check with its exit and tail, and
+--     the note a check that printed nothing gets;
+--   8 system: which ending paragraph each mode states, that no mode means
+--     declare, and that a mode it does not know fails;
+--   9 shapes: a plan-mode result, with and without a failing check.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
+
+if rawget(_G, "std") == nil then
+    -- The pure spec runner carries no host bridges, and `plan_of` reaches for
+    -- `std.json.decode` when a model sends its steps as a string instead of an
+    -- array. This stands in for the host's decoder over the one shape the plan
+    -- tool takes: an array of objects whose values are strings.
+    local function decode(text)
+        local out = {}
+        for object in text:gmatch("%b{}") do
+            local item = {}
+            for key, value in object:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do
+                item[key] = value
+            end
+            out[#out + 1] = item
+        end
+        return out
+    end
+    _G.std = { json = { decode = decode } }
+end
 
 local coding = require("coding")
 
@@ -103,6 +133,25 @@ describe("coding.run — what it refuses", function()
         end).to.fail()
     end)
 
+    it('refuses a done it does not know, and done = "plan" without a check_timeout', function()
+        expect(function()
+            coding.run({ spec = "x", verify = "true", targets = { "a" }, llm = llm, done = "x" })
+        end).to.fail()
+        expect(function()
+            coding.run({ spec = "x", verify = "true", targets = { "a" }, llm = llm, done = "plan" })
+        end).to.fail()
+        expect(function()
+            coding.run({
+                spec = "x",
+                verify = "true",
+                targets = { "a" },
+                llm = llm,
+                done = "plan",
+                check_timeout = 0,
+            })
+        end).to.fail()
+    end)
+
     it("declares its opts and result shapes, baseline and no_edits included", function()
         expect(type(coding.shapes.run_opts)).to.be("table")
         expect(type(coding.shapes.run_result)).to.be("table")
@@ -119,5 +168,159 @@ describe("coding.run — what it refuses", function()
                 coding.shapes.run_result
             )
         ).to.be(true)
+    end)
+end)
+
+describe("coding.decide — what ends a run", function()
+    local base = { declared = true, verify_ok = true, edits_applied = 1 }
+    local function with(over)
+        local f = {}
+        for k, v in pairs(base) do
+            f[k] = v
+        end
+        for k, v in pairs(over) do
+            f[k] = v
+        end
+        return f
+    end
+
+    it("declare: the model answering without a tool call, green, with an edit landed", function()
+        expect(coding.decide("declare", base)).to.be(true)
+    end)
+
+    it("declare: a green verify alone never ends the run", function()
+        expect(coding.decide("declare", with({ declared = false }))).to.be(false)
+    end)
+
+    it("declare: declaring on a red verify, or with nothing edited, does not end it", function()
+        expect(coding.decide("declare", with({ verify_ok = false }))).to.be(false)
+        expect(coding.decide("declare", with({ edits_applied = 0 }))).to.be(false)
+    end)
+
+    it("plan: needs a filed plan with every check passing, on top of declare's facts", function()
+        expect(coding.decide("plan", base)).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 } }))).to.be(true)
+        expect(coding.decide("plan", with({ plan = { total = 3, passed = 2 } }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 0, passed = 0 } }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, declared = false }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, verify_ok = false }))).to.be(false)
+    end)
+end)
+
+describe("coding.plan_of — the plan tool's input", function()
+    it("accepts steps with a step and a check", function()
+        local steps = coding.plan_of({ steps = { { step = "add fn", check = "grep -q 'fn double' src/lib.rs" } } })
+        expect(#steps).to.be(1)
+        expect(steps[1].check).to.be("grep -q 'fn double' src/lib.rs")
+    end)
+
+    it("accepts the same array sent as a JSON string", function()
+        local steps = coding.plan_of({ steps = '[{"step":"add fn","check":"grep -q double src/lib.rs"}]' })
+        expect(#steps).to.be(1)
+        expect(steps[1].step).to.be("add fn")
+        expect(steps[1].check).to.be("grep -q double src/lib.rs")
+    end)
+
+    it("refuses an empty plan, a step without a check, a blank step", function()
+        local s, err = coding.plan_of({ steps = {} })
+        expect(s).to.be(nil)
+        expect(err:find("non%-empty array") ~= nil).to.be(true)
+        s, err = coding.plan_of({ steps = { { step = "x" } } })
+        expect(s).to.be(nil)
+        expect(err:find("steps%[1%].check") ~= nil).to.be(true)
+        s, err = coding.plan_of({ steps = { { step = "  ", check = "true" } } })
+        expect(s).to.be(nil)
+        expect(err:find("steps%[1%].step") ~= nil).to.be(true)
+        expect(coding.plan_of(nil)).to.be(nil)
+    end)
+end)
+
+describe("coding.plan_report — the checks as facts", function()
+    it("counts passes and shows the failing check with its exit and tail", function()
+        local text, passed = coding.plan_report({
+            { step = "add fn", check = "grep -q double src/lib.rs", ok = true, exit_code = 0, tail = "" },
+            { step = "add test", check = "cargo test double", ok = false, exit_code = 101, tail = "error: no test" },
+        })
+        expect(passed).to.be(1)
+        expect(text:sub(1, 30)).to.be("<harness>plan: 1/2 checks pass")
+        expect(text:find("[pass] 1. add fn", 1, true) ~= nil).to.be(true)
+        expect(text:find("[fail] 2. add test", 1, true) ~= nil).to.be(true)
+        expect(text:find("check: cargo test double -> exit 101", 1, true) ~= nil).to.be(true)
+        expect(text:find("error: no test", 1, true) ~= nil).to.be(true)
+        expect(text:sub(-10)).to.be("</harness>")
+    end)
+
+    it("says a failing check printed nothing, so its exit is all it reported", function()
+        local text, passed = coding.plan_report({
+            {
+                step = "twelve tests",
+                check = "test $(grep -c 'fn test_' src/lib.rs) -ge 12",
+                ok = false,
+                exit_code = 1,
+                tail = "",
+            },
+        })
+        expect(passed).to.be(0)
+        expect(text:find("printed nothing", 1, true) ~= nil).to.be(true)
+        expect(text:find("have it print the value", 1, true) ~= nil).to.be(true)
+    end)
+end)
+
+describe("coding.system — states how the run ends", function()
+    it("declare: no tool call + green + an edit; green alone is not the end", function()
+        local sys = coding.system("fs_read", "fs_search_replace", "declare")
+        expect(sys:find("you answer without a tool call", 1, true) ~= nil).to.be(true)
+        expect(sys:find("The verify passing by itself does not end the run", 1, true) ~= nil).to.be(true)
+        expect(sys:find("`plan` tool", 1, true)).to.be(nil)
+    end)
+
+    it("plan: names the plan tool and the checks", function()
+        local sys = coding.system("fs_read", "fs_search_replace", "plan")
+        expect(sys:find("file a plan with the `plan` tool", 1, true) ~= nil).to.be(true)
+        expect(sys:find("every check passes", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("no mode is declare, and a mode it does not know fails", function()
+        expect(coding.system("r", "e")).to.be(coding.system("r", "e", "declare"))
+        expect(function()
+            coding.system("r", "e", "green")
+        end).to.fail()
+    end)
+end)
+
+describe("coding.shapes — done and plan on the result", function()
+    local check = require("lshape").check
+
+    it("accepts a plan-mode result with nothing left failing", function()
+        expect(check.check({
+            ok = true,
+            iters = 2,
+            summary = "PASS in 2 iters",
+            done = "plan",
+            plan = { total = 3, passed = 3, filed = true, failing = {} },
+        }, coding.shapes.run_result)).to.be(true)
+    end)
+
+    it("accepts one that names the check still failing", function()
+        expect(check.check({
+            ok = false,
+            iters = 5,
+            summary = "give-up: max_iters at iter 5/5",
+            done = "plan",
+            failure_reason = "max_iters",
+            plan = {
+                total = 3,
+                passed = 2,
+                filed = true,
+                failing = {
+                    {
+                        step = "twelve tests",
+                        check = "test $(grep -c 'fn test_' src/lib.rs) -ge 12",
+                        exit_code = 1,
+                        tail = "",
+                    },
+                },
+            },
+        }, coding.shapes.run_result)).to.be(true)
     end)
 end)

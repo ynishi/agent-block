@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A `coding.run` ends when the model says it does, and a green verify alone no
+  longer ends one. The verify passing is one fact and never the whole of it: a
+  spec spanning a function and the test it asked for goes green on the part
+  that had to compile while the test is not written yet [measured
+  2026-09-11/12: of 9 runs, the 4 that landed a single edit converged on a
+  green before any test existed]. `done = "declare"` — the default, so a
+  caller that says nothing gets it — ends a run when the model answers WITHOUT
+  a tool call while the verify is green and an edit has landed. `done = "plan"`
+  adds a `plan` tool: the model first files the steps it will take, each with a
+  shell command that exits 0 once that step is done; the harness runs every
+  check after each iteration and hands the results back as facts, and the run
+  ends only when all of them pass as well. `check_timeout` is the seconds one
+  such check may take, and is required in that mode. The result says which mode
+  ran (`done`) and, in plan mode, what the checks came to — `plan =
+  { total, passed, filed, failing }`, where `failing` names the checks still
+  red when the run ended rather than leaving a caller with a count.
+
 - A failed `fs_search_replace` says what is actually there. "Not found" on its
   own was the one failure a model could not act on: it said the guess was
   wrong without saying what the file holds, so a model that believes the code

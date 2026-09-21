@@ -21,6 +21,8 @@
 --   CODING_ITERS     iterations, each ending in a verify (default 5)
 --   CODING_TURNS     beats per iteration before verify runs anyway (default 8)
 --   CODING_BASELINE  "false" skips the verify before the first beat (default: run it)
+--   CODING_DONE      what ends the run: "declare" (default) | "plan"
+--   CODING_CHECK_TIMEOUT  seconds one plan check may take (default 120; "plan" only)
 --
 -- The exit code is 0 whenever the loop ran — `ok` in the value says whether
 -- the verify passed — and non-zero only when it could not run (missing input
@@ -79,6 +81,8 @@ local result = coding.run({
     iters = tonumber(E.get("CODING_ITERS") or "5"),
     turns = tonumber(E.get("CODING_TURNS") or "8"),
     baseline = E.get("CODING_BASELINE") ~= "false",
+    done = E.get("CODING_DONE") or "declare",
+    check_timeout = tonumber(E.get("CODING_CHECK_TIMEOUT") or "120"),
 })
 
 print("[coding_loop] " .. result.summary)
