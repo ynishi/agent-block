@@ -28,10 +28,6 @@
 --   CODING_VERIFY_TIMEOUT  seconds one verify may take, every time (default 900)
 --   CODING_RESULT_SHARE    share of the window one tool result may take (default 0.25)
 --   CODING_REPEAT_MAX      times the same read may be made with no edit between (default 2)
---   CODING_STRICT    "true" makes every loop knob this script's to state
---                    rather than `coding.run`'s. This script names them all,
---                    so under strict it is a guard: a knob dropped from the
---                    call above is refused instead of quietly defaulted
 --
 -- `reserve` and `max_tokens` are the same question asked of two servers: how
 -- much room the reply gets. The anthropic API requires a cap and that cap IS
@@ -98,7 +94,6 @@ local result = coding.run({
     -- The reply's room where the wire carries no cap. On the anthropic path
     -- `max_tokens` already names it and this holds nothing extra back.
     reserve = tonumber(E.get("CODING_RESERVE") or "6144"),
-    strict = E.get("CODING_STRICT") == "true",
     iters = tonumber(E.get("CODING_ITERS") or "5"),
     turns = tonumber(E.get("CODING_TURNS") or "8"),
     timeout = tonumber(E.get("CODING_VERIFY_TIMEOUT") or "900"),
