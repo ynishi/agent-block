@@ -5,7 +5,7 @@
 //! that matters runs a script afterwards and asks the module which copy
 //! answered: vendor `session`, mark the copy, `require("session")`, and read the
 //! mark back. The rest pins what the caller is told along the way — the header
-//! on the copy, the listing, the refusal to overwrite, and the seal.
+//! on the copy, the listing, and the refusal to overwrite.
 
 mod common;
 
@@ -101,7 +101,14 @@ fn the_listing_says_what_this_project_has_already_taken_over() {
             .any(|l| l.starts_with("session") && !l.contains("vendored")),
         "{before}"
     );
-    assert!(before.contains("sealed"), "{before}");
+    // Every root is listed as vendorable; only a pack carries a tag of its own.
+    assert!(
+        before
+            .lines()
+            .any(|l| l.starts_with("knl") && l.contains("lib")),
+        "{before}"
+    );
+    assert!(before.contains("pack"), "{before}");
 
     common::agent_block_cmd()
         .env("AGENT_BLOCK_HOME", home.path())
@@ -159,25 +166,45 @@ fn a_second_vendor_is_refused_unless_forced() {
     );
 }
 
-/// A module that cannot be shadowed cannot be vendored either: handing over a
-/// copy would be handing over a file that fails the next run.
+/// The kernel vendors like every other module: the copy lands on the require
+/// path with the specs that check it, and the header names the original it
+/// came from.
 #[test]
-fn a_sealed_module_is_refused_and_nothing_is_written() {
+fn the_kernel_is_written_with_the_specs_that_check_it() {
     let home = tempdir().expect("tempdir");
     let project = tempdir().expect("tempdir");
+    let target = project.path().join(".agent-block/lib/knl/init.lua");
 
     common::agent_block_cmd()
         .env("AGENT_BLOCK_HOME", home.path())
         .args(["-p", &project.path().to_string_lossy()])
         .args(["vendor", "knl"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("`knl` is sealed"))
-        .stderr(predicate::str::contains("require(\"embedded.knl\")"));
+        .success()
+        .stdout(predicate::str::contains(target.to_string_lossy().as_ref()));
 
+    let written = std::fs::read_to_string(&target).expect("the copy is there");
+    assert_eq!(
+        written.lines().next().expect("a header"),
+        format!(
+            "-- vendored from agent-block {} (embedded knl)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "{written}"
+    );
     assert!(
-        !project.path().join(".agent-block").exists(),
-        "a refusal writes nothing"
+        written.contains("require(\"embedded.knl\")"),
+        "the header names the original: {written}"
+    );
+
+    let specs = project.path().join(".agent-block/lib/knl/spec");
+    let written_specs: Vec<String> = std::fs::read_dir(&specs)
+        .expect("the specs came with it")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !written_specs.is_empty(),
+        "the kernel's specs are what check a replacement: {written_specs:?}"
     );
 }
 

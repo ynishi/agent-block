@@ -15,14 +15,12 @@
 //! agent-block vendor --list
 //! ```
 //!
-//! Three refusals, and each of them is the same point made about a different
-//! name. A **sealed** module is the kernel and its declaration layer; a project
-//! cannot shadow it at all, so handing it a copy would be handing it a file
-//! that fails the next run. A **sub-module** (`lshape.t`) is not a unit: a
-//! module vendors whole, because half of one on disk and half in memory is two
-//! versions of the same module wearing one name. An **existing file** is
-//! whatever the project has already edited, and overwriting it without being
-//! told to would throw that away — `--force` is that telling.
+//! Two refusals, and each of them is the same point made about a different
+//! name. A **sub-module** (`lshape.t`) is not a unit: a module vendors whole,
+//! because half of one on disk and half in memory is two versions of the same
+//! module wearing one name. An **existing file** is whatever the project has
+//! already edited, and overwriting it without being told to would throw that
+//! away — `--force` is that telling.
 //!
 //! A **pack** (`policy`, `supervisor`) vendors, with a warning: it is a value a
 //! script hands to `knl.device`, not a registry the host reads, so a whole copy
@@ -58,7 +56,7 @@ use agent_block_core::host::PROJECT_DIR;
 
 /// The two shell packs: named here because the warning is about what they are,
 /// which is a fact of this crate's own layout rather than of the embedded list
-/// (see the README's "Embedded blocks: four layers").
+/// (see the README's "Embedded blocks: every one is yours to change").
 const PACKS: &[&str] = &["policy", "supervisor"];
 
 /// `agent-block vendor` arguments.
@@ -82,8 +80,8 @@ pub struct VendorArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// List what can be vendored instead of vendoring: name, whether it is
-    /// sealed or a pack, and whether this project already has a copy.
+    /// List what can be vendored instead of vendoring: name, whether it is a
+    /// pack, and whether this project already has a copy.
     #[arg(long, conflicts_with_all = ["names", "force"])]
     pub list: bool,
 }
@@ -171,18 +169,24 @@ pub fn run(args: VendorArgs, project: &Path) -> anyhow::Result<()> {
 
 /// What `name` vendors to, or why it does not.
 fn resolve(name: &str) -> anyhow::Result<Plan> {
-    if embedded::is_sealed(name) {
-        bail!(
-            "`{name}` is sealed: a project cannot shadow it (the kernel is the contract every \
-             block is written against); read it with require(\"embedded.{name}\")"
-        );
-    }
-
     if let Some((root, _)) = name.split_once('.') {
         bail!(
             "`{name}` is part of `{root}`, and a module vendors whole: run `agent-block vendor \
              {root}`, which writes `{root}` and every sub-module it has. Half a module on disk \
              and half in memory is two versions of it under one name."
+        );
+    }
+
+    // `knl_types` is embedded but has no file behind it: the lshape declaration
+    // of the kernel's syscall surface is generated at start from the Rust types.
+    // Without this arm the caller falls through to "not an embedded module",
+    // which is the wrong reason — it is embedded, there is just nothing to copy.
+    if name == "knl_types" {
+        bail!(
+            "`knl_types` is generated at start from the Rust syscall surface, so there is no \
+             file to write out. A filesystem `knl_types` wins over the generated one all the \
+             same: write one if you mean to declare that surface yourself, and read the \
+             generated one with require(\"knl_types\")."
         );
     }
 
@@ -310,7 +314,7 @@ const KIND: &str = "lib";
 struct Row {
     /// The root's name, with its sub-modules in brackets.
     label: String,
-    /// `sealed`, `pack`, or nothing.
+    /// `pack`, or nothing.
     tag: &'static str,
     /// Whether this project already has a copy.
     vendored: bool,
@@ -356,13 +360,7 @@ fn rows(dir: &Path) -> Vec<Row> {
             if specs > 0 {
                 label.push_str(&format!(" (spec/: {specs})"));
             }
-            let tag = if embedded::is_sealed(e.name) {
-                "sealed"
-            } else if PACKS.contains(&e.name) {
-                "pack"
-            } else {
-                ""
-            };
+            let tag = if PACKS.contains(&e.name) { "pack" } else { "" };
             Row {
                 label,
                 tag,
@@ -477,21 +475,14 @@ mod tests {
         assert!(msg.contains("vendors whole"), "{msg}");
     }
 
-    /// A sealed module is refused, root and sub-module alike, and the refusal
-    /// says both why and how to read it anyway.
+    /// The generated declaration has no file behind it, and the refusal says
+    /// that rather than claiming the binary does not carry it.
     #[test]
-    fn a_sealed_name_is_refused_with_the_way_to_read_it() {
-        let err = resolve("knl").expect_err("knl is sealed");
+    fn the_generated_declaration_has_nothing_to_write_out() {
+        let err = resolve("knl_types").expect_err("knl_types is generated, not stored");
         let msg = err.to_string();
-        assert!(msg.contains("`knl` is sealed"), "{msg}");
-        assert!(msg.contains("require(\"embedded.knl\")"), "{msg}");
-
-        // The generated one has no file behind it and is sealed as well, and a
-        // sub-module of a sealed root is answered by the seal, not by the
-        // sub-module rule.
-        assert!(resolve("knl_types").is_err());
-        let err = resolve("lshape.t").expect_err("lshape.t is sealed");
-        assert!(err.to_string().contains("sealed"), "{err}");
+        assert!(msg.contains("generated at start"), "{msg}");
+        assert!(!msg.contains("not an embedded module"), "{msg}");
     }
 
     /// An unknown name is told what there is, roots only — a list including
@@ -541,9 +532,9 @@ mod tests {
     }
 
     /// The listing folds sub-modules under their root, calls every entry what
-    /// it is to a project (a module), marks the two layers a caller should
-    /// think twice about, and says which names this project has already taken
-    /// over.
+    /// it is to a project (a module), marks the packs a whole copy is rarely
+    /// the right change to, and says which names this project has already
+    /// taken over.
     #[test]
     fn the_listing_folds_sub_modules_and_marks_what_is_already_vendored() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -571,7 +562,8 @@ mod tests {
             line("lshape").starts_with("lshape (+t, check, reflect, luacats)"),
             "{listing}"
         );
-        assert!(line("lshape").contains("sealed"), "{listing}");
+        // Vendorable like every other root: no tag of its own.
+        assert!(line("lshape").ends_with("lib"), "{listing}");
         assert!(line("policy").contains("pack"), "{listing}");
         assert!(line("policy").contains("(spec/: "), "{listing}");
         assert!(!line("session").contains("spec/"), "{listing}");

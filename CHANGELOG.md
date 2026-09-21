@@ -209,6 +209,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default because it is every span in the process, this binary's own
   included.
 
+### Removed
+
+- The seal is gone. Every embedded module can be shadowed and vendored, the
+  kernel and its declaration layer included: a `lib/knl/init.lua` is the kernel
+  that run uses, and `agent-block vendor knl` (or `knl_adapter`, or `lshape`)
+  writes the copy with the specs that check it. `AGENT_BLOCK_UNSEAL` no longer
+  exists — there is nothing left for it to downgrade — and `vendor --list` no
+  longer prints a `sealed` column. Every module here is Lua so that a project
+  can change any of it, which is what a runtime that is Lua on top of Rust is
+  for; a module being well tested and a module being replaceable are
+  independent properties, and the seal took the one for the other. What is
+  true, and what the seal stood in for, is that a replacement of the kernel has
+  to keep what the rest of the binary reads by name — and that is said where it
+  can be checked rather than asserted in prose: the module doc of
+  `crates/agent-block-core/src/bridge/knl.rs` for the Rust half, and the specs
+  `vendor knl` writes beside the copy for the Lua half. `knl_types` is still
+  the one embedded module with no file to hand out, being generated at start
+  from the Rust types; a filesystem copy of it wins over the generated one, and
+  `vendor knl_types` now says that rather than calling it sealed.
+
 ### Docs
 
 - The README's "Overriding a block or a module" says what a vendored copy's
