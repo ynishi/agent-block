@@ -275,6 +275,65 @@ fn the_help_gives_both_forms() {
         .stdout(predicate::str::contains("agent-block vendor --list"));
 }
 
+/// The Lua half of a bridge vendors like any module, and the copy is what the
+/// host runs: `std.fs.register_tools` comes from `.agent-block/lib/fs_tools/`
+/// once that exists, with no install in between.
+#[test]
+fn a_vendored_bridge_tool_module_is_the_one_the_host_runs() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+    let target = project.path().join(".agent-block/lib/fs_tools/init.lua");
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["vendor", "fs_tools"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fs_tools/init.lua"));
+
+    // Mark the copy where the host will see it. This module is run for its
+    // effect — it installs `tool_specs` / `register_tools` onto the `std.fs`
+    // the bridge just built and returns nothing — so the mark is one more
+    // statement appended to it, on the same table.
+    let source = std::fs::read_to_string(&target).expect("read the copy");
+    std::fs::write(
+        &target,
+        format!("{source}\nstd.fs.vendored_marker = 'from the copy'\n"),
+    )
+    .expect("write");
+
+    let script = project.path().join("probe.lua");
+    std::fs::write(
+        &script,
+        "print('marker=' .. tostring(std.fs.vendored_marker))\n\
+         print('tools=' .. tostring(type(std.fs.register_tools)))\n",
+    )
+    .expect("write");
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["-s", &script.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("marker=from the copy"))
+        .stdout(predicate::str::contains("tools=function"));
+
+    // And with no copy, the embedded module is what runs — the marker is nil.
+    let bare = tempdir().expect("tempdir");
+    let script2 = bare.path().join("probe.lua");
+    std::fs::copy(&script, &script2).expect("copy");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &bare.path().to_string_lossy()])
+        .args(["-s", &script2.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("marker=nil"))
+        .stdout(predicate::str::contains("tools=function"));
+}
+
 /// A pack is written, with the reason a whole copy is rarely what was meant on
 /// stderr beside it.
 #[test]

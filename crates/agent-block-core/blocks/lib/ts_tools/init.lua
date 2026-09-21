@@ -1,4 +1,10 @@
--- Embedded Lua source loaded by src/bridge/ts.rs.
+-- blocks/lib/ts_tools/init.lua — the Lua half of the `std.ts` bridge.
+--
+-- `src/bridge/ts.rs` registers the Rust half and then `require`s this module by
+-- name, so the tier order every other module follows applies here too: a
+-- project's `.agent-block/lib/ts_tools/` wins, this source is the fallback.
+-- `agent-block vendor ts_tools` therefore changes the tool surface a model
+-- is handed with no install in between.
 -- Defines std.ts.register_tools(opts?) — LLM-facing tool registration helper.
 --
 -- opts (all optional):

@@ -6,7 +6,7 @@
 //! the host's environment-driven SQL configuration into a
 //! [`mlua_batteries_sqlite::sql::SqlConfig`] before delegating to
 //! [`mlua_batteries_sqlite::sql::register_with`], then layers the agent-block
-//! Lua tool helpers (`sql_tools.lua`) on top.
+//! Lua tool helpers (the embedded `sql_tools` module) on top.
 //!
 //! What the batteries take is the connection the host opened
 //! ([`crate::host::HostContext::sql_conn`]) — shared as `Arc<Mutex<_>>` with
@@ -38,10 +38,13 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         cfg,
     )?;
 
-    // Load std.sql.register_tools (LLM-facing helper; requires `tool` global).
-    lua.load(include_str!("sql_tools.lua"))
-        .set_name("std.sql.register_tools")
-        .exec()?;
+    // The Lua half (std.sql.register_tools; needs the `tool` global), through
+    // `require`, so a vendored `sql_tools` wins.
+    super::load_tools_module(
+        lua,
+        "sql_tools",
+        include_str!("../../blocks/lib/sql_tools/init.lua"),
+    )?;
 
     Ok(())
 }

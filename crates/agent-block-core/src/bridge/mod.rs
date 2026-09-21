@@ -64,7 +64,7 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     let _ = is_handler_side;
     sh::register(lua, ctx)?;
     tool::register(lua)?;
-    // After tool::register — fs_tools.lua needs the `tool` global.
+    // After tool::register — the `fs_tools` module needs the `tool` global.
     fs::register(lua, std::sync::Arc::clone(&ctx.fs_snapshots))?;
     log::register(lua, ctx)?;
     mcp::register(lua, ctx)?;
@@ -83,6 +83,39 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     #[cfg(feature = "sqlite")]
     ts::register(lua, ctx.ts_isle.clone())?;
     task::register(lua)?;
+    Ok(())
+}
+
+/// Load the Lua half of a bridge — the `std.<x>.register_tools` helper a
+/// model is handed — through `require`, so the project's vendored copy is the
+/// one that runs.
+///
+/// The Rust half of a bridge is registered here, on a VM whose require
+/// registry is already installed (the Isle init closure in `host.rs` runs
+/// first). So `require("<name>")` resolves the way every other module does:
+/// `.agent-block/lib/<name>/` first, the embedded source last. That is what
+/// makes `agent-block vendor fs_tools` a change to the tool surface without an
+/// install — the same path a vendored `agent` or `policy` takes.
+///
+/// A VM with no registry — a unit test's bare `Lua::new()` — cannot resolve
+/// the name at all, and for that one case the embedded source is run
+/// directly. Only "not found" falls back: an error *inside* a copy (a syntax
+/// error in what the project wrote) is the project's to see, not a reason to
+/// silently run the embedded one instead.
+pub(crate) fn load_tools_module(lua: &Lua, name: &str, embedded: &str) -> LuaResult<()> {
+    let probe = format!(
+        r#"local ok, err = pcall(require, "{name}")
+if ok then return "loaded" end
+if tostring(err):find("module '{name}' not found", 1, true) then return "not found" end
+error(err, 0)"#
+    );
+    let outcome: String = lua
+        .load(&probe)
+        .set_name(format!("require {name}"))
+        .eval()?;
+    if outcome == "not found" {
+        lua.load(embedded).set_name(name).exec()?;
+    }
     Ok(())
 }
 

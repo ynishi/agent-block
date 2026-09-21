@@ -1,4 +1,10 @@
--- Embedded Lua source loaded by src/bridge/fs.rs.
+-- blocks/lib/fs_tools/init.lua — the Lua half of the `std.fs` bridge.
+--
+-- `src/bridge/fs.rs` registers the Rust half and then `require`s this module by
+-- name, so the tier order every other module follows applies here too: a
+-- project's `.agent-block/lib/fs_tools/` wins, this source is the fallback.
+-- `agent-block vendor fs_tools` therefore changes the tool surface a model
+-- is handed with no install in between.
 -- Defines std.fs.register_tools(opts?) — LLM-facing tool registration helper.
 --
 -- opts (all optional):

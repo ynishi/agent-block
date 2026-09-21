@@ -1,4 +1,10 @@
--- Embedded Lua source loaded by src/bridge/kv.rs.
+-- blocks/lib/kv_tools/init.lua — the Lua half of the `std.kv` bridge.
+--
+-- `src/bridge/kv.rs` registers the Rust half and then `require`s this module by
+-- name, so the tier order every other module follows applies here too: a
+-- project's `.agent-block/lib/kv_tools/` wins, this source is the fallback.
+-- `agent-block vendor kv_tools` therefore changes the tool surface a model
+-- is handed with no install in between.
 -- Defines std.kv.register_tools(opts?) — LLM-facing tool registration helper.
 --
 -- opts (all optional):

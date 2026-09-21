@@ -1,4 +1,10 @@
--- Embedded Lua source loaded by src/bridge/sql.rs.
+-- blocks/lib/sql_tools/init.lua — the Lua half of the `std.sql` bridge.
+--
+-- `src/bridge/sql.rs` registers the Rust half and then `require`s this module by
+-- name, so the tier order every other module follows applies here too: a
+-- project's `.agent-block/lib/sql_tools/` wins, this source is the fallback.
+-- `agent-block vendor sql_tools` therefore changes the tool surface a model
+-- is handed with no install in between.
 -- Defines std.sql.register_tools(opts?) — LLM-facing tool registration helper.
 --
 -- opts (all optional):

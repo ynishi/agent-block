@@ -86,6 +86,18 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         include_str!("../blocks/lib/supervisor/init.lua"),
     ),
     ("job", include_str!("../blocks/lib/job/init.lua")),
+    // The Lua half of four bridges — the `std.<x>.register_tools` /
+    // `std.fs.tool_specs` helpers a model is handed. Each bridge `require`s
+    // its module right after registering its Rust half (see
+    // `bridge::load_tools_module`), so these resolve like every other
+    // embedded module: a project's vendored copy first, this source last.
+    ("fs_tools", include_str!("../blocks/lib/fs_tools/init.lua")),
+    ("ts_tools", include_str!("../blocks/lib/ts_tools/init.lua")),
+    (
+        "sql_tools",
+        include_str!("../blocks/lib/sql_tools/init.lua"),
+    ),
+    ("kv_tools", include_str!("../blocks/lib/kv_tools/init.lua")),
 ];
 
 /// Embedded modules a filesystem copy may not replace.

@@ -750,6 +750,15 @@ To run the binary's own fixture suite against a project's copies rather than the
 embedded modules, set `AGENT_BLOCK_PROJECT=<dir>`: `-p/--project` reads it, and an
 explicit `-p` still wins.
 
+The Lua half of the `std.fs` / `std.ts` / `std.sql` / `std.kv` bridges — the
+`std.<x>.register_tools` helpers (and `std.fs.tool_specs`) that decide which
+operations a model is handed, under what names, locked to which paths — is
+embedded as `fs_tools` / `ts_tools` / `sql_tools` / `kv_tools` and vendors the
+same way. `agent-block vendor fs_tools`, edit, and the next run hands the model
+the surface you wrote, with no install in between. Each bridge registers its
+Rust half and then `require`s its module by name, so the copy wins for the same
+reason every other vendored module does.
+
 Two layers answer back. A **sealed** module is refused outright (`knl` is sealed: a
 project cannot shadow it) — the copy would only fail the next run; read it with
 `require("embedded.knl")`. A **pack** (`policy`, `supervisor`) is written, but with a

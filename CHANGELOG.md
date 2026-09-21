@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Lua half of the `std.fs` / `std.ts` / `std.sql` / `std.kv` bridges is an
+  embedded module rather than a source file compiled into one call site.
+  `fs_tools` / `ts_tools` / `sql_tools` / `kv_tools` now live under
+  `blocks/lib/`, each bridge `require`s its own by name after registering the
+  Rust half, and the require path answers the way it does for every other
+  module: a project's `.agent-block/lib/fs_tools/` wins, the embedded source is
+  the fallback. So `agent-block vendor fs_tools` changes which file operations a
+  model is handed, under what names and locked to which paths, with no install
+  in between. A VM with no require registry — a unit test's bare `Lua::new()` —
+  still gets the embedded source directly; only "module not found" falls back,
+  so a syntax error inside a project's copy is reported rather than silently
+  replaced.
+
 - A module vendors with its specs. `vendor policy` writes
   `.agent-block/lib/policy/spec/*.lua` beside `init.lua` — the same mlua-lspec
   specs that check the embedded module — and `lua-spec-runner --project <dir>`
