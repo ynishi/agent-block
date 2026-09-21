@@ -23,6 +23,24 @@
 --   CODING_BASELINE  "false" skips the verify before the first beat (default: run it)
 --   CODING_DONE      what ends the run: "declare" (default) | "plan"
 --   CODING_CHECK_TIMEOUT  seconds one plan check may take (default 120; "plan" only)
+--   CODING_RESERVE   tokens the fold holds back for the reply on the openai
+--                    path, where the wire carries no cap (default 6144)
+--   CODING_VERIFY_TIMEOUT  seconds one verify may take, every time (default 900)
+--   CODING_RESULT_SHARE    share of the window one tool result may take (default 0.25)
+--   CODING_REPEAT_MAX      times the same read may be made with no edit between (default 2)
+--   CODING_STRICT    "true" makes every loop knob this script's to state
+--                    rather than `coding.run`'s. This script names them all,
+--                    so under strict it is a guard: a knob dropped from the
+--                    call above is refused instead of quietly defaulted
+--
+-- `reserve` and `max_tokens` are the same question asked of two servers: how
+-- much room the reply gets. The anthropic API requires a cap and that cap IS
+-- the room, so the conf carries `max_tokens`. An OpenAI-compatible server
+-- does not require one, and a cap invented here is a second, smaller ceiling
+-- on top of the model's own [measured: 4096 cut 103 of 415 beats short], so
+-- that path sends no cap and holds tokens back in the fold instead. 6144 was
+-- chosen against a 32k window in a sibling lane; scale it with the window of
+-- the model actually being run.
 --
 -- The exit code is 0 whenever the loop ran — `ok` in the value says whether
 -- the verify passed — and non-zero only when it could not run (missing input
@@ -49,7 +67,6 @@ if provider == "openai" then
             dialect = "vllm",
             thinking = { enabled = false },
             temperature = 0.2,
-            max_tokens = 4096,
             timeout = 600,
         },
     }
@@ -78,8 +95,15 @@ local result = coding.run({
     verify = E.get("CODING_VERIFY") or "cargo check --all-targets",
     repo = E.get("CODING_REPO") or ".",
     llm = llm,
+    -- The reply's room where the wire carries no cap. On the anthropic path
+    -- `max_tokens` already names it and this holds nothing extra back.
+    reserve = tonumber(E.get("CODING_RESERVE") or "6144"),
+    strict = E.get("CODING_STRICT") == "true",
     iters = tonumber(E.get("CODING_ITERS") or "5"),
     turns = tonumber(E.get("CODING_TURNS") or "8"),
+    timeout = tonumber(E.get("CODING_VERIFY_TIMEOUT") or "900"),
+    result_share = tonumber(E.get("CODING_RESULT_SHARE") or "0.25"),
+    repeat_max = tonumber(E.get("CODING_REPEAT_MAX") or "2"),
     baseline = E.get("CODING_BASELINE") ~= "false",
     done = E.get("CODING_DONE") or "declare",
     check_timeout = tonumber(E.get("CODING_CHECK_TIMEOUT") or "120"),

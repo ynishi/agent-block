@@ -17,16 +17,24 @@
 --   4 run: the opts it refuses — no spec, no verify, no targets, an llm
 --     without port and conf, a non-integer iteration count, a `done` that is
 --     neither mode, and `done = "plan"` with no `check_timeout`;
---   5 decide: what ends a run — the model answering with no tool call while an
+--   5 run, the model's facts (the tripwires): a conf naming the reply neither
+--     a cap nor a reserve is refused and either one answers it, a reserve
+--     that is not whole tokens is refused, a conf with no timeout is refused,
+--     and a port whose profile names no window is refused before a session
+--     opens;
+--   6 run, strict: `strict = true` with an Exec knob left unnamed is refused
+--     and the refusal names the knob; one that names them all gets past it;
+--   7 decide: what ends a run — the model answering with no tool call while an
 --     edit has landed and the verify is green, and, in plan mode, every check
 --     it filed passing; a green verify alone never ends one;
---   6 plan_of: the plan tool's input, as an array or as a JSON string, and
+--   8 plan_of: the plan tool's input, as an array or as a JSON string, and
 --     what it refuses;
---   7 plan_report: the counts, the failing check with its exit and tail, and
+--   9 plan_report: the counts, the failing check with its exit and tail, and
 --     the note a check that printed nothing gets;
---   8 system: which ending paragraph each mode states, that no mode means
+--  10 system: which ending paragraph each mode states, that no mode means
 --     declare, and that a mode it does not know fails;
---   9 shapes: a plan-mode result, with and without a failing check.
+--  11 shapes: a plan-mode result, with and without a failing check, and one
+--     carrying the `config` the run was started with.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -110,7 +118,29 @@ describe("coding.seed", function()
 end)
 
 describe("coding.run — what it refuses", function()
-    local llm = { port = {}, conf = {} }
+    -- The model's facts, which the run now refuses to start without. Every
+    -- case below has to get past them to reach the thing it is about, so they
+    -- sit in the shared conf rather than in each case.
+    local llm = { port = {}, conf = { max_tokens = 4096, timeout = 600 } }
+
+    --- The message `coding.run` refused the given opts with. Every run in
+    --- this file fails — the pure runner carries no host bridges, so nothing
+    --- here reaches a session — and what a case asserts is WHICH refusal it
+    --- got, not that there was one.
+    local function refusal(over)
+        local opts = { spec = "x", verify = "true", targets = { "a" }, llm = llm }
+        for k, v in pairs(over or {}) do
+            opts[k] = v
+        end
+        local ok, err = pcall(coding.run, opts)
+        expect(ok).to.be(false)
+        return tostring(err)
+    end
+
+    --- Whether that message is the one about `text`.
+    local function about(message, text)
+        return message:find(text, 1, true) ~= nil
+    end
 
     it("needs a spec, a verify, targets, and an llm with port and conf", function()
         expect(function()
@@ -150,6 +180,65 @@ describe("coding.run — what it refuses", function()
                 check_timeout = 0,
             })
         end).to.fail()
+    end)
+
+    it("needs the reply's room named — a cap on the wire, or a reserve held back", function()
+        expect(about(refusal({ llm = { port = {}, conf = { timeout = 600 } } }), "the reply's room")).to.be(true)
+        -- Either one answers it, and the run gets past that tripwire.
+        expect(about(refusal({}), "the reply's room")).to.be(false)
+        expect(about(refusal({ llm = { port = {}, conf = { timeout = 600 } }, reserve = 4096 }), "the reply's room")).to.be(
+            false
+        )
+    end)
+
+    it("takes a reserve of whole tokens and nothing else", function()
+        expect(about(refusal({ reserve = 0 }), "`reserve` must be a whole number")).to.be(true)
+        expect(about(refusal({ reserve = "observed_max" }), "`reserve` must be a whole number")).to.be(true)
+    end)
+
+    it("needs the reply's seconds named", function()
+        expect(about(refusal({ llm = { port = {}, conf = { max_tokens = 4096 } } }), "the reply's seconds")).to.be(true)
+    end)
+
+    it("needs the model's window — declared in the conf, or asked of the server", function()
+        -- A port whose profile answers no window. The run refuses on it
+        -- before it opens a session, so this needs no host behind it.
+        local function port_seeing(context_window)
+            return {
+                count = function()
+                    return 1
+                end,
+                profile = function()
+                    return { context_window = context_window }
+                end,
+            }
+        end
+        local blind = { llm = { port = port_seeing(nil), conf = { max_tokens = 4096, timeout = 600 } } }
+        expect(about(refusal(blind), "the model's window is not named")).to.be(true)
+        local declared = {
+            llm = { port = port_seeing(32768), conf = { context_window = 32768, max_tokens = 4096, timeout = 600 } },
+        }
+        expect(about(refusal(declared), "the model's window is not named")).to.be(false)
+    end)
+
+    it("strict = true: every Exec knob is the caller's to state, and the refusal names them", function()
+        local named = {
+            strict = true,
+            turns = 8,
+            timeout = 360,
+            result_share = 0.25,
+            repeat_max = 2,
+            done = "declare",
+        }
+        local without_iters = {}
+        for k, v in pairs(named) do
+            without_iters[k] = v
+        end
+        local said = refusal(without_iters)
+        expect(about(said, "strict = true")).to.be(true)
+        expect(about(said, "these are not: iters")).to.be(true)
+        named.iters = 5
+        expect(about(refusal(named), "strict = true")).to.be(false)
     end)
 
     it("declares its opts and result shapes, baseline and no_edits included", function()
@@ -298,6 +387,15 @@ describe("coding.shapes — done and plan on the result", function()
             summary = "PASS in 2 iters",
             done = "plan",
             plan = { total = 3, passed = 3, filed = true, failing = {} },
+        }, coding.shapes.run_result)).to.be(true)
+    end)
+
+    it("accepts one carrying the config the run was started with", function()
+        expect(check.check({
+            ok = true,
+            iters = 1,
+            summary = "PASS in 1 iters",
+            config = { strict = false, values = { iters = { value = 5, from = "default" } } },
         }, coding.shapes.run_result)).to.be(true)
     end)
 

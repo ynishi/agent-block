@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `coding.run` splits its opts by where a value comes from, and refuses to
+  start without the ones it cannot answer. Three facts about the model are
+  tripwires rather than defaults, because a default here is a number invented
+  about somebody else's server: the reply's room (`llm.conf.max_tokens`, the
+  cap the wire carries, or the new `reserve` opt, the tokens the fold holds
+  back when no cap is sent), the window (`llm.conf.context_window`, or a port
+  whose profile can ask its server — asked up front now, so the refusal comes
+  before the baseline verify rather than out of the fold a command later), and
+  the reply's seconds (`llm.conf.timeout`, the line `agent.run` already draws).
+  All three are checked together and the refusal names each missing one and
+  the opt it goes in. `thinking`, the sampling knobs and `reasoning_effort` are
+  not tripwires: absent, they are not sent, and the server's own default
+  stands. The loop's own policy — iterations, turns, the verify's timeout
+  curve, the caps, `done` — keeps every default it had, and `strict = true`
+  gives those defaults up: each such knob must then be named by the caller,
+  and the run refuses while any is not, listing all of them at once. `strict`
+  is a lever the top level pulls on itself and is never read from the
+  environment here, for the reason rustc has `--cap-lints`. What a run was
+  configured with is written into the record as one `config` event and handed
+  back as `result.config`: every knob with the value it ran at and where that
+  value came from — `caller`, `default`, or `discovered` for a window a port
+  asked its server for — so what a run did is read off its own log instead of
+  reconstructed from the caller's source.
+
 - `policy.window{ fit = { reserve } }` holds tokens back for the reply. The
   limit a fitted window measures against is the context window less
   `profile.max_output`, so a port that sends no answer cap leaves the whole of

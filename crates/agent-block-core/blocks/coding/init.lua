@@ -10,6 +10,8 @@
 --       verify  = "cargo test --quiet",         -- runs in repo after every iteration
 --       repo    = "/path/to/repo",              -- default: the process's directory
 --       llm     = { port = adapter.openai, conf = { base_url = ..., model = ..., ... } },
+--       reserve = 6144,                         -- tokens the fold holds back for the reply,
+--                                               -- when llm.conf carries no max_tokens cap
 --       iters   = 5,                            -- iterations, each ending in a verify
 --       turns   = 8,                            -- beats per iteration before verify runs anyway
 --       timeout = 360,                          -- seconds a verify may take, every time; or
@@ -18,10 +20,11 @@
 --       baseline = true,                        -- verify once before the first beat (default)
 --       done    = "declare",                    -- what ends the run: "declare" (default) | "plan"
 --       check_timeout = 120,                    -- seconds one plan check may take; done = "plan" only
+--       strict  = false,                        -- true: every Exec knob below must be named here
 --   })
 --
--- result: { ok, iters, summary, done, session, baseline_ok?, failure_reason?,
---           last_error?, plan? }
+-- result: { ok, iters, summary, done, config, session, baseline_ok?,
+--           failure_reason?, last_error?, plan? }
 --
 -- The verify runs once BEFORE the first beat (unless `baseline = false`), so
 -- the record has the run's starting point, a table `timeout` takes its first
@@ -44,6 +47,48 @@
 -- check after each iteration and hands the results back, and the run ends
 -- only when all of them pass as well. `check_timeout` is the seconds one such
 -- check may take, and is required in that mode.
+--
+-- Two kinds of opts: Data and Exec
+--   DATA is a fact about the model, and nothing in this module can answer
+--   one. A default here would be a number invented about somebody else's
+--   server, so the three below are TRIPWIRES instead: the run refuses to
+--   start while any is missing, and the refusal names what is missing and the
+--   opt it goes in.
+--
+--     the reply's room     `llm.conf.max_tokens`, the cap the wire carries,
+--                          or `reserve`, the tokens the fold holds back when
+--                          no cap is sent. One of the two, never neither
+--                          [measured 2026-09-13: a fold with no cap and no
+--                          reserve filled a 32k window and left the reply 50
+--                          tokens]
+--     the window           `llm.conf.context_window` declared beside the
+--                          model, or a port whose `profile` can ask its
+--                          server for it
+--     the reply's seconds  `llm.conf.timeout` — how long one model call may
+--                          take, which is the line `agent.run` draws as well
+--
+--   `thinking`, the sampling knobs and `reasoning_effort` are NOT tripwires:
+--   absent, they are not sent, and the server's own default stands. Nothing
+--   is invented for them either.
+--
+--   EXEC is loop policy — the iterations, the turns, the verify's timeout
+--   curve, the two caps, `done` — and every one of them has a default, stated
+--   above. `strict = true` gives those defaults up: each Exec knob with a
+--   number or a mode behind it must then be named by the caller, and the run
+--   refuses while any is not, listing all of them at once. `repo` /
+--   `baseline` / `owner` / `system` / `store` stay outside it — single
+--   self-evident values rather than knobs to tune.
+--
+--   `strict` is a lever the top level pulls on ITSELF, and this module never
+--   reads an environment variable for it: a library that switches its own
+--   strictness on over its consumers breaks builds it does not own, which is
+--   the lesson behind rustc's `--cap-lints`.
+--
+--   What the run was configured with goes into the record as one `config`
+--   event and comes back as `result.config`: every knob with the value it ran
+--   at and where that value came from — `caller`, `default`, or `discovered`
+--   (the window a port asked its server for) — so what a run did is read off
+--   its own log instead of reconstructed from the caller's source.
 --
 -- What this module is
 --   A CONSUMER of the kernel, beside `agent`: the kernel provides one beat and
@@ -112,6 +157,12 @@ local ERROR_TAIL = 800
 -- default like the other knobs: a caller that says nothing gets "declare".
 local DONE_MODES = { declare = true, plan = true }
 local DEFAULT_DONE = "declare"
+-- The Exec knobs `strict` covers: each has a number or a mode behind it here,
+-- and under strict the caller states it instead of taking this module's.
+-- `repo` / `baseline` / `owner` / `system` / `store` are deliberately absent —
+-- a single self-evident value is not a knob to tune. `check_timeout` is absent
+-- too: `done = "plan"` already requires it of every caller, strict or not.
+local STRICT_KNOBS = { "iters", "turns", "timeout", "result_share", "repeat_max", "done" }
 
 -- ============================================================
 -- Shapes
@@ -128,23 +179,37 @@ local RUN_OPTS = T.shape({
         :is_optional(),
     llm = T.shape({
         port = T.table:describe("a knl_adapter LLMPort — knl_adapter.openai / knl_adapter.anthropic"),
-        conf = T.table:describe("the conf the port is opened with (model, base_url, api_key, ...)"),
+        conf = T.table:describe(
+            "the conf the port is opened with (model, base_url, api_key, ...). Three facts about the model are "
+                .. "required, because nothing here can answer them: `timeout` (seconds one reply may take), "
+                .. "`max_tokens` (the reply's cap on the wire) or the `reserve` opt in its place, and "
+                .. "`context_window` unless the port's profile can ask its server for it"
+        ),
     }):describe("the model"),
-    iters = T.number:describe("iterations, each ending in a verify; default 5"):is_optional(),
-    turns = T.number:describe("beats per iteration before verify runs anyway; default 8"):is_optional(),
+    reserve = T.number
+        :describe(
+            "tokens the fold holds back for the reply when the wire carries no cap; a whole number >= 1, "
+                .. "required when llm.conf names no max_tokens"
+        )
+        :is_optional(),
+    iters = T.number:describe("iterations, each ending in a verify; default 5, required under `strict`"):is_optional(),
+    turns = T.number
+        :describe("beats per iteration before verify runs anyway; default 8, required under `strict`")
+        :is_optional(),
     timeout = T.any_of({ T.number, T.table })
         :describe(
             "policy.verdict's timeout: seconds handed to every verify as they are, or "
-                .. '{ first, factor?, floor?, measure? } read off the log; default { 900, 3, 60, "longest" }'
+                .. '{ first, factor?, floor?, measure? } read off the log; default { 900, 3, 60, "longest" }, '
+                .. "required under `strict`. This is the VERIFY's timeout; the reply's is llm.conf.timeout"
         )
         :is_optional(),
     store = T.any:describe("the session's store, as knl.session takes it; default the host's"):is_optional(),
     owner = T.string:describe('the session\'s owner; default "coding"'):is_optional(),
     system = T.string:describe("the system line; default: the one below, naming the two tools"):is_optional(),
     result_share = T.number
-        :describe("policy.result_cap's share of the window per tool result; default 0.25")
+        :describe("policy.result_cap's share of the window per tool result; default 0.25, required under `strict`")
         :is_optional(),
-    repeat_max = T.number:describe("policy.repeat_cap's max; default 2"):is_optional(),
+    repeat_max = T.number:describe("policy.repeat_cap's max; default 2, required under `strict`"):is_optional(),
     baseline = T.boolean
         :describe("run the verify once before the first beat, so the record has the starting point; default true")
         :is_optional(),
@@ -154,11 +219,20 @@ local RUN_OPTS = T.shape({
                 .. 'verify is green and an edit has landed. "plan": the model first files a plan — steps, each '
                 .. "with a shell check — through the `plan` tool; the harness runs every check after each "
                 .. "iteration and hands the results back, and the run ends when every check passes, the verify "
-                .. "is green, and the model answers without a tool call. A green verify alone never ends a run"
+                .. "is green, and the model answers without a tool call. A green verify alone never ends a run. "
+                .. "Required under `strict`"
         )
         :is_optional(),
     check_timeout = T.number
         :describe('done = "plan": seconds one plan check may take; required in that mode, ignored otherwise')
+        :is_optional(),
+    strict = T.boolean
+        :describe(
+            "true: every Exec knob with a default (iters, turns, timeout, result_share, repeat_max, done, and "
+                .. 'check_timeout under done = "plan") must be named by the caller, and the run refuses while '
+                .. "any is not; default false. A lever the top level pulls on itself — never read from the "
+                .. "environment here"
+        )
         :is_optional(),
 })
 
@@ -175,6 +249,13 @@ local RUN_RESULT = T.shape({
         :is_optional(),
     last_error = T.string:describe("the tail of the last verify output or model error, when not ok"):is_optional(),
     done = T.string:describe("the done mode the run used: declare | plan"):is_optional(),
+    config = T.table
+        :describe(
+            "what the run was configured with, the same table the `config` event carries: "
+                .. '{ strict = <boolean>, values = { <knob> = { value = <v>, from = "caller" | "default" | '
+                .. '"discovered" } ... } }'
+        )
+        :is_optional(),
     plan = T.table
         :describe(
             "done = plan: { total, passed, filed, failing } — checks filed, how many passed at the end, whether "
@@ -195,6 +276,16 @@ M.shapes = {
 
 local function tail(text, n)
     return tostring(text or ""):sub(-n)
+end
+
+--- A number of at least `least`, and nothing else.
+local function at_least(v, least)
+    return type(v) == "number" and v >= least
+end
+
+--- The same, whole: the shape a count of tokens has.
+local function whole_at_least(v, least)
+    return at_least(v, least) and v % 1 == 0
 end
 
 --- The list of target paths, absolute under `repo`: an array, or one
@@ -455,6 +546,48 @@ local function check_opts(opts)
     if opts.done == "plan" and (type(opts.check_timeout) ~= "number" or opts.check_timeout < 1) then
         error('coding.run: `check_timeout` (seconds) is required when done = "plan"', 3)
     end
+    if opts.reserve ~= nil and not whole_at_least(opts.reserve, 1) then
+        error("coding.run: `reserve` must be a whole number >= 1 (tokens), got " .. tostring(opts.reserve), 3)
+    end
+    if opts.strict ~= nil and type(opts.strict) ~= "boolean" then
+        error("coding.run: `strict` must be a boolean, got " .. tostring(opts.strict), 3)
+    end
+
+    -- The tripwires: facts about the model that nothing in this module can
+    -- answer, so a missing one stops the run instead of being filled in with
+    -- a number invented about somebody else's server. Collected and raised
+    -- together — a caller fixing a conf wants the whole list, not one more
+    -- per attempt. The third, the window, is asked of the port in
+    -- `_run_impl`: that is the first place there is a port to ask.
+    local conf = opts.llm.conf
+    local unanswered = {}
+    if not at_least(conf.max_tokens, 1) and not whole_at_least(opts.reserve, 1) then
+        unanswered[#unanswered + 1] = "the reply's room is not named — give llm.conf.max_tokens (a cap sent on "
+            .. "the wire) or reserve (tokens the fold holds back for the reply)"
+    end
+    if not at_least(conf.timeout, 1) then
+        unanswered[#unanswered + 1] = "the reply's seconds are not named — give llm.conf.timeout (how long one "
+            .. "model call may take)"
+    end
+    if #unanswered > 0 then
+        error("coding.run: " .. table.concat(unanswered, "; and "), 3)
+    end
+
+    if opts.strict == true then
+        local unnamed = {}
+        for _, k in ipairs(STRICT_KNOBS) do
+            if opts[k] == nil then
+                unnamed[#unnamed + 1] = k
+            end
+        end
+        if #unnamed > 0 then
+            error(
+                "coding.run: strict = true, so every Exec knob is the caller's to state, and these are not: "
+                    .. table.concat(unnamed, ", "),
+                3
+            )
+        end
+    end
     shape.assert_dev(opts, RUN_OPTS, "coding.run opts")
 end
 
@@ -469,6 +602,20 @@ function M._run_impl(opts)
     local done_mode = opts.done or DEFAULT_DONE
     local check_timeout = opts.check_timeout
     local verify_cmd = opts.verify
+
+    -- The third tripwire, the window: the conf declares it, or the port's
+    -- profile asks its server for it. `policy.window` raises for this too,
+    -- but deeper down and a baseline verify later; saying it here refuses the
+    -- run before it has run a command, in this module's own voice.
+    local profile = port:profile(conf)
+    local window = type(profile) == "table" and profile.context_window or nil
+    if window == nil then
+        error(
+            "coding.run: the model's window is not named — declare context_window in llm.conf beside the model, "
+                .. "or open the run with a port whose profile can ask its server for it",
+            2
+        )
+    end
 
     -- Tools: std.fs, path-locked to the targets, declared as the adapter
     -- takes them, then wrapped by the two caps. repeat_cap needs the
@@ -532,6 +679,57 @@ function M._run_impl(opts)
 
     local seed = M.seed(opts.spec, targets)
     local system = opts.system or M.system(read_spec.name, edit_spec.name, done_mode)
+
+    -- What this run was configured with, and where each value came from. It
+    -- goes into the record as one event and comes back on the result, so a
+    -- finished run says what it ran at without anyone reading the source that
+    -- started it — which is the difference between a run whose iterations
+    -- were five because the caller said so and one where five was this
+    -- module's own number.
+    local function named(value, given)
+        return { value = value, from = given and "caller" or "default" }
+    end
+    local values = {
+        -- Exec: the loop's own policy, each with a default here. `store` and,
+        -- outside plan mode, `check_timeout` have no value to name when the
+        -- caller names none — the default store is the host's — so those read
+        -- as a `from` alone.
+        iters = named(max_iters, opts.iters ~= nil),
+        turns = named(max_turns, opts.turns ~= nil),
+        timeout = named(opts.timeout or DEFAULT_TIMEOUT, opts.timeout ~= nil),
+        result_share = named(opts.result_share or DEFAULT_RESULT_SHARE, opts.result_share ~= nil),
+        repeat_max = named(opts.repeat_max or DEFAULT_REPEAT_MAX, opts.repeat_max ~= nil),
+        done = named(done_mode, opts.done ~= nil),
+        check_timeout = named(check_timeout, opts.check_timeout ~= nil),
+        repo = named(repo, opts.repo ~= nil),
+        baseline = named(opts.baseline ~= false, opts.baseline ~= nil),
+        owner = named(opts.owner or "coding", opts.owner ~= nil),
+        system = named(system, opts.system ~= nil),
+        store = named(opts.store, opts.store ~= nil),
+        -- The task, as the run resolved it: the targets are the absolute
+        -- paths the tools were locked to, not the string the caller passed.
+        verify = named(verify_cmd, true),
+        targets = named(targets, true),
+        -- Data: the model's own facts. The window is the one value here that
+        -- can come from somewhere other than the caller.
+        context_window = { value = window, from = conf.context_window ~= nil and "caller" or "discovered" },
+        -- `llm.conf.timeout`, the reply's seconds — named apart from
+        -- `timeout` above, which is the verify's curve.
+        llm_timeout = named(conf.timeout, true),
+    }
+    -- Named only where the caller named one: a table constructor drops a key
+    -- whose value is nil, so what is absent here was absent in the conf, and
+    -- no entry claims a source for a value nobody gave.
+    for key, value in pairs({
+        model = conf.model,
+        base_url = conf.base_url,
+        dialect = conf.dialect,
+        max_tokens = conf.max_tokens,
+        reserve = opts.reserve,
+    }) do
+        values[key] = named(value, true)
+    end
+    local config = { strict = opts.strict == true, values = values }
 
     --- Run every check the model filed; nil when no plan has been filed.
     local function run_plan_checks()
@@ -628,7 +826,8 @@ function M._run_impl(opts)
         store = opts.store,
     }, function(s)
         session_id = tostring(s:id())
-        local fold, fits = policy.window({ fit = { port = port, conf = conf }, keep_seed = true })
+        local fold, fits =
+            policy.window({ fit = { port = port, conf = conf, reserve = opts.reserve }, keep_seed = true })
         local device = kernel.device({
             llm = port:open(conf),
             system = system,
@@ -657,6 +856,11 @@ function M._run_impl(opts)
             end
         end
         s:append({ kind = "msg_user", meta = { label = "spec" }, data = { content = seed } })
+        -- Under no beat, like the baseline verify above: this is what the run
+        -- was configured with, not a turn of the conversation. The kernel's
+        -- fold skips a kind it does not know, so the record gains the event
+        -- and the request the model sees is the one it would have been.
+        s:append({ kind = "config", data = config })
 
         local function stop(reason, err)
             failure_reason, last_error = reason, err
@@ -843,6 +1047,7 @@ function M._run_impl(opts)
         failure_reason = (not converged) and failure_reason or nil,
         last_error = (not converged) and last_error or nil,
         done = done_mode,
+        config = config,
         -- Which checks were still failing, by name: a count alone (3/4) does
         -- not say which step the run never finished, and the one it never
         -- finished is the one a caller has to look at.
