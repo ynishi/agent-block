@@ -35,3 +35,19 @@ fn fs_search_replace_translates_to_the_edit_contract() {
         .stdout(predicate::str::contains("[SR] done"))
         .stdout(predicate::str::contains("= false").not());
 }
+
+/// The `read` tool spec: start-end/total on every result, and a cut result
+/// says what cut it (`limit` / `max_tokens` / the shell's budget) and where
+/// (`end_line`), with no second copy of that fact. Same one-line-per-property
+/// shape as the fixtures above.
+#[test]
+fn fs_read_reports_the_range_and_what_cut_it() {
+    let tmp = tempdir().expect("tempdir");
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", tmp.path())
+        .args(["-s", &common::fixture("fs_read.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[RD] done"))
+        .stdout(predicate::str::contains("= false").not());
+}

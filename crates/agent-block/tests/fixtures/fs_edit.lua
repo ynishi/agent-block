@@ -117,6 +117,6 @@ local denied = tool.call("fs_read", { path = dir .. "/other.txt" })
 check("path_lock.denies_other", denied.ok == false and denied.reason == "path_not_allowed")
 
 local allowed = tool.call("fs_read", { path = path })
-check("path_lock.allows_target", allowed.lines == 4)
+check("path_lock.allows_target", allowed.total == 4 and allowed.start_line == 1 and allowed.end_line == 4)
 
 print("[FS] done")

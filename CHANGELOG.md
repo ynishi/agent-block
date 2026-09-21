@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A failed `fs_search_replace` says what is actually there. "Not found" on its
+  own was the one failure a model could not act on: it said the guess was
+  wrong without saying what the file holds, so a model that believes the code
+  reads one way re-sends the same belief [measured 2026-09-11: one run sent
+  `collect::<Vec<u32>>()` four times; the file held what the model itself had
+  written two edits earlier, and it took narrowing the read twice and six
+  attempts to copy it]. The sibling failures already did better —
+  `search_ambiguous` returns the match count, `result_too_large` the size and
+  the limit — and this closes the last one. The result now carries the point
+  where the search stopped agreeing with the file and the file's own text from
+  there, in the shape the search tried to name; when not even the first line
+  occurs, the line sharing the most identifiers with it, which is the case a
+  model working from a paraphrase of the seed lands in. An edit whose `{` minus
+  `}` count differs from what it replaced is reported as well, so a snippet
+  appended after a block without its closing brace is answered by the tool
+  rather than by the verify two iterations later.
+- `std.fs.tool_specs` / `register_tools` require `opts.allowed`. Which tools a
+  model is handed is the caller's decision and nobody else's; a default meant a
+  caller that said nothing still got a surface someone else picked, and then had
+  no way to know what its model was holding. The old default `{"read","edit"}`
+  handed out the line-addressed edit in particular, which a loop then
+  compensated for by telling the model in prose which tool to call — and a
+  spec's own "read this file first" was overridden that way [measured
+  2026-09-12]. There is no opt-in tier any more either: `write`, `rollback` and
+  `search_replace` sit beside the other two, named or absent.
+
 - The Lua half of the `std.fs` / `std.ts` / `std.sql` / `std.kv` bridges is an
   embedded module rather than a source file compiled into one call site.
   `fs_tools` / `ts_tools` / `sql_tools` / `kv_tools` now live under

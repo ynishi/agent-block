@@ -119,6 +119,68 @@ res = sr({ path = path, base = "0000000000000000", edits = { { search = "alpha",
 check("stale.rejected", res.ok == false and res.reason == "stale_base")
 check("stale.file_untouched", std.fs.read(path) == "alpha\n")
 
+-- not found, first line absent: the nearest line by shared words is named --
+-- [2026-09-13 dmdeclar beat 1: the model wrote from memory an `assert!(...).is_none()`
+--  where the file has `assert_eq!(..., None)`; nothing pointed at line 501]
+r = reset(
+    "fn a() {}\n"
+        .. "    assert_eq!(ScheduleKind::parse(\"linear\"), Some(ScheduleKind::Linear));\n"
+        .. "    assert_eq!(ScheduleKind::parse(\"triangular\"), None);\n"
+        .. "    for name in ScheduleKind::NAMES {\n"
+)
+res = sr({
+    path = path,
+    base = r.version,
+    edits = { { search = "    assert!(ScheduleKind::parse(\"triangular\").is_none());", replace = "x" } },
+})
+check("nearest.rejected", res.ok == false and res.reason == "search_not_found")
+check("nearest.no_actual", res.failures[1].actual == nil)
+check("nearest.names_line_3", type(res.failures[1].nearest) == "table" and res.failures[1].nearest.line == 3)
+check("nearest.carries_text", res.failures[1].nearest.text == "    assert_eq!(ScheduleKind::parse(\"triangular\"), None);")
+check("nearest.shared_words", res.failures[1].nearest.shared_words == 3)
+check("nearest.file_untouched", std.fs.read(path):find("assert!(", 1, true) == nil)
+
+-- nothing shares two words: no nearest, and nothing invented -----------------
+res = sr({ path = path, base = r.version, edits = { { search = "zebra quokka", replace = "x" } } })
+check("nearest.absent_when_unrelated", res.reason == "search_not_found" and res.failures[1].nearest == nil)
+
+-- ambiguous: the lines of every occurrence, not only the count ---------------
+-- [2026-09-13 dmdclref beat 2: `    }\n}` at the end of the impl and of mod tests]
+r = reset("impl A {\n    fn f() {\n    }\n}\n\nmod t {\n    fn g() {\n    }\n}\n")
+res = sr({ path = path, base = r.version, edits = { { search = "    }\n}", replace = "x" } } })
+check("ambiguous.at_lines", res.reason == "search_ambiguous" and res.matches == 2)
+check("ambiguous.at_lines_values", res.failures[1].at_lines[1] == 3 and res.failures[1].at_lines[2] == 8)
+
+-- a replace that moves a brace is applied, and said ---------------------------
+-- [2026-09-13 dmdeclar beat 4: `}` + a new test appended after a one-line anchor
+--  inside a function, stranding the rest of that function outside it]
+r = reset("fn a() {\n    x();\n    y();\n}\n")
+res = sr({
+    path = path,
+    base = r.version,
+    edits = { { search = "    x();", replace = "    x();\n}\n\nfn b() {\n    z();" } },
+})
+check("braces.applied", res.ok == true and res.applied == 1)
+check("braces.shift_reported", res.brace_shift == "edit 1: +0" or res.brace_shift == nil)
+-- the balanced case above: `}` then `{` cancel out. Now an unbalanced one.
+r = reset("fn a() {\n    x();\n    y();\n}\n")
+res = sr({
+    path = path,
+    base = r.version,
+    edits = { { search = "    x();", replace = "    x();\n}\n\n#[test]\nfn t() {\n}" } },
+})
+check("braces.unbalanced_applied", res.ok == true and res.applied == 1)
+check("braces.unbalanced_shift", res.brace_shift == "edit 1: -1")
+check("braces.note_names_it", type(res.note) == "string" and res.note:find("brace", 1, true) ~= nil)
+-- a search that includes the closing brace is balanced, and quiet
+r = reset("fn a() {\n    x();\n}\n")
+res = sr({
+    path = path,
+    base = r.version,
+    edits = { { search = "    x();\n}", replace = "    x();\n}\n\nfn b() {\n}" } },
+})
+check("braces.balanced_quiet", res.ok == true and res.brace_shift == nil and res.note == nil)
+
 -- malformed edits are refused before the file is read ----------------------
 res = sr({ path = path, edits = {} })
 check("empty.rejected", res.ok == false and res.reason == "no_edits")
