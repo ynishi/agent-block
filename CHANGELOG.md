@@ -92,6 +92,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The OpenAI adapter sends no answer cap when the caller names none, and
+  `profile` answers `max_output = nil` to match. The server's own limit is then
+  the window less the prompt, which is the cap a self-hosted model actually
+  has; the 4,096 this adapter used to invent was a second, smaller one, and it
+  was the one that cut replies [measured 2026-09-12: 103 of 415 beats ended
+  mid-reasoning without reaching a tool call, 26 of them at exactly 4,096. The
+  server was vLLM, which has only `--max-model-len 32768` and treats a request
+  with no `max_tokens` as asking for the whole remainder]. The generic backend
+  no longer fills the field either — `max_tokens` is the request's or the
+  conf's, or absent. The knl_adapter's openai Port therefore declares no
+  `default_max_output`, so a fold sized by the profile holds nothing back for
+  room the wire never asked for. A conf that names `max_tokens` is unaffected.
+
+  The Anthropic adapter still sends one, because `max_tokens` is a required
+  field of the Messages API, and its module says why rather than sharing a
+  constant that reads as a policy. `profile` reports the model's own maximum
+  as `max_output_limit` for a caller that wants to raise the cap.
+
 - The kernel's event store is eventsdb 0.6.0, and nothing in that release
   breaks a caller — every entry is an addition, and the one type that grew a
   field is `#[non_exhaustive]` — so the move is a version and the two

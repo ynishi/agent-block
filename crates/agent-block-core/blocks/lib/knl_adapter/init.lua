@@ -867,7 +867,10 @@ M.openai = LLMPort.new({
     build = openai_build,
     parse = openai_parse,
     classify = openai_classify,
-    default_max_output = proto_openai.DEFAULT_MAX_TOKENS,
+    -- No `default_max_output`: the openai adapter sends no cap when the conf
+    -- names none, so the room an answer has is the window less the prompt and
+    -- there is no number for the fold to hold back. A conf that names
+    -- `max_tokens` is read through `profile` as before.
     -- The compatible servers count and describe their models (vLLM
     -- /tokenize + /v1/models, llama.cpp /apply-template + /tokenize +
     -- /props, Ollama /api/show); OpenAI's own chat completions do neither,

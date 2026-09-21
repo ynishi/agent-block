@@ -22,6 +22,14 @@ local DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 --- The answer's cap `build` sends when the spec names none. Exported so
 --- `profile` answers the same number `build` will send.
+--- The cap `build` sends when the spec names none.
+---
+--- Unlike the openai adapter, which sends no cap at all and lets the window's
+--- remainder be the limit, this one must send a number: `max_tokens` is a
+--- required field of the Messages API. So a value has to exist, and 4,096 is
+--- the conservative one — well under every current model's own maximum, which
+--- `profile` reports separately as `max_output_limit` for a caller that wants
+--- to raise it. Naming a `max_tokens` in the conf is how to.
 M.DEFAULT_MAX_TOKENS = 4096
 local API_URL = "https://api.anthropic.com/v1/messages"
 local API_VERSION = "2023-06-01"

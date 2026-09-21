@@ -23,10 +23,17 @@ local M = { name = "openai" }
 
 local DEFAULT_MODEL = "gpt-4o-mini"
 
---- The answer's cap `build` sends when the spec names none. Exported so
---- `profile` — and any Port asking how much room an answer takes — answers
---- the same number `build` will send, never a room the wire does not ask for.
-M.DEFAULT_MAX_TOKENS = 4096
+--- No answer cap is sent when the spec names none, and `profile` answers
+--- `max_output = nil` to match, so a fold sized by the profile reserves
+--- nothing the wire does not ask for.
+---
+--- The server's own limit is then the window less the prompt, which is the cap
+--- a self-hosted model actually has. A number invented here is a second,
+--- smaller one, and it is the one that cuts replies
+--- [measured 2026-09-12: with the old 4,096 default, 103 of 415 beats were cut
+---  mid-reasoning and never reached a tool call; 26 stopped at exactly 4,096.
+---  The server was vLLM, which has only `--max-model-len 32768` and treats a
+---  request with no `max_tokens` as asking for the whole remainder].
 local DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 -- ============================================================
@@ -347,11 +354,14 @@ function M.build(spec)
 
     -- The o-series and gpt-5 families reject `max_tokens`; models older than
     -- the rename reject `max_completion_tokens`. Compatible servers only know
-    -- the original name.
-    if reasoning_model then
-        body.max_completion_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS
-    else
-        body.max_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS
+    -- the original name. Sent only when the spec names a cap: absent, the
+    -- server's own window is the cap.
+    if spec.max_tokens ~= nil then
+        if reasoning_model then
+            body.max_completion_tokens = spec.max_tokens
+        else
+            body.max_tokens = spec.max_tokens
+        end
     end
 
     -- Reasoning models accept only the default for the sampling knobs and
@@ -871,7 +881,7 @@ function M.profile(spec)
         return nil, "no window discovery on the " .. dialect .. " dialect; declare context_window"
     end
 
-    return { context_window = math.floor(window), max_output = spec.max_tokens or M.DEFAULT_MAX_TOKENS }, nil
+    return { context_window = math.floor(window), max_output = spec.max_tokens }, nil
 end
 
 --- Is the server behind `spec` up and serving: one GET, read as liveness.

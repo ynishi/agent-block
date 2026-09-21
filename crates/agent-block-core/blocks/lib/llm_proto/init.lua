@@ -379,9 +379,6 @@ end
 --- right above the one refusing is the one that asks again.
 local DEFAULT_MAX_RETRIES = 2
 
---- Output cap when neither the request nor the conf names one.
-local DEFAULT_MAX_TOKENS = 4096
-
 --- Seconds a request may take when the conf does not say.
 local DEFAULT_TIMEOUT = 120
 
@@ -625,7 +622,13 @@ function M.backend(conf)
         for key, value in pairs(req) do
             spec[key] = value
         end
-        spec.max_tokens = req.max_tokens or conf.max_tokens or DEFAULT_MAX_TOKENS
+        -- No cap when neither the request nor the conf names one: what an
+        -- answer may cost is the caller's to say, and a number invented here
+        -- would be a second, smaller ceiling under the server's own. Each
+        -- adapter decides what that means on its wire — `openai` sends no
+        -- field and lets the window's remainder be the cap, `anthropic` must
+        -- send one because its API requires the key.
+        spec.max_tokens = req.max_tokens or conf.max_tokens
 
         local built, berr = adapter.build(spec)
         if not built then
