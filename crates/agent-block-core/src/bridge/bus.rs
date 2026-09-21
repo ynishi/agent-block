@@ -29,7 +29,7 @@
 //! `run()` await. This avoids the `await-holding-lock` anti-pattern even
 //! though the registration helpers are now async.
 //!
-//! # Handler Isle forwarding (Subtask 2)
+//! # Handler Isle forwarding
 //!
 //! Lua handlers passed to `bus.on` / `bus.on_any` are serialized via
 //! `Function::dump(true)` on the main Isle and reloaded on the dedicated
@@ -82,10 +82,12 @@
 //! method suspends only its own coroutine. `handler_await_leaves_the_isle_running`
 //! in the tests below measures that.
 //!
-//! # wf-sim verdict doc comments
+//! # The doc comments on `bus.on` and `bus.on_any`
 //!
-//! The doc comments on `bus.on` and `bus.on_any` (below) encode the wf-sim
-//! verdicts. Do not remove.
+//! Those two carry the reasoning behind the shape they have — which
+//! registration wins, what a handler may and may not capture, what happens
+//! after `bus.serve` has started. They are the record of those decisions and
+//! there is no other copy: do not thin them out.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -537,8 +539,8 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 /// the `__bus_dispatch(kind, id, payload_json, meta_json)` Lua dispatcher on
 /// the **handler Isle**.
 ///
-/// After Subtask 2 these globals no longer live on the main Isle; the main
-/// Isle exposes only the `bus.*` Lua table (see [`register`]). Callers must
+/// These globals live on the handler Isle and nowhere else; the main Isle
+/// exposes only the `bus.*` Lua table (see [`register`]). Callers must
 /// invoke this function from inside the handler Isle's bridge registration
 /// (`bridge::register_all_handler_side`).
 ///

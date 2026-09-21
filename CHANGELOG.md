@@ -86,6 +86,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question those would (what was edited, what upstream changed, how to merge
   the two, what to send upstream).
 
+- Doc comments in the bus, MCP handler and host modules said which internal
+  note a decision came from rather than what the decision was — a reference
+  no reader outside this machine can follow, and one that outlived the note
+  it pointed at. Each now carries the reasoning itself: why the dispatcher
+  awaits one handler at a time, why a second `bus.on` for the same kind
+  replaces rather than refuses, why notifications reach Lua on the Isle that
+  defined the callback, why they travel on a bounded channel. Build-order
+  numbering is gone from the same comments, which describe what the code is
+  rather than the order it arrived in.
+
 ## [0.39.0] - 2026-09-20
 
 ### Added

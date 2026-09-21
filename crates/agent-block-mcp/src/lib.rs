@@ -1,8 +1,8 @@
 //! MCP Client — manages MCP server child processes via rmcp.
 //!
 //! Uses `rmcp` (1.4.x) `RunningService<RoleClient, AgentBlockClientHandler>` internally.
-//! `AgentBlockClientHandler` provides custom notification handling via Lua callbacks
-//! (wired in Subtask 2/3). For Subtask 1, all notification methods are default no-ops.
+//! `AgentBlockClientHandler` provides custom notification handling via Lua
+//! callbacks; a connection that registers none gets rmcp's no-op defaults.
 //!
 //! All rmcp round-trips are wrapped in a per-call timeout so a hung child
 //! cannot block a Lua coroutine indefinitely.

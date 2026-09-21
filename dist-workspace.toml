@@ -19,6 +19,7 @@ install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
 # The generated release.yml carries one manual edit (permissions:
-# id-token: write, required by the cargo-dist-checker C8 gate); tell
-# `dist plan` not to fail on the resulting drift from the generated form.
+# id-token: write, needed for the OIDC token the publish step requests);
+# tell `dist plan` not to fail on the resulting drift from the generated
+# form.
 allow-dirty = ["ci"]

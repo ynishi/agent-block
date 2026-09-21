@@ -997,8 +997,8 @@ pub struct HostContext {
     #[cfg(feature = "sqlite")]
     pub ts_isle: rusqlite_isle::AsyncIsle,
     /// Async handle to the main Isle Lua VM that runs the user script via
-    /// `coroutine_eval`. After Subtask 2, `bridge::bus` no longer dispatches
-    /// handlers against this Isle; handlers live on `handler_isle` instead.
+    /// `coroutine_eval`. `bridge::bus` does not dispatch handlers against
+    /// this Isle; handlers live on `handler_isle` instead.
     /// The field is retained because bridge code still keyed to the main
     /// Isle (future `coroutine_call` back-edges, introspection APIs) may
     /// need it, and removing it would force another HostContext reshape.
