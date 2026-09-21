@@ -804,6 +804,9 @@ local WINDOW_REPORT = T.shape({
     before = T.number:describe("what the whole log counted"):is_optional(),
     after = T.number:describe("what was sent"):is_optional(),
     limit = T.number:describe("the room the profile left for a request"):is_optional(),
+    reserve = T.number
+        :describe("tokens held back for the reply beyond profile.max_output, and so not in `limit`")
+        :is_optional(),
 }, { open = false })
 
 --- An event's `meta`: labels, and only labels.

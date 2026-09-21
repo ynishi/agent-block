@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.window{ fit = { reserve } }` holds tokens back for the reply. The
+  limit a fitted window measures against is the context window less
+  `profile.max_output`, so a port that sends no answer cap leaves the whole of
+  it to the request: the fold fills it with prompt and the model has nowhere
+  left to answer [measured 2026-09-13 in a sibling lane: in=32,718 / out=50
+  for two beats in a row]. `reserve` is a whole number of tokens held back
+  beyond what the wire's cap already covers — `max(0, reserve - max_output)`,
+  so a reserve at or under a cap that is there holds nothing extra — and a
+  reserve leaving the request less than one token raises rather than sending a
+  window of nothing. The fold's report says how many were held (`reserve`)
+  beside the number the candidate was measured against (`limit`), and the
+  predicate `fit` hands back is held against that same number. Absent, the
+  window is the one it was.
+
 - A `coding.run` ends when the model says it does, and a green verify alone no
   longer ends one. The verify passing is one fact and never the whole of it: a
   spec spanning a function and the test it asked for goes green on the part
