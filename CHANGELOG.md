@@ -110,6 +110,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constant that reads as a policy. `profile` reports the model's own maximum
   as `max_output_limit` for a caller that wants to raise the cap.
 
+- `agent.run` requires `timeout` and `max_iterations`, and passes `max_tokens`
+  through as named or not at all. The line is whether the caller knows the
+  value and the module cannot: how long this model's reply may take and how
+  many beats the run is granted are the run's — the 120 and 20 that stood in
+  for them were the same second ceiling as the 4,096 above, under other names.
+  A run that names neither answers `ok = false` saying which, as it does for
+  a missing prompt. What stays in the module is what a caller has no basis to
+  choose: the retry curve after a transport or API error, the stagnation and
+  repeat thresholds, the verify timeout read off the log.
+
+  `job.toml` requires `timeout` and `job.tick` requires `max_runs` on the same
+  line: how long its block may run is the job's to say, how many runs the host
+  carries is the manager's (`agent-block serve --max-runs`, which it already
+  passed).
+
+  `ScriptSource::DefaultAgent` carries an `AgentProfile` — provider, endpoint,
+  model, timeout, beats, answer cap — since the embedded invoker has no other
+  place to be told what the run is granted. The profile has no `Default`; it
+  is injected as `_AGENT_PROFILE` and passed to `agent.run` whole.
+
 - The kernel's event store is eventsdb 0.6.0, and nothing in that release
   breaks a caller — every entry is an addition, and the one type that grew a
   field is `#[non_exhaustive]` — so the move is a version and the two

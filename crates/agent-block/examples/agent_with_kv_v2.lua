@@ -32,6 +32,7 @@ Use the tools; do not guess values.
     model = "claude-haiku-4-5-20251001",
     max_tokens = 512,
     max_iterations = 8,
+    timeout = 120,
     on_turn = function(info)
         local ns = {}
         for _, tc in ipairs(info.tool_calls) do

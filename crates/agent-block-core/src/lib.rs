@@ -50,4 +50,4 @@ pub mod knl;
 pub mod sandbox;
 
 pub use agent_block_types::error::{BlockError, BlockResult};
-pub use host::{run, run_capture, BlockConfig, BlockConfigBuilder, HostContext};
+pub use host::{run, run_capture, AgentProfile, BlockConfig, BlockConfigBuilder, HostContext};

@@ -6,9 +6,9 @@
 --       prompt = "...",
 --       system = "...",
 --       model = "claude-sonnet-4-20250514",
---       max_tokens = 4096,
---       timeout = 120,
---       max_iterations = 20,
+--       max_tokens = nil,       -- absent: the server's own cap (see llm_proto)
+--       timeout = 120,          -- required: how long this model's reply may take
+--       max_iterations = 20,    -- required: the session's grant
 --       max_tokens_budget = nil,
 --       mcp_servers = { { name = "outline", command = "outline-mcp", args = {} } },
 --       on_turn = function(turn_info) end,
@@ -700,8 +700,14 @@ local function port_conf(opts, provider)
             conf[key] = value
         end
     end
-    conf.max_tokens = opts.max_tokens or 4096
-    conf.timeout = opts.timeout or 120
+    -- `max_tokens` passes as named or not at all: absent, an OpenAI-compatible
+    -- server caps the reply at what its window has left, which is the cap the
+    -- model actually has; a number placed here instead was a second, smaller
+    -- ceiling nobody chose (the Anthropic adapter fills the field its API
+    -- requires). `timeout` is how long this model's reply may take, which
+    -- the caller who picked the model knows and this module does not.
+    conf.max_tokens = opts.max_tokens
+    conf.timeout = opts.timeout
     if provider ~= "openai" then
         conf.context_management = resolve_context_management(opts)
     end
@@ -1001,9 +1007,10 @@ end
 ---   prompt          (required) Initial user prompt string
 ---   system          (optional) System prompt string
 ---   model           (optional) LLM model identifier
----   max_tokens      (optional) Per-request token limit (default: 4096)
----   timeout         (optional) HTTP timeout in seconds (default: 120)
----   max_iterations  (optional) Max beats (default: 20). The session's grant.
+---   max_tokens      (optional) Per-request token limit. Absent, the request
+---                   carries none and the server's own cap is the cap
+---   timeout         (required) HTTP timeout in seconds
+---   max_iterations  (required) Max beats. The session's grant.
 ---   max_tokens_budget (optional) Total token budget across all beats, read
 ---                   off the log after each one (default: nil = unlimited)
 ---   store           (optional) Where the session log goes. Omitted is the
@@ -1073,6 +1080,15 @@ function M._run_impl(opts)
     if opts.history ~= nil and type(opts.history) ~= "table" then
         return failed("history must be a table (messages array)")
     end
+    -- Both are the run's own: how long this model's reply may take, and how
+    -- many beats the session is granted. Neither is a number this module
+    -- could know, so neither has one here.
+    if type(opts.timeout) ~= "number" then
+        return failed("timeout (seconds) is required")
+    end
+    if type(opts.max_iterations) ~= "number" then
+        return failed("max_iterations is required")
+    end
 
     local provider = opts.provider or "anthropic"
     if PORTS[provider] == nil then
@@ -1098,7 +1114,7 @@ function M._run_impl(opts)
     -- — a duplicate tool name, a spec with no schema field it knows — and for
     -- a store that would not take the log. `run` never throws, so those come
     -- back as the failure they are.
-    local ran, result = pcall(run_loop, opts, provider, candidates, opts.max_iterations or 20)
+    local ran, result = pcall(run_loop, opts, provider, candidates, opts.max_iterations)
 
     -- Always disconnect, regardless of outcome.
     disconnect_mcp_servers(connected)

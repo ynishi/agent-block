@@ -65,6 +65,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio-util = { version = "0.7" }
 serde_json = "1"
+# `tests/e2e_default_agent.rs` implements the bus `Handler` trait to catch
+# what the embedded invoker emits.
+async-trait.workspace = true
 # Re-export internal crates for tests/examples that wire pieces directly.
 agent-block-types.workspace = true
 mlua.workspace = true

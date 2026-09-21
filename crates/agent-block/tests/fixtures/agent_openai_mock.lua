@@ -15,6 +15,8 @@ local result = agent.run({
     model = "qwen-test",
     api_key = "dummy",
     prompt = "Use the echo tool to say hello",
+    timeout = 30,
+    max_iterations = 5,
     extra_tools = {
         {
             name = "echo",

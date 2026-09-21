@@ -158,12 +158,23 @@ local function fake_session()
     return s
 end
 
+-- A declaration names its own timeout and a tick names the host's run cap;
+-- neither has a number in the module. These cases are about scheduling, so
+-- the helpers name one once and a case that cares passes its own.
 local function decl(name, extra)
-    local t = { name = name, path = "/repo/blocks/" .. name .. "/init.lua", cwd = "/repo" }
+    local t = { name = name, path = "/repo/blocks/" .. name .. "/init.lua", cwd = "/repo", timeout = "10m" }
     for k, v in pairs(extra or {}) do
         t[k] = v
     end
     return job.decl(t)
+end
+
+local function tick(jobs, facts, now, opts)
+    local merged = { max_runs = 4 }
+    for k, v in pairs(opts or {}) do
+        merged[k] = v
+    end
+    return job.tick(jobs, facts, now, merged)
 end
 
 local function names(list)
@@ -191,24 +202,27 @@ describe("job.decl — a declaration, checked", function()
         expect(d.timeout).to.be(600)
     end)
 
-    it("takes seconds as a number and defaults the timeout", function()
-        local d = decl("drain", { every = 90 })
+    it("takes seconds as a number and requires a timeout", function()
+        local d = decl("drain", { every = 90, timeout = 30 })
         expect(d.every).to.be(90)
-        expect(d.timeout).to.be(600)
+        expect(d.timeout).to.be(30)
+        local ok, err = pcall(job.decl, { name = "x", path = "/p", cwd = "/c" })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("'timeout' is required", 1, true) ~= nil).to.be(true)
     end)
 
     it("refuses an unknown field, a missing path, and a bad duration", function()
         expect(function()
-            job.decl({ name = "x", path = "/p", cwd = "/c", evry = "2m" })
+            job.decl({ name = "x", path = "/p", cwd = "/c", timeout = "1m", evry = "2m" })
         end).to.fail()
         expect(function()
             job.decl({ name = "x", cwd = "/c" })
         end).to.fail()
         expect(function()
-            job.decl({ name = "x", path = "/p", cwd = "/c", every = "soon" })
+            job.decl({ name = "x", path = "/p", cwd = "/c", timeout = "1m", every = "soon" })
         end).to.fail()
         expect(function()
-            job.decl({ name = "x", path = "/p", cwd = "/c", every = 0 })
+            job.decl({ name = "x", path = "/p", cwd = "/c", timeout = "1m", every = 0 })
         end).to.fail()
     end)
 
@@ -226,7 +240,7 @@ describe("job.tick — the decision", function()
     local empty = { ended = {}, live = {}, live_count = 0, requested = {}, stops = {} }
 
     it("starts a job with no history at once", function()
-        local plan = job.tick({ decl("a", { every = "2m" }) }, empty, 1000)
+        local plan = tick({ decl("a", { every = "2m" }) }, empty, 1000)
         expect(names(plan.start)).to.be("a")
         expect(plan.start[1].reason).to.be("due")
         expect(#plan.skip).to.be(0)
@@ -235,8 +249,8 @@ describe("job.tick — the decision", function()
     it("counts `every` from the previous end", function()
         local jobs = { decl("a", { every = "2m" }) }
         local facts = { ended = { a = 1000 }, live = {}, live_count = 0, requested = {}, stops = {} }
-        expect(#job.tick(jobs, facts, 1119).start).to.be(0)
-        expect(names(job.tick(jobs, facts, 1120).start)).to.be("a")
+        expect(#tick(jobs, facts, 1119).start).to.be(0)
+        expect(names(tick(jobs, facts, 1120).start)).to.be("a")
     end)
 
     it("never starts a job that is live, and says so", function()
@@ -248,7 +262,7 @@ describe("job.tick — the decision", function()
             requested = {},
             stops = {},
         }
-        local plan = job.tick(jobs, facts, 5000)
+        local plan = tick(jobs, facts, 5000)
         expect(#plan.start).to.be(0)
         expect(plan.skip[1].job).to.be("a")
         expect(plan.skip[1].reason).to.be("overlapping")
@@ -256,7 +270,7 @@ describe("job.tick — the decision", function()
 
     it("caps the manager at max_runs, in declaration order", function()
         local jobs = { decl("a", { every = "1m" }), decl("b", { every = "1m" }), decl("c", { every = "1m" }) }
-        local plan = job.tick(jobs, empty, 1000, { max_runs = 2 })
+        local plan = tick(jobs, empty, 1000, { max_runs = 2 })
         expect(names(plan.start)).to.be("a,b")
         expect(plan.skip[1].job).to.be("c")
         expect(plan.skip[1].reason).to.be("max_runs")
@@ -271,7 +285,7 @@ describe("job.tick — the decision", function()
             requested = {},
             stops = {},
         }
-        local plan = job.tick(jobs, facts, 1000, { max_runs = 2 })
+        local plan = tick(jobs, facts, 1000, { max_runs = 2 })
         expect(names(plan.start)).to.be("a")
         expect(plan.skip[1].reason).to.be("max_runs")
     end)
@@ -285,7 +299,7 @@ describe("job.tick — the decision", function()
             requested = { { job = "a", seq = 7, by = "http" }, { job = "b", seq = 9, by = "cli" } },
             stops = {},
         }
-        local plan = job.tick(jobs, facts, 1001)
+        local plan = tick(jobs, facts, 1001)
         expect(names(plan.start)).to.be("a,b")
         expect(plan.start[1].reason).to.be("requested")
         expect(plan.start[1].requested).to.be(7)
@@ -301,17 +315,16 @@ describe("job.tick — the decision", function()
             requested = { { job = "a", seq = 7, by = "http" } },
             stops = {},
         }
-        local plan = job.tick(jobs, facts, 1000)
+        local plan = tick(jobs, facts, 1000)
         expect(plan.skip[1].reason).to.be("overlapping")
         expect(plan.skip[1].requested).to.be(7)
         -- Due by the interval alone, nothing to answer.
-        local plan2 =
-            job.tick(jobs, { ended = {}, live = facts.live, live_count = 1, requested = {}, stops = {} }, 1000)
+        local plan2 = tick(jobs, { ended = {}, live = facts.live, live_count = 1, requested = {}, stops = {} }, 1000)
         expect(plan2.skip[1].requested).to.be(nil)
     end)
 
     it("leaves a job without `every` alone until asked", function()
-        local plan = job.tick({ decl("manual") }, empty, 1000)
+        local plan = tick({ decl("manual") }, empty, 1000)
         expect(#plan.start).to.be(0)
         expect(#plan.skip).to.be(0)
     end)
@@ -319,7 +332,7 @@ describe("job.tick — the decision", function()
     it("reads nothing but its arguments: the same inputs give the same plan", function()
         local jobs = { decl("a", { every = "2m" }), decl("b", { every = "2m" }) }
         local facts = { ended = { a = 1000 }, live = {}, live_count = 0, requested = {}, stops = {} }
-        expect(names(job.tick(jobs, facts, 1130).start)).to.be(names(job.tick(jobs, facts, 1130).start))
+        expect(names(tick(jobs, facts, 1130).start)).to.be(names(tick(jobs, facts, 1130).start))
     end)
 end)
 
@@ -542,9 +555,7 @@ describe("job.run — a record, a process, a record", function()
 
         -- The command names the file and nothing else: no environment
         -- prefix at all, so a process this block starts inherits none of it.
-        expect(seen[1]).to.be(
-            "'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'"
-        )
+        expect(seen[1]).to.be("'agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'")
         expect(seen[1]:find("AGENT_BLOCK_", 1, true)).to.be(nil)
     end)
 end)
@@ -555,9 +566,7 @@ describe("job.command — what a run is", function()
             bin = "/usr/bin/agent-block",
             config = "/r/a-1.config",
         })
-        expect(cmd).to.be(
-            "'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'"
-        )
+        expect(cmd).to.be("'/usr/bin/agent-block' -s '/repo/blocks/a/init.lua' -p '/repo' --config '/r/a-1.config'")
     end)
 
     it("is three arguments and no environment when there is no config", function()
@@ -723,7 +732,7 @@ describe("job — the loop, end to end on a fake log", function()
             return t
         end
         local function step()
-            local plan = job.tick(jobs, job.read(s), t)
+            local plan = tick(jobs, job.read(s), t)
             for _, item in ipairs(plan.start) do
                 job.run(s, item.decl, { log = "/l", exec = exec, now = clock, requested = item.requested })
             end

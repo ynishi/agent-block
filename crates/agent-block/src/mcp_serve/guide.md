@@ -18,6 +18,8 @@ local result = agent.run({
     model = "claude-haiku-4-5-20251001",
     prompt = _PROMPT,
     system = _CONTEXT,
+    timeout = 120,        -- seconds one reply may take; required
+    max_iterations = 20,  -- beats this run is granted; required
 })
 
 return std.json.encode({

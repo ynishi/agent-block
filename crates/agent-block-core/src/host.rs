@@ -156,18 +156,54 @@ const EMBEDDED_ALIAS_PREFIX: &str = "embedded.";
 /// Embedded default agent invoker used by [`ScriptSource::DefaultAgent`].
 ///
 /// Runs the StdPkg `agent` module with `_PROMPT` / `_CONTEXT` injected and
-/// emits the result on the EventBus. The emit kind is `"_"` — a neutral
-/// label with no SDK-side meaning. The result is intended to be received
-/// via [`BlockConfig::host_handler`] (the kind-agnostic single sink); the
+/// the variant's [`AgentProfile`] as `_AGENT_PROFILE`, and emits the result
+/// on the EventBus. The emit kind is `"_"` — a neutral label with no
+/// SDK-side meaning. The result is intended to be received via
+/// [`BlockConfig::host_handler`] (the kind-agnostic single sink); the
 /// literal label is irrelevant to SDK consumers.
 const DEFAULT_AGENT_INVOKER: &str = r#"
 local agent = require("agent")
-local r = agent.run({
-    prompt = _PROMPT,
-    system = _CONTEXT,
-})
-bus.emit("_", r)
+local opts = {}
+for k, v in pairs(_AGENT_PROFILE) do
+    opts[k] = v
+end
+opts.prompt = _PROMPT
+opts.system = _CONTEXT
+bus.emit("_", agent.run(opts))
 "#;
+
+/// What [`ScriptSource::DefaultAgent`] runs `agent.run` with, besides the
+/// prompt and context. `agent.run` has no number of its own for how long a
+/// reply may take or how many beats a run is granted — both are the run's —
+/// so the variant carries them, and the SDK consumer who chose this path is
+/// the one who names them. There is deliberately no `Default`: a profile
+/// nobody wrote would be the number nobody chose, back under another name.
+///
+/// Serialised as-is into the `_AGENT_PROFILE` Lua global; the invoker passes
+/// every field through, so the names are `agent.run`'s.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentProfile {
+    /// `"anthropic"` | `"openai"`.
+    pub provider: String,
+    /// Where the provider is. `None` is the provider's own endpoint (or
+    /// `OPENAI_BASE_URL` for the openai path); a local vLLM / llama.cpp
+    /// server is named here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model identifier. `None` leaves it to the provider's own resolution
+    /// (`ANTHROPIC_MODEL` / `OPENAI_MODEL`, then the adapter's default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Seconds one reply may take.
+    pub timeout: f64,
+    /// Beats the run is granted.
+    pub max_iterations: u64,
+    /// Per-reply token cap. `None` sends none: an OpenAI-compatible server
+    /// then caps at what its window has left, which is the cap the model
+    /// actually has; the Anthropic adapter fills the field its API requires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
 
 /// How the Lua script source for `run()` is supplied.
 ///
@@ -191,14 +227,18 @@ pub enum ScriptSource {
         name: String,
     },
     /// Use the embedded default agent invoker. `prompt` / `context`
-    /// are forwarded as `_PROMPT` / `_CONTEXT` Lua globals and the
-    /// agent result is emitted on the EventBus under a neutral label
-    /// (`"_"`). SDK consumers should pair this with
-    /// [`BlockConfig::host_handler`] (the kind-agnostic single sink)
-    /// and `auto_serve_bus = true`. The emit-kind is intentionally
+    /// are forwarded as `_PROMPT` / `_CONTEXT` Lua globals, the profile
+    /// as `_AGENT_PROFILE`, and the agent result is emitted on the
+    /// EventBus under a neutral label (`"_"`). SDK consumers should pair
+    /// this with [`BlockConfig::host_handler`] (the kind-agnostic single
+    /// sink) and `auto_serve_bus = true`. The emit-kind is intentionally
     /// meaningless; consumers that need string-keyed routing should
     /// supply [`ScriptSource::Inline`] with their own invoker.
-    DefaultAgent,
+    ///
+    /// The profile is what the run is granted — provider, model, how long a
+    /// reply may take, how many beats — named by the consumer, since the
+    /// host has no number of its own for any of them.
+    DefaultAgent(AgentProfile),
 }
 
 /// How a string payload (prompt / system context) is supplied.
@@ -656,7 +696,7 @@ pub struct BlockConfig {
     /// `_TENANT`, `_FEATURE_FLAGS`, etc.). Keys must be valid Lua
     /// identifiers; values are any `serde_json::Value`.
     ///
-    /// `_PROMPT`, `_CONTEXT`, and `_SCRIPT_NAME` are reserved
+    /// `_PROMPT`, `_CONTEXT`, `_SCRIPT_NAME`, and `_AGENT_PROFILE` are reserved
     /// (managed by other `BlockConfig` fields); colliding with them
     /// silently overrides those defaults — use with care.
     pub extra_globals: HashMap<String, serde_json::Value>,
@@ -1477,7 +1517,7 @@ fn resolve_sources(config: &BlockConfig) -> BlockResult<ResolvedSources> {
         ScriptSource::Inline { source, name } => {
             (source.clone(), name.clone(), config.project_root.clone())
         }
-        ScriptSource::DefaultAgent => (
+        ScriptSource::DefaultAgent(_) => (
             DEFAULT_AGENT_INVOKER.to_string(),
             "default_agent_invoker.lua".to_string(),
             config.project_root.clone(),
@@ -2254,6 +2294,14 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     let prompt = prompt_resolved.clone();
     let context = context_resolved.clone();
 
+    // The default invoker reads its profile from `_AGENT_PROFILE`; it rides
+    // in with the caller's globals so the Isles see one map.
+    let mut globals = config.extra_globals.clone();
+    if let ScriptSource::DefaultAgent(profile) = &config.script {
+        let value = serde_json::to_value(profile)?;
+        globals.insert("_AGENT_PROFILE".to_string(), value);
+    }
+
     // ── main + handler Isles ──────────────────────────────────────
     let SpawnedIsles {
         isle,
@@ -2267,7 +2315,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
         &lib_roots,
         prompt,
         context,
-        &config.extra_globals,
+        &globals,
     )
     .await?;
 

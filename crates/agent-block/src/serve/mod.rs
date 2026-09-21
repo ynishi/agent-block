@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! every   = "2m"      # since the previous run ended; omit to run only on request
-//! timeout = "10m"     # the run's group is killed at this; default 10m
+//! timeout = "10m"     # the run's group is killed at this; required
 //! prompt  = "..."     # what `_PROMPT` is in the block; optional
 //! context = "..."     # what `_CONTEXT` is; optional
 //! block   = "other"   # run a different block under this job name; optional
@@ -110,12 +110,14 @@ pub enum Spelled {
 /// The file beside a block, as written. Unknown keys are refused: a
 /// misspelt `evry` that silently meant "never" is the mistake a declaration
 /// can least afford.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JobFile {
     block: Option<String>,
     every: Option<Spelled>,
-    timeout: Option<Spelled>,
+    /// Required: how long its block may run is the job's to say, and a
+    /// number the manager put here instead would be one nobody chose.
+    timeout: Spelled,
     prompt: Option<String>,
     context: Option<String>,
 }
@@ -129,8 +131,7 @@ pub struct JobDecl {
     pub cwd: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub every: Option<Spelled>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<Spelled>,
+    pub timeout: Spelled,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,12 +341,16 @@ mod tests {
         assert_eq!(job.path, drain.join("init.lua"));
         assert_eq!(job.cwd, root);
         assert_eq!(job.every, Some(Spelled::Text("2m".into())));
-        assert_eq!(job.timeout, Some(Spelled::Seconds(30.0)));
+        assert_eq!(job.timeout, Spelled::Seconds(30.0));
         assert_eq!(job.prompt.as_deref(), Some("go"));
 
-        std::fs::write(drain.join("job.toml"), "evry = \"2m\"\n").unwrap();
+        std::fs::write(drain.join("job.toml"), "evry = \"2m\"\ntimeout = 30\n").unwrap();
         let err = scan_jobs(&registered).expect_err("unknown key");
         assert!(format!("{err:#}").contains("job.toml"), "{err:#}");
+
+        std::fs::write(drain.join("job.toml"), "every = \"2m\"\n").unwrap();
+        let err = scan_jobs(&registered).expect_err("no timeout");
+        assert!(format!("{err:#}").contains("timeout"), "{err:#}");
     }
 
     #[test]
@@ -354,7 +359,11 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("blocks/nightly")).unwrap();
         std::fs::write(root.join("blocks/nightly/init.lua"), "").unwrap();
-        std::fs::write(root.join("blocks/nightly/job.toml"), "block = \"worker\"\n").unwrap();
+        std::fs::write(
+            root.join("blocks/nightly/job.toml"),
+            "block = \"worker\"\ntimeout = 30\n",
+        )
+        .unwrap();
         std::fs::write(root.join("blocks/worker.lua"), "").unwrap();
         let registered = blocks::scan(&[root.join("blocks")]);
         let jobs = scan_jobs(&registered).expect("scan");
@@ -362,7 +371,11 @@ mod tests {
         assert_eq!(jobs[0].block, "worker");
         assert_eq!(jobs[0].path, root.join("blocks/worker.lua"));
 
-        std::fs::write(root.join("blocks/nightly/job.toml"), "block = \"ghost\"\n").unwrap();
+        std::fs::write(
+            root.join("blocks/nightly/job.toml"),
+            "block = \"ghost\"\ntimeout = 30\n",
+        )
+        .unwrap();
         assert!(scan_jobs(&registered).is_err());
     }
 

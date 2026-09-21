@@ -115,6 +115,8 @@ local agent = require("agent")
 local result = agent.run({
     prompt = _PROMPT,    -- nil when --prompt is omitted (agent.run will error — expected)
     system = _CONTEXT,   -- nil when -c is omitted (system prompt is optional)
+    timeout = 120,       -- required: seconds one reply may take
+    max_iterations = 20, -- required: beats this run is granted
 })
 print(result.content)
 ```
@@ -255,7 +257,7 @@ off and gets one value back.
 -- blocks/summarize.lua
 -- Summarize the prompt. Returns { ok, text }.
 local agent = require("agent")
-local r = agent.run({ prompt = _PROMPT, system = _CONTEXT })
+local r = agent.run({ prompt = _PROMPT, system = _CONTEXT, timeout = 120, max_iterations = 20 })
 return std.json.encode({ ok = r.ok, text = r.text })
 ```
 
@@ -295,7 +297,7 @@ manager keeps the record.
 ```toml
 # blocks/drain/job.toml — beside blocks/drain/init.lua
 every   = "2m"     # since the previous run ended; omit to run only on request
-timeout = "10m"    # the run's process group is killed at this; default 10m
+timeout = "10m"    # the run's process group is killed at this; required
 prompt  = "..."    # _PROMPT in the block; optional
 context = "..."    # _CONTEXT; optional
 ```
@@ -779,10 +781,10 @@ local result = agent.run({
     prompt  = "List files in the current directory and summarise them.",
     system  = "You are a helpful assistant.",           -- optional
     model   = "claude-haiku-4-5-20251001",             -- optional, env ANTHROPIC_MODEL as fallback
-    max_tokens       = 4096,                            -- per-request token limit
-    max_iterations   = 20,                              -- loop iteration cap
+    max_tokens       = 4096,                            -- optional; absent, the server's own cap is the cap
+    max_iterations   = 20,                              -- required: beats this run is granted
     max_tokens_budget = 50000,                          -- total token budget (nil = unlimited)
-    timeout          = 120,                             -- HTTP timeout in seconds
+    timeout          = 120,                             -- required: seconds one reply may take
     mcp_servers = {                                     -- optional MCP servers to connect
         { name = "outline", command = "outline-mcp", args = {} },
         -- HTTP/SSE form: use `url` instead of `command`
@@ -844,13 +846,15 @@ By default `agent.run` uses the Anthropic Messages API. Pass `provider = "openai
 
 ```lua
 -- Anthropic (default) — requires ANTHROPIC_API_KEY
-local result = agent.run({ prompt = "Hello", model = "claude-haiku-4-5-20251001" })
+local result = agent.run({ prompt = "Hello", model = "claude-haiku-4-5-20251001", timeout = 120, max_iterations = 20 })
 
 -- OpenAI — requires OPENAI_API_KEY (or opts.api_key)
 local result = agent.run({
     prompt  = "Hello",
     provider = "openai",
     model   = "gpt-4o-mini",
+    timeout = 120,
+    max_iterations = 20,
 })
 
 -- Local vLLM / llama.cpp / RunPod — custom base_url
@@ -860,6 +864,8 @@ local result = agent.run({
     base_url = "http://localhost:8080/v1",
     model    = "Qwen/Qwen3-0.6B",
     api_key  = "token-abc123",           -- or api_key_env = "MY_KEY"
+    timeout  = 600,                      -- a local model's reply takes what it takes; say so
+    max_iterations = 20,
 })
 ```
 
@@ -881,6 +887,8 @@ Request building lives in the `llm_proto` package, reached through the provider 
 ```lua
 local result = agent.run({
     prompt = "...",
+    timeout = 120,
+    max_iterations = 20,
     -- "auto" | "none" | "required" | { type = "function", name = "grep" }
     -- Anthropic spellings ("any", { type = "tool", name = ... }) are accepted too.
     tool_choice = "required",

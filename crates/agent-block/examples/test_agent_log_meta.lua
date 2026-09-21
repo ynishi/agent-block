@@ -47,6 +47,7 @@ local result = agent.run({
     system = "You are concise and use tools when available.",
     max_tokens = 256,
     max_iterations = 4,
+    timeout = 120,
     on_turn = function(info)
         log.info(
             string.format(

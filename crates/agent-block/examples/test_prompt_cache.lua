@@ -173,6 +173,7 @@ local result = agent.run({
     system = LONG_SYSTEM,
     max_tokens = 256,
     max_iterations = 4,
+    timeout = 120,
     -- Disable context-management beta to isolate cache behavior from
     -- cm edits that could invalidate the byte-exact cache key.
     context_management = false,

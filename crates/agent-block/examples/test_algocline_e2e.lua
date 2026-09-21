@@ -46,6 +46,7 @@ Be concise in final reporting.]],
     model = "claude-haiku-4-5-20251001",
     max_tokens = 1024,
     max_iterations = 25,
+    timeout = 120,
     mcp_servers = {
         { name = "algocline", command = "alc", args = {} },
     },

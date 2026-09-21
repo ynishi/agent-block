@@ -17,6 +17,8 @@
 --       prompt  = "hello again",
 --       history = prior,                    -- prepended to messages
 --       system  = "...",
+--       timeout = 120,
+--       max_iterations = 20,
 --   })
 --
 --   session.save(id, r.messages)            -- store full thread back

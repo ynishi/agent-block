@@ -46,6 +46,7 @@ dependencies = [
  "agent-block-types",
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "axum",
  "clap",
  "dotenvy",
