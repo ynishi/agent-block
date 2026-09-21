@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `knl.shapes.tool_spec` declares what a tool is — its name, what the model is
+  told about it, its input schema, and the function that runs it. That triple
+  was written three times and nowhere declared: `std.fs.tool_specs` answers
+  with it, `knl_adapter.tools` takes an array of it, and a device's map holds
+  it under the name. Now the kernel owns the one declaration and the other two
+  are projections of it — a device's entry is the spec minus the name its map
+  keys on, and `knl_adapter.shapes.tool_decl` (what a provider is shown) is the
+  spec minus the handler, both taken from its fields rather than restated.
+  `knl.device` checks each entry against that shape instead of a hand-written
+  reading of it beside it, so a tool with no handler, or one whose handler is
+  not a function, is refused where the device is built and the message names
+  the tool.
+
 - `coding.run` splits its opts by where a value comes from, and refuses to
   start without the ones it cannot answer. Three facts about the model are
   tripwires rather than defaults, because a default here is a number invented
