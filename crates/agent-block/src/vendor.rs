@@ -30,9 +30,22 @@
 //! because the copy is still a legal thing to have — it just is not the way to
 //! make a small change.
 //!
-//! Nothing here keeps a copy in step with the binary it came from. That is the
-//! deal the header states plainly: a vendored module is the project's from the
-//! moment it is written, and an upgrade of agent-block moves the embedded one
+//! A module is written with its **specs**: the `spec/*.lua` beside it in the
+//! crate's tree land under `.agent-block/lib/<name>/spec/`, so the copy a
+//! project edits is a copy it can check — `lua-spec-runner --project <dir>`
+//! runs them with the project's `.agent-block/lib/` first on the require path,
+//! the order the host uses. A spec is not `require`d, so it carries no
+//! `require` name; the header says what it is instead.
+//!
+//! Nothing here keeps a copy in step with the binary it came from, and nothing
+//! here remembers what the copy looked like when it was written: that is the
+//! project's version control. The copy is a plain file under `.agent-block/`,
+//! meant to be committed — the vendor run in one commit, the project's edits
+//! after it — so `git log` is the record of what was changed, `git diff` after
+//! a `--force` is the update upstream made, and a three-way merge of the two
+//! is `git merge-file` with the earlier vendor commit as the base. The header
+//! states the deal plainly: a vendored module is the project's from the moment
+//! it is written, and an upgrade of agent-block moves the embedded one
 //! underneath it without touching it.
 
 use std::path::{Path, PathBuf};
@@ -80,10 +93,22 @@ pub struct VendorArgs {
 struct Vendored {
     /// Where it goes, relative to `<dir>/.agent-block/`.
     rel: PathBuf,
-    /// The `require` name this file answers for.
+    /// The `require` name this file answers for, or for a spec the
+    /// `<module>/spec/<file>` it is.
     name: String,
     /// The embedded source it is a copy of.
     source: &'static str,
+    /// Which of the two things a vendored file is.
+    kind: Kind,
+}
+
+/// The two kinds of file a vendor writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A module or sub-module: what `require` resolves to.
+    Module,
+    /// A spec: checks the module beside it; run by `lua-spec-runner --project`.
+    Spec,
 }
 
 /// What one name expands to: the files, and anything the caller should hear
@@ -136,7 +161,7 @@ pub fn run(args: VendorArgs, project: &Path) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating '{}'", parent.display()))?;
         }
-        let body = render(&file.name, file.source);
+        let body = render(&file.name, file.source, file.kind);
         std::fs::write(&target, body).with_context(|| format!("writing '{}'", target.display()))?;
         println!("{}", target.display());
     }
@@ -178,6 +203,7 @@ fn resolve(name: &str) -> anyhow::Result<Plan> {
         rel: module_path(name),
         name: name.to_string(),
         source: entry.source,
+        kind: Kind::Module,
     }];
     for sub in subs_of(name) {
         let tail = sub.name.trim_start_matches(name).trim_start_matches('.');
@@ -187,6 +213,19 @@ fn resolve(name: &str) -> anyhow::Result<Plan> {
                 .join(format!("{}.lua", tail.replace('.', "/"))),
             name: sub.name.to_string(),
             source: sub.source,
+            kind: Kind::Module,
+        });
+    }
+    // The specs go with the module: a copy that can be edited is a copy that
+    // needs checking, and the checks are the ones the embedded module has.
+    // They land under `spec/` beside it, where `lua-spec-runner --project`
+    // finds them and where `require("<name>.spec.support")` still resolves.
+    for spec in embedded::specs_of(name) {
+        files.push(Vendored {
+            rel: PathBuf::from("lib").join(name).join("spec").join(spec.file),
+            name: format!("{name}/spec/{}", spec.file),
+            source: spec.source,
+            kind: Kind::Spec,
         });
     }
 
@@ -233,18 +272,30 @@ fn roots() -> Vec<&'static str> {
 /// the file is the only place the answers survive: where it came from (and from
 /// which version — the embedded one has moved since), what name it now answers
 /// to, and how to reach the original it replaced.
-fn render(name: &str, source: &str) -> String {
-    format!("{}\n{source}", header(name))
+fn render(name: &str, source: &str, kind: Kind) -> String {
+    format!("{}\n{source}", header(name, kind))
 }
 
 /// The header lines, without the trailing blank one.
-fn header(name: &str) -> String {
-    format!(
-        "-- vendored from agent-block {version} (embedded {name})\n\
-         -- This copy is what require(\"{name}\") resolves to in this project;\n\
-         -- the original stays reachable as require(\"embedded.{name}\"). Edit freely; nothing keeps it in step with upstream.\n",
-        version = env!("CARGO_PKG_VERSION"),
-    )
+///
+/// A spec's header says what a spec is for instead of what `require` does
+/// with it, since nothing `require`s a spec; the first line keeps the same
+/// shape so a reader finds the version in the same place.
+fn header(name: &str, kind: Kind) -> String {
+    match kind {
+        Kind::Module => format!(
+            "-- vendored from agent-block {version} (embedded {name})\n\
+             -- This copy is what require(\"{name}\") resolves to in this project;\n\
+             -- the original stays reachable as require(\"embedded.{name}\"). Edit freely; nothing keeps it in step with upstream.\n",
+            version = env!("CARGO_PKG_VERSION"),
+        ),
+        Kind::Spec => format!(
+            "-- vendored from agent-block {version} (spec {name})\n\
+             -- This spec checks the vendored module beside it;\n\
+             -- run it with `lua-spec-runner --project <dir>`. Edit freely; nothing keeps it in step with upstream.\n",
+            version = env!("CARGO_PKG_VERSION"),
+        ),
+    }
 }
 
 /// What every row of `--list` says in its second column.
@@ -292,7 +343,7 @@ fn rows(dir: &Path) -> Vec<Row> {
         .filter(|e| !e.name.contains('.'))
         .map(|e| {
             let subs = subs_of(e.name);
-            let label = if subs.is_empty() {
+            let mut label = if subs.is_empty() {
                 e.name.to_string()
             } else {
                 let tails: Vec<&str> = subs
@@ -301,6 +352,10 @@ fn rows(dir: &Path) -> Vec<Row> {
                     .collect();
                 format!("{} (+{})", e.name, tails.join(", "))
             };
+            let specs = embedded::specs_of(e.name).len();
+            if specs > 0 {
+                label.push_str(&format!(" (spec/: {specs})"));
+            }
             let tag = if embedded::is_sealed(e.name) {
                 "sealed"
             } else if PACKS.contains(&e.name) {
@@ -321,9 +376,20 @@ fn rows(dir: &Path) -> Vec<Row> {
 mod tests {
     use super::*;
 
+    /// Every planned path, specs included.
     fn rels(plan: &Plan) -> Vec<String> {
         plan.files
             .iter()
+            .map(|f| f.rel.display().to_string())
+            .collect()
+    }
+
+    /// The planned module paths alone: what the older tests pin, with the
+    /// specs (which go along with every module that has them) set aside.
+    fn module_rels(plan: &Plan) -> Vec<String> {
+        plan.files
+            .iter()
+            .filter(|f| f.kind == Kind::Module)
             .map(|f| f.rel.display().to_string())
             .collect()
     }
@@ -334,12 +400,12 @@ mod tests {
     #[test]
     fn an_embedded_consumer_vendors_as_a_module() {
         let plan = resolve("agent").expect("agent is embedded");
-        assert_eq!(rels(&plan), ["lib/agent/init.lua"]);
+        assert_eq!(module_rels(&plan), ["lib/agent/init.lua"]);
         assert!(plan.warning.is_none());
         assert!(plan.files[0].source.contains("function"));
 
         let plan = resolve("coding").expect("coding is embedded");
-        assert_eq!(rels(&plan), ["lib/coding/init.lua"]);
+        assert_eq!(module_rels(&plan), ["lib/coding/init.lua"]);
     }
 
     /// A module vendors whole: the root and every sub-module the binary
@@ -348,7 +414,7 @@ mod tests {
     fn a_module_vendors_with_every_sub_module_it_has() {
         let plan = resolve("llm_proto").expect("llm_proto is embedded");
         assert_eq!(
-            rels(&plan),
+            module_rels(&plan),
             [
                 "lib/llm_proto/init.lua",
                 "lib/llm_proto/openai.lua",
@@ -356,6 +422,46 @@ mod tests {
             ]
         );
         assert_eq!(plan.files[1].name, "llm_proto.openai");
+
+        let plan = resolve("session").expect("session is embedded");
+        assert_eq!(rels(&plan), ["lib/session/init.lua"]);
+    }
+
+    /// A module vendors with its specs: they land under `spec/` beside it, each
+    /// named by its path, each with a header that says what it is rather than
+    /// what `require` would do with it. A module without a `spec/` plans what
+    /// it did before.
+    #[test]
+    fn a_module_vendors_with_its_specs() {
+        let plan = resolve("policy").expect("policy is embedded");
+        let planned = rels(&plan);
+        assert_eq!(planned[0], "lib/policy/init.lua");
+        assert!(
+            planned.contains(&"lib/policy/spec/api_spec.lua".to_string()),
+            "{planned:?}"
+        );
+        assert!(
+            planned.contains(&"lib/policy/spec/support.lua".to_string()),
+            "{planned:?}"
+        );
+        let spec = plan
+            .files
+            .iter()
+            .find(|f| f.rel.ends_with("spec/api_spec.lua"))
+            .expect("the spec is planned");
+        assert_eq!(spec.kind, Kind::Spec);
+        assert_eq!(spec.name, "policy/spec/api_spec.lua");
+        let text = render(&spec.name, spec.source, spec.kind);
+        assert!(
+            text.starts_with(&format!(
+                "-- vendored from agent-block {} (spec policy/spec/api_spec.lua)\n",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{text}"
+        );
+        assert!(text.contains("lua-spec-runner --project"), "{text}");
+        assert!(!text.contains("require(\"policy/spec"), "{text}");
+        assert!(text.ends_with(spec.source), "{text}");
 
         let plan = resolve("session").expect("session is embedded");
         assert_eq!(rels(&plan), ["lib/session/init.lua"]);
@@ -405,7 +511,7 @@ mod tests {
     #[test]
     fn a_pack_warns_and_is_written_anyway() {
         let plan = resolve("policy").expect("policy is embedded");
-        assert_eq!(rels(&plan), ["lib/policy/init.lua"]);
+        assert_eq!(module_rels(&plan), ["lib/policy/init.lua"]);
         let warning = plan.warning.expect("a pack warns");
         assert!(warning.contains("knl.device"), "{warning}");
         assert!(warning.contains("embedded.policy"), "{warning}");
@@ -415,7 +521,7 @@ mod tests {
     /// this copy now answers for, and the original under `embedded.`.
     #[test]
     fn the_header_names_the_version_and_the_original() {
-        let body = render("session", "return {}\n");
+        let body = render("session", "return {}\n", Kind::Module);
         let mut lines = body.lines();
         assert_eq!(
             lines.next(),
@@ -467,6 +573,8 @@ mod tests {
         );
         assert!(line("lshape").contains("sealed"), "{listing}");
         assert!(line("policy").contains("pack"), "{listing}");
+        assert!(line("policy").contains("(spec/: "), "{listing}");
+        assert!(!line("session").contains("spec/"), "{listing}");
         assert!(
             !listing.lines().any(|l| l.starts_with("lshape.t")),
             "{listing}"

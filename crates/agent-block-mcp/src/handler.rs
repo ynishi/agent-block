@@ -1,8 +1,8 @@
 //! `AgentBlockClientHandler` — custom `ClientHandler` for agent-block MCP clients.
 //!
-//! Subtask 1: structural skeleton.
-//! Subtask 2: `on_progress` wired to `handler_isle` bytecode forwarding.
-//! Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
+//! It answers the notifications a server sends unasked — progress, log
+//! messages, resource updates — and the one request a server makes of its
+//! client, `create_message` (sampling). Each is handed to Lua.
 //!
 //! # The VM thread never waits, and the host never drives it synchronously
 //!
@@ -234,15 +234,18 @@ impl ServerHandlerRegistry {
 /// correct sampling handler by server name without needing the `RequestContext`
 /// to carry server identity.
 ///
-/// # Subtask evolution
-/// - Subtask 1: skeleton — all notification methods are the default no-ops from rmcp.
-/// - Subtask 2: `on_progress` wired to `handler_isle` bytecode forwarding.
-/// - Subtask 3: `on_logging_message` log bridge + `create_message` sampling skeleton.
-/// - Subtask 4: progress/log notifications dispatched to main Isle via `exec` so user
-///   callbacks run with their upvalues intact (no bytecode dump/reload across VMs).
-/// - Subtask 5 (M-3): bounded notification channel replaces per-notification spawns
-///   to cap memory growth when a chatty server floods notifications faster than Lua
-///   can consume them.
+/// # Two decisions worth keeping
+///
+/// **Notifications reach Lua on the main Isle, through `exec`.** The earlier
+/// route dumped the callback to bytecode and reloaded it on another VM,
+/// which silently dropped its upvalues: a callback closing over a counter
+/// found `nil` there. Running it where it was defined keeps the closure
+/// whole.
+///
+/// **A bounded channel carries them, not a spawn per notification.** A
+/// chatty server can emit faster than Lua consumes, and one task per
+/// notification turns that into unbounded memory. The bound makes the
+/// producer wait instead.
 #[derive(Clone)]
 pub struct AgentBlockClientHandler {
     /// Keyed by server name so a single handler instance can serve multiple servers

@@ -22,8 +22,10 @@
 //! ## Serial guarantee
 //!
 //! The loop awaits each handler to completion before pulling the next
-//! event. This gives Lua handlers the cooperative-serial model described
-//! in `plan.md` (§設計選択 A1 + mlua-isle single-thread VM).
+//! event. That is what gives Lua handlers a cooperative-serial model: one
+//! handler at a time, in arrival order, on a VM that is single-threaded
+//! anyway (mlua-isle). A handler that awaits suspends only its own
+//! coroutine, and the next event waits for it to finish.
 //!
 //! ## Shutdown policy
 //!
@@ -34,7 +36,9 @@
 //!    iteration finishes its await. The loop then exits.
 //! 4. Events that had queued into the mpsc buffer are **not drained** —
 //!    their ack senders drop, and callers see `RecvError` on their
-//!    oneshot (documented in `plan.md` Risks).
+//!    oneshot. This is the known cost of cancelling: a caller that had
+//!    queued an event and is waiting for its ack learns that the bus went
+//!    away, not what became of the event.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,11 +53,12 @@ use agent_block_types::error::BlockError;
 
 /// Callable target for a registered handler.
 ///
-/// Subtask 1 uses a trait object as a placeholder; Subtask 3 will plug in
-/// an `mlua::RegistryKey`-backed implementation that dispatches into the
-/// Isle Lua thread. The trait contract here intentionally mirrors what
-/// Subtask 3 needs: take an owned [`Event`] (minus its `ack_tx`, which is
-/// managed by the dispatcher), return a result that becomes the ack.
+/// A trait object rather than a concrete type, so that this module knows
+/// nothing about Lua: the Lua-side handler is one implementation, holding
+/// an `mlua::RegistryKey` and dispatching into the Isle's VM thread. The
+/// contract is shaped for that caller — take an owned [`Event`] (minus its
+/// `ack_tx`, which the dispatcher manages), return a result that becomes
+/// the ack.
 ///
 /// `'static` bound is required because the dispatcher invokes handlers via
 /// `tokio::task::spawn`, which requires the future to outlive any
@@ -78,7 +83,7 @@ pub type HandlerKey = Arc<dyn Handler>;
 pub struct EventBus {
     /// Ingress queue. Sources push events into the paired `Sender` (held
     /// outside). Capacity is configured by the caller (default comes from
-    /// `AGENT_BLOCK_BUS_CAPACITY`, wired in Subtask 2).
+    /// `AGENT_BLOCK_BUS_CAPACITY`).
     rx: mpsc::Receiver<Event>,
     /// kind -> handler. Populated via [`EventBus::on`] before [`EventBus::run`]
     /// is awaited.
@@ -86,7 +91,9 @@ pub struct EventBus {
     /// Fallback handler — fires only when no `handlers[kind]` is present.
     any: Option<HandlerKey>,
     /// Set once when `run` begins. Used to reject `on` / `on_any` calls
-    /// after dispatcher start (see plan.md §Constraints).
+    /// after dispatcher start: the handler table is read by the running
+    /// loop, and a registration landing mid-dispatch would change which
+    /// handler an in-flight event reaches.
     running: bool,
 }
 
@@ -103,8 +110,12 @@ impl EventBus {
     }
 
     /// Register a kind-specific handler. Last write wins — re-registering
-    /// the same `kind` silently replaces the previous handler (documented
-    /// in plan.md §Phase 3 / wf-sim Counter-WF).
+    /// the same `kind` replaces the previous handler, with a `warn!` saying
+    /// so. Replacing rather than refusing is deliberate: a script that
+    /// registers in a loop or re-runs its setup should end with the handler
+    /// it registered last, not with an error about the one it registered
+    /// first. The warning is there because the other reading — two
+    /// registrations that were both meant to fire — is a real mistake.
     ///
     /// Returns `Err(BlockError::Bus)` if called after [`EventBus::run`] has
     /// begun.
@@ -984,11 +995,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // General tests (plan.md §一般テスト)
+    // General dispatch tests: which handler fires, and what a failing one
+    // does to the loop.
     // -----------------------------------------------------------------
 
     /// on_any fires only when the event's kind has no specialized handler.
-    /// (plan.md §一般テスト — on_any フォールバック)
     #[tokio::test]
     async fn general_on_any_fallback_vs_no_handler_warn() {
         // 1) No specialized, no on_any → nack.
@@ -1025,7 +1036,6 @@ mod tests {
     }
 
     /// When a specialized handler matches, on_any is NOT invoked.
-    /// (plan.md §一般テスト — 優先順位)
     #[tokio::test]
     async fn general_specialized_wins_over_on_any() {
         let (tx, rx) = mpsc::channel::<Event>(2);
@@ -1063,7 +1073,6 @@ mod tests {
 
     /// A handler returning `Err(...)` delivers an error ack and the loop
     /// continues to dispatch the next event.
-    /// (plan.md §一般テスト — Handler error 継続)
     #[tokio::test]
     async fn general_handler_error_ack_and_loop_continues() {
         let (tx, rx) = mpsc::channel::<Event>(4);

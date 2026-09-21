@@ -26,11 +26,11 @@ for the full step-by-step procedure and troubleshooting.
 
 | | elapsed (SIGTERM → exit) |
 |---|---|
-| Before handler Isle split (pre subtask 1/2) | ~10000 ms |
+| Before the handler Isle split | ~10000 ms |
 | After handler Isle split | < 3000 ms (threshold); measured ~1100 ms |
 
-The ~10x gap is the value delivered by subtask 1/2. `verify.sh` is designed
-to catch a regression of that gap.
+The ~10x gap is what the split bought. `verify.sh` is designed to catch a
+regression of that gap.
 
 ## Prerequisites
 

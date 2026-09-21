@@ -4,7 +4,7 @@
 `bus.on(kind, fn)` in `agent-block` has its SIGTERM teardown bounded by
 `AGENT_BLOCK_TASK_GRACE_MS`, **over the public mesh relay**.
 
-**Scope**: handler Isle split (see `CHANGELOG.md` Unreleased / Subtask 1 + 2 of 4).
+**Scope**: the handler Isle split (see `CHANGELOG.md`).
 
 **When to run**: as a regression check whenever the handler dispatch path is
 touched — `src/bridge/bus.rs`, `src/host.rs::HostContext`, `src/bridge/mesh.rs`.
@@ -175,8 +175,8 @@ Isle `LocalSet` is being occupied by the CPU-bound handler again.
 3. Verify `LuaHandler { isle }` points at `host_ctx.handler_isle` rather than
    the main Isle
 
-**Fix**: inspect the subtask 1 / 2 diffs (`git show 442e3a1 a1a09c0`) and
-identify the regressing commit.
+**Fix**: inspect the diffs that introduced the split
+(`git show 442e3a1 a1a09c0`) and identify the regressing commit.
 
 ### D. `exit code != 0`
 
@@ -192,8 +192,8 @@ graceful path — likely a panic along the way.
 
 | | elapsed (SIGTERM → exit) | threshold | verdict |
 |---|---|---|---|
-| Before subtask 1/2 | ~10000 ms | < 3000 ms | FAIL (expected) |
-| After subtask 1/2 | ~1100 ms | < 3000 ms | PASS |
+| Before the split | ~10000 ms | < 3000 ms | FAIL (expected) |
+| After the split | ~1100 ms | < 3000 ms | PASS |
 
 ## Related
 

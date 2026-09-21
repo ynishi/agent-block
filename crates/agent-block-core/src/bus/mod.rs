@@ -1,12 +1,10 @@
 //! EventBus: serial event dispatcher feeding Lua handlers registered via
 //! `bus.on(kind, fn)` / `bus.on_any(fn)`.
 //!
-//! This subtask (Subtask 1) defines the pure-Rust core: [`Event`],
-//! [`Source`], [`EventBus`], plus a [`Handler`] trait placeholder that
-//! Subtask 3 will swap for an `mlua::RegistryKey`-backed implementation.
-//!
-//! Module wiring (`mod bus;` in `main.rs`) and `tokio-util` Cargo
-//! dependency are deferred to Subtask 2.
+//! The pure-Rust core lives here: [`Event`], [`Source`], [`EventBus`] and
+//! the [`Handler`] trait they dispatch through. Nothing in this module
+//! knows about Lua — the Lua-side handler is one implementation of
+//! [`Handler`], registered by the `bus` bridge.
 
 pub mod dispatcher;
 pub mod event;

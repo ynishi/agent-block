@@ -44,6 +44,14 @@ test-lua filter="":
     LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- {{ filter }}
 
 # [allow-agent]
+# Run a project's vendored specs against its vendored modules: what
+# `agent-block vendor <name>` wrote under <dir>/.agent-block/lib/<name>/spec/,
+# with <dir>/.agent-block/lib/ first on the require path. The other half of
+# vendoring — a copy the project can edit is a copy that needs checking.
+test-lua-project dir filter="":
+    LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- --project {{ dir }} {{ filter }}
+
+# [allow-agent]
 # Format and lint
 lint:
     cargo fmt --all

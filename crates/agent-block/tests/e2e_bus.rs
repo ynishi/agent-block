@@ -137,8 +137,9 @@ mod unix {
 
     #[test]
     fn bus_serve_with_no_handlers_exits_on_signal() {
-        // Script calls bus.serve() without registering anything. Per plan.md
-        // decision the dispatcher idles until shutdown.
+        // Script calls bus.serve() without registering anything. A bus with
+        // no handlers idles until shutdown rather than refusing to start:
+        // registering nothing is a script that means to wait.
         let mut tmp = NamedTempFile::new().expect("tempfile");
         writeln!(
             tmp,

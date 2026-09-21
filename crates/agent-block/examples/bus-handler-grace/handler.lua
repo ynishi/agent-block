@@ -5,7 +5,7 @@
 -- while this handler is in-flight, the grace window (AGENT_BLOCK_TASK_GRACE_MS,
 -- default 1000ms) must bound the shutdown time.
 --
--- Before the handler Isle split (subtasks 1+2), the main Isle LocalSet was
+-- Before the handler Isle split, the main Isle LocalSet was
 -- occupied by the CPU-bound Lua loop, so the shutdown signal future could
 -- not be polled and the process waited for the handler to finish (~10s).
 -- After the split, the handler runs on a dedicated OS thread so the main
