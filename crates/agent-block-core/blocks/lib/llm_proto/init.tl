@@ -44,9 +44,6 @@
 --- parse answers, and the `Adapter` both dialects are. The wire bodies stay
 --- `{string:any}`: they are JSON, and the provider's, not this module's.
 local host = require("host_types")
-global std: host.Std
-global log: host.Log
-global http: host.Http
 
 local record M
     --- One content block, in the canonical (Anthropic-shaped) vocabulary:

@@ -2,11 +2,11 @@
 -- against the module's own records. The specs beside it hold the wire,
 -- the transport and the adapters.
 local t = require("htl.test")
-local host = require("host_types")
+require("host_types")
 
 --- What `classify_error` reads a body with: the two JSON texts the tests
 --- send, decoded by hand — the host's `std.json` is not in this state.
-global std: host.Std = {
+std = {
     json = {
         decode = function(text: string): any
             if text == '{"error":{"code":"insufficient_quota","message":"no"}}' then

@@ -20,8 +20,7 @@
 --- over values a caller already has, so they load and run in a VM with no
 --- MCP at all. The one global read is `std.json`, declared through
 --- `host_types` (see that file for why the declaration assigns nothing).
-local host = require("host_types")
-global std: host.Std
+require("host_types")
 
 local record mcp_tools
     --- One item of `mcp.list_tools(server).tools`, as the server declared it.
@@ -54,11 +53,11 @@ end
 --- snake_case name every adapter build reads, an empty description rather
 --- than a missing one, and an empty object schema for a server that declared
 --- none (a provider will reject a tool with no schema at all).
-function mcp_tools.tool_decl(server: string, tool: mcp_tools.Tool): mcp_tools.Decl
+function mcp_tools.tool_decl(server: string, listed: mcp_tools.Tool): mcp_tools.Decl
     return {
-        name = server .. "__" .. tool.name,
-        description = tool.description or "",
-        input_schema = tool.inputSchema or tool.input_schema or { type = "object", properties = {} },
+        name = server .. "__" .. listed.name,
+        description = listed.description or "",
+        input_schema = listed.inputSchema or listed.input_schema or { type = "object", properties = {} },
     }
 end
 

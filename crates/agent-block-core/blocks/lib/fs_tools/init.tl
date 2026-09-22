@@ -92,9 +92,6 @@
 --- modes. `knl/init.lua` requires `knl_types` on the same terms and for the
 --- same reason.
 local host = require("host_types")
-global std: host.Std
-global tool: host.Tool
-global log: host.Log
 
 local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil

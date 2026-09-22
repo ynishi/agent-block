@@ -2,12 +2,12 @@
 -- translations, against a fake `std.json` declared through `host_types`.
 --
 -- Run via `just test-tl` (walks `blocks/lib` for `*_test.tl`; one state per
--- file). The declaration is the module's own: `global std: host.Std` with a
--- value, which is what a test may do and a module must not.
+-- file). The declaration is `host_types`'; what a test adds is the VALUE,
+-- which is what a test may do and a module must not.
 local t = require("htl.test")
-local host = require("host_types")
+require("host_types")
 
-global std: host.Std = {
+std = {
     json = {
         encode = function(v: any): string
             local blocks = v as { { string: any } }

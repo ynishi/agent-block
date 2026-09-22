@@ -98,10 +98,9 @@
 ---
 --- Written in Teal and embedded through `include_tl!` (`host.rs`); the Lua
 --- the host holds is what Teal generates from this file, without these
---- comments. `knl` is read through its declaration (`knl.d.tl`) while the
---- kernel is Lua; the host globals through `host_types`.
+--- comments. `knl` is read through its own record (the kernel is Teal too);
+--- the host globals through `host_types`.
 local host = require("host_types")
-global std: host.Std
 
 local kernel = require("knl")
 local lshape = require("lshape")

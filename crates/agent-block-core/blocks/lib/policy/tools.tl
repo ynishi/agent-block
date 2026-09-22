@@ -11,8 +11,7 @@
 --- keeps. This file is `require`d by `policy/init.lua` and not meant to be
 --- reached for directly.
 
-local host = require("host_types")
-global std: host.Std
+require("host_types")
 
 local kernel = require("knl")
 local lshape = require("lshape")

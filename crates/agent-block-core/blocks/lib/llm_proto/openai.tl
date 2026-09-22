@@ -17,9 +17,7 @@
 ---            docs.vllm.ai/en/latest/features/reasoning_outputs/
 ---            github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 
-local host = require("host_types")
-global std: host.Std
-global log: host.Log
+require("host_types")
 
 local proto = require("llm_proto")
 

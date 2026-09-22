@@ -49,9 +49,7 @@
 ---   session.save(id, msgs)     → void
 ---   session.clear(id)          → boolean (true if a row was deleted)
 ---   session.NS                 → namespace constant for advanced std.kv use
-local host = require("host_types")
-global std: host.Std
-global log: host.Log
+require("host_types")
 
 --- One message of an `agent.run` thread: `role` and `content` are what a
 --- caller reads back, and whatever else the run wrote rides along.

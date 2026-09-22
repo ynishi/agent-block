@@ -44,9 +44,7 @@
 --- `knl/init.lua` requires `knl_types` on the same terms and for the same
 --- reason. (`host_types`, the one `require` a Teal module cannot do without,
 --- is answered on that VM by the bridge itself — `bridge/mod.rs`.)
-local host = require("host_types")
-global std: host.Std
-global tool: host.Tool
+require("host_types")
 
 local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil

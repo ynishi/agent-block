@@ -261,8 +261,8 @@
 ---
 --- Written in Teal, all six files, and embedded through `include_tl!`
 --- (`host.rs`); the Lua the host holds is what Teal generates, without
---- these comments. The kernel is read through its declaration (`knl.d.tl`)
---- while it is Lua; the records the files share are `policy.shared`'s.
+--- these comments. The kernel is read through its own record (`knl` is
+--- Teal too); the records the files share are `policy.shared`'s.
 local lshape = require("lshape")
 local shape = lshape.check
 local shared = require("policy.shared")

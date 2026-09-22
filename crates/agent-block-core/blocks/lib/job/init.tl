@@ -99,8 +99,6 @@
 --- `host_types`, and reached the tolerant way (`rawget(_G, ...)`) where a
 --- VM without them is expected: a spec hands in its own `exec` / `now`.
 local host = require("host_types")
-global std: host.Std
-global sh: host.Sh
 
 --- The manager's session: what `job` asks of it. The kernel's session
 --- userdata (`knl.open`) answers both; a spec's fake answers the same two.

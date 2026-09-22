@@ -46,9 +46,7 @@
 --- See `kv_tools/init.lua` for the case this covers: the bridge's fallback
 --- runs this source on a bare `Lua::new()`, where nothing resolves, and that
 --- VM only needs `std.ts` to hold its functions.
-local host = require("host_types")
-global std: host.Std
-global tool: host.Tool
+require("host_types")
 
 local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil

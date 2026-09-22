@@ -31,9 +31,7 @@
 --- `bridge/sql.rs`); the Lua the host holds is what Teal generates from this
 --- file, without these comments. The globals it reads are declared through
 --- `host_types`, and `lshape` through `lshape.d.tl` beside the vendored copy.
-local host = require("host_types")
-global std: host.Std
-global tool: host.Tool
+require("host_types")
 
 --- `lshape`, the tolerant way, for the one VM that has no `require` at all.
 --- See `kv_tools/init.lua` for the case this covers: the bridge's fallback

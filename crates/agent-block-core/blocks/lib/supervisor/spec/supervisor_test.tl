@@ -3,13 +3,13 @@
 -- specs beside it hold the bracket, the nursery and the fold against a
 -- fake kernel.
 local t = require("htl.test")
-local knl = require("knl")
+local kernel = require("knl")
 local supervisor = require("supervisor")
 
 --- A table that is not a session, wearing the type so the call is checked
 --- and the refusal is the module's own.
-local function not_a_session(): knl.Session
-    return { not_a = "session" } as knl.Session
+local function not_a_session(): kernel.Session
+    return { not_a = "session" } as kernel.Session
 end
 
 t.describe("child", function()

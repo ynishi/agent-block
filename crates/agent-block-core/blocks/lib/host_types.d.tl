@@ -4,16 +4,25 @@
 --- Lua one does: `std.*` from mlua-batteries, and the bridges beside it. The
 --- checker has to be told their shape, and told in a way that generates no
 --- code — the global is the host's, set before any module loads, and a module
---- that assigned it would be the second owner of one name. So the shape is a
---- record here, and a `.tl` declares the global against it:
+--- that assigned it would be the second owner of one name. So the shapes are
+--- records here, and the globals are DECLARED here too, at the foot of this
+--- file. A module asks for them by requiring it:
 ---
----     local host = require("host_types")
----     global std: host.Std
+---     require("host_types")
 ---
---- `global std: host.Std` is a declaration, not an assignment: the generated
---- Lua carries nothing for it, and `std.json.encode` in the module reads the
---- global at call time, late-bound, exactly as the Lua module did — which is
---- what lets a spec install a fake `std` before requiring the module.
+--- and then reads `std.json.encode` as it always did. The declarations are
+--- not assignments: the generated Lua carries nothing for them, and the
+--- module reads the global at call time, late-bound, exactly as the Lua
+--- module did — which is what lets a spec install a fake `std` before
+--- requiring the module.
+---
+--- One declaration point, and it has to be this one. A `global` declared in
+--- a `.tl` that other modules REQUIRE splits that module's record types: two
+--- consumers in one check run each get their own instance, and a value
+--- cannot pass between them [htl 0.8.0; `knl` is the module this surfaced
+--- on, being the one that is both required widely and reads a host global].
+--- Declared in a `.d.tl` the same files check clean, so a module states no
+--- global of its own — it requires this file and gets all of them.
 ---
 --- The `require` line is what the generated Lua does carry, so this
 --- declaration has a run-time half beside it, `host_types.lua`, an empty
@@ -29,7 +38,7 @@
 ---
 --- The binary carries this file: `host.rs` writes it (and `lshape.d.tl`) to
 --- a directory named by its content at start and puts that on the checker's
---- path, so a project's own `.tl` writes the same two lines above against
+--- path, so a project's own `.tl` writes the same one line above against
 --- the `agent-block` that runs it.
 local record host_types
     --- `std`, as registered by `mlua_batteries::register_all` in `host.rs`,
@@ -218,4 +227,22 @@ local record host_types
         error: function(string)
     end
 end
+
+-- The globals themselves, declared once for every module that requires this
+-- file. Each names a record above; a module adds no `global` line of its own
+-- (see the header).
+global std: host_types.Std
+global tool: host_types.Tool
+global sh: host_types.Sh
+global http: host_types.Http
+global mcp: host_types.Mcp
+global log: host_types.Log
+
+--- `knl`, the kernel's syscall bridge (`bridge/knl.rs`), as the host installs
+--- it. A map of syscalls rather than a record, and loose for the reason `Mcp`
+--- above is loose: its vocabulary is the `knl` module's, which reads this
+--- file, so naming it here would have this file read `knl` back. The module
+--- reaches it by a name held in a variable anyway, which is what a map is.
+global knl: {string:any}
+
 return host_types

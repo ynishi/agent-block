@@ -275,6 +275,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `knl` is written in Teal, and its declaration is the module. The kernel was
+  the last of the embedded modules still in Lua, typed for the ones above it
+  by a hand-written `blocks/lib/knl.d.tl` that a drift test held to the
+  module's exported names. The records that file declared — `Session`,
+  `Device`, `Request`, `Outcome` and the rest — are in `blocks/lib/knl/
+  init.tl` now, beside the module's table and aliased into it with `type X =
+  X`, so `kernel.Session` still names the type from a module that requires
+  this one and the two can no longer say different things: Teal holds the
+  module to its own record at build time, which is what the declaration was
+  standing in for. They are declared BESIDE the table rather than inside it
+  because a record nested in the module record is a KEY of it in the
+  generated Lua, and `knl/spec/api_spec.lua` walks those keys — every export
+  must have a registry entry. `knl.d.tl` is gone, and the drift test now
+  reads the module's own record, which is a tighter check than before: the
+  four `Outcome` constructors the old declaration left out are declared now.
+  The bridge's types come from `knl_types` through a `local type` import, so
+  the kernel's load-time requires are the one they have always been
+  (`lshape`) — a hard `require` would raise in the VMs that have no
+  `knl_types`, which is the case the registry's `pcall` fallback exists for.
+  Nothing a caller sees moved: `require("knl")` answers the same table with
+  the same exports, `knl.shapes`, `knl.views` and `knl.Outcome` hold the same
+  names, and every spec runs unchanged against the Lua Teal generates. One
+  local function was renamed on the way — `record`, which appends an event
+  through the dev-mode contract, is `record_event`, because `record` is how
+  Teal spells a type declaration and a local cannot take that name.
+
+- The host's globals are declared in one place, `blocks/lib/host_types.d.tl`,
+  and a module written in Teal states none of its own. It used to write the
+  pair — `local host = require("host_types")` and then `global std: host.Std`
+  — and a project's own `.tl` was told to do the same; now it requires the
+  file and the globals come with it. `std`, `tool`, `sh`, `http`, `mcp` and
+  `log` are declared there against the records already beside them, and the
+  `knl` syscall bridge with them, loose (a map of syscalls) for the reason
+  `Mcp` is loose: naming its vocabulary would have the file read `knl` back.
+  The reason it has to be one place is a checker one and is written at the
+  declarations: a `global` declared in a `.tl` that other modules REQUIRE
+  splits that module's record types, so two consumers in one check run each
+  get their own `knl.Session` and a value cannot pass between them [htl
+  0.8.0]. Nothing at run time changed — a declaration generates no code, the
+  globals are still the host's, and a spec can still install a fake `std`
+  before requiring the module.
+
 - `policy` is one module in five files. `blocks/lib/policy/init.lua` had
   grown past three thousand lines, and it is now the door — the header, the
   eleven gathered by name, `policy.shapes`, the api registry and its dev-mode

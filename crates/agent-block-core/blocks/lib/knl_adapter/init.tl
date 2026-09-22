@@ -102,11 +102,9 @@
 --- Ports are records with a metatable — the same `__index` class the Lua
 --- was — so `LLMPort.new{...}` and `port:open(conf)` read as they did, and
 --- the checker holds a provider impl to the three methods the interface
---- names. The kernel is read through `knl.d.tl`, the host globals through
---- `host_types`.
-local host = require("host_types")
-global log: host.Log
-global mcp: host.Mcp
+--- names. The kernel is read through its own record, the host globals
+--- through `host_types`.
+require("host_types")
 
 local proto = require("llm_proto")
 --- MCP's tool vocabulary (the `<server>__<tool>` namespace, the content
@@ -1170,8 +1168,8 @@ function M.mcp_tools(server: string, opts?: McpToolsOpts): {ToolPort}
         end
     end
     local ports: {ToolPort} = {}
-    for _, tool in ipairs(list.tools or {}) do
-        local entry = tool as mcp_tools.Tool
+    for _, listed in ipairs(list.tools or {}) do
+        local entry = listed as mcp_tools.Tool
         if allow == nil or allow[entry.name] then
             ports[#ports + 1] = ToolPort.mcp(server, entry)
         end

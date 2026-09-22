@@ -14,9 +14,7 @@
 --- Reference: platform.claude.com/docs/en/build-with-claude/extended-thinking
 ---            platform.claude.com/docs/en/agents-and-tools/tool-use
 
-local host = require("host_types")
-global std: host.Std
-global log: host.Log
+require("host_types")
 
 local proto = require("llm_proto")
 

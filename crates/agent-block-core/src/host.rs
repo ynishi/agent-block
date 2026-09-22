@@ -88,13 +88,16 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     // The run-time half of `blocks/lib/host_types.d.tl`: an empty table, for
     // the `require("host_types")` every Teal module's generated Lua carries.
     ("host_types", include_str!("../blocks/lib/host_types.lua")),
-    ("knl", include_str!("../blocks/lib/knl/init.lua")),
-    // Written in Teal, against `knl.d.tl` (`include_tl!`).
+    // The kernel itself, written in Teal (`include_tl!`), and with it the
+    // declaration the modules below read: the records `knl.d.tl` used to
+    // hold are in the module now, beside its table.
+    ("knl", htl::include_tl!("blocks/lib/knl/init.tl")),
+    // Written in Teal, against `knl` (`include_tl!`).
     (
         "knl_adapter",
         htl::include_tl!("blocks/lib/knl_adapter/init.tl"),
     ),
-    // Written in Teal, all six files, against `knl.d.tl` (`include_tl!`).
+    // Written in Teal, all six files, against `knl` (`include_tl!`).
     ("policy", htl::include_tl!("blocks/lib/policy/init.tl")),
     (
         "policy.shared",
@@ -110,7 +113,7 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         htl::include_tl!("blocks/lib/policy/carry.tl"),
     ),
     ("policy.loop", htl::include_tl!("blocks/lib/policy/loop.tl")),
-    // Written in Teal, against `knl.d.tl` (`include_tl!`).
+    // Written in Teal, against `knl` (`include_tl!`).
     (
         "supervisor",
         htl::include_tl!("blocks/lib/supervisor/init.tl"),

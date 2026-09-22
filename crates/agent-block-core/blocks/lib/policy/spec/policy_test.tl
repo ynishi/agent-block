@@ -3,7 +3,7 @@
 -- default judgement — typed against the module's records. The thirteen
 -- specs beside it hold the rest against a fake kernel.
 local t = require("htl.test")
-local knl = require("knl")
+local kernel = require("knl")
 local shared = require("policy.shared")
 local policy = require("policy")
 
@@ -49,7 +49,7 @@ t.describe("split", function()
 end)
 
 t.describe("retry", function()
-    local function failed(kind: string, retryable: boolean): knl.OutcomeValue
+    local function failed(kind: string, retryable: boolean): kernel.OutcomeValue
         return { status = "error", kind = "state", detail = { kind = kind, retryable = retryable } }
     end
     t.it("asks again exactly when the failure says it is worth it, under max attempts", function()
@@ -85,11 +85,11 @@ t.describe("escalate", function()
         end
         local swapped: any = nil
         local device = {
-            with = function(_: knl.Device, config: knl.DeviceConfig): knl.Device
+            with = function(_: kernel.Device, config: kernel.DeviceConfig): kernel.Device
                 swapped = config.llm
-                return { llm = config.llm } as knl.Device
+                return { llm = config.llm } as kernel.Device
             end,
-        } as knl.Device
+        } as kernel.Device
         local escalate = policy.escalate({ strong = strong })
         t.expect(escalate({ status = "ok", out = {} }, device)):to_equal(device)
         t.expect(escalate({ status = "error", detail = { retryable = true } }, device)):to_equal(device)
