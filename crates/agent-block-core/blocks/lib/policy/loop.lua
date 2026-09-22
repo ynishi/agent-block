@@ -31,6 +31,7 @@ local DEFAULT_TIMEOUT_MEASURE = shared.DEFAULT_TIMEOUT_MEASURE
 local callable = shared.callable
 local whole_at_least = shared.whole_at_least
 local only = shared.only
+local opts_of = shared.opts_of
 local whole_log = shared.whole_log
 local beats_of = shared.beats_of
 local canonical = shared.canonical
@@ -344,11 +345,7 @@ end
 --- @param opts table|nil  { run?, changed?, kind?, timeout? }
 --- @return function verdict  fn(session, out) -> { ok, checked, ran, changed?, result?, reason? }
 function M.verdict(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.verdict: opts must be a table", 2)
-    end
-    only(opts, { run = true, changed = true, kind = true, timeout = true }, "policy.verdict")
+    opts = opts_of(opts, { run = true, changed = true, kind = true, timeout = true }, "policy.verdict")
     if opts.run ~= nil and type(opts.run) ~= "function" then
         error("policy.verdict: run must be a function (fn(timeout?) -> { ok, ... })", 2)
     end
@@ -623,11 +620,7 @@ end
 --- @param opts table  { same?, no_progress?, signature? }
 --- @return function predicate  fn(session) -> nil | "repeated" | "no_progress"
 function M.stagnation(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.stagnation: opts must be a table", 2)
-    end
-    only(opts, { same = true, no_progress = true, signature = true }, "policy.stagnation")
+    opts = opts_of(opts, { same = true, no_progress = true, signature = true }, "policy.stagnation")
     if opts.same ~= nil and not whole_at_least(opts.same, 2) then
         -- Two is the floor because one beat cannot repeat anything.
         error("policy.stagnation: same must be a whole number >= 2, got " .. tostring(opts.same), 2)
@@ -707,11 +700,7 @@ end
 --- @param opts table  { kinds? = { <error kind | call error kind>... }, max? = <whole number >= 1> }
 --- @return function predicate  fn(outcome, attempt) -> boolean, number?
 function M.retry(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.retry: opts must be a table", 2)
-    end
-    only(opts, { kinds = true, max = true }, "policy.retry")
+    opts = opts_of(opts, { kinds = true, max = true }, "policy.retry")
     if opts.max ~= nil and not whole_at_least(opts.max, 1) then
         error("policy.retry: max must be a whole number >= 1, got " .. tostring(opts.max), 2)
     end
@@ -822,11 +811,7 @@ end
 --- @param opts table  { strong = <llm>, when? = fn(outcome) -> boolean }
 --- @return function next  fn(outcome, device) -> device
 function M.escalate(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.escalate: opts must be a table", 2)
-    end
-    only(opts, { strong = true, when = true }, "policy.escalate")
+    opts = opts_of(opts, { strong = true, when = true }, "policy.escalate")
     if not callable(opts.strong) then
         error("policy.escalate: strong must be an llm (a function, or a callable)", 2)
     end

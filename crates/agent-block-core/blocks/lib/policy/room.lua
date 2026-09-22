@@ -27,7 +27,7 @@ local M = {}
 local DEFAULT_RESULT_SHARE = shared.DEFAULT_RESULT_SHARE
 local ARRAY_TAG = shared.ARRAY_TAG
 local whole_at_least = shared.whole_at_least
-local only = shared.only
+local opts_of = shared.opts_of
 local whole_log = shared.whole_log
 local beat_of = shared.beat_of
 local needs_session = shared.needs_session
@@ -363,11 +363,7 @@ end
 --- @param opts table  { port, conf?, reserve?, used? }
 --- @return table  policy.shapes.split
 function M.split(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.split: opts must be a table", 2)
-    end
-    only(opts, { port = true, conf = true, reserve = true, used = true }, "policy.split")
+    opts = opts_of(opts, { port = true, conf = true, reserve = true, used = true }, "policy.split")
     if type(opts.port) ~= "table" or type(opts.port.profile) ~= "function" then
         error("policy.split: port must answer profile(conf)", 2)
     end
@@ -390,6 +386,122 @@ function M.split(opts)
         out.room = reply_room(profile, "policy.split", opts.used, 2)
     end
     return out
+end
+
+-- The newest beat is never dropped, `keep_seed` or not. It holds the
+-- tool_result the model is waiting for, and a request without it answers
+-- nothing the model asked: it would read the file again, which is the
+-- loop this fold exists to prevent. When even that one beat does not fit,
+-- the honest answer is that nothing fits — said out loud, by the
+-- predicate or by the raise — and not a request that quietly forgot.
+local floor = 1
+
+-- The profile is read per fold, not captured: a Port opened with one conf
+-- answers one profile, and reading it each time costs nothing while
+-- letting a Port whose window is learned late (a served model queried
+-- for it) answer the truth.
+--- The largest window that fits, or nil and what the smallest one cost.
+--- Whole beats go, oldest first: the candidates are nested, so the search
+--- is over a monotone predicate and a bisection finds the same answer as
+--- the walk in log candidates rather than all of them — which matters
+--- because each candidate is a fold and, on a Port with a server to ask,
+--- a count the first time it is seen.
+---
+--- It answers in one of two forms, and the failing one says HOW the
+--- number was reached — because the two ways of failing want two
+--- different sentences. `"beat"` is the newest beat costing more than the
+--- window; `"seed"` is a history with no `meta.beat` on any event, where
+--- there was no beat to keep and the whole list was counted as the seed.
+--- The second is a caller's mistake and not a model's limit, and a raise
+--- that called it "the newest beat" would send them looking for a beat
+--- that is not there.
+---
+--- @param events table  the log, as the fold was handed it
+--- @param device table  the device, read for system / tools
+--- @param port table  the Port that counts and answers a profile
+--- @param conf table|nil  what the Port was opened with
+--- @param reserve number|nil  `fit.reserve`, tokens held back for the reply
+--- @param tail number|nil  the most beats a window may keep, when capped
+--- @param keep_seed boolean  whether the events before the first beat stay
+--- @return table|nil request  the fitted request, or nil when none fits
+--- @return table|nil report  what it dropped to get there (with a request)
+--- @return number|nil tokens  what the smallest candidate cost (with nil)
+--- @return number|nil limit  the room the profile left (with nil)
+--- @return string|nil counted  "beat" | "seed" — what those tokens are of
+local function largest_fitting(events, device, port, conf, reserve, tail, keep_seed)
+    -- The room a request may take, and what `fit.reserve` held back to
+    -- leave it. Both come off the profile read for this fold, so a Port
+    -- that learns its window late is read at its word every time.
+    local limit, held = request_limit(port:profile(conf), "policy.window", reserve)
+    local n = beat_count(events)
+    local most = tail and math.min(tail, n) or n
+
+    local function fold_at(k)
+        local slice, report = window_slice(events, k, keep_seed)
+        local request = kernel.fold(slice, device)
+        local tokens = port:count(request, conf)
+        if type(tokens) ~= "number" then
+            error("policy.window: port:count must answer a number, got " .. tostring(tokens), 3)
+        end
+        return request, tokens, report
+    end
+
+    --- The chosen candidate's report, with the counting written onto it.
+    --- `limit` is the effective one — the number this candidate was
+    --- measured against — and `reserve` is how much of the window is not
+    --- in it, so a reader of the log can tell a short window from one cut
+    --- short to leave the reply room.
+    local function counted(report, before, after)
+        report.before, report.after, report.limit = before, after, limit
+        report.reserve = held
+        return report
+    end
+
+    if most < floor then
+        -- No beat yet: the seed alone is the whole conversation, and
+        -- there is nothing to choose between.
+        local request, tokens, report = fold_at(0)
+        if tokens <= limit then
+            return request, counted(report, tokens, tokens)
+        end
+        return nil, nil, tokens, limit, "seed"
+    end
+
+    local whole, whole_tokens, whole_report = fold_at(most)
+    if whole_tokens <= limit then
+        return whole, counted(whole_report, whole_tokens, whole_tokens)
+    end
+
+    -- Everything fits at `lo` or below and nothing at `hi` or above;
+    -- `floor` is the smallest window there is, and it has already failed
+    -- when the loop ends without an answer.
+    local lo, hi = floor, most
+    local best, best_tokens, best_report = nil, nil, nil
+    local smallest_tokens = nil
+    while lo <= hi do
+        local mid = (lo + hi) // 2
+        local request, tokens, report = fold_at(mid)
+        if tokens <= limit then
+            best, best_tokens, best_report = request, tokens, report
+            lo = mid + 1
+        else
+            hi = mid - 1
+            if mid == floor then
+                smallest_tokens = tokens
+            end
+        end
+    end
+    if best then
+        -- `before` is the largest candidate's count — the whole log, or
+        -- the `tail` window when `tail` capped it — which is the number
+        -- the dropping was measured against.
+        return best, counted(best_report, whole_tokens, best_tokens)
+    end
+    if smallest_tokens == nil then
+        local _, tokens = fold_at(floor)
+        smallest_tokens = tokens
+    end
+    return nil, nil, smallest_tokens, limit, "beat"
 end
 
 --- Build a `fold` that folds the last `tail` beats of the log.
@@ -482,11 +594,7 @@ end
 --- @return function fold  fn(events, device) -> request, report
 --- @return function|nil fits  fn(session, device) -> nil | "context", tokens, limit (with `fit` only)
 function M.window(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.window: opts must be a table", 2)
-    end
-    only(opts, { tail = true, keep_seed = true, fit = true }, "policy.window")
+    opts = opts_of(opts, { tail = true, keep_seed = true, fit = true }, "policy.window")
     if opts.fit == nil and not whole_at_least(opts.tail, 1) then
         error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
     end
@@ -513,117 +621,9 @@ function M.window(opts)
         end
     end
 
-    -- The newest beat is never dropped, `keep_seed` or not. It holds the
-    -- tool_result the model is waiting for, and a request without it answers
-    -- nothing the model asked: it would read the file again, which is the
-    -- loop this fold exists to prevent. When even that one beat does not fit,
-    -- the honest answer is that nothing fits — said out loud, by the
-    -- predicate or by the raise — and not a request that quietly forgot.
-    local floor = 1
-
-    -- The profile is read per fold, not captured: a Port opened with one conf
-    -- answers one profile, and reading it each time costs nothing while
-    -- letting a Port whose window is learned late (a served model queried
-    -- for it) answer the truth.
-    --- The largest window that fits, or nil and what the smallest one cost.
-    --- Whole beats go, oldest first: the candidates are nested, so the search
-    --- is over a monotone predicate and a bisection finds the same answer as
-    --- the walk in log candidates rather than all of them — which matters
-    --- because each candidate is a fold and, on a Port with a server to ask,
-    --- a count the first time it is seen.
-    ---
-    --- It answers in one of two forms, and the failing one says HOW the
-    --- number was reached — because the two ways of failing want two
-    --- different sentences. `"beat"` is the newest beat costing more than the
-    --- window; `"seed"` is a history with no `meta.beat` on any event, where
-    --- there was no beat to keep and the whole list was counted as the seed.
-    --- The second is a caller's mistake and not a model's limit, and a raise
-    --- that called it "the newest beat" would send them looking for a beat
-    --- that is not there.
-    ---
-    --- @return table|nil request  the fitted request, or nil when none fits
-    --- @return table|nil report  what it dropped to get there (with a request)
-    --- @return number|nil tokens  what the smallest candidate cost (with nil)
-    --- @return number|nil limit  the room the profile left (with nil)
-    --- @return string|nil counted  "beat" | "seed" — what those tokens are of
-    local function largest_fitting(events, device)
-        -- The room a request may take, and what `fit.reserve` held back to
-        -- leave it. Both come off the profile read for this fold, so a Port
-        -- that learns its window late is read at its word every time.
-        local limit, held = request_limit(port:profile(conf), "policy.window", reserve)
-        local n = beat_count(events)
-        local most = tail and math.min(tail, n) or n
-
-        local function fold_at(k)
-            local slice, report = window_slice(events, k, keep_seed)
-            local request = kernel.fold(slice, device)
-            local tokens = port:count(request, conf)
-            if type(tokens) ~= "number" then
-                error("policy.window: port:count must answer a number, got " .. tostring(tokens), 3)
-            end
-            return request, tokens, report
-        end
-
-        --- The chosen candidate's report, with the counting written onto it.
-        --- `limit` is the effective one — the number this candidate was
-        --- measured against — and `reserve` is how much of the window is not
-        --- in it, so a reader of the log can tell a short window from one cut
-        --- short to leave the reply room.
-        local function counted(report, before, after)
-            report.before, report.after, report.limit = before, after, limit
-            report.reserve = held
-            return report
-        end
-
-        if most < floor then
-            -- No beat yet: the seed alone is the whole conversation, and
-            -- there is nothing to choose between.
-            local request, tokens, report = fold_at(0)
-            if tokens <= limit then
-                return request, counted(report, tokens, tokens)
-            end
-            return nil, nil, tokens, limit, "seed"
-        end
-
-        local whole, whole_tokens, whole_report = fold_at(most)
-        if whole_tokens <= limit then
-            return whole, counted(whole_report, whole_tokens, whole_tokens)
-        end
-
-        -- Everything fits at `lo` or below and nothing at `hi` or above;
-        -- `floor` is the smallest window there is, and it has already failed
-        -- when the loop ends without an answer.
-        local lo, hi = floor, most
-        local best, best_tokens, best_report = nil, nil, nil
-        local smallest_tokens = nil
-        while lo <= hi do
-            local mid = (lo + hi) // 2
-            local request, tokens, report = fold_at(mid)
-            if tokens <= limit then
-                best, best_tokens, best_report = request, tokens, report
-                lo = mid + 1
-            else
-                hi = mid - 1
-                if mid == floor then
-                    smallest_tokens = tokens
-                end
-            end
-        end
-        if best then
-            -- `before` is the largest candidate's count — the whole log, or
-            -- the `tail` window when `tail` capped it — which is the number
-            -- the dropping was measured against.
-            return best, counted(best_report, whole_tokens, best_tokens)
-        end
-        if smallest_tokens == nil then
-            local _, tokens = fold_at(floor)
-            smallest_tokens = tokens
-        end
-        return nil, nil, smallest_tokens, limit, "beat"
-    end
-
     local fold = function(events, device)
-        local request, report, tokens, limit, counted = largest_fitting(events, device)
+        local request, report, tokens, limit, counted =
+            largest_fitting(events, device, port, conf, reserve, tail, keep_seed)
         if request then
             return request, report
         end
@@ -657,7 +657,15 @@ function M.window(opts)
     --- the limit come beside it, so the caller can say by how much.
     local fits = function(session, device)
         needs_session(session, "policy.window fits")
-        local request, _, tokens, limit = largest_fitting(whole_log(session, "policy.window fits"), device or {})
+        local request, _, tokens, limit = largest_fitting(
+            whole_log(session, "policy.window fits"),
+            device or {},
+            port,
+            conf,
+            reserve,
+            tail,
+            keep_seed
+        )
         if request == nil then
             return "context", tokens, limit
         end
@@ -695,11 +703,7 @@ end
 --- @param opts table  { port = <Port answering count(request, conf)>, conf = <table>? }
 --- @return function cost  fn(request) -> integer >= 1
 function M.tokens(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.tokens: opts must be a table", 2)
-    end
-    only(opts, { port = true, conf = true }, "policy.tokens")
+    opts = opts_of(opts, { port = true, conf = true }, "policy.tokens")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" then
         error("policy.tokens: port must be a table answering count(request, conf)", 2)
     end
@@ -757,11 +761,7 @@ end
 --- @param opts table  { port, conf?, share? }
 --- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
 function M.result_cap(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.result_cap: opts must be a table", 2)
-    end
-    only(opts, { port = true, conf = true, share = true }, "policy.result_cap")
+    opts = opts_of(opts, { port = true, conf = true, share = true }, "policy.result_cap")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
         error("policy.result_cap: port must answer count(request, conf) and profile(conf)", 2)
     end
@@ -906,11 +906,7 @@ end
 --- @param opts table  { port, conf, call_reserve, budget? }
 --- @return function filter  fn(request) -> request
 function M.thinking_cap(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.thinking_cap: opts must be a table", 2)
-    end
-    only(opts, { port = true, conf = true, call_reserve = true, budget = true }, "policy.thinking_cap")
+    opts = opts_of(opts, { port = true, conf = true, call_reserve = true, budget = true }, "policy.thinking_cap")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
         error("policy.thinking_cap: port must answer count(request, conf) and profile(conf)", 2)
     end

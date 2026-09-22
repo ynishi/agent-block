@@ -21,7 +21,7 @@ local M = {}
 -- What this file shares with its siblings, by the names the code was
 -- written against (`policy.shared`).
 local DEFAULT_REPEAT_MAX = shared.DEFAULT_REPEAT_MAX
-local only = shared.only
+local opts_of = shared.opts_of
 local whole_log = shared.whole_log
 local needs_session = shared.needs_session
 local opts_contract = shared.opts_contract
@@ -119,11 +119,7 @@ end
 --- @param opts table|nil  { max?, resets? }
 --- @return function binder  fn(session) -> fn(tools) -> tools
 function M.repeat_cap(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.repeat_cap: opts must be a table", 2)
-    end
-    only(opts, { max = true, resets = true }, "policy.repeat_cap")
+    opts = opts_of(opts, { max = true, resets = true }, "policy.repeat_cap")
     if opts.max ~= nil and (type(opts.max) ~= "number" or opts.max < 1 or opts.max % 1 ~= 0) then
         error("policy.repeat_cap: max must be a whole number >= 1, got " .. tostring(opts.max), 2)
     end
@@ -266,11 +262,7 @@ end
 --- @param opts table|nil  no options; passing one is refused by name
 --- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
 function M.require_args(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.require_args: opts must be a table", 2)
-    end
-    only(opts, {}, "policy.require_args")
+    opts = opts_of(opts, {}, "policy.require_args")
     shape.assert_dev(opts, REQUIRE_ARGS_OPTS, "policy.require_args opts")
 
     return function(tools)
