@@ -93,21 +93,22 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "knl_adapter",
         include_str!("../blocks/lib/knl_adapter/init.lua"),
     ),
-    ("policy", include_str!("../blocks/lib/policy/init.lua")),
+    // Written in Teal, all six files, against `knl.d.tl` (`include_tl!`).
+    ("policy", htl::include_tl!("blocks/lib/policy/init.tl")),
     (
         "policy.shared",
-        include_str!("../blocks/lib/policy/shared.lua"),
+        htl::include_tl!("blocks/lib/policy/shared.tl"),
     ),
-    ("policy.room", include_str!("../blocks/lib/policy/room.lua")),
+    ("policy.room", htl::include_tl!("blocks/lib/policy/room.tl")),
     (
         "policy.tools",
-        include_str!("../blocks/lib/policy/tools.lua"),
+        htl::include_tl!("blocks/lib/policy/tools.tl"),
     ),
     (
         "policy.carry",
-        include_str!("../blocks/lib/policy/carry.lua"),
+        htl::include_tl!("blocks/lib/policy/carry.tl"),
     ),
-    ("policy.loop", include_str!("../blocks/lib/policy/loop.lua")),
+    ("policy.loop", htl::include_tl!("blocks/lib/policy/loop.tl")),
     // Written in Teal, against `knl.d.tl` (`include_tl!`).
     (
         "supervisor",

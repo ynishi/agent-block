@@ -14,13 +14,74 @@
 --- keeps. This file is `require`d by `policy/init.lua` and not meant to be
 --- reached for directly.
 
+local host = require("host_types")
+global std: host.Std
+
 local kernel = require("knl")
 local lshape = require("lshape")
 local shared = require("policy.shared")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+--- What `window{ fit }` is: the Port that counts and answers a profile, the
+--- conf it is opened with, and the tokens held back for the reply.
+local record Fit
+    port: shared.Port
+    conf: any
+    reserve: number
+end
+local record WindowOpts
+    tail: number
+    keep_seed: boolean
+    fit: Fit
+end
+local record SplitOpts
+    port: shared.Port
+    conf: any
+    reserve: number
+    used: number
+end
+--- What `split` answers (`policy.shapes.split`); `room` only with `used`.
+local record Split ---@struct
+    window: number
+    max_output: number
+    limit: number
+    held: number
+    room: number ---@optional
+end
+local record TokensOpts
+    port: shared.Port
+    conf: any
+end
+local record ResultCapOpts
+    port: shared.Port
+    conf: any
+    share: number
+end
+local record ThinkingCapOpts
+    port: shared.Port
+    conf: {string:any}
+    call_reserve: number
+    budget: integer
+end
+
+local record M
+    --- A fold: the request, and what the window left out.
+    type Fold = function({shared.Event}, kernel.Device): kernel.Request, kernel.WindowReport
+    --- The same question asked before the beat: `"context"` with the
+    --- tokens and the limit, or nil.
+    type Fits = function(kernel.Session, kernel.Device): string, number, number
+    type Cost = function(kernel.Request): integer
+    type ToolsWrap = function({string:kernel.ToolEntry}): {string:kernel.ToolEntry}
+    type Filter = function(kernel.Request): kernel.Request
+    type WindowFactory = function(WindowOpts): Fold, Fits
+    type SplitFn = function(SplitOpts): Split
+    type TokensFactory = function(TokensOpts): Cost
+    type ResultCapFactory = function(ResultCapOpts): ToolsWrap
+    type ThinkingCapFactory = function(ThinkingCapOpts): Filter
+    shapes: {string:lshape.Schema}
+    api: {string:shared.ApiEntry}
+end
 
 -- What this file shares with its siblings, by the names the code was
 -- written against (`policy.shared`).
@@ -40,16 +101,16 @@ local SESSION_ARG = shared.SESSION_ARG
 local WINDOW_OPTS, WINDOW_ARG = opts_contract({
     tail = T.number:describe("how many beats the request keeps; a whole number >= 1"):is_optional(),
     keep_seed = T.boolean
-        :describe("also keep every event before the first beat (the caller's seed), ahead of the window; default false")
-        :is_optional(),
+    :describe("also keep every event before the first beat (the caller's seed), ahead of the window; default false")
+    :is_optional(),
     fit = T.table
-        :describe(
-            "{ port, conf?, reserve? }: keep as many beats as fit the port's context window — "
-                .. "port:count(request, conf) + profile.max_output + reserve <= profile.context_window. "
-                .. "`reserve` is a whole number of tokens held back for the reply when the wire sends no "
-                .. "cap; it holds back only what profile.max_output does not already cover"
-        )
-        :is_optional(),
+    :describe(
+        "{ port, conf?, reserve? }: keep as many beats as fit the port's context window — "
+            .. "port:count(request, conf) + profile.max_output + reserve <= profile.context_window. "
+            .. "`reserve` is a whole number of tokens held back for the reply when the wire sends no "
+            .. "cap; it holds back only what profile.max_output does not already cover"
+    )
+    :is_optional(),
 })
 
 --- What `policy.split` is asked with: the Port and conf the numbers come
@@ -59,11 +120,11 @@ local SPLIT_OPTS, SPLIT_ARG = opts_contract({
     port = T.table:describe("an LLM Port: profile(conf) for the window and the reply's cap"),
     conf = T.table:describe("the conf the port is opened with"):is_optional(),
     reserve = T.number
-        :describe("tokens the fold holds back for the reply — the same number window{ fit.reserve } was given")
-        :is_optional(),
+    :describe("tokens the fold holds back for the reply — the same number window{ fit.reserve } was given")
+    :is_optional(),
     used = T.number
-        :describe("what a request costs by the Port's count; given, the answer carries the reply's `room`")
-        :is_optional(),
+    :describe("what a request costs by the Port's count; given, the answer carries the reply's `room`")
+    :is_optional(),
 })
 
 --- What `policy.split` answers.
@@ -73,8 +134,8 @@ local SPLIT = T.shape({
     limit = T.number:describe("the most a request may cost — the prompt's side"),
     held = T.number:describe("what `reserve` held back beyond max_output, and so is not in `limit`"),
     room = T.number
-        :describe("the reply's side for a request costing `used`: min(window - used, max_output)")
-        :is_optional(),
+    :describe("the reply's side for a request costing `used`: min(window - used, max_output)")
+    :is_optional(),
 }, { open = false })
 
 --- What `policy.tokens` is configured with: the Port whose counting the cost
@@ -91,8 +152,8 @@ local RESULT_CAP_OPTS, RESULT_CAP_ARG = opts_contract({
     port = T.table:describe("an LLM Port: profile(conf) for the window, count(request, conf) for the size"),
     conf = T.table:describe("the conf the port is opened with"):is_optional(),
     share = T.number
-        :describe("the most of the window one tool result may take, 0 < share <= 1; default 0.25")
-        :is_optional(),
+    :describe("the most of the window one tool result may take, 0 < share <= 1; default 0.25")
+    :is_optional(),
 })
 
 --- What `policy.thinking_cap` is configured with. One number of tokens and
@@ -159,9 +220,9 @@ local THINKING_CAP_OPTS, THINKING_CAP_ARG = opts_contract({
 --- @param keep_seed boolean|nil  keep the events before the first beat too
 --- @return table  the slice, in seq order
 --- @return table  what the cut did: { dropped, kept, seed_kept }
-local function window_slice(events, tail, keep_seed)
+local function window_slice(events: {shared.Event}, tail: number, keep_seed?: boolean): {shared.Event}, kernel.WindowReport
     events = events or {}
-    local order, first_at = {}, {}
+    local order, first_at: {string}, {string:integer} = {}, {}
     for i, ev in ipairs(events) do
         local id = beat_of(ev)
         if id ~= nil and first_at[id] == nil then
@@ -172,15 +233,16 @@ local function window_slice(events, tail, keep_seed)
     if #order <= tail then
         -- Nothing went, so nothing ahead of the window went either: the
         -- whole log IS the request.
-        return events, { dropped = setmetatable({}, ARRAY_TAG), kept = #order, seed_kept = true }
+        local none = setmetatable({} as any, ARRAY_TAG as metatable<any>) as {string}
+        return events, { dropped = none, kept = #order, seed_kept = true }
     end
-    local cut = #order - tail
-    local dropped = setmetatable({}, ARRAY_TAG)
+    local cut = math.floor(#order - tail)
+    local dropped = setmetatable({} as any, ARRAY_TAG as metatable<any>) as {string}
     for i = 1, cut do
         dropped[i] = order[i]
     end
     local from = first_at[order[cut + 1]]
-    local slice = {}
+    local slice: {shared.Event} = {}
     if keep_seed then
         for i = 1, first_at[order[1]] - 1 do
             slice[#slice + 1] = events[i]
@@ -193,8 +255,8 @@ local function window_slice(events, tail, keep_seed)
 end
 
 --- How many beats `events` holds.
-local function beat_count(events)
-    local seen, n = {}, 0
+local function beat_count(events: {shared.Event}): integer
+    local seen, n: {string:boolean}, integer = {}, 0
     for _, ev in ipairs(events or {}) do
         local id = beat_of(ev)
         if id ~= nil and not seen[id] then
@@ -207,7 +269,7 @@ end
 
 --- What a Port must answer for `fit`, checked at construction so a window that
 --- cannot count is refused before a beat asks it to.
-local function port_for_fit(fit, who)
+local function port_for_fit(fit: Fit, who: string): shared.Port, any, number
     if type(fit) ~= "table" or type(fit.port) ~= "table" then
         error(who .. ": fit must be { port = <Port>, conf? }", 3)
     end
@@ -254,7 +316,7 @@ end
 --- @param level number  where the raise points, as `error` counts it
 --- @return number window  profile.context_window
 --- @return number output  profile.max_output, or 0 for a wire with no cap
-local function profile_split(profile, who, level)
+local function profile_split(profile: shared.Profile, who: string, level: integer): integer, integer
     if type(profile) ~= "table" then
         error(who .. ": port:profile(conf) must answer a table, got " .. tostring(profile), level)
     end
@@ -274,11 +336,17 @@ local function profile_split(profile, who, level)
     end
     if output >= window then
         error(
-            string.format("%s: profile.max_output (%d) leaves no room in context_window (%d)", who, output, window),
+            string.format(
+                "%s: profile.max_output (%d) leaves no room in context_window (%d)",
+                who,
+                math.floor(output),
+                math.floor(window)
+            ),
             level
         )
     end
-    return window, output
+    -- Whole numbers, checked above; said so to the checker.
+    return math.floor(window), math.floor(output)
 end
 
 --- The tokens a request may take, read off the Port's profile: the window
@@ -296,7 +364,7 @@ end
 --- @param reserve number|nil  tokens held back for the reply; nil is none
 --- @return number limit  the tokens one request may take
 --- @return number held  what the reserve held back beyond profile.max_output
-local function request_limit(profile, who, reserve)
+local function request_limit(profile: shared.Profile, who: string, reserve?: number): number, number
     local window, output = profile_split(profile, who, 4)
     local held = math.max(0, (reserve or 0) - output)
     local limit = window - output - held
@@ -305,7 +373,7 @@ local function request_limit(profile, who, reserve)
             string.format(
                 "%s: fit.reserve (%d) beside profile.max_output (%d) leaves no room in context_window (%d)",
                 who,
-                reserve or 0,
+                math.floor(reserve or 0),
                 output,
                 window
             ),
@@ -330,7 +398,7 @@ end
 --- @param used number  what the request costs, by the Port's count
 --- @param level number  where a raise about the profile points
 --- @return number room  tokens the reply has, cap and window both honoured
-local function reply_room(profile, who, used, level)
+local function reply_room(profile: shared.Profile, who: string, used: number, level: integer): number
     local window, output = profile_split(profile, who, level)
     local room = window - used
     if output > 0 and output < room then
@@ -362,7 +430,7 @@ end
 ---
 --- @param opts table  { port, conf?, reserve?, used? }
 --- @return table  policy.shapes.split
-function M.split(opts)
+function M.split(opts: SplitOpts): Split
     opts = opts_of(opts, { port = true, conf = true, reserve = true, used = true }, "policy.split")
     if type(opts.port) ~= "table" or type(opts.port.profile) ~= "function" then
         error("policy.split: port must answer profile(conf)", 2)
@@ -381,7 +449,7 @@ function M.split(opts)
     local profile = opts.port:profile(opts.conf)
     local window, output = profile_split(profile, "policy.split", 2)
     local limit, held = request_limit(profile, "policy.split", opts.reserve)
-    local out = { window = window, max_output = output, limit = limit, held = held }
+    local out: Split = { window = window, max_output = output, limit = limit, held = held }
     if opts.used ~= nil then
         out.room = reply_room(profile, "policy.split", opts.used, 2)
     end
@@ -428,7 +496,15 @@ local floor = 1
 --- @return number|nil tokens  what the smallest candidate cost (with nil)
 --- @return number|nil limit  the room the profile left (with nil)
 --- @return string|nil counted  "beat" | "seed" — what those tokens are of
-local function largest_fitting(events, device, port, conf, reserve, tail, keep_seed)
+local function largest_fitting(
+    events: {shared.Event},
+    device: kernel.Device,
+    port: shared.Port,
+    conf: any,
+    reserve: number,
+    tail: number,
+    keep_seed: boolean
+): kernel.Request, kernel.WindowReport, number, number, string
     -- The room a request may take, and what `fit.reserve` held back to
     -- leave it. Both come off the profile read for this fold, so a Port
     -- that learns its window late is read at its word every time.
@@ -436,7 +512,7 @@ local function largest_fitting(events, device, port, conf, reserve, tail, keep_s
     local n = beat_count(events)
     local most = tail and math.min(tail, n) or n
 
-    local function fold_at(k)
+    local function fold_at(k: number): kernel.Request, number, kernel.WindowReport
         local slice, report = window_slice(events, k, keep_seed)
         local request = kernel.fold(slice, device)
         local tokens = port:count(request, conf)
@@ -451,7 +527,7 @@ local function largest_fitting(events, device, port, conf, reserve, tail, keep_s
     --- measured against — and `reserve` is how much of the window is not
     --- in it, so a reader of the log can tell a short window from one cut
     --- short to leave the reply room.
-    local function counted(report, before, after)
+    local function counted(report: kernel.WindowReport, before: number, after: number): kernel.WindowReport
         report.before, report.after, report.limit = before, after, limit
         report.reserve = held
         return report
@@ -475,9 +551,9 @@ local function largest_fitting(events, device, port, conf, reserve, tail, keep_s
     -- Everything fits at `lo` or below and nothing at `hi` or above;
     -- `floor` is the smallest window there is, and it has already failed
     -- when the loop ends without an answer.
-    local lo, hi = floor, most
-    local best, best_tokens, best_report = nil, nil, nil
-    local smallest_tokens = nil
+    local lo, hi: number, number = floor, most
+    local best, best_tokens, best_report: kernel.Request, number, kernel.WindowReport = nil, nil, nil
+    local smallest_tokens: number = nil
     while lo <= hi do
         local mid = (lo + hi) // 2
         local request, tokens, report = fold_at(mid)
@@ -593,7 +669,7 @@ end
 --- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf?, reserve = <whole number >= 0>? }? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request, report
 --- @return function|nil fits  fn(session, device) -> nil | "context", tokens, limit (with `fit` only)
-function M.window(opts)
+function M.window(opts: WindowOpts): M.Fold, M.Fits
     opts = opts_of(opts, { tail = true, keep_seed = true, fit = true }, "policy.window")
     if opts.fit == nil and not whole_at_least(opts.tail, 1) then
         error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
@@ -604,7 +680,7 @@ function M.window(opts)
     if opts.keep_seed ~= nil and type(opts.keep_seed) ~= "boolean" then
         error("policy.window: keep_seed must be a boolean, got " .. tostring(opts.keep_seed), 2)
     end
-    local port, conf, reserve
+    local port, conf, reserve: shared.Port, any, number
     if opts.fit ~= nil then
         port, conf, reserve = port_for_fit(opts.fit, "policy.window")
     end
@@ -613,7 +689,7 @@ function M.window(opts)
     local tail = opts.tail
     local keep_seed = opts.keep_seed == true
     if port == nil then
-        return function(events, device)
+        return function(events: {shared.Event}, device: kernel.Device): kernel.Request, kernel.WindowReport
             local slice, report = window_slice(events, tail, keep_seed)
             -- No `before` / `after` / `limit`: this form counts nothing, and
             -- a number here would be one this fold never asked for.
@@ -621,7 +697,7 @@ function M.window(opts)
         end
     end
 
-    local fold = function(events, device)
+    local fold = function(events: {shared.Event}, device: kernel.Device): kernel.Request, kernel.WindowReport
         local request, report, tokens, limit, counted =
             largest_fitting(events, device, port, conf, reserve, tail, keep_seed)
         if request then
@@ -655,7 +731,7 @@ function M.window(opts)
     --- The same question, asked before the beat rather than inside it. When
     --- the answer is `"context"`, the tokens the smallest candidate cost and
     --- the limit come beside it, so the caller can say by how much.
-    local fits = function(session, device)
+    local fits = function(session: kernel.Session, device: kernel.Device): string, number, number
         needs_session(session, "policy.window fits")
         local request, _, tokens, limit = largest_fitting(
             whole_log(session, "policy.window fits"),
@@ -702,7 +778,7 @@ end
 ---
 --- @param opts table  { port = <Port answering count(request, conf)>, conf = <table>? }
 --- @return function cost  fn(request) -> integer >= 1
-function M.tokens(opts)
+function M.tokens(opts: TokensOpts): M.Cost
     opts = opts_of(opts, { port = true, conf = true }, "policy.tokens")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" then
         error("policy.tokens: port must be a table answering count(request, conf)", 2)
@@ -713,7 +789,7 @@ function M.tokens(opts)
     shape.assert_dev(opts, TOKENS_OPTS, "policy.tokens opts")
 
     local port, conf = opts.port, opts.conf
-    return function(request)
+    return function(request: kernel.Request): integer
         local n = port:count(request, conf)
         if not whole_at_least(n, 0) then
             error("policy.tokens: port:count must answer a whole number >= 0, got " .. tostring(n), 2)
@@ -721,7 +797,7 @@ function M.tokens(opts)
         if n < 1 then
             return 1
         end
-        return n
+        return math.floor(n)
     end
 end
 
@@ -760,7 +836,7 @@ end
 ---
 --- @param opts table  { port, conf?, share? }
 --- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
-function M.result_cap(opts)
+function M.result_cap(opts: ResultCapOpts): M.ToolsWrap
     opts = opts_of(opts, { port = true, conf = true, share = true }, "policy.result_cap")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
         error("policy.result_cap: port must answer count(request, conf) and profile(conf)", 2)
@@ -776,26 +852,26 @@ function M.result_cap(opts)
     local port, conf = opts.port, opts.conf
     local share = opts.share or DEFAULT_RESULT_SHARE
 
-    return function(tools)
+    return function(tools: {string:kernel.ToolEntry}): {string:kernel.ToolEntry}
         if type(tools) ~= "table" then
             error("policy.result_cap: tools must be the device's map of name -> entry", 2)
         end
-        local out = {}
+        local out: {string:kernel.ToolEntry} = {}
         for name, entry in pairs(tools) do
             if type(entry) ~= "table" or type(entry.handler) ~= "function" then
                 error("policy.result_cap: tool '" .. tostring(name) .. "' has no handler", 2)
             end
-            local capped = {}
-            for key, value in pairs(entry) do
+            local capped: {string:any} = {}
+            for key, value in pairs(entry as {string:any}) do
                 capped[key] = value
             end
             local handler = entry.handler
-            capped.handler = function(args)
+            capped.handler = function(args: any): any
                 local result = handler(args)
                 -- Measured as the kernel will render it — a string verbatim,
                 -- anything else as JSON — because that rendering is what
                 -- reaches the request, not the table.
-                local text = type(result) == "string" and result or std.json.encode(result)
+                local text = type(result) == "string" and result as string or std.json.encode(result)
                 local limit = math.floor(request_limit(port:profile(conf), "policy.result_cap") * share)
                 local tokens = port:count({ messages = { { role = "user", content = text } } }, conf)
                 if type(tokens) ~= "number" then
@@ -819,7 +895,7 @@ function M.result_cap(opts)
                     ),
                 }
             end
-            out[name] = capped
+            out[name] = capped as kernel.ToolEntry
         end
         return out
     end
@@ -905,7 +981,7 @@ end
 ---
 --- @param opts table  { port, conf, call_reserve, budget? }
 --- @return function filter  fn(request) -> request
-function M.thinking_cap(opts)
+function M.thinking_cap(opts: ThinkingCapOpts): M.Filter
     opts = opts_of(opts, { port = true, conf = true, call_reserve = true, budget = true }, "policy.thinking_cap")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
         error("policy.thinking_cap: port must answer count(request, conf) and profile(conf)", 2)
@@ -918,7 +994,7 @@ function M.thinking_cap(opts)
     -- request's table replaces the conf's — so a budget sent over a conf that
     -- said nothing would be the thing that turned reasoning on.
     local declared = opts.conf.thinking
-    local on = declared == true or (type(declared) == "table" and declared.enabled ~= false)
+    local on = declared == true or (type(declared) == "table" and (declared as {string:any}).enabled ~= false)
     if not on then
         error(
             "policy.thinking_cap: the conf does not turn reasoning on (thinking = true, or { enabled = true, ... }); "
@@ -946,7 +1022,7 @@ function M.thinking_cap(opts)
     local port, conf = opts.port, opts.conf
     local call_reserve, budget = opts.call_reserve, opts.budget
 
-    return function(request)
+    return function(request: kernel.Request): kernel.Request
         local used = port:count(request, conf)
         if type(used) ~= "number" then
             error("policy.thinking_cap: port:count must answer a number, got " .. tostring(used), 0)
@@ -967,21 +1043,21 @@ function M.thinking_cap(opts)
         -- The conf's own thinking keys, under the budget: `true` carries as
         -- `enabled`, a table as its keys — the construction above has already
         -- said it is one of those two.
-        local thinking = {}
+        local thinking: {string:any} = {}
         if type(declared) == "table" then
-            for key, value in pairs(declared) do
+            for key, value in pairs(declared as {string:any}) do
                 thinking[key] = value
             end
         else
             thinking.enabled = true
         end
         thinking.budget_tokens = stop
-        local out = {}
-        for key, value in pairs(request) do
+        local out: {string:any} = {}
+        for key, value in pairs(request as {string:any}) do
             out[key] = value
         end
         out.thinking = thinking
-        return out
+        return out as kernel.Request
     end
 end
 

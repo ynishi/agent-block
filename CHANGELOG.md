@@ -587,6 +587,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to build one, and the kernel's tolerant `pcall(require, "knl_types")`
   otherwise met htl's declaration-only stub and raised at its first index.
 
+- `policy` is written in Teal, all six files (`blocks/lib/policy/
+  {init,shared,room,tools,carry,loop}.tl`, embedded through `include_tl!`):
+  the eleven policies and `split` with the same contracts, typed. Every
+  factory's opts is a record beside the file that owns it; `shared`
+  declares what the six share — a stored `Event`, a `BeatRecord`, a
+  `ToolPair`, the registry's `ApiArg` / `ApiEntry`, and the `Port` /
+  `Profile` a room policy asks — and the door names each factory by the
+  type its file exports (`room.WindowFactory`, `loop.RetryFactory`, …),
+  aliases that generate no Lua. `Split`, `Verdict` and a `Check` are
+  `---@struct` with their optional fields marked. Two readings changed
+  form for the checker and not the reader: the profile's whole numbers are
+  floored where they are formatted, and `opts_of` is generic so a factory
+  keeps its opts' type through the prelude. The 213 policy specs pass
+  against the generated Lua, and `policy_test.tl` (`htl test`) holds
+  `split`, `retry` and `escalate`'s default judgement.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

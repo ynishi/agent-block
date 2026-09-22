@@ -15,7 +15,18 @@ local shared = require("policy.shared")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+local record CarryOpts
+    max_bytes: integer
+    failed: function(shared.ToolPair): boolean
+end
+
+local record M
+    type Filter = function(kernel.Request): kernel.Request
+    type Bind = function(kernel.Session): Filter
+    type CarryFactory = function(CarryOpts): Bind
+    shapes: {string:lshape.Schema}
+    api: {string:shared.ApiEntry}
+end
 
 -- What this file shares with its siblings, by the names the code was
 -- written against (`policy.shared`).
@@ -23,7 +34,6 @@ local DEFAULT_MAX_BYTES = shared.DEFAULT_MAX_BYTES
 local ELLIPSIS = shared.ELLIPSIS
 local NOTE_PREFIX = shared.NOTE_PREFIX
 local ARRAY_TAG = shared.ARRAY_TAG
-local callable = shared.callable
 local whole_at_least = shared.whole_at_least
 local opts_of = shared.opts_of
 local whole_log = shared.whole_log
@@ -54,7 +64,7 @@ local CARRY_OPTS, CARRY_ARG = opts_contract({
 --- sentence that happens to end oddly, and the model has no way to tell that
 --- something was removed; the marker is what makes the trim visible, and it
 --- is paid for out of the limit rather than added on top of it.
-local function trim(text, limit)
+local function trim(text: string, limit: integer): string
     if #text <= limit then
         return text
     end
@@ -73,9 +83,9 @@ end
 --- reading `table: 0x55…` would carry the failure forward without carrying
 --- what failed, which is the whole of what the next beat needs. `canonical` is
 --- this module's own renderer and costs it no host global.
-local function render_result(result)
+local function render_result(result: any): string
     if type(result) == "string" then
-        return result
+        return result as string
     end
     return canonical(result)
 end
@@ -87,18 +97,18 @@ end
 --- record carried is read as true, which keeps this exactly the judgement
 --- `carry` has always made: a pair is a failure when it closed `ok = false`,
 --- not when it left the flag out.
-local function default_failed(pair)
+local function default_failed(pair: shared.ToolPair): boolean
     return not pair.ok
 end
 
 --- One `tool_result` event as the pair a predicate is handed
 --- (`policy.shapes.tool_pair`), with the call half looked up by id.
-local function pair_of(beat, called, data)
-    local call = called[data.call_id] or {}
+local function pair_of(beat: string, called: {string:{string:any}}, data: {string:any}): shared.ToolPair
+    local call = called[data.call_id as string] or {}
     return {
         beat = beat,
-        call_id = data.call_id,
-        name = call.name,
+        call_id = data.call_id as string,
+        name = call.name as string,
         input = call.input,
         result = data.result,
         ok = data.ok ~= false,
@@ -110,7 +120,7 @@ end
 --- The tool's NAME comes off the `tool_call` half of the pair, and when the
 --- pair has no call to take it from the note says a tool call failed rather
 --- than inventing one to blame.
-local function reason_for(pair)
+local function reason_for(pair: shared.ToolPair): string
     local who = "a tool call"
     if pair.name ~= nil then
         who = "tool '" .. tostring(pair.name) .. "'"
@@ -141,24 +151,24 @@ end
 --- @param limit number  the note's whole length in bytes
 --- @param failed function  fn(pair) -> boolean, over a `policy.shapes.tool_pair`
 --- @return string|nil  the note, or nil when the last beat did not fail
-local function failure_note(events, limit, failed)
+local function failure_note(events: {shared.Event}, limit: integer, failed: function(shared.ToolPair): boolean): string
     local order = beats_of(events)
     local previous = order[#order]
     if previous == nil then
         return nil
     end
 
-    local called = {}
+    local called: {string:{string:any}} = {}
     for _, ev in ipairs(previous.events) do
         if ev.kind == "tool_call" then
             local data = data_of(ev)
             if data.call_id ~= nil then
-                called[data.call_id] = { name = data.name, input = data.args }
+                called[data.call_id as string] = { name = data.name, input = data.args }
             end
         end
     end
 
-    local reasons = {}
+    local reasons: {string} = {}
     for _, ev in ipairs(previous.events) do
         local data = data_of(ev)
         if ev.kind == "llm_call_failed" then
@@ -191,17 +201,17 @@ end
 --- The request is rebuilt rather than edited. A filter replaces the request
 --- wholesale, and writing into the table it was handed would reach the
 --- caller's fold and — through the `llm_request` record — the durable log.
-local function prepend_note(request, note)
-    local out = {}
-    for k, v in pairs(request) do
+local function prepend_note(request: kernel.Request, note: string): kernel.Request
+    local out: {string:any} = {}
+    for k, v in pairs(request as {string:any}) do
         out[k] = v
     end
-    local messages = setmetatable({ { role = "user", content = note } }, ARRAY_TAG)
+    local messages = setmetatable({ { role = "user", content = note } } as any, ARRAY_TAG as metatable<any>) as {any}
     for _, message in ipairs(request.messages or {}) do
         messages[#messages + 1] = message
     end
     out.messages = messages
-    return out
+    return out as kernel.Request
 end
 
 --- Build a BINDER that answers a `filter` carrying the last beat's failure
@@ -249,7 +259,7 @@ end
 ---
 --- @param opts table  { max_bytes? = <whole number >= 1>, failed? = fn(pair) -> boolean }
 --- @return function bind  fn(session) -> fn(request) -> request
-function M.carry(opts)
+function M.carry(opts: CarryOpts): M.Bind
     opts = opts_of(opts, { max_bytes = true, failed = true }, "policy.carry")
     if opts.max_bytes ~= nil and not whole_at_least(opts.max_bytes, 1) then
         error("policy.carry: max_bytes must be a whole number >= 1, got " .. tostring(opts.max_bytes), 2)
@@ -265,12 +275,12 @@ function M.carry(opts)
 
     local limit = opts.max_bytes or DEFAULT_MAX_BYTES
     local failed = opts.failed or default_failed
-    return function(session)
+    return function(session: kernel.Session): M.Filter
         -- Checked where it is bound rather than at the first beat: a filter
         -- that raised on its first call would be reported as a filter
         -- failure, which is not what went wrong.
         needs_session(session, "policy.carry bind")
-        return function(request)
+        return function(request: kernel.Request): kernel.Request
             local note = failure_note(whole_log(session, "policy.carry"), limit, failed)
             if note == nil then
                 return request
