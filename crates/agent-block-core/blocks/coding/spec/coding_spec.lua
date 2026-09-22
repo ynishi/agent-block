@@ -34,7 +34,16 @@
 --  10 system: which ending paragraph each mode states, that no mode means
 --     declare, and that a mode it does not know fails;
 --  11 shapes: a plan-mode result, with and without a failing check, and one
---     carrying the `config` the run was started with.
+--     carrying the `config` the run was started with;
+--  12 config_of: where each value came from — `caller` for one the caller
+--     named, `default` for one it did not, `discovered` for a window the conf
+--     left to the port, and no entry at all for a value nobody gave;
+--  13 result_of: the result out of a converged state and out of one that gave
+--     up, and what plan mode puts on it — the counts, the checks still
+--     failing, and a plan nobody filed;
+--  14 _beat_outcome: the kernel's four statuses as the loop reads them — the
+--     answer, `max_iters` for a stop on the grant, `llm_call` for an error or
+--     a refusal.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -420,5 +429,177 @@ describe("coding.shapes — done and plan on the result", function()
                 },
             },
         }, coding.shapes.run_result)).to.be(true)
+    end)
+end)
+
+describe("coding.config_of — what the run was configured with", function()
+    local conf = { model = "m", timeout = 600, max_tokens = 4096, context_window = 32768 }
+    local resolved = {
+        iters = 5,
+        turns = 8,
+        done = "declare",
+        repo = "/r",
+        system = "SYS",
+        targets = { "/r/a.rs" },
+        window = 32768,
+    }
+    local function config(over)
+        local opts = { llm = { port = {}, conf = conf }, verify = "true" }
+        for k, v in pairs(over or {}) do
+            opts[k] = v
+        end
+        return coding.config_of(opts, resolved)
+    end
+
+    it("says caller for a knob the caller named and default for one it did not", function()
+        local c = config({ iters = 5 })
+        expect(c.values.iters.from).to.be("caller")
+        expect(c.values.iters.value).to.be(5)
+        expect(c.values.turns.from).to.be("default")
+        expect(c.values.turns.value).to.be(8)
+        expect(c.strict).to.be(false)
+    end)
+
+    it("says discovered for a window the conf did not declare, caller for one it did", function()
+        local blind = config({ llm = { port = {}, conf = { model = "m", timeout = 600, max_tokens = 4096 } } })
+        expect(blind.values.context_window.from).to.be("discovered")
+        expect(blind.values.context_window.value).to.be(32768)
+        expect(config({}).values.context_window.from).to.be("caller")
+    end)
+
+    it("names the values the run resolved, not the strings it was given", function()
+        local c = config({ strict = true, repo = "/r/" })
+        expect(c.strict).to.be(true)
+        expect(c.values.repo.value).to.be("/r")
+        expect(c.values.repo.from).to.be("caller")
+        expect(c.values.targets.value[1]).to.be("/r/a.rs")
+        expect(c.values.system.value).to.be("SYS")
+        expect(c.values.verify.value).to.be("true")
+        expect(c.values.llm_timeout.value).to.be(600)
+    end)
+
+    it("claims no source for a value nobody gave", function()
+        local c = config({ llm = { port = {}, conf = { timeout = 600 } } })
+        expect(c.values.model).to.be(nil)
+        expect(c.values.max_tokens).to.be(nil)
+        expect(c.values.reserve).to.be(nil)
+        -- Outside plan mode `check_timeout` has no value to name, so it reads
+        -- as a `from` alone rather than as an absent knob.
+        expect(c.values.check_timeout.value).to.be(nil)
+        expect(c.values.check_timeout.from).to.be("default")
+    end)
+end)
+
+describe("coding.result_of — the result out of the state the loop left", function()
+    local check = require("lshape").check
+
+    --- The state a finished run leaves behind, with a case's own fields over it.
+    local function state(over)
+        local st = {
+            done = "declare",
+            config = { strict = false, values = { iters = { value = 5, from = "default" } } },
+            iters = 0,
+            converged = false,
+            failure_reason = nil,
+            last_error = nil,
+            session_id = "s-1",
+            zero_edits = 0,
+            baseline_ok = nil,
+            edits_applied = 0,
+            plan_steps = nil,
+            last_plan = nil,
+            last_checks = nil,
+        }
+        for k, v in pairs(over or {}) do
+            st[k] = v
+        end
+        return st
+    end
+
+    it("a converged run: ok, the pass line, and no failure on it", function()
+        local r = coding.result_of(state({ converged = true, iters = 2, baseline_ok = false }), 5)
+        expect(r.ok).to.be(true)
+        expect(r.iters).to.be(2)
+        expect(r.summary).to.be("PASS in 2 iters")
+        expect(r.failure_reason).to.be(nil)
+        expect(r.last_error).to.be(nil)
+        expect(r.baseline_ok).to.be(false)
+        expect(r.session).to.be("s-1")
+        expect(r.plan).to.be(nil)
+        expect(check.check(r, coding.shapes.run_result)).to.be(true)
+    end)
+
+    it("a run that gave up: the reason, the last error, and where it stopped", function()
+        local r = coding.result_of(state({ iters = 3, failure_reason = "no_edits", last_error = "error: nope" }), 5)
+        expect(r.ok).to.be(false)
+        expect(r.summary).to.be("give-up: no_edits at iter 3/5")
+        expect(r.failure_reason).to.be("no_edits")
+        expect(r.last_error).to.be("error: nope")
+        expect(check.check(r, coding.shapes.run_result)).to.be(true)
+    end)
+
+    it("plan mode: the counts and the checks still failing, or a plan nobody filed", function()
+        local checks = {
+            { step = "a", check = "true", ok = true, exit_code = 0, tail = "" },
+            { step = "b", check = "false", ok = false, exit_code = 1, tail = "" },
+        }
+        local r = coding.result_of(
+            state({
+                done = "plan",
+                iters = 5,
+                failure_reason = "max_iters",
+                last_plan = { total = 2, passed = 1 },
+                last_checks = checks,
+            }),
+            5
+        )
+        expect(r.done).to.be("plan")
+        expect(r.plan.total).to.be(2)
+        expect(r.plan.passed).to.be(1)
+        expect(r.plan.filed).to.be(true)
+        expect(#r.plan.failing).to.be(1)
+        expect(r.plan.failing[1].step).to.be("b")
+        expect(check.check(r, coding.shapes.run_result)).to.be(true)
+
+        local none = coding.result_of(state({ done = "plan", iters = 1, failure_reason = "max_iters" }), 1)
+        expect(none.plan.filed).to.be(false)
+        expect(none.plan.total).to.be(0)
+        expect(#none.plan.failing).to.be(0)
+    end)
+end)
+
+describe("coding._beat_outcome — a beat's Outcome, as the loop reads it", function()
+    local Outcome = require("knl").Outcome
+
+    it("ok: the answer, and nothing to stop for", function()
+        local answer, reason, err = coding._beat_outcome(Outcome.ok({ beat = "b-1" }))
+        expect(answer.beat).to.be("b-1")
+        expect(reason).to.be(nil)
+        expect(err).to.be(nil)
+    end)
+
+    it("stopped on the grant is max_iters; any other stop keeps its own word", function()
+        local answer, reason, err = coding._beat_outcome(Outcome.stopped("budget", "beats"))
+        expect(answer).to.be(nil)
+        expect(reason).to.be("max_iters")
+        expect(err).to.be("budget")
+        local none, other = coding._beat_outcome(Outcome.stopped("closed"))
+        expect(none).to.be(nil)
+        expect(other).to.be("stopped")
+    end)
+
+    it("an error and a refusal are both llm_call, carrying what was said", function()
+        local a, reason, err = coding._beat_outcome(Outcome.err("call", { kind = "timeout", message = "no answer" }))
+        expect(a).to.be(nil)
+        expect(reason).to.be("llm_call")
+        expect(err).to.be("timeout: no answer")
+        local b, r2, e2 = coding._beat_outcome(Outcome.err("state", "closed"))
+        expect(b).to.be(nil)
+        expect(r2).to.be("llm_call")
+        expect(e2).to.be("state: closed")
+        local c, r3, e3 = coding._beat_outcome(Outcome.refused("model", { kind = "refusal", message = "declined" }))
+        expect(c).to.be(nil)
+        expect(r3).to.be("llm_call")
+        expect(e3).to.be("refusal: declined")
     end)
 end)

@@ -12,7 +12,7 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde_json::json;
@@ -131,6 +131,168 @@ pub async fn spawn_openai_mock_server() -> (String, Arc<AtomicUsize>, Cancellati
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port for openai mock");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let ct_shutdown = ct.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled_owned().await })
+            .await;
+    });
+
+    (format!("http://{addr}"), call_count, ct)
+}
+
+// ============================================================
+// The scripted mock — a run's answers, in order
+// ============================================================
+//
+// The fixed mock above serves one two-turn scenario. A loop test needs to say
+// what the model answers on each call: `spawn_scripted_openai_mock` takes the
+// `message` objects, n-th call answers the n-th of them, and a call past the
+// end answers the last one again (so a loop that takes one turn more than the
+// script expected does not get a 500 it would report as an llm_call failure).
+//
+// Beside the chat route it serves the rest of the vLLM-compatible surface a
+// `dialect = "vllm"` conf reaches for — `POST /tokenize` (the token count) and
+// `GET /v1/models` (the model card's `max_model_len`) — so a conf that names
+// the dialect is answered on every route it asks, not only the one it calls
+// most.
+
+/// Shared state for the scripted handler.
+#[derive(Clone)]
+pub struct ScriptedState {
+    pub call_count: Arc<AtomicUsize>,
+    script: Arc<Vec<serde_json::Value>>,
+    model: Arc<String>,
+}
+
+/// The token count `POST /tokenize` answers. Fixed and small: what these
+/// tests exercise is the loop, not the fold's dropping, so every request
+/// fits and `policy.window{ fit }` never has a beat to drop.
+const SCRIPTED_TOKEN_COUNT: u64 = 128;
+
+/// The window `GET /v1/models` names for the scripted model.
+const SCRIPTED_MAX_MODEL_LEN: u64 = 32768;
+
+/// `POST /chat/completions` — answer the n-th scripted message.
+///
+/// `finish_reason` is read off the message rather than passed in: a message
+/// carrying `tool_calls` is a turn that asked for a tool, anything else is a
+/// turn that answered. One fact, in one place.
+async fn scripted_chat_handler(
+    State(state): State<ScriptedState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = serde_json::from_slice::<serde_json::Value>(&body) {
+        eprintln!("[scripted_openai_mock] failed to parse request body: {e}");
+        let err_body = json!({ "error": format!("bad request: {e}") }).to_string();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            err_body,
+        );
+    }
+
+    let n = state.call_count.fetch_add(1, Ordering::SeqCst);
+    let idx = n.min(state.script.len() - 1);
+    let message = state.script[idx].clone();
+    let asked_for_tools = message
+        .get("tool_calls")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
+    let response_json = json!({
+        "id": format!("chatcmpl-scripted-{}", n + 1),
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": if asked_for_tools { "tool_calls" } else { "stop" }
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    });
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response_json.to_string(),
+    )
+}
+
+/// `GET /v1/models` — the model card vLLM's window discovery reads.
+async fn scripted_models_handler(State(state): State<ScriptedState>) -> impl IntoResponse {
+    let body = json!({
+        "object": "list",
+        "data": [{
+            "id": state.model.as_str(),
+            "object": "model",
+            "max_model_len": SCRIPTED_MAX_MODEL_LEN
+        }]
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+}
+
+/// `POST /tokenize` — vLLM's token count for a request.
+async fn scripted_tokenize_handler() -> impl IntoResponse {
+    let body = json!({ "count": SCRIPTED_TOKEN_COUNT }).to_string();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+/// Spawn a scripted OpenAI-compatible mock on an ephemeral port.
+///
+/// `script` is the `message` object each `/chat/completions` call answers
+/// with, in order; the last one answers every call past the end.
+///
+/// Returns `(base_url, call_count, cancellation_token)` — `call_count` is the
+/// number of chat calls made, which is the number of beats that reached the
+/// provider.
+///
+/// Panics on an empty script (there would be nothing to answer with) or if
+/// the ephemeral port cannot be bound (test infra failure).
+pub async fn spawn_scripted_openai_mock(
+    script: Vec<serde_json::Value>,
+    model: &str,
+) -> (String, Arc<AtomicUsize>, CancellationToken) {
+    assert!(
+        !script.is_empty(),
+        "spawn_scripted_openai_mock: the script must name at least one answer"
+    );
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let ct = CancellationToken::new();
+
+    let state = ScriptedState {
+        call_count: call_count.clone(),
+        script: Arc::new(script),
+        model: Arc::new(model.to_string()),
+    };
+
+    let router = Router::new()
+        .route("/chat/completions", post(scripted_chat_handler))
+        // `llm_proto` builds the chat URL as `base_url .. "/chat/completions"`,
+        // so the first route is the one it calls; the second is here for a
+        // caller that passes a base_url already ending in `/v1`.
+        .route("/v1/chat/completions", post(scripted_chat_handler))
+        .route("/v1/models", get(scripted_models_handler))
+        .route("/tokenize", post(scripted_tokenize_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port for scripted openai mock");
     let addr = listener.local_addr().expect("local_addr");
 
     let ct_shutdown = ct.clone();
