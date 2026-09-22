@@ -38,6 +38,8 @@ local record host_types
         record Json
             --- JSON text for a value.
             encode: function(any): string
+            --- The value JSON text holds; raises on text that is not JSON.
+            decode: function(string): any
         end
         --- Namespace / key → JSON-serialised value, in the host's database.
         record Kv
@@ -94,6 +96,18 @@ local record host_types
             --- Restore the content the last successful edit replaced.
             rollback: function(string): {string:any}
         end
+        --- The environment.
+        record Env
+            --- The variable's value; nil when it is unset.
+            get: function(string): string ---@nilable
+            --- The variable's value, or the default.
+            get_or: function(string, string): string
+        end
+        --- Cooperative tasks: what yields to the runtime.
+        record Task
+            --- Sleep for this many milliseconds, without parking the VM.
+            sleep: function(number)
+        end
         --- The clock.
         record Time
             --- Seconds since the epoch, fractional.
@@ -105,6 +119,28 @@ local record host_types
         ts: Ts
         fs: Fs
         time: Time
+        env: Env
+        task: Task
+    end
+    --- `http`, the client bridge (`bridge/http.rs`): one request, one
+    --- answer. A transport failure — refused, unresolved, a deadline —
+    --- RAISES; a status is an answer.
+    record Http
+        record RequestOpts
+            method: string
+            headers: {string:string}
+            body: string
+            --- Seconds.
+            timeout: number
+            stream: boolean
+            on_data: function(string)
+        end
+        record Response
+            status: integer
+            headers: {string:string}
+            body: string
+        end
+        request: function(string, ?RequestOpts): Response
     end
     --- `sh`, the process bridge (`bridge/sh.rs`): one command in a shell,
     --- in a process group of its own.

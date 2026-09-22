@@ -534,6 +534,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The 40 job specs pass against the generated Lua, and `job_test.tl`
   (`htl test`) holds the pure half — `duration`, `decl`, `tick`.
 
+- `llm_proto` is written in Teal, the two adapters with it
+  (`blocks/lib/llm_proto/{init,openai,anthropic}.tl`, embedded through
+  `include_tl!`): the same wire format, transport and parse, with the
+  vocabulary as records. `Spec` names every field an adapter reads, in one
+  place; `ToolChoice` / `Thinking` / `Classified` / `Wire` / `Usage` /
+  `Profile` / `Health` / `Result` are `---@struct` with their optional
+  fields marked; `Decoded` is what a parse answers and `Adapter` what both
+  dialects are. The wire bodies stay `{string:any}` — they are JSON, and
+  the provider's. `host_types.d.tl` grows `http` (`request` with
+  `RequestOpts` / `Response`), `std.env` (`get` nilable, `get_or`),
+  `std.task.sleep` and `std.json.decode`. The 117 llm_proto specs pass
+  against the generated Lua, and `llm_proto_test.tl` (`htl test`) holds
+  the pure half — the two normalizers, `classify_error`, `retry_delay`,
+  `health_of`, `server_root`, `estimate_tokens`.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

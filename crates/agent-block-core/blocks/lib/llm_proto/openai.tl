@@ -17,9 +17,43 @@
 ---            docs.vllm.ai/en/latest/features/reasoning_outputs/
 ---            github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 
+local host = require("host_types")
+global std: host.Std
+global log: host.Log
+
 local proto = require("llm_proto")
 
-local M = { name = "openai" }
+--- The adapter, and what the specs reach into beside it: the dialect and
+--- model-family readings, and the conversions, each exported under the name
+--- it has here.
+local record M
+    name: string
+    --- One OpenAI-shaped message: a flat list with `tool_calls` on an
+    --- assistant turn and `role = "tool"` for a result.
+    record OaiMessage
+        role: string
+        content: any
+        tool_calls: {OaiToolCall}
+        tool_call_id: string
+    end
+    record OaiFunction
+        name: string
+        arguments: any
+    end
+    record OaiToolCall
+        id: string
+        type: string
+        ["function"]: OaiFunction
+    end
+    --- The readings, for the specs.
+    _resolve_dialect: function(proto.Spec): string
+    _is_reasoning_model: function(string): boolean
+    _tools_need_effort_none: function(string): boolean
+    _thinking_kwarg_for: function(string): string
+    _needs_strict_alternation: function(string): boolean
+end
+
+M.name = "openai"
 
 local DEFAULT_MODEL = "gpt-4o-mini"
 
@@ -54,7 +88,7 @@ local DEFAULT_BASE_URL = "https://api.openai.com/v1"
 ---
 --- @param spec table
 --- @return string  "openai" | "vllm" | "llamacpp" | "ollama"
-local function resolve_dialect(spec)
+local function resolve_dialect(spec: proto.Spec): string
     if spec.dialect then
         return spec.dialect == "compat" and "vllm" or spec.dialect
     end
@@ -82,7 +116,7 @@ M._resolve_dialect = resolve_dialect
 ---
 --- @param model string
 --- @return boolean
-local function is_reasoning_model(model)
+local function is_reasoning_model(model: string): boolean
     local m = tostring(model or ""):lower()
     return m:match("^o%d") ~= nil or m:match("^gpt%-5") ~= nil
 end
@@ -90,7 +124,7 @@ end
 --- Extract the major.minor version of a gpt-N.M model id.
 --- @param model string
 --- @return number major, number minor  0, 0 when the id carries no version
-local function gpt_version(model)
+local function gpt_version(model: string): number, number
     local major, minor = tostring(model or ""):lower():match("^gpt%-(%d+)%.(%d+)")
     if major then
         return tonumber(major), tonumber(minor)
@@ -111,7 +145,7 @@ end
 ---
 --- @param model string
 --- @return boolean
-local function tools_need_effort_none(model)
+local function tools_need_effort_none(model: string): boolean
     local major, minor = gpt_version(model)
     return major > 5 or (major == 5 and minor >= 6)
 end
@@ -124,7 +158,7 @@ end
 ---
 --- @param model string
 --- @return string
-local function thinking_kwarg_for(model)
+local function thinking_kwarg_for(model: string): string
     local m = tostring(model or ""):lower()
     if m:find("deepseek", 1, true) or m:find("granite", 1, true) or m:find("holo", 1, true) then
         return "thinking"
@@ -158,11 +192,11 @@ M._thinking_kwarg_for = thinking_kwarg_for
 ---
 --- @param messages table  OpenAI-shaped messages array
 --- @return table
-function M.flatten_for_strict_alternation(messages)
-    local out = {}
+function M.flatten_for_strict_alternation(messages: {M.OaiMessage}): {M.OaiMessage}
+    local out: {M.OaiMessage} = {}
     for _, msg in ipairs(messages or {}) do
         local role = msg.role
-        local text = msg.content
+        local text: any = msg.content
 
         if role == "tool" then
             -- Tool results become part of the user side of the exchange.
@@ -175,22 +209,23 @@ function M.flatten_for_strict_alternation(messages)
         if type(text) ~= "string" then
             text = text and std.json.encode(text) or ""
         end
+        local line = text as string
 
         -- An assistant turn that only carried tool_calls has no text of its
         -- own; describing the call keeps the alternation intact.
-        if role == "assistant" and text == "" and msg.tool_calls then
-            local names = {}
+        if role == "assistant" and line == "" and msg.tool_calls then
+            local names: {string} = {}
             for _, tc in ipairs(msg.tool_calls) do
-                table.insert(names, (tc["function"] or {}).name or "?")
+                table.insert(names, (tc["function"] or {} as M.OaiFunction).name or "?")
             end
-            text = "[tool call] " .. table.concat(names, ", ")
+            line = "[tool call] " .. table.concat(names, ", ")
         end
 
         local prev = out[#out]
         if prev and prev.role == role then
-            prev.content = prev.content .. "\n\n" .. text
+            prev.content = (prev.content as string) .. "\n\n" .. line
         else
-            table.insert(out, { role = role, content = text })
+            table.insert(out, { role = role, content = line })
         end
     end
     return out
@@ -199,7 +234,7 @@ end
 --- Does this model need `flatten_for_strict_alternation`?
 --- @param model string
 --- @return boolean
-local function needs_strict_alternation(model)
+local function needs_strict_alternation(model: string): boolean
     return tostring(model or ""):lower():find("gemma", 1, true) ~= nil
 end
 
@@ -208,8 +243,8 @@ M._needs_strict_alternation = needs_strict_alternation
 --- @param messages table  Canonical messages array
 --- @param system string|nil
 --- @return table  OpenAI-shaped messages array
-function M.convert_messages(messages, system)
-    local out = {}
+function M.convert_messages(messages: {proto.Message}, system?: string): {M.OaiMessage}
+    local out: {M.OaiMessage} = {}
 
     if system and system ~= "" then
         table.insert(out, { role = "system", content = system })
@@ -219,10 +254,11 @@ function M.convert_messages(messages, system)
         if type(msg.content) == "string" then
             table.insert(out, { role = msg.role, content = msg.content })
         elseif type(msg.content) == "table" then
+            local blocks = msg.content as {proto.Block}
             if msg.role == "assistant" then
-                local text_parts = {}
-                local tool_calls = {}
-                for _, block in ipairs(msg.content) do
+                local text_parts: {string} = {}
+                local tool_calls: {M.OaiToolCall} = {}
+                for _, block in ipairs(blocks) do
                     if block.type == "text" then
                         table.insert(text_parts, block.text or "")
                     elseif block.type == "tool_use" then
@@ -237,7 +273,7 @@ function M.convert_messages(messages, system)
                     end
                 end
                 local text_content = #text_parts > 0 and table.concat(text_parts, "\n") or nil
-                local oai_msg = { role = "assistant" }
+                local oai_msg: M.OaiMessage = { role = "assistant" }
                 if text_content then
                     oai_msg.content = text_content
                 end
@@ -247,14 +283,14 @@ function M.convert_messages(messages, system)
                 table.insert(out, oai_msg)
             elseif msg.role == "user" then
                 local has_tool_result = false
-                for _, block in ipairs(msg.content) do
+                for _, block in ipairs(blocks) do
                     if block.type == "tool_result" then
                         has_tool_result = true
                         break
                     end
                 end
                 if has_tool_result then
-                    for _, block in ipairs(msg.content) do
+                    for _, block in ipairs(blocks) do
                         if block.type == "tool_result" then
                             table.insert(out, {
                                 role = "tool",
@@ -264,8 +300,8 @@ function M.convert_messages(messages, system)
                         end
                     end
                 else
-                    local parts = {}
-                    for _, block in ipairs(msg.content) do
+                    local parts: {string} = {}
+                    for _, block in ipairs(blocks) do
                         if block.type == "text" then
                             table.insert(parts, block.text or "")
                         end
@@ -285,13 +321,13 @@ end
 --- `cache_control` is stripped defensively — it is an Anthropic-only marker.
 --- @param tools table|nil
 --- @return table|nil
-function M.convert_tools(tools)
+function M.convert_tools(tools?: {proto.Tool}): {{string:any}}
     if not tools or #tools == 0 then
         return nil
     end
-    local out = {}
+    local out: {{string:any}} = {}
     for _, t in ipairs(tools) do
-        local fn = {
+        local fn: {string:any} = {
             name = t.name,
             description = t.description or "",
             parameters = t.input_schema or { type = "object", properties = {} },
@@ -321,7 +357,7 @@ end
 --- }
 --- @return table|nil req  { url, headers, body }
 --- @return string|nil err
-function M.build(spec)
+function M.build(spec?: proto.Spec): proto.Wire, string
     spec = spec or {}
 
     local api_key = spec.api_key
@@ -347,7 +383,7 @@ function M.build(spec)
         messages = M.flatten_for_strict_alternation(messages)
     end
 
-    local body = {
+    local body: {string:any} = {
         model = model,
         messages = messages,
     }
@@ -367,7 +403,7 @@ function M.build(spec)
     -- Reasoning models accept only the default for the sampling knobs and
     -- return 400 for anything else, so a caller-supplied value is dropped
     -- rather than turned into a failed request.
-    local function sampling_ok(name, value)
+    local function sampling_ok(name: string, value: any): boolean
         if value == nil then
             return false
         end
@@ -417,8 +453,9 @@ function M.build(spec)
         "verbosity",
         "response_format",
     }) do
-        if spec[key] ~= nil then
-            body[key] = spec[key]
+        local value = (spec as {string:any})[key]
+        if value ~= nil then
+            body[key] = value
         end
     end
 
@@ -464,8 +501,9 @@ function M.build(spec)
         -- it, which would merely look like the switch was set.
         if dialect == "vllm" or dialect == "llamacpp" then
             local key = thinking.kwarg or thinking_kwarg_for(model)
-            body.chat_template_kwargs = body.chat_template_kwargs or {}
-            body.chat_template_kwargs[key] = thinking.enabled and true or false
+            local kwargs = (body.chat_template_kwargs or {}) as {string:any}
+            body.chat_template_kwargs = kwargs
+            kwargs[key] = thinking.enabled and true or false
             if dialect == "vllm" and thinking.effort then
                 body.reasoning_effort = thinking.effort
             end
@@ -496,10 +534,10 @@ function M.build(spec)
         local effort = body.reasoning_effort
         if effort and effort ~= "none" then
             return nil,
-                "model "
-                    .. model
-                    .. " does not accept tools together with reasoning on Chat Completions; "
-                    .. "use thinking = { effort = 'none' } (or drop the tools)"
+            "model "
+                .. model
+                .. " does not accept tools together with reasoning on Chat Completions; "
+                .. "use thinking = { effort = 'none' } (or drop the tools)"
         end
         body.reasoning_effort = "none"
     end
@@ -539,12 +577,12 @@ end
 --- @param text string
 --- @return string|nil thinking
 --- @return string remaining_text
-function M.split_think(text)
+function M.split_think(text: string): string, string
     local CLOSE = "</think>"
 
     -- Last close, not first: a nested block would otherwise cut the split in
     -- the middle of the reasoning.
-    local close_s, pos = nil, 1
+    local close_s, pos: integer, integer = nil, 1
     while true do
         local s = text:find(CLOSE, pos, true)
         if not s then
@@ -558,7 +596,7 @@ function M.split_think(text)
     local close_e = close_s + #CLOSE - 1
 
     local open_s, open_e = text:find("<think>", 1, true)
-    local thinking, rest
+    local thinking, rest: string, string
     if open_s and open_s < close_s then
         thinking = text:sub(open_e + 1, close_s - 1)
         rest = text:sub(1, open_s - 1) .. text:sub(close_e + 1)
@@ -572,7 +610,7 @@ end
 
 --- `content_filter` is deliberately left as its own value rather than folded
 --- into `end_turn`: the model was stopped, it did not finish.
-function M.map_finish_reason(finish_reason)
+function M.map_finish_reason(finish_reason: any): string
     if finish_reason == "stop" then
         return "end_turn"
     elseif finish_reason == "tool_calls" then
@@ -599,12 +637,13 @@ end
 --- @param raw table  Parsed response JSON
 --- @return table|nil decoded { content, stop_reason, usage, context_management }
 --- @return string|nil err
-function M.parse(raw)
-    if not raw or not raw.choices or #raw.choices == 0 then
+function M.parse(raw: {string:any}): proto.Decoded, string
+    local choices = raw and raw.choices as {{string:any}}
+    if not raw or not choices or #choices == 0 then
         return nil, "invalid OpenAI response: missing choices"
     end
-    local choice = raw.choices[1]
-    local message = choice and choice.message
+    local choice = choices[1]
+    local message = choice and choice.message as {string:any}
     if not message then
         return nil, "invalid OpenAI response: missing choices[0].message"
     end
@@ -612,22 +651,23 @@ function M.parse(raw)
     -- Raw assistant dump, gated by AGENT_BLOCK_DEBUG_RAW=1. Compatible servers
     -- disagree about where tool calls and reasoning end up, and the normalized
     -- blocks below hide that; this prints what actually arrived on the wire.
+    local tool_calls = (message.tool_calls or {}) as {{string:any}}
     if std.env.get("AGENT_BLOCK_DEBUG_RAW") == "1" then
-        local text_raw = message.content
+        local text_raw = message.content as string
         log.info(
             "[DEBUG_RAW] content_len="
                 .. tostring(text_raw and #text_raw or 0)
                 .. " tool_calls="
-                .. tostring(#(message.tool_calls or {}))
+                .. tostring(#tool_calls)
                 .. " content_preview<<<"
                 .. (text_raw or ""):sub(1, 1500)
                 .. ">>>"
         )
-        for i, tc in ipairs(message.tool_calls or {}) do
-            local fn = tc["function"] or {}
+        for i, tc in ipairs(tool_calls) do
+            local fn = (tc["function"] or {}) as {string:any}
             log.info(
                 "[DEBUG_RAW] tool_call["
-                    .. i
+                    .. tostring(i)
                     .. "] name="
                     .. tostring(fn.name)
                     .. " args="
@@ -636,25 +676,25 @@ function M.parse(raw)
         end
     end
 
-    local content = {}
+    local content: {proto.Block} = {}
 
     -- Reasoning first, mirroring Anthropic's block ordering. Servers moving
     -- from `reasoning_content` to `reasoning` can send both, one of them
     -- empty, so the non-empty one wins rather than the first one present.
-    local reasoning = nil
+    local reasoning: string = nil
     if type(message.reasoning_content) == "string" and message.reasoning_content ~= "" then
-        reasoning = message.reasoning_content
+        reasoning = message.reasoning_content as string
     elseif type(message.reasoning) == "string" and message.reasoning ~= "" then
-        reasoning = message.reasoning
+        reasoning = message.reasoning as string
     end
 
-    local text = message.content
+    local text: any = message.content
 
     -- No reasoning field, but the tags are in the text: llama.cpp with
     -- `--reasoning-format none` leaves them there, and DeepSeek-R1 sometimes
     -- omits the opening tag so the parser never splits it out.
-    if not reasoning and type(text) == "string" and text:find("</think>", 1, true) then
-        local split, rest = M.split_think(text)
+    if not reasoning and type(text) == "string" and (text as string):find("</think>", 1, true) then
+        local split, rest = M.split_think(text as string)
         reasoning, text = split, rest
     end
 
@@ -662,12 +702,12 @@ function M.parse(raw)
         table.insert(content, { type = "thinking", thinking = reasoning })
     end
     if text and text ~= "" then
-        table.insert(content, { type = "text", text = text })
+        table.insert(content, { type = "text", text = text as string })
     end
 
-    for i, tc in ipairs(message.tool_calls or {}) do
-        local fn = tc["function"] or {}
-        local tc_id = tc.id
+    for i, tc in ipairs(tool_calls) do
+        local fn = (tc["function"] or {}) as {string:any}
+        local tc_id = tc.id as string
         if tc_id == nil or tc_id == "" then
             -- Exactly 9 alphanumerics: Mistral's chat template rejects any
             -- other shape when the id comes back on a tool_result, and no
@@ -675,14 +715,14 @@ function M.parse(raw)
             tc_id = string.format("tc%07d", i)
         end
 
-        local input
+        local input: {string:any}
         local raw_args = fn.arguments
         if type(raw_args) == "table" then
-            input = raw_args
+            input = raw_args as {string:any}
         else
-            local ok, parsed = pcall(std.json.decode, raw_args or "{}")
+            local ok, parsed = pcall(std.json.decode, (raw_args or "{}") as string)
             if ok and type(parsed) == "table" then
-                input = parsed
+                input = parsed as {string:any}
             else
                 log.warn(
                     "llm_proto.openai: tool_call arguments JSON parse failed for tool '"
@@ -692,7 +732,7 @@ function M.parse(raw)
                 table.insert(content, {
                     type = "tool_use",
                     id = tc_id,
-                    name = fn.name or "",
+                    name = (fn.name or "") as string,
                     input = {},
                     is_error_hint = "arguments_parse_failed",
                 })
@@ -702,15 +742,15 @@ function M.parse(raw)
         table.insert(content, {
             type = "tool_use",
             id = tc_id,
-            name = fn.name or "",
+            name = (fn.name or "") as string,
             input = input,
         })
         ::continue_tc::
     end
 
-    local u = raw.usage or {}
-    local out_details = u.completion_tokens_details or {}
-    local in_details = u.prompt_tokens_details or {}
+    local u = (raw.usage or {}) as {string:any}
+    local out_details = (u.completion_tokens_details or {}) as {string:any}
+    local in_details = (u.prompt_tokens_details or {}) as {string:any}
 
     -- A refusal comes back with content = null, which would otherwise read as
     -- an empty but successful turn.
@@ -722,20 +762,20 @@ function M.parse(raw)
     return {
         content = content,
         stop_reason = stop_reason,
-        refusal = message.refusal,
+        refusal = message.refusal as string,
         stop_details = message.refusal and { type = "refusal", explanation = message.refusal } or nil,
         usage = {
-            input_tokens = tonumber(u.prompt_tokens) or 0,
-            output_tokens = tonumber(u.completion_tokens) or 0,
+            input_tokens = (tonumber(u.prompt_tokens) or 0) as integer,
+            output_tokens = (tonumber(u.completion_tokens) or 0) as integer,
             -- Prompt caching is automatic on OpenAI; these mirror the
             -- Anthropic counters so callers read one shape.
-            cache_creation_input_tokens = tonumber(in_details.cache_write_tokens) or 0,
-            cache_read_input_tokens = tonumber(in_details.cached_tokens) or 0,
-            thinking_tokens = tonumber(out_details.reasoning_tokens) or 0,
+            cache_creation_input_tokens = (tonumber(in_details.cache_write_tokens) or 0) as integer,
+            cache_read_input_tokens = (tonumber(in_details.cached_tokens) or 0) as integer,
+            thinking_tokens = (tonumber(out_details.reasoning_tokens) or 0) as integer,
         },
         context_management = nil,
     },
-        nil
+    nil
 end
 
 -- ============================================================
@@ -760,7 +800,7 @@ end
 --- @param spec table  the same spec `build` takes
 --- @return integer|nil tokens
 --- @return string|nil err  when the dialect has no counter or the call failed
-function M.count(spec)
+function M.count(spec?: proto.Spec): integer, string
     spec = spec or {}
     local dialect = resolve_dialect(spec)
     if dialect ~= "vllm" and dialect ~= "llamacpp" then
@@ -787,7 +827,7 @@ function M.count(spec)
         if type(decoded.count) ~= "number" then
             return nil, "vllm /tokenize answered no count"
         end
-        return math.floor(decoded.count), nil
+        return math.floor(decoded.count as number), nil
     end
 
     -- llamacpp: the template first, then the tokens of the rendered prompt.
@@ -811,7 +851,7 @@ function M.count(spec)
     if type(counted.tokens) ~= "table" then
         return nil, "llama.cpp /tokenize answered no tokens"
     end
-    return #counted.tokens, nil
+    return #(counted.tokens as {any}), nil
 end
 
 --- What the model behind `spec` can take, asked of the server where it says.
@@ -828,7 +868,7 @@ end
 --- @param spec table  the same spec `build` takes
 --- @return table|nil profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
 --- @return string|nil err  when the dialect has no discovery or the call failed
-function M.profile(spec)
+function M.profile(spec?: proto.Spec): proto.Profile, string
     spec = spec or {}
     local dialect = resolve_dialect(spec)
     local model = spec.model or std.env.get_or("OPENAI_MODEL", DEFAULT_MODEL)
@@ -838,16 +878,16 @@ function M.profile(spec)
     if api_key then
         headers["Authorization"] = "Bearer " .. api_key
     end
-    local window
+    local window: number
 
     if dialect == "vllm" then
         local decoded, err = proto.probe("GET", root .. "/v1/models", headers)
         if not decoded then
             return nil, err
         end
-        for _, card in ipairs(decoded.data or {}) do
+        for _, card in ipairs((decoded.data or {}) as {{string:any}}) do
             if card.id == model and type(card.max_model_len) == "number" then
-                window = card.max_model_len
+                window = card.max_model_len as number
             end
         end
         if window == nil then
@@ -858,9 +898,9 @@ function M.profile(spec)
         if not decoded then
             return nil, err
         end
-        local settings = decoded.default_generation_settings
+        local settings = decoded.default_generation_settings as {string:any}
         if type(settings) == "table" and type(settings.n_ctx) == "number" then
-            window = settings.n_ctx
+            window = settings.n_ctx as number
         else
             return nil, "llama.cpp /props names no n_ctx"
         end
@@ -869,9 +909,9 @@ function M.profile(spec)
         if not decoded then
             return nil, err
         end
-        for key, value in pairs(decoded.model_info or {}) do
+        for key, value in pairs((decoded.model_info or {}) as {string:any}) do
             if type(key) == "string" and key:match("%.context_length$") and type(value) == "number" then
-                window = value
+                window = value as number
             end
         end
         if window == nil then
@@ -897,7 +937,7 @@ end
 ---
 --- @param spec table  the same spec `build` takes
 --- @return table  { alive, kind, status?, message? }
-function M.health(spec)
+function M.health(spec?: proto.Spec): proto.Health
     spec = spec or {}
     local base_url = spec.base_url or DEFAULT_BASE_URL
     local root = proto.server_root(base_url)

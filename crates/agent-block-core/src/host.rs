@@ -50,17 +50,18 @@ pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     // Written in Teal, like `mcp_tools` below.
     ("session", htl::include_tl!("blocks/lib/session/init.tl")),
+    // Written in Teal, the two adapters with it (`include_tl!`).
     (
         "llm_proto",
-        include_str!("../blocks/lib/llm_proto/init.lua"),
+        htl::include_tl!("blocks/lib/llm_proto/init.tl"),
     ),
     (
         "llm_proto.openai",
-        include_str!("../blocks/lib/llm_proto/openai.lua"),
+        htl::include_tl!("blocks/lib/llm_proto/openai.tl"),
     ),
     (
         "llm_proto.anthropic",
-        include_str!("../blocks/lib/llm_proto/anthropic.lua"),
+        htl::include_tl!("blocks/lib/llm_proto/anthropic.tl"),
     ),
     ("lshape", include_str!("../blocks/lib/lshape/init.lua")),
     ("lshape.t", include_str!("../blocks/lib/lshape/t.lua")),

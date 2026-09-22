@@ -52,7 +52,8 @@ t.describe("tick", function()
         local jobs = { decl("a", "2m") }
         local plan = job.tick(jobs, facts(), 1000, { max_runs = 4 })
         t.expect(#plan.start):to_equal(1)
-        t.expect(plan.start[1].reason):to_equal("due")
+        local first = plan.start[1]
+        t.expect(first and first.reason):to_equal("due")
 
         local f = facts()
         f.ended.a = 1000
@@ -67,21 +68,25 @@ t.describe("tick", function()
         f.live_count = 1
         local plan = job.tick(jobs, f, 5000, { max_runs = 4 })
         t.expect(#plan.start):to_equal(0)
-        t.expect(plan.skip[1].reason):to_equal("overlapping")
-        t.expect(plan.skip[1].requested):to_be_nil()
+        local skipped = plan.skip[1]
+        t.expect(skipped and skipped.reason):to_equal("overlapping")
+        t.expect(skipped and skipped.requested):to_be_nil()
 
         f.requested = { { job = "a", seq = 7, by = "me" } }
         plan = job.tick(jobs, f, 5000, { max_runs = 4 })
-        t.expect(plan.skip[1].requested):to_equal(7)
+        skipped = plan.skip[1]
+        t.expect(skipped and skipped.requested):to_equal(7)
     end)
 
     t.it("caps the host's runs, favouring the jobs declared first", function()
         local jobs = { decl("a", "1m"), decl("b", "1m"), decl("c", "1m") }
         local plan = job.tick(jobs, facts(), 0, { max_runs = 2 })
         t.expect(#plan.start):to_equal(2)
-        t.expect(plan.start[2].decl.name):to_equal("b")
-        t.expect(plan.skip[1].job):to_equal("c")
-        t.expect(plan.skip[1].reason):to_equal("max_runs")
+        local second = plan.start[2]
+        t.expect(second and second.decl.name):to_equal("b")
+        local skipped = plan.skip[1]
+        t.expect(skipped and skipped.job):to_equal("c")
+        t.expect(skipped and skipped.reason):to_equal("max_runs")
     end)
 
     t.it("starts on request regardless of `every`, and a job with no `every` only then", function()
@@ -90,8 +95,9 @@ t.describe("tick", function()
         local f = facts()
         f.requested = { { job = "manual", seq = 3 } }
         local plan = job.tick(jobs, f, 0, { max_runs = 1 })
-        t.expect(plan.start[1].reason):to_equal("requested")
-        t.expect(plan.start[1].requested):to_equal(3)
+        local first = plan.start[1]
+        t.expect(first and first.reason):to_equal("requested")
+        t.expect(first and first.requested):to_equal(3)
     end)
 
     t.it("refuses a tick with no max_runs", function()
