@@ -2065,8 +2065,7 @@ end
 -- open / resume / session — the state half
 -- ============================================================
 
-local OPEN_STATE_KEYS =
-    { owner = true, budget = true, store = true, meta = true, parent = true }
+local OPEN_STATE_KEYS = { owner = true, budget = true, store = true, meta = true, parent = true }
 local RESUME_STATE_KEYS = { store = true, session = true, budget = true }
 
 --- Reject anything that is not a state key. Policy has its own constructor
@@ -2510,14 +2509,17 @@ local function execute_tools(session, device, out, beat_id)
 
         -- Record the call before running it: a run that dies mid-tool
         -- leaves a history that says a call was made.
-        record(session, with_beat({
-            kind = "tool_call",
-            data = {
-                call_id = call_id,
-                name = name,
-                args = args,
-            },
-        }, beat_id))
+        record(
+            session,
+            with_beat({
+                kind = "tool_call",
+                data = {
+                    call_id = call_id,
+                    name = name,
+                    args = args,
+                },
+            }, beat_id)
+        )
 
         local ok, result
         if item.action == "deny" then
@@ -2548,14 +2550,17 @@ local function execute_tools(session, device, out, beat_id)
             result = ""
         end
 
-        record(session, with_beat({
-            kind = "tool_result",
-            data = {
-                call_id = call_id,
-                ok = ok,
-                result = result,
-            },
-        }, beat_id))
+        record(
+            session,
+            with_beat({
+                kind = "tool_result",
+                data = {
+                    call_id = call_id,
+                    ok = ok,
+                    result = result,
+                },
+            }, beat_id)
+        )
 
         summary[#summary + 1] = { call_id = call_id, name = name, ok = ok }
     end
@@ -2735,10 +2740,14 @@ function M.beat(session, device)
     if type(report) == "table" then
         request_data.window = report
     end
-    local rec_ok, rec_err = pcall(record, session, with_beat({
-        kind = "llm_request",
-        data = request_data,
-    }, beat_id))
+    local rec_ok, rec_err = pcall(
+        record,
+        session,
+        with_beat({
+            kind = "llm_request",
+            data = request_data,
+        }, beat_id)
+    )
     if not rec_ok then
         return emit(Outcome.err("state", read_error(rec_err)))
     end
@@ -2783,16 +2792,20 @@ function M.beat(session, device)
         -- log says the same thing the Outcome does.
         local classified = call_error(reason, raised)
         shape.assert_dev(classified, CALL_ERROR, "knl_call_error")
-        local noted_ok, note_err = pcall(record, session, with_beat({
-            kind = "llm_call_failed",
-            data = {
-                error = classified.message,
-                kind = classified.kind,
-                retryable = classified.retryable,
-                retry_after = classified.retry_after,
-                status = classified.status,
-            },
-        }, beat_id))
+        local noted_ok, note_err = pcall(
+            record,
+            session,
+            with_beat({
+                kind = "llm_call_failed",
+                data = {
+                    error = classified.message,
+                    kind = classified.kind,
+                    retryable = classified.retryable,
+                    retry_after = classified.retry_after,
+                    status = classified.status,
+                },
+            }, beat_id)
+        )
         if not noted_ok then
             -- Two failures, one Outcome. The state is the one reported:
             -- the call failing is a fact this beat could not write down,
@@ -2812,14 +2825,18 @@ function M.beat(session, device)
     -- deduction was taken at [3]).  The counts go in as they came: the adapter
     -- normalized them to three numbers on its way out, so there is nothing
     -- here to default and nothing to invent.
-    local resp_ok, resp_err = pcall(record, session, with_beat({
-        kind = "llm_response",
-        data = {
-            content = resp.content,
-            usage = resp.usage,
-            stop_reason = resp.stop_reason,
-        },
-    }, beat_id))
+    local resp_ok, resp_err = pcall(
+        record,
+        session,
+        with_beat({
+            kind = "llm_response",
+            data = {
+                content = resp.content,
+                usage = resp.usage,
+                stop_reason = resp.stop_reason,
+            },
+        }, beat_id)
+    )
     if not resp_ok then
         return emit(Outcome.err("state", read_error(resp_err)))
     end

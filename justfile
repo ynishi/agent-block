@@ -52,9 +52,13 @@ test-lua-project dir filter="":
     LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- --project {{ dir }} {{ filter }}
 
 # [allow-agent]
-# Format and lint
+# Format and lint. Lua goes through stylua (`cargo install stylua`; config in
+# .stylua.toml, exclusions in .styluaignore) on the same terms as `cargo fmt`:
+# the tree is formatted in place, and `check` runs this first so a commit made
+# after `just check` is one stylua would not touch.
 lint:
     cargo fmt --all
+    stylua .
     cargo clippy --workspace --no-deps -- -D warnings
 
 # [allow-agent]

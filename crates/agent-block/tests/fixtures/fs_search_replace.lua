@@ -124,19 +124,22 @@ check("stale.file_untouched", std.fs.read(path) == "alpha\n")
 --  where the file has `assert_eq!(..., None)`; nothing pointed at line 501]
 r = reset(
     "fn a() {}\n"
-        .. "    assert_eq!(ScheduleKind::parse(\"linear\"), Some(ScheduleKind::Linear));\n"
-        .. "    assert_eq!(ScheduleKind::parse(\"triangular\"), None);\n"
+        .. '    assert_eq!(ScheduleKind::parse("linear"), Some(ScheduleKind::Linear));\n'
+        .. '    assert_eq!(ScheduleKind::parse("triangular"), None);\n'
         .. "    for name in ScheduleKind::NAMES {\n"
 )
 res = sr({
     path = path,
     base = r.version,
-    edits = { { search = "    assert!(ScheduleKind::parse(\"triangular\").is_none());", replace = "x" } },
+    edits = { { search = '    assert!(ScheduleKind::parse("triangular").is_none());', replace = "x" } },
 })
 check("nearest.rejected", res.ok == false and res.reason == "search_not_found")
 check("nearest.no_actual", res.failures[1].actual == nil)
 check("nearest.names_line_3", type(res.failures[1].nearest) == "table" and res.failures[1].nearest.line == 3)
-check("nearest.carries_text", res.failures[1].nearest.text == "    assert_eq!(ScheduleKind::parse(\"triangular\"), None);")
+check(
+    "nearest.carries_text",
+    res.failures[1].nearest.text == '    assert_eq!(ScheduleKind::parse("triangular"), None);'
+)
 check("nearest.shared_words", res.failures[1].nearest.shared_words == 3)
 check("nearest.file_untouched", std.fs.read(path):find("assert!(", 1, true) == nil)
 
