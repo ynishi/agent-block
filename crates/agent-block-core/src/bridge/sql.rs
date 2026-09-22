@@ -45,7 +45,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         lua,
         "sql_tools",
         "sql",
-        include_str!("../../blocks/lib/sql_tools/init.lua"),
+        htl::include_tl!("blocks/lib/sql_tools/init.tl"),
     )?;
 
     Ok(())

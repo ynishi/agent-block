@@ -132,6 +132,11 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
 /// Only "not found" falls back: an error *inside* a copy (a syntax error in
 /// what the project wrote) is the project's to see, not a reason to silently
 /// run the embedded one instead.
+/// `package.preload.host_types` for a VM with no registry: what
+/// `require("host_types")` answers there (see [`load_tools_module`]).
+const HOST_TYPES_PRELOAD: &str = r#"package.preload["host_types"] = package.preload["host_types"]
+    or function() return {} end"#;
+
 pub(crate) fn load_tools_module(
     lua: &Lua,
     name: &str,
@@ -151,7 +156,19 @@ error(mod, 0)"#
         .set_name(format!("require {name}"))
         .eval()?;
     let module = match found {
-        LuaValue::Boolean(false) => lua.load(embedded).set_name(name).eval::<LuaValue>()?,
+        LuaValue::Boolean(false) => {
+            // A module written in Teal begins with `require("host_types")` —
+            // the run-time half of the declaration its types come from,
+            // an empty table (`blocks/lib/host_types.d.tl` says why). On a
+            // VM with no registry that name resolves nowhere either, so it
+            // is answered here, from `package.preload`, before the source
+            // runs: the same empty table the host embeds, under the same
+            // name. `or` keeps a preload the VM already has.
+            lua.load(HOST_TYPES_PRELOAD)
+                .set_name("preload host_types")
+                .exec()?;
+            lua.load(embedded).set_name(name).eval::<LuaValue>()?
+        }
         other => other,
     };
 

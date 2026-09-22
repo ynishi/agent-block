@@ -40,8 +40,32 @@ local record host_types
             --- Remove (ns, key); true when a row was there to remove.
             delete: function(string, string): boolean
         end
+        --- The SQL bridge over the host's SQLite database (`bridge/sql.rs`).
+        record Sql
+            record ExecResult
+                affected: integer
+                last_id: integer
+            end
+            --- Rows of a SELECT, each a column → value table.
+            query: function(string, ?{any}): {{string:any}}
+            --- A statement; how many rows it touched and the last rowid.
+            exec: function(string, ?{any}): ExecResult
+            --- The sentinel a NULL column comes back as.
+            null: any
+        end
         json: Json
         kv: Kv
+        sql: Sql
+    end
+    --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
+    --- call, by name.
+    record Tool
+        record Meta
+            description: string
+            input_schema: {string:any}
+        end
+        --- Register one tool: its name, what it takes, and the handler.
+        register: function(string, Meta, function(any): any)
     end
     --- `log`, the tracing bridge (`bridge/log.rs`): one message per call,
     --- attributed to the running script.
