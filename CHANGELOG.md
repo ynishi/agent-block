@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `coding.config_of(opts, resolved)` and `coding.result_of(st, max_iters)` are
+  the two halves of a run that were built inline: what the run was configured
+  with — every knob with its value and whether that value came from the
+  `caller`, this module's `default`, or was `discovered` by asking the port —
+  and the result the run answers with. Both are functions of their arguments,
+  so what a `config` event will say, and what a given end state reports, can be
+  checked without opening a session.
+
 - `knl.shapes.tool_spec` declares what a tool is — its name, what the model is
   told about it, its input schema, and the function that runs it. That triple
   was written three times and nowhere declared: `std.fs.tool_specs` answers
@@ -159,6 +167,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel's session ids are UUIDs.
 
 ### Changed
+
+- The `coding` loop's state is one table and its steps are plain functions.
+  `coding.run`'s implementation held its state in a dozen mutable locals that
+  a dozen nested closures read and wrote: the `plan` tool handler wrote the
+  steps into a local, the verdict's `changed` read an edit counter the loop
+  moved, the `Outcome.match` arms smuggled the answer out through a sink table
+  and recorded a failure by side effect, and the run's own result was built
+  inline around an immediately-invoked function. What a step touched could
+  only be learnt by reading everything above it. The loop now holds one `st`
+  table with every moving field named and initialised in one place, and each
+  step is a module-level function of its arguments — `run_verify`,
+  `run_checks`, `edits_in`, `failing_of`, `beat_outcome` (whose arms return
+  the answer, or the reason there is none, instead of writing it somewhere),
+  `run_iteration`, and the two below. `coding.run`'s behaviour is unchanged,
+  and is now covered end to end: four tests drive the real binary and the real
+  bridges against a scripted in-process model — the model declaring on a green
+  verify, a green that does not end the run while tools are still being
+  called, `done = "plan"` ending when every filed check passes, and the
+  tripwire that refuses a run naming the reply no room.
 
 - The four bridge tool modules are libraries, and the bridge does the wiring.
   `fs_tools` / `kv_tools` / `sql_tools` / `ts_tools` were still the scripts

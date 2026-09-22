@@ -105,7 +105,7 @@
 --                         of the window) and `policy.repeat_cap` (the same read
 --                         again, with no edit between, is refused)
 --     what a failure says `policy.carry` — one note about an edit the tool refused
---     when to stop        `policy.verdict{ run = verify, changed, timeout }` after
+--     when to stop        `policy.verdict{ run = run_verify, changed, timeout }` after
 --                         every iteration — green counts only with an edit landed —
 --                         and `M.decide` over it: the run ends when the model
 --                         answers with no tool call while those facts agree and,
@@ -153,10 +153,16 @@ local STAGNATION_WINDOW = 3
 local VERIFY_TAIL = 6000
 local FEEDBACK_TAIL = 2000
 local ERROR_TAIL = 800
+-- What one plan check's output is cut to before it goes back to the model.
+-- Shorter than the verify's: a check is one command with one thing to say,
+-- and there may be a dozen of them in a single report.
+local CHECK_TAIL = 300
 -- `done` is a loop policy, not a fact about the caller's task, so it has a
 -- default like the other knobs: a caller that says nothing gets "declare".
 local DONE_MODES = { declare = true, plan = true }
 local DEFAULT_DONE = "declare"
+-- The session's owner when the caller names none.
+local DEFAULT_OWNER = "coding"
 -- The Exec knobs `strict` covers: each has a number or a mode behind it here,
 -- and under strict the caller states it instead of taking this module's.
 -- `repo` / `baseline` / `owner` / `system` / `store` are deliberately absent —
@@ -516,6 +522,346 @@ function M.plan_report(results)
 end
 
 -- ============================================================
+-- Pure helpers — the loop's own steps
+-- ============================================================
+--
+-- The loop below is a sequence of these, over one state table. Each is a
+-- function of its arguments: what it reads is in the signature, so a step can
+-- be read — and checked — without the loop around it.
+
+--- A `std.fs` tool spec as the adapter takes it: the four fields, nothing else.
+local function as_tool(spec)
+    return {
+        name = spec.name,
+        description = spec.description,
+        input_schema = spec.input_schema,
+        handler = spec.handler,
+    }
+end
+
+--- Edits this beat applied, read off the log: a `tool_result` for the edit
+--- tool whose result says ok.
+---
+--- @param session table  the kernel session
+--- @param beat_id any  the beat to count, as `out.beat` names it
+--- @param edit_name string  the edit tool's name
+--- @return number applied
+local function edits_in(session, beat_id, edit_name)
+    local by_call, applied = {}, 0
+    for _, ev in ipairs((session:events())) do
+        -- The beat id is a label in the envelope (`meta.beat`), and an event
+        -- need not carry `meta` at all.
+        if ev.meta ~= nil and ev.meta.beat == beat_id then
+            local data = type(ev.data) == "table" and ev.data or {}
+            if ev.kind == "tool_call" and data.name == edit_name then
+                by_call[data.call_id] = true
+            elseif ev.kind == "tool_result" and by_call[data.call_id] then
+                if type(data.result) == "table" and data.result.ok == true then
+                    applied = applied + 1
+                end
+            end
+        end
+    end
+    return applied
+end
+
+--- What `policy.stagnation` reads as a beat's signature: the verify output
+--- recorded under it. Two beats whose verify said the same thing are the same
+--- beat as far as progress goes.
+local function verify_signature(beat)
+    for _, ev in ipairs(beat.events) do
+        if ev.kind == "verify" then
+            return tostring((ev.data or {}).stderr or "")
+        end
+    end
+    return nil
+end
+
+--- What `policy.carry` counts as a failed call / result pair.
+local function failed_pair(pair)
+    return pair.ok == false or (type(pair.result) == "table" and pair.result.ok == false)
+end
+
+--- A failed Outcome as one sentence: the stage, and what the detail said.
+local function detail_of(o)
+    local d = o.detail
+    if type(d) == "table" then
+        return tostring(d.kind or o.kind) .. ": " .. tostring(d.message or "unknown failure")
+    end
+    return tostring(o.kind) .. ": " .. tostring(d)
+end
+
+--- A beat's Outcome, read as the loop needs it: the answer, or why there is
+--- none. The arms return their values rather than writing somewhere the
+--- caller can read afterwards, so what a beat produced is in the call's
+--- return and nowhere else.
+---
+--- The mapping is the kernel's four statuses onto this module's
+--- `failure_reason` vocabulary: a `stopped` on the grant is `max_iters` (the
+--- grant IS the iteration cap), any other `stopped` keeps its own word, and a
+--- beat that errored or was refused is `llm_call` with the tail of what it
+--- said.
+---
+--- @param o table  an Outcome
+--- @return table|nil answer  the beat's `out`, or nil
+--- @return string|nil reason  the failure_reason, when there is no answer
+--- @return string|nil err  what to record as last_error, when there is one
+local function beat_outcome(o)
+    return Outcome.match(o, {
+        stopped = function(x)
+            return nil, x.reason == "budget" and "max_iters" or "stopped", tostring(x.reason)
+        end,
+        error = function(x)
+            return nil, "llm_call", tail(detail_of(x), ERROR_TAIL)
+        end,
+        refused = function(x)
+            return nil, "llm_call", tail(detail_of(x), ERROR_TAIL)
+        end,
+        ok = function(x)
+            return x.out
+        end,
+    })
+end
+
+-- Exposed under a leading underscore, like `_run_impl`: the spec checks the
+-- four statuses map onto the four answers, and nothing outside this module
+-- has a beat to hand it.
+M._beat_outcome = beat_outcome
+
+--- The verify, run once: the command in the repository, with the seconds
+--- `policy.verdict` decided. A command that did not run at all is said with
+--- `ran = false` — the verdict tells that from one that ran and said no.
+---
+--- @param cmd string
+--- @param repo string
+--- @param seconds number|nil
+--- @return table  { ok, ran?, stdout, stderr, exit_code }
+local function run_verify(cmd, repo, seconds)
+    local res = sh.exec(cmd, { cwd = repo, timeout = seconds })
+    if res.ok ~= true then
+        return {
+            ok = false,
+            ran = false,
+            stdout = "",
+            stderr = "verify did not run: " .. tostring(res.error),
+            exit_code = -1,
+        }
+    end
+    local merged = tostring(res.stdout or "") .. tostring(res.stderr or "")
+    return { ok = res.code == 0, stdout = "", stderr = tail(merged, VERIFY_TAIL), exit_code = res.code }
+end
+
+--- Run every check the model filed; nil when no plan has been filed.
+---
+--- @param steps table|nil  { { step, check } ... }
+--- @param repo string
+--- @param seconds number  what one check may take
+--- @return table|nil results  { { step, check, ok, exit_code, tail } ... }
+local function run_checks(steps, repo, seconds)
+    if not steps then
+        return nil
+    end
+    local results = {}
+    for i, step in ipairs(steps) do
+        local r = sh.exec(step.check, { cwd = repo, timeout = seconds })
+        local ok = r.ok == true and r.code == 0
+        local out = r.ok == true and (tostring(r.stdout or "") .. tostring(r.stderr or ""))
+            or ("did not run: " .. tostring(r.error))
+        results[i] = {
+            step = step.step,
+            check = step.check,
+            ok = ok,
+            exit_code = r.ok == true and r.code or -1,
+            tail = tail(out, CHECK_TAIL),
+        }
+    end
+    return results
+end
+
+--- The checks still failing, as the result names them.
+local function failing_of(checks)
+    local out = {}
+    for _, c in ipairs(checks or {}) do
+        if not c.ok then
+            out[#out + 1] = { step = c.step, check = c.check, exit_code = c.exit_code, tail = c.tail }
+        end
+    end
+    return out
+end
+
+--- Give up: why, and the last thing that was said about it. The loop breaks
+--- after calling this; nothing here decides that.
+local function stop(st, reason, err)
+    st.failure_reason, st.last_error = reason, err
+end
+
+--- One value in the `config` record: what it ran at, and where that came from.
+local function named(value, given)
+    return { value = value, from = given and "caller" or "default" }
+end
+
+--- What the run was configured with, and where each value came from.
+---
+--- It goes into the record as one event and comes back on the result, so a
+--- finished run says what it ran at without anyone reading the source that
+--- started it — which is the difference between a run whose iterations were
+--- five because the caller said so and one where five was this module's own
+--- number.
+---
+--- `opts` says what the caller named; `resolved` carries the seven values the
+--- run worked out for itself, which are not read off `opts` — the defaults
+--- applied, the repo with its trailing slash gone, the targets as absolute
+--- paths, the system line, and the window.
+---
+--- @param opts table  the caller's opts, as `run` received them
+--- @param resolved table  { iters, turns, done, repo, system, targets, window }
+--- @return table  { strict = <boolean>, values = { <knob> = { value, from } ... } }
+function M.config_of(opts, resolved)
+    local conf = (type(opts.llm) == "table" and opts.llm.conf) or {}
+    local values = {
+        -- Exec: the loop's own policy, each with a default here. `store` and,
+        -- outside plan mode, `check_timeout` have no value to name when the
+        -- caller names none — the default store is the host's — so those read
+        -- as a `from` alone.
+        iters = named(resolved.iters, opts.iters ~= nil),
+        turns = named(resolved.turns, opts.turns ~= nil),
+        timeout = named(opts.timeout or DEFAULT_TIMEOUT, opts.timeout ~= nil),
+        result_share = named(opts.result_share or DEFAULT_RESULT_SHARE, opts.result_share ~= nil),
+        repeat_max = named(opts.repeat_max or DEFAULT_REPEAT_MAX, opts.repeat_max ~= nil),
+        done = named(resolved.done, opts.done ~= nil),
+        check_timeout = named(opts.check_timeout, opts.check_timeout ~= nil),
+        repo = named(resolved.repo, opts.repo ~= nil),
+        baseline = named(opts.baseline ~= false, opts.baseline ~= nil),
+        owner = named(opts.owner or DEFAULT_OWNER, opts.owner ~= nil),
+        system = named(resolved.system, opts.system ~= nil),
+        store = named(opts.store, opts.store ~= nil),
+        -- The task, as the run resolved it: the targets are the absolute
+        -- paths the tools were locked to, not the string the caller passed.
+        verify = named(opts.verify, true),
+        targets = named(resolved.targets, true),
+        -- Data: the model's own facts. The window is the one value here that
+        -- can come from somewhere other than the caller.
+        context_window = { value = resolved.window, from = conf.context_window ~= nil and "caller" or "discovered" },
+        -- `llm.conf.timeout`, the reply's seconds — named apart from
+        -- `timeout` above, which is the verify's curve.
+        llm_timeout = named(conf.timeout, true),
+    }
+    -- Named only where the caller named one: a table constructor drops a key
+    -- whose value is nil, so what is absent here was absent in the conf, and
+    -- no entry claims a source for a value nobody gave.
+    for key, value in pairs({
+        model = conf.model,
+        base_url = conf.base_url,
+        dialect = conf.dialect,
+        max_tokens = conf.max_tokens,
+        reserve = opts.reserve,
+    }) do
+        values[key] = named(value, true)
+    end
+    return { strict = opts.strict == true, values = values }
+end
+
+--- The run's result, out of the state the loop left behind.
+---
+--- @param st table  the loop's state
+--- @param max_iters number  the cap, for the give-up line
+--- @return table  the RUN_RESULT value
+function M.result_of(st, max_iters)
+    local converged = st.converged
+    return {
+        ok = converged,
+        iters = st.iters,
+        summary = converged and string.format("PASS in %d iters", st.iters)
+            or string.format("give-up: %s at iter %d/%d", tostring(st.failure_reason), st.iters, max_iters),
+        session = st.session_id,
+        baseline_ok = st.baseline_ok,
+        failure_reason = (not converged) and st.failure_reason or nil,
+        last_error = (not converged) and st.last_error or nil,
+        done = st.done,
+        config = st.config,
+        -- Which checks were still failing, by name: a count alone (3/4) does
+        -- not say which step the run never finished, and the one it never
+        -- finished is the one a caller has to look at.
+        plan = st.done == "plan" and (st.last_plan and {
+            total = st.last_plan.total,
+            passed = st.last_plan.passed,
+            filed = true,
+            failing = failing_of(st.last_checks),
+        } or { total = 0, passed = 0, filed = false, failing = {} }) or nil,
+    }
+end
+
+--- One iteration: beats until an edit lands, the model stops asking for
+--- tools, or the turn cap — then the caller verifies, whatever the model
+--- said.
+---
+--- nil says the run must halt, and `st.failure_reason` says why: a request
+--- that no longer fits the window, or a beat that did not come off.
+---
+--- @param st table  the loop's state
+--- @param s table  the session
+--- @param device table
+--- @param fits function|nil  policy.window's second return
+--- @param max_turns number
+--- @param edit_name string  the edit tool's name
+--- @return table|nil answer  the last beat's `out`
+--- @return boolean declared  the answer asked for no tool: the model saying it is done
+--- @return number applied_here  edits this iteration landed
+local function run_iteration(st, s, device, fits, max_turns, edit_name)
+    local applied_here, answer, declared = 0, nil, false
+    for turn = 1, max_turns do
+        if fits then
+            local over, tokens, limit = fits(s, device)
+            if over ~= nil then
+                -- Before any beat the request is the seed alone, and a seed
+                -- that does not fit is the caller's targets, not the loop's
+                -- history: it fails here, at once.
+                if st.iters == 0 and turn == 1 then
+                    stop(
+                        st,
+                        "seed_overflow",
+                        string.format(
+                            "the seed alone is %d tokens and the window leaves %d; name narrower targets",
+                            tokens,
+                            limit
+                        )
+                    )
+                else
+                    stop(st, "context", "the newest beat does not fit the model's window")
+                end
+                return nil
+            end
+        end
+        local out, reason, err = beat_outcome(kernel.beat(s, device))
+        if not out then
+            stop(st, reason, err)
+            return nil
+        end
+        answer = out
+        applied_here = applied_here + edits_in(s, answer.beat, edit_name)
+        local no_tools = not (answer.tools and #answer.tools > 0)
+        if applied_here > 0 or no_tools then
+            -- An answer with no tool call is the model saying it is done;
+            -- whether the run is over is decided by the caller, against the
+            -- facts.
+            declared = no_tools
+            break
+        end
+        if turn == 3 or turn == 6 then
+            s:append({
+                kind = "msg_user",
+                data = {
+                    content = "You have been reading without editing; old reads are already gone. Apply an edit NOW with "
+                        .. edit_name
+                        .. " to the region you most recently read.",
+                },
+            })
+        end
+    end
+    return answer, declared, applied_here
+end
+
+-- ============================================================
 -- The loop
 -- ============================================================
 
@@ -622,19 +968,46 @@ function M._run_impl(opts)
     -- session, so it is bound inside the session below.
     local read_spec = std.fs.tool_specs({ allowed = { "read" }, path_lock = targets })[1]
     local edit_spec = std.fs.tool_specs({ allowed = { "search_replace" }, path_lock = targets })[1]
-    local function as_tool(spec)
-        return {
-            name = spec.name,
-            description = spec.description,
-            input_schema = spec.input_schema,
-            handler = spec.handler,
-        }
-    end
+
+    local seed = M.seed(opts.spec, targets)
+    local system = opts.system or M.system(read_spec.name, edit_spec.name, done_mode)
+
+    -- Everything the run holds, in one table. The first two are fixed at the
+    -- start and never written again — `result_of` reads them back out of here
+    -- — and the rest is what the loop moves. Named once, initialised once:
+    -- what a step changes is `st.<field>` and is visible as that.
+    local st = {
+        done = done_mode,
+        config = M.config_of(opts, {
+            iters = max_iters,
+            turns = max_turns,
+            done = done_mode,
+            repo = repo,
+            system = system,
+            targets = targets,
+            window = window,
+        }),
+        iters = 0,
+        converged = false,
+        failure_reason = nil,
+        last_error = nil,
+        session_id = nil,
+        zero_edits = 0,
+        baseline_ok = nil,
+        edits_applied = 0,
+        -- The plan the model filed, and the last run of its checks: the counts
+        -- for the result, and the checks themselves so the ones still failing
+        -- can be named rather than only counted.
+        plan_steps = nil,
+        last_plan = nil,
+        last_checks = nil,
+    }
+
     -- done = "plan": the model files its plan through a tool, so the steps and
     -- their checks are a recorded tool_call and not prose to be parsed. The
     -- tool is not an edit and does not reset `repeat_cap` — filing a plan is
-    -- not progress on the files.
-    local plan_steps = nil
+    -- not progress on the files. Its handler is the one place a tool reaches
+    -- the loop's state, and it reaches exactly one field of it.
     local tool_list = { as_tool(read_spec), as_tool(edit_spec) }
     if done_mode == "plan" then
         tool_list[#tool_list + 1] = {
@@ -668,7 +1041,7 @@ function M._run_impl(opts)
                 if not steps then
                     return { ok = false, reason = "bad_plan", error = err }
                 end
-                plan_steps = steps
+                st.plan_steps = steps
                 return { ok = true, steps = #steps }
             end,
         }
@@ -677,155 +1050,25 @@ function M._run_impl(opts)
     local size_cap = policy.result_cap({ port = port, conf = conf, share = opts.result_share or DEFAULT_RESULT_SHARE })
     local repeat_cap = policy.repeat_cap({ max = opts.repeat_max or DEFAULT_REPEAT_MAX, resets = { edit_spec.name } })
 
-    local seed = M.seed(opts.spec, targets)
-    local system = opts.system or M.system(read_spec.name, edit_spec.name, done_mode)
-
-    -- What this run was configured with, and where each value came from. It
-    -- goes into the record as one event and comes back on the result, so a
-    -- finished run says what it ran at without anyone reading the source that
-    -- started it — which is the difference between a run whose iterations
-    -- were five because the caller said so and one where five was this
-    -- module's own number.
-    local function named(value, given)
-        return { value = value, from = given and "caller" or "default" }
-    end
-    local values = {
-        -- Exec: the loop's own policy, each with a default here. `store` and,
-        -- outside plan mode, `check_timeout` have no value to name when the
-        -- caller names none — the default store is the host's — so those read
-        -- as a `from` alone.
-        iters = named(max_iters, opts.iters ~= nil),
-        turns = named(max_turns, opts.turns ~= nil),
-        timeout = named(opts.timeout or DEFAULT_TIMEOUT, opts.timeout ~= nil),
-        result_share = named(opts.result_share or DEFAULT_RESULT_SHARE, opts.result_share ~= nil),
-        repeat_max = named(opts.repeat_max or DEFAULT_REPEAT_MAX, opts.repeat_max ~= nil),
-        done = named(done_mode, opts.done ~= nil),
-        check_timeout = named(check_timeout, opts.check_timeout ~= nil),
-        repo = named(repo, opts.repo ~= nil),
-        baseline = named(opts.baseline ~= false, opts.baseline ~= nil),
-        owner = named(opts.owner or "coding", opts.owner ~= nil),
-        system = named(system, opts.system ~= nil),
-        store = named(opts.store, opts.store ~= nil),
-        -- The task, as the run resolved it: the targets are the absolute
-        -- paths the tools were locked to, not the string the caller passed.
-        verify = named(verify_cmd, true),
-        targets = named(targets, true),
-        -- Data: the model's own facts. The window is the one value here that
-        -- can come from somewhere other than the caller.
-        context_window = { value = window, from = conf.context_window ~= nil and "caller" or "discovered" },
-        -- `llm.conf.timeout`, the reply's seconds — named apart from
-        -- `timeout` above, which is the verify's curve.
-        llm_timeout = named(conf.timeout, true),
-    }
-    -- Named only where the caller named one: a table constructor drops a key
-    -- whose value is nil, so what is absent here was absent in the conf, and
-    -- no entry claims a source for a value nobody gave.
-    for key, value in pairs({
-        model = conf.model,
-        base_url = conf.base_url,
-        dialect = conf.dialect,
-        max_tokens = conf.max_tokens,
-        reserve = opts.reserve,
-    }) do
-        values[key] = named(value, true)
-    end
-    local config = { strict = opts.strict == true, values = values }
-
-    --- Run every check the model filed; nil when no plan has been filed.
-    local function run_plan_checks()
-        if not plan_steps then
-            return nil
-        end
-        local results = {}
-        for i, st in ipairs(plan_steps) do
-            local r = sh.exec(st.check, { cwd = repo, timeout = check_timeout })
-            local ok = r.ok == true and r.code == 0
-            local out = r.ok == true and (tostring(r.stdout or "") .. tostring(r.stderr or ""))
-                or ("did not run: " .. tostring(r.error))
-            results[i] = {
-                step = st.step,
-                check = st.check,
-                ok = ok,
-                exit_code = r.ok == true and r.code or -1,
-                tail = tail(out, 300),
-            }
-        end
-        return results
-    end
-
     -- Verify, as a verdict: `timeout` hands the seconds to the run, `changed`
     -- withholds a green until an edit has landed.
-    local edits_applied = 0
-    local function verify(seconds)
-        local res = sh.exec(verify_cmd, { cwd = repo, timeout = seconds })
-        if res.ok ~= true then
-            return {
-                ok = false,
-                ran = false,
-                stdout = "",
-                stderr = "verify did not run: " .. tostring(res.error),
-                exit_code = -1,
-            }
-        end
-        local merged = tostring(res.stdout or "") .. tostring(res.stderr or "")
-        return { ok = res.code == 0, stdout = "", stderr = tail(merged, VERIFY_TAIL), exit_code = res.code }
-    end
     local verdict = policy.verdict({
-        run = verify,
+        run = function(seconds)
+            return run_verify(verify_cmd, repo, seconds)
+        end,
         changed = function()
-            return edits_applied > 0
+            return st.edits_applied > 0
         end,
         timeout = opts.timeout or DEFAULT_TIMEOUT,
     })
-
-    --- Edits this beat applied, read off the log: a `tool_result` for the
-    --- edit tool whose result says ok.
-    local function edits_in(session, beat_id)
-        local by_call, applied = {}, 0
-        for _, ev in ipairs((session:events())) do
-            -- The beat id is a label in the envelope (`meta.beat`), and an
-            -- event need not carry `meta` at all.
-            if ev.meta ~= nil and ev.meta.beat == beat_id then
-                local data = type(ev.data) == "table" and ev.data or {}
-                if ev.kind == "tool_call" and data.name == edit_spec.name then
-                    by_call[data.call_id] = true
-                elseif ev.kind == "tool_result" and by_call[data.call_id] then
-                    if type(data.result) == "table" and data.result.ok == true then
-                        applied = applied + 1
-                    end
-                end
-            end
-        end
-        return applied
-    end
-
-    local function verify_signature(beat)
-        for _, ev in ipairs(beat.events) do
-            if ev.kind == "verify" then
-                return tostring((ev.data or {}).stderr or "")
-            end
-        end
-        return nil
-    end
-
-    local function failed_pair(pair)
-        return pair.ok == false or (type(pair.result) == "table" and pair.result.ok == false)
-    end
-
     local stalled = policy.stagnation({ same = STAGNATION_WINDOW, signature = verify_signature })
-    local iters, converged, failure_reason, last_error, session_id = 0, false, nil, nil, nil
-    local zero_edits = 0
-    local baseline_ok = nil
-    -- The last plan run: the counts for the result, and the checks themselves
-    -- so the ones still failing can be named rather than only counted.
-    local last_plan, last_checks = nil, nil
 
     kernel.session({
-        owner = opts.owner or "coding",
+        owner = opts.owner or DEFAULT_OWNER,
         budget = { amount = max_iters * max_turns, tag = "beats" },
         store = opts.store,
     }, function(s)
-        session_id = tostring(s:id())
+        st.session_id = tostring(s:id())
         local fold, fits =
             policy.window({ fit = { port = port, conf = conf, reserve = opts.reserve }, keep_seed = true })
         local device = kernel.device({
@@ -846,8 +1089,8 @@ function M._run_impl(opts)
         -- way as a matter of course.
         if opts.baseline ~= false then
             local b = verdict(s, {})
-            baseline_ok = b.result.ok == true
-            if not baseline_ok then
+            st.baseline_ok = b.result.ok == true
+            if not st.baseline_ok then
                 seed = seed
                     .. "\n\n## Current build status: FAILING\nThe verify command ALREADY fails on the current state "
                     .. "of the files, before any edit of yours. Fix these errors FIRST — the output names the "
@@ -860,98 +1103,17 @@ function M._run_impl(opts)
         -- was configured with, not a turn of the conversation. The kernel's
         -- fold skips a kind it does not know, so the record gains the event
         -- and the request the model sees is the one it would have been.
-        s:append({ kind = "config", data = config })
-
-        local function stop(reason, err)
-            failure_reason, last_error = reason, err
-            return false
-        end
-        local function detail_of(o)
-            local d = o.detail
-            if type(d) == "table" then
-                return tostring(d.kind or o.kind) .. ": " .. tostring(d.message or "unknown failure")
-            end
-            return tostring(o.kind) .. ": " .. tostring(d)
-        end
-        local arms = function(sink)
-            return {
-                stopped = function(o)
-                    return stop(o.reason == "budget" and "max_iters" or "stopped", tostring(o.reason))
-                end,
-                error = function(o)
-                    return stop("llm_call", tail(detail_of(o), ERROR_TAIL))
-                end,
-                refused = function(o)
-                    return stop("llm_call", tail(detail_of(o), ERROR_TAIL))
-                end,
-                ok = function(o)
-                    sink.out = o.out
-                    return true
-                end,
-            }
-        end
+        s:append({ kind = "config", data = st.config })
 
         while true do
-            -- One iteration: beats until an edit lands, the model stops
-            -- asking for tools, or the turn cap — then verify, whatever the
-            -- model said.
-            local applied_here, answer, halted, declared = 0, nil, false, false
-            for turn = 1, max_turns do
-                if fits then
-                    local over, tokens, limit = fits(s, device)
-                    if over ~= nil then
-                        -- Before any beat the request is the seed alone, and
-                        -- a seed that does not fit is the caller's targets,
-                        -- not the loop's history: it fails here, at once.
-                        if iters == 0 and turn == 1 then
-                            stop(
-                                "seed_overflow",
-                                string.format(
-                                    "the seed alone is %d tokens and the window leaves %d; name narrower targets",
-                                    tokens,
-                                    limit
-                                )
-                            )
-                        else
-                            stop("context", "the newest beat does not fit the model's window")
-                        end
-                        halted = true
-                        break
-                    end
-                end
-                local sink = {}
-                if not Outcome.match(kernel.beat(s, device), arms(sink)) then
-                    halted = true
-                    break
-                end
-                answer = sink.out
-                applied_here = applied_here + edits_in(s, answer.beat)
-                local no_tools = not (answer.tools and #answer.tools > 0)
-                if applied_here > 0 or no_tools then
-                    -- An answer with no tool call is the model saying it is
-                    -- done; whether the run is over is decided below, against
-                    -- the facts.
-                    declared = no_tools
-                    break
-                end
-                if turn == 3 or turn == 6 then
-                    s:append({
-                        kind = "msg_user",
-                        data = {
-                            content = "You have been reading without editing; old reads are already gone. Apply an edit NOW with "
-                                .. edit_spec.name
-                                .. " to the region you most recently read.",
-                        },
-                    })
-                end
-            end
-            if halted or answer == nil then
+            local answer, declared, applied_here = run_iteration(st, s, device, fits, max_turns, edit_spec.name)
+            if answer == nil then
                 break
             end
 
-            iters = iters + 1
-            edits_applied = edits_applied + applied_here
-            zero_edits = applied_here == 0 and zero_edits + 1 or 0
+            st.iters = st.iters + 1
+            st.edits_applied = st.edits_applied + applied_here
+            st.zero_edits = applied_here == 0 and st.zero_edits + 1 or 0
             local v = verdict(s, answer)
             -- The verify is one fact. It never ends the run by itself: a spec
             -- spanning two files, or one file and the tests it asked for, goes
@@ -960,37 +1122,37 @@ function M._run_impl(opts)
             -- single edit converged on a green before the tests existed]. What
             -- ends the run is the model answering without a tool call while
             -- the facts agree (`M.decide`).
-            local checks = done_mode == "plan" and run_plan_checks() or nil
+            local checks = done_mode == "plan" and run_checks(st.plan_steps, repo, check_timeout) or nil
             local plan_facts = nil
             if checks then
                 local _, passed = M.plan_report(checks)
                 plan_facts = { total = #checks, passed = passed }
-                last_plan, last_checks = plan_facts, checks
+                st.last_plan, st.last_checks = plan_facts, checks
             end
             if
                 M.decide(done_mode, {
                     declared = declared,
                     verify_ok = v.ok == true,
-                    edits_applied = edits_applied,
+                    edits_applied = st.edits_applied,
                     plan = plan_facts,
                 })
             then
-                converged = true
+                st.converged = true
                 break
             end
             if not v.result.ok then
-                last_error = tail(v.result.stderr, ERROR_TAIL)
+                st.last_error = tail(v.result.stderr, ERROR_TAIL)
             end
-            if zero_edits >= STAGNATION_WINDOW then
+            if st.zero_edits >= STAGNATION_WINDOW then
                 -- Iteration after iteration with no edit landing is the
                 -- model failing to edit, which is not the same as editing
                 -- toward a build that stays red — a caller that retries
                 -- one should not retry the other.
-                stop("no_edits", last_error)
+                stop(st, "no_edits", st.last_error)
                 break
             end
-            if iters >= max_iters then
-                stop("max_iters", nil)
+            if st.iters >= max_iters then
+                stop(st, "max_iters", nil)
                 break
             end
 
@@ -998,7 +1160,7 @@ function M._run_impl(opts)
             -- to call next.
             local parts = {}
             if v.result.ok then
-                if edits_applied == 0 then
+                if st.edits_applied == 0 then
                     parts[#parts + 1] =
                         "The verify command passes on the UNMODIFIED code: no edit has landed in this run."
                 else
@@ -1006,13 +1168,13 @@ function M._run_impl(opts)
                 end
             else
                 if stalled(s) ~= nil then
-                    stop("stagnation", last_error)
+                    stop(st, "stagnation", st.last_error)
                     break
                 end
                 local said
-                if baseline_ok == false then
+                if st.baseline_ok == false then
                     said = "The verify still fails, as it did before you started:\n"
-                elseif baseline_ok == true then
+                elseif st.baseline_ok == true then
                     said = "The verify passed before your edits and fails now — your edits broke it:\n"
                 else
                     said = "The verify failed:\n"
@@ -1037,35 +1199,7 @@ function M._run_impl(opts)
         end
     end)
 
-    return {
-        ok = converged,
-        iters = iters,
-        summary = converged and string.format("PASS in %d iters", iters)
-            or string.format("give-up: %s at iter %d/%d", tostring(failure_reason), iters, max_iters),
-        session = session_id,
-        baseline_ok = baseline_ok,
-        failure_reason = (not converged) and failure_reason or nil,
-        last_error = (not converged) and last_error or nil,
-        done = done_mode,
-        config = config,
-        -- Which checks were still failing, by name: a count alone (3/4) does
-        -- not say which step the run never finished, and the one it never
-        -- finished is the one a caller has to look at.
-        plan = done_mode == "plan" and (last_plan and {
-            total = last_plan.total,
-            passed = last_plan.passed,
-            filed = true,
-            failing = (function()
-                local out = {}
-                for _, c in ipairs(last_checks or {}) do
-                    if not c.ok then
-                        out[#out + 1] = { step = c.step, check = c.check, exit_code = c.exit_code, tail = c.tail }
-                    end
-                end
-                return out
-            end)(),
-        } or { total = 0, passed = 0, filed = false, failing = {} }) or nil,
-    }
+    return M.result_of(st, max_iters)
 end
 
 --- Run the loop. See the header for `opts` and the result.
