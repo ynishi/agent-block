@@ -549,6 +549,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pure half — the two normalizers, `classify_error`, `retry_delay`,
   `health_of`, `server_root`, `estimate_tokens`.
 
+- The kernel is declared for the checker, so a module written in Teal can
+  `require("knl")`. Two files. `blocks/lib/knl_types.d.tl` is generated:
+  the syscall types `bridge/knl.rs` declares (schema-bridge IR) rendered as
+  Teal — a record per object, an enum per closed set, a type alias for the
+  rest, a field's own object nested and named after it — by the same
+  source the lshape `knl_types` module comes from, so the two cannot
+  disagree. The tree holds a copy for the checker at `cargo build` and in
+  CI, a test pins it to the renderer (`AGENT_BLOCK_WRITE_DTS=1` regenerates
+  it), and the host hands the checker its own render at start beside
+  `host_types.d.tl`, so a project's `.tl` is checked against the binary
+  that runs it. `blocks/lib/knl.d.tl` is hand-written while `knl` is Lua:
+  the module's exports — `open` / `resume` / `session` / `device` / `beat`
+  / `fold` / `error` / `api` / `views.*` / `export` — the `Session` the
+  kernel's userdata is, `Device`, `DeviceConfig`, `OutcomeValue`, and
+  `shapes` as lshape schemas; `e2e_knl_decl_drift.rs` holds every declared
+  name to what `require("knl")` exports.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

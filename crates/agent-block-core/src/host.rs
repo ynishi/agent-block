@@ -1208,15 +1208,24 @@ where
 /// collides with what htl keeps there.
 struct TealChecker(#[allow(dead_code)] htl::Htl);
 
-/// The declarations this binary ships for a `.tl` to be checked against —
-/// `host_types.d.tl` and `lshape.d.tl`, as text.
-const TEAL_DECLARATIONS: &[(&str, &str)] = &[
-    (
-        "host_types.d.tl",
-        include_str!("../blocks/lib/host_types.d.tl"),
-    ),
-    ("lshape.d.tl", include_str!("../blocks/lib/lshape.d.tl")),
-];
+/// The declarations this binary ships for a `.tl` to be checked against:
+/// `host_types.d.tl` and `lshape.d.tl` as the tree holds them, and
+/// `knl_types.d.tl` as this binary renders it from the kernel's Rust types
+/// (`bridge::knl::teal_module_source`) — the binary's own, whatever the
+/// tree's copy said.
+fn teal_declarations() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "host_types.d.tl",
+            include_str!("../blocks/lib/host_types.d.tl").to_string(),
+        ),
+        (
+            "lshape.d.tl",
+            include_str!("../blocks/lib/lshape.d.tl").to_string(),
+        ),
+        ("knl_types.d.tl", crate::bridge::knl::teal_module_source()),
+    ]
+}
 
 /// Where the checker reads this binary's declarations from: a directory
 /// under the temp dir named by the crate version and a hash of the texts,
@@ -1227,8 +1236,9 @@ const TEAL_DECLARATIONS: &[(&str, &str)] = &[
 /// arrangement for `htl.test`'s declaration.
 fn teal_declarations_dir() -> std::io::Result<PathBuf> {
     use sha2::{Digest, Sha256};
+    let declarations = teal_declarations();
     let mut hasher = Sha256::new();
-    for (name, text) in TEAL_DECLARATIONS {
+    for (name, text) in &declarations {
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
         hasher.update(text.as_bytes());
@@ -1240,7 +1250,7 @@ fn teal_declarations_dir() -> std::io::Result<PathBuf> {
         "agent-block-dts-{}-{key}",
         env!("CARGO_PKG_VERSION")
     ));
-    for (name, text) in TEAL_DECLARATIONS {
+    for (name, text) in &declarations {
         htl::write_if_changed(&dir.join(name), text)?;
     }
     Ok(dir)
