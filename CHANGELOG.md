@@ -405,6 +405,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default because it is every span in the process, this binary's own
   included.
 
+- `mlua-pkg` is 0.11 (was 0.9). The `Registry` / `Resolver` / `FsResolver` /
+  `MemoryResolver` surface `host.rs` builds the `require` chain from is
+  unchanged between the two, so nothing in the chain moved; what the bump
+  buys is a resolver written against the current trait — the one a Teal
+  (`.tl`) resolver implements — being something the same `Registry` can hold,
+  which is the first step of typing `blocks/lib`.
+
 ### Removed
 
 - The seal is gone. Every embedded module can be shadowed and vendored, the

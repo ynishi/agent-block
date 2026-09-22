@@ -70,7 +70,12 @@ mlua-batteries-sqlite = "0.8"
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
-mlua-pkg     = "0.9"
+#
+# 0.11 because a `Resolver` is only addable to a `Registry` of the same
+# major, and 0.x majors do not unify: a resolver from another crate — the
+# Teal one `htl` ships, which is how `blocks/lib` gets typed — has to be
+# written against the mlua-pkg this chain is built on, or it cannot join it.
+mlua-pkg     = "0.11"
 # The SQLite cluster, one line for everything that links it. `libsqlite3-sys`
 # declares `links = "sqlite3"`, so the graph holds exactly one major of it
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38
