@@ -19,6 +19,14 @@
 --       store   = { sqlite = "/path/run.sqlite" },          -- the session's store; default the host's
 --       baseline = true,                        -- verify once before the first beat (default)
 --       done    = "declare",                    -- what ends the run: "declare" (default) | "plan"
+--       ops     = { read = "read", edit = { "search_replace", "write", "append" } },
+--                                               -- the std.fs ops the model is handed;
+--                                               -- default { read = "read", edit = { "search_replace" } }
+--       seed    = "names",                      -- how the targets enter the seed: "names" (default,
+--                                               -- the paths alone, for the model to read in ranges)
+--                                               -- or "full" (each one whole and line-numbered)
+--       call_reserve = 3072,                    -- tokens kept out of the model's reasoning for the
+--                                               -- tool call after it; absent = no stop point is sent
 --       check_timeout = 120,                    -- seconds one plan check may take; done = "plan" only
 --       strict  = false,                        -- true: every Exec knob below must be named here
 --   })
@@ -72,12 +80,13 @@
 --   is invented for them either.
 --
 --   EXEC is loop policy — the iterations, the turns, the verify's timeout
---   curve, the two caps, `done` — and every one of them has a default, stated
---   above. `strict = true` gives those defaults up: each Exec knob with a
---   number or a mode behind it must then be named by the caller, and the run
---   refuses while any is not, listing all of them at once. `repo` /
---   `baseline` / `owner` / `system` / `store` stay outside it — single
---   self-evident values rather than knobs to tune.
+--   curve, the two caps, `done`, the `ops` the model is handed, the shape of
+--   the `seed` — and every one of them has a default, stated above.
+--   `strict = true` gives those defaults
+--   up: each Exec knob with a number, a mode or a tool set behind it must then
+--   be named by the caller, and the run refuses while any is not, listing all
+--   of them at once. `repo` / `baseline` / `owner` / `system` / `store` stay
+--   outside it — single self-evident values rather than knobs to tune.
 --
 --   `strict` is a lever the top level pulls on ITSELF, and this module never
 --   reads an environment variable for it: a library that switches its own
@@ -97,13 +106,22 @@
 --   guarantee the seams do not already sell. Every part is a value in a seam
 --   the kernel has, and the module is the wiring:
 --
---     the task            `spec`, pinned as the seed the fold keeps
---     the files           `std.fs.tool_specs` read / search_replace, path-locked
---                         to the targets; every target enters the seed whole
+--     the task            `spec`, pinned as the seed the fold keeps — with
+--                         the targets whole, or by name alone (`seed`)
+--     the files           `std.fs.tool_specs`, path-locked to the targets —
+--                         the ops `ops` names, read / search_replace by
+--                         default
 --     what one beat sends `policy.window{ fit, keep_seed }`
 --     what a tool answers `policy.result_cap` (a result may not outgrow a share
---                         of the window) and `policy.repeat_cap` (the same read
---                         again, with no edit between, is refused)
+--                         of the window), `policy.repeat_cap` (the same read
+--                         again, with no edit between, is refused) and
+--                         `policy.require_args` (a call whose required
+--                         arguments did not all arrive is refused before the
+--                         tool runs — a reply cut at the output limit is where
+--                         one comes from)
+--     where thinking stops `policy.thinking_cap{ port, conf, reserve, call_reserve }`,
+--                         when `call_reserve` is named: the reasoning's stop
+--                         point, sized per request so the call after it fits
 --     what a failure says `policy.carry` — one note about an edit the tool refused
 --     when to stop        `policy.verdict{ run = run_verify, changed, timeout }` after
 --                         every iteration — green counts only with an edit landed —
@@ -123,7 +141,10 @@
 --   No retry policy of its own, no branch on a model's name, no reading of
 --   what the verify printed beyond handing it back to the model: a model's
 --   limits go into the seams (the `policy` header says where), and a
---   different verify is a different `verify` string. It does not commit,
+--   different verify is a different `verify` string. What that string covers
+--   is the caller's too: one that only looks for a string goes green on a
+--   file that no longer parses, so put the parse in it as well
+--   (`luac -p src/x.lua && grep -q ...`, `cargo check`). It does not commit,
 --   branch, or talk to an issue tracker — the loop ends with the files
 --   edited on disk and the verdict in the result; what happens to them next
 --   is the caller's.
@@ -161,14 +182,26 @@ local CHECK_TAIL = 300
 -- default like the other knobs: a caller that says nothing gets "declare".
 local DONE_MODES = { declare = true, plan = true }
 local DEFAULT_DONE = "declare"
+-- The `std.fs` ops the model is handed when the caller names none: the two
+-- tools this loop has always handed out. `ops` is where a caller says
+-- otherwise, and the op names are `std.fs`'s — this module keeps no list of
+-- them, it asks (`fs_spec`).
+local DEFAULT_READ_OP = "read"
+local DEFAULT_EDIT_OPS = { "search_replace" }
+-- How the targets enter the seed: whole, or by name alone. "full" is the
+-- default because this tree has measured neither against the other; what is
+-- known about names is written where `M.seed` explains it.
+local SEED_MODES = { full = true, names = true }
+local DEFAULT_SEED = "names"
 -- The session's owner when the caller names none.
 local DEFAULT_OWNER = "coding"
--- The Exec knobs `strict` covers: each has a number or a mode behind it here,
--- and under strict the caller states it instead of taking this module's.
+-- The Exec knobs `strict` covers: each has a number, a mode or a tool set
+-- behind it here, and under strict the caller states it instead of taking this
+-- module's.
 -- `repo` / `baseline` / `owner` / `system` / `store` are deliberately absent —
 -- a single self-evident value is not a knob to tune. `check_timeout` is absent
 -- too: `done = "plan"` already requires it of every caller, strict or not.
-local STRICT_KNOBS = { "iters", "turns", "timeout", "result_share", "repeat_max", "done" }
+local STRICT_KNOBS = { "iters", "turns", "timeout", "result_share", "repeat_max", "done", "ops", "seed" }
 
 -- ============================================================
 -- Shapes
@@ -216,6 +249,48 @@ local RUN_OPTS = T.shape({
         :describe("policy.result_cap's share of the window per tool result; default 0.25, required under `strict`")
         :is_optional(),
     repeat_max = T.number:describe("policy.repeat_cap's max; default 2, required under `strict`"):is_optional(),
+    ops = T.shape({
+        read = T.string:describe('the std.fs op that reads; default "read"'):is_optional(),
+        edit = T.any_of({ T.string, T.array_of(T.string) })
+            :describe(
+                'the std.fs ops that edit: one name or an array of them; default { "search_replace" }. '
+                    .. "Every one is path-locked to the targets, every one counts as an edit, and every one "
+                    .. "resets policy.repeat_cap. `write` and `append` together are how a file too large for "
+                    .. "one reply gets written — write the first part, append the rest "
+                    .. "[measured 2026-09-17 in a sibling lane: a run that meant to add its tests on the next "
+                    .. "turn hit the window and left a 0-byte file; the one run of that task the lane judged "
+                    .. "correct wrote the file and extended it by three appends — the others used append too "
+                    .. "and were still judged wrong. Append gets the file written, not the task right]"
+            )
+            :is_optional(),
+    })
+        :describe("which std.fs ops the model is handed; default read + search_replace, required under `strict`")
+        :is_optional(),
+    call_reserve = T.number
+        :describe(
+            "tokens kept out of the model's reasoning for the tool call that follows it. Given, the run "
+                .. "sends a stop point for the reasoning with every request (policy.thinking_cap): the window "
+                .. "less what the request already costs, less `reserve`, less this. Absent, no stop point is "
+                .. "sent and the server's own default stands, which is today's behaviour. It reaches the wire "
+                .. "only on a dialect that takes a per-request budget — vllm's thinking_token_budget; the "
+                .. "openai adapter warns and sends nothing on the others — and it does nothing useful without "
+                .. "`reserve`, whose number it is measured against "
+                .. "[measured 2026-09-14 in a sibling lane: on a 32k window, the beats where the stop point "
+                .. "fired still delivered their tool call, where the unbounded ones filled the window and "
+                .. "delivered nothing]"
+        )
+        :is_optional(),
+    seed = T.string
+        :describe(
+            'how the targets enter the seed; default "names", required under `strict`. "names": the paths '
+                .. 'alone, and the model reads the parts it needs with the read tool. "full": each target whole '
+                .. "and line-numbered. Names is the shape every run in a sibling lane has taken since "
+                .. "2026-09-14 — the rework runs it judged correct (4 of 6), and a 1,991-line target (2 of 2) no "
+                .. "32k window could hold whole — and the one published comparison prefers it (SWE-agent ACI: "
+                .. "whole-file seeding 12.7 against 18.0 for a 100-line viewer). Full has no run behind it "
+                .. "since that lane switched"
+        )
+        :is_optional(),
     baseline = T.boolean
         :describe("run the verify once before the first beat, so the record has the starting point; default true")
         :is_optional(),
@@ -234,9 +309,10 @@ local RUN_OPTS = T.shape({
         :is_optional(),
     strict = T.boolean
         :describe(
-            "true: every Exec knob with a default (iters, turns, timeout, result_share, repeat_max, done, and "
-                .. 'check_timeout under done = "plan") must be named by the caller, and the run refuses while '
-                .. "any is not; default false. A lever the top level pulls on itself — never read from the "
+            "true: every Exec knob with a default (iters, turns, timeout, result_share, repeat_max, done, ops, "
+                .. 'seed, and check_timeout under done = "plan") must be named by the caller, and the run '
+                .. "refuses while any is not; default false. A lever the top level pulls on itself — never "
+                .. "read from the "
                 .. "environment here"
         )
         :is_optional(),
@@ -329,6 +405,62 @@ function M.targets(targets, repo)
     return out
 end
 
+--- The ops the model is handed, resolved: one op that reads, and the ops that
+--- edit.
+---
+--- The names are `std.fs`'s and are not checked against a list here — this
+--- module has no business keeping a second copy of another module's op names,
+--- and an op that does not exist is refused when the tool is built, by the
+--- module that knows (`fs_spec`). What is checked here is the SHAPE: a read
+--- that is one name, an edit that is one name or several, and no key beside
+--- those two, so a typo is not a tool surface nobody chose.
+---
+--- @param ops table|nil  { read?, edit? } — edit is a string or an array
+--- @return table  { read = <string>, edit = { <string>, ... } }
+function M.ops_of(ops)
+    if ops == nil then
+        return { read = DEFAULT_READ_OP, edit = { DEFAULT_EDIT_OPS[1] } }
+    end
+    if type(ops) ~= "table" then
+        error('coding.run: `ops` must be a table — { read = "read", edit = { "search_replace" } }', 2)
+    end
+    for key in pairs(ops) do
+        if key ~= "read" and key ~= "edit" then
+            error("coding.run: `ops` has no option '" .. tostring(key) .. "' — it takes `read` and `edit`", 2)
+        end
+    end
+    local read = ops.read
+    if read == nil then
+        read = DEFAULT_READ_OP
+    elseif type(read) ~= "string" or read == "" then
+        error("coding.run: `ops.read` must be the name of one std.fs op, got " .. tostring(read), 2)
+    end
+    local raw = ops.edit
+    if raw == nil then
+        raw = DEFAULT_EDIT_OPS
+    elseif type(raw) == "string" then
+        raw = { raw }
+    elseif type(raw) ~= "table" then
+        error("coding.run: `ops.edit` must be one std.fs op name or an array of them, got " .. tostring(raw), 2)
+    end
+    local edit, seen = {}, {}
+    for i, name in ipairs(raw) do
+        if type(name) ~= "string" or name == "" then
+            error(("coding.run: `ops.edit[%d]` must be a non-empty std.fs op name"):format(i), 2)
+        end
+        -- Named twice is one tool: the map a device holds is keyed by name,
+        -- and `knl_adapter.tools` refuses a duplicate as the wiring bug it is.
+        if not seen[name] then
+            seen[name] = true
+            edit[#edit + 1] = name
+        end
+    end
+    if #edit == 0 then
+        error("coding.run: `ops.edit` names no op — the loop has nothing to edit with", 2)
+    end
+    return { read = read, edit = edit }
+end
+
 --- `text` with each line prefixed by its 1-based number and a tab.
 function M.numbered(text)
     if text == "" then
@@ -345,19 +477,46 @@ function M.numbered(text)
     return table.concat(out, "\n")
 end
 
---- The seed: `spec`, then each target whole and line-numbered, absent when
---- it does not exist yet. A target is not compacted here: the caller wrote
---- the spec and chose the targets, and one too big to hand over whole is a
---- narrower target's job, not a lossy substitute made in this module. A
---- seed that does not fit the window fails the run before its first beat
---- (`failure_reason = "seed_overflow"`).
+--- The seed: `spec`, then the targets — whole and line-numbered under
+--- `mode = "full"` (the default), or as a list of paths under
+--- `mode = "names"`.
+---
+--- FULL hands each target over as it is, absent when it does not exist yet. A
+--- target is not compacted: the caller wrote the spec and chose the targets,
+--- and one too big to hand over whole is a narrower target's job, not a lossy
+--- substitute made in this module. A seed that does not fit the window fails
+--- the run before its first beat (`failure_reason = "seed_overflow"`).
+---
+--- NAMES hands over the paths and nothing else; the model reads the parts it
+--- needs, in ranges, with the read tool. That is the only shape that runs at
+--- all when a target does not fit the window [measured 2026-09-14 in a
+--- sibling lane, on a 32k window: a 2,000-line target — about 25k tokens —
+--- ran and passed only as names]. It is also what the one published
+--- comparison prefers: a viewer-based agent measured whole-file seeding worst
+--- of its options (SWE-agent ACI, 12.7 against 18.0 for a 100-line viewer).
+--- `coding.run` defaults to names for that reason: every run in that lane has
+--- taken it since 2026-09-14, and full has no run behind it since. Here, the
+--- helper's `mode` left nil reads as `"full"` — the plain reading of "seed
+--- these files" — and the loop passes its choice explicitly.
 ---
 --- @param spec string
 --- @param targets table  absolute paths
---- @param opts table|nil  { read? }
+--- @param opts table|nil  { read?, mode? = "full" (default) | "names" }
 --- @return string seed
 function M.seed(spec, targets, opts)
     opts = opts or {}
+    if opts.mode ~= nil and not SEED_MODES[opts.mode] then
+        error('coding.seed: `mode` must be "full" or "names", got ' .. tostring(opts.mode), 2)
+    end
+    if opts.mode == "names" then
+        local out = spec
+            .. "\n\n## Target files (edit these; read the parts you need first — their content is not "
+            .. "included here)\n"
+        for _, path in ipairs(targets) do
+            out = out .. path .. "\n"
+        end
+        return out
+    end
     local read = opts.read
         or function(path)
             local f = io.open(path, "r")
@@ -383,15 +542,36 @@ function M.seed(spec, targets, opts)
     return out
 end
 
---- The system line, naming the two tools and how the run ends.
+--- The system line, naming the tools and how the run ends.
+---
+--- `edit_tool` is one name or several. The line each one gets is keyed off
+--- the TOOL rather than off how many there are: a `search_replace` gets the
+--- paragraph about copying a snippet verbatim, because that paragraph is
+--- about that tool, and any other edit tool is named with a pointer to its own
+--- description. So the default — one `search_replace` — reads exactly as it
+--- did, and a caller who swaps in `write` is not handed advice about a
+--- `search` field that tool does not have.
 ---
 --- @param read_tool string
---- @param edit_tool string
+--- @param edit_tool string|table  one edit tool's name, or an array of them
 --- @param done string|nil  "declare" (the default) | "plan"
 function M.system(read_tool, edit_tool, done)
     done = done or DEFAULT_DONE
     if not DONE_MODES[done] then
         error('coding.system: `done` must be "declare" or "plan", got ' .. tostring(done), 2)
+    end
+    local edit_tools = type(edit_tool) == "table" and edit_tool or { tostring(edit_tool) }
+    local edit_lines = {}
+    for _, name in ipairs(edit_tools) do
+        if name:match("search_replace$") then
+            edit_lines[#edit_lines + 1] = "- "
+                .. name
+                .. " changes it: `search` is a verbatim snippet of the CURRENT file, unique in it; `replace` is "
+                .. "the new text. Keep each search small (1-10 lines); split a big change into several edits. "
+                .. "`search_not_found` means you guessed the text: re-read that region and copy it exactly.\n"
+        else
+            edit_lines[#edit_lines + 1] = "- " .. name .. " changes it; its own description says what it takes.\n"
+        end
     end
     local ending
     if done == "plan" then
@@ -410,11 +590,7 @@ function M.system(read_tool, edit_tool, done)
         .. "- "
         .. read_tool
         .. " shows a file's current content (start_line / end_line for a slice of a large one).\n"
-        .. "- "
-        .. edit_tool
-        .. " changes it: `search` is a verbatim snippet of the CURRENT file, unique in it; `replace` is the new text. "
-        .. "Keep each search small (1-10 lines); split a big change into several edits. `search_not_found` means you "
-        .. "guessed the text: re-read that region and copy it exactly.\n"
+        .. table.concat(edit_lines)
         .. "- Every path must be one of the target files. Make the SMALLEST change that satisfies the spec.\n"
         .. ending
         .. "Old reads drop out of the conversation as you go; read a region, edit it at once, move on.\n"
@@ -456,6 +632,39 @@ function M.decide(mode, f)
         return plan.passed == plan.total
     end
     return true
+end
+
+--- The words a provider uses for a reply that stopped at the output limit
+--- rather than because the model was finished.
+---
+--- `max_tokens` is the canonical one: Anthropic says it itself, and the
+--- OpenAI dialect's `map_finish_reason` turns `length` into it
+--- (`llm_proto/openai.lua`). `length` is here beside it because a port whose
+--- parse hands the provider's own word through unmapped is a port this module
+--- has no business second-guessing, and reading one word too many costs
+--- nothing.
+local CUT_STOP_REASONS = { max_tokens = true, length = true }
+
+--- Whether a beat's answer stopped at the output limit.
+---
+--- Read off the answer the beat already handed back (`out.stop_reason`, the
+--- provider's own word, recorded on the `llm_response` as well), so the
+--- question costs no read of the log.
+---
+--- What it is for: such an answer is NOT the model saying it is done, and a
+--- tool call inside it may have been cut part-way through its arguments
+--- (`policy.require_args` is what catches that half). The loop says the fact
+--- back and goes on.
+---
+--- The server may not report it. vLLM answers `tool_calls` for a call it cut
+--- at the ceiling and llama.cpp answers `stop` for everything, so a false
+--- here means "nothing said it was cut", never "it was not". That is why the
+--- arguments are checked as well.
+---
+--- @param stop_reason string|nil  the beat answer's `stop_reason`
+--- @return boolean
+function M.cut_at_limit(stop_reason)
+    return type(stop_reason) == "string" and CUT_STOP_REASONS[stop_reason] == true
 end
 
 --- The `plan` tool's input, checked: a non-empty array of { step, check },
@@ -539,21 +748,26 @@ local function as_tool(spec)
     }
 end
 
---- Edits this beat applied, read off the log: a `tool_result` for the edit
---- tool whose result says ok.
+--- Edits this beat applied, read off the log: a `tool_result` for any of the
+--- edit tools whose result says ok.
+---
+--- Any of them, because which op applied the change is not what is being
+--- counted: an `append` that landed is as much an edit as a `search_replace`
+--- that landed, and a run handed both would otherwise have half its work
+--- read as no work at all — which is `no_edits` on a run that is editing.
 ---
 --- @param session table  the kernel session
 --- @param beat_id any  the beat to count, as `out.beat` names it
---- @param edit_name string  the edit tool's name
+--- @param edit_names table  the edit tools' names, as a set
 --- @return number applied
-local function edits_in(session, beat_id, edit_name)
+local function edits_in(session, beat_id, edit_names)
     local by_call, applied = {}, 0
     for _, ev in ipairs((session:events())) do
         -- The beat id is a label in the envelope (`meta.beat`), and an event
         -- need not carry `meta` at all.
         if ev.meta ~= nil and ev.meta.beat == beat_id then
             local data = type(ev.data) == "table" and ev.data or {}
-            if ev.kind == "tool_call" and data.name == edit_name then
+            if ev.kind == "tool_call" and edit_names[data.name] then
                 by_call[data.call_id] = true
             elseif ev.kind == "tool_result" and by_call[data.call_id] then
                 if type(data.result) == "table" and data.result.ok == true then
@@ -729,6 +943,14 @@ function M.config_of(opts, resolved)
         result_share = named(opts.result_share or DEFAULT_RESULT_SHARE, opts.result_share ~= nil),
         repeat_max = named(opts.repeat_max or DEFAULT_REPEAT_MAX, opts.repeat_max ~= nil),
         done = named(resolved.done, opts.done ~= nil),
+        -- The ops as the run resolved them — `{ read = <op>, edit = { <op> ... } }`,
+        -- the names handed to `std.fs.tool_specs` — rather than the shorthand
+        -- a caller may have written them in.
+        ops = named(resolved.ops, opts.ops ~= nil),
+        seed = named(resolved.seed, opts.seed ~= nil),
+        -- No default to name: absent, no stop point is sent at all, so the
+        -- entry reads as a `from` alone — like `store` and `check_timeout`.
+        call_reserve = named(opts.call_reserve, opts.call_reserve ~= nil),
         check_timeout = named(opts.check_timeout, opts.check_timeout ~= nil),
         repo = named(resolved.repo, opts.repo ~= nil),
         baseline = named(opts.baseline ~= false, opts.baseline ~= nil),
@@ -803,11 +1025,11 @@ end
 --- @param device table
 --- @param fits function|nil  policy.window's second return
 --- @param max_turns number
---- @param edit_name string  the edit tool's name
+--- @param edits table  the edit tools: { set = { <name> = true }, prose = <string> }
 --- @return table|nil answer  the last beat's `out`
 --- @return boolean declared  the answer asked for no tool: the model saying it is done
 --- @return number applied_here  edits this iteration landed
-local function run_iteration(st, s, device, fits, max_turns, edit_name)
+local function run_iteration(st, s, device, fits, max_turns, edits)
     local applied_here, answer, declared = 0, nil, false
     for turn = 1, max_turns do
         if fits then
@@ -838,13 +1060,16 @@ local function run_iteration(st, s, device, fits, max_turns, edit_name)
             return nil
         end
         answer = out
-        applied_here = applied_here + edits_in(s, answer.beat, edit_name)
+        applied_here = applied_here + edits_in(s, answer.beat, edits.set)
         local no_tools = not (answer.tools and #answer.tools > 0)
         if applied_here > 0 or no_tools then
             -- An answer with no tool call is the model saying it is done;
             -- whether the run is over is decided by the caller, against the
-            -- facts.
-            declared = no_tools
+            -- facts. Unless it is an answer that ran out of room: a reply the
+            -- server cut off stopped where it stopped, and where it stopped
+            -- is not a decision. It said nothing about being done, and what
+            -- it was in the middle of saying may have been a tool call.
+            declared = no_tools and not M.cut_at_limit(answer.stop_reason)
             break
         end
         if turn == 3 or turn == 6 then
@@ -852,7 +1077,7 @@ local function run_iteration(st, s, device, fits, max_turns, edit_name)
                 kind = "msg_user",
                 data = {
                     content = "You have been reading without editing; old reads are already gone. Apply an edit NOW with "
-                        .. edit_name
+                        .. edits.prose
                         .. " to the region you most recently read.",
                 },
             })
@@ -892,8 +1117,19 @@ local function check_opts(opts)
     if opts.done == "plan" and (type(opts.check_timeout) ~= "number" or opts.check_timeout < 1) then
         error('coding.run: `check_timeout` (seconds) is required when done = "plan"', 3)
     end
+    if opts.seed ~= nil and not SEED_MODES[opts.seed] then
+        error('coding.run: `seed` must be "full" or "names", got ' .. tostring(opts.seed), 3)
+    end
+    -- The shape of `ops`, here with the other opts rather than where the tools
+    -- are built: a tool set the caller mistyped is a refusal like any other,
+    -- and refusing it before the baseline verify means no command has run yet.
+    -- The value is resolved again where it is used; the function is pure.
+    M.ops_of(opts.ops)
     if opts.reserve ~= nil and not whole_at_least(opts.reserve, 1) then
         error("coding.run: `reserve` must be a whole number >= 1 (tokens), got " .. tostring(opts.reserve), 3)
+    end
+    if opts.call_reserve ~= nil and not whole_at_least(opts.call_reserve, 0) then
+        error("coding.run: `call_reserve` must be a whole number >= 0 (tokens), got " .. tostring(opts.call_reserve), 3)
     end
     if opts.strict ~= nil and type(opts.strict) ~= "boolean" then
         error("coding.run: `strict` must be a boolean, got " .. tostring(opts.strict), 3)
@@ -948,6 +1184,8 @@ function M._run_impl(opts)
     local done_mode = opts.done or DEFAULT_DONE
     local check_timeout = opts.check_timeout
     local verify_cmd = opts.verify
+    local ops = M.ops_of(opts.ops)
+    local seed_mode = opts.seed or DEFAULT_SEED
 
     -- The third tripwire, the window: the conf declares it, or the port's
     -- profile asks its server for it. `policy.window` raises for this too,
@@ -964,13 +1202,34 @@ function M._run_impl(opts)
     end
 
     -- Tools: std.fs, path-locked to the targets, declared as the adapter
-    -- takes them, then wrapped by the two caps. repeat_cap needs the
-    -- session, so it is bound inside the session below.
-    local read_spec = std.fs.tool_specs({ allowed = { "read" }, path_lock = targets })[1]
-    local edit_spec = std.fs.tool_specs({ allowed = { "search_replace" }, path_lock = targets })[1]
+    -- takes them, then wrapped by the caps. repeat_cap needs the session, so
+    -- it is bound inside the session below.
+    --
+    -- Which ops those are is the caller's (`ops`), and an op `std.fs` does not
+    -- have is refused here, by name: `tool_specs` answers only for the ops it
+    -- knows and says nothing about the rest, so a typo would otherwise be a
+    -- tool quietly missing from the model's hand.
+    local function fs_spec(op)
+        local built = std.fs.tool_specs({ allowed = { op }, path_lock = targets })[1]
+        if built == nil then
+            error("coding.run: `ops` names '" .. tostring(op) .. "', which is not a std.fs op", 3)
+        end
+        return built
+    end
+    local read_spec = fs_spec(ops.read)
+    local edit_specs, edit_names, edit_set = {}, {}, {}
+    for i, op in ipairs(ops.edit) do
+        edit_specs[i] = fs_spec(op)
+        edit_names[i] = edit_specs[i].name
+        edit_set[edit_specs[i].name] = true
+    end
+    -- The edit tools as one phrase, for the nudge that names them.
+    local edit_prose = #edit_names == 1 and edit_names[1]
+        or (table.concat(edit_names, ", ", 1, #edit_names - 1) .. " or " .. edit_names[#edit_names])
+    local edits = { set = edit_set, prose = edit_prose }
 
-    local seed = M.seed(opts.spec, targets)
-    local system = opts.system or M.system(read_spec.name, edit_spec.name, done_mode)
+    local seed = M.seed(opts.spec, targets, { mode = seed_mode })
+    local system = opts.system or M.system(read_spec.name, edit_names, done_mode)
 
     -- Everything the run holds, in one table. The first two are fixed at the
     -- start and never written again — `result_of` reads them back out of here
@@ -982,6 +1241,8 @@ function M._run_impl(opts)
             iters = max_iters,
             turns = max_turns,
             done = done_mode,
+            ops = ops,
+            seed = seed_mode,
             repo = repo,
             system = system,
             targets = targets,
@@ -1008,7 +1269,10 @@ function M._run_impl(opts)
     -- tool is not an edit and does not reset `repeat_cap` — filing a plan is
     -- not progress on the files. Its handler is the one place a tool reaches
     -- the loop's state, and it reaches exactly one field of it.
-    local tool_list = { as_tool(read_spec), as_tool(edit_spec) }
+    local tool_list = { as_tool(read_spec) }
+    for _, spec in ipairs(edit_specs) do
+        tool_list[#tool_list + 1] = as_tool(spec)
+    end
     if done_mode == "plan" then
         tool_list[#tool_list + 1] = {
             name = "plan",
@@ -1048,7 +1312,16 @@ function M._run_impl(opts)
     end
     local raw_tools = adapter.tools(tool_list)
     local size_cap = policy.result_cap({ port = port, conf = conf, share = opts.result_share or DEFAULT_RESULT_SHARE })
-    local repeat_cap = policy.repeat_cap({ max = opts.repeat_max or DEFAULT_REPEAT_MAX, resets = { edit_spec.name } })
+    -- Every edit tool resets the count, not just the first: what makes an old
+    -- read new again is the file having changed, and any of them changes it.
+    local repeat_cap = policy.repeat_cap({ max = opts.repeat_max or DEFAULT_REPEAT_MAX, resets = edit_names })
+    -- Outermost of the three, and it is the order that makes sense rather
+    -- than the one that happens to work: a call that arrived without its
+    -- arguments is not a repeat of anything — the arguments are what
+    -- `repeat_cap` compares — and it has no result to measure. So it is
+    -- answered before either cap looks at it. The caps are unaffected either
+    -- way: `repeat_cap` counts off the log rather than off its own wrapper.
+    local args_present = policy.require_args()
 
     -- Verify, as a verdict: `timeout` hands the seconds to the run, `changed`
     -- withholds a green until an edit has landed.
@@ -1071,12 +1344,27 @@ function M._run_impl(opts)
         st.session_id = tostring(s:id())
         local fold, fits =
             policy.window({ fit = { port = port, conf = conf, reserve = opts.reserve }, keep_seed = true })
+        -- The note about the beat that failed, and — when the caller named a
+        -- `call_reserve` — where this beat's reasoning has to stop for the
+        -- call after it to fit. The stop point is computed on the request the
+        -- fold has just built, so it goes after `carry`, which adds to that
+        -- request as well.
+        local filters = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) }
+        if opts.call_reserve ~= nil then
+            filters[#filters + 1] = policy.thinking_cap({
+                port = port,
+                conf = conf,
+                reserve = opts.reserve or 0,
+                call_reserve = opts.call_reserve,
+                budget = type(conf.thinking) == "table" and conf.thinking.budget_tokens or nil,
+            })
+        end
         local device = kernel.device({
             llm = port:open(conf),
             system = system,
-            tools = repeat_cap(s)(size_cap(raw_tools)),
+            tools = args_present(repeat_cap(s)(size_cap(raw_tools))),
             fold = fold,
-            filters = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) },
+            filters = filters,
         })
         -- The state before any edit: the verify once, recorded like the ones
         -- the iterations make (under no beat), so the record has the run's
@@ -1106,7 +1394,7 @@ function M._run_impl(opts)
         s:append({ kind = "config", data = st.config })
 
         while true do
-            local answer, declared, applied_here = run_iteration(st, s, device, fits, max_turns, edit_spec.name)
+            local answer, declared, applied_here = run_iteration(st, s, device, fits, max_turns, edits)
             if answer == nil then
                 break
             end
@@ -1189,6 +1477,15 @@ function M._run_impl(opts)
                 else
                     parts[#parts + 1] = "<harness>plan: none filed yet</harness>"
                 end
+            end
+            if M.cut_at_limit(answer.stop_reason) then
+                -- Said as a fact, like everything else that goes back: the
+                -- model cannot see that its own reply was cut, and without
+                -- this the next turn reads a conversation in which it fell
+                -- silent for no reason — or in which a tool answered
+                -- `argument_missing` to a call it believes it sent whole.
+                parts[#parts + 1] = "<harness>the reply stopped at the output limit; the tool call, if any, "
+                    .. "never arrived whole</harness>"
             end
             if declared then
                 -- The model said it was done and the facts above say otherwise;

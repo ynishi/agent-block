@@ -15,7 +15,7 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The nine, and where each one plugs in
+--- The eleven, and where each one plugs in
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
 ---                                         fit the model's window
@@ -35,11 +35,17 @@
 ---     policy.repeat_cap  -> `tools`       the same call, again, with nothing
 ---                                         changed in between, is refused
 ---                                         past a count
+---     policy.require_args-> `tools`       a call whose required arguments did
+---                                         not all arrive is refused before
+---                                         the handler runs
+---     policy.thinking_cap-> a `filter`    where the reasoning has to stop for
+---                                         the tool call after it to still fit
 ---     policy.verdict     -> a check       the loop runs it after every beat:
 ---                                         is the thing outside the
 ---                                         conversation true yet?
 ---
----   `window`, `carry`, `tokens`, `result_cap` and `repeat_cap` are device
+---   `window`, `carry`, `tokens`, `result_cap`, `repeat_cap`, `require_args`
+---   and `thinking_cap` are device
 ---   fields (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
 ---   `stagnation`, `retry`, `escalate` and `verdict` are the loop's own and
 ---   the kernel never sees them. That
@@ -129,6 +135,10 @@
 ---     escalate    reads NO log: the `Outcome` it is given
 ---     repeat_cap  reads the log — `session:events()`, through the binder,
 ---                 on every call it is asked to answer
+---     require_args reads NO log: the arguments it is handed, against the
+---                 `required` list the tool already declares
+---     thinking_cap reads NO log: the request it is handed, counted by the
+---                 Port, against the window the Port declares
 ---     verdict     reads the log — `session:events()`, per call, and only
 ---                 when `timeout` is a table: what the checks took are gaps
 ---                 between the kernel's stamps, read by the `measure` the
@@ -633,6 +643,29 @@ local REPEAT_CAP_OPTS, REPEAT_CAP_ARG = opts_contract({
         :is_optional(),
 })
 
+--- What `policy.thinking_cap` is configured with. Two numbers of tokens and
+--- the Port that knows the window; `budget` is the caller's own ceiling on
+--- the reasoning, when it has one.
+local THINKING_CAP_OPTS, THINKING_CAP_ARG = opts_contract({
+    port = T.table:describe("an LLM Port: profile(conf) for the window, count(request, conf) for the request"),
+    conf = T.table:describe("the conf the port is opened with"):is_optional(),
+    reserve = T.number
+        :describe(
+            "tokens the fold holds back for the reply — the same number window{ fit.reserve } was given; default 0"
+        )
+        :is_optional(),
+    call_reserve = T.number:describe("tokens kept out of the reasoning for the tool call that follows it"),
+    budget = T.number:describe("the most reasoning this run may take, whatever the room says"):is_optional(),
+})
+
+--- What `policy.require_args` is configured with: nothing. The list of
+--- arguments a call must carry is the tool's own (`input_schema.required`),
+--- so there is no threshold here to name and no model-specific number to
+--- tune. The contract is declared all the same — an option passed to it is a
+--- caller expecting a knob this policy does not have, and saying so is worth
+--- more than accepting it silently.
+local REQUIRE_ARGS_OPTS, REQUIRE_ARGS_ARG = opts_contract({})
+
 --- What `policy.carry` is configured with. `failed` is the caller's reading of
 --- a tool pair, for the failures the kernel's `ok` flag cannot see.
 local CARRY_OPTS, CARRY_ARG = opts_contract({
@@ -729,6 +762,8 @@ local STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
 M.shapes = {
     window_opts = WINDOW_OPTS,
     carry_opts = CARRY_OPTS,
+    require_args_opts = REQUIRE_ARGS_OPTS,
+    thinking_cap_opts = THINKING_CAP_OPTS,
     stagnation_opts = STAGNATION_OPTS,
     retry_opts = RETRY_OPTS,
     escalate_opts = ESCALATE_OPTS,
@@ -1884,6 +1919,256 @@ function M.result_cap(opts)
 end
 
 -- ============================================================
+-- thinking_cap — where the reasoning has to stop for the call to fit
+-- ============================================================
+
+--- Build a `filter` that sends the reasoning's stop point with every request.
+---
+---     local device = knl.device({
+---         llm = port:open(conf),
+---         filters = {
+---             policy.carry({ max_bytes = 512 })(session),
+---             policy.thinking_cap({ port = port, conf = conf, reserve = 6144, call_reserve = 3072 }),
+---         },
+---     })
+---
+--- THE MODEL CANNOT SEE ITS ROOM, and its reasoning comes out of the same
+--- allowance as the answer. A beat whose prompt has grown has less left for
+--- both, and nothing in the conversation says so; the model reasons at the
+--- length it would have reasoned at on an empty window, fills what is left,
+--- and the tool call it was about to make never gets written
+--- [measured 2026-09-13 in a sibling lane: a prompt of 24,984 tokens in a 32k
+---  window, 7,121 of them spent thinking, and the call that followed arrived
+---  as `{}`]. This filter computes where the reasoning has to stop for the
+--- call to still fit, and sends that number with the request.
+---
+---     room = window - port:count(request, conf) - reserve
+---     T    = min(room - call_reserve, budget)
+---
+--- `reserve` is the same number `window{ fit.reserve }` was given — what the
+--- fold already held back for the reply — so what is left over is the reply's
+--- room, and `call_reserve` is the part of it the tool call needs. When `T` is
+--- under one token the request goes through untouched: there is no stop point
+--- worth sending, and saying "stop after 0 tokens" is not one.
+---
+--- It reads no log and holds nothing between beats: the room is derived from
+--- the request it is handed, every time, through the Port's own count — which
+--- the fold has already asked for the same request, so the answer is cached
+--- and asking costs nothing.
+---
+--- WHERE IT REACHES THE WIRE. `request.thinking.budget_tokens` is a
+--- per-request budget, and vLLM is the dialect that takes one
+--- (`thinking_token_budget`); on llama.cpp and Ollama the equivalent is a
+--- server flag, and `llm_proto.openai` logs a warning and sends nothing.
+--- Anthropic deprecated its own `budget_tokens` in 4.6. So this is opt-in and
+--- does nothing on a wire with nowhere to put it.
+---
+--- NO OTHER HARNESS SIZES REASONING PER REQUEST. Claude Code, Codex,
+--- OpenHands, Aider, Cline, SWE-agent and mini-swe-agent all fix an effort for
+--- the run; what varies with the remaining room is done provider-side where it
+--- is done at all. The evidence for doing it here is a sibling lane's
+--- [measured 2026-09-14: on a 32k window, the beats where the stop point fired
+---  — the model thinking exactly to the budget — still delivered their tool
+---  call, where the unbounded beats had filled the window and delivered
+---  nothing].
+---
+--- The request is not changed in place: what comes back is a copy with
+--- `thinking` on it, merged over the conf's own thinking keys so an `effort`
+--- or a `kwarg` the caller set is still there. The request's own `thinking`
+--- wins over the conf's where both reach the provider — `knl_adapter`'s build
+--- merges the conf and then the request, field by field.
+---
+--- @param opts table  { port, conf?, reserve?, call_reserve, budget? }
+--- @return function filter  fn(request) -> request
+function M.thinking_cap(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.thinking_cap: opts must be a table", 2)
+    end
+    only(opts, { port = true, conf = true, reserve = true, call_reserve = true, budget = true }, "policy.thinking_cap")
+    if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
+        error("policy.thinking_cap: port must answer count(request, conf) and profile(conf)", 2)
+    end
+    if opts.conf ~= nil and type(opts.conf) ~= "table" then
+        error("policy.thinking_cap: conf must be a table when given", 2)
+    end
+    if opts.reserve ~= nil and not whole_at_least(opts.reserve, 0) then
+        error("policy.thinking_cap: reserve must be a whole number >= 0 (tokens), got " .. tostring(opts.reserve), 2)
+    end
+    -- Required, and the one opt that is: a cap with nothing kept back for the
+    -- call is a cap that lets the reasoning run to the end of the window,
+    -- which is what happens without this policy at all.
+    if not whole_at_least(opts.call_reserve, 0) then
+        error(
+            "policy.thinking_cap: call_reserve must be a whole number >= 0 (tokens kept out of the reasoning "
+                .. "for the call that follows it), got "
+                .. tostring(opts.call_reserve),
+            2
+        )
+    end
+    if opts.budget ~= nil and not whole_at_least(opts.budget, 1) then
+        error("policy.thinking_cap: budget must be a whole number >= 1 (tokens), got " .. tostring(opts.budget), 2)
+    end
+    shape.assert_dev(opts, THINKING_CAP_OPTS, "policy.thinking_cap opts")
+
+    local port, conf = opts.port, opts.conf
+    local reserve, call_reserve, budget = opts.reserve or 0, opts.call_reserve, opts.budget
+
+    return function(request)
+        local profile = port:profile(conf)
+        local window = type(profile) == "table" and profile.context_window or nil
+        if not whole_at_least(window, 1) then
+            error(
+                "policy.thinking_cap: the port's profile names no context_window; declare it in the conf the "
+                    .. "port is opened with (context_window = <tokens>) or on the port",
+                0
+            )
+        end
+        local used = port:count(request, conf)
+        if type(used) ~= "number" then
+            error("policy.thinking_cap: port:count must answer a number, got " .. tostring(used), 0)
+        end
+        local stop = math.floor(window - used - reserve - call_reserve)
+        if budget and budget < stop then
+            stop = budget
+        end
+        if stop < 1 then
+            -- Nothing sensible to send. The request goes as it is and the
+            -- server's own default decides, which is the same thing that
+            -- happens on every beat without this filter.
+            return request
+        end
+        local thinking = {}
+        -- Read out rather than `and`/`or`ed: `thinking = false` is a value
+        -- this has to carry, and the idiom would drop it for a nil.
+        local declared = nil
+        if type(conf) == "table" then
+            declared = conf.thinking
+        end
+        if type(declared) == "table" then
+            for key, value in pairs(declared) do
+                thinking[key] = value
+            end
+        elseif type(declared) == "boolean" then
+            -- `thinking = false` is reasoning turned off, and a budget must
+            -- not turn it back on: the switch is carried across as it stands.
+            thinking.enabled = declared
+        end
+        thinking.budget_tokens = stop
+        local out = {}
+        for key, value in pairs(request) do
+            out[key] = value
+        end
+        out.thinking = thinking
+        return out
+    end
+end
+
+-- ============================================================
+-- require_args — a call that arrived without its arguments is refused
+-- ============================================================
+
+--- Build a wrapper over a device's `tools` map that refuses a call missing
+--- one of the arguments its own schema declares required.
+---
+---     tools = policy.require_args()(
+---         knl_adapter.tools({ read_spec, edit_spec })
+---     )
+---
+--- WHAT THIS IS ABOUT. A reply that runs out of room stops wherever it had
+--- got to, and where it had got to may be the middle of a tool call's
+--- arguments. The call still reaches the tool — with a `path` and no
+--- `content`, with an `edits` array that was never opened — and the handler
+--- then answers whatever its own vocabulary has for the field it found
+--- missing, which says nothing about the reply having been cut
+--- [measured 2026-09-17 in a sibling lane: five `fs_write` calls arrived with
+---  no `content`, and on three of them nothing told the model the call had
+---  been cut, so it sent the same shape again. The same accident is recorded
+---  in this tree's own `fs_tools`, as `path_missing`].
+---
+--- THE CHECK IS ON THE ARGUMENTS, not on what the server said. The wire has
+--- a field for exactly this — `finish_reason` / `stop_reason` — and the
+--- servers do not fill it reliably: vLLM reports a call cut at the output
+--- ceiling as a whole one (`tool_calls`), llama.cpp answers `stop` for
+--- everything. So the fact is read where it cannot be misreported: the
+--- arguments that arrived, against the list the tool declares. The two are a
+--- pair rather than alternatives — a consumer that also reads `stop_reason`
+--- learns it about a beat with no tool call at all, which this cannot see.
+---
+--- NOTHING IS RETRIED AND NOTHING IS REPAIRED. The refusal is a return value
+--- the model reads, `{ ok = false, reason = "argument_missing", missing }`,
+--- and the next move is the model's. Re-sending the same request on the
+--- harness's own initiative is the failure mode the other harnesses report
+--- (Cline: a required-argument check followed by the same prompt, looping);
+--- guessing the missing argument is worse, and vLLM's own position on a
+--- truncated call is that it will not be inferred from the JSON or repaired.
+---
+--- A tool whose schema declares no `required` list is handed back untouched —
+--- the same entry, not a copy of it: there is nothing to check, so there is
+--- no reason for a call to it to pass through one more function.
+---
+--- @param opts table|nil  no options; passing one is refused by name
+--- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
+function M.require_args(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.require_args: opts must be a table", 2)
+    end
+    only(opts, {}, "policy.require_args")
+    shape.assert_dev(opts, REQUIRE_ARGS_OPTS, "policy.require_args opts")
+
+    return function(tools)
+        if type(tools) ~= "table" then
+            error("policy.require_args: tools must be the device's map of name -> entry", 2)
+        end
+        local out = {}
+        for name, entry in pairs(tools) do
+            if type(entry) ~= "table" or type(entry.handler) ~= "function" then
+                error("policy.require_args: tool '" .. tostring(name) .. "' has no handler", 2)
+            end
+            local schema = entry.input_schema
+            local declared = type(schema) == "table" and schema.required or nil
+            local required = {}
+            if type(declared) == "table" then
+                for _, key in ipairs(declared) do
+                    if type(key) == "string" then
+                        required[#required + 1] = key
+                    end
+                end
+            end
+            if #required == 0 then
+                out[name] = entry
+            else
+                local checked = {}
+                for key, value in pairs(entry) do
+                    checked[key] = value
+                end
+                local handler = entry.handler
+                checked.handler = function(args)
+                    local given = type(args) == "table" and args or {}
+                    for _, key in ipairs(required) do
+                        if given[key] == nil then
+                            return {
+                                ok = false,
+                                reason = "argument_missing",
+                                missing = key,
+                                error = key
+                                    .. " never arrived. A reply that runs out of room stops part-way through "
+                                    .. "its arguments, so the call reaches the tool without them. Send a "
+                                    .. "smaller call.",
+                            }
+                        end
+                    end
+                    return handler(args)
+                end
+                out[name] = checked
+            end
+        end
+        return out
+    end
+end
+
+-- ============================================================
 -- carry — one bounded note about the beat that failed
 -- ============================================================
 
@@ -2594,6 +2879,26 @@ M.shapes.api = {
             wrap = {
                 args = { arg_of(T.table, "tools (the device's map of name -> entry)") },
                 returns = "table — the same map, each handler refusing a repeated call",
+            },
+        },
+    },
+    thinking_cap = {
+        args = { arg_of(THINKING_CAP_ARG, "opts") },
+        returns = "filter — fn(request) -> request",
+        members = {
+            filter = {
+                args = { arg_of(kernel.shapes.request, "request") },
+                returns = kernel.shapes.request,
+            },
+        },
+    },
+    require_args = {
+        args = { arg_of(REQUIRE_ARGS_ARG, "opts") },
+        returns = "bind — fn(tools) -> tools",
+        members = {
+            bind = {
+                args = { arg_of(T.table, "tools (the device's map of name -> entry)") },
+                returns = "table — the same map, each handler holding its call to the schema's `required`",
             },
         },
     },

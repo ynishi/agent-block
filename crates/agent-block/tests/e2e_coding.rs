@@ -2,9 +2,11 @@
 //!
 //! The specs in `blocks/coding/spec/` cover the module's pure parts — what the
 //! seed is made of, what the opts refuse, what `decide` decides. Nothing ran
-//! the loop itself: the four tests here do, through the real binary, the real
+//! the loop itself: the tests here do, through the real binary, the real
 //! bridges (`sh.exec` runs the verify, `std.fs` applies the edit) and a mock
-//! that answers whatever the test scripted for each call.
+//! that answers whatever the test scripted for each call and records every
+//! request it was sent — what the loop SAYS BACK about a beat is on the wire
+//! and nowhere else.
 //!
 //! The repository is a temporary directory holding one file, and the verify is
 //! a fixed-string grep over it — so a test says green or red for exactly one
@@ -66,13 +68,34 @@ fn answer_turn(text: &str) -> Value {
     json!({ "role": "assistant", "content": text, "tool_calls": null })
 }
 
-/// Run the fixture against a scripted mock and return `(stdout, chat_calls)`.
+/// What one run left behind: what the fixture printed, how many beats reached
+/// the model, and every chat request body in the order it was sent.
+struct Ran {
+    stdout: String,
+    calls: usize,
+    bodies: Vec<Value>,
+}
+
+impl Ran {
+    /// Whether any request body after the first carries `text`.
+    ///
+    /// After the first, because the first is the seed alone: everything the
+    /// loop says back about a beat is by definition in a later one.
+    fn a_later_request_says(&self, text: &str) -> bool {
+        self.bodies
+            .iter()
+            .skip(1)
+            .any(|body| body.to_string().contains(text))
+    }
+}
+
+/// Run the fixture against a scripted mock and return what the run left.
 ///
 /// `env` carries the case's own variables (`CODING_DONE_TEST` and the like);
 /// the repository, the base url and a private `AGENT_BLOCK_HOME` are set here
 /// because every case needs them and needs them the same.
-async fn run_fixture(script: Vec<Value>, repo: &str, env: &[(&str, &str)]) -> (String, usize) {
-    let (base_url, call_count, ct) =
+async fn run_fixture(script: Vec<Value>, repo: &str, env: &[(&str, &str)]) -> Ran {
+    let (base_url, call_count, bodies, ct) =
         common::openai_mock::spawn_scripted_openai_mock(script, "mock").await;
     // Give the server a moment to start accepting connections.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -100,8 +123,16 @@ async fn run_fixture(script: Vec<Value>, repo: &str, env: &[(&str, &str)]) -> (S
     .expect("subprocess task should not panic");
 
     let calls = call_count.load(Ordering::SeqCst);
+    let bodies = bodies
+        .lock()
+        .expect("the recorded bodies are not poisoned")
+        .clone();
     ct.cancel();
-    (stdout, calls)
+    Ran {
+        stdout,
+        calls,
+        bodies,
+    }
 }
 
 /// Assert `stdout` carries the marker line `line`.
@@ -128,19 +159,19 @@ async fn coding_run_converges_when_the_model_declares_on_a_green_verify() {
         answer_turn("Done: double returns n * 2."),
     ];
 
-    let (stdout, calls) = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
+    let ran = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
 
-    says(&stdout, "CODING_MOCK_DONE");
-    says(&stdout, "ok=true");
-    says(&stdout, "iters=2");
-    says(&stdout, "failure_reason=nil");
-    says(&stdout, "done=declare");
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "iters=2");
+    says(&ran.stdout, "failure_reason=nil");
+    says(&ran.stdout, "done=declare");
     // The repository was red before the first beat, which is the fact the
     // baseline verify exists to record.
-    says(&stdout, "baseline_ok=false");
-    says(&stdout, "config.values.iters.from=caller");
-    says(&stdout, "config.values.context_window.from=caller");
-    assert_eq!(calls, 2, "one beat per turn: the edit, then the answer");
+    says(&ran.stdout, "baseline_ok=false");
+    says(&ran.stdout, "config.values.iters.from=caller");
+    says(&ran.stdout, "config.values.context_window.from=caller");
+    assert_eq!(ran.calls, 2, "one beat per turn: the edit, then the answer");
 
     // The edit landed on disk, which is the only place it could have.
     let after = std::fs::read_to_string(&target).expect("read the target back");
@@ -166,16 +197,16 @@ async fn coding_run_does_not_end_on_a_green_verify_while_tools_are_still_called(
         answer_turn("Checked the file; done."),
     ];
 
-    let (stdout, calls) = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
+    let ran = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
 
-    says(&stdout, "CODING_MOCK_DONE");
-    says(&stdout, "ok=true");
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
     // Iteration 1 ends on the edit; iteration 2 spends a turn on the read and
     // declares on the next one, so the extra beat costs no extra iteration.
-    says(&stdout, "iters=2");
-    says(&stdout, "done=declare");
+    says(&ran.stdout, "iters=2");
+    says(&ran.stdout, "done=declare");
     assert_eq!(
-        calls, 3,
+        ran.calls, 3,
         "the read is a beat of its own: the run did not end on the green verify that preceded it"
     );
 }
@@ -200,18 +231,226 @@ async fn coding_run_in_plan_mode_ends_when_every_filed_check_passes() {
     );
     let script = vec![plan, edit_turn(&target), answer_turn("Plan done.")];
 
-    let (stdout, calls) = run_fixture(
+    let ran = run_fixture(
         script,
         &dir.path().to_string_lossy(),
         &[("CODING_DONE_TEST", "plan")],
     )
     .await;
 
-    says(&stdout, "CODING_MOCK_DONE");
-    says(&stdout, "ok=true");
-    says(&stdout, "done=plan");
-    says(&stdout, "plan.total=2 plan.passed=2 plan.filed=true");
-    assert_eq!(calls, 3, "the plan, the edit, the answer");
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "done=plan");
+    says(&ran.stdout, "plan.total=2 plan.passed=2 plan.filed=true");
+    assert_eq!(ran.calls, 3, "the plan, the edit, the answer");
+}
+
+/// A call that arrived without one of its required arguments is refused by
+/// name, and the run goes on.
+///
+/// The first turn asks for an edit with a `path` and no `edits` — the shape a
+/// reply cut at the output limit leaves behind, and the one the provider
+/// reports as a whole call. `policy.require_args` answers it
+/// `argument_missing` before the tool runs, which is what the next request
+/// carries; the model then sends the edit whole and declares.
+#[tokio::test]
+async fn coding_run_refuses_a_tool_call_whose_required_argument_never_arrived() {
+    let (dir, target) = make_repo();
+    let cut_edit = tool_call(
+        "call_edit_cut",
+        "fs_search_replace",
+        json!({ "path": target }),
+    );
+    let script = vec![cut_edit, edit_turn(&target), answer_turn("Sent it whole.")];
+
+    let ran = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    assert!(
+        ran.a_later_request_says("argument_missing"),
+        "the refusal should reach the model as the tool's answer; the requests were:\n{:#?}",
+        ran.bodies
+    );
+    assert!(
+        ran.a_later_request_says("never arrived"),
+        "the refusal should say why a whole-looking call can arrive without its arguments"
+    );
+
+    // The run carried on to the edit it was after.
+    let after = std::fs::read_to_string(&target).expect("read the target back");
+    assert!(
+        after.contains(LIB_AFTER_LINE),
+        "the edit that followed the refused call should be in the file; it holds:\n{after}"
+    );
+}
+
+/// A reply the server cut at the output limit does not end the run, and the
+/// next request says so.
+///
+/// The first turn answers with no tool call and `finish_reason = "length"`:
+/// that is not the model saying it is done, so `declare` does not fire on it.
+/// The loop states the fact and goes on to the edit and the real declaration.
+#[tokio::test]
+async fn coding_run_does_not_take_a_cut_reply_as_the_model_declaring() {
+    let (dir, target) = make_repo();
+    let mut cut = answer_turn("I will now edit the file by");
+    cut["finish_reason"] = json!("length");
+    let script = vec![cut, edit_turn(&target), answer_turn("Done.")];
+
+    let ran = run_fixture(script, &dir.path().to_string_lossy(), &[]).await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    // The cut reply cost an iteration of its own: it neither edited nor ended
+    // the run, so the edit and the declaration are the two that follow.
+    says(&ran.stdout, "iters=3");
+    assert_eq!(ran.calls, 3, "the cut reply, the edit, the answer");
+    assert!(
+        ran.a_later_request_says("the reply stopped at the output limit"),
+        "the next request should carry the fact; the requests were:\n{:#?}",
+        ran.bodies
+    );
+}
+
+/// `ops`: a file written in two calls — `write` for the first part, `append`
+/// for the rest.
+///
+/// The verify greps for `return n * 2`, and the first call deliberately stops
+/// one character short of it: nothing is green until the append has landed. So
+/// this says that both ops were handed over, that both are path-locked to the
+/// target, and that both count as edits — an append that did not count would
+/// leave the run reading its second iteration as no edit at all.
+#[tokio::test]
+async fn coding_run_writes_a_file_in_two_calls_when_ops_names_write_and_append() {
+    let (dir, target) = make_repo();
+    // Ends mid-expression: `return n * ` does not match the verify.
+    let first_half = "local M = {}\n\nfunction M.double(n)\n    return n * ";
+    let script = vec![
+        tool_call(
+            "call_write_1",
+            "fs_write",
+            json!({ "path": target, "content": first_half }),
+        ),
+        tool_call(
+            "call_append_1",
+            "fs_append",
+            json!({ "path": target, "content": "2\nend\n\nreturn M\n" }),
+        ),
+        answer_turn("Written in two parts."),
+    ];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[("CODING_EDIT_OPS_TEST", "write,append")],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    // One iteration per edit — each ends the turn loop the moment it lands —
+    // and the declaration in the third.
+    says(&ran.stdout, "iters=3");
+    assert_eq!(ran.calls, 3, "the write, the append, the answer");
+
+    let after = std::fs::read_to_string(&target).expect("read the target back");
+    assert_eq!(
+        after, "local M = {}\n\nfunction M.double(n)\n    return n * 2\nend\n\nreturn M\n",
+        "the two calls should have written the whole file between them"
+    );
+}
+
+/// `seed = "names"`: the targets go in as paths, and the model reads what it
+/// needs.
+///
+/// The first request is the whole of the evidence for the seed — it is the
+/// seed and nothing else — so it is asserted directly: the target's path is
+/// there and the target's content is not. The run then reads the file, edits
+/// it and declares, which is the point of the shape: nothing is lost, it is
+/// fetched a range at a time.
+#[tokio::test]
+async fn coding_run_seeds_the_targets_by_name_and_lets_the_model_read_them() {
+    let (dir, target) = make_repo();
+    let script = vec![
+        tool_call("call_read_1", "fs_read", json!({ "path": target })),
+        edit_turn(&target),
+        answer_turn("Read it, edited it."),
+    ];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[("CODING_SEED_TEST", "names")],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+
+    let first = ran.bodies.first().expect("a first request").to_string();
+    assert!(
+        first.contains("Target files"),
+        "the seed should list the targets; the first request was:\n{first}"
+    );
+    assert!(
+        first.contains(target.trim_start_matches('/')),
+        "the seed should name the target's path; the first request was:\n{first}"
+    );
+    assert!(
+        !first.contains("function M.double"),
+        "the seed should carry no line of the target; the first request was:\n{first}"
+    );
+
+    // The model read the file and the edit landed all the same.
+    let after = std::fs::read_to_string(&target).expect("read the target back");
+    assert!(
+        after.contains(LIB_AFTER_LINE),
+        "the edit should be in the file; it holds:\n{after}"
+    );
+}
+
+/// `call_reserve`: every request carries the point its reasoning has to stop
+/// at for the tool call after it to fit.
+///
+/// The mock's `/tokenize` answers a fixed count and its model card a fixed
+/// window, so the number is arithmetic rather than a guess: the window, less
+/// what the request costs, less the fold's reserve, less what is kept for the
+/// call. The conf names the vllm dialect and asks for reasoning, which is what
+/// puts `thinking_token_budget` on the wire at all.
+#[tokio::test]
+async fn coding_run_sends_the_reasonings_stop_point_when_call_reserve_is_named() {
+    let (dir, target) = make_repo();
+    let script = vec![
+        edit_turn(&target),
+        answer_turn("Done: double returns n * 2."),
+    ];
+
+    // The mock's own numbers (tests/common/openai_mock.rs) and the fixture's.
+    const WINDOW: i64 = 32768;
+    const COUNTED: i64 = 128;
+    const RESERVE: i64 = 1024;
+    const CALL_RESERVE: i64 = 512;
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[("CODING_CALL_RESERVE_TEST", &CALL_RESERVE.to_string())],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+
+    let expected = WINDOW - COUNTED - RESERVE - CALL_RESERVE;
+    for (n, body) in ran.bodies.iter().enumerate() {
+        assert_eq!(
+            body["thinking_token_budget"].as_i64(),
+            Some(expected),
+            "request {n} should carry the stop point {expected}; it was:\n{body:#?}"
+        );
+    }
+    assert!(!ran.bodies.is_empty(), "the run should have sent requests");
 }
 
 /// The tripwire: neither `llm.conf.max_tokens` nor `reserve` names the room
@@ -224,14 +463,14 @@ async fn coding_run_refuses_when_the_replys_room_is_not_named() {
     let (dir, _target) = make_repo();
     let script = vec![answer_turn("never reached")];
 
-    let (stdout, calls) = run_fixture(
+    let ran = run_fixture(
         script,
         &dir.path().to_string_lossy(),
         &[("CODING_OMIT_RESERVE", "1")],
     )
     .await;
 
-    says(&stdout, "CODING_MOCK_REFUSED");
-    says(&stdout, "the reply's room is not named");
-    assert_eq!(calls, 0, "the refusal comes before any model call");
+    says(&ran.stdout, "CODING_MOCK_REFUSED");
+    says(&ran.stdout, "the reply's room is not named");
+    assert_eq!(ran.calls, 0, "the refusal comes before any model call");
 }
