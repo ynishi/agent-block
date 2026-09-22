@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.split({ port, conf?, reserve?, used? })` hands the window's split
+  back as a value: `{ window, max_output, limit, held }` — the profile's
+  window and the wire's cap (0 for none), the most a request may cost, and
+  what `reserve` held back beyond the cap — with `room` beside them when
+  `used` names what a request costs: the reply's side, `min(window − used,
+  max_output)`. They are the same readings `policy.window`, `result_cap` and
+  `thinking_cap` make for themselves, off the same profile through the same
+  three functions, so a caller can log the numbers a run is sized by, check
+  a conf before opening a session, or size something of its own against the
+  split rather than a second guess at it. A reading, not a policy: it plugs
+  into no seam and changes nothing by being called. The shape is
+  `policy.shapes.split`.
+
 - `policy.thinking_cap({ port, conf, call_reserve, budget? })` sends the
   reasoning's stop point with every request, and `coding.run{ call_reserve =
   N }` is the opt that puts it on a run. The model cannot see its room, and

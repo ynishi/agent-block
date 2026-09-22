@@ -52,6 +52,31 @@ local WINDOW_OPTS, WINDOW_ARG = opts_contract({
         :is_optional(),
 })
 
+--- What `policy.split` is asked with: the Port and conf the numbers come
+--- from, the `reserve` the fold was given, and — for the reply's side — what
+--- the request already costs.
+local SPLIT_OPTS, SPLIT_ARG = opts_contract({
+    port = T.table:describe("an LLM Port: profile(conf) for the window and the reply's cap"),
+    conf = T.table:describe("the conf the port is opened with"):is_optional(),
+    reserve = T.number
+        :describe("tokens the fold holds back for the reply — the same number window{ fit.reserve } was given")
+        :is_optional(),
+    used = T.number
+        :describe("what a request costs by the Port's count; given, the answer carries the reply's `room`")
+        :is_optional(),
+})
+
+--- What `policy.split` answers.
+local SPLIT = T.shape({
+    window = T.number:describe("profile.context_window"),
+    max_output = T.number:describe("profile.max_output, or 0 for a wire with no cap"),
+    limit = T.number:describe("the most a request may cost — the prompt's side"),
+    held = T.number:describe("what `reserve` held back beyond max_output, and so is not in `limit`"),
+    room = T.number
+        :describe("the reply's side for a request costing `used`: min(window - used, max_output)")
+        :is_optional(),
+}, { open = false })
+
 --- What `policy.tokens` is configured with: the Port whose counting the cost
 --- delegates to, and the conf that Port was (or will be) opened with.
 local TOKENS_OPTS, TOKENS_ARG = opts_contract({
@@ -312,6 +337,59 @@ local function reply_room(profile, who, used, level)
         room = output
     end
     return room
+end
+
+--- The split, as a value: where the prompt ends and the reply begins, for
+--- the Port and conf named, read out rather than acted on.
+---
+---     policy.split({ port = port, conf = conf, reserve = 6144 })
+---     -- { window = 32768, max_output = 0, limit = 26624, held = 6144 }
+---     policy.split({ port = port, conf = conf, reserve = 6144, used = 24984 })
+---     -- { ..., room = 7784 }
+---
+--- The same three readings `window`, `result_cap` and `thinking_cap` make
+--- for themselves (`profile_split` / `request_limit` / `reply_room`), handed
+--- back together so a caller can see the numbers a run is being sized by —
+--- to log them beside a beat, to check a conf before opening a session, or
+--- to size something of its own against the same split rather than a second
+--- guess at it. It is not a policy: it plugs into no seam, and nothing here
+--- changes because it was called.
+---
+--- `room` is on the answer only when `used` was given: without a request
+--- there is no reply's side to read, and a zero there would be a number
+--- about nothing. The raises are the profile's — no window, a cap that
+--- leaves no room — and they point at the caller.
+---
+--- @param opts table  { port, conf?, reserve?, used? }
+--- @return table  policy.shapes.split
+function M.split(opts)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error("policy.split: opts must be a table", 2)
+    end
+    only(opts, { port = true, conf = true, reserve = true, used = true }, "policy.split")
+    if type(opts.port) ~= "table" or type(opts.port.profile) ~= "function" then
+        error("policy.split: port must answer profile(conf)", 2)
+    end
+    if opts.conf ~= nil and type(opts.conf) ~= "table" then
+        error("policy.split: conf must be a table when given", 2)
+    end
+    if opts.reserve ~= nil and not whole_at_least(opts.reserve, 0) then
+        error("policy.split: reserve must be a whole number >= 0 (tokens), got " .. tostring(opts.reserve), 2)
+    end
+    if opts.used ~= nil and not whole_at_least(opts.used, 0) then
+        error("policy.split: used must be a whole number >= 0 (tokens), got " .. tostring(opts.used), 2)
+    end
+    shape.assert_dev(opts, SPLIT_OPTS, "policy.split opts")
+
+    local profile = opts.port:profile(opts.conf)
+    local window, output = profile_split(profile, "policy.split", 2)
+    local limit, held = request_limit(profile, "policy.split", opts.reserve)
+    local out = { window = window, max_output = output, limit = limit, held = held }
+    if opts.used ~= nil then
+        out.room = reply_room(profile, "policy.split", opts.used, 2)
+    end
+    return out
 end
 
 --- Build a `fold` that folds the last `tail` beats of the log.
@@ -915,10 +993,16 @@ end
 M.shapes = {
     window_opts = WINDOW_OPTS,
     thinking_cap_opts = THINKING_CAP_OPTS,
+    split_opts = SPLIT_OPTS,
+    split = SPLIT,
 }
 
 --- This file's entries in `policy.shapes.api`, gathered there.
 M.api = {
+    split = {
+        args = { arg_of(SPLIT_ARG, "opts") },
+        returns = SPLIT,
+    },
     window = {
         args = { arg_of(WINDOW_ARG, "opts") },
         returns = 'fold — fn(events, device) -> request, report; and, with `fit`, fits — fn(session, device) -> nil | "context"',

@@ -63,7 +63,10 @@
 ---                         four that size against the model's window, and
 ---                         the one split of it they all read (`request_limit`
 ---                         for the prompt, `reply_room` for the reply), off
----                         the Port's profile
+---                         the Port's profile; `policy.split` hands that
+---                         split back as a value, for a caller that wants to
+---                         see the numbers a run is sized by — a reading,
+---                         not a twelfth policy
 ---     policy/tools.lua    repeat_cap, require_args — the two that wrap the
 ---                         device's tools map
 ---     policy/carry.lua    carry — the one filter that reads the log
@@ -279,6 +282,8 @@ M.window = room.window
 M.tokens = room.tokens
 M.result_cap = room.result_cap
 M.thinking_cap = room.thinking_cap
+-- The window's split as a value — a reading beside the four, not a policy.
+M.split = room.split
 M.repeat_cap = tools.repeat_cap
 M.require_args = tools.require_args
 M.carry = carry.carry
@@ -298,6 +303,8 @@ M.escalate = loop.escalate
 
 M.shapes = {
     window_opts = room.shapes.window_opts,
+    split_opts = room.shapes.split_opts,
+    split = room.shapes.split,
     carry_opts = carry.shapes.carry_opts,
     require_args_opts = tools.shapes.require_args_opts,
     thinking_cap_opts = room.shapes.thinking_cap_opts,
