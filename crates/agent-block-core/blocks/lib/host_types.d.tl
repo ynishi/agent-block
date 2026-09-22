@@ -105,8 +105,17 @@ local record host_types
         end
         --- Cooperative tasks: what yields to the runtime.
         record Task
+            --- A nursery: what a scope's body spawns into, and cancels.
+            record Scope
+                spawn: function(Scope, function())
+                cancel: function(Scope)
+            end
             --- Sleep for this many milliseconds, without parking the VM.
             sleep: function(number)
+            --- Run the body in a scope that waits for everything it spawned.
+            scope: function(function(Scope)): any...
+            --- The same, cancelled at the deadline (milliseconds).
+            with_timeout: function(number, function(Scope)): any...
         end
         --- The clock.
         record Time

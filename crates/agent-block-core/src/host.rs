@@ -108,9 +108,10 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         include_str!("../blocks/lib/policy/carry.lua"),
     ),
     ("policy.loop", include_str!("../blocks/lib/policy/loop.lua")),
+    // Written in Teal, against `knl.d.tl` (`include_tl!`).
     (
         "supervisor",
-        include_str!("../blocks/lib/supervisor/init.lua"),
+        htl::include_tl!("blocks/lib/supervisor/init.tl"),
     ),
     ("job", htl::include_tl!("blocks/lib/job/init.tl")),
     // The Lua half of four bridges — the `std.<x>.register_tools` /
@@ -1497,15 +1498,18 @@ fn build_isle_init(
         for (name, source) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
             memory = memory.add(*name, *source);
         }
-        // `knl_types` is the one embedded module with no file behind it: the
-        // lshape declaration of the kernel's syscall surface, generated here
-        // from the Rust argument and return types in `bridge/knl.rs`. It is
-        // built at start rather than checked in because a generated file in
-        // the tree is a file that can be edited, and one that has been edited
-        // is a second declaration wearing the first one's name — which is
-        // exactly the drift the Lua kernel's registry stopped having when it
-        // started pointing at this. Same lowest priority as the rest: a
-        // filesystem `knl_types` would win, and would be the caller's own.
+        // `knl_types` is the embedded module the host builds rather than
+        // reads: the lshape declaration of the kernel's syscall surface,
+        // generated here from the Rust argument and return types in
+        // `bridge/knl.rs`, so what a running host holds is what its own
+        // types say. The tree carries a copy (`blocks/lib/knl_types.lua`,
+        // beside the Teal declaration `knl_types.d.tl`) for the two runners
+        // that have no host to build one — `htl test` and `lua-spec-runner`
+        // — and a test in `bridge/knl.rs` holds both copies to the
+        // generator, which is what keeps an edited copy from becoming a
+        // second declaration wearing the first one's name. Same lowest
+        // priority as the rest: a filesystem `knl_types` would win, and
+        // would be the caller's own.
         memory = memory.add("knl_types", crate::bridge::knl::lshape_module_source());
         registry.add(memory);
 

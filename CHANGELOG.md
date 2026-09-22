@@ -566,6 +566,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shapes` as lshape schemas; `e2e_knl_decl_drift.rs` holds every declared
   name to what `require("knl")` exports.
 
+- `supervisor` is written in Teal (`blocks/lib/supervisor/init.tl`,
+  embedded through `include_tl!`), the first module checked against
+  `knl.d.tl`: `child` / `parallel` / `merge` with the same contracts, typed
+  — `ChildOpts` / `ChildBudget` / `ChildEntry` / `ParallelOpts` /
+  `MergeOpts` as what a caller writes, `Slot` (`---@struct`) as what a
+  sibling's place in `parallel`'s answer holds, `ApiArg` / `ApiEntry` as
+  the registry's form, and the query options a merge freezes as the
+  kernel's own `QueryOpts`. `host_types.d.tl` grows `std.task.scope` /
+  `with_timeout` and the `Scope` a body spawns into; `lshape.d.tl` grows
+  `t._internal`. The 55 supervisor specs pass against the generated Lua,
+  and `supervisor_test.tl` (`htl test`) holds the refusals a call meets
+  before a child is opened. Two things the move settled for every module
+  after it: a record a module needs only for itself is declared beside
+  `M`, not nested in it — nested, it is a key of the module table, and a
+  spec that holds that table to the registry sees an export — and the
+  tree now carries `blocks/lib/knl_types.lua`, the lshape module the host
+  builds at start, rendered by the same generator and pinned by the same
+  test as `knl_types.d.tl`: `htl test` and `lua-spec-runner` have no host
+  to build one, and the kernel's tolerant `pcall(require, "knl_types")`
+  otherwise met htl's declaration-only stub and raised at its first index.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

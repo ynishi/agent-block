@@ -95,13 +95,84 @@
 ---   policy over a subtree, waiting on a child from outside its bracket, and
 ---   any read of the tree that decides something. Each is deferred until a
 ---   real loop asks for it.
+---
+--- Written in Teal and embedded through `include_tl!` (`host.rs`); the Lua
+--- the host holds is what Teal generates from this file, without these
+--- comments. `knl` is read through its declaration (`knl.d.tl`) while the
+--- kernel is Lua; the host globals through `host_types`.
+local host = require("host_types")
+global std: host.Std
 
 local kernel = require("knl")
 local lshape = require("lshape")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+--- The shapes this module reads and writes, declared beside it rather than
+--- on it: a record nested in `M` would be a key of the module table, and
+--- the api spec holds that table to the registry, export for export.
+--- What a parent moves to a child.
+local record ChildBudget
+    amount: integer
+    tag: string
+end
+--- What `child` is configured with.
+local record ChildOpts
+    budget: ChildBudget
+end
+--- One entry of `parallel`'s list.
+local record ChildEntry
+    opts: ChildOpts
+    fn: function(kernel.Session): any...
+end
+--- What `parallel` is configured with.
+local record ParallelOpts
+    joiner: string
+    timeout_ms: integer
+end
+--- What `merge` is configured with.
+local record MergeOpts
+    limit: integer
+    timeout_ms: integer
+end
+--- What a sibling's slot in `parallel`'s answer holds: `ok` with the
+--- body's returns packed in `values`, or not, with `err` and whether it
+--- unwound on the scope's cancel. Built whole, one per entry.
+local record Slot ---@struct
+    ok: boolean
+    values: any ---@optional
+    err: any ---@optional
+    cancelled: boolean ---@optional
+end
+--- One declared argument of the registry.
+local record ApiArg ---@struct
+    shape: lshape.Schema
+    desc: string
+end
+--- One entry of the registry: what goes in, what comes out, and the
+--- functions a caller supplies or an export hands back.
+local record ApiEntry
+    args: {ApiArg}
+    returns: any
+    members: {string:ApiEntry}
+end
+--- The public contracts, as data.
+local record Shapes
+    child_opts: lshape.Schema
+    child_budget: lshape.Schema
+    child_entry: lshape.Schema
+    parallel_opts: lshape.Schema
+    merge_opts: lshape.Schema
+    joiner: lshape.Schema
+    result_slot: lshape.Schema
+    results: lshape.Schema
+    api: {string:ApiEntry}
+end
+
+--- The module: its three exports and the registry, and nothing else.
+local record M
+    shapes: Shapes
+end
 
 -- ============================================================
 -- Shared helpers
@@ -111,10 +182,10 @@ local M = {}
 --- `__jsontype = "array"`), the same one `knl.fold` puts on every array it
 --- builds. `merge` rebuilds the messages array, so it re-tags: an array that
 --- lost the tag on the way out of a fold would cross the boundary as `{}`.
-local ARRAY_TAG = { __jsontype = "array" }
+local ARRAY_TAG: {string:string} = { __jsontype = "array" }
 
-local function tag_array(t)
-    return setmetatable(t, ARRAY_TAG)
+local function tag_array(t: {any}): {any}
+    return setmetatable(t as any, ARRAY_TAG as metatable<any>) as {any}
 end
 
 --- Whether `v` is a whole number of at least `min`.
@@ -123,15 +194,15 @@ end
 --- gate would let `amount = 0` through in prod — an allocation of nothing,
 --- which is a child that can never beat and a supervisor that looks like it
 --- worked.
-local function whole_at_least(v, min)
-    return type(v) == "number" and v % 1 == 0 and v >= min
+local function whole_at_least(v: any, min: number): boolean
+    return type(v) == "number" and (v as number) % 1 == 0 and (v as number) >= min
 end
 
 --- Reject an option this call does not know. Loud, and in prod too.
 ---
 --- `who` names the call and, for a nested table, the field: the message a
 --- caller reads is the one place a typo is explained, so it says where.
-local function only(opts, allowed, who)
+local function only(opts: {string:any}, allowed: {string:boolean}, who: string)
     for k in pairs(opts) do
         if not allowed[k] then
             error(who .. ": unknown option '" .. tostring(k) .. "'", 3)
@@ -147,7 +218,7 @@ end
 --- whose indexing can raise. This used to answer `table or userdata`, which
 --- let a table that was not a session through to fail further in, on a method
 --- the caller had every right to make.
-local function is_handle(v)
+local function is_handle(v: any): boolean
     return kernel.is_session(v)
 end
 
@@ -165,12 +236,12 @@ end
 --- A VM with no bridge gets the same fields with nothing read out of them, so
 --- a caller's `err.message` is always there and `err.kind` is the field it has
 --- to ask for.
-local function read_error(e)
-    local bridge = rawget(_G, "knl")
+local function read_error(e: any): kernel.Error
+    local bridge = rawget(_G as {string:any}, "knl") as {string:any}
     if type(bridge) == "table" and type(bridge.error) == "function" then
-        local ok, structured = pcall(bridge.error, e)
+        local ok, structured = pcall((bridge.error as function(any): any), e)
         if ok and type(structured) == "table" then
-            return structured
+            return structured as kernel.Error
         end
     end
     return { retryable = false, message = tostring(e) }
@@ -181,9 +252,9 @@ end
 --- The nursery is the host's, and a VM without it (the pure spec runner) is
 --- not a VM `parallel` can run in at all. Saying so is better than indexing
 --- nil three frames deeper.
-local function nursery()
-    local std = rawget(_G, "std")
-    local task = type(std) == "table" and std.task or nil
+local function nursery(): host.Std.Task
+    local std_g = rawget(_G, "std") as host.Std
+    local task = type(std_g) == "table" and std_g.task or nil
     if type(task) ~= "table" or type(task.scope) ~= "function" then
         error("supervisor.parallel: std.task is not available in this VM (it is the host's nursery)", 3)
     end
@@ -197,9 +268,9 @@ end
 --- of an event is JSON in one of them. `session:events()` decodes on the way
 --- out and a query does not, which is the difference between reading your own
 --- stream and reading somebody else's.
-local function json_decoder()
-    local std = rawget(_G, "std")
-    local json = type(std) == "table" and std.json or nil
+local function json_decoder(): function(string): any
+    local std_g = rawget(_G, "std") as host.Std
+    local json = type(std_g) == "table" and std_g.json or nil
     if type(json) ~= "table" or type(json.decode) ~= "function" then
         error("supervisor.merge: std.json.decode is not available in this VM (the `data` column is text)", 3)
     end
@@ -216,7 +287,7 @@ end
 
 --- A Lua function, as a shape. `lshape.t` exposes only the five prims it
 --- names, so this is built from the same plain-data schema form.
-local FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
+local FUNCTION = setmetatable({ kind = "prim", prim = "function" } as any, lshape.t._internal.schema_mt) as lshape.Schema
 
 --- A session handle: the kernel's shape, not a second copy of it.
 local SESSION_HANDLE = kernel.shapes.session_handle
@@ -230,7 +301,7 @@ local SESSION_HANDLE = kernel.shapes.session_handle
 --- closed shape, the dev-only gate became the thing that reported an unknown
 --- option, in different words, so the module said two different things about
 --- one typo depending on `LSHAPE_CHECK`.
-local function opts_contract(fields)
+local function opts_contract(fields: {string:lshape.Schema}): lshape.Schema, lshape.Schema
     return T.shape(fields, { open = false }), T.shape(fields)
 end
 
@@ -340,16 +411,16 @@ M.shapes = {
 ---
 --- `who` names the call site — `supervisor.child` or the entry of a
 --- `parallel` list — so a bad entry in a list of five says which one.
-local function child_contract(opts, who)
+local function child_contract(opts: ChildOpts, who: string)
     if type(opts) ~= "table" then
         error(who .. ": opts must be a table { budget = { amount, tag? } }", 3)
     end
-    only(opts, { budget = true }, who)
+    only(opts as {string:any}, { budget = true }, who)
     local budget = opts.budget
     if type(budget) ~= "table" then
         error(who .. ": budget is required — a child opens out of the parent's balance", 3)
     end
-    only(budget, { amount = true, tag = true }, who .. " budget")
+    only(budget as {string:any}, { amount = true, tag = true }, who .. " budget")
     if not whole_at_least(budget.amount, 1) then
         error(who .. ": budget.amount must be a whole number >= 1, got " .. tostring(budget.amount), 3)
     end
@@ -372,12 +443,12 @@ end
 --- The bracket cannot make that distinction — from inside `knl.session` an
 --- open that raised and a body that raised are both "the call failed" — and it
 --- is exactly the distinction `child`'s contract rests on.
-local function attempt(parent, opts, fn)
+local function attempt(parent: kernel.Session, opts: ChildOpts, fn: function(kernel.Session): any...): string, any
     local entered = false
     local returned = table.pack(pcall(kernel.session, {
         parent = parent,
         budget = { from_parent = opts.budget.amount, tag = opts.budget.tag },
-    }, function(child)
+        }, function(child: kernel.Session): any...
         entered = true
         return fn(child)
     end))
@@ -424,7 +495,7 @@ end
 --- @param opts table  { budget = { amount = <whole number >= 1>, tag? } }
 --- @param fn function  fn(child) -> ...
 --- @return ...  whatever `fn` returned, or `nil, err` on a refusal
-function M.child(parent, opts, fn)
+function M.child(parent: kernel.Session, opts: ChildOpts, fn: function(kernel.Session): any...): any...
     if not is_handle(parent) then
         error("supervisor.child: the first argument must be a knl session (from knl.open / knl.session)", 2)
     end
@@ -436,7 +507,8 @@ function M.child(parent, opts, fn)
 
     local status, payload = attempt(parent, opts, fn)
     if status == "ran" then
-        return table.unpack(payload, 2, payload.n)
+        local packed = payload as {any}
+        return table.unpack(packed, 2, (payload as {string:integer}).n)
     end
     if status == "refused" then
         return nil, payload
@@ -458,7 +530,7 @@ end
 --- it produces is a `cancelled` flag beside the error rather than a different
 --- kind of slot: the sibling still failed, and what it failed of is worth
 --- saying.
-local function is_cancellation(raised)
+local function is_cancellation(raised: any): boolean
     return tostring(raised):find("task cancelled", 1, true) ~= nil
 end
 
@@ -540,7 +612,7 @@ end
 --- @param children table  array of { opts = <child opts>, fn = fn(child) }
 --- @param opts table|nil  { joiner? = "isolate" | "cancel_on_error", timeout_ms? }
 --- @return table results  one slot per entry, aligned by index
-function M.parallel(parent, children, opts)
+function M.parallel(parent: kernel.Session, children: {ChildEntry}, opts?: ParallelOpts): {Slot}
     if not is_handle(parent) then
         error("supervisor.parallel: the first argument must be a knl session", 2)
     end
@@ -548,11 +620,11 @@ function M.parallel(parent, children, opts)
         error("supervisor.parallel: the second argument must be an array of { opts, fn }", 2)
     end
     for i, entry in ipairs(children) do
-        local who = "supervisor.parallel: children[" .. i .. "]"
+        local who = "supervisor.parallel: children[" .. tostring(i) .. "]"
         if type(entry) ~= "table" then
             error(who .. " must be a table { opts, fn }", 2)
         end
-        only(entry, { opts = true, fn = true }, who)
+        only(entry as {string:any}, { opts = true, fn = true }, who)
         if type(entry.fn) ~= "function" then
             error(who .. ": fn must be a function fn(child)", 2)
         end
@@ -562,7 +634,7 @@ function M.parallel(parent, children, opts)
     if type(opts) ~= "table" then
         error("supervisor.parallel: opts must be a table", 2)
     end
-    only(opts, { joiner = true, timeout_ms = true }, "supervisor.parallel")
+    only(opts as {string:any}, { joiner = true, timeout_ms = true }, "supervisor.parallel")
     if opts.joiner ~= nil and opts.joiner ~= "isolate" and opts.joiner ~= "cancel_on_error" then
         error("supervisor.parallel: joiner must be 'isolate' or 'cancel_on_error', got " .. tostring(opts.joiner), 2)
     end
@@ -575,17 +647,18 @@ function M.parallel(parent, children, opts)
     -- a bad fifth entry must not leave four sessions in the log.
     local task = nursery()
     local cancel_on_error = opts.joiner == "cancel_on_error"
-    local results = {}
+    local results: {Slot} = {}
 
-    local function body(scope)
+    local function body(scope: host.Std.Task.Scope)
         for i, entry in ipairs(children) do
             scope:spawn(function()
                 local status, payload = attempt(parent, entry.opts, entry.fn)
                 if status == "ran" then
-                    results[i] = { ok = true, values = table.pack(table.unpack(payload, 2, payload.n)) }
+                    local packed = payload as {any}
+                    results[i] = { ok = true, values = table.pack(table.unpack(packed, 2, (payload as {string:integer}).n)) }
                     return
                 end
-                local slot = { ok = false, err = payload }
+                local slot: Slot = { ok = false, err = payload }
                 if status == "raised" and is_cancellation(payload) then
                     slot.cancelled = true
                 end
@@ -600,7 +673,7 @@ function M.parallel(parent, children, opts)
     -- The scope waits for every child it spawned before it returns, so the
     -- slots are complete by the line below — unless the deadline tore the
     -- scope down, which is the one path that raises out of the nursery.
-    local ran, raised
+    local ran, raised: boolean, any
     if opts.timeout_ms ~= nil then
         ran, raised = pcall(task.with_timeout, opts.timeout_ms, body)
     else
@@ -649,25 +722,25 @@ SELECT stream,
 --- the decoding `session:events()` does on the way out of the syscall is not
 --- done for a read. A NULL column (an event that carried no `data`) is nil,
 --- which is what `knl.fold` already reads as "nothing this fold is about".
-local function decoded(decode, value)
+local function decoded(decode: function(string): any, value: any): any
     if value == nil then
         return nil
     end
     if type(value) == "table" then
         return value
     end
-    return decode(value)
+    return decode(value as string)
 end
 
 --- A session, as the id a query binds: a string is one already, a handle is
 --- asked for its own.
-local function stream_id(value, who)
+local function stream_id(value: any, who: string): string
     if type(value) == "string" then
-        return value
+        return value as string
     end
     if is_handle(value) then
-        local ok, id = pcall(function()
-            return value:id()
+        local ok, id = pcall(function(): string
+            return (value as kernel.Session):id()
         end)
         if ok and type(id) == "string" then
             return id
@@ -711,7 +784,7 @@ end
 --- @param sessions table  the streams to read, in the order they belong in
 --- @param opts table|nil  { limit?, timeout_ms? }
 --- @return function fold  fn(events, device) -> request
-function M.merge(parent, sessions, opts)
+function M.merge(parent: kernel.Session, sessions: {any}, opts?: MergeOpts): function({any}, kernel.Device): kernel.Request
     if not is_handle(parent) then
         error("supervisor.merge: the first argument must be a knl session", 2)
     end
@@ -722,36 +795,38 @@ function M.merge(parent, sessions, opts)
     if type(opts) ~= "table" then
         error("supervisor.merge: opts must be a table", 2)
     end
-    only(opts, { limit = true, timeout_ms = true }, "supervisor.merge")
+    only(opts as {string:any}, { limit = true, timeout_ms = true }, "supervisor.merge")
     for _, name in ipairs({ "limit", "timeout_ms" }) do
-        if opts[name] ~= nil and not whole_at_least(opts[name], 1) then
-            error("supervisor.merge: " .. name .. " must be a whole number >= 1, got " .. tostring(opts[name]), 2)
+        local value = (opts as {string:any})[name]
+        if value ~= nil and not whole_at_least(value, 1) then
+            error("supervisor.merge: " .. name .. " must be a whole number >= 1, got " .. tostring(value), 2)
         end
     end
     shape.assert_dev(opts, MERGE_OPTS, "supervisor.merge opts")
 
-    local ids = {}
+    local ids: {string} = {}
     for i, value in ipairs(sessions) do
-        ids[i] = stream_id(value, "supervisor.merge: sessions[" .. i .. "]")
+        ids[i] = stream_id(value, "supervisor.merge: sessions[" .. tostring(i) .. "]")
     end
     -- Frozen at construction, like a device's fields: the decoder this needs
     -- and the set it reads are what this fold IS, and a fold that resolved
     -- either per beat could answer two different things for one device.
     local decode = json_decoder()
-    local query_opts = { sessions = ids, limit = opts.limit, timeout_ms = opts.timeout_ms }
+    local query_opts: kernel.QueryOpts = { sessions = ids, limit = opts.limit, timeout_ms = opts.timeout_ms }
 
-    return function(events, device)
+    return function(events: {any}, device: kernel.Device): kernel.Request
         local rows, truncated = parent:query(MERGE_SQL, nil, query_opts)
         if truncated then
             error("supervisor.merge: the read hit the row limit — the request would be missing history", 0)
         end
 
-        local by_stream = {}
+        local by_stream: {string:{any}} = {}
         for _, row in ipairs(rows) do
-            local bucket = by_stream[row.stream]
+            local stream = row.stream as string
+            local bucket = by_stream[stream]
             if bucket == nil then
                 bucket = {}
-                by_stream[row.stream] = bucket
+                by_stream[stream] = bucket
             end
             bucket[#bucket + 1] = { kind = row.kind, data = decoded(decode, row.data) }
         end
@@ -788,7 +863,7 @@ end
 -- so their entries are declared and walked by the spec and nothing wraps them.
 
 --- One declared argument: the shape it is held to, and the word for it.
-local function arg_of(schema, desc)
+local function arg_of(schema: lshape.Schema, desc: string): ApiArg
     return { shape = schema, desc = desc }
 end
 
@@ -862,12 +937,17 @@ M.shapes.api = {
 -- entries)` still reaches its own defaulting rather than a shape violation
 -- about an opts table that was never there.
 
-local function arg_checked(name, fn, declared)
-    return function(...)
+local function arg_checked(name: string, fn: function(...: any): any..., declared: {ApiArg}): function(...: any): any...
+    return function(...: any): any...
         for i = 1, #declared do
             local value = select(i, ...)
             if value ~= nil then
-                shape.assert_dev(value, declared[i].shape, name .. " arg " .. i .. " (" .. declared[i].desc .. ")")
+                local declared_arg = declared[i]
+                shape.assert_dev(
+                    value,
+                    declared_arg.shape,
+                    name .. " arg " .. tostring(i) .. " (" .. declared_arg.desc .. ")"
+                )
             end
         end
         return fn(...)
@@ -875,10 +955,11 @@ local function arg_checked(name, fn, declared)
 end
 
 if shape.is_dev_mode() then
+    local exports = M as {string:any}
     for name, entry in pairs(M.shapes.api) do
-        local export = M[name]
+        local export = exports[name]
         if type(export) == "function" then
-            M[name] = arg_checked("supervisor." .. name, export, entry.args)
+            exports[name] = arg_checked("supervisor." .. name, export as function(...: any): any..., entry.args)
         end
     end
 end

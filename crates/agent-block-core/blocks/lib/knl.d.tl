@@ -39,7 +39,11 @@ local record knl
         --- One of the kernel's views of this session, by name.
         view: function(Session, kt.ViewName, ?kt.ViewOpts): any
         --- Rows of a statement over the log, and whether the read was cut.
-        query: function(Session, kt.Sql, ?kt.QueryParams, ?kt.QueryOpts): {{string:any}}, boolean
+        --- The options are this module's `QueryOpts` — the same three fields
+        --- the syscall's (`knl_types.QueryOpts`) declares — so a module typed
+        --- against `knl` needs no `require("knl_types")` at run time, where
+        --- that module is the host's and a bare VM has none.
+        query: function(Session, kt.Sql, ?kt.QueryParams, ?QueryOpts): {{string:any}}, boolean
         --- Hold units of the budget: what was granted, and the grant's tag.
         reserve: function(Session, kt.Amount): kt.Amount, string
         --- Spend held units.

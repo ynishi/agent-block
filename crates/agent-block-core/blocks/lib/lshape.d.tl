@@ -45,6 +45,12 @@ local record lshape
         any_of: function({Schema}): Schema
         tuple: function({Schema}): Schema
         map_of: function(Schema, Schema): Schema
+        --- The plain-data form a schema is built from, for a prim `t`
+        --- does not name (a function).
+        _internal: Internal
+    end
+    record Internal
+        schema_mt: metatable<any>
     end
     --- The boundary checks, `lshape.check`.
     record Check
