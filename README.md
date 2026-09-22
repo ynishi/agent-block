@@ -213,6 +213,45 @@ lib/summarize_util.lua            pull the reusable part out; require("summarize
 crates/agent-block-core/blocks/lib/…    upstream, once it is general (EMBEDDED_LIBS)
 ```
 
+### Writing a module
+
+A module is one file, `lib/<name>/init.lua`, ending in `return M` — the table
+of what it exports; what it splits out is a sibling, `<name>/<sub>.lua`,
+required as `<name>.<sub>`. It writes nothing onto globals — putting its
+functions on `std.*` or into a registry is the caller's job, or the bridge's —
+which is what lets a project's copy of the same name replace it there and
+still wrap the original through `require("embedded.<name>")` ([Embedded
+blocks](#embedded-blocks-every-one-is-yours-to-change)).
+
+```lua
+--- <name> — <one line>, then what it is, how it is used, what it does not do.
+local shape = require("lshape").check
+local M = {}
+M.shapes = { run_opts = RUN_OPTS }  -- the opts contract, published as data
+function M.run(opts)
+    if opts.port == nil then error("<name>.run: `port` is required", 0) end
+    shape.assert_dev(opts, RUN_OPTS, "<name>.run opts")  -- dev: LSHAPE_CHECK=1
+end
+return M
+```
+
+Its checks live beside it in `lib/<name>/spec/*_spec.lua` (mlua-lspec; a
+`spec/support.lua` holds the stubs several specs share). `agent-block vendor
+<name>` copies them with the module, and `just test-lua-project <dir>` runs
+them against the copy.
+
+The opts a public function takes and the values it answers are lshape shapes,
+published under `M.shapes` so a caller reads the contract as data and asserted
+at the boundary in dev mode — `policy`'s `opts_contract` is the idiom. The
+loud refusals that name a missing field stay in plain Lua, so they fire in
+prod too.
+
+The header is `--- <name> — <one line>`, then what it is, how it is used, and
+what it does not do. Comments are English; a measurement is cited as
+`[measured YYYY-MM-DD: ...]`. The Lua half of a Rust bridge — `fs_tools` and
+its siblings — is a library on these same terms, and the bridge is what
+installs its functions onto `std.<x>` (`bridge::load_tools_module`).
+
 Going the other way — starting from something embedded and making it the
 project's — is [Overriding a block or a
 module](#overriding-a-block-or-a-module).

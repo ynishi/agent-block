@@ -1,10 +1,10 @@
--- agent_run_test.lua — mlua-lspec tests that drive agent.run itself.
+-- agent_run_spec.lua — mlua-lspec tests that drive agent.run itself.
 --
 -- Run via:
---   just test-lua agent_run_test   # this file
+--   just test-lua agent_run_spec   # this file
 --   just test-lua                  # every spec fixture
 --
--- agent_helpers_test covers the pure helpers; these go through `M.run`, so the
+-- agent_helpers_spec covers the pure helpers; these go through `M.run`, so the
 -- dev-mode assert on `M.shapes.run_result` fires on every case below —
 -- including the ones that are supposed to fail, since a failure is a shape too.
 --

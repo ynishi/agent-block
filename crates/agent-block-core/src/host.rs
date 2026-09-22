@@ -43,6 +43,10 @@ pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 /// `llm_proto` is the provider-neutral LLM wire format, `session` persists a
 /// messages array through `std.kv`, and `lshape` is a schema validator.
 /// Listing them as tools would be misleading.
+///
+/// What an embedded module is — its file, the table it returns, its specs
+/// beside it, its `M.shapes`, its header — is stated in README § "Writing a
+/// module", and a module that joins this list is one that has that form.
 pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     ("session", include_str!("../blocks/lib/session/init.lua")),
     (

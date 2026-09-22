@@ -1,7 +1,7 @@
--- llm_proto_test.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
+-- llm_proto_spec.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
 --
 -- Run via:
---   just test-lua llm_proto_test   # this file
+--   just test-lua llm_proto_spec   # this file
 --   just test-lua                  # every spec fixture
 --
 -- Covers the pieces that used to be duplicated (or missing) across the blocks

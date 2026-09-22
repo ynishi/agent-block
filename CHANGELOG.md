@@ -285,6 +285,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   numbering is gone from the same comments, which describe what the code is
   rather than the order it arrived in.
 
+- The README says what an embedded module is, under "Writing a module": one
+  `lib/<name>/init.lua` that returns the table of what it exports and writes
+  nothing onto globals, replaceable by a project's copy of the same name that
+  can wrap the original, with its checks beside it in
+  `lib/<name>/spec/*_spec.lua`, the opts its public functions take and the
+  values they answer declared as `M.shapes` and asserted at the boundary in
+  dev mode beside refusals that stay loud in prod, and a header in English
+  that says what it is, how it is used and what it does not do. The seven
+  spec files still called `*_test.lua` are `*_spec.lua` now, which is what
+  every other one was already called; discovery reads the `spec/` directory
+  and the file's use of the framework, never the suffix, so only the names
+  changed.
+
 ## [0.39.0] - 2026-09-20
 
 ### Added

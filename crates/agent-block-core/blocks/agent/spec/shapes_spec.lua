@@ -1,7 +1,7 @@
--- shapes_test.lua — mlua-lspec unit tests for the blocks' boundary contracts.
+-- shapes_spec.lua — mlua-lspec unit tests for the blocks' boundary contracts.
 --
 -- Run via:
---   just test-lua shapes_test   # this file
+--   just test-lua shapes_spec   # this file
 --   just test-lua               # every spec fixture
 --
 -- The contracts themselves (agent.shapes) are plain data,

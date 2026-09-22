@@ -1,7 +1,7 @@
--- llm_proto_backend_test.lua — mlua-lspec tests for llm_proto.backend.
+-- llm_proto_backend_spec.lua — mlua-lspec tests for llm_proto.backend.
 --
 -- Run via:
---   just test-lua llm_proto_backend_test   # this file
+--   just test-lua llm_proto_backend_spec   # this file
 --   just test-lua                          # every spec fixture
 --
 -- `llm_proto.backend` is the whole model call as one closure: build the wire
@@ -22,7 +22,7 @@
 -- The transport is stubbed at its two ends rather than by writing a JSON codec:
 -- each request body encodes to a sentinel the test can look the table back up
 -- from, and each response body decodes to whatever the test queued. The wire
--- format itself has llm_proto_test.
+-- format itself has llm_proto_spec.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -90,7 +90,7 @@ if not std then
                     -- Error bodies land here too (classify_error tries to read
                     -- them); it calls through pcall, so raising is the honest
                     -- answer for a body the test never queued.
-                    error("llm_proto_backend_test: unexpected body to decode: " .. tostring(s), 0)
+                    error("llm_proto_backend_spec: unexpected body to decode: " .. tostring(s), 0)
                 end
                 return v
             end,
@@ -121,7 +121,7 @@ if not http then
             })
             local entry = table.remove(queue, 1)
             if not entry then
-                error("llm_proto_backend_test: the backend asked for a response the test did not queue", 0)
+                error("llm_proto_backend_spec: the backend asked for a response the test did not queue", 0)
             end
             local body = "<undecodable-body>"
             if entry.response then

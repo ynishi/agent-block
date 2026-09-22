@@ -1,9 +1,9 @@
--- coding_test.lua — mlua-lspec tests for the `coding` consumer block's pure
+-- coding_spec.lua — mlua-lspec tests for the `coding` consumer block's pure
 -- parts: what the seed is made of, how targets are resolved, and what
 -- `coding.run` refuses before it opens a session.
 --
 -- Run via:
---   just test-lua coding_test
+--   just test-lua coding_spec
 --
 -- The loop itself is exercised end to end by running
 -- `examples/coding_loop.lua` against a crate; nothing here calls a model.
