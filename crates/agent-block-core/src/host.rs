@@ -89,9 +89,10 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     // the `require("host_types")` every Teal module's generated Lua carries.
     ("host_types", include_str!("../blocks/lib/host_types.lua")),
     ("knl", include_str!("../blocks/lib/knl/init.lua")),
+    // Written in Teal, against `knl.d.tl` (`include_tl!`).
     (
         "knl_adapter",
-        include_str!("../blocks/lib/knl_adapter/init.lua"),
+        htl::include_tl!("blocks/lib/knl_adapter/init.tl"),
     ),
     // Written in Teal, all six files, against `knl.d.tl` (`include_tl!`).
     ("policy", htl::include_tl!("blocks/lib/policy/init.tl")),

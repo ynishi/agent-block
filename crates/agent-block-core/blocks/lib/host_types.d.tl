@@ -189,6 +189,26 @@ local record host_types
         --- Register one tool: its name, what it takes, and the handler.
         register: function(string, Meta, function(any): any)
     end
+    --- `mcp`, the client bridge (`bridge/mcp.rs`): the tools a connected
+    --- server lists, and one call to one of them.
+    record Mcp
+        --- The blocks and the tool entries are MCP's own vocabulary, which
+        --- `mcp_tools` closes; they are loose here so that this file, which
+        --- `mcp_tools` reads, does not read it back.
+        record CallResult
+            ok: boolean
+            error: string
+            content: {{string:any}}
+            is_error: boolean
+        end
+        record ListResult
+            ok: boolean
+            error: string
+            tools: {{string:any}}
+        end
+        list_tools: function(string): ListResult
+        call: function(string, string, any): CallResult
+    end
     --- `log`, the tracing bridge (`bridge/log.rs`): one message per call,
     --- attributed to the running script.
     record Log

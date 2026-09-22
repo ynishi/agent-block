@@ -603,6 +603,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the generated Lua, and `policy_test.tl` (`htl test`) holds
   `split`, `retry` and `escalate`'s default judgement.
 
+- `knl_adapter` is written in Teal (`blocks/lib/knl_adapter/init.tl`,
+  embedded through `include_tl!`): the two Ports are records with the
+  metatable the Lua gave them — the same `__index` class, so
+  `LLMPort.new{...}` and `port:open(conf)` read as they did — and the
+  checker holds a provider impl to `build` / `parse` / `classify` and a
+  tool source to `declare` / `invoke`. `Verdict`, `Profile`, the count
+  cache and what the transport `Seen` are records beside `M`.
+  `host_types.d.tl` grows the `mcp` bridge (`list_tools`, `call`), and
+  `llm_proto`'s `Adapter` names `DEFAULT_MAX_TOKENS`. The 74 knl_adapter
+  specs pass against the generated Lua, and `knl_adapter_test.tl` (`htl
+  test`) holds the Port contracts and the tool binding.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

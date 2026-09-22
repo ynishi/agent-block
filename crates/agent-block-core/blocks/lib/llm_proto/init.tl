@@ -230,6 +230,9 @@ local record M
     --- One provider dialect: what `adapter` answers.
     record Adapter
         name: string
+        --- The cap `build` sends when the spec names none, on a wire that
+        --- requires one (`anthropic`); absent on a wire that sends none.
+        DEFAULT_MAX_TOKENS: integer
         build: function(Spec): Wire, string
         parse: function({string:any}): Decoded, string
         count: function(Spec): integer, string

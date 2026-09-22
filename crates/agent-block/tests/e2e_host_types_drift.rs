@@ -106,7 +106,7 @@ fn every_declared_function_is_registered_by_the_host() {
 
     let declared = declared();
     assert!(
-        declared.len() >= 12,
+        declared.len() >= 13,
         "the declaration reader found only {declared:?} — the parser and the file disagree"
     );
     let mut missing = Vec::new();
