@@ -26,6 +26,11 @@
 --- held against the kernel's declaration where both halves exist:
 --- `crates/agent-block/tests/e2e_embedded_blocks.rs`.
 ---
+--- Written in Teal and embedded through `include_tl!` (`host.rs` and
+--- `bridge/fs.rs`); the Lua the host holds is what Teal generates from this
+--- file, without these comments. The globals it reads are declared through
+--- `host_types`, and `lshape` through `lshape.d.tl` beside the vendored copy.
+---
 --- opts:
 ---   allowed   : array of op names  — REQUIRED. "read", "write", "edit",
 ---                                   "rollback", "search_replace", "append"
@@ -86,11 +91,70 @@
 --- every refusal that names a field is hand-written below and is loud in both
 --- modes. `knl/init.lua` requires `knl_types` on the same terms and for the
 --- same reason.
+local host = require("host_types")
+global std: host.Std
+global tool: host.Tool
+global log: host.Log
+
 local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil
 local shape = shape_ok and lshape.check or nil
 
-local M = {}
+local record M
+    --- What one result may cost, from `policy.result_budget`.
+    record Limits
+        --- A number, or fn() -> number.
+        result_tokens: any
+        --- fn(text) -> tokens.
+        count: function(string): number
+    end
+    --- What `tool_specs` / `register_tools` take.
+    record Opts
+        allowed: {string}
+        prefix: string
+        path_lock: {string}
+        limits: Limits
+    end
+    --- One edit, as `edit` (line-addressed) or `search_replace` (by text)
+    --- names it.
+    record Edit
+        start_line: integer
+        end_line: integer
+        expect: string
+        replace: string
+        search: string
+    end
+    --- What the tools take, all six in one shape.
+    record Input
+        path: string
+        start_line: integer
+        end_line: integer
+        limit: integer
+        max_tokens: integer
+        base: string
+        edits: {Edit}
+        content: string
+    end
+    --- One tool, before it is named.
+    record Def
+        description: string
+        input_schema: {string:any}
+        handler: function(Input): {string:any}
+    end
+    --- One tool, named: what `tool_specs` answers, one `knl.shapes.tool_spec`.
+    record Spec
+        name: string
+        description: string
+        input_schema: {string:any}
+        handler: function(Input): {string:any}
+    end
+    --- The opts contract, as data.
+    record Shapes
+        tool_specs_opts: lshape.Schema
+        register_tools_opts: lshape.Schema
+    end
+    shapes: Shapes
+end
 
 --- What `tool_specs` is configured with. CLOSED on purpose: an option this
 --- module does not know is a typo, and a typo that quietly became a no-op is
@@ -113,24 +177,24 @@ local M = {}
 --- wrote. That is one mistake with two answers, split by an environment
 --- variable. `policy`'s `opts_contract` splits the same way for the same
 --- reason.
-local TOOL_SPECS_OPTS
+local TOOL_SPECS_OPTS: lshape.Schema
 if shape_ok then
     TOOL_SPECS_OPTS = T.shape({
         allowed = T.array_of(T.string)
-            :describe(
-                'the ops this caller hands its model: "read", "write", "edit", "rollback", '
-                    .. '"search_replace", "append". Required — its absence is refused by name below, in '
-                    .. "both modes"
-            )
-            :is_optional(),
+        :describe(
+            'the ops this caller hands its model: "read", "write", "edit", "rollback", '
+                .. '"search_replace", "append". Required — its absence is refused by name below, in '
+                .. "both modes"
+        )
+        :is_optional(),
         prefix = T.string:describe('prepended to every tool name; default "fs_"'):is_optional(),
         path_lock = T.array_of(T.string)
-            :describe("the only files the tools may touch; every other path is refused by name")
-            :is_optional(),
+        :describe("the only files the tools may touch; every other path is refused by name")
+        :is_optional(),
         limits = T.shape({
             result_tokens = T.any_of({ T.number, T.fn })
-                :describe("what one result may take: a number, or fn() -> number; needs `count`")
-                :is_optional(),
+            :describe("what one result may take: a number, or fn() -> number; needs `count`")
+            :is_optional(),
             count = T.fn:describe("fn(text) -> tokens, the counter `result_tokens` is measured with"):is_optional(),
         }):is_optional(),
     }, { open = false })
@@ -172,8 +236,8 @@ M.shapes = {
 -- returned — as many lines as the search had, so the caller sees the region
 -- in the shape it tried to name. Returns `nil` when not even the first line
 -- occurs: there is no region to point at, and the caller should re-read.
-local function diverges_at(content, search)
-    local lines = {}
+local function diverges_at(content: string, search: string): integer, string
+    local lines: {string} = {}
     for line in (search .. "\n"):gmatch("([^\n]*)\n") do
         lines[#lines + 1] = line
     end
@@ -184,13 +248,13 @@ local function diverges_at(content, search)
         return nil, nil
     end
 
-    local function prefix_pos(n)
-        return content:find(table.concat(lines, "\n", 1, n), 1, true)
+    local function prefix_pos(n: integer): integer
+        return (content:find(table.concat(lines, "\n", 1, n), 1, true))
     end
     if not prefix_pos(1) then
         return nil, nil
     end
-    local lo, hi = 1, #lines -- prefix_pos(lo) matched, prefix_pos(hi+1) did not
+    local lo, hi: integer, integer = 1, #lines -- prefix_pos(lo) matched, prefix_pos(hi+1) did not
     while lo < hi do
         local mid = lo + math.ceil((hi - lo) / 2)
         if prefix_pos(mid) then
@@ -205,9 +269,9 @@ local function diverges_at(content, search)
     local start = prefix_pos(lo)
     -- `()` captures the position OF the last newline, so the line after it
     -- starts one byte later.
-    local nl = content:sub(1, start - 1):match(".*()\n")
+    local nl = (content:sub(1, start - 1):match(".*()\n")) as integer
     local line_start = nl and (nl + 1) or 1
-    local out, at = {}, line_start
+    local out, at: {string}, integer = {}, line_start
     for _ = 1, #lines do
         local eol = content:find("\n", at, true)
         out[#out + 1] = content:sub(at, eol and eol - 1 or #content)
@@ -231,9 +295,9 @@ end
 -- The file's line that shares the most identifiers with the search's first
 -- line, ties broken by the longer common prefix; nil when nothing shares
 -- two identifiers (one word in common points at nothing in particular).
-local function nearest_line(content, search)
+local function nearest_line(content: string, search: string): {string:any}
     local first = search:match("^[^\n]*") or ""
-    local want, n_want = {}, 0
+    local want, n_want: {string:boolean}, integer = {}, 0
     for tok in first:gmatch("[%w_]+") do
         if #tok >= 3 and not want[tok] then
             want[tok] = true
@@ -243,7 +307,7 @@ local function nearest_line(content, search)
     if n_want == 0 then
         return nil
     end
-    local function prefix_len(a, b)
+    local function prefix_len(a: string, b: string): integer
         local n = math.min(#a, #b)
         for i = 1, n do
             if a:byte(i) ~= b:byte(i) then
@@ -253,11 +317,11 @@ local function nearest_line(content, search)
         return n
     end
     local trimmed_first = first:match("^%s*(.-)%s*$")
-    local best, best_score, best_prefix, best_text = nil, 0, 0, nil
+    local best, best_score, best_prefix, best_text: integer, integer, integer, string = nil, 0, 0, nil
     local lineno = 0
     for line in (content .. "\n"):gmatch("([^\n]*)\n") do
         lineno = lineno + 1
-        local seen, score = {}, 0
+        local seen, score: {string:boolean}, integer = {}, 0
         for tok in line:gmatch("[%w_]+") do
             if want[tok] and not seen[tok] then
                 seen[tok] = true
@@ -285,19 +349,19 @@ end
 --  after a one-line anchor, which left the rest of an existing test (the NAMES
 --  loop) outside the function. The error was "unexpected closing delimiter",
 --  and the repair took two beats].
-local function brace_balance(text)
+local function brace_balance(text: string): integer
     local _, open = tostring(text or ""):gsub("{", "")
     local _, close = tostring(text or ""):gsub("}", "")
     return open - close
 end
 
-local function line_edit_for(content, pos, search, replace)
+local function line_edit_for(content: string, pos: integer, search: string, replace: string): {string:any}
     local end_pos = pos + #search - 1
     if search:sub(-1) == "\n" and replace:sub(-1) == "\n" then
         replace = replace:sub(1, -2)
     end
     local before = content:sub(1, pos - 1)
-    local last_nl = before:match(".*()\n")
+    local last_nl = (before:match(".*()\n")) as integer
     local span_start = last_nl and (last_nl + 1) or 1
     local nl_after = content:find("\n", end_pos, true)
     local span_end = nl_after and (nl_after - 1) or #content
@@ -324,7 +388,7 @@ end
 -- one LLM call use this and dispatch the handlers themselves.
 --
 -- Returns an array of { name, description, input_schema, handler }.
-function M.tool_specs(opts)
+function M.tool_specs(opts: M.Opts): {M.Spec}
     opts = opts or {}
     if shape ~= nil then
         shape.assert_dev(opts, TOOL_SPECS_OPTS, "std.fs.tool_specs opts")
@@ -357,14 +421,16 @@ function M.tool_specs(opts)
     -- page instead invites the opposite — agents "exhaustively call next
     -- through every match" [SWE-agent, arXiv:2405.15793 Table 3] — so the cut
     -- is at the budget, never at a page size.
-    local budget_tokens, budget_count
+    local budget_tokens: function(): number
+    local budget_count: function(string): number
     if type(opts.limits) == "table" then
         local rt = opts.limits.result_tokens
         if type(rt) == "function" then
-            budget_tokens = rt
+            budget_tokens = rt as function(): number
         elseif type(rt) == "number" then
-            budget_tokens = function()
-                return rt
+            local n = rt as number
+            budget_tokens = function(): number
+                return n
             end
         end
         if type(opts.limits.count) == "function" then
@@ -386,14 +452,14 @@ function M.tool_specs(opts)
     --- [measured 2026-09-12: the content was fitted to 768 tokens, but with the
     ---  metadata and the JSON escaping the real thing came to 914 and was
     ---  refused as `result_too_large`].
-    local function fit_lines(lines, budget, count, render)
-        local function cost(k)
+    local function fit_lines(lines: {string}, budget: number, count: function(string): number, render: function(integer): string): integer
+        local function cost(k: integer): number
             return count(render(k))
         end
         if #lines == 0 or cost(#lines) <= budget then
             return #lines
         end
-        local lo, hi, best = 1, #lines, 0
+        local lo, hi, best: integer, integer, integer = 1, #lines, 0
         while lo <= hi do
             local mid = (lo + hi) // 2
             if cost(mid) <= budget then
@@ -405,8 +471,8 @@ function M.tool_specs(opts)
         return best
     end
 
-    local lock_set = nil
-    local lock_list = nil
+    local lock_set: {string:boolean} = nil
+    local lock_list: string = nil
     if path_lock and #path_lock > 0 then
         lock_set = {}
         for _, p in ipairs(path_lock) do
@@ -439,7 +505,7 @@ function M.tool_specs(opts)
     --- output ceiling) meant opening `knl.sqlite` per run
     --- [measured 2026-09-11: working out that all eleven were beats with
     ---  out=4096 meant going through the run directories one at a time in SQL].
-    local function refused(res, ctx)
+    local function refused(res: {string:any}, ctx: string): {string:any}
         log.debug(
             "[fs refused] "
                 .. tostring(res.reason)
@@ -451,7 +517,7 @@ function M.tool_specs(opts)
         return res
     end
 
-    local function check_path(path)
+    local function check_path(path: string): {string:any}
         if path == nil or path == "" then
             return refused({
                 ok = false,
@@ -478,7 +544,7 @@ function M.tool_specs(opts)
         return nil
     end
 
-    local function path_prop()
+    local function path_prop(): {string:any}
         local desc = "Absolute path of the file."
         if lock_list then
             desc = desc .. " Must be one of: " .. lock_list
@@ -486,7 +552,7 @@ function M.tool_specs(opts)
         return { type = "string", description = desc }
     end
 
-    local defs = {
+    local defs: {string:M.Def} = {
         read = {
             description = "Read a file, or a range of its lines. Returns { content, start_line, end_line, "
                 .. "total, version }: the range actually returned and the file's total line count, the "
@@ -500,8 +566,8 @@ function M.tool_specs(opts)
                 .. ") carries `truncated = true` and `cut_by`; `end_line` is the last line it holds.",
             input_schema = {
                 type = "object",
-                properties = (function()
-                    local props = {
+                properties = (function(): {string:any}
+                    local props: {string:any} = {
                         path = path_prop(),
                         start_line = {
                             type = "integer",
@@ -528,7 +594,7 @@ function M.tool_specs(opts)
                 end)(),
                 required = { "path" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -569,7 +635,7 @@ function M.tool_specs(opts)
                 if last > total then
                     last = total
                 end
-                local out = {}
+                local out: {string} = {}
                 local n = 0
                 for line in (res.content .. "\n"):gmatch("(.-)\n") do
                     n = n + 1
@@ -580,15 +646,18 @@ function M.tool_specs(opts)
                 -- What cut the result, if anything. `truncated` says that it was cut;
                 -- `end_line` and `total` say where and how much there is. No "next"
                 -- offset: it is `end_line + 1`, and saying it twice adds nothing.
-                local cut_by = nil
-                local limit = tonumber(input.limit)
+                local cut_by: string = nil
+                local limit: integer = nil
+                if input.limit ~= nil then
+                    limit = math.floor(tonumber(input.limit))
+                end
                 if limit and limit >= 1 and #out > limit then
                     for i = #out, limit + 1, -1 do
                         out[i] = nil
                     end
                     cut_by = "limit"
                 end
-                local function result_of(k, cb)
+                local function result_of(k: integer, cb: string): {string:any}
                     local stop = k > 0 and (first + k - 1) or (first - 1)
                     return {
                         content = table.concat(out, "\n", 1, k),
@@ -602,7 +671,7 @@ function M.tool_specs(opts)
                 end
                 -- Token budget: the caller's `max_tokens` and the shell's share, the
                 -- smaller wins. Only measurable when a counter was handed in.
-                local budget, budget_from = nil, nil
+                local budget, budget_from: number, string = nil, nil
                 if budget_tokens then
                     budget, budget_from = budget_tokens(), "budget"
                 end
@@ -613,7 +682,7 @@ function M.tool_specs(opts)
                 if budget then
                     -- Measure the result as it will be returned (metadata and JSON
                     -- escaping included), which is what the shell measures too.
-                    local kept = fit_lines(out, budget, budget_count, function(k)
+                    local kept = fit_lines(out, budget, budget_count, function(k: integer): string
                         return std.json.encode(result_of(k, budget_from))
                     end)
                     if kept < #out then
@@ -629,8 +698,8 @@ function M.tool_specs(opts)
                                     first,
                                     budget
                                 ),
-                            }, "path=" .. tostring(input.path) .. " line=" .. tostring(
-                                first
+                                }, "path=" .. tostring(input.path) .. " line=" .. tostring(
+                                    first
                             ))
                         end
                         for i = #out, kept + 1, -1 do
@@ -700,7 +769,7 @@ function M.tool_specs(opts)
                 },
                 required = { "path", "edits" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -766,7 +835,7 @@ function M.tool_specs(opts)
                 },
                 required = { "path", "edits" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -790,8 +859,8 @@ function M.tool_specs(opts)
                 -- one of them sends it back to re-read for a single line; the
                 -- set is what shows the region moved.
                 local content = std.fs.read_versioned(input.path).content
-                local translated = {}
-                local failures = {}
+                local translated: {integer:{string:any}} = {}
+                local failures: {{string:any}} = {}
                 for i, e in ipairs(edits) do
                     local search = type(e) == "table" and e.search or nil
                     local replace = type(e) == "table" and e.replace or nil
@@ -822,11 +891,11 @@ function M.tool_specs(opts)
                             --  of `mod tests`). The model inferred which one from
                             --  the count and got it right, but with the line
                             --  numbers there is nothing to infer].
-                            local function line_of(p)
+                            local function line_of(p: integer): integer
                                 local _, n = content:sub(1, p - 1):gsub("\n", "")
                                 return n + 1
                             end
-                            local matches, at_lines = 1, { line_of(pos) }
+                            local matches, at_lines: integer, {integer} = 1, { line_of(pos) }
                             local at = content:find(search, pos + #search, true)
                             while at do
                                 matches = matches + 1
@@ -856,11 +925,11 @@ function M.tool_specs(opts)
                         edit_index = first.edit_index,
                         matches = first.matches,
                         failures = failures,
-                    }, string.format(
-                        "path=%s edits=%d failed=%d",
-                        tostring(input.path),
-                        #edits,
-                        #failures
+                        }, string.format(
+                            "path=%s edits=%d failed=%d",
+                            tostring(input.path),
+                            #edits,
+                            #failures
                     ))
                 end
                 -- Say how the file's shape changed, per edit and in total.
@@ -877,9 +946,9 @@ function M.tool_specs(opts)
                 --  which had written six acceptance tests].
                 -- Counts, not a judgement: the tool does not refuse a shrink —
                 -- deleting code is a legitimate edit — it only states it.
-                local shrank, net, braces = {}, 0, {}
+                local shrank, net, braces: {string}, integer, {string} = {}, 0, {}
                 for i, e in ipairs(edits) do
-                    local function lines_of(t)
+                    local function lines_of(t: string): integer
                         local _, n = tostring(t or ""):gsub("\n", "")
                         return n + 1
                     end
@@ -896,24 +965,26 @@ function M.tool_specs(opts)
                 local res = std.fs.edit(input.path, { base = input.base, edits = translated })
                 if type(res) == "table" and res.ok ~= false then
                     res.net_line_delta = net
-                    local notes = {}
+                    local notes: {string} = {}
                     if #shrank > 0 then
-                        res.shrank = table.concat(shrank, "; ")
+                        local shrank_text = table.concat(shrank, "; ")
+                        res.shrank = shrank_text
                         notes[#notes + 1] = "Some replacements are shorter than the text they replaced ("
-                            .. res.shrank
+                            .. shrank_text
                             .. "). If that was not intended, the lines you left out of `replace` are now gone "
                             .. "— re-read the region and put them back."
-                        log.debug("[fs shrink] " .. tostring(input.path) .. " " .. res.shrank .. " net=" .. net)
+                        log.debug("[fs shrink] " .. tostring(input.path) .. " " .. shrank_text .. " net=" .. tostring(net))
                     end
                     if #braces > 0 then
-                        res.brace_shift = table.concat(braces, "; ")
+                        local brace_text = table.concat(braces, "; ")
+                        res.brace_shift = brace_text
                         notes[#notes + 1] = "Some replacements change the count of `{` minus `}` against the text they "
                             .. "replaced ("
-                            .. res.brace_shift
+                            .. brace_text
                             .. "). If the edit was meant to add code after a block, the block's closing brace "
                             .. "belongs inside `search` — as it stands, the text that followed your search is "
                             .. "now on the other side of a brace. Re-read the region if that was not intended."
-                        log.debug("[fs braces] " .. tostring(input.path) .. " " .. res.brace_shift)
+                        log.debug("[fs braces] " .. tostring(input.path) .. " " .. brace_text)
                     end
                     if #notes > 0 then
                         res.note = table.concat(notes, " ")
@@ -936,7 +1007,7 @@ function M.tool_specs(opts)
                 },
                 required = { "path", "content" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -971,7 +1042,7 @@ function M.tool_specs(opts)
             -- or extends is a call whose result the caller cannot predict: a
             -- path typed one character wrong would answer `ok` and leave the
             -- text in a file nobody meant to write.
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -998,7 +1069,8 @@ function M.tool_specs(opts)
                         ),
                     }, "path=" .. tostring(input.path))
                 end
-                std.fs.write(input.path, tostring(current.content or "") .. input.content)
+                local cur = current as host.Std.Fs.ReadVersioned
+                std.fs.write(input.path, tostring(cur.content or "") .. input.content)
                 return { ok = true }
             end,
         },
@@ -1012,7 +1084,7 @@ function M.tool_specs(opts)
                 properties = { path = path_prop() },
                 required = { "path" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local denied = check_path(input.path)
                 if denied then
                     return denied
@@ -1022,7 +1094,7 @@ function M.tool_specs(opts)
         },
     }
 
-    local specs = {}
+    local specs: {M.Spec} = {}
     for _, op in ipairs(allowed) do
         local def = defs[op]
         if def then
@@ -1041,8 +1113,8 @@ end
 --- the VM and want them visible to `tool.schema()` / `tool.call`.
 --
 -- Returns: array of registered tool names.
-function M.register_tools(opts)
-    local registered = {}
+function M.register_tools(opts: M.Opts): {string}
+    local registered: {string} = {}
     for _, spec in ipairs(M.tool_specs(opts)) do
         tool.register(spec.name, { description = spec.description, input_schema = spec.input_schema }, spec.handler)
         table.insert(registered, spec.name)

@@ -277,7 +277,12 @@ fn roots() -> Vec<&'static str> {
 /// which version — the embedded one has moved since), what name it now answers
 /// to, and how to reach the original it replaced.
 fn render(name: &str, source: &str, kind: Kind) -> String {
-    format!("{}\n{source}", header(name, kind))
+    // A file ends with a newline. The hand-written sources do; the Lua Teal
+    // generates for a module written in `.tl` does not, and a copy that
+    // ends mid-line is one whose last line cannot be spliced after — the
+    // `function M.x() … end` a project adds before `return M`.
+    let newline = if source.ends_with('\n') { "" } else { "\n" };
+    format!("{}\n{source}{newline}", header(name, kind))
 }
 
 /// The header lines, without the trailing blank one.

@@ -67,10 +67,28 @@ local record host_types
             --- The latest row matching the tags, or nil.
             last: function(string, ?{string:string}): {string:any}
         end
+        --- The file bridge (`bridge/fs.rs`): versioned reads, line-addressed
+        --- edits held to a `base` version, and the rollback of the last one.
+        record Fs
+            record ReadVersioned
+                content: string
+                version: string
+                lines: integer
+            end
+            --- The file, its content fingerprint, and its line count.
+            read_versioned: function(string): ReadVersioned
+            --- `{ base?, edits = {...} }`; answers the bridge's result table.
+            edit: function(string, {string:any}): {string:any}
+            --- Write the whole file.
+            write: function(string, string)
+            --- Restore the content the last successful edit replaced.
+            rollback: function(string): {string:any}
+        end
         json: Json
         kv: Kv
         sql: Sql
         ts: Ts
+        fs: Fs
     end
     --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
     --- call, by name.

@@ -455,6 +455,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `just test-lua` builds `agent-block` first; `just lint` runs `htl fmt` over
   `blocks/lib` beside stylua.
 
+- The Lua half of the four bridge tool modules is written in Teal —
+  `sql_tools`, `kv_tools`, `ts_tools`, `fs_tools` (`blocks/lib/<name>/
+  init.tl`), embedded through `include_tl!` both in `EMBEDDED_LIBS` and in
+  each bridge's fallback (`bridge/{sql,kv,ts,fs}.rs`). The same tools with
+  the same behaviour, typed: an `Opts` record per module, one `Input` shape
+  its handlers share, one `Def` per op, and `M.shapes.*` as `lshape.Schema`;
+  `fs_tools` types its helpers (`diverges_at`, `nearest_line`,
+  `line_edit_for`, `fit_lines`) and what `tool_specs` answers (`Spec`).
+  `blocks/lib/lshape.d.tl` declares the vendored validator for the checker
+  — the `t` DSL and `check` — without touching the upstream copy beside it;
+  a tool module keeps its tolerant `pcall(require, "lshape")`, and the
+  bridge's bare-VM fallback answers `require("host_types")` from
+  `package.preload` before running the source (`bridge/mod.rs`).
+  `host_types.d.tl` grows `std.sql` / `std.ts` / `std.fs` / `std.kv.list`
+  and the `tool` bridge. The 42 specs of the four modules pass against the
+  generated Lua.
+
+- `agent-block vendor` ends the copy it writes with a newline. The
+  hand-written sources did; the Lua Teal generates for a module does not,
+  and a copy that ends mid-line is one whose last line cannot be spliced
+  after — the `function M.x() … end` a project adds before `return M`.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

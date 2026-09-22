@@ -117,7 +117,7 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     // its module right after registering its Rust half (see
     // `bridge::load_tools_module`), so these resolve like every other
     // embedded module: a project's vendored copy first, this source last.
-    ("fs_tools", include_str!("../blocks/lib/fs_tools/init.lua")),
+    ("fs_tools", htl::include_tl!("blocks/lib/fs_tools/init.tl")),
     ("ts_tools", htl::include_tl!("blocks/lib/ts_tools/init.tl")),
     // Written in Teal, like `mcp_tools` above; `bridge/sql.rs` embeds the
     // same generated Lua for its fallback path.

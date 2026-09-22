@@ -412,7 +412,7 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
         lua,
         "fs_tools",
         "fs",
-        include_str!("../../blocks/lib/fs_tools/init.lua"),
+        htl::include_tl!("blocks/lib/fs_tools/init.tl"),
     )?;
 
     Ok(())
