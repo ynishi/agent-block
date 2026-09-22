@@ -869,7 +869,7 @@ function M.tool_specs(opts)
                 -- model did not reproduce, and nothing says so: the answer is
                 -- `applied = n` either way, and the loss surfaces one verify
                 -- later as a compile error pointing somewhere else entirely
-                -- [measured 2026-09-11, ST1 run 182520: one edit did not write
+                -- [measured 2026-09-11 in a sibling lane: one edit did not write
                 --  back the `opts` / `cursor` / `}` it had included in its
                 --  search, and the struct's closing brace went with them. The
                 --  error was "unclosed delimiter" at line 1568, while what had
