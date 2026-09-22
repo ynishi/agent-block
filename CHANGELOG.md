@@ -262,6 +262,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `policy` is one module in five files. `blocks/lib/policy/init.lua` had
+  grown past three thousand lines, and it is now the door — the header, the
+  eleven gathered by name, `policy.shapes`, the api registry and its dev-mode
+  gate — over four files grouped by what their policies read: `room`
+  (window, tokens, result_cap, thinking_cap — the ones that size against the
+  model's window, and the one split of it they share, `request_limit` for the
+  prompt and `reply_room` for the reply), `tools` (repeat_cap, require_args —
+  the ones that wrap the device's tools map), `carry` (the one filter that
+  reads the log) and `loop` (verdict, stagnation, retry, escalate — what the
+  loop asks between beats); `shared` holds the defaults, the log readers, the
+  contract prelude and the shapes more than one file hands out. Nothing a
+  caller sees moved: `require("policy")` answers the same table with the same
+  eleven exports and the same `shapes`, every spec runs unchanged against it,
+  and `agent-block vendor policy` copies the six files as one module
+  (`policy.<name>` is how a sub-file is named, as `llm_proto.openai` is). The
+  every-module fixture counts twenty-seven embedded names where it counted
+  twenty-two.
+
 - `coding.run` seeds the targets by name unless told otherwise: `seed`
   defaults to `"names"`, where the loop had always handed every target over
   whole and line-numbered. A caller that wants the old shape says `seed =

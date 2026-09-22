@@ -502,7 +502,19 @@ mod tests {
     #[test]
     fn a_pack_warns_and_is_written_anyway() {
         let plan = resolve("policy").expect("policy is embedded");
-        assert_eq!(module_rels(&plan), ["lib/policy/init.lua"]);
+        // The module and every file under it, in the order they are embedded:
+        // a pack vendors whole, the door first and its four files after.
+        assert_eq!(
+            module_rels(&plan),
+            [
+                "lib/policy/init.lua",
+                "lib/policy/shared.lua",
+                "lib/policy/room.lua",
+                "lib/policy/tools.lua",
+                "lib/policy/carry.lua",
+                "lib/policy/loop.lua",
+            ]
+        );
         let warning = plan.warning.expect("a pack warns");
         assert!(warning.contains("knl.device"), "{warning}");
         assert!(warning.contains("embedded.policy"), "{warning}");
