@@ -28,7 +28,7 @@
 ---
 --- opts:
 ---   allowed   : array of op names  — REQUIRED. "read", "write", "edit",
----                                   "rollback", "search_replace"
+---                                   "rollback", "search_replace", "append"
 ---   prefix    : tool name prefix   (default: "fs_")
 ---   path_lock : array of paths     (restricts every op to these files; the
 ---                                   model cannot reach anything else)
@@ -53,6 +53,16 @@
 --- `write` is the one to think twice about: whole-file replacement is how a
 --- model silently discards code it did not think to reproduce. That is a reason
 --- to weigh it, not a reason for this file to withhold it.
+---
+--- `append` adds text at the end of a file that already exists, and is the
+--- way to write one that does not fit a single call: `write` the first part,
+--- append the rest. A model that runs out of room mid-file otherwise has
+--- nothing to continue with — it re-`write`s from the top and loses what it
+--- had, or leaves the file empty [measured 2026-09-17 in a sibling lane: a run
+--- said it would add the tests next turn, hit the window, and left a 0-byte
+--- file. The one run of that task the lane judged correct wrote the file and
+--- extended it by three appends; the others used `append` too and were still
+--- judged wrong — the op gets the file written, not the task right].
 ---
 --- `search_replace` is the same edit addressed differently: the model names a
 --- verbatim snippet instead of a line range, and the handler finds the snippet
@@ -109,7 +119,8 @@ if shape_ok then
         allowed = T.array_of(T.string)
             :describe(
                 'the ops this caller hands its model: "read", "write", "edit", "rollback", '
-                    .. '"search_replace". Required — its absence is refused by name below, in both modes'
+                    .. '"search_replace", "append". Required — its absence is refused by name below, in '
+                    .. "both modes"
             )
             :is_optional(),
         prefix = T.string:describe('prepended to every tool name; default "fs_"'):is_optional(),
@@ -858,7 +869,7 @@ function M.tool_specs(opts)
                 -- model did not reproduce, and nothing says so: the answer is
                 -- `applied = n` either way, and the loss surfaces one verify
                 -- later as a compile error pointing somewhere else entirely
-                -- [measured 2026-09-11, ST1 run 182520: one edit did not write
+                -- [measured 2026-09-11 in a sibling lane: one edit did not write
                 --  back the `opts` / `cursor` / `}` it had included in its
                 --  search, and the struct's closing brace went with them. The
                 --  error was "unclosed delimiter" at line 1568, while what had
@@ -931,6 +942,63 @@ function M.tool_specs(opts)
                     return denied
                 end
                 std.fs.write(input.path, input.content)
+                return { ok = true }
+            end,
+        },
+
+        append = {
+            description = "Add text to the end of a file, keeping what is already there. This is the way to "
+                .. "write a file that does not fit one call: write the first part with "
+                .. prefix
+                .. "write, then append the rest, one call at a time. The file must exist — create it with "
+                .. prefix
+                .. "write first.",
+            input_schema = {
+                type = "object",
+                properties = {
+                    path = path_prop(),
+                    content = { type = "string", description = "Text added at the end, verbatim." },
+                },
+                required = { "path", "content" },
+            },
+            -- Read then write, through the same two primitives `write` and
+            -- `search_replace` use. Not `edit`: an append addresses no line
+            -- range and has no `expect` to hold the file to — what it asserts
+            -- about the file is only that it is there.
+            --
+            -- A file that is not there is refused rather than created. The op
+            -- that creates a file is `write`, and one call that either creates
+            -- or extends is a call whose result the caller cannot predict: a
+            -- path typed one character wrong would answer `ok` and leave the
+            -- text in a file nobody meant to write.
+            handler = function(input)
+                local denied = check_path(input.path)
+                if denied then
+                    return denied
+                end
+                -- `read_versioned` raises for a file that is not there (the
+                -- bridge's read is the only thing that knows), so the raise is
+                -- what stands in for "does it exist".
+                local read, current = pcall(std.fs.read_versioned, input.path)
+                if not read or type(current) ~= "table" then
+                    -- The same `path_missing` the check above answers for a
+                    -- call with no path at all, and for the same reason from
+                    -- the caller's side: the file this names is not there to
+                    -- act on. The two are told apart by what they carry — that
+                    -- one names the allowed paths, this one names the file.
+                    return refused({
+                        ok = false,
+                        reason = "path_missing",
+                        path = input.path,
+                        error = string.format(
+                            "'%s' does not exist, so there is nothing to add to. Create it with %swrite "
+                                .. "first, then append the rest.",
+                            tostring(input.path),
+                            prefix
+                        ),
+                    }, "path=" .. tostring(input.path))
+                end
+                std.fs.write(input.path, tostring(current.content or "") .. input.content)
                 return { ok = true }
             end,
         },

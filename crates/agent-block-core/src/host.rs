@@ -86,6 +86,20 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     ),
     ("policy", include_str!("../blocks/lib/policy/init.lua")),
     (
+        "policy.shared",
+        include_str!("../blocks/lib/policy/shared.lua"),
+    ),
+    ("policy.room", include_str!("../blocks/lib/policy/room.lua")),
+    (
+        "policy.tools",
+        include_str!("../blocks/lib/policy/tools.lua"),
+    ),
+    (
+        "policy.carry",
+        include_str!("../blocks/lib/policy/carry.lua"),
+    ),
+    ("policy.loop", include_str!("../blocks/lib/policy/loop.lua")),
+    (
         "supervisor",
         include_str!("../blocks/lib/supervisor/init.lua"),
     ),

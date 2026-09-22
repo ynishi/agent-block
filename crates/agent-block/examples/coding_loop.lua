@@ -23,6 +23,7 @@
 --   CODING_BASELINE  "false" skips the verify before the first beat (default: run it)
 --   CODING_DONE      what ends the run: "declare" (default) | "plan"
 --   CODING_CHECK_TIMEOUT  seconds one plan check may take (default 120; "plan" only)
+--   CODING_SEED      how the targets enter the seed: "names" (default) | "full"
 --   CODING_RESERVE   tokens the fold holds back for the reply on the openai
 --                    path, where the wire carries no cap (default 6144)
 --   CODING_VERIFY_TIMEOUT  seconds one verify may take, every time (default 900)
@@ -101,6 +102,7 @@ local result = coding.run({
     repeat_max = tonumber(E.get("CODING_REPEAT_MAX") or "2"),
     baseline = E.get("CODING_BASELINE") ~= "false",
     done = E.get("CODING_DONE") or "declare",
+    seed = E.get("CODING_SEED") or "names",
     check_timeout = tonumber(E.get("CODING_CHECK_TIMEOUT") or "120"),
 })
 

@@ -483,7 +483,12 @@ fn a_module_vendors_with_its_specs_beside_it() {
         .args(["vendor", "--list"])
         .assert()
         .success()
-        .stdout(predicate::str::is_match(r"(?m)^policy \(spec/: \d+\).*vendored$").expect("re"));
+        .stdout(
+            predicate::str::is_match(
+                r"(?m)^policy \(\+shared, room, tools, carry, loop\) \(spec/: \d+\).*vendored$",
+            )
+            .expect("re"),
+        );
 
     // `session` has no spec/: only the module itself is written.
     common::agent_block_cmd()

@@ -18,7 +18,7 @@ use axum::{
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -158,11 +158,23 @@ pub async fn spawn_openai_mock_server() -> (String, Arc<AtomicUsize>, Cancellati
 // `GET /v1/models` (the model card's `max_model_len`) — so a conf that names
 // the dialect is answered on every route it asks, not only the one it calls
 // most.
+//
+// Every chat request body is kept, in order, so a test can assert on what the
+// harness SENT and not only on what it did with the answer: the note a loop
+// puts in front of the next turn, and the fields a policy writes onto the
+// request, exist nowhere else.
+//
+// A scripted message may carry a `finish_reason` of its own. Without one the
+// handler derives it (a message with `tool_calls` asked for a tool, anything
+// else answered), which is the honest reading of a whole reply; naming it is
+// how a test scripts a reply that was CUT — `finish_reason = "length"` — which
+// no shape of the message itself can express.
 
 /// Shared state for the scripted handler.
 #[derive(Clone)]
 pub struct ScriptedState {
     pub call_count: Arc<AtomicUsize>,
+    pub bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     script: Arc<Vec<serde_json::Value>>,
     model: Arc<String>,
 }
@@ -175,32 +187,59 @@ const SCRIPTED_TOKEN_COUNT: u64 = 128;
 /// The window `GET /v1/models` names for the scripted model.
 const SCRIPTED_MAX_MODEL_LEN: u64 = 32768;
 
-/// `POST /chat/completions` — answer the n-th scripted message.
+/// `POST /chat/completions` — answer the n-th scripted message, recording the
+/// body it was sent.
 ///
-/// `finish_reason` is read off the message rather than passed in: a message
-/// carrying `tool_calls` is a turn that asked for a tool, anything else is a
-/// turn that answered. One fact, in one place.
+/// `finish_reason` is derived from the message unless the script names one: a
+/// message carrying `tool_calls` is a turn that asked for a tool, anything
+/// else is a turn that answered. One fact, in one place — and a scripted
+/// `finish_reason` is the one thing that reading cannot reach, a reply the
+/// server cut off.
 async fn scripted_chat_handler(
     State(state): State<ScriptedState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = serde_json::from_slice::<serde_json::Value>(&body) {
-        eprintln!("[scripted_openai_mock] failed to parse request body: {e}");
-        let err_body = json!({ "error": format!("bad request: {e}") }).to_string();
-        return (
-            StatusCode::BAD_REQUEST,
-            [(header::CONTENT_TYPE, "application/json")],
-            err_body,
-        );
-    }
+    let parsed = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("[scripted_openai_mock] failed to parse request body: {e}");
+            let err_body = json!({ "error": format!("bad request: {e}") }).to_string();
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                err_body,
+            );
+        }
+    };
+    state
+        .bodies
+        .lock()
+        .expect("the recorded bodies are not poisoned")
+        .push(parsed);
 
     let n = state.call_count.fetch_add(1, Ordering::SeqCst);
     let idx = n.min(state.script.len() - 1);
-    let message = state.script[idx].clone();
+    let mut message = state.script[idx].clone();
     let asked_for_tools = message
         .get("tool_calls")
         .map(|v| !v.is_null())
         .unwrap_or(false);
+    // The script's own word for how this reply ended, taken off the message
+    // and not sent as part of it: `finish_reason` is the choice's field, not
+    // the message's, and a test that scripts a cut reply is saying something
+    // about the turn rather than about its content.
+    let scripted_finish = message
+        .as_object_mut()
+        .and_then(|m| m.remove("finish_reason"))
+        .and_then(|v| v.as_str().map(str::to_owned));
+    let finish_reason = scripted_finish.unwrap_or_else(|| {
+        if asked_for_tools {
+            "tool_calls"
+        } else {
+            "stop"
+        }
+        .to_owned()
+    });
 
     let response_json = json!({
         "id": format!("chatcmpl-scripted-{}", n + 1),
@@ -208,7 +247,7 @@ async fn scripted_chat_handler(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": if asked_for_tools { "tool_calls" } else { "stop" }
+            "finish_reason": finish_reason
         }],
         "usage": {
             "prompt_tokens": 10,
@@ -254,28 +293,38 @@ async fn scripted_tokenize_handler() -> impl IntoResponse {
 /// Spawn a scripted OpenAI-compatible mock on an ephemeral port.
 ///
 /// `script` is the `message` object each `/chat/completions` call answers
-/// with, in order; the last one answers every call past the end.
+/// with, in order; the last one answers every call past the end. A message
+/// carrying a `finish_reason` string has it lifted onto the choice (and
+/// removed from the message), which is how a cut reply is scripted.
 ///
-/// Returns `(base_url, call_count, cancellation_token)` — `call_count` is the
-/// number of chat calls made, which is the number of beats that reached the
-/// provider.
+/// Returns `(base_url, call_count, bodies, cancellation_token)` —
+/// `call_count` is the number of chat calls made, which is the number of
+/// beats that reached the provider, and `bodies` is every chat request body
+/// in the order they arrived.
 ///
 /// Panics on an empty script (there would be nothing to answer with) or if
 /// the ephemeral port cannot be bound (test infra failure).
 pub async fn spawn_scripted_openai_mock(
     script: Vec<serde_json::Value>,
     model: &str,
-) -> (String, Arc<AtomicUsize>, CancellationToken) {
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    CancellationToken,
+) {
     assert!(
         !script.is_empty(),
         "spawn_scripted_openai_mock: the script must name at least one answer"
     );
 
     let call_count = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
     let ct = CancellationToken::new();
 
     let state = ScriptedState {
         call_count: call_count.clone(),
+        bodies: bodies.clone(),
         script: Arc::new(script),
         model: Arc::new(model.to_string()),
     };
@@ -302,5 +351,5 @@ pub async fn spawn_scripted_openai_mock(
             .await;
     });
 
-    (format!("http://{addr}"), call_count, ct)
+    (format!("http://{addr}"), call_count, bodies, ct)
 }

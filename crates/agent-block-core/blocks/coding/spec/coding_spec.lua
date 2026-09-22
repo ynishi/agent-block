@@ -13,7 +13,8 @@
 --     under the repo, an absolute path left alone, an empty list refused;
 --   2 numbered: 1-based numbers, a trailing newline does not add a line;
 --   3 seed: every file goes in whole and numbered, however large, a missing
---     one is left out, and the spec comes first;
+--     one is left out, and the spec comes first; `mode = "names"` lists the
+--     paths and reads nothing, and a mode it does not know is refused;
 --   4 run: the opts it refuses — no spec, no verify, no targets, an llm
 --     without port and conf, a non-integer iteration count, a `done` that is
 --     neither mode, and `done = "plan"` with no `check_timeout`;
@@ -41,7 +42,12 @@
 --  13 result_of: the result out of a converged state and out of one that gave
 --     up, and what plan mode puts on it — the counts, the checks still
 --     failing, and a plan nobody filed;
---  14 _beat_outcome: the kernel's four statuses as the loop reads them — the
+--  14 ops_of: which std.fs ops the model is handed — the default two, one
+--     edit op or several, a name given twice counted once, the shapes it
+--     refuses, and that the names themselves are std.fs's to judge;
+--  15 cut_at_limit: which stop_reason words say a reply was cut at the
+--     output limit, and that a reply which finished is not one;
+--  16 _beat_outcome: the kernel's four statuses as the loop reads them — the
 --     answer, `max_iters` for a stop on the grant, `llm_call` for an error or
 --     a refusal.
 
@@ -124,6 +130,37 @@ describe("coding.seed", function()
         expect(seed:find("101\tpub fn big() {}", 1, true) ~= nil).to.be(true)
         expect(seed:find("Structural map", 1, true)).to.be(nil)
     end)
+
+    it('mode = "names": every path, no content, and the model told to read what it needs', function()
+        local seed = coding.seed("Do it.", { "/r/small.rs", "/r/big.rs" }, { read = read, mode = "names" })
+        expect(seed:sub(1, 6)).to.be("Do it.")
+        expect(seed:find("## Target files", 1, true) ~= nil).to.be(true)
+        expect(seed:find("read the parts you need first", 1, true) ~= nil).to.be(true)
+        expect(seed:find("/r/small.rs", 1, true) ~= nil).to.be(true)
+        expect(seed:find("/r/big.rs", 1, true) ~= nil).to.be(true)
+        -- Not one line of either file, and not one line number.
+        expect(seed:find("pub fn a() {}", 1, true)).to.be(nil)
+        expect(seed:find("pub fn big() {}", 1, true)).to.be(nil)
+        expect(seed:find("## Current content of", 1, true)).to.be(nil)
+    end)
+
+    it("names a target the full mode would leave out — nothing is read to build it", function()
+        -- `read` is never called, so a target that does not exist yet is in
+        -- the list all the same: its path is what the model is being given.
+        local seed = coding.seed("Do it.", { "/r/none.rs" }, {
+            read = function()
+                error("mode = names must not read a target")
+            end,
+            mode = "names",
+        })
+        expect(seed:find("/r/none.rs", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("refuses a mode it does not know", function()
+        expect(function()
+            coding.seed("Do it.", { "/r/small.rs" }, { read = read, mode = "map" })
+        end).to.fail()
+    end)
 end)
 
 describe("coding.run — what it refuses", function()
@@ -200,9 +237,44 @@ describe("coding.run — what it refuses", function()
         )
     end)
 
+    it('refuses a seed shape that is neither "full" nor "names"', function()
+        expect(about(refusal({ seed = "map" }), '`seed` must be "full" or "names"')).to.be(true)
+        expect(about(refusal({ seed = "names" }), "`seed`")).to.be(false)
+    end)
+
+    it("refuses a tool set it cannot read, with the other opts", function()
+        expect(about(refusal({ ops = "search_replace" }), "`ops` must be a table")).to.be(true)
+        expect(about(refusal({ ops = { edits = { "write" } } }), "`ops` has no option 'edits'")).to.be(true)
+        -- A tool set it can read gets past this and on to the next refusal.
+        expect(about(refusal({ ops = { edit = { "write", "append" } } }), "`ops`")).to.be(false)
+    end)
+
     it("takes a reserve of whole tokens and nothing else", function()
         expect(about(refusal({ reserve = 0 }), "`reserve` must be a whole number")).to.be(true)
         expect(about(refusal({ reserve = "observed_max" }), "`reserve` must be a whole number")).to.be(true)
+    end)
+
+    it("takes a call_reserve of whole tokens and nothing else", function()
+        expect(about(refusal({ call_reserve = -1 }), "`call_reserve` must be a whole number")).to.be(true)
+        expect(about(refusal({ call_reserve = 1.5 }), "`call_reserve` must be a whole number")).to.be(true)
+        -- Zero is a number a caller may mean: keep nothing back for the call.
+        local thinking_on = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = true } }
+        expect(about(refusal({ call_reserve = 0, llm = thinking_on }), "`call_reserve`")).to.be(false)
+    end)
+
+    it("refuses a call_reserve over a conf that does not turn reasoning on", function()
+        -- The stop point goes on the wire as a thinking table, and the
+        -- adapter reads one as reasoning on: a conf that said nothing, or
+        -- said off, would be switched on by the budget. Refused before the
+        -- baseline verify, with the other opts.
+        expect(about(refusal({ call_reserve = 512 }), "needs llm.conf.thinking to turn reasoning on")).to.be(true)
+        local off = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = false } }
+        expect(about(refusal({ call_reserve = 512, llm = off }), "needs llm.conf.thinking")).to.be(true)
+        local disabled = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = { enabled = false } } }
+        expect(about(refusal({ call_reserve = 512, llm = disabled }), "needs llm.conf.thinking")).to.be(true)
+        -- Either spelling of "on" gets past it.
+        local on = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = { effort = "high" } } }
+        expect(about(refusal({ call_reserve = 512, llm = on }), "needs llm.conf.thinking")).to.be(false)
     end)
 
     it("needs the reply's seconds named", function()
@@ -238,6 +310,8 @@ describe("coding.run — what it refuses", function()
             result_share = 0.25,
             repeat_max = 2,
             done = "declare",
+            ops = { read = "read", edit = { "search_replace" } },
+            seed = "full",
         }
         local without_iters = {}
         for k, v in pairs(named) do
@@ -302,6 +376,66 @@ describe("coding.decide — what ends a run", function()
         expect(coding.decide("plan", with({ plan = { total = 0, passed = 0 } }))).to.be(false)
         expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, declared = false }))).to.be(false)
         expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, verify_ok = false }))).to.be(false)
+    end)
+end)
+
+describe("coding.ops_of — which std.fs ops the model is handed", function()
+    it("is read + search_replace when the caller names none", function()
+        local ops = coding.ops_of(nil)
+        expect(ops.read).to.be("read")
+        expect(ops.edit).to.equal({ "search_replace" })
+    end)
+
+    it("takes one edit op as a string and several as an array", function()
+        expect(coding.ops_of({ edit = "write" }).edit).to.equal({ "write" })
+        local several = coding.ops_of({ read = "read", edit = { "search_replace", "write", "append" } })
+        expect(several.edit).to.equal({ "search_replace", "write", "append" })
+        expect(several.read).to.be("read")
+    end)
+
+    it("names an op once however often the caller does — one tool, one entry", function()
+        expect(coding.ops_of({ edit = { "write", "write", "append" } }).edit).to.equal({ "write", "append" })
+    end)
+
+    it("refuses a shape that is not a tool set, and a key it does not know", function()
+        expect(function()
+            coding.ops_of("search_replace")
+        end).to.fail()
+        expect(function()
+            coding.ops_of({ edit = {} })
+        end).to.fail()
+        expect(function()
+            coding.ops_of({ edit = { 7 } })
+        end).to.fail()
+        expect(function()
+            coding.ops_of({ read = true })
+        end).to.fail()
+        expect(function()
+            coding.ops_of({ edits = { "write" } })
+        end).to.fail()
+    end)
+
+    it("does not check the names against a list of its own — that is std.fs's to answer", function()
+        -- An op that does not exist gets this far; it is refused where the
+        -- tool is built, by the module that knows which ops there are.
+        expect(coding.ops_of({ edit = { "teleport" } }).edit).to.equal({ "teleport" })
+    end)
+end)
+
+describe("coding.cut_at_limit — an answer that ran out of room", function()
+    it("knows the word each dialect uses for a reply cut at the output limit", function()
+        -- Anthropic says `max_tokens` itself; the OpenAI dialect's
+        -- `map_finish_reason` turns `length` into the same word, and `length`
+        -- is read as well for a port that hands the provider's own through.
+        expect(coding.cut_at_limit("max_tokens")).to.be(true)
+        expect(coding.cut_at_limit("length")).to.be(true)
+    end)
+
+    it("is false for a reply that finished, and for one with no word at all", function()
+        expect(coding.cut_at_limit("end_turn")).to.be(false)
+        expect(coding.cut_at_limit("tool_use")).to.be(false)
+        expect(coding.cut_at_limit(nil)).to.be(false)
+        expect(coding.cut_at_limit(4096)).to.be(false)
     end)
 end)
 
@@ -438,6 +572,8 @@ describe("coding.config_of — what the run was configured with", function()
         iters = 5,
         turns = 8,
         done = "declare",
+        ops = { read = "read", edit = { "search_replace", "append" } },
+        seed = "names",
         repo = "/r",
         system = "SYS",
         targets = { "/r/a.rs" },
@@ -476,6 +612,29 @@ describe("coding.config_of — what the run was configured with", function()
         expect(c.values.system.value).to.be("SYS")
         expect(c.values.verify.value).to.be("true")
         expect(c.values.llm_timeout.value).to.be(600)
+    end)
+
+    it("carries the ops the run resolved, and where they came from", function()
+        local taken = config({})
+        expect(taken.values.ops.from).to.be("default")
+        expect(taken.values.ops.value.read).to.be("read")
+        expect(taken.values.ops.value.edit).to.equal({ "search_replace", "append" })
+        expect(config({ ops = { edit = { "write" } } }).values.ops.from).to.be("caller")
+    end)
+
+    it("carries the seed shape the run used", function()
+        expect(config({}).values.seed.from).to.be("default")
+        expect(config({}).values.seed.value).to.be("names")
+        expect(config({ seed = "names" }).values.seed.from).to.be("caller")
+    end)
+
+    it("names a call_reserve the caller gave, and claims no value for one nobody did", function()
+        local none = config({})
+        expect(none.values.call_reserve.value).to.be(nil)
+        expect(none.values.call_reserve.from).to.be("default")
+        local given = config({ call_reserve = 3072 })
+        expect(given.values.call_reserve.value).to.be(3072)
+        expect(given.values.call_reserve.from).to.be("caller")
     end)
 
     it("claims no source for a value nobody gave", function()

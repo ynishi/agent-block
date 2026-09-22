@@ -10,6 +10,12 @@
 --   CODING_DONE_TEST      "declare" (default) | "plan"
 --   CODING_OMIT_RESERVE   "1": run with neither `reserve` nor `max_tokens`,
 --                         which is the tripwire case — no model is called
+--   CODING_EDIT_OPS_TEST  comma-separated std.fs edit ops, e.g.
+--                         "search_replace,write,append"; default the module's
+--   CODING_SEED_TEST      "full" (default) | "names"
+--   CODING_CALL_RESERVE_TEST  tokens kept out of the reasoning for the call;
+--                         set, the conf also asks for thinking, so the vllm
+--                         dialect puts `thinking_token_budget` on the wire
 --
 -- One marker line per fact, so a Rust assertion names the fact and not a
 -- position in the output.
@@ -20,6 +26,9 @@ local repo = std.env.get("CODING_REPO_TEST")
 assert(repo, "CODING_REPO_TEST must be set")
 local done_mode = std.env.get("CODING_DONE_TEST") or "declare"
 local omit_reserve = std.env.get("CODING_OMIT_RESERVE") == "1"
+local edit_ops = std.env.get("CODING_EDIT_OPS_TEST")
+local seed_mode = std.env.get("CODING_SEED_TEST")
+local call_reserve = tonumber(std.env.get("CODING_CALL_RESERVE_TEST") or "")
 
 local coding = require("coding")
 local adapter = require("knl_adapter")
@@ -52,6 +61,22 @@ local opts = {
 }
 if done_mode == "plan" then
     opts.check_timeout = 10
+end
+if seed_mode then
+    opts.seed = seed_mode
+end
+if call_reserve then
+    opts.call_reserve = call_reserve
+    -- The budget only reaches the wire when the request asks for reasoning at
+    -- all, and only on the vllm dialect this conf already names.
+    opts.llm.conf.thinking = { enabled = true }
+end
+if edit_ops then
+    local edit = {}
+    for op in edit_ops:gmatch("[^,]+") do
+        edit[#edit + 1] = op
+    end
+    opts.ops = { read = "read", edit = edit }
 end
 if omit_reserve then
     opts.reserve = nil

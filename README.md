@@ -704,7 +704,7 @@ to keep so that the rest of the binary keeps working.
 | module | what a replacement must keep |
 |---|---|
 | kernel + declaration — `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | A project's `lib/knl/init.lua` is the kernel for that project, and `require("embedded.knl")` still reads the original. The kernel is one thing across Rust and Lua, so what a replacement has to keep is stated in the module doc of `crates/agent-block-core/src/bridge/knl.rs` and checked by the specs `agent-block vendor knl` writes beside the copy. `knl_types` has no file to vendor because it is generated at start from the Rust types — put one on the filesystem and it wins over the generated one, and the surface is yours to declare from then on. |
-| shell packs — `policy`, `supervisor` | Whatever your own loop calls on them, and the signatures the kernel's seams take: a `fold` is handed the log, a filter is `fn(request) -> request`, a `cost` answers a number. A pack is a value you hand to `knl.device` or consult between beats, not a registry the host reads, so a whole copy is usually more than a change needs — shadow and delegate through `embedded.<name>`, or hand your own value to the seam directly. The module headers say which of the nine plugs in where. |
+| shell packs — `policy`, `supervisor` | Whatever your own loop calls on them, and the signatures the kernel's seams take: a `fold` is handed the log, a filter is `fn(request) -> request`, a `cost` answers a number. A pack is a value you hand to `knl.device` or consult between beats, not a registry the host reads, so a whole copy is usually more than a change needs — shadow and delegate through `embedded.<name>`, or hand your own value to the seam directly. The module headers say which of the eleven plugs in where. |
 | consumers — `agent`, `coding` | Whatever your own scripts call: `agent.run(opts)`, `coding.run(opts)`. `agent-block vendor agent` (or `vendor coding`) writes the embedded source into `.agent-block/lib/` with its specs, and it is the module your scripts get; a hand-written `lib/agent/init.lua` in the project root works the same way and still wins over the user tier. `coding.run` is the loop that edits files until a verify command passes; `examples/coding_loop.lua` is a block over it. |
 | utilities — `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Whatever `knl_adapter` calls on them, since it requires both: `adapter(provider)` and the `build` / `parse` / `count` / `profile` / `health` it hands back, plus `transport` and `response_blocks`, on `llm_proto`; `tool_decl` and `result_text` on `mcp_tools`. Delegating through `embedded.<name>` is the cheap way to keep that half intact while changing the other. |
 
@@ -785,7 +785,7 @@ agent-block vendor --force        overwrite a copy that is already there
 carries is a module to a project), a `pack`
 when it is one, and `vendored` when this project has a copy — with sub-modules
 folded under the root they belong to (`lshape (+t, check, reflect, luacats)`) and the
-spec count beside it (`policy (spec/: 11)`). An
+spec count beside it (`policy (+shared, room, tools, carry, loop) (spec/: 14)`). An
 existing copy is never overwritten without `--force`, because by then it is the
 project's own and likely edited; with it the copy is replaced outright, and the edits
 it had are wherever you committed them.

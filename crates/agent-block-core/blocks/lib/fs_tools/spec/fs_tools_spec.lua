@@ -24,7 +24,9 @@
 --   4 `path_lock` is the handler's, not the caller's: a path outside the lock
 --     is refused by the handler before the bridge is touched at all;
 --   5 `register_tools` puts the same specs in the registry and answers their
---     names.
+--     names;
+--   6 `append` adds to the end of a file that is there, refuses one that is
+--     not by pointing at `write`, and is path-locked like every other op.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -35,11 +37,30 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 --- the `path_lock` case below.
 local reads = {}
 
+--- Every `std.fs.write`, in order: `{ path, content }` each. The `append` op
+--- is a read and a write, and what it wrote is the whole of what it did.
+local writes = {}
+
+--- What a path holds. A path that is not in here is one the bridge cannot
+--- read, and the stub raises for it exactly as the real `read_versioned`
+--- does — which is how `append` tells a file that is not there from one that
+--- is.
+local files = { ["/work/kept.rs"] = "alpha\nbravo\n" }
+
 _G.std = {
     fs = {
         read_versioned = function(path)
             reads[#reads + 1] = path
-            return { content = "alpha\nbravo\n", lines = 2, version = "v1" }
+            local content = files[path]
+            if content == nil then
+                error("fs.edit: cannot read " .. tostring(path) .. ": No such file or directory")
+            end
+            local _, newlines = content:gsub("\n", "")
+            return { content = content, lines = newlines, version = "v1" }
+        end,
+        write = function(path, content)
+            writes[#writes + 1] = { path = path, content = content }
+            files[path] = content
         end,
     },
     json = {
@@ -190,6 +211,54 @@ describe("fs_tools.tool_specs — path_lock", function()
         expect(answer.ok).to.be(nil)
         expect(answer.total).to.be(2)
         expect(reads[1]).to.be("/work/kept.rs")
+    end)
+end)
+
+describe("fs_tools.tool_specs — append", function()
+    --- The `append` spec, locked to the one file the tests write.
+    local function append_spec()
+        return fs_tools.tool_specs({ allowed = { "append" }, path_lock = { "/work/kept.rs" } })[1]
+    end
+
+    it("adds to the end, keeping what was there, in one write", function()
+        files["/work/kept.rs"] = "alpha\nbravo\n"
+        writes = {}
+        local answer = append_spec().handler({ path = "/work/kept.rs", content = "charlie\n" })
+
+        expect(answer.ok).to.be(true)
+        expect(#writes).to.be(1)
+        expect(writes[1].path).to.be("/work/kept.rs")
+        expect(writes[1].content).to.be("alpha\nbravo\ncharlie\n")
+    end)
+
+    it("refuses a file that is not there, and says to create it with write first", function()
+        files["/work/kept.rs"] = nil
+        writes = {}
+        local answer = append_spec().handler({ path = "/work/kept.rs", content = "x" })
+
+        expect(answer.ok).to.be(false)
+        expect(answer.reason).to.be("path_missing")
+        expect(answer.path).to.be("/work/kept.rs")
+        expect(answer.error:find("fs_write", 1, true) ~= nil).to.be(true)
+        -- Nothing was written: the op that creates a file is `write`, and a
+        -- refusal that quietly created one would be that op under this name.
+        expect(#writes).to.be(0)
+        files["/work/kept.rs"] = "alpha\nbravo\n"
+    end)
+
+    it("holds to the path lock, before the bridge is touched at all", function()
+        reads, writes = {}, {}
+        local answer = append_spec().handler({ path = "/etc/passwd", content = "x" })
+
+        expect(answer.ok).to.be(false)
+        expect(answer.reason).to.be("path_not_allowed")
+        expect(#reads).to.be(0)
+        expect(#writes).to.be(0)
+    end)
+
+    it("declares both its arguments required, so a call cut short is caught", function()
+        local schema = append_spec().input_schema
+        expect(schema.required).to.equal({ "path", "content" })
     end)
 end)
 

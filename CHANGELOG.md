@@ -9,6 +9,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.split({ port, conf?, reserve?, used? })` hands the window's split
+  back as a value: `{ window, max_output, limit, held }` — the profile's
+  window and the wire's cap (0 for none), the most a request may cost, and
+  what `reserve` held back beyond the cap — with `room` beside them when
+  `used` names what a request costs: the reply's side, `min(window − used,
+  max_output)`. They are the same readings `policy.window`, `result_cap` and
+  `thinking_cap` make for themselves, off the same profile through the same
+  three functions, so a caller can log the numbers a run is sized by, check
+  a conf before opening a session, or size something of its own against the
+  split rather than a second guess at it. A reading, not a policy: it plugs
+  into no seam and changes nothing by being called. The shape is
+  `policy.shapes.split`.
+
+- `policy.thinking_cap({ port, conf, call_reserve, budget? })` sends the
+  reasoning's stop point with every request, and `coding.run{ call_reserve =
+  N }` is the opt that puts it on a run. The model cannot see its room, and
+  its reasoning comes out of the same allowance as the answer: a beat whose
+  prompt has grown has less left for both, nothing in the conversation says so,
+  and the tool call the model was about to make never gets written [measured
+  2026-09-13 in a sibling lane: a prompt of 24,984 tokens in a 32k window,
+  7,121 of them spent thinking, and the call that followed arrived as `{}`].
+  The filter takes the reply's room — the window less the Port's count of the
+  request, and no more than `profile.max_output` where the wire carries that
+  cap — less `call_reserve`, capped by `budget` when the caller has one, and
+  sends it as `request.thinking.budget_tokens`; under one token it sends
+  nothing, since "stop after 0 tokens" is not a stop point. The room is read
+  off the same profile `policy.window` splits the window by, through a
+  `reply_room` beside its `request_limit`, so the split between prompt and
+  reply is decided in one place; what the fold held back as `reserve` is not
+  named to this filter and not subtracted again — it is that room. The conf
+  has to turn reasoning on (`thinking = true`, or a table whose `enabled` is
+  not false), and the filter refuses one that does not: the adapter reads a
+  thinking table on the request as reasoning on, and the request's replaces
+  the conf's, so a budget over a conf that asked for no reasoning would switch
+  it on by itself. It reads no log and keeps nothing between beats — the room
+  comes from the Port's own count of the request the fold has just built, which
+  is the count the fold already asked for when nothing before this filter
+  changed the request. No other harness sizes reasoning per request; the ones surveyed fix
+  an effort for the run, and what varies with the remaining room is done
+  provider-side where it is done at all. The evidence for doing it here is a
+  sibling lane's [measured 2026-09-14: on a 32k window, the beats where the
+  stop point fired still delivered their tool call, where the unbounded ones
+  filled the window and delivered nothing]. It is opt-in and reaches the wire
+  only on a dialect that takes a per-request budget — vLLM's
+  `thinking_token_budget`; `llm_proto.openai` warns and sends nothing on the
+  others, and Anthropic deprecated its own `budget_tokens` in 4.6.
+
+- `coding.run{ seed = "names" }` seeds the targets by path instead of by
+  content, and it is the default: the spec, then the list of files to edit,
+  and the model reads the parts it needs with the read tool.
+  `coding.seed(spec, targets, { mode = "names" })` is the same thing as a
+  function; `seed = "full"` is every target whole and line-numbered, the shape
+  the loop had before. Names is the shape every run in the sibling lane has
+  taken since 2026-09-14 — the rework runs it judged correct (4 of 6), and a
+  1,991-line target (2 of 2) that no window in that lane could have held whole
+  — and the one published comparison prefers it too: a viewer-based agent
+  measured whole-file seeding worst of its options (SWE-agent ACI, 12.7
+  against 18.0 for a 100-line viewer). Full has no run behind it since the
+  lane switched. `seed` joins the knobs `strict` requires a caller to state,
+  and goes into the `config` record with the rest.
+
+- `std.fs` has an `append` op, and `coding.run{ ops }` says which ops the model
+  is handed. Appending is how a file too large for one reply gets written:
+  `write` the first part, append the rest, one call at a time. Without it a
+  model that runs out of room mid-file has nothing to continue with — it
+  rewrites from the top and loses what it had, or leaves the file empty
+  [measured 2026-09-17 in a sibling lane: a run said it would add its tests on
+  the next turn, hit the window, and left a 0-byte file. In the one run of
+  that task the lane later judged correct, the model's first write arrived
+  without its content and was refused, the reply was cut, and the file was
+  then written and extended by three appends; the other runs of the task used
+  append as well and were still judged wrong — append got the file written,
+  it did not get the task right]. The op reads and writes through the
+  same primitives the other ops use, holds to the same `path_lock`, and refuses
+  a file that is not there rather than creating one: the op that creates a file
+  is `write`, and one call that either creates or extends is a call whose
+  result the caller cannot predict. `coding.run{ ops = { read = "read", edit =
+  { "search_replace", "write", "append" } } }` picks the tool set; the default
+  is `{ read = "read", edit = { "search_replace" } }`, the two tools the loop
+  has always handed out. Every edit op is path-locked to the targets, every one
+  counts toward the edits a run has landed, and every one resets
+  `policy.repeat_cap` — what makes an old read new again is the file having
+  changed, and any of them changes it. The system line names the edit tools it
+  was given, an op `std.fs` does not have is refused by name, and `ops` joins
+  the knobs `strict` requires a caller to state.
+
+- `policy.require_args()` refuses a tool call whose required arguments did not
+  all arrive, before the handler runs: `{ ok = false, reason =
+  "argument_missing", missing = <key> }`, naming the argument and saying where
+  a call like that comes from. A reply that runs out of room stops wherever it
+  had got to, and that may be the middle of a call's arguments — the call
+  reaches the tool with a `path` and no `content`, and the tool answers in its
+  own vocabulary for a field it found missing, which says nothing about the
+  reply having been cut [measured 2026-09-17 in a sibling lane: five `fs_write`
+  calls arrived with no `content` and three of them drew no word about it, so
+  the model sent the same shape again]. The check is on the arguments rather
+  than on `finish_reason`, because the servers do not fill that field reliably
+  — vLLM reports a call cut at the output ceiling as a whole one — and nothing
+  is retried or repaired: re-sending on the harness's own initiative is the
+  loop other harnesses report. A tool declaring no `required` list is handed
+  back as it is. `coding.run` wraps its tools with it, outermost of the three:
+  a call that arrived without its arguments is not a repeat of anything and has
+  no result to measure. Beside it, a beat whose answer stopped at the output
+  limit (`stop_reason` = `max_tokens` / `length`) is no longer read as the
+  model declaring it is done, and the next request carries the fact as one
+  harness line.
+
 - `coding.config_of(opts, resolved)` and `coding.result_of(st, max_iters)` are
   the two halves of a run that were built inline: what the run was configured
   with — every knob with its value and whether that value came from the
@@ -167,6 +274,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel's session ids are UUIDs.
 
 ### Changed
+
+- `policy` is one module in five files. `blocks/lib/policy/init.lua` had
+  grown past three thousand lines, and it is now the door — the header, the
+  eleven gathered by name, `policy.shapes`, the api registry and its dev-mode
+  gate — over four files grouped by what their policies read: `room`
+  (window, tokens, result_cap, thinking_cap — the ones that size against the
+  model's window, and the one split of it they share, `request_limit` for the
+  prompt and `reply_room` for the reply), `tools` (repeat_cap, require_args —
+  the ones that wrap the device's tools map), `carry` (the one filter that
+  reads the log) and `loop` (verdict, stagnation, retry, escalate — what the
+  loop asks between beats); `shared` holds the defaults, the log readers, the
+  contract prelude and the shapes more than one file hands out. Nothing a
+  caller sees moved: `require("policy")` answers the same table with the same
+  eleven exports and the same `shapes`, every spec runs unchanged against it,
+  and `agent-block vendor policy` copies the six files as one module
+  (`policy.<name>` is how a sub-file is named, as `llm_proto.openai` is). The
+  every-module fixture counts twenty-seven embedded names where it counted
+  twenty-two.
+
+- `coding.run` seeds the targets by name unless told otherwise: `seed`
+  defaults to `"names"`, where the loop had always handed every target over
+  whole and line-numbered. A caller that wants the old shape says `seed =
+  "full"`. `coding.seed` the helper is unchanged — its `mode` left nil still
+  reads as `"full"` — the default moved on the loop alone. The reasons are
+  under Added, with the opt.
 
 - The `coding` loop's state is one table and its steps are plain functions.
   `coding.run`'s implementation held its state in a dozen mutable locals that
