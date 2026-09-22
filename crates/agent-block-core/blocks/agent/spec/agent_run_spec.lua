@@ -1,10 +1,10 @@
--- agent_run_test.lua — mlua-lspec tests that drive agent.run itself.
+-- agent_run_spec.lua — mlua-lspec tests that drive agent.run itself.
 --
 -- Run via:
---   just test-lua agent_run_test   # this file
+--   just test-lua agent_run_spec   # this file
 --   just test-lua                  # every spec fixture
 --
--- agent_helpers_test covers the pure helpers; these go through `M.run`, so the
+-- agent_helpers_spec covers the pure helpers; these go through `M.run`, so the
 -- dev-mode assert on `M.shapes.run_result` fires on every case below —
 -- including the ones that are supposed to fail, since a failure is a shape too.
 --
@@ -57,6 +57,23 @@ local check = lshape.check
 local kernel = require("knl")
 local Outcome = kernel.Outcome
 local agent = require("agent")
+
+-- `agent.run` has no number of its own for how long a reply may take or how
+-- many beats a session is granted; both are the run's. These cases measure
+-- behaviour, not allotment, so one helper names them once and a case that
+-- cares passes its own.
+local RUN_REQUIRED = { timeout = 120, max_iterations = 20 }
+
+local function agent_run(opts)
+    local merged = {}
+    for k, v in pairs(RUN_REQUIRED) do
+        merged[k] = v
+    end
+    for k, v in pairs(opts or {}) do
+        merged[k] = v
+    end
+    return agent.run(merged)
+end
 
 local real_fold = kernel.fold
 
@@ -134,28 +151,37 @@ describe("agent.run result contract", function()
     end)
 
     it("refuses a missing prompt as a failure, not an exception", function()
-        local res = agent.run({})
+        local res = agent_run({})
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("prompt is required")
         expect(res.num_turns).to.equal(0)
         expect(check.check(res, agent.shapes.run_result)).to.equal(true)
+
+        -- Neither has a default: the run says how long a reply may take and
+        -- how many beats it is granted, or it does not run.
+        res = agent.run({ prompt = "ask", max_iterations = 1 })
+        expect(res.ok).to.equal(false)
+        expect(res.error).to.equal("timeout (seconds) is required")
+        res = agent.run({ prompt = "ask", timeout = 5 })
+        expect(res.ok).to.equal(false)
+        expect(res.error).to.equal("max_iterations is required")
     end)
 
     it("treats an empty prompt the same way", function()
-        local res = agent.run({ prompt = "" })
+        local res = agent_run({ prompt = "" })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("prompt is required")
     end)
 
     it("refuses a history that is not a messages array", function()
-        local res = agent.run({ prompt = "ask", history = "nope" })
+        local res = agent_run({ prompt = "ask", history = "nope" })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("history must be a table (messages array)")
     end)
 
     it("returns content on the success path", function()
         beats = { answered("thinking", { tool = "x" }), answered("the answer") }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(res.ok).to.equal(true)
         expect(res.content).to.equal("the answer")
         expect(res.num_turns).to.equal(2)
@@ -173,7 +199,7 @@ describe("agent.run result contract", function()
         -- says so and carries none, rather than answering ok with a hole.
         beats = { answered("the answer") }
         truncate_reads = true
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         truncate_reads = false
 
         expect(res.ok).to.equal(false)
@@ -190,7 +216,7 @@ describe("agent.run result contract", function()
         -- The success half of the contract requires `content`; a beat is
         -- allowed to settle without producing any text.
         beats = { answered(nil) }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(res.ok).to.equal(true)
         expect(res.content).to.equal("")
     end)
@@ -198,7 +224,7 @@ describe("agent.run result contract", function()
     it("keeps beating while the server paused its own tool loop", function()
         -- No tool was asked for, but the turn is unfinished.
         beats = { answered("half", { stop_reason = "pause_turn" }), answered("done") }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(res.ok).to.equal(true)
         expect(res.content).to.equal("done")
         expect(res.num_turns).to.equal(2)
@@ -212,7 +238,7 @@ describe("agent.run result contract", function()
                 message = "API error 500",
             }),
         }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("call: server: API error 500")
         expect(res.content).to.equal(nil)
@@ -228,14 +254,14 @@ describe("agent.run result contract", function()
                 refusal = { kind = "model", detail = "I cannot help with that" },
             }),
         }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("model refused to respond (kind=model): I cannot help with that")
     end)
 
     it("reports the exhausted grant as the iteration cap it is", function()
         beats = { answered("more", { tool = "x" }), Outcome.stopped("budget", "beats") }
-        local res = agent.run({ prompt = "ask", max_iterations = 1 })
+        local res = agent_run({ prompt = "ask", max_iterations = 1 })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("max_iterations (1) reached")
         -- The stopped beat never reached the provider, so it is not a turn.
@@ -244,14 +270,14 @@ describe("agent.run result contract", function()
 
     it("grants one unit per iteration, so the cap and the budget are one bound", function()
         beats = { answered("done") }
-        agent.run({ prompt = "ask", max_iterations = 7 })
+        agent_run({ prompt = "ask", max_iterations = 7 })
         expect(opened_with.budget.amount).to.equal(7)
         expect(opened_with.budget.tag).to.equal("beats")
     end)
 
     it("stops on the token budget, reading the spend off the log", function()
         beats = { answered("more", { tool = "x" }), answered("still more", { tool = "x" }) }
-        local res = agent.run({ prompt = "ask", max_tokens_budget = 3 })
+        local res = agent_run({ prompt = "ask", max_tokens_budget = 3 })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("token budget exceeded (3/3)")
         expect(res.num_turns).to.equal(1)
@@ -260,7 +286,7 @@ describe("agent.run result contract", function()
     it("stops when on_turn says so, and reports what was answered", function()
         beats = { answered("first", { tool = "x" }) }
         local seen = {}
-        local res = agent.run({
+        local res = agent_run({
             prompt = "ask",
             on_turn = function(info)
                 seen[#seen + 1] = info
@@ -284,7 +310,7 @@ describe("agent.run result contract", function()
         kernel.fold = function()
             return { messages = "not a message array" }
         end
-        local ok, err = pcall(agent.run, { prompt = "ask" })
+        local ok, err = pcall(agent_run, { prompt = "ask" })
         kernel.fold = real_fold
         expect(ok).to.equal(false)
         expect(tostring(err):find("shape violation", 1, true) ~= nil).to.be.truthy()
@@ -293,7 +319,7 @@ describe("agent.run result contract", function()
 
     it("carries the thread back out, folded from what the run laid down", function()
         beats = { answered("done") }
-        local res = agent.run({ prompt = "ask" })
+        local res = agent_run({ prompt = "ask" })
         expect(#res.messages).to.equal(1)
         expect(res.messages[1].role).to.equal("user")
         expect(res.messages[1].content).to.equal("ask")
@@ -305,7 +331,7 @@ describe("agent.run result contract", function()
     -- laid down as the events they are, and the thread comes back unchanged.
     it("replays a prior thread without duplicating its tool results", function()
         beats = { answered("done") }
-        local res = agent.run({
+        local res = agent_run({
             prompt = "and now?",
             history = {
                 { role = "user", content = "hello" },
@@ -376,7 +402,7 @@ describe("agent.run correlation ids", function()
             AGENT_BLOCK_AGENT_ID = "a-1",
             AGENT_BLOCK_AGENT_NAME = "planner",
         }, function()
-            expect(agent.run({ prompt = "ask" }).ok).to.equal(true)
+            expect(agent_run({ prompt = "ask" }).ok).to.equal(true)
         end)
 
         local meta = seed_meta()
@@ -395,7 +421,7 @@ describe("agent.run correlation ids", function()
     it("carries only the label when none of them is set", function()
         beats = { answered("done") }
         with_env({ AGENT_BLOCK_RUN_ID = "", AGENT_BLOCK_AGENT_NAME = "" }, function()
-            expect(agent.run({ prompt = "ask" }).ok).to.equal(true)
+            expect(agent_run({ prompt = "ask" }).ok).to.equal(true)
         end)
 
         local meta = seed_meta()

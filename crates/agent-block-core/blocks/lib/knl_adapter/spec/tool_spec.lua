@@ -181,6 +181,25 @@ describe("ToolPort.lua — flat spec pass-through", function()
     end)
 end)
 
+describe("knl_adapter.shapes — the tool contracts, re-exported", function()
+    it("a tool spec is the kernel's shape, by identity", function()
+        -- Not a copy of the same fields: the thing a caller hands `tools`
+        -- is what a device holds, so there is one declaration of it and the
+        -- adapter points at it.
+        expect(adapter.shapes.tool_spec).to.be(kernel.shapes.tool_spec)
+    end)
+
+    it("a declaration is that shape minus the handler, field for field", function()
+        -- What a provider is shown has no handler in it; what it does have
+        -- is the kernel's own fields, so a spec and its declaration cannot
+        -- come to mean different things by `input_schema`.
+        expect(adapter.shapes.tool_decl.fields.handler).to.be(nil)
+        for _, field in ipairs({ "name", "description", "input_schema" }) do
+            expect(adapter.shapes.tool_decl.fields[field]).to.be(kernel.shapes.tool_spec.fields[field])
+        end
+    end)
+end)
+
 describe("knl_adapter.tools — binding into the knl map", function()
     it("binds a flat-spec array (the fs.tool_specs shape) as-is", function()
         local tools = adapter.tools({ flat_spec("fs_read"), flat_spec("fs_edit") })

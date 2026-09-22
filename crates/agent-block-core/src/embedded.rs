@@ -16,14 +16,12 @@
 //!
 //! Two things are deliberately not here. `knl_types` is embedded but generated
 //! at start from the Rust syscall surface, so it has no static source to hand
-//! out — and it is sealed, so the only correct answer to a request for it is
-//! the refusal [`is_sealed`] produces. And nothing here writes: what a copy
-//! should say at the top of it, and where it may land, belong to the tool doing
-//! the writing, not to the list.
+//! out. And nothing here writes: what a copy should say at the top of it, and
+//! where it may land, belong to the tool doing the writing, not to the list.
 
 use std::sync::OnceLock;
 
-use crate::host::{EMBEDDED_BLOCKS, EMBEDDED_LIBS, SEALED};
+use crate::host::{EMBEDDED_BLOCKS, EMBEDDED_LIBS};
 
 /// Which of the host's two embedded lists an entry came from.
 ///
@@ -92,17 +90,6 @@ pub fn find(name: &str) -> Option<&'static Entry> {
     entries().iter().find(|e| e.name == name)
 }
 
-/// Whether `name` is a module a project may not shadow — the kernel, its
-/// declaration layer, and the `lshape` those are written in.
-///
-/// True for a sub-module of a sealed root as well as for the names listed
-/// outright: sealing `lshape` and leaving `lshape.t` open would seal nothing,
-/// and the run-time check ([`crate::host`]) reads the same list the same way.
-pub fn is_sealed(name: &str) -> bool {
-    let root = name.split('.').next().unwrap_or(name);
-    SEALED.iter().any(|s| *s == name || *s == root)
-}
-
 // `EMBEDDED_SPECS`: every `blocks/**/spec/*.lua`, listed by `build.rs`.
 include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
@@ -161,19 +148,6 @@ mod tests {
         assert_eq!(session.kind, Kind::Lib);
         assert!(session.source.contains("return M"), "{}", session.source);
         assert!(find("no_such_module").is_none());
-    }
-
-    /// A sub-module of a sealed root is sealed, whether or not it is spelled
-    /// out in the list.
-    #[test]
-    fn the_seal_covers_a_root_and_its_parts() {
-        assert!(is_sealed("knl"));
-        assert!(is_sealed("knl_types"));
-        assert!(is_sealed("lshape"));
-        assert!(is_sealed("lshape.t"));
-        assert!(is_sealed("lshape.whatever_comes_next"));
-        assert!(!is_sealed("agent"));
-        assert!(!is_sealed("llm_proto.openai"));
     }
 
     /// The specs come from the tree, not a hand list: a module with a `spec/`

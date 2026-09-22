@@ -148,6 +148,12 @@ M.shapes = { llm_result = RESULT, llm_usage = kernel.shapes.llm_usage }
 local TOOL_USE_BLOCK = kernel.shapes.tool_use_block
 M.shapes.tool_use_block = TOOL_USE_BLOCK
 
+--- A flat tool spec — what `M.tools` takes and `std.fs.tool_specs` answers
+--- with — re-exported like the result shape: one copy, the kernel's. The
+--- declaration half this module binds it to is `M.shapes.tool_decl`, built
+--- from these very fields at the ToolPort section below.
+M.shapes.tool_spec = kernel.shapes.tool_spec
+
 --- The classification a failed call is reported with, re-exported like the
 --- result shape: one copy, the kernel's.
 M.shapes.call_error = kernel.shapes.call_error
@@ -867,7 +873,10 @@ M.openai = LLMPort.new({
     build = openai_build,
     parse = openai_parse,
     classify = openai_classify,
-    default_max_output = proto_openai.DEFAULT_MAX_TOKENS,
+    -- No `default_max_output`: the openai adapter sends no cap when the conf
+    -- names none, so the room an answer has is the window less the prompt and
+    -- there is no number for the fold to hold back. A conf that names
+    -- `max_tokens` is read through `profile` as before.
     -- The compatible servers count and describe their models (vLLM
     -- /tokenize + /v1/models, llama.cpp /apply-template + /tokenize +
     -- /props, Ollama /api/show); OpenAI's own chat completions do neither,
@@ -916,10 +925,18 @@ M.openai = LLMPort.new({
 --- The declare() contract — the same triple fold's wire_tools puts on the
 --- request. Asserted in dev mode; `name` is checked loudly always (a
 --- nameless tool is a construction error, not a policy).
+---
+--- It is `knl.shapes.tool_spec` minus the handler, and it says so by taking
+--- the kernel's own field tables rather than writing three more of them: a
+--- declaration is what a tool looks like to a provider, and a tool is the
+--- kernel's shape. lshape has no "minus a field" combinator — `T.partial`
+--- makes every field optional, which would give up the one thing checked
+--- loudly here — so the subset is named field by field.
+local KERNEL_TOOL_FIELDS = kernel.shapes.tool_spec.fields
 local TOOL_DECL = T.shape({
-    name = T.string,
-    description = T.string:is_optional(),
-    input_schema = T.any:is_optional(),
+    name = KERNEL_TOOL_FIELDS.name,
+    description = KERNEL_TOOL_FIELDS.description,
+    input_schema = KERNEL_TOOL_FIELDS.input_schema,
 })
 
 local ToolPort = {}

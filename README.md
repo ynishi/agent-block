@@ -115,6 +115,8 @@ local agent = require("agent")
 local result = agent.run({
     prompt = _PROMPT,    -- nil when --prompt is omitted (agent.run will error — expected)
     system = _CONTEXT,   -- nil when -c is omitted (system prompt is optional)
+    timeout = 120,       -- required: seconds one reply may take
+    max_iterations = 20, -- required: beats this run is granted
 })
 print(result.content)
 ```
@@ -211,6 +213,45 @@ lib/summarize_util.lua            pull the reusable part out; require("summarize
 crates/agent-block-core/blocks/lib/…    upstream, once it is general (EMBEDDED_LIBS)
 ```
 
+### Writing a module
+
+A module is one file, `lib/<name>/init.lua`, ending in `return M` — the table
+of what it exports; what it splits out is a sibling, `<name>/<sub>.lua`,
+required as `<name>.<sub>`. It writes nothing onto globals — putting its
+functions on `std.*` or into a registry is the caller's job, or the bridge's —
+which is what lets a project's copy of the same name replace it there and
+still wrap the original through `require("embedded.<name>")` ([Embedded
+blocks](#embedded-blocks-every-one-is-yours-to-change)).
+
+```lua
+--- <name> — <one line>, then what it is, how it is used, what it does not do.
+local shape = require("lshape").check
+local M = {}
+M.shapes = { run_opts = RUN_OPTS }  -- the opts contract, published as data
+function M.run(opts)
+    if opts.port == nil then error("<name>.run: `port` is required", 0) end
+    shape.assert_dev(opts, RUN_OPTS, "<name>.run opts")  -- dev: LSHAPE_CHECK=1
+end
+return M
+```
+
+Its checks live beside it in `lib/<name>/spec/*_spec.lua` (mlua-lspec; a
+`spec/support.lua` holds the stubs several specs share). `agent-block vendor
+<name>` copies them with the module, and `just test-lua-project <dir>` runs
+them against the copy.
+
+The opts a public function takes and the values it answers are lshape shapes,
+published under `M.shapes` so a caller reads the contract as data and asserted
+at the boundary in dev mode — `policy`'s `opts_contract` is the idiom. The
+loud refusals that name a missing field stay in plain Lua, so they fire in
+prod too.
+
+The header is `--- <name> — <one line>`, then what it is, how it is used, and
+what it does not do. Comments are English; a measurement is cited as
+`[measured YYYY-MM-DD: ...]`. The Lua half of a Rust bridge — `fs_tools` and
+its siblings — is a library on these same terms, and the bridge is what
+installs its functions onto `std.<x>` (`bridge::load_tools_module`).
+
 Going the other way — starting from something embedded and making it the
 project's — is [Overriding a block or a
 module](#overriding-a-block-or-a-module).
@@ -255,7 +296,7 @@ off and gets one value back.
 -- blocks/summarize.lua
 -- Summarize the prompt. Returns { ok, text }.
 local agent = require("agent")
-local r = agent.run({ prompt = _PROMPT, system = _CONTEXT })
+local r = agent.run({ prompt = _PROMPT, system = _CONTEXT, timeout = 120, max_iterations = 20 })
 return std.json.encode({ ok = r.ok, text = r.text })
 ```
 
@@ -295,7 +336,7 @@ manager keeps the record.
 ```toml
 # blocks/drain/job.toml — beside blocks/drain/init.lua
 every   = "2m"     # since the previous run ended; omit to run only on request
-timeout = "10m"    # the run's process group is killed at this; default 10m
+timeout = "10m"    # the run's process group is killed at this; required
 prompt  = "..."    # _PROMPT in the block; optional
 context = "..."    # _CONTEXT; optional
 ```
@@ -593,7 +634,7 @@ live in `docs/architecture/mcp-support.md`.
 - `std.fs.read(path)`, `std.fs.write(path, content)`, `std.fs.glob(pattern)`, `std.fs.exists(path)`
 - `std.fs.walk(dir)`, `std.fs.copy(src, dst)`, `std.fs.mkdir(path)`, `std.fs.remove(path)`
 - `std.fs.is_file(path)`, `std.fs.is_dir(path)`, `std.fs.read_binary(path)`, `std.fs.write_binary(path, bytes)`
-- `std.fs.tool_specs(opts)` / `std.fs.register_tools(opts)` — the LLM-facing file tools (agent-block): `fs_read` and `fs_edit` (line-addressed, checked against an `expect` of the current text) by default; opt in through `opts.allowed` to `fs_write`, `fs_rollback` and `fs_search_replace`, which addresses an edit by a unique verbatim snippet and carries it out as `fs_edit` with the same checks — the form to offer a model that reconstructs `expect` from memory instead of copying it
+- `std.fs.tool_specs(opts)` / `std.fs.register_tools(opts)` — the LLM-facing file tools (agent-block). `opts.allowed` names them and is **required**, because which tools a model holds is the caller's decision and a default here hands a caller that said nothing a surface someone else picked: `read`, `edit` (line-addressed, checked against an `expect` of the current text), `write`, `rollback`, and `search_replace`, which addresses an edit by a unique verbatim snippet and carries it out as `fs_edit` with the same checks — the form to offer a model that reconstructs `expect` from memory instead of copying it. A failed `search_replace` says where the file stopped agreeing with the snippet and what it says from there, rather than only "not found", and an edit whose `{`/`}` balance differs from what it replaced is flagged on the result
 
 ### sh.*
 - `sh.exec(cmd, opts)` — Execute a shell command. `opts.cwd` (default: project root), `opts.timeout` (seconds, default 30), `opts.label` (a name for the command's process group, see `sh.kill`). On timeout the child's whole process group is SIGKILLed, not left running; the result then says `timed_out = true` beside `error`.
@@ -649,26 +690,28 @@ index change is required.
 
 Storage: `AGENT_BLOCK_HOME/ts.sqlite` (override via `AGENT_BLOCK_TS_PATH`; `:memory:` supported).
 
-### Embedded blocks: four layers
+### Embedded blocks: every one is yours to change
 
 The crate's `blocks/` directory is baked into the binary, so `require("agent")` works
-after `cargo install` with no path configuration. A filesystem copy of a module in a
-`lib/` tier normally wins over the embedded one — but the four layers below differ in
-whether that is the intended way to change them.
+after `cargo install` with no path configuration. Every embedded module is Lua, and a
+filesystem copy of one in a `lib/` tier wins over the embedded source — the kernel
+included. That is what the runtime being Lua on top of Rust is for: a project changes
+the module it needs changed, without a fork and without an install. A module being well
+tested is not a module being locked; the two are independent properties. What differs
+between the modules below is not whether you may replace one, but what a replacement has
+to keep so that the rest of the binary keeps working.
 
-| layer | modules | how to change it |
-|---|---|---|
-| kernel + declaration | `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | **Sealed** — a filesystem copy fails the run rather than replacing the module. The kernel is one thing across Rust and Lua, held together by declaration tests a Lua-side replacement would pass while meaning something else. Change it upstream. `AGENT_BLOCK_UNSEAL=1` downgrades the refusal to a warning, for work on the kernel itself and not for shipping. |
-| shell packs | `policy`, `supervisor` | Do not shadow: a pack is a value you hand to `knl.device` or consult in your own loop, not a registry the host reads. The two are one set — a loop is composed from both — and a model's limits are not a third pack: they go into the seams the kernel already has (`fold` / `filters` / `cost` / `tool_policy`, the loop's predicates, the supervisor's tree) and into what the Port declares (`LLMPort:profile`); see the `policy` module header. For a partial change, delegate through `embedded.<name>`. |
-| consumers | `agent`, `coding` | Copy-on-write is the intended way — `agent-block vendor agent` (or `vendor coding`) writes the file the idiom used to have you write by hand, into `.agent-block/lib/`, and it is the module your scripts get. A hand-written `lib/agent/init.lua` in the project root still works and still wins over the user tier. For a partial change, delegate through `embedded.<name>`. `coding.run` is the loop that edits files until a verify command passes; `examples/coding_loop.lua` is a block over it. |
-| utilities | `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Shadowing works, but `knl_adapter` requires `llm_proto` and `mcp_tools`, so replacing either replaces a sealed module's dependency. Prefer delegation. |
+| module | what a replacement must keep |
+|---|---|
+| kernel + declaration — `knl`, `knl_adapter`, `knl_types`, `lshape` (and `lshape.t` / `.check` / `.reflect` / `.luacats`) | A project's `lib/knl/init.lua` is the kernel for that project, and `require("embedded.knl")` still reads the original. The kernel is one thing across Rust and Lua, so what a replacement has to keep is stated in the module doc of `crates/agent-block-core/src/bridge/knl.rs` and checked by the specs `agent-block vendor knl` writes beside the copy. `knl_types` has no file to vendor because it is generated at start from the Rust types — put one on the filesystem and it wins over the generated one, and the surface is yours to declare from then on. |
+| shell packs — `policy`, `supervisor` | Whatever your own loop calls on them, and the signatures the kernel's seams take: a `fold` is handed the log, a filter is `fn(request) -> request`, a `cost` answers a number. A pack is a value you hand to `knl.device` or consult between beats, not a registry the host reads, so a whole copy is usually more than a change needs — shadow and delegate through `embedded.<name>`, or hand your own value to the seam directly. The module headers say which of the nine plugs in where. |
+| consumers — `agent`, `coding` | Whatever your own scripts call: `agent.run(opts)`, `coding.run(opts)`. `agent-block vendor agent` (or `vendor coding`) writes the embedded source into `.agent-block/lib/` with its specs, and it is the module your scripts get; a hand-written `lib/agent/init.lua` in the project root works the same way and still wins over the user tier. `coding.run` is the loop that edits files until a verify command passes; `examples/coding_loop.lua` is a block over it. |
+| utilities — `llm_proto` (with `.openai` / `.anthropic`), `mcp_tools`, `session` | Whatever `knl_adapter` calls on them, since it requires both: `adapter(provider)` and the `build` / `parse` / `count` / `profile` / `health` it hands back, plus `transport` and `response_blocks`, on `llm_proto`; `tool_decl` and `result_text` on `mcp_tools`. Delegating through `embedded.<name>` is the cheap way to keep that half intact while changing the other. |
 
 Resolution order, highest priority first: the script's own directory →
 `project_root/.agent-block/lib/` → `project_root/lib/` → `$AGENT_BLOCK_HOME/lib/` →
 embedded. `blocks/` directories are not on it (see
-[Blocks and libraries](#blocks-and-libraries)). The seal is checked once at start over
-those filesystem roots, before the script runs; the error names the module and the file
-that would have replaced it.
+[Blocks and libraries](#blocks-and-libraries)).
 
 Delegation — a shadowing module reaching the one it replaced:
 
@@ -685,8 +728,9 @@ registered a second time under that prefix, ahead of the filesystem roots, so a
 `lib/embedded/` directory cannot stand in for it. The alias evaluates the embedded
 source under its own name, which means `require("agent")` (yours) and
 `require("embedded.agent")` (the base) are two tables — exactly the pair the idiom needs.
-It exists for sealed modules too: `require("embedded.knl")` reads the kernel, which is
-fine; replacing it is what the seal refuses.
+It exists for the kernel too: `require("embedded.knl")` is the embedded kernel whatever
+`lib/knl/init.lua` says, which is exactly what a kernel override needs to wrap the one
+it replaces.
 
 Promotion runs the other way. A module that starts as `project_root/lib/<name>/init.lua`
 moves to `~/.agent-block/lib/` when a second project wants it, and becomes an embedded
@@ -738,8 +782,8 @@ agent-block vendor --force        overwrite a copy that is already there
 ```
 
 `--list` prints one line per embedded root — name, `lib` (everything the binary
-carries is a module to a project), whether it is
-`sealed` or a `pack`, and `vendored` when this project has a copy — with sub-modules
+carries is a module to a project), a `pack`
+when it is one, and `vendored` when this project has a copy — with sub-modules
 folded under the root they belong to (`lshape (+t, check, reflect, luacats)`) and the
 spec count beside it (`policy (spec/: 11)`). An
 existing copy is never overwritten without `--force`, because by then it is the
@@ -750,11 +794,21 @@ To run the binary's own fixture suite against a project's copies rather than the
 embedded modules, set `AGENT_BLOCK_PROJECT=<dir>`: `-p/--project` reads it, and an
 explicit `-p` still wins.
 
-Two layers answer back. A **sealed** module is refused outright (`knl` is sealed: a
-project cannot shadow it) — the copy would only fail the next run; read it with
-`require("embedded.knl")`. A **pack** (`policy`, `supervisor`) is written, but with a
+The Lua half of the `std.fs` / `std.ts` / `std.sql` / `std.kv` bridges — the
+`std.<x>.register_tools` helpers (and `std.fs.tool_specs`) that decide which
+operations a model is handed, under what names, locked to which paths — is
+embedded as `fs_tools` / `ts_tools` / `sql_tools` / `kv_tools` and vendors the
+same way. `agent-block vendor fs_tools`, edit, and the next run hands the model
+the surface you wrote, with no install in between. Each bridge registers its
+Rust half and then `require`s its module by name, so the copy wins for the same
+reason every other vendored module does.
+
+One name answers back. A **pack** (`policy`, `supervisor`) is written, but with a
 warning, because a pack is a value you hand to `knl.device` and not a registry the host
-reads, so a whole copy is rarely the change that was meant.
+reads, so a whole copy is rarely the change that was meant. And `knl_types` has no file
+behind it — it is generated at start from the Rust types — so there is nothing for
+`vendor` to write; put one on the filesystem if you mean to declare that surface
+yourself.
 
 For a partial change — keeping the embedded behaviour and adding to it — do not vendor
 at all: shadow and delegate through `embedded.<name>`, as above.
@@ -770,10 +824,10 @@ local result = agent.run({
     prompt  = "List files in the current directory and summarise them.",
     system  = "You are a helpful assistant.",           -- optional
     model   = "claude-haiku-4-5-20251001",             -- optional, env ANTHROPIC_MODEL as fallback
-    max_tokens       = 4096,                            -- per-request token limit
-    max_iterations   = 20,                              -- loop iteration cap
+    max_tokens       = 4096,                            -- optional; absent, the server's own cap is the cap
+    max_iterations   = 20,                              -- required: beats this run is granted
     max_tokens_budget = 50000,                          -- total token budget (nil = unlimited)
-    timeout          = 120,                             -- HTTP timeout in seconds
+    timeout          = 120,                             -- required: seconds one reply may take
     mcp_servers = {                                     -- optional MCP servers to connect
         { name = "outline", command = "outline-mcp", args = {} },
         -- HTTP/SSE form: use `url` instead of `command`
@@ -835,13 +889,15 @@ By default `agent.run` uses the Anthropic Messages API. Pass `provider = "openai
 
 ```lua
 -- Anthropic (default) — requires ANTHROPIC_API_KEY
-local result = agent.run({ prompt = "Hello", model = "claude-haiku-4-5-20251001" })
+local result = agent.run({ prompt = "Hello", model = "claude-haiku-4-5-20251001", timeout = 120, max_iterations = 20 })
 
 -- OpenAI — requires OPENAI_API_KEY (or opts.api_key)
 local result = agent.run({
     prompt  = "Hello",
     provider = "openai",
     model   = "gpt-4o-mini",
+    timeout = 120,
+    max_iterations = 20,
 })
 
 -- Local vLLM / llama.cpp / RunPod — custom base_url
@@ -851,6 +907,8 @@ local result = agent.run({
     base_url = "http://localhost:8080/v1",
     model    = "Qwen/Qwen3-0.6B",
     api_key  = "token-abc123",           -- or api_key_env = "MY_KEY"
+    timeout  = 600,                      -- a local model's reply takes what it takes; say so
+    max_iterations = 20,
 })
 ```
 
@@ -872,6 +930,8 @@ Request building lives in the `llm_proto` package, reached through the provider 
 ```lua
 local result = agent.run({
     prompt = "...",
+    timeout = 120,
+    max_iterations = 20,
     -- "auto" | "none" | "required" | { type = "function", name = "grep" }
     -- Anthropic spellings ("any", { type = "tool", name = ... }) are accepted too.
     tool_choice = "required",
@@ -920,7 +980,7 @@ Key behaviours:
 - Never throws — all errors returned as `{ ok=false, error="..." }`.
 - Context editing is on by default: once the conversation crosses ~80K input tokens, Anthropic evicts all but the most recent 3 tool-use / tool-result pairs server-side so the loop can keep running. Works on Sonnet 4 / Sonnet 4.5 / Haiku 4.5 / Opus 4 / 4.1 / 4.5. Pass `context_management = false` to disable, or `context_management_config = { edits = { ... } }` to replace the default entirely (the whole table is forwarded as `body.context_management`; no partial merge).
 - `on_turn(info)` is handed exactly four keys — `turn_number`, `content`, `tool_calls`, `usage` — and returning `false` from it stops the run. What the server did with context editing is not among them; the response that carried it is in the session log as `llm_response`.
-- `agent` is a consumer block: a local `lib/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: four layers](#embedded-blocks-four-layers).
+- `agent` is a consumer block: a local `lib/agent/init.lua` in the project root replaces it, and can delegate to the embedded one through `require("embedded.agent")`. See [Embedded blocks: every one is yours to change](#embedded-blocks-every-one-is-yours-to-change).
 - No block emits an LLM dump. Each model call is recorded in the session log (`llm_request` / `llm_response` / `llm_call_failed`) instead, and `AGENT_BLOCK_LLM_DUMP` is gone with the layer that read it.
 
 ### lshape (Vendored package — `require("lshape")`)

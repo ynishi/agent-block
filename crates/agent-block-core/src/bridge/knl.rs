@@ -279,6 +279,55 @@
 //! straight past.  The generated module is built at start rather than checked
 //! in for the same reason: a generated file in the tree is one somebody can
 //! edit, and an edited one is the second declaration all over again.
+//!
+//! # What a replacement of the Lua kernel has to keep
+//!
+//! `knl` is an embedded Lua module like every other one, so a project's
+//! `lib/knl/init.lua` is the kernel that project runs with and
+//! `require("embedded.knl")` is still the one it replaced.  Nothing here
+//! refuses that.  What the rest of the binary reads by name, and therefore
+//! what a replacement has to go on answering, is this:
+//!
+//! - **The global `knl` is this module's, and is captured rather than stood
+//!   in for.**  The five functions above and the session userdata are bound
+//!   onto a Lua global before any `require` runs; the embedded kernel takes
+//!   it as `local syscall = knl` at load, before its own name shadows it, and
+//!   re-exports `error` and `api` from there.  A replacement that defines
+//!   those itself is a second syscall layer over no syscalls.
+//! - **`shapes` and `api()` name the same things, both ways.**  Every name in
+//!   `knl.shapes.session` / `.module` is one [`SESSION_API`] / [`MODULE_API`]
+//!   declares and the reverse, `knl.shapes.error_kinds` is
+//!   `knl.api().errors`, and `knl.shapes.schema` is `knl.api().schema` — the
+//!   `events` table, its columns, `position` as the primary key, and the beat
+//!   at `meta.beat` rather than in a column of its own.
+//! - **The shapes are the generated ones, by identity.**  Every `args` /
+//!   `returns` is an export of `require("knl_types")` itself, not a table of
+//!   the same fields: a hand-written stand-in is the second declaration this
+//!   module's [`types`] exists to have removed.  `knl_types` has no file
+//!   behind it for that reason — and a filesystem copy of it still wins over
+//!   the generated one, at which point declaring that surface is the
+//!   project's job.
+//! - **The event vocabulary the shell writes is read in Rust, by name.**
+//!   `agent-block knl export --as messages` folds a log to its conversation
+//!   without a VM, so it reads `msg_user`, `llm_response`, `tool_call` and
+//!   `tool_result` as kinds and `content`, `usage`, `stop_reason`, `call_id`,
+//!   `name`, `args`, `result` and `ok` as the fields under their `data`.  The
+//!   store's own index for the session tree reads `session_opened` with
+//!   `data.parent` the same way ([`crate::knl::logs`]).  Rename one of those
+//!   and the CLI goes quiet rather than red.
+//! - **The kernel's own kinds stay the kernel's.**  `session_*` and
+//!   `budget_*` are refused from `append`, and `session_opened.data.parent` /
+//!   `session_closed.data.open_children` are what the tree view reads.
+//! - **It loads with no bridge under it.**  `require("knl_types")` is
+//!   `pcall`ed, because `lua-spec-runner` runs the Lua half's specs in a VM
+//!   this module was never installed into.
+//!
+//! The Lua half of the contract — the beat, `Outcome`'s four statuses,
+//! `device.llm`'s `"ok"` / `"refused"` and its `nil, <call_error>`, and which
+//! entry points the other embedded modules call — is stated in the module doc
+//! of `blocks/lib/knl/init.lua`, and the specs under `blocks/lib/knl/spec/`
+//! check it.  `agent-block vendor knl` writes those specs beside the copy, so
+//! a replacement is checked by the same assertions the embedded one is.
 
 use mlua::prelude::*;
 use serde_json::{Map, Value};

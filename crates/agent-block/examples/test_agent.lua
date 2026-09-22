@@ -31,6 +31,7 @@ local result = agent.run({
     system = _CONTEXT or "You are a helpful assistant. Use available tools to answer questions. Be concise.",
     max_tokens = 512,
     max_iterations = 5,
+    timeout = 120,
     on_turn = function(info)
         log.info(
             string.format(

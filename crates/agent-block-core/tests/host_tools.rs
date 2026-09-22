@@ -15,7 +15,8 @@ use tokio::sync::oneshot;
 
 use agent_block_core::bus::{AckResult, Handler};
 use agent_block_core::host::{
-    inspect_tools, run, BlockConfig, HostToolSpec, ScriptSource, ToolHandler, ToolSource,
+    inspect_tools, run, AgentProfile, BlockConfig, HostToolSpec, ScriptSource, ToolHandler,
+    ToolSource,
 };
 use agent_block_types::error::{BlockError, BlockResult};
 
@@ -116,7 +117,15 @@ async fn inspect_tools_lists_host_and_embedded_sources() {
         handler: Arc::new(AdderTool),
     };
 
-    let config = BlockConfig::builder(ScriptSource::DefaultAgent, std::env::temp_dir())
+    let profile = AgentProfile {
+        provider: "anthropic".to_string(),
+        base_url: None,
+        model: None,
+        timeout: 30.0,
+        max_iterations: 5,
+        max_tokens: None,
+    };
+    let config = BlockConfig::builder(ScriptSource::DefaultAgent(profile), std::env::temp_dir())
         .mcp_rpc_timeout(Duration::from_secs(30))
         .host_tools(vec![adder])
         .build();

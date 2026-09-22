@@ -359,6 +359,23 @@ describe("knl.device — construction and resolution", function()
         local d = K.device({ tools = echo_tools() })
         expect(type(d.tools.echo.handler)).to.be("function")
     end)
+
+    it("refuses an entry that cannot be run, and names the tool", function()
+        -- The name is the point: with several tools bound, a message about
+        -- "handler" alone says which contract broke and not which tool.
+        -- Loud in both modes — a device whose entry has nothing to call
+        -- fails at the first beat otherwise, a long way from the line that
+        -- built it.
+        local ok, err = pcall(function()
+            K.device({ tools = { echo = echo_tools().echo, broken = { description = "no handler" } } })
+        end)
+        expect(ok).to.be(false)
+        expect(tostring(err):find("broken", 1, true) ~= nil).to.be(true)
+
+        expect(function()
+            K.device({ tools = { broken = { handler = "not-a-function" } } })
+        end).to.fail()
+    end)
 end)
 
 describe("knl.device — immutability", function()
@@ -893,6 +910,7 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             "event_meta",
             "events",
             "device_config",
+            "tool_spec",
             "tool_entry",
             "tool_policy_decision",
             "cost_result",
@@ -905,6 +923,34 @@ describe("knl shapes — data contracts, asserted in dev mode", function()
             "error",
         }) do
             expect(K.shapes[name]).to.exist()
+        end
+    end)
+
+    it("a tool is one shape: a name, what a model is told, and what runs", function()
+        -- The flat spec — what `std.fs.tool_specs` answers with and what
+        -- `knl_adapter.tools` takes. `name` and `handler` are the whole of
+        -- what a tool must have: a nameless one cannot be called for, and
+        -- one with nothing to call is not a tool.
+        expect(shape.check({ name = "echo", handler = function() end }, K.shapes.tool_spec)).to.be(true)
+        expect(shape.check({
+            name = "echo",
+            description = "say it back",
+            input_schema = { type = "object" },
+            handler = function() end,
+        }, K.shapes.tool_spec)).to.be(true)
+        expect(shape.check({ handler = function() end }, K.shapes.tool_spec)).to.be(false)
+        expect(shape.check({ name = "echo" }, K.shapes.tool_spec)).to.be(false)
+        expect(shape.check({ name = "echo", handler = "fs_read" }, K.shapes.tool_spec)).to.be(false)
+    end)
+
+    it("a device's entry is that shape minus the name the map keys on", function()
+        -- Not a second declaration of the triple: `tool_entry` is built from
+        -- `tool_spec`'s own fields, so the two cannot come to disagree about
+        -- what a description or a handler is.
+        expect(shape.check({ handler = function() end }, K.shapes.tool_entry)).to.be(true)
+        expect(shape.check({ description = "d" }, K.shapes.tool_entry)).to.be(false)
+        for _, field in ipairs({ "description", "input_schema", "handler" }) do
+            expect(K.shapes.tool_entry.fields[field]).to.be(K.shapes.tool_spec.fields[field])
         end
     end)
 

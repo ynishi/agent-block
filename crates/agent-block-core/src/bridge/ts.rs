@@ -258,7 +258,7 @@ fn build_query_sql(
 ///
 /// 1. Installs `std.ts.append`, `std.ts.query`, and `std.ts.last` as async
 ///    Lua functions.
-/// 2. Loads `ts_tools.lua` to provide `std.ts.register_tools`.
+/// 2. Loads the `ts_tools` module (a vendored copy first) to provide `std.ts.register_tools`.
 ///
 /// # Arguments
 ///
@@ -268,7 +268,7 @@ fn build_query_sql(
 /// # Errors
 ///
 /// Returns a `LuaError` if the `std` global is not a table, any `std.ts`
-/// assignment fails, or `ts_tools.lua` fails to load.
+/// assignment fails, or the `ts_tools` module fails to load.
 pub fn register(lua: &Lua, isle: AsyncIsle) -> LuaResult<()> {
     // ── Build std.ts table ────────────────────────────────────────────────
     let ts_tbl = lua.create_table()?;
@@ -286,10 +286,13 @@ pub fn register(lua: &Lua, isle: AsyncIsle) -> LuaResult<()> {
     let std_table: LuaTable = lua.globals().get("std")?;
     std_table.set("ts", ts_tbl)?;
 
-    // ── Load ts_tools.lua (std.ts.register_tools) ─────────────────────────
-    lua.load(include_str!("ts_tools.lua"))
-        .set_name("std.ts.register_tools")
-        .exec()?;
+    // ── The Lua half: the `ts_tools` library, installed onto `std.ts` ────
+    super::load_tools_module(
+        lua,
+        "ts_tools",
+        "ts",
+        include_str!("../../blocks/lib/ts_tools/init.lua"),
+    )?;
 
     Ok(())
 }

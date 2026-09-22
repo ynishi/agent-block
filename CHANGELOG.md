@@ -9,6 +9,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `knl.shapes.tool_spec` declares what a tool is — its name, what the model is
+  told about it, its input schema, and the function that runs it. That triple
+  was written three times and nowhere declared: `std.fs.tool_specs` answers
+  with it, `knl_adapter.tools` takes an array of it, and a device's map holds
+  it under the name. Now the kernel owns the one declaration and the other two
+  are projections of it — a device's entry is the spec minus the name its map
+  keys on, and `knl_adapter.shapes.tool_decl` (what a provider is shown) is the
+  spec minus the handler, both taken from its fields rather than restated.
+  `knl.device` checks each entry against that shape instead of a hand-written
+  reading of it beside it, so a tool with no handler, or one whose handler is
+  not a function, is refused where the device is built and the message names
+  the tool.
+
+- `coding.run` splits its opts by where a value comes from, and refuses to
+  start without the ones it cannot answer. Three facts about the model are
+  tripwires rather than defaults, because a default here is a number invented
+  about somebody else's server: the reply's room (`llm.conf.max_tokens`, the
+  cap the wire carries, or the new `reserve` opt, the tokens the fold holds
+  back when no cap is sent), the window (`llm.conf.context_window`, or a port
+  whose profile can ask its server — asked up front now, so the refusal comes
+  before the baseline verify rather than out of the fold a command later), and
+  the reply's seconds (`llm.conf.timeout`, the line `agent.run` already draws).
+  All three are checked together and the refusal names each missing one and
+  the opt it goes in. `thinking`, the sampling knobs and `reasoning_effort` are
+  not tripwires: absent, they are not sent, and the server's own default
+  stands. The loop's own policy — iterations, turns, the verify's timeout
+  curve, the caps, `done` — keeps every default it had, and `strict = true`
+  gives those defaults up: each such knob must then be named by the caller,
+  and the run refuses while any is not, listing all of them at once. `strict`
+  is a lever the top level pulls on itself and is never read from the
+  environment here, for the reason rustc has `--cap-lints`. What a run was
+  configured with is written into the record as one `config` event and handed
+  back as `result.config`: every knob with the value it ran at and where that
+  value came from — `caller`, `default`, or `discovered` for a window a port
+  asked its server for — so what a run did is read off its own log instead of
+  reconstructed from the caller's source.
+
+- `policy.window{ fit = { reserve } }` holds tokens back for the reply. The
+  limit a fitted window measures against is the context window less
+  `profile.max_output`, so a port that sends no answer cap leaves the whole of
+  it to the request: the fold fills it with prompt and the model has nowhere
+  left to answer [measured 2026-09-13 in a sibling lane: in=32,718 / out=50
+  for two beats in a row]. `reserve` is a whole number of tokens held back
+  beyond what the wire's cap already covers — `max(0, reserve - max_output)`,
+  so a reserve at or under a cap that is there holds nothing extra — and a
+  reserve leaving the request less than one token raises rather than sending a
+  window of nothing. The fold's report says how many were held (`reserve`)
+  beside the number the candidate was measured against (`limit`), and the
+  predicate `fit` hands back is held against that same number. Absent, the
+  window is the one it was.
+
+- A `coding.run` ends when the model says it does, and a green verify alone no
+  longer ends one. The verify passing is one fact and never the whole of it: a
+  spec spanning a function and the test it asked for goes green on the part
+  that had to compile while the test is not written yet [measured
+  2026-09-11/12: of 9 runs, the 4 that landed a single edit converged on a
+  green before any test existed]. `done = "declare"` — the default, so a
+  caller that says nothing gets it — ends a run when the model answers WITHOUT
+  a tool call while the verify is green and an edit has landed. `done = "plan"`
+  adds a `plan` tool: the model first files the steps it will take, each with a
+  shell command that exits 0 once that step is done; the harness runs every
+  check after each iteration and hands the results back as facts, and the run
+  ends only when all of them pass as well. `check_timeout` is the seconds one
+  such check may take, and is required in that mode. The result says which mode
+  ran (`done`) and, in plan mode, what the checks came to — `plan =
+  { total, passed, filed, failing }`, where `failing` names the checks still
+  red when the run ended rather than leaving a caller with a count.
+
+- A failed `fs_search_replace` says what is actually there. "Not found" on its
+  own was the one failure a model could not act on: it said the guess was
+  wrong without saying what the file holds, so a model that believes the code
+  reads one way re-sends the same belief [measured 2026-09-11: one run sent
+  `collect::<Vec<u32>>()` four times; the file held what the model itself had
+  written two edits earlier, and it took narrowing the read twice and six
+  attempts to copy it]. The sibling failures already did better —
+  `search_ambiguous` returns the match count, `result_too_large` the size and
+  the limit — and this closes the last one. The result now carries the point
+  where the search stopped agreeing with the file and the file's own text from
+  there, in the shape the search tried to name; when not even the first line
+  occurs, the line sharing the most identifiers with it, which is the case a
+  model working from a paraphrase of the seed lands in. An edit whose `{` minus
+  `}` count differs from what it replaced is reported as well, so a snippet
+  appended after a block without its closing brace is answered by the tool
+  rather than by the verify two iterations later.
+- `std.fs.tool_specs` / `register_tools` require `opts.allowed`. Which tools a
+  model is handed is the caller's decision and nobody else's; a default meant a
+  caller that said nothing still got a surface someone else picked, and then had
+  no way to know what its model was holding. The old default `{"read","edit"}`
+  handed out the line-addressed edit in particular, which a loop then
+  compensated for by telling the model in prose which tool to call — and a
+  spec's own "read this file first" was overridden that way [measured
+  2026-09-12]. There is no opt-in tier any more either: `write`, `rollback` and
+  `search_replace` sit beside the other two, named or absent.
+
+- The Lua half of the `std.fs` / `std.ts` / `std.sql` / `std.kv` bridges is an
+  embedded module rather than a source file compiled into one call site.
+  `fs_tools` / `ts_tools` / `sql_tools` / `kv_tools` now live under
+  `blocks/lib/`, each bridge `require`s its own by name after registering the
+  Rust half, and the require path answers the way it does for every other
+  module: a project's `.agent-block/lib/fs_tools/` wins, the embedded source is
+  the fallback. So `agent-block vendor fs_tools` changes which file operations a
+  model is handed, under what names and locked to which paths, with no install
+  in between. A VM with no require registry — a unit test's bare `Lua::new()` —
+  still gets the embedded source directly; only "module not found" falls back,
+  so a syntax error inside a project's copy is reported rather than silently
+  replaced.
+
 - A module vendors with its specs. `vendor policy` writes
   `.agent-block/lib/policy/spec/*.lua` beside `init.lua` — the same mlua-lspec
   specs that check the embedded module — and `lua-spec-runner --project <dir>`
@@ -53,6 +160,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The four bridge tool modules are libraries, and the bridge does the wiring.
+  `fs_tools` / `kv_tools` / `sql_tools` / `ts_tools` were still the scripts
+  they had been before they moved under `blocks/lib/`: each assigned onto
+  `std.fs` / `std.kv` / `std.sql` / `std.ts` as a side effect and returned
+  nothing, so `require("fs_tools")` answered `true` and the delegation idiom
+  the README gives for every other module — `local base =
+  require("embedded.fs_tools")`, wrap what it answers — had nothing to wrap.
+  Each now ends with `return M`, like every other embedded module, and the
+  bridge installs the functions that table holds onto `std.<x>` after
+  `require` has found it. A vendored copy is installed the same way, and
+  through its `__index` chain as well, so a copy that wraps one function and
+  inherits the rest is whole on both sides: `std.fs.tool_specs` is the
+  wrapper, `std.fs.register_tools` is the base's. A copy still written the old
+  way is refused by name, with the command that rewrites it, rather than
+  leaving the tools silently missing.
+
+  Each module publishes its opts contract as data under `M.shapes` and asserts
+  it in dev beside the refusals it already had — the hand-written ones stay,
+  and stay loud in both modes, because a caller that omits `allowed` omits it
+  in production too. Each has a spec of its own now
+  (`blocks/lib/<name>/spec/`), and one e2e test holds the whole set to the
+  rule: every embedded module answers a table, under its own name and under
+  the `embedded.` alias.
+
+- The OpenAI adapter sends no answer cap when the caller names none, and
+  `profile` answers `max_output = nil` to match. The server's own limit is then
+  the window less the prompt, which is the cap a self-hosted model actually
+  has; the 4,096 this adapter used to invent was a second, smaller one, and it
+  was the one that cut replies [measured 2026-09-12: 103 of 415 beats ended
+  mid-reasoning without reaching a tool call, 26 of them at exactly 4,096. The
+  server was vLLM, which has only `--max-model-len 32768` and treats a request
+  with no `max_tokens` as asking for the whole remainder]. The generic backend
+  no longer fills the field either — `max_tokens` is the request's or the
+  conf's, or absent. The knl_adapter's openai Port therefore declares no
+  `default_max_output`, so a fold sized by the profile holds nothing back for
+  room the wire never asked for. A conf that names `max_tokens` is unaffected.
+
+  The Anthropic adapter still sends one, because `max_tokens` is a required
+  field of the Messages API, and its module says why rather than sharing a
+  constant that reads as a policy. `profile` reports the model's own maximum
+  as `max_output_limit` for a caller that wants to raise the cap.
+
+- `agent.run` requires `timeout` and `max_iterations`, and passes `max_tokens`
+  through as named or not at all. The line is whether the caller knows the
+  value and the module cannot: how long this model's reply may take and how
+  many beats the run is granted are the run's — the 120 and 20 that stood in
+  for them were the same second ceiling as the 4,096 above, under other names.
+  A run that names neither answers `ok = false` saying which, as it does for
+  a missing prompt. What stays in the module is what a caller has no basis to
+  choose: the retry curve after a transport or API error, the stagnation and
+  repeat thresholds, the verify timeout read off the log.
+
+  `job.toml` requires `timeout` and `job.tick` requires `max_runs` on the same
+  line: how long its block may run is the job's to say, how many runs the host
+  carries is the manager's (`agent-block serve --max-runs`, which it already
+  passed).
+
+  `ScriptSource::DefaultAgent` carries an `AgentProfile` — provider, endpoint,
+  model, timeout, beats, answer cap — since the embedded invoker has no other
+  place to be told what the run is granted. The profile has no `Default`; it
+  is injected as `_AGENT_PROFILE` and passed to `agent.run` whole.
+
 - The kernel's event store is eventsdb 0.6.0, and nothing in that release
   breaks a caller — every entry is an addition, and the one type that grew a
   field is `#[non_exhaustive]` — so the move is a version and the two
@@ -77,6 +246,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default because it is every span in the process, this binary's own
   included.
 
+### Removed
+
+- The seal is gone. Every embedded module can be shadowed and vendored, the
+  kernel and its declaration layer included: a `lib/knl/init.lua` is the kernel
+  that run uses, and `agent-block vendor knl` (or `knl_adapter`, or `lshape`)
+  writes the copy with the specs that check it. `AGENT_BLOCK_UNSEAL` no longer
+  exists — there is nothing left for it to downgrade — and `vendor --list` no
+  longer prints a `sealed` column. Every module here is Lua so that a project
+  can change any of it, which is what a runtime that is Lua on top of Rust is
+  for; a module being well tested and a module being replaceable are
+  independent properties, and the seal took the one for the other. What is
+  true, and what the seal stood in for, is that a replacement of the kernel has
+  to keep what the rest of the binary reads by name — and that is said where it
+  can be checked rather than asserted in prose: the module doc of
+  `crates/agent-block-core/src/bridge/knl.rs` for the Rust half, and the specs
+  `vendor knl` writes beside the copy for the Lua half. `knl_types` is still
+  the one embedded module with no file to hand out, being generated at start
+  from the Rust types; a filesystem copy of it wins over the generated one, and
+  `vendor knl_types` now says that rather than calling it sealed.
+
 ### Docs
 
 - The README's "Overriding a block or a module" says what a vendored copy's
@@ -95,6 +284,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defined the callback, why they travel on a bounded channel. Build-order
   numbering is gone from the same comments, which describe what the code is
   rather than the order it arrived in.
+
+- The README says what an embedded module is, under "Writing a module": one
+  `lib/<name>/init.lua` that returns the table of what it exports and writes
+  nothing onto globals, replaceable by a project's copy of the same name that
+  can wrap the original, with its checks beside it in
+  `lib/<name>/spec/*_spec.lua`, the opts its public functions take and the
+  values they answer declared as `M.shapes` and asserted at the boundary in
+  dev mode beside refusals that stay loud in prod, and a header in English
+  that says what it is, how it is used and what it does not do. The seven
+  spec files still called `*_test.lua` are `*_spec.lua` now, which is what
+  every other one was already called; discovery reads the `spec/` directory
+  and the file's use of the framework, never the suffix, so only the names
+  changed.
 
 ## [0.39.0] - 2026-09-20
 

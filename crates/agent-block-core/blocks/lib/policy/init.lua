@@ -61,7 +61,9 @@
 ---   seam for it, and by what the Port already knows:
 ---
 ---     the window            the Port declares it (`LLMPort:profile`), and
----                           `window{ fit }` / `tokens` ask it
+---                           `window{ fit }` / `tokens` ask it; `fit.reserve`
+---                           is the reply's room, for a wire that sends no
+---                           cap of its own
 ---     what a tool may do    `tool_policy` on the device, reading the log
 ---     what a request says   `fold` (what is sent) and `filters` (a note)
 ---     when to stop          a predicate the loop asks (`stagnation`, and
@@ -574,7 +576,10 @@ local WINDOW_OPTS, WINDOW_ARG = opts_contract({
         :is_optional(),
     fit = T.table
         :describe(
-            "{ port, conf? }: keep as many beats as fit the port's context window — port:count(request, conf) + profile.max_output <= profile.context_window"
+            "{ port, conf?, reserve? }: keep as many beats as fit the port's context window — "
+                .. "port:count(request, conf) + profile.max_output + reserve <= profile.context_window. "
+                .. "`reserve` is a whole number of tokens held back for the reply when the wire sends no "
+                .. "cap; it holds back only what profile.max_output does not already cover"
         )
         :is_optional(),
 })
@@ -839,14 +844,43 @@ local function port_for_fit(fit, who)
     if fit.conf ~= nil and type(fit.conf) ~= "table" then
         error(who .. ": fit.conf must be a table when given", 3)
     end
-    return fit.port, fit.conf
+    -- A whole number of tokens and nothing else. A reserve computed per fold
+    -- would be a second policy hiding inside an opt, and the report could no
+    -- longer say, before the counting, how much of the window is not the
+    -- request's. The type and the value are both in the raise: the two ways
+    -- to get this wrong are a function where a number goes and a negative
+    -- number, and they read nothing alike.
+    if fit.reserve ~= nil and not whole_at_least(fit.reserve, 0) then
+        error(
+            who
+                .. ": fit.reserve must be a whole number >= 0, got "
+                .. type(fit.reserve)
+                .. " ("
+                .. tostring(fit.reserve)
+                .. ")",
+            3
+        )
+    end
+    return fit.port, fit.conf, fit.reserve
 end
 
 --- The tokens a request may take, read off the Port's profile: the window
---- less the room the answer needs. Loud when the profile does not say —
---- a window that guessed would be the 400 it exists to prevent, one step
---- later.
-local function request_limit(profile, who)
+--- less the room the answer needs, less what `reserve` holds back for a reply
+--- the wire puts no cap on. Loud when the profile does not say — a window
+--- that guessed would be the 400 it exists to prevent, one step later.
+---
+--- `reserve` holds back only what `profile.max_output` does not already: that
+--- cap comes out of the window here anyway, and a cap on the wire bounds the
+--- reply by itself, so a reserve at or under one that is there holds nothing
+--- extra. The held amount is `max(0, reserve - max_output)`, and it is
+--- answered beside the limit so the fold can report what it gave up.
+---
+--- @param profile table  the Port's answer to profile(conf)
+--- @param who string  the factory's name, for the raise
+--- @param reserve number|nil  tokens held back for the reply; nil is none
+--- @return number limit  the tokens one request may take
+--- @return number held  what the reserve held back beyond profile.max_output
+local function request_limit(profile, who, reserve)
     if type(profile) ~= "table" then
         error(who .. ": port:profile(conf) must answer a table, got " .. tostring(profile), 3)
     end
@@ -870,7 +904,21 @@ local function request_limit(profile, who)
             3
         )
     end
-    return window - output
+    local held = math.max(0, (reserve or 0) - output)
+    local limit = window - output - held
+    if limit < 1 then
+        error(
+            string.format(
+                "%s: fit.reserve (%d) beside profile.max_output (%d) leaves no room in context_window (%d)",
+                who,
+                reserve or 0,
+                output,
+                window
+            ),
+            3
+        )
+    end
+    return limit, held
 end
 
 --- Build a `fold` that folds the last `tail` beats of the log.
@@ -903,6 +951,25 @@ end
 ---
 ---     knl.device({ llm = port:open(conf), fold = policy.window({ fit = { port = port, conf = conf }, keep_seed = true }) })
 ---
+--- `fit.reserve` is the room held back for the REPLY. `profile.max_output` is
+--- a cap the wire carries and the limit above already subtracts it, but a
+--- port that sends no cap leaves the whole window to the request — and a
+--- fold that filled it would leave the model nowhere to answer. Measured
+--- 2026-09-13 in a sibling lane: in=32,718 / out=50 for two beats in a row.
+--- `reserve` holds back what the cap does not, `max(0, reserve - max_output)`,
+--- so a reserve at or under a cap that is there holds nothing extra and the
+--- window is the same one it was. It is a whole number of tokens; a reserve
+--- that would leave the request less than one token raises, naming the three
+--- numbers it was reached from.
+---
+--- A number, and not the largest reply seen so far. That largest is a peak
+--- and not a choice: it holds nothing back until a reply has already been cut
+--- off once, and half the window afterwards [measured 2026-09-14 in the same
+--- lane]. How much room the reply needs is the caller's to say, and a number
+--- is how it is said.
+---
+---     policy.window({ fit = { port = port, conf = conf, reserve = 4096 }, keep_seed = true })
+---
 --- The fold raising is the last resort and not the intended one. A loop that
 --- would rather stop than fail asks the SECOND value `fit` hands back —
 --- a predicate in `stagnation`'s form, answering `"context"` when the next
@@ -924,11 +991,15 @@ end
 ---
 ---       { dropped = { <beat id>, ... },  -- oldest first, empty when none
 ---         kept = <beats kept>, seed_kept = <boolean>,
----         before = <tokens>?, after = <tokens>?, limit = <tokens>? }
+---         before = <tokens>?, after = <tokens>?, limit = <tokens>?,
+---         reserve = <tokens>? }
 ---
 ---   `before` is what the whole log cost (or the `tail` window, when `tail`
----   caps it), `after` what was sent, `limit` the room the profile left. All
----   three are absent for a window of n beats, which never counts anything.
+---   caps it), `after` what was sent, `limit` the room the candidate was
+---   measured against, and `reserve` how much of the window is held back for
+---   the reply and therefore not in `limit` (0 when `fit.reserve` is absent
+---   or the wire's cap already covered it). All four are absent for a window
+---   of n beats, which never counts anything.
 ---
 ---   A caller that takes one value is unaffected — Lua drops the extra
 ---   return, and `knl.fold` itself answers nothing beside the request.
@@ -936,9 +1007,9 @@ end
 ---   event as `data.window`, so what a run dropped is in the log rather than
 ---   only in the moment. Nothing in the kernel decides anything on it.
 ---
---- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf? }? } — `tail` is required without `fit`
+--- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf?, reserve = <whole number >= 0>? }? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request, report
---- @return function|nil fits  fn(session, device) -> nil | "context" (with `fit` only)
+--- @return function|nil fits  fn(session, device) -> nil | "context", tokens, limit (with `fit` only)
 function M.window(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
@@ -954,9 +1025,9 @@ function M.window(opts)
     if opts.keep_seed ~= nil and type(opts.keep_seed) ~= "boolean" then
         error("policy.window: keep_seed must be a boolean, got " .. tostring(opts.keep_seed), 2)
     end
-    local port, conf
+    local port, conf, reserve
     if opts.fit ~= nil then
-        port, conf = port_for_fit(opts.fit, "policy.window")
+        port, conf, reserve = port_for_fit(opts.fit, "policy.window")
     end
     shape.assert_dev(opts, WINDOW_OPTS, "policy.window opts")
 
@@ -1005,7 +1076,10 @@ function M.window(opts)
     --- @return number|nil limit  the room the profile left (with nil)
     --- @return string|nil counted  "beat" | "seed" — what those tokens are of
     local function largest_fitting(events, device)
-        local limit = request_limit(port:profile(conf), "policy.window")
+        -- The room a request may take, and what `fit.reserve` held back to
+        -- leave it. Both come off the profile read for this fold, so a Port
+        -- that learns its window late is read at its word every time.
+        local limit, held = request_limit(port:profile(conf), "policy.window", reserve)
         local n = beat_count(events)
         local most = tail and math.min(tail, n) or n
 
@@ -1020,8 +1094,13 @@ function M.window(opts)
         end
 
         --- The chosen candidate's report, with the counting written onto it.
+        --- `limit` is the effective one — the number this candidate was
+        --- measured against — and `reserve` is how much of the window is not
+        --- in it, so a reader of the log can tell a short window from one cut
+        --- short to leave the reply room.
         local function counted(report, before, after)
             report.before, report.after, report.limit = before, after, limit
+            report.reserve = held
             return report
         end
 
@@ -1102,12 +1181,14 @@ function M.window(opts)
         )
     end
 
-    --- The same question, asked before the beat rather than inside it.
+    --- The same question, asked before the beat rather than inside it. When
+    --- the answer is `"context"`, the tokens the smallest candidate cost and
+    --- the limit come beside it, so the caller can say by how much.
     local fits = function(session, device)
         needs_session(session, "policy.window fits")
-        local request = largest_fitting(whole_log(session, "policy.window fits"), device or {})
+        local request, _, tokens, limit = largest_fitting(whole_log(session, "policy.window fits"), device or {})
         if request == nil then
-            return "context"
+            return "context", tokens, limit
         end
         return nil
     end

@@ -6,7 +6,7 @@
 //! the host's environment-driven SQL configuration into a
 //! [`mlua_batteries_sqlite::sql::SqlConfig`] (shared with `std.sql`) before
 //! delegating to [`mlua_batteries_sqlite::kv::register_with`], then layers the
-//! agent-block Lua tool helpers (`kv_tools.lua`) on top.
+//! agent-block Lua tool helpers (the embedded `kv_tools` module) on top.
 //!
 //! What the batteries take is the connection the host opened
 //! ([`crate::host::HostContext::kv_conn`]) — a database of its own, shared as
@@ -44,10 +44,15 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         cfg,
     )?;
 
-    // Load std.kv.register_tools (LLM-facing helper; requires `tool` global).
-    lua.load(include_str!("kv_tools.lua"))
-        .set_name("std.kv.register_tools")
-        .exec()?;
+    // The Lua half — the `kv_tools` library, installed onto `std.kv` as
+    // `register_tools` (which calls the `tool` global). Through `require`,
+    // so a vendored `kv_tools` wins.
+    super::load_tools_module(
+        lua,
+        "kv_tools",
+        "kv",
+        include_str!("../../blocks/lib/kv_tools/init.lua"),
+    )?;
 
     Ok(())
 }

@@ -1,7 +1,7 @@
--- llm_proto_test.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
+-- llm_proto_spec.lua — mlua-lspec unit tests for blocks/lib/llm_proto.
 --
 -- Run via:
---   just test-lua llm_proto_test   # this file
+--   just test-lua llm_proto_spec   # this file
 --   just test-lua                  # every spec fixture
 --
 -- Covers the pieces that used to be duplicated (or missing) across the blocks
@@ -353,6 +353,31 @@ describe("llm_proto.openai model families", function()
             max_tokens = 512,
         })
         expect(compat.body.max_tokens).to.equal(512)
+        expect(compat.body.max_completion_tokens).to.equal(nil)
+    end)
+
+    it("carries no cap constant to fall back on, and anthropic still does", function()
+        -- The two wires differ and the modules say so rather than sharing a
+        -- number: an OpenAI-compatible server treats a missing `max_tokens` as
+        -- the whole remainder, and Anthropic's API requires the key.
+        expect(openai.DEFAULT_MAX_TOKENS).to.equal(nil)
+        expect(type(anthropic.DEFAULT_MAX_TOKENS)).to.equal("number")
+    end)
+
+    it("sends no cap at all when the spec names none, on either name", function()
+        -- The server's own limit is then the window less the prompt, which is
+        -- the cap a self-hosted model actually has. Inventing one here put a
+        -- second, smaller ceiling under it.
+        local plain = o_build({ model = "gpt-4o-mini" })
+        expect(plain.body.max_tokens).to.equal(nil)
+        expect(plain.body.max_completion_tokens).to.equal(nil)
+
+        local reasoning = o_build({ model = "gpt-5.2" })
+        expect(reasoning.body.max_tokens).to.equal(nil)
+        expect(reasoning.body.max_completion_tokens).to.equal(nil)
+
+        local compat = o_build({ model = "qwen3", base_url = "http://localhost:8000/v1" })
+        expect(compat.body.max_tokens).to.equal(nil)
         expect(compat.body.max_completion_tokens).to.equal(nil)
     end)
 

@@ -403,10 +403,17 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
         })?,
     )?;
 
-    // Load std.fs.register_tools (LLM-facing helper; requires `tool` global).
-    lua.load(include_str!("fs_tools.lua"))
-        .set_name("std.fs.register_tools")
-        .exec()?;
+    // The Lua half — the `fs_tools` library, whose exported functions are
+    // installed onto the `std.fs` built above as `tool_specs` /
+    // `register_tools`. Through `require`, so a vendored `fs_tools` wins.
+    // After `tool::register`, because `register_tools` calls the `tool`
+    // global.
+    super::load_tools_module(
+        lua,
+        "fs_tools",
+        "fs",
+        include_str!("../../blocks/lib/fs_tools/init.lua"),
+    )?;
 
     Ok(())
 }

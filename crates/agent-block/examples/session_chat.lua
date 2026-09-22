@@ -42,6 +42,7 @@ local r = agent.run({
     history = prior,
     system = "You are a concise assistant. Remember context from prior turns.",
     max_iterations = 5,
+    timeout = 120,
 })
 
 if not r.ok then

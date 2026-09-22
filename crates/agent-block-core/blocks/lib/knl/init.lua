@@ -804,6 +804,9 @@ local WINDOW_REPORT = T.shape({
     before = T.number:describe("what the whole log counted"):is_optional(),
     after = T.number:describe("what was sent"):is_optional(),
     limit = T.number:describe("the room the profile left for a request"):is_optional(),
+    reserve = T.number
+        :describe("tokens held back for the reply beyond profile.max_output, and so not in `limit`")
+        :is_optional(),
 }, { open = false })
 
 --- An event's `meta`: labels, and only labels.
@@ -1009,14 +1012,41 @@ local EVENT_DATA = {
     }, { open = false }),
 }
 
---- One entry of a device's `tools` map: what the model may call
---- (description / input_schema, both optional and both provider
---- vocabulary) plus how to call it. Only `input_schema` is read; there is
---- no alias.
-local TOOL_ENTRY = T.shape({
+--- One tool, flat: what it is called, what the model is told about it, the
+--- input schema it is declared with, and the function that runs it. This is
+--- the shape `std.fs.tool_specs` answers with and the one
+--- `knl_adapter.tools` takes, and it is the kernel's because the device it
+--- ends up in is.
+---
+--- The two halves of a tool's life are PROJECTIONS of it, taken from these
+--- fields rather than written again: a device's `tools` map is keyed BY the
+--- name, so its entries are this minus `name` (`TOOL_ENTRY` below), and what
+--- a Port declares to a provider is this minus the handler
+--- (`knl_adapter.shapes.tool_decl`). Three declarations of one triple is how
+--- the three drift apart; one, projected twice, is how they cannot.
+---
+--- Open, like the other shapes at this boundary (`tool_use_block`):
+--- `description` and `input_schema` are the provider's vocabulary, and a
+--- source that carries its own labels alongside is not this layer's to
+--- refuse. The one confusable key IS refused, loudly and by name — a spec
+--- that spells the schema field `schema` is a construction error in
+--- `knl_adapter.ToolPort.lua`, not a second accepted spelling.
+local TOOL_SPEC = T.shape({
+    name = T.string,
     description = T.string:is_optional(),
     input_schema = T.any:is_optional(),
     handler = FUNCTION,
+})
+
+--- One entry of a device's `tools` map: `TOOL_SPEC` minus `name`, because
+--- the map's key is the name. The three fields are the spec's own tables, so
+--- what an entry promises and what a spec promises cannot say different
+--- things about the same field. Only `input_schema` is read; there is no
+--- alias.
+local TOOL_ENTRY = T.shape({
+    description = TOOL_SPEC.fields.description,
+    input_schema = TOOL_SPEC.fields.input_schema,
+    handler = TOOL_SPEC.fields.handler,
 })
 
 --- What a `tool_policy` may decide: `nil`
@@ -1337,6 +1367,10 @@ M.shapes = {
     events = EVENT_DATA,
     budget_allocation = BUDGET_ALLOCATION,
     device_config = DEVICE_CONFIG,
+    -- A tool, and the two projections of it this layer hands around: the
+    -- flat spec a caller writes (`knl_adapter.tools` takes an array of
+    -- them), and the entry a device's map holds under the name.
+    tool_spec = TOOL_SPEC,
     tool_entry = TOOL_ENTRY,
     tool_policy_decision = TOOL_POLICY_DECISION,
     cost_result = COST_RESULT,
@@ -1872,9 +1906,13 @@ end
 --- This is the loud half of the pair: `DEVICE_CONFIG` says the same thing
 --- as data and is asserted beside it, but a dev-mode assert is a no-op in
 --- prod and a device built out of a mistyped config would then fail at the
---- first beat instead of at the line that built it. It also makes the two
---- judgements a shape cannot: "callable" (function / `__call`), and "a map
---- of entries, not an array of flat specs".
+--- first beat instead of at the line that built it. Loud does not mean
+--- restated: the entries run against `TOOL_ENTRY` here, the same shape
+--- `DEVICE_CONFIG` names. What is left over is the judgement a shape cannot
+--- make either way — "callable" (function / `__call`), and "a map of
+--- entries, not an array of flat specs", which is a real distinction
+--- (`knl_adapter.tools` is what turns the second into the first) and so
+--- keeps a sentence of its own.
 local function device_problem(config)
     if config.llm ~= nil and not callable(config.llm) then
         return "llm must be a function (or a callable)"
@@ -1885,6 +1923,20 @@ local function device_problem(config)
         end
         if config.tools[1] ~= nil then
             return "tools must be a map (name -> entry); bind an array of specs with knl_adapter.tools first"
+        end
+        -- Every entry against the shape that declares one, rather than a
+        -- hand-written reading of the same triple beside it. The name is in
+        -- the message because that is what the caller has to go and fix:
+        -- with a dozen tools bound, "handler must be a function" names none
+        -- of them.
+        for name, entry in pairs(config.tools) do
+            local ok, why = shape.check(entry, TOOL_ENTRY)
+            if not ok then
+                return "tools['"
+                    .. tostring(name)
+                    .. "'] is not { description?, input_schema?, handler }: "
+                    .. tostring(why)
+            end
         end
     end
     if config.tool_policy ~= nil and type(config.tool_policy) ~= "function" then

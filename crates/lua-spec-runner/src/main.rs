@@ -42,7 +42,7 @@
 //!
 //! ```sh
 //! just test-lua                 # every fixture
-//! just test-lua llm_proto_test  # fixtures whose name contains the argument
+//! just test-lua llm_proto_spec  # fixtures whose name contains the argument
 //! ```
 
 use std::path::{Path, PathBuf};

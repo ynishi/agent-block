@@ -95,8 +95,6 @@
 
 local M = {}
 
-local DEFAULT_TIMEOUT_S = 600
-local DEFAULT_MAX_RUNS = 4
 local DEFAULT_BIN = "agent-block"
 local STDERR_TAIL_BYTES = 4096
 --- The most of a block's returned value the record carries whole. The
@@ -180,6 +178,11 @@ function M.decl(t)
             error("job.decl: '" .. k .. "' must be a non-empty string (job '" .. tostring(t.name) .. "')", 2)
         end
     end
+    -- How long a run may take is the job's to say: it knows what its block
+    -- does, this module does not, so there is no number here to fall back on.
+    if t.timeout == nil then
+        error("job.decl: 'timeout' is required (job '" .. tostring(t.name) .. "')", 2)
+    end
     for _, k in ipairs({ "block", "prompt", "context" }) do
         if t[k] ~= nil and type(t[k]) ~= "string" then
             error("job.decl: '" .. k .. "' must be a string (job '" .. t.name .. "')", 2)
@@ -191,7 +194,7 @@ function M.decl(t)
         path = t.path,
         cwd = t.cwd,
         every = t.every ~= nil and M.duration(t.every, "job.decl: every") or nil,
-        timeout = t.timeout ~= nil and M.duration(t.timeout, "job.decl: timeout") or DEFAULT_TIMEOUT_S,
+        timeout = M.duration(t.timeout, "job.decl: timeout"),
         prompt = t.prompt,
         context = t.context,
     }
@@ -444,11 +447,14 @@ end
 --- @param jobs table  array of decls (`job.decl`)
 --- @param facts table  from `job.read`
 --- @param now number  seconds
---- @param opts table|nil  { max_runs? }
+--- @param opts table  { max_runs } — how many runs this host can carry at
+---   once, which the manager knows and this module does not
 --- @return table plan  { start = { { decl, reason, requested? }, ... }, skip = { { job, reason, requested? }, ... } }
 function M.tick(jobs, facts, now, opts)
-    opts = opts or {}
-    local max_runs = opts.max_runs or DEFAULT_MAX_RUNS
+    local max_runs = type(opts) == "table" and opts.max_runs or nil
+    if type(max_runs) ~= "number" then
+        error("job.tick: opts.max_runs is required", 2)
+    end
     local plan = { start = {}, skip = {} }
     local live = facts.live_count or 0
 

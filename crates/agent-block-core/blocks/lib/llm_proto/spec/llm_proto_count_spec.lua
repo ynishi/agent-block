@@ -1,9 +1,9 @@
--- llm_proto_count_test.lua — mlua-lspec tests for the adapters' `count` and
+-- llm_proto_count_spec.lua — mlua-lspec tests for the adapters' `count` and
 -- `profile`: what a server knows about a request and about its model, asked
 -- of the server's own surface.
 --
 -- Run via:
---   just test-lua llm_proto_count_test
+--   just test-lua llm_proto_count_spec
 --
 -- What is pinned:
 --   1. openai / vllm dialect: `count` posts the built chat form (messages,
@@ -20,7 +20,7 @@
 --      `count_tokens` and reads `input_tokens`; `profile` reads
 --      `max_input_tokens` / `max_tokens` off `/v1/models/{model}`
 --
--- The transport is stubbed the way llm_proto_backend_test stubs it: each
+-- The transport is stubbed the way llm_proto_backend_spec stubs it: each
 -- request body encodes to a sentinel the test can look the table back up
 -- from, and each response decodes to whatever the test queued.
 
@@ -70,7 +70,7 @@ if not std then
             decode = function(s)
                 local v = decodable[s]
                 if v == nil then
-                    error("llm_proto_count_test: unexpected body to decode: " .. tostring(s), 0)
+                    error("llm_proto_count_spec: unexpected body to decode: " .. tostring(s), 0)
                 end
                 return v
             end,
@@ -97,7 +97,7 @@ if not http then
             })
             local entry = table.remove(queue, 1)
             if not entry then
-                error("llm_proto_count_test: a probe the test did not queue: " .. url, 0)
+                error("llm_proto_count_spec: a probe the test did not queue: " .. url, 0)
             end
             local body = "<undecodable-body>"
             if entry.response then
