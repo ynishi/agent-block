@@ -83,6 +83,8 @@ local record host_types
                 version: string
                 lines: integer
             end
+            --- The file's content.
+            read: function(string): string
             --- The file, its content fingerprint, and its line count.
             read_versioned: function(string): ReadVersioned
             --- `{ base?, edits = {...} }`; answers the bridge's result table.
@@ -92,11 +94,43 @@ local record host_types
             --- Restore the content the last successful edit replaced.
             rollback: function(string): {string:any}
         end
+        --- The clock.
+        record Time
+            --- Seconds since the epoch, fractional.
+            now: function(): number
+        end
         json: Json
         kv: Kv
         sql: Sql
         ts: Ts
         fs: Fs
+        time: Time
+    end
+    --- `sh`, the process bridge (`bridge/sh.rs`): one command in a shell,
+    --- in a process group of its own.
+    record Sh
+        --- What `exec` answers: `ok` with the exit `code` and both streams,
+        --- `killed` when `kill` ended it; or `ok = false` with `error`, and
+        --- `timed_out` when that is what the error was.
+        record ExecResult
+            ok: boolean
+            code: integer
+            stdout: string
+            stderr: string
+            killed: boolean
+            error: string
+            timed_out: boolean
+        end
+        --- What `exec` takes beside the command: the directory, the
+        --- timeout in seconds, and the label `kill` reaches the group by.
+        record ExecOpts
+            cwd: string
+            timeout: number
+            label: string
+        end
+        exec: function(string, ?ExecOpts): ExecResult
+        --- End the group started under a label.
+        kill: function(string)
     end
     --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
     --- call, by name.

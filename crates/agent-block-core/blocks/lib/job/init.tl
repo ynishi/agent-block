@@ -92,8 +92,131 @@
 ---   tree is not involved. Not a budget: a run has a time limit, which is a
 ---   limit and not a quota (the kernel's header says why the two are kept
 ---   apart, and this module keeps the word out).
+---
+--- Written in Teal and embedded through `include_tl!` (`host.rs`); the Lua
+--- the host holds is what Teal generates from this file, without these
+--- comments. The host globals it reads — `std`, `sh` — are declared through
+--- `host_types`, and reached the tolerant way (`rawget(_G, ...)`) where a
+--- VM without them is expected: a spec hands in its own `exec` / `now`.
+local host = require("host_types")
+global std: host.Std
+global sh: host.Sh
 
-local M = {}
+--- The manager's session: what `job` asks of it. The kernel's session
+--- userdata (`knl.open`) answers both; a spec's fake answers the same two.
+local record Session
+    --- One record onto the log.
+    append: function(Session, {string:any}): integer
+    --- Rows of a statement, and whether the read was cut at the row cap.
+    query: function(Session, string, ?{string:any}, ?{string:any}): {{string:any}}, boolean
+end
+
+local record M
+    --- A declaration, checked and normalized (`M.decl`): built whole there,
+    --- and the three that may be absent say so.
+    record Decl ---@struct
+        name: string
+        block: string
+        path: string
+        cwd: string
+        --- Seconds; a job declared without one starts only on request.
+        every: number ---@optional
+        --- Seconds.
+        timeout: number
+        prompt: string ---@optional
+        context: string ---@optional
+    end
+    --- One live run, as `read` answers it.
+    record Live ---@struct
+        run_id: string
+        seq: integer
+        started: number
+    end
+    --- One pending request, as `read` answers it.
+    record Request ---@struct
+        job: string
+        seq: integer
+        by: string ---@optional
+    end
+    --- One pending stop, as `read` answers it.
+    record Stop ---@struct
+        run_id: string
+        seq: integer
+        by: string ---@optional
+    end
+    --- The facts a tick needs, off the log.
+    record Facts ---@struct
+        ended: {string:number}
+        live: {string:Live}
+        live_count: integer
+        requested: {Request}
+        stops: {Stop}
+    end
+    --- What `read` / `runs` / `run_of` / `reconcile` take beside the session.
+    record ReadOpts
+        --- The manager's streams, the current one included.
+        sessions: {string}
+        job: string
+        limit: integer
+    end
+    --- What `tick` takes.
+    record TickOpts
+        max_runs: number
+    end
+    --- One start a tick decided on.
+    record Start ---@struct
+        decl: Decl
+        reason: string
+        requested: integer ---@optional
+    end
+    --- One start a tick refused.
+    record Skip ---@struct
+        job: string
+        reason: string
+        requested: integer ---@optional
+    end
+    --- What `tick` answers.
+    record Plan ---@struct
+        start: {Start}
+        skip: {Skip}
+    end
+    --- What one run's process is given (`M.config`).
+    record Config ---@struct
+        prompt: string ---@optional
+        context: string ---@optional
+        result: string ---@optional
+        labels: {string:string}
+    end
+    --- What `command` takes.
+    record CommandOpts
+        bin: string
+        config: string
+    end
+    --- What `run` takes beside the session and the decl.
+    record RunOpts
+        exec: function(string, {string:any}): host.Sh.ExecResult
+        now: function(): number
+        bin: string
+        requested: integer
+        run_id: string
+        result: string
+        config: string
+        write: function(string, string)
+        encode: function(any): string
+        read: function(string): string
+    end
+    --- What `run` answers.
+    record RunResult ---@struct
+        run_id: string
+        outcome: string
+        exit_code: integer ---@optional
+        took_s: number
+        error: string ---@optional
+        result: string ---@optional
+    end
+    DEFERRED_EXIT: integer
+    DEFER_PREFIX: string
+end
 
 local DEFAULT_BIN = "agent-block"
 local STDERR_TAIL_BYTES = 4096
@@ -106,7 +229,7 @@ local RESULT_MAX_BYTES = 65536
 -- duration — "2m" is 120 seconds
 -- ============================================================
 
-local UNITS = { s = 1, m = 60, h = 3600, d = 86400 }
+local UNITS: {string:number} = { s = 1, m = 60, h = 3600, d = 86400 }
 
 --- Seconds from a duration: a number is seconds already; a string is a
 --- number and a unit (`s` / `m` / `h` / `d`), or a bare number of seconds.
@@ -114,24 +237,26 @@ local UNITS = { s = 1, m = 60, h = 3600, d = 86400 }
 --- @param v number|string
 --- @param who string  for the message
 --- @return number seconds
-function M.duration(v, who)
+function M.duration(v: any, who?: string): number
     who = who or "job.duration"
     if type(v) == "number" then
-        if v <= 0 then
+        local n = v as number
+        if n <= 0 then
             error(who .. ": a duration must be positive, got " .. tostring(v), 2)
         end
-        return v
+        return n
     end
     if type(v) ~= "string" then
         error(who .. ": a duration is a number of seconds or a string like '2m', got " .. tostring(v), 2)
     end
-    local num, unit = v:match("^%s*(%d+%.?%d*)%s*([smhd]?)%s*$")
+    local text = v as string
+    local num, unit = text:match("^%s*(%d+%.?%d*)%s*([smhd]?)%s*$")
     if num == nil then
-        error(who .. ": not a duration: '" .. v .. "' (a number and one of s/m/h/d)", 2)
+        error(who .. ": not a duration: '" .. text .. "' (a number and one of s/m/h/d)", 2)
     end
     local secs = tonumber(num) * UNITS[unit ~= "" and unit or "s"]
     if secs <= 0 then
-        error(who .. ": a duration must be positive, got '" .. v .. "'", 2)
+        error(who .. ": a duration must be positive, got '" .. text .. "'", 2)
     end
     return secs
 end
@@ -154,11 +279,11 @@ end
 ---
 --- @param t table  { name, path, cwd, every?, timeout?, prompt?, context?, block? }
 --- @return table decl  { name, block, path, cwd, every?, timeout, prompt?, context? }
-function M.decl(t)
+function M.decl(t: {string:any}): M.Decl
     if type(t) ~= "table" then
         error("job.decl: a declaration is a table", 2)
     end
-    local known = {
+    local known: {string:boolean} = {
         name = true,
         block = true,
         path = true,
@@ -185,18 +310,18 @@ function M.decl(t)
     end
     for _, k in ipairs({ "block", "prompt", "context" }) do
         if t[k] ~= nil and type(t[k]) ~= "string" then
-            error("job.decl: '" .. k .. "' must be a string (job '" .. t.name .. "')", 2)
+            error("job.decl: '" .. k .. "' must be a string (job '" .. tostring(t.name) .. "')", 2)
         end
     end
     return {
-        name = t.name,
-        block = t.block or t.name,
-        path = t.path,
-        cwd = t.cwd,
+        name = t.name as string,
+        block = (t.block or t.name) as string,
+        path = t.path as string,
+        cwd = t.cwd as string,
         every = t.every ~= nil and M.duration(t.every, "job.decl: every") or nil,
         timeout = M.duration(t.timeout, "job.decl: timeout"),
-        prompt = t.prompt,
-        context = t.context,
+        prompt = t.prompt as string,
+        context = t.context as string,
     }
 end
 
@@ -351,11 +476,11 @@ SELECT json_extract(r.data, '$.run_id') AS run_id,
 --- The query options a read passes through: the set of streams. `$sessions`
 --- in every statement above is what the kernel expands this to, and with no
 --- set it is the session's own stream.
-local function span(opts)
+local function span(opts: M.ReadOpts): {string:any}
     return { sessions = opts and opts.sessions or nil }
 end
 
-local function rows_of(session, sql, who, opts)
+local function rows_of(session: Session, sql: string, who: string, opts: M.ReadOpts): {{string:any}}
     local rows, truncated = session:query(sql, nil, span(opts))
     if truncated then
         error(who .. ": the read hit the kernel's row cap; the log is larger than one decision can take in", 0)
@@ -384,24 +509,28 @@ end
 --- @param opts table|nil  { sessions? }
 --- @return table facts  { ended = { [job] = seconds }, live = { [job] = { run_id, seq, started } },
 ---                        live_count, requested = { { job, seq, by }, ... }, stops = { { run_id, seq, by }, ... } }
-function M.read(session, opts)
-    local facts = { ended = {}, live = {}, live_count = 0, requested = {}, stops = {} }
+function M.read(session: Session, opts?: M.ReadOpts): M.Facts
+    local facts: M.Facts = { ended = {}, live = {}, live_count = 0, requested = {}, stops = {} }
     for _, r in ipairs(rows_of(session, ENDED_SQL, "job.read", opts)) do
         if r.job ~= nil and type(r.ended_ms) == "number" then
-            facts.ended[r.job] = r.ended_ms / 1000
+            facts.ended[r.job as string] = (r.ended_ms as number) / 1000
         end
     end
     for _, r in ipairs(rows_of(session, LIVE_SQL, "job.read", opts)) do
         if r.job ~= nil then
-            facts.live[r.job] = { run_id = r.run_id, seq = r.seq, started = (r.started_ms or 0) / 1000 }
+            facts.live[r.job as string] = {
+                run_id = r.run_id as string,
+                seq = r.seq as integer,
+                started = ((r.started_ms or 0) as number) / 1000,
+            }
             facts.live_count = facts.live_count + 1
         end
     end
     for _, r in ipairs(rows_of(session, REQUESTED_SQL, "job.read", opts)) do
-        facts.requested[#facts.requested + 1] = { job = r.job, seq = r.seq, by = r.by }
+        facts.requested[#facts.requested + 1] = { job = r.job as string, seq = r.seq as integer, by = r.by as string }
     end
     for _, r in ipairs(rows_of(session, STOPS_SQL, "job.read", opts)) do
-        facts.stops[#facts.stops + 1] = { run_id = r.run_id, seq = r.seq, by = r.by }
+        facts.stops[#facts.stops + 1] = { run_id = r.run_id as string, seq = r.seq as integer, by = r.by as string }
     end
     return facts
 end
@@ -411,7 +540,7 @@ end
 --- @param session userdata|table
 --- @param opts table|nil  { job?, limit?, sessions? }
 --- @return table rows  `{ job, run_id, started_ms, log, ended_ms?, outcome?, exit_code?, took_s?, error? }`
-function M.runs(session, opts)
+function M.runs(session: Session, opts?: M.ReadOpts): {{string:any}}
     opts = opts or {}
     local limit = opts.limit or 50
     if opts.job ~= nil then
@@ -428,7 +557,7 @@ end
 --- @param run_id string
 --- @param opts table|nil  { sessions? }
 --- @return table|nil row
-function M.run_of(session, run_id, opts)
+function M.run_of(session: Session, run_id: string, opts?: M.ReadOpts): {string:any}
     local rows = session:query(RUN_SQL, { run_id = run_id }, span(opts))
     return rows and rows[1] or nil
 end
@@ -450,23 +579,23 @@ end
 --- @param opts table  { max_runs } — how many runs this host can carry at
 ---   once, which the manager knows and this module does not
 --- @return table plan  { start = { { decl, reason, requested? }, ... }, skip = { { job, reason, requested? }, ... } }
-function M.tick(jobs, facts, now, opts)
+function M.tick(jobs: {M.Decl}, facts: M.Facts, now: number, opts: M.TickOpts): M.Plan
     local max_runs = type(opts) == "table" and opts.max_runs or nil
     if type(max_runs) ~= "number" then
         error("job.tick: opts.max_runs is required", 2)
     end
-    local plan = { start = {}, skip = {} }
+    local plan: M.Plan = { start = {}, skip = {} }
     local live = facts.live_count or 0
 
     -- The newest pending request per job; older ones are answered by the
     -- same start, which is what "a request is a record" means.
-    local requested = {}
+    local requested: {string:M.Request} = {}
     for _, r in ipairs(facts.requested or {}) do
         requested[r.job] = r
     end
 
     for _, decl in ipairs(jobs) do
-        local reason
+        local reason: string
         local request = requested[decl.name]
         if request ~= nil then
             reason = "requested"
@@ -498,17 +627,17 @@ end
 -- ============================================================
 
 --- Single-quote `s` for `sh -c`.
-local function sq(s)
-    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+local function sq(s: any): string
+    return "'" .. (tostring(s):gsub("'", "'\\''")) .. "'"
 end
 
 --- The last `n` bytes of `s`, so a record stays a record and not a log.
-local function tail(s, n)
-    s = tostring(s or "")
-    if #s <= n then
-        return s
+local function tail(s: any, n: integer): string
+    local text = tostring(s or "")
+    if #text <= n then
+        return text
     end
-    return s:sub(-n)
+    return text:sub(-n)
 end
 
 --- What one run's process is given, as a value: `{ prompt?, context?,
@@ -527,7 +656,7 @@ end
 --- @param run_id string  the run this is
 --- @param result string|nil  where the returned value is written
 --- @return table  the config, ready for `std.json.encode`
-function M.config(decl, run_id, result)
+function M.config(decl: M.Decl, run_id: string, result?: string): M.Config
     return {
         prompt = decl.prompt,
         context = decl.context,
@@ -551,9 +680,9 @@ end
 --- @param decl table  a decl
 --- @param opts table|nil  { bin?, config? }
 --- @return string command
-function M.command(decl, opts)
+function M.command(decl: M.Decl, opts?: M.CommandOpts): string
     opts = opts or {}
-    local parts = {
+    local parts: {string} = {
         sq(opts.bin or DEFAULT_BIN),
         "-s",
         sq(decl.path),
@@ -604,7 +733,7 @@ M.DEFER_PREFIX = "job.defer: "
 --- from anywhere below a `pcall` it is that pcall's to re-raise.
 ---
 --- @param reason string  what was looked at and found not ready
-function M.defer(reason)
+function M.defer(reason: string)
     error(M.DEFER_PREFIX .. tostring(reason), 0)
 end
 
@@ -614,7 +743,7 @@ end
 --- @return string outcome
 --- @return number|nil exit_code
 --- @return string|nil error
-local function outcome_of(result)
+local function outcome_of(result: host.Sh.ExecResult): string, integer, string
     if type(result) ~= "table" then
         return "failed", nil, "run answered " .. tostring(result)
     end
@@ -669,7 +798,7 @@ end
 --- @param decl table  a decl
 --- @param opts table|nil  { exec?, now?, bin?, requested?, run_id?, result?, config?, write?, encode? }
 --- @return table  { run_id, outcome, exit_code?, took_s, error? }
-function M.run(session, decl, opts)
+function M.run(session: Session, decl: M.Decl, opts?: M.RunOpts): M.RunResult
     opts = opts or {}
     local exec = opts.exec or (rawget(_G, "sh") and sh.exec)
     if type(exec) ~= "function" then
@@ -677,8 +806,8 @@ function M.run(session, decl, opts)
     end
     local now = opts.now
     if now == nil then
-        local std = rawget(_G, "std")
-        now = std and std.time and std.time.now or os.time
+        local std_g = rawget(_G, "std") as host.Std
+        now = std_g and std_g.time and std_g.time.now or os.time as function(): number
     end
 
     local started = now()
@@ -699,7 +828,7 @@ function M.run(session, decl, opts)
     -- file rather than an environment prefix, so nothing the block starts
     -- inherits this run's prompt or its result file.
     if opts.config ~= nil then
-        local std_g = rawget(_G, "std")
+        local std_g = rawget(_G, "std") as host.Std
         local write = opts.write or (std_g and std_g.fs and std_g.fs.write)
         if type(write) ~= "function" then
             error("job.run: no write: pass opts.write, or run where `std.fs.write` exists", 2)
@@ -724,12 +853,12 @@ function M.run(session, decl, opts)
     -- The block's answer: the value it returned, read back from the file
     -- the process was told to write it to. Whole or not at all — a JSON
     -- string cut short is nothing — and pointed at when it is too large.
-    local answer, answer_truncated
+    local answer, answer_truncated: string, boolean
     if opts.result ~= nil then
         local read = opts.read
         if read == nil then
-            local std = rawget(_G, "std")
-            read = std and std.fs and std.fs.read
+            local std_g = rawget(_G, "std") as host.Std
+            read = std_g and std_g.fs and std_g.fs.read
         end
         if type(read) == "function" then
             local ok, content = pcall(read, opts.result)
@@ -777,7 +906,7 @@ end
 --- @param now number|nil  seconds
 --- @param opts table|nil  { sessions? } — the previous manager's runs are on its stream
 --- @return number closed
-function M.reconcile(session, now, opts)
+function M.reconcile(session: Session, now?: number, opts?: M.ReadOpts): integer
     now = now or os.time()
     local facts = M.read(session, opts)
     local closed = 0
@@ -801,7 +930,7 @@ end
 --- @param session userdata|table
 --- @param job string
 --- @param by string|nil  who asked
-function M.request(session, job, by)
+function M.request(session: Session, job: string, by?: string)
     if type(job) ~= "string" or job == "" then
         error("job.request: job must be a non-empty string", 2)
     end
@@ -812,7 +941,7 @@ end
 ---
 --- @param session userdata|table
 --- @param skip table  a `plan.skip` item with `requested` set
-function M.skipped(session, skip)
+function M.skipped(session: Session, skip: M.Skip)
     session:append({
         kind = "run_skipped",
         data = { job = skip.job, reason = skip.reason, requested = skip.requested },
@@ -825,7 +954,7 @@ end
 --- @param session userdata|table
 --- @param run_id string
 --- @param by string|nil
-function M.stop(session, run_id, by)
+function M.stop(session: Session, run_id: string, by?: string)
     if type(run_id) ~= "string" or run_id == "" then
         error("job.stop: run_id must be a non-empty string", 2)
     end

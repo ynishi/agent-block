@@ -522,6 +522,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every field of those may be absent, which is the fact, and the loud
   refusals that name a missing one stay in the code.
 
+- `job` is written in Teal (`blocks/lib/job/init.tl`, embedded through
+  `include_tl!`): the same four — `read` / `tick` / `run` and the records
+  they write — with the shapes named. `Decl` is `---@struct` with `every` /
+  `prompt` / `context` as `---@optional`, which is exactly what `decl`
+  promised in prose; `Facts`, `Plan` (`Start` / `Skip`), `Config` and
+  `RunResult` are built whole and say so; a `Session` record is what `job`
+  asks of the kernel's session (`append`, `query`), and a spec's fake
+  answers the same two. `host_types.d.tl` grows `sh` (`exec` with its
+  `ExecResult` / `ExecOpts`, `kill`), `std.time.now` and `std.fs.read`.
+  The 40 job specs pass against the generated Lua, and `job_test.tl`
+  (`htl test`) holds the pure half — `duration`, `decl`, `tick`.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

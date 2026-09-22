@@ -111,7 +111,7 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "supervisor",
         include_str!("../blocks/lib/supervisor/init.lua"),
     ),
-    ("job", include_str!("../blocks/lib/job/init.lua")),
+    ("job", htl::include_tl!("blocks/lib/job/init.tl")),
     // The Lua half of four bridges — the `std.<x>.register_tools` /
     // `std.fs.tool_specs` helpers a model is handed. Each bridge `require`s
     // its module right after registering its Rust half (see
