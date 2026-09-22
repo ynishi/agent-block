@@ -55,9 +55,22 @@ local record host_types
             --- The sentinel a NULL column comes back as.
             null: any
         end
+        --- The time-series bridge over the host's SQLite database
+        --- (`bridge/ts.rs`): named streams of timestamped JSON values.
+        record Ts
+            --- Append a point: series, value, optional flat tags, optional
+            --- Unix-ms timestamp (now when absent).
+            append: function(string, any, ?{string:string}, ?integer)
+            --- Rows of a series under the query options (`from` / `to` /
+            --- `tags` / `agg` / `bucket_ms` / `limit` / `offset`).
+            query: function(string, ?{string:any}): {{string:any}}
+            --- The latest row matching the tags, or nil.
+            last: function(string, ?{string:string}): {string:any}
+        end
         json: Json
         kv: Kv
         sql: Sql
+        ts: Ts
     end
     --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
     --- call, by name.
