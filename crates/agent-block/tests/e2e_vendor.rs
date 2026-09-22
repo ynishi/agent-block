@@ -319,21 +319,22 @@ fn a_vendored_bridge_tool_module_is_the_one_the_host_runs() {
         .success()
         .stdout(predicate::str::contains("fs_tools/init.lua"));
 
-    // Mark the copy where the host will see it. This module is run for its
-    // effect — it installs `tool_specs` / `register_tools` onto the `std.fs`
-    // the bridge just built and returns nothing — so the mark is one more
-    // statement appended to it, on the same table.
+    // Mark the copy where the host will see it. The module is a library — it
+    // answers a table and the bridge installs what that table holds — so the
+    // mark is one more export, added before the `return M` the copy ends with.
     let source = std::fs::read_to_string(&target).expect("read the copy");
-    std::fs::write(
-        &target,
-        format!("{source}\nstd.fs.vendored_marker = 'from the copy'\n"),
-    )
-    .expect("write");
+    let marked = source.replace(
+        "\nreturn M\n",
+        "\nfunction M.vendored_marker()\n    return 'from the copy'\nend\n\nreturn M\n",
+    );
+    assert_ne!(marked, source, "the vendored copy ends with `return M`");
+    std::fs::write(&target, marked).expect("write");
 
     let script = project.path().join("probe.lua");
     std::fs::write(
         &script,
-        "print('marker=' .. tostring(std.fs.vendored_marker))\n\
+        "local marker = std.fs.vendored_marker\n\
+         print('marker=' .. tostring(marker and marker()))\n\
          print('tools=' .. tostring(type(std.fs.register_tools)))\n",
     )
     .expect("write");
@@ -359,6 +360,57 @@ fn a_vendored_bridge_tool_module_is_the_one_the_host_runs() {
         .success()
         .stdout(predicate::str::contains("marker=nil"))
         .stdout(predicate::str::contains("tools=function"));
+}
+
+/// The delegation idiom, on a bridge's tool module: a project's `fs_tools`
+/// wraps ONE function of the embedded one and inherits the rest, and what the
+/// host installs on `std.fs` is the wrapper — reached by a script that calls
+/// `std.fs.tool_specs`, not by requiring anything itself.
+///
+/// The inherited half is the other assertion here. `register_tools` is not on
+/// the wrapper table at all; it is on the base, behind `__index`, and a script
+/// that calls it has to find the embedded one and get an array of names back.
+#[test]
+fn a_vendored_tool_module_can_wrap_the_embedded_one() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+    let target = project.path().join(".agent-block/lib/fs_tools/init.lua");
+    std::fs::create_dir_all(target.parent().expect("the copy has a parent")).expect("mkdir");
+    std::fs::write(
+        &target,
+        "local base = require(\"embedded.fs_tools\")\n\
+         local M = setmetatable({}, { __index = base })\n\
+         function M.tool_specs(o)\n\
+         \x20   print(\"WRAPPED\")\n\
+         \x20   return base.tool_specs(o)\n\
+         end\n\
+         return M\n",
+    )
+    .expect("write the wrapper");
+
+    let script = project.path().join("probe.lua");
+    std::fs::write(
+        &script,
+        "local specs = std.fs.tool_specs({ allowed = { \"read\" } })\n\
+         print('spec_name=' .. specs[1].name)\n\
+         print('handler=' .. type(specs[1].handler))\n\
+         print('inherited=' .. type(std.fs.register_tools))\n",
+    )
+    .expect("write");
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["-s", &script.to_string_lossy()])
+        .assert()
+        .success()
+        // The wrapper ran …
+        .stdout(predicate::str::contains("WRAPPED"))
+        // … and what it delegated to is the embedded module's own answer.
+        .stdout(predicate::str::contains("spec_name=fs_read"))
+        .stdout(predicate::str::contains("handler=function"))
+        // The function the wrapper did not define came through `__index`.
+        .stdout(predicate::str::contains("inherited=function"));
 }
 
 /// A pack is written, with the reason a whole copy is rarely what was meant on

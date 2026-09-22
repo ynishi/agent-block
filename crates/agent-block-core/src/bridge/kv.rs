@@ -44,11 +44,13 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         cfg,
     )?;
 
-    // The Lua half (std.kv.register_tools; needs the `tool` global), through
-    // `require`, so a vendored `kv_tools` wins.
+    // The Lua half — the `kv_tools` library, installed onto `std.kv` as
+    // `register_tools` (which calls the `tool` global). Through `require`,
+    // so a vendored `kv_tools` wins.
     super::load_tools_module(
         lua,
         "kv_tools",
+        "kv",
         include_str!("../../blocks/lib/kv_tools/init.lua"),
     )?;
 

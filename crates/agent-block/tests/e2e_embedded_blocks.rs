@@ -60,6 +60,38 @@ fn a_project_agent_can_delegate_to_the_embedded_one() {
         .stdout(predicate::str::contains("BASE_RUN_TYPE=function"));
 }
 
+// ── (a2) every module is a module ─────────────────────────────────────────
+
+/// **Every embedded module answers a table, under its own name and under the
+/// `embedded.` alias.**
+///
+/// This is the precondition of the delegation idiom, and it is asserted for
+/// the whole set rather than one module at a time because the way it breaks
+/// is by omission: a module written as a script — assigning onto a global and
+/// returning nothing — answers `true`, `require` is happy, and
+/// `require("embedded.<name>").f` is a nil index somewhere else entirely.
+/// The four bridge tool modules were exactly that until they became
+/// libraries.
+///
+/// The fixture carries the list (`EMBEDDED_BLOCKS` + `EMBEDDED_LIBS` +
+/// `knl_types`) and prints every name that fails, so one run names all of
+/// them rather than the first.
+#[test]
+fn every_embedded_module_answers_a_table() {
+    let home = tempdir().expect("tempdir");
+    let project = tempdir().expect("tempdir");
+
+    common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["-p", &project.path().to_string_lossy()])
+        .args(["-s", &common::fixture("embedded_every_module.lua")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("checked=22"))
+        .stdout(predicate::str::contains("FAIL").not())
+        .stdout(predicate::str::contains("ok"));
+}
+
 // ── (b) the alias, the kernel included ─────────────────────────────────────
 
 #[test]

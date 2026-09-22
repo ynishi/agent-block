@@ -286,10 +286,11 @@ pub fn register(lua: &Lua, isle: AsyncIsle) -> LuaResult<()> {
     let std_table: LuaTable = lua.globals().get("std")?;
     std_table.set("ts", ts_tbl)?;
 
-    // ── The Lua half (std.ts.register_tools), through `require` ──────────
+    // ── The Lua half: the `ts_tools` library, installed onto `std.ts` ────
     super::load_tools_module(
         lua,
         "ts_tools",
+        "ts",
         include_str!("../../blocks/lib/ts_tools/init.lua"),
     )?;
 

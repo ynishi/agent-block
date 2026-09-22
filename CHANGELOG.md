@@ -160,6 +160,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The four bridge tool modules are libraries, and the bridge does the wiring.
+  `fs_tools` / `kv_tools` / `sql_tools` / `ts_tools` were still the scripts
+  they had been before they moved under `blocks/lib/`: each assigned onto
+  `std.fs` / `std.kv` / `std.sql` / `std.ts` as a side effect and returned
+  nothing, so `require("fs_tools")` answered `true` and the delegation idiom
+  the README gives for every other module — `local base =
+  require("embedded.fs_tools")`, wrap what it answers — had nothing to wrap.
+  Each now ends with `return M`, like every other embedded module, and the
+  bridge installs the functions that table holds onto `std.<x>` after
+  `require` has found it. A vendored copy is installed the same way, and
+  through its `__index` chain as well, so a copy that wraps one function and
+  inherits the rest is whole on both sides: `std.fs.tool_specs` is the
+  wrapper, `std.fs.register_tools` is the base's. A copy still written the old
+  way is refused by name, with the command that rewrites it, rather than
+  leaving the tools silently missing.
+
+  Each module publishes its opts contract as data under `M.shapes` and asserts
+  it in dev beside the refusals it already had — the hand-written ones stay,
+  and stay loud in both modes, because a caller that omits `allowed` omits it
+  in production too. Each has a spec of its own now
+  (`blocks/lib/<name>/spec/`), and one e2e test holds the whole set to the
+  rule: every embedded module answers a table, under its own name and under
+  the `embedded.` alias.
+
 - The OpenAI adapter sends no answer cap when the caller names none, and
   `profile` answers `max_output = nil` to match. The server's own limit is then
   the window less the prompt, which is the cap a self-hosted model actually

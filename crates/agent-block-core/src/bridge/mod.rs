@@ -86,37 +86,131 @@ fn register_non_bus_bridges(lua: &Lua, ctx: &HostContext, is_handler_side: bool)
     Ok(())
 }
 
-/// Load the Lua half of a bridge — the `std.<x>.register_tools` helper a
-/// model is handed — through `require`, so the project's vendored copy is the
-/// one that runs.
+/// Install the Lua half of a bridge — `std.<x>.tool_specs` /
+/// `std.<x>.register_tools`, the helpers a model is handed — onto the
+/// `std.<std_key>` table the Rust half has just built.
 ///
-/// The Rust half of a bridge is registered here, on a VM whose require
-/// registry is already installed (the Isle init closure in `host.rs` runs
-/// first). So `require("<name>")` resolves the way every other module does:
-/// `.agent-block/lib/<name>/` first, the embedded source last. That is what
-/// makes `agent-block vendor fs_tools` a change to the tool surface without an
-/// install — the same path a vendored `agent` or `policy` takes.
+/// The module is a LIBRARY: `fs_tools` and its three siblings are ordinary
+/// modules that answer a table of functions, exactly as `agent`, `policy` and
+/// every other embedded module do. They write nothing onto `std` themselves,
+/// because a library is not wiring — which is what makes
+/// `require("fs_tools")` a table a project can wrap. The wiring is here: each
+/// exported FUNCTION is set on `std.<std_key>` under its own name. Other
+/// exports (`M.shapes`) stay on the module, where a caller that wants the
+/// contract reads it as `require("fs_tools").shapes`.
+///
+/// The module is found through `require`, so the project's vendored copy is
+/// the one that runs. The Rust half of a bridge is registered on a VM whose
+/// require registry is already installed (the Isle init closure in `host.rs`
+/// runs first), so `require("<name>")` resolves the way every other module
+/// does: `.agent-block/lib/<name>/` first, the embedded source last. That is
+/// what makes `agent-block vendor fs_tools` a change to the tool surface
+/// without an install — the same path a vendored `agent` or `policy` takes,
+/// including the delegation idiom, since the vendored copy is installed from
+/// whatever table it answers:
+///
+/// ```lua
+/// local base = require("embedded.fs_tools")
+/// local M = setmetatable({}, { __index = base })
+/// function M.tool_specs(opts) return base.tool_specs(opts) end
+/// return M
+/// ```
+///
+/// The wrapper above defines ONE of the module's functions and inherits the
+/// rest through `__index`, which raw iteration does not see — so the install
+/// walks the `__index` chain, nearest table first, and a name already taken
+/// at a nearer level is not looked for again. Without that walk a vendored
+/// copy that overrode `tool_specs` would leave `std.fs.register_tools` nil:
+/// the one idiom this shape exists for would half-work. A `__index` that is
+/// a FUNCTION cannot be enumerated at all; a copy written that way installs
+/// only what it holds itself, and the rest stays reachable through
+/// `require("fs_tools")`.
 ///
 /// A VM with no registry — a unit test's bare `Lua::new()` — cannot resolve
 /// the name at all, and for that one case the embedded source is run
-/// directly. Only "not found" falls back: an error *inside* a copy (a syntax
-/// error in what the project wrote) is the project's to see, not a reason to
-/// silently run the embedded one instead.
-pub(crate) fn load_tools_module(lua: &Lua, name: &str, embedded: &str) -> LuaResult<()> {
+/// directly; the chunk answers the same table, and is installed the same way.
+/// Only "not found" falls back: an error *inside* a copy (a syntax error in
+/// what the project wrote) is the project's to see, not a reason to silently
+/// run the embedded one instead.
+pub(crate) fn load_tools_module(
+    lua: &Lua,
+    name: &str,
+    std_key: &str,
+    embedded: &str,
+) -> LuaResult<()> {
+    // `require` answers the module, or the sentinel when the name resolves
+    // nowhere. A table cannot be the sentinel, so the two cannot be confused.
     let probe = format!(
-        r#"local ok, err = pcall(require, "{name}")
-if ok then return "loaded" end
-if tostring(err):find("module '{name}' not found", 1, true) then return "not found" end
-error(err, 0)"#
+        r#"local ok, mod = pcall(require, "{name}")
+if ok then return mod end
+if tostring(mod):find("module '{name}' not found", 1, true) then return false end
+error(mod, 0)"#
     );
-    let outcome: String = lua
+    let found: LuaValue = lua
         .load(&probe)
         .set_name(format!("require {name}"))
         .eval()?;
-    if outcome == "not found" {
-        lua.load(embedded).set_name(name).exec()?;
-    }
+    let module = match found {
+        LuaValue::Boolean(false) => lua.load(embedded).set_name(name).eval::<LuaValue>()?,
+        other => other,
+    };
+
+    let module = match module {
+        LuaValue::Table(table) => table,
+        // A copy written against the older form assigned onto `std.<x>` as a
+        // side effect and returned nothing (`require` then answers `true`).
+        // Say which module and what it has to do, rather than installing
+        // nothing and letting the tools go missing at the first call.
+        other => {
+            return Err(mlua::Error::external(format!(
+                "the `{name}` module answered {} — a tool module is a library: it must end \
+                 with `return M`, the table holding its functions. \
+                 `agent-block vendor --force {name}` rewrites the copy from the current \
+                 embedded source.",
+                found_type(&other)
+            )))
+        }
+    };
+
+    lua.load(INSTALL_TOOLS_MODULE)
+        .set_name(format!("install {name}"))
+        .call::<()>((module, std_key))?;
     Ok(())
+}
+
+/// The install itself, in Lua because the `__index` walk is: `getmetatable`
+/// and `rawget` say in four lines what the same traversal costs through the
+/// Rust bindings, and this is the only place either is needed.
+///
+/// A name seen at a nearer level is not taken from a farther one, whatever
+/// its type — a wrapper that replaced a function with a table meant to
+/// replace it, not to fall through to the one it shadowed.
+const INSTALL_TOOLS_MODULE: &str = r#"
+local module, key = ...
+local target = std[key]
+local seen = {}
+local level = module
+while type(level) == "table" do
+    for name, value in pairs(level) do
+        if not seen[name] then
+            seen[name] = true
+            if type(value) == "function" then
+                target[name] = value
+            end
+        end
+    end
+    local mt = getmetatable(level)
+    level = type(mt) == "table" and rawget(mt, "__index") or nil
+end
+"#;
+
+/// The Lua type name of a value, for the message above.
+fn found_type(value: &LuaValue) -> &'static str {
+    match value {
+        LuaValue::Nil => "nil",
+        LuaValue::Boolean(_) => "a boolean",
+        _ => value.type_name(),
+    }
 }
 
 /// Register all bridge APIs into the Lua state (main Isle).

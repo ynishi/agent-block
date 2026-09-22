@@ -38,11 +38,13 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         cfg,
     )?;
 
-    // The Lua half (std.sql.register_tools; needs the `tool` global), through
-    // `require`, so a vendored `sql_tools` wins.
+    // The Lua half — the `sql_tools` library, installed onto `std.sql` as
+    // `register_tools` (which calls the `tool` global). Through `require`,
+    // so a vendored `sql_tools` wins.
     super::load_tools_module(
         lua,
         "sql_tools",
+        "sql",
         include_str!("../../blocks/lib/sql_tools/init.lua"),
     )?;
 

@@ -1,55 +1,137 @@
--- blocks/lib/fs_tools/init.lua — the Lua half of the `std.fs` bridge.
---
--- `src/bridge/fs.rs` registers the Rust half and then `require`s this module by
--- name, so the tier order every other module follows applies here too: a
--- project's `.agent-block/lib/fs_tools/` wins, this source is the fallback.
--- `agent-block vendor fs_tools` therefore changes the tool surface a model
--- is handed with no install in between.
---
--- Defines std.fs.tool_specs(opts) / std.fs.register_tools(opts) — the
--- LLM-facing file tools.
---
--- opts:
---   allowed   : array of op names  — REQUIRED. "read", "write", "edit",
---                                   "rollback", "search_replace"
---   prefix    : tool name prefix   (default: "fs_")
---   path_lock : array of paths     (restricts every op to these files; the
---                                   model cannot reach anything else)
---   limits    : { result_tokens, count } — what one result may cost, from
---                                   `policy.result_budget`; optional
---
--- Returns: array of registered tool names.
---
--- `allowed` has no default, and there is no "opt-in" tier among the ops.
--- Which tools a model is handed is the caller's decision and nobody else's:
--- a default here means a caller that said nothing still gets a tool surface
--- someone else picked, and the caller then has no way to know what its model
--- is holding. `{"read","edit"}` was that default, which handed out the
--- line-addressed edit even though the note below records it losing to
--- `search_replace` on a real task — and the loop compensated by TELLING the
--- model in prose which tool to call, which is how a spec's own "read this
--- file first" came to be overridden by the harness
--- [実測 2026-09-12: model は ref を読もうとして 8 回以上ためらった末、
---  "the harness says to start this reply with an fs_search_replace call" を
---  理由に read を捨てた]。
---
--- The tool set is the control. Name it.
---
--- `write` is the one to think twice about: whole-file replacement is how a
--- model silently discards code it did not think to reproduce. That is a reason
--- to weigh it, not a reason for this file to withhold it.
---
--- `search_replace` is the same edit addressed differently: the model names a
--- verbatim snippet instead of a line range, and the handler finds the snippet
--- in the file as it is now and hands `std.fs.edit` the line range and the
--- `expect` text that snippet implies. Nothing is applied that `edit` would
--- not apply. It exists because some models cannot produce an exact `expect`
--- for lines they have read — they reconstruct it from memory and churn on
--- `expect_mismatch` — while copying a snippet they have just seen is within
--- reach; on one real-repository task the line-addressed form did not reach
--- green in four runs and this form did in one to three, three times out of
--- three. Which form a loop offers is the caller's choice: it is a tool spec,
--- not a policy.
+--- fs_tools — the library behind `std.fs.tool_specs` / `std.fs.register_tools`.
+---
+--- `src/bridge/fs.rs` registers the Rust half of the `std.fs` bridge and then
+--- `require`s this module by name, installing every function it exports onto
+--- `std.fs` (`bridge::load_tools_module`). This module writes nothing onto
+--- `std` itself: it is a library, and the wiring is the bridge's.
+---
+--- The tier order every other module follows applies here too: a project's
+--- `.agent-block/lib/fs_tools/` wins, this source is the fallback.
+--- `agent-block vendor fs_tools` therefore changes the tool surface a model
+--- is handed with no install in between, and a vendored copy delegates the
+--- way any other module does — `local base = require("embedded.fs_tools")`,
+--- wrap what it answers, `return M`.
+---
+--- Exports:
+---   tool_specs(opts)     -> the LLM-facing file tools, built and handed back
+---   register_tools(opts) -> the same tools, registered; array of their names
+---   shapes.tool_specs_opts / shapes.register_tools_opts — the opts contract,
+---     as data
+---
+--- What `tool_specs` answers is an array of `knl.shapes.tool_spec`: each
+--- entry carries `name`, `description`, `input_schema` and `handler`. The
+--- kernel is deliberately NOT required here to say so — a tool module has to
+--- load on a VM that has none (the bridge runs this source directly when
+--- `require` resolves nothing) — so the field set is named by doc here and
+--- held against the kernel's declaration where both halves exist:
+--- `crates/agent-block/tests/e2e_embedded_blocks.rs`.
+---
+--- opts:
+---   allowed   : array of op names  — REQUIRED. "read", "write", "edit",
+---                                   "rollback", "search_replace"
+---   prefix    : tool name prefix   (default: "fs_")
+---   path_lock : array of paths     (restricts every op to these files; the
+---                                   model cannot reach anything else)
+---   limits    : { result_tokens, count } — what one result may cost, from
+---                                   `policy.result_budget`; optional
+---
+--- `allowed` has no default, and there is no "opt-in" tier among the ops.
+--- Which tools a model is handed is the caller's decision and nobody else's:
+--- a default here means a caller that said nothing still gets a tool surface
+--- someone else picked, and the caller then has no way to know what its model
+--- is holding. `{"read","edit"}` was that default, which handed out the
+--- line-addressed edit even though the note below records it losing to
+--- `search_replace` on a real task — and the loop compensated by TELLING the
+--- model in prose which tool to call, which is how a spec's own "read this
+--- file first" came to be overridden by the harness
+--- [measured 2026-09-12: the model hesitated over reading the ref more than
+---  eight times and then dropped it, on the grounds that "the harness says to
+---  start this reply with an fs_search_replace call"].
+---
+--- The tool set is the control. Name it.
+---
+--- `write` is the one to think twice about: whole-file replacement is how a
+--- model silently discards code it did not think to reproduce. That is a reason
+--- to weigh it, not a reason for this file to withhold it.
+---
+--- `search_replace` is the same edit addressed differently: the model names a
+--- verbatim snippet instead of a line range, and the handler finds the snippet
+--- in the file as it is now and hands `std.fs.edit` the line range and the
+--- `expect` text that snippet implies. Nothing is applied that `edit` would
+--- not apply. It exists because some models cannot produce an exact `expect`
+--- for lines they have read — they reconstruct it from memory and churn on
+--- `expect_mismatch` — while copying a snippet they have just seen is within
+--- reach; on one real-repository task the line-addressed form did not reach
+--- green in four runs and this form did in one to three, three times out of
+--- three. Which form a loop offers is the caller's choice: it is a tool spec,
+--- not a policy.
+
+--- `lshape`, the tolerant way, for the one VM that has no `require` at all.
+---
+--- `bridge::load_tools_module` falls back to running this source directly
+--- when the name resolves nowhere, which is a Rust unit test's bare
+--- `Lua::new()`. Nothing resolves there — not `lshape`, not anything — and
+--- that VM only needs `std.fs` to hold its functions; it never calls one. So
+--- an absent `lshape` costs the dev-mode reading of `opts` and nothing else:
+--- every refusal that names a field is hand-written below and is loud in both
+--- modes. `knl/init.lua` requires `knl_types` on the same terms and for the
+--- same reason.
+local shape_ok, lshape = pcall(require, "lshape")
+local T = shape_ok and lshape.t or nil
+local shape = shape_ok and lshape.check or nil
+
+local M = {}
+
+--- What `tool_specs` is configured with. CLOSED on purpose: an option this
+--- module does not know is a typo, and a typo that quietly became a no-op is
+--- a tool surface nobody chose — `path_lok` reads exactly like a caller that
+--- locked the paths and did not.
+---
+--- This is the dev-mode reading, and it sits BESIDE the hand-written refusals
+--- rather than replacing them: a missing `allowed`, and a
+--- `limits.result_tokens` with no `limits.count` to measure against, are
+--- named in prose and raised in both modes, because a caller that gets them
+--- wrong gets them wrong in production too.
+---
+--- Which is why `allowed` is OPTIONAL here even though it is required. The
+--- judgement lives in one place: "is `allowed` there at all" is the function's
+--- own, loud in both modes and phrased as advice ("name the ops this caller
+--- hands its model"); "are the declared keys the right shape" is this
+--- contract's, and is welcome to be dev-only. A required field here would
+--- make the shape the thing that answers a missing `allowed` — in dev only,
+--- with a message about a shape violation instead of the one the function
+--- wrote. That is one mistake with two answers, split by an environment
+--- variable. `policy`'s `opts_contract` splits the same way for the same
+--- reason.
+local TOOL_SPECS_OPTS
+if shape_ok then
+    TOOL_SPECS_OPTS = T.shape({
+        allowed = T.array_of(T.string)
+            :describe(
+                'the ops this caller hands its model: "read", "write", "edit", "rollback", '
+                    .. '"search_replace". Required — its absence is refused by name below, in both modes'
+            )
+            :is_optional(),
+        prefix = T.string:describe('prepended to every tool name; default "fs_"'):is_optional(),
+        path_lock = T.array_of(T.string)
+            :describe("the only files the tools may touch; every other path is refused by name")
+            :is_optional(),
+        limits = T.shape({
+            result_tokens = T.any_of({ T.number, T.fn })
+                :describe("what one result may take: a number, or fn() -> number; needs `count`")
+                :is_optional(),
+            count = T.fn:describe("fn(text) -> tokens, the counter `result_tokens` is measured with"):is_optional(),
+        }):is_optional(),
+    }, { open = false })
+end
+
+--- `register_tools` forwards its opts to `tool_specs` untouched, so the
+--- contract is the same one under the second name — one declaration read from
+--- two places, rather than two that can drift.
+M.shapes = {
+    tool_specs_opts = TOOL_SPECS_OPTS,
+    register_tools_opts = TOOL_SPECS_OPTS,
+}
 
 -- Turn a snippet matched at `pos` into the line-addressed edit `std.fs.edit`
 -- takes. The match is widened to whole lines: `expect` is the exact text of
@@ -69,9 +151,10 @@
 -- believes the code reads one way re-sends the same belief. The sibling
 -- failures already do better — `search_ambiguous` returns the match count,
 -- `result_too_large` returns the size and the limit — and this closes the
--- last one [実測 2026-09-11: `collect::<Vec<u32>>()` を 4 回送り続けた run。
---  file の実体は model 自身が前の編集で書いた `collect::<Vec<u32>()))` で、
---  読み幅を 1378..1383 → 1379..1382 と狭めて 6 回目にやっと写せた]。
+-- last one [measured 2026-09-11: a run that sent `collect::<Vec<u32>>()` four
+--  times over. What the file held was `collect::<Vec<u32>()))`, which the model
+--  itself had written in an earlier edit; it copied it correctly on the sixth
+--  try, after narrowing its read from 1378..1383 to 1379..1382].
 --
 -- The longest whole-line prefix of `search` that does occur is found by
 -- halving the line count, then the file's own text from that point is
@@ -129,10 +212,11 @@ end
 -- region to point at — and that is the case a model working from memory
 -- lands in: it paraphrases a line it has in the seed, and the paraphrase
 -- shares its words with the real line but not its text
--- [実測 2026-09-13 dmdeclar beat 1: seed の line 501 は
---  `assert_eq!(ScheduleKind::parse("triangular"), None);` なのに、model は
---  `assert!(ScheduleKind::parse("triangular").is_none());` を anchor に書いた。
---  `actual` は出ず、次 beat は EOF 越えの read で 1 手、さらに 1 手で当てた]。
+-- [measured 2026-09-13, dmdeclar beat 1: line 501 of the seed reads
+--  `assert_eq!(ScheduleKind::parse("triangular"), None);`, but the model wrote
+--  `assert!(ScheduleKind::parse("triangular").is_none());` as its anchor. No
+--  `actual` came back; the next beat spent one move on a read that ran past
+--  EOF, and one more to hit it].
 -- The file's line that shares the most identifiers with the search's first
 -- line, ties broken by the longer common prefix; nil when nothing shares
 -- two identifiers (one word in common points at nothing in particular).
@@ -186,9 +270,10 @@ end
 -- moves a brace, and the tool says so rather than letting the verify find
 -- the mismatch two beats later. Counts, not a judgement — braces in strings
 -- count too, and an edit that means to open or close a block is legitimate
--- [実測 2026-09-13 dmdeclar beat 4: 1 行の anchor の直後に `}` と test 2 本を
---  足し、既存 test の残り (NAMES loop) が関数の外に出た。error は
---  "unexpected closing delimiter" で、修復に 2 beat].
+-- [measured 2026-09-13, dmdeclar beat 4: a `}` and two tests were appended right
+--  after a one-line anchor, which left the rest of an existing test (the NAMES
+--  loop) outside the function. The error was "unexpected closing delimiter",
+--  and the repair took two beats].
 local function brace_balance(text)
     local _, open = tostring(text or ""):gsub("{", "")
     local _, close = tostring(text or ""):gsub("}", "")
@@ -228,8 +313,11 @@ end
 -- one LLM call use this and dispatch the handlers themselves.
 --
 -- Returns an array of { name, description, input_schema, handler }.
-std.fs.tool_specs = function(opts)
+function M.tool_specs(opts)
     opts = opts or {}
+    if shape ~= nil then
+        shape.assert_dev(opts, TOOL_SPECS_OPTS, "std.fs.tool_specs opts")
+    end
     local allowed = opts.allowed
     if type(allowed) ~= "table" or #allowed == 0 then
         error("std.fs.tool_specs: `allowed` is required — name the ops this caller hands its model", 2)
@@ -248,8 +336,8 @@ std.fs.tool_specs = function(opts)
     -- which left the model nothing to look at and no way forward, and the
     -- limit appeared in neither the description nor the input_schema, so
     -- nobody knew it was there until it fired
-    -- [実測 2026-09-12: `result_cap` は `{ok=false, reason="result_too_large"}`
-    --  を返すだけだった]。
+    -- [measured 2026-09-12: `result_cap` answered nothing but
+    --  `{ok=false, reason="result_too_large"}`].
     --
     -- The one measured improvement in this area is the resume line: a read
     -- that reports the range returned, the total, what is left and the next
@@ -284,8 +372,9 @@ std.fs.tool_specs = function(opts)
     --- `k` lines — the whole encoded table, not the content alone. Measuring
     --- the content and returning a table costs the difference, and the shell
     --- then refuses a result the tool believed it had fitted
-    --- [実測 2026-09-12: content を 768 tok に収めたのに、metadata と JSON
-    ---  escaping を足した実体は 914 tok で `result_too_large` になった]。
+    --- [measured 2026-09-12: the content was fitted to 768 tokens, but with the
+    ---  metadata and the JSON escaping the real thing came to 914 and was
+    ---  refused as `result_too_large`].
     local function fit_lines(lines, budget, count, render)
         local function cost(k)
             return count(render(k))
@@ -337,8 +426,8 @@ std.fs.tool_specs = function(opts)
     --- which reaches the model but nowhere a human reads: working out that
     --- `no_edits` and `path_missing` were the same event (a call cut at the
     --- output ceiling) meant opening `knl.sqlite` per run
-    --- [実測 2026-09-11: 11 件すべて out=4096 の beat だったと分かるまで、
-    ---  run dir を 1 本ずつ SQL で舐めていた]。
+    --- [measured 2026-09-11: working out that all eleven were beats with
+    ---  out=4096 meant going through the run directories one at a time in SQL].
     local function refused(res, ctx)
         log.debug(
             "[fs refused] "
@@ -717,9 +806,11 @@ std.fs.tool_specs = function(opts)
                             -- to add, where "more than once" does not. And say
                             -- where: the line of each occurrence, so the caller
                             -- can pick the one it meant instead of guessing
-                            -- [実測 2026-09-13 dmdclref beat 2: `    }\n}` が 2 箇所
-                            --  (impl の末尾と mod tests の末尾)。model は数から
-                            --  場所を推理して当てたが、行番号があれば推理は要らない].
+                            -- [measured 2026-09-13, dmdclref beat 2: `    }\n}`
+                            --  occurred twice (the end of the impl and the end
+                            --  of `mod tests`). The model inferred which one from
+                            --  the count and got it right, but with the line
+                            --  numbers there is nothing to infer].
                             local function line_of(p)
                                 local _, n = content:sub(1, p - 1):gsub("\n", "")
                                 return n + 1
@@ -767,11 +858,12 @@ std.fs.tool_specs = function(opts)
                 -- model did not reproduce, and nothing says so: the answer is
                 -- `applied = n` either way, and the loss surfaces one verify
                 -- later as a compile error pointing somewhere else entirely
-                -- [実測 2026-09-11 ST1 run 182520: 1 件の edit が search に
-                --  含めた `opts` / `cursor` / `}` を replace に書き戻さず、
-                --  struct の閉じ括弧ごと消えた。error は 1568 行目の
-                --  "unclosed delimiter" で、消えた場所は 280 行目付近。
-                --  その 1 件で run (受入 test 6 本を書き上げていた) が全損]。
+                -- [measured 2026-09-11, ST1 run 182520: one edit did not write
+                --  back the `opts` / `cursor` / `}` it had included in its
+                --  search, and the struct's closing brace went with them. The
+                --  error was "unclosed delimiter" at line 1568, while what had
+                --  gone was around line 280. That one edit cost the whole run,
+                --  which had written six acceptance tests].
                 -- Counts, not a judgement: the tool does not refuse a shrink —
                 -- deleting code is a legitimate edit — it only states it.
                 local shrank, net, braces = {}, 0, {}
@@ -877,15 +969,17 @@ std.fs.tool_specs = function(opts)
     return specs
 end
 
--- Register the same tools into the global tool registry, for callers that own
--- the VM and want them visible to `tool.schema()` / `tool.call`.
+--- Register the same tools into the global tool registry, for callers that own
+--- the VM and want them visible to `tool.schema()` / `tool.call`.
 --
 -- Returns: array of registered tool names.
-std.fs.register_tools = function(opts)
+function M.register_tools(opts)
     local registered = {}
-    for _, spec in ipairs(std.fs.tool_specs(opts)) do
+    for _, spec in ipairs(M.tool_specs(opts)) do
         tool.register(spec.name, { description = spec.description, input_schema = spec.input_schema }, spec.handler)
         table.insert(registered, spec.name)
     end
     return registered
 end
+
+return M
