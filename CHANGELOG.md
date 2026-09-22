@@ -9,21 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `policy.thinking_cap({ port, conf, reserve, call_reserve, budget? })` sends
-  the reasoning's stop point with every request, and `coding.run{ call_reserve
-  = N }` is the opt that puts it on a run. The model cannot see its room, and
+- `policy.thinking_cap({ port, conf, call_reserve, budget? })` sends the
+  reasoning's stop point with every request, and `coding.run{ call_reserve =
+  N }` is the opt that puts it on a run. The model cannot see its room, and
   its reasoning comes out of the same allowance as the answer: a beat whose
   prompt has grown has less left for both, nothing in the conversation says so,
   and the tool call the model was about to make never gets written [measured
   2026-09-13 in a sibling lane: a prompt of 24,984 tokens in a 32k window,
   7,121 of them spent thinking, and the call that followed arrived as `{}`].
-  The filter computes `window − count − reserve − call_reserve`, capped by
-  `budget` when the caller has one, and sends it as
-  `request.thinking.budget_tokens`; under one token it sends nothing, since
-  "stop after 0 tokens" is not a stop point. It reads no log and keeps nothing
-  between beats — the room comes from the Port's own count of the request the
-  fold has just built, which the fold has already asked for, so the answer is
-  cached. No other harness sizes reasoning per request; the ones surveyed fix
+  The filter takes the reply's room — the window less the Port's count of the
+  request, and no more than `profile.max_output` where the wire carries that
+  cap — less `call_reserve`, capped by `budget` when the caller has one, and
+  sends it as `request.thinking.budget_tokens`; under one token it sends
+  nothing, since "stop after 0 tokens" is not a stop point. The room is read
+  off the same profile `policy.window` splits the window by, through a
+  `reply_room` beside its `request_limit`, so the split between prompt and
+  reply is decided in one place; what the fold held back as `reserve` is not
+  named to this filter and not subtracted again — it is that room. The conf
+  has to turn reasoning on (`thinking = true`, or a table whose `enabled` is
+  not false), and the filter refuses one that does not: the adapter reads a
+  thinking table on the request as reasoning on, and the request's replaces
+  the conf's, so a budget over a conf that asked for no reasoning would switch
+  it on by itself. It reads no log and keeps nothing between beats — the room
+  comes from the Port's own count of the request the fold has just built, which
+  is the count the fold already asked for when nothing before this filter
+  changed the request. No other harness sizes reasoning per request; the ones surveyed fix
   an effort for the run, and what varies with the remaining room is done
   provider-side where it is done at all. The evidence for doing it here is a
   sibling lane's [measured 2026-09-14: on a 32k window, the beats where the
@@ -251,6 +261,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel's session ids are UUIDs.
 
 ### Changed
+
+- `coding.run` seeds the targets by name unless told otherwise: `seed`
+  defaults to `"names"`, where the loop had always handed every target over
+  whole and line-numbered. A caller that wants the old shape says `seed =
+  "full"`. `coding.seed` the helper is unchanged — its `mode` left nil still
+  reads as `"full"` — the default moved on the loop alone. The reasons are
+  under Added, with the opt.
 
 - The `coding` loop's state is one table and its steps are plain functions.
   `coding.run`'s implementation held its state in a dozen mutable locals that

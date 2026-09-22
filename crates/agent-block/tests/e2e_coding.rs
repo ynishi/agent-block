@@ -414,10 +414,12 @@ async fn coding_run_seeds_the_targets_by_name_and_lets_the_model_read_them() {
 /// at for the tool call after it to fit.
 ///
 /// The mock's `/tokenize` answers a fixed count and its model card a fixed
-/// window, so the number is arithmetic rather than a guess: the window, less
-/// what the request costs, less the fold's reserve, less what is kept for the
-/// call. The conf names the vllm dialect and asks for reasoning, which is what
-/// puts `thinking_token_budget` on the wire at all.
+/// window, so the number is arithmetic rather than a guess: the reply's room
+/// — the window less what the request costs, with no `max_tokens` on this
+/// conf to cap it lower — less what is kept for the call. The fold's
+/// `reserve` is not in the sum: it is what made that room, not a second
+/// deduction from it. The conf names the vllm dialect and asks for
+/// reasoning, which is what puts `thinking_token_budget` on the wire at all.
 #[tokio::test]
 async fn coding_run_sends_the_reasonings_stop_point_when_call_reserve_is_named() {
     let (dir, target) = make_repo();
@@ -429,7 +431,6 @@ async fn coding_run_sends_the_reasonings_stop_point_when_call_reserve_is_named()
     // The mock's own numbers (tests/common/openai_mock.rs) and the fixture's.
     const WINDOW: i64 = 32768;
     const COUNTED: i64 = 128;
-    const RESERVE: i64 = 1024;
     const CALL_RESERVE: i64 = 512;
 
     let ran = run_fixture(
@@ -442,7 +443,7 @@ async fn coding_run_sends_the_reasonings_stop_point_when_call_reserve_is_named()
     says(&ran.stdout, "CODING_MOCK_DONE");
     says(&ran.stdout, "ok=true");
 
-    let expected = WINDOW - COUNTED - RESERVE - CALL_RESERVE;
+    let expected = WINDOW - COUNTED - CALL_RESERVE;
     for (n, body) in ran.bodies.iter().enumerate() {
         assert_eq!(
             body["thinking_token_budget"].as_i64(),

@@ -258,7 +258,23 @@ describe("coding.run — what it refuses", function()
         expect(about(refusal({ call_reserve = -1 }), "`call_reserve` must be a whole number")).to.be(true)
         expect(about(refusal({ call_reserve = 1.5 }), "`call_reserve` must be a whole number")).to.be(true)
         -- Zero is a number a caller may mean: keep nothing back for the call.
-        expect(about(refusal({ call_reserve = 0 }), "`call_reserve`")).to.be(false)
+        local thinking_on = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = true } }
+        expect(about(refusal({ call_reserve = 0, llm = thinking_on }), "`call_reserve`")).to.be(false)
+    end)
+
+    it("refuses a call_reserve over a conf that does not turn reasoning on", function()
+        -- The stop point goes on the wire as a thinking table, and the
+        -- adapter reads one as reasoning on: a conf that said nothing, or
+        -- said off, would be switched on by the budget. Refused before the
+        -- baseline verify, with the other opts.
+        expect(about(refusal({ call_reserve = 512 }), "needs llm.conf.thinking to turn reasoning on")).to.be(true)
+        local off = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = false } }
+        expect(about(refusal({ call_reserve = 512, llm = off }), "needs llm.conf.thinking")).to.be(true)
+        local disabled = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = { enabled = false } } }
+        expect(about(refusal({ call_reserve = 512, llm = disabled }), "needs llm.conf.thinking")).to.be(true)
+        -- Either spelling of "on" gets past it.
+        local on = { port = {}, conf = { max_tokens = 4096, timeout = 600, thinking = { effort = "high" } } }
+        expect(about(refusal({ call_reserve = 512, llm = on }), "needs llm.conf.thinking")).to.be(false)
     end)
 
     it("needs the reply's seconds named", function()

@@ -138,7 +138,7 @@
 ---     require_args reads NO log: the arguments it is handed, against the
 ---                 `required` list the tool already declares
 ---     thinking_cap reads NO log: the request it is handed, counted by the
----                 Port, against the window the Port declares
+---                 Port, against the room the Port's profile leaves the reply
 ---     verdict     reads the log — `session:events()`, per call, and only
 ---                 when `timeout` is a table: what the checks took are gaps
 ---                 between the kernel's stamps, read by the `measure` the
@@ -643,17 +643,17 @@ local REPEAT_CAP_OPTS, REPEAT_CAP_ARG = opts_contract({
         :is_optional(),
 })
 
---- What `policy.thinking_cap` is configured with. Two numbers of tokens and
---- the Port that knows the window; `budget` is the caller's own ceiling on
---- the reasoning, when it has one.
+--- What `policy.thinking_cap` is configured with. One number of tokens and
+--- the Port that knows the window and the reply's cap; `budget` is the
+--- caller's own ceiling on the reasoning, when it has one. There is no
+--- `reserve`: what the fold held back for the reply is read off the same
+--- profile the fold read it from, not named a second time.
 local THINKING_CAP_OPTS, THINKING_CAP_ARG = opts_contract({
-    port = T.table:describe("an LLM Port: profile(conf) for the window, count(request, conf) for the request"),
-    conf = T.table:describe("the conf the port is opened with"):is_optional(),
-    reserve = T.number
-        :describe(
-            "tokens the fold holds back for the reply — the same number window{ fit.reserve } was given; default 0"
-        )
-        :is_optional(),
+    port = T.table:describe("an LLM Port: profile(conf) for the window and cap, count(request, conf) for the request"),
+    conf = T.table:describe(
+        "the conf the port is opened with; its `thinking` has to turn reasoning on (true, or a table whose "
+            .. "enabled is not false)"
+    ),
     call_reserve = T.number:describe("tokens kept out of the reasoning for the tool call that follows it"),
     budget = T.number:describe("the most reasoning this run may take, whatever the room says"):is_optional(),
 })
@@ -899,10 +899,53 @@ local function port_for_fit(fit, who)
     return fit.port, fit.conf, fit.reserve
 end
 
+--- The two numbers the window is split by, read off the Port's profile and
+--- checked once for every policy that sizes anything against them: the
+--- window, and the cap the wire puts on the reply (0 when it puts none —
+--- `profile.max_output`, the conf's `max_tokens` or the impl's default). Loud
+--- when the profile does not say — a window that guessed would be the 400 it
+--- exists to prevent, one step later.
+---
+--- `request_limit` and `reply_room` below are the two sides of that one split
+--- — how much the prompt may take, how much the reply then has — and both
+--- read these numbers here rather than each doing its own arithmetic, so
+--- there is one answer to "where does the prompt end and the reply begin".
+---
+--- @param profile table  the Port's answer to profile(conf)
+--- @param who string  the policy's name, for the raise
+--- @param level number  where the raise points, as `error` counts it
+--- @return number window  profile.context_window
+--- @return number output  profile.max_output, or 0 for a wire with no cap
+local function profile_split(profile, who, level)
+    if type(profile) ~= "table" then
+        error(who .. ": port:profile(conf) must answer a table, got " .. tostring(profile), level)
+    end
+    local window, output = profile.context_window, profile.max_output
+    if not whole_at_least(window, 1) then
+        error(
+            who
+                .. ": the port's profile names no context_window; declare it in the conf the port is opened with "
+                .. "(context_window = <tokens>) or on the port",
+            level
+        )
+    end
+    if output == nil then
+        output = 0
+    elseif not whole_at_least(output, 0) then
+        error(who .. ": profile.max_output must be a whole number >= 0, got " .. tostring(output), level)
+    end
+    if output >= window then
+        error(
+            string.format("%s: profile.max_output (%d) leaves no room in context_window (%d)", who, output, window),
+            level
+        )
+    end
+    return window, output
+end
+
 --- The tokens a request may take, read off the Port's profile: the window
 --- less the room the answer needs, less what `reserve` holds back for a reply
---- the wire puts no cap on. Loud when the profile does not say — a window
---- that guessed would be the 400 it exists to prevent, one step later.
+--- the wire puts no cap on.
 ---
 --- `reserve` holds back only what `profile.max_output` does not already: that
 --- cap comes out of the window here anyway, and a cap on the wire bounds the
@@ -916,29 +959,7 @@ end
 --- @return number limit  the tokens one request may take
 --- @return number held  what the reserve held back beyond profile.max_output
 local function request_limit(profile, who, reserve)
-    if type(profile) ~= "table" then
-        error(who .. ": port:profile(conf) must answer a table, got " .. tostring(profile), 3)
-    end
-    local window, output = profile.context_window, profile.max_output
-    if not whole_at_least(window, 1) then
-        error(
-            who
-                .. ": the port's profile names no context_window; declare it in the conf the port is opened with "
-                .. "(context_window = <tokens>) or on the port",
-            3
-        )
-    end
-    if output == nil then
-        output = 0
-    elseif not whole_at_least(output, 0) then
-        error(who .. ": profile.max_output must be a whole number >= 0, got " .. tostring(output), 3)
-    end
-    if output >= window then
-        error(
-            string.format("%s: profile.max_output (%d) leaves no room in context_window (%d)", who, output, window),
-            3
-        )
-    end
+    local window, output = profile_split(profile, who, 4)
     local held = math.max(0, (reserve or 0) - output)
     local limit = window - output - held
     if limit < 1 then
@@ -954,6 +975,30 @@ local function request_limit(profile, who, reserve)
         )
     end
     return limit, held
+end
+
+--- The tokens the reply may take once the request is known — the other side
+--- of the split `request_limit` reads: the window less the request, and no
+--- more than the cap the wire carries when it carries one. The fold has
+--- already held `reserve` back to make this room; it is not subtracted again
+--- here, because it IS this room.
+---
+--- May be zero or negative — a request the fold let through on an estimate
+--- that the server counts higher — and that is the caller's to read as "no
+--- room", not a raise: the request is already built and on its way.
+---
+--- @param profile table  the Port's answer to profile(conf)
+--- @param who string  the policy's name, for the raise
+--- @param used number  what the request costs, by the Port's count
+--- @param level number  where a raise about the profile points
+--- @return number room  tokens the reply has, cap and window both honoured
+local function reply_room(profile, who, used, level)
+    local window, output = profile_split(profile, who, level)
+    local room = window - used
+    if output > 0 and output < room then
+        room = output
+    end
+    return room
 end
 
 --- Build a `fold` that folds the last `tail` beats of the log.
@@ -1925,10 +1970,10 @@ end
 --- Build a `filter` that sends the reasoning's stop point with every request.
 ---
 ---     local device = knl.device({
----         llm = port:open(conf),
+---         llm = port:open(conf), -- conf.thinking turns reasoning on
 ---         filters = {
 ---             policy.carry({ max_bytes = 512 })(session),
----             policy.thinking_cap({ port = port, conf = conf, reserve = 6144, call_reserve = 3072 }),
+---             policy.thinking_cap({ port = port, conf = conf, call_reserve = 3072 }),
 ---         },
 ---     })
 ---
@@ -1942,19 +1987,40 @@ end
 ---  as `{}`]. This filter computes where the reasoning has to stop for the
 --- call to still fit, and sends that number with the request.
 ---
----     room = window - port:count(request, conf) - reserve
+---     room = window - port:count(request, conf)      -- and no more than
+---                                                    -- profile.max_output,
+---                                                    -- where the wire has a cap
 ---     T    = min(room - call_reserve, budget)
 ---
---- `reserve` is the same number `window{ fit.reserve }` was given — what the
---- fold already held back for the reply — so what is left over is the reply's
---- room, and `call_reserve` is the part of it the tool call needs. When `T` is
---- under one token the request goes through untouched: there is no stop point
---- worth sending, and saying "stop after 0 tokens" is not one.
+--- The room is the reply's, and it is read where the window's split between
+--- prompt and reply is decided — the same profile `policy.window` sized the
+--- request against, through `reply_room` beside its `request_limit` — rather
+--- than computed again here. So a `max_tokens` on the conf bounds it the way
+--- it bounds the reply on the wire, and what the fold held back as `reserve`
+--- is not named again: it IS this room, and a filter that subtracted it a
+--- second time would leave the most crowded beat — the one the stop point is
+--- for — with no stop point at all [the prompt above, 24,984 in 32k with a
+--- reserve of 6,144: the room is 7,784; 7,784 less 6,144 again is less than
+--- a `call_reserve` of 3,072, and nothing would be sent]. `call_reserve` is
+--- the part of the room the tool call needs. When `T` is under one token the
+--- request goes through untouched: there is no stop point worth sending, and
+--- saying "stop after 0 tokens" is not one.
+---
+--- REASONING HAS TO BE ON IN THE CONF — `thinking = true`, or a table whose
+--- `enabled` is not false — and a conf that says nothing is refused when the
+--- filter is built. The adapter reads any `thinking` table on the request as
+--- reasoning turned on (`llm_proto.normalize_thinking`: `enabled` defaults to
+--- true), and the request's `thinking` replaces the conf's wholesale
+--- (`knl_adapter`'s build merges the conf and then the request, field by
+--- field). A budget sent to a conf that never asked for reasoning would
+--- therefore switch reasoning on by itself, on the wire, on every beat — a
+--- side effect no `call_reserve` asked for. The conf's own keys (`effort`,
+--- `kwarg`, `mode`) are carried across under the budget.
 ---
 --- It reads no log and holds nothing between beats: the room is derived from
---- the request it is handed, every time, through the Port's own count — which
---- the fold has already asked for the same request, so the answer is cached
---- and asking costs nothing.
+--- the request it is handed, every time, through the Port's own count. When
+--- no filter before this one changed the request, that is the count the fold
+--- already asked for, and the Port answers it from cache.
 ---
 --- WHERE IT REACHES THE WIRE. `request.thinking.budget_tokens` is a
 --- per-request budget, and vLLM is the dialect that takes one
@@ -1973,27 +2039,35 @@ end
 ---  nothing].
 ---
 --- The request is not changed in place: what comes back is a copy with
---- `thinking` on it, merged over the conf's own thinking keys so an `effort`
---- or a `kwarg` the caller set is still there. The request's own `thinking`
---- wins over the conf's where both reach the provider — `knl_adapter`'s build
---- merges the conf and then the request, field by field.
+--- `thinking` on it.
 ---
---- @param opts table  { port, conf?, reserve?, call_reserve, budget? }
+--- @param opts table  { port, conf, call_reserve, budget? }
 --- @return function filter  fn(request) -> request
 function M.thinking_cap(opts)
     opts = opts or {}
     if type(opts) ~= "table" then
         error("policy.thinking_cap: opts must be a table", 2)
     end
-    only(opts, { port = true, conf = true, reserve = true, call_reserve = true, budget = true }, "policy.thinking_cap")
+    only(opts, { port = true, conf = true, call_reserve = true, budget = true }, "policy.thinking_cap")
     if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
         error("policy.thinking_cap: port must answer count(request, conf) and profile(conf)", 2)
     end
-    if opts.conf ~= nil and type(opts.conf) ~= "table" then
-        error("policy.thinking_cap: conf must be a table when given", 2)
+    if type(opts.conf) ~= "table" then
+        error("policy.thinking_cap: conf must be the table the port is opened with", 2)
     end
-    if opts.reserve ~= nil and not whole_at_least(opts.reserve, 0) then
-        error("policy.thinking_cap: reserve must be a whole number >= 0 (tokens), got " .. tostring(opts.reserve), 2)
+    -- The conf has to have turned reasoning on itself. The adapter reads a
+    -- thinking table as "on" unless it says `enabled = false`, and the
+    -- request's table replaces the conf's — so a budget sent over a conf that
+    -- said nothing would be the thing that turned reasoning on.
+    local declared = opts.conf.thinking
+    local on = declared == true or (type(declared) == "table" and declared.enabled ~= false)
+    if not on then
+        error(
+            "policy.thinking_cap: the conf does not turn reasoning on (thinking = true, or { enabled = true, ... }); "
+                .. "a stop point is sent as a thinking table, and one sent over a conf that asked for no reasoning "
+                .. "would switch it on by itself",
+            2
+        )
     end
     -- Required, and the one opt that is: a cap with nothing kept back for the
     -- call is a cap that lets the reasoning run to the end of the window,
@@ -2012,23 +2086,17 @@ function M.thinking_cap(opts)
     shape.assert_dev(opts, THINKING_CAP_OPTS, "policy.thinking_cap opts")
 
     local port, conf = opts.port, opts.conf
-    local reserve, call_reserve, budget = opts.reserve or 0, opts.call_reserve, opts.budget
+    local call_reserve, budget = opts.call_reserve, opts.budget
 
     return function(request)
-        local profile = port:profile(conf)
-        local window = type(profile) == "table" and profile.context_window or nil
-        if not whole_at_least(window, 1) then
-            error(
-                "policy.thinking_cap: the port's profile names no context_window; declare it in the conf the "
-                    .. "port is opened with (context_window = <tokens>) or on the port",
-                0
-            )
-        end
         local used = port:count(request, conf)
         if type(used) ~= "number" then
             error("policy.thinking_cap: port:count must answer a number, got " .. tostring(used), 0)
         end
-        local stop = math.floor(window - used - reserve - call_reserve)
+        -- The reply's room, off the profile the fold split the window by: the
+        -- window less this request, under the wire's cap where there is one.
+        local room = reply_room(port:profile(conf), "policy.thinking_cap", used, 0)
+        local stop = math.floor(room - call_reserve)
         if budget and budget < stop then
             stop = budget
         end
@@ -2038,21 +2106,16 @@ function M.thinking_cap(opts)
             -- happens on every beat without this filter.
             return request
         end
+        -- The conf's own thinking keys, under the budget: `true` carries as
+        -- `enabled`, a table as its keys — the construction above has already
+        -- said it is one of those two.
         local thinking = {}
-        -- Read out rather than `and`/`or`ed: `thinking = false` is a value
-        -- this has to carry, and the idiom would drop it for a nil.
-        local declared = nil
-        if type(conf) == "table" then
-            declared = conf.thinking
-        end
         if type(declared) == "table" then
             for key, value in pairs(declared) do
                 thinking[key] = value
             end
-        elseif type(declared) == "boolean" then
-            -- `thinking = false` is reasoning turned off, and a budget must
-            -- not turn it back on: the switch is carried across as it stands.
-            thinking.enabled = declared
+        else
+            thinking.enabled = true
         end
         thinking.budget_tokens = stop
         local out = {}

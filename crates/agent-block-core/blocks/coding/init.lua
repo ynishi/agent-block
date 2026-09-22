@@ -26,7 +26,8 @@
 --                                               -- the paths alone, for the model to read in ranges)
 --                                               -- or "full" (each one whole and line-numbered)
 --       call_reserve = 3072,                    -- tokens kept out of the model's reasoning for the
---                                               -- tool call after it; absent = no stop point is sent
+--                                               -- tool call after it; absent = no stop point is sent;
+--                                               -- given, llm.conf.thinking must turn reasoning on
 --       check_timeout = 120,                    -- seconds one plan check may take; done = "plan" only
 --       strict  = false,                        -- true: every Exec knob below must be named here
 --   })
@@ -119,9 +120,10 @@
 --                         arguments did not all arrive is refused before the
 --                         tool runs — a reply cut at the output limit is where
 --                         one comes from)
---     where thinking stops `policy.thinking_cap{ port, conf, reserve, call_reserve }`,
+--     where thinking stops `policy.thinking_cap{ port, conf, call_reserve }`,
 --                         when `call_reserve` is named: the reasoning's stop
---                         point, sized per request so the call after it fits
+--                         point, sized per request off the reply's room so
+--                         the call after it fits
 --     what a failure says `policy.carry` — one note about an edit the tool refused
 --     when to stop        `policy.verdict{ run = run_verify, changed, timeout }` after
 --                         every iteration — green counts only with an edit landed —
@@ -188,9 +190,11 @@ local DEFAULT_DONE = "declare"
 -- them, it asks (`fs_spec`).
 local DEFAULT_READ_OP = "read"
 local DEFAULT_EDIT_OPS = { "search_replace" }
--- How the targets enter the seed: whole, or by name alone. "full" is the
--- default because this tree has measured neither against the other; what is
--- known about names is written where `M.seed` explains it.
+-- How the targets enter the seed: whole, or by name alone. "names" is the
+-- default here — the shape every run in a sibling lane has taken since
+-- 2026-09-14 — and the reasons are written where `M.seed` explains it. The
+-- helper itself reads a nil `mode` as "full", the plain meaning of "seed
+-- these files"; the loop passes its choice explicitly.
 local SEED_MODES = { full = true, names = true }
 local DEFAULT_SEED = "names"
 -- The session's owner when the caller names none.
@@ -269,12 +273,14 @@ local RUN_OPTS = T.shape({
     call_reserve = T.number
         :describe(
             "tokens kept out of the model's reasoning for the tool call that follows it. Given, the run "
-                .. "sends a stop point for the reasoning with every request (policy.thinking_cap): the window "
-                .. "less what the request already costs, less `reserve`, less this. Absent, no stop point is "
-                .. "sent and the server's own default stands, which is today's behaviour. It reaches the wire "
-                .. "only on a dialect that takes a per-request budget — vllm's thinking_token_budget; the "
-                .. "openai adapter warns and sends nothing on the others — and it does nothing useful without "
-                .. "`reserve`, whose number it is measured against "
+                .. "sends a stop point for the reasoning with every request (policy.thinking_cap): the reply's "
+                .. "room — the window less what the request costs, under llm.conf.max_tokens where there is "
+                .. "one — less this. Absent, no stop point is sent and the server's own default stands, which "
+                .. "is today's behaviour. Given, llm.conf.thinking must turn reasoning on (true, or a table "
+                .. "whose enabled is not false): the stop point goes on the wire as a thinking table, and one "
+                .. "sent over a conf that asked for no reasoning would switch it on. It reaches the wire only "
+                .. "on a dialect that takes a per-request budget — vllm's thinking_token_budget; the openai "
+                .. "adapter warns and sends nothing on the others "
                 .. "[measured 2026-09-14 in a sibling lane: on a 32k window, the beats where the stop point "
                 .. "fired still delivered their tool call, where the unbounded ones filled the window and "
                 .. "delivered nothing]"
@@ -419,7 +425,12 @@ end
 --- @return table  { read = <string>, edit = { <string>, ... } }
 function M.ops_of(ops)
     if ops == nil then
-        return { read = DEFAULT_READ_OP, edit = { DEFAULT_EDIT_OPS[1] } }
+        -- A copy, not the constant: the caller may hold on to the table.
+        local edit = {}
+        for i, name in ipairs(DEFAULT_EDIT_OPS) do
+            edit[i] = name
+        end
+        return { read = DEFAULT_READ_OP, edit = edit }
     end
     if type(ops) ~= "table" then
         error('coding.run: `ops` must be a table — { read = "read", edit = { "search_replace" } }', 2)
@@ -1142,6 +1153,22 @@ local function check_opts(opts)
     -- per attempt. The third, the window, is asked of the port in
     -- `_run_impl`: that is the first place there is a port to ask.
     local conf = opts.llm.conf
+    -- A stop point for the reasoning needs the conf to have turned reasoning
+    -- on: `policy.thinking_cap` refuses the pair too, but that is inside the
+    -- session, after the baseline verify has already run a command. Refused
+    -- here, with the other opts, nothing has run yet.
+    if opts.call_reserve ~= nil then
+        local declared = conf.thinking
+        local on = declared == true or (type(declared) == "table" and declared.enabled ~= false)
+        if not on then
+            error(
+                "coding.run: `call_reserve` needs llm.conf.thinking to turn reasoning on (thinking = true, or "
+                    .. "{ enabled = true, ... }) — the stop point is sent as a thinking table, and one sent over a "
+                    .. "conf that asked for no reasoning would switch it on by itself",
+                3
+            )
+        end
+    end
     local unanswered = {}
     if not at_least(conf.max_tokens, 1) and not whole_at_least(opts.reserve, 1) then
         unanswered[#unanswered + 1] = "the reply's room is not named — give llm.conf.max_tokens (a cap sent on "
@@ -1348,13 +1375,15 @@ function M._run_impl(opts)
         -- `call_reserve` — where this beat's reasoning has to stop for the
         -- call after it to fit. The stop point is computed on the request the
         -- fold has just built, so it goes after `carry`, which adds to that
-        -- request as well.
+        -- request as well. The reply's room it is measured against comes off
+        -- the same profile the fold above split the window by (`max_tokens`,
+        -- or what `reserve` held back), so nothing about the room is named
+        -- twice.
         local filters = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) }
         if opts.call_reserve ~= nil then
             filters[#filters + 1] = policy.thinking_cap({
                 port = port,
                 conf = conf,
-                reserve = opts.reserve or 0,
                 call_reserve = opts.call_reserve,
                 budget = type(conf.thinking) == "table" and conf.thinking.budget_tokens or nil,
             })
