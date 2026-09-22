@@ -412,6 +412,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`.tl`) resolver implements — being something the same `Registry` can hold,
   which is the first step of typing `blocks/lib`.
 
+- `htl` 0.7 is a dependency of `agent-block-core`, with default features
+  off and `macros` / `pkg` / `dts` on: `include_tl!` for a module written as
+  `.tl`, the resolver that puts one into the `require` chain, and the
+  `.d.tl` a `#[host_module]` declares. Nothing uses it yet — this is the
+  graph being proven before a module moves. What it proved: mlua stays one
+  copy at 0.12.1 with `error-send` joining its features, and the batteries
+  compile under that; the second `mlua-batteries` (0.7) the proc macro
+  pulls is host-side only, so one `std.*` registers into a state, not two.
+
+- A module may be written in Teal. Every filesystem tier of the `require`
+  chain (`script_dir` > `.agent-block/lib` > `lib` > `$AGENT_BLOCK_HOME/lib`)
+  now has a Teal resolver ahead of its Lua one: `name.tl` (or `name/init.tl`)
+  is type-checked and generated at the `require`, `name.d.tl` beside a
+  `name.lua` types the Lua without replacing it, and a type error in a `.tl`
+  refuses the `require` — named with file and line — rather than falling
+  through to a copy in a lower tier. The checker is compiled into each VM at
+  start (`Htl::from_lua`; the cost is traced at debug as `htl checker
+  attached`). What a `.tl` can require is what has a `.tl` or `.d.tl` the
+  checker can see: the embedded modules have none yet, so a `.tl` that
+  requires `knl` or `policy` is refused with `no type information for
+  required module` until their declarations land. `just check-tl` (in
+  `just check`) runs `htl check --strict` over `blocks/lib`, with
+  `crates/agent-block-core/htl.toml` naming the require root; `just test-tl`
+  runs `htl test` there, outside `check` until the first `*_test.tl` exists.
+
+- `mcp_tools` is the first embedded module written in Teal
+  (`blocks/lib/mcp_tools/init.tl`, embedded through `include_tl!`): the same
+  two functions with the same behaviour, typed — `tool_decl` over a `Tool`
+  record with both spellings of the schema key, `result_text` over `Block`s
+  — and a type error or an htl lint in it is now a `cargo build` error. What
+  the host embeds and `vendor` writes is the Lua Teal generates, which
+  carries no comments; the module's own words are in the `.tl`.
+  `blocks/lib/host_types.d.tl` is where a Teal module learns the shape of
+  the globals the host owns (`std`, so far only `json.encode`, growing with
+  each module that moves): `global std: host.Std` is a declaration that
+  generates nothing, so the global stays late-bound and a spec can still
+  install a fake before requiring the module. `host_types.lua` beside it is
+  the run-time half of that `require`, an empty table, embedded like any
+  other entry. `lua-spec-runner` takes a Teal module's Lua from the binary
+  that embeds it (`agent-block vendor` into `target/lua-spec-runner/`), so
+  `just test-lua` builds `agent-block` first; `just lint` runs `htl fmt` over
+  `blocks/lib` beside stylua.
+
+- `session` is the second module written in Teal
+  (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
+  `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and
+  `save` takes. Its record is named `M`, so the generated module reads as a
+  hand-written one does (`M.NS = ...`, `return M`) and a vendored copy is
+  edited the same way. `host_types.d.tl` grows with it: `std.kv` (`get` /
+  `set` / `delete`) and the `log` bridge (`debug` / `info` / `warn` /
+  `error`).
+
 ### Removed
 
 - The seal is gone. Every embedded module can be shadowed and vendored, the

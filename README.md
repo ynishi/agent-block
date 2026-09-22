@@ -240,6 +240,20 @@ Its checks live beside it in `lib/<name>/spec/*_spec.lua` (mlua-lspec; a
 <name>` copies them with the module, and `just test-lua-project <dir>` runs
 them against the copy.
 
+A module may be written in Teal instead — `lib/<name>/init.tl`, the same
+shape with types on it — and embedded through `include_tl!`, so a type error
+in it fails `cargo build`. The globals the host puts in the VM (`std`, …) are
+declared once, in `lib/host_types.d.tl`, and a module names what it reads
+from them: `local host = require("host_types")` then `global std: host.Std`,
+a declaration that generates nothing, so the global stays the host's and
+late-bound, as it is for a Lua module. `host_types.lua` beside the
+declaration is its run-time half (an empty table), which is what the
+`require` in the generated Lua resolves to wherever the module loads. What
+the host embeds is the generated Lua, comments stripped — `vendor` writes
+that, so a project reads the module's own words in the `.tl` in this
+repository. `just check-tl` type-checks the tree; a Teal module's Lua specs
+run as before, against the Lua the binary embeds.
+
 The opts a public function takes and the values it answers are lshape shapes,
 published under `M.shapes` so a caller reads the contract as data and asserted
 at the boundary in dev mode — `policy`'s `opts_contract` is the idiom. The

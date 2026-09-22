@@ -48,7 +48,8 @@ pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
 /// beside it, its `M.shapes`, its header — is stated in README § "Writing a
 /// module", and a module that joins this list is one that has that form.
 pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
-    ("session", include_str!("../blocks/lib/session/init.lua")),
+    // Written in Teal, like `mcp_tools` below.
+    ("session", htl::include_tl!("blocks/lib/session/init.tl")),
     (
         "llm_proto",
         include_str!("../blocks/lib/llm_proto/init.lua"),
@@ -75,10 +76,17 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "lshape.luacats",
         include_str!("../blocks/lib/lshape/luacats.lua"),
     ),
+    // Written in Teal: `include_tl!` type-checks it at `cargo build` and
+    // embeds the Lua it generates, so what the host holds is Lua like every
+    // other entry here — without the comments, which Teal does not carry
+    // over. Its one `require` is `host_types`, below.
     (
         "mcp_tools",
-        include_str!("../blocks/lib/mcp_tools/init.lua"),
+        htl::include_tl!("blocks/lib/mcp_tools/init.tl"),
     ),
+    // The run-time half of `blocks/lib/host_types.d.tl`: an empty table, for
+    // the `require("host_types")` every Teal module's generated Lua carries.
+    ("host_types", include_str!("../blocks/lib/host_types.lua")),
     ("knl", include_str!("../blocks/lib/knl/init.lua")),
     (
         "knl_adapter",
@@ -1272,6 +1280,9 @@ fn build_isle_init(
         //   script_dir/  >  project_root/.agent-block/lib/  >  project_root/lib/
         //     >  $AGENT_BLOCK_HOME/lib/  >  embedded
         //
+        // and inside each filesystem tier, `.tl` before `.lua` (see the loop
+        // below).
+        //
         // with one name space held out of it: `embedded.<name>` resolves from
         // memory and only from memory (see below). `blocks/` directories are
         // deliberately absent: they hold entry points, not modules (see
@@ -1285,6 +1296,33 @@ fn build_isle_init(
         // `package.path` above is left in place: it still serves plain Lua
         // files that predate the Registry and anything a script requires
         // relative to itself.
+        // ── Teal ──────────────────────────────────────────────────────
+        // The checker for `.tl` modules lives in this state: `Htl::from_lua`
+        // compiles the vendored Teal compiler into it (as `package.preload`
+        // entries `tl`, `htl.lint`, `htl.fmt`) and leaves the checker's API in
+        // the Lua registry, which is where a `TealResolver` finds it from a
+        // bare `&Lua`. The `Htl` handle itself is not kept: everything the
+        // resolvers need stays in the state after it is dropped. One checker
+        // per Isle (main and handler are built from this closure), which is
+        // the same number of `std` registrations there are.
+        //
+        // What it costs is the compile of `tl.lua` at start, and that is paid
+        // whether or not a `.tl` is ever required — traced at debug so the
+        // number is visible rather than assumed [measured 2026-09-22: 45 ms
+        // per Isle in a debug build, 18 ms in release; two Isles per
+        // process]. Until the embedded modules
+        // have declarations a checker can read (`.d.tl`), a `.tl` that
+        // requires one of them is refused with `no type information for
+        // required module`; the declarations are the step after this one.
+        let htl_started = std::time::Instant::now();
+        let htl = htl::Htl::from_lua(lua.clone()).map_err(|e| {
+            mlua::Error::external(format!("attaching the Teal checker to the VM: {e:#}"))
+        })?;
+        tracing::debug!(
+            elapsed_ms = htl_started.elapsed().as_millis() as u64,
+            "htl checker attached"
+        );
+
         let mut registry = mlua_pkg::Registry::new();
 
         // `embedded.<name>` — the escape hatch out of the priority chain, and
@@ -1308,7 +1346,29 @@ fn build_isle_init(
 
         let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
         fs_roots.extend(lib_roots.iter().cloned());
-        for root in fs_roots {
+        // The checker resolves the `require`s *inside* a `.tl` through its
+        // own search path, not through this registry, so every tier is put
+        // on it up front, in chain order: a `.tl` in the project's `lib/` may
+        // require a `.d.tl` the user's `lib/` holds, and the nearer tier's
+        // declaration is the one read when two tiers declare the same name.
+        htl.add_search_paths(&fs_roots)
+            .map_err(|e| mlua::Error::external(format!("Teal checker search path: {e:#}")))?;
+        for root in &fs_roots {
+            // Two resolvers per tier, Teal ahead of Lua, so that within one
+            // directory `name.tl` (checked and generated at require) wins over
+            // `name.lua`, and `name.d.tl` beside a `name.lua` types the Lua
+            // without replacing it — the Teal resolver steps aside when a Lua
+            // sibling exists, and the filesystem resolver behind it serves the
+            // file. A type error in a `.tl` is `Some(Err)`: the require fails
+            // there rather than falling through to a copy in a lower tier.
+            match htl::pkg::TealResolver::new_symlink_aware(root.clone()) {
+                Ok(resolver) => {
+                    registry.add(resolver);
+                }
+                Err(e) => {
+                    warn!(root = %root.display(), error = %e, "TealResolver init skipped");
+                }
+            }
             // Symlink-aware, not the plain constructor: this repo's own
             // `blocks/agent` is a symlink into `crates/agent-block-core/blocks/`,
             // and the default sandbox rejects anything whose canonical path

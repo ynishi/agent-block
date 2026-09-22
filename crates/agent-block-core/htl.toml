@@ -1,0 +1,22 @@
+# htl (Teal) settings for the Lua half of this crate. Walked up to from any
+# `.tl` under `blocks/`, by `htl check` / `htl test` / `htl fmt` and by
+# `include_tl!`.
+
+# Where the checker looks for what a module requires. `blocks/lib` is the
+# `require` root the host uses for the embedded modules (`require("policy")`
+# is `blocks/lib/policy/init.*`), so it is the root here too; a module that
+# has no `.tl` or `.d.tl` under it is not visible to the checker, whatever the
+# host resolves at run time.
+[check]
+paths = ["blocks/lib"]
+
+# `global std: host.Std` is how a module names a global the host owns
+# (`blocks/lib/host_types.d.tl`): a declaration that generates nothing, so the
+# global stays late-bound as it is in Lua. The rule that would rather see a
+# local is right for a program and wrong for a module in a host, so it is off.
+[lint]
+rules = { "no-global" = "allow" }
+
+# The same width stylua formats the Lua beside it to (`.stylua.toml`).
+[fmt]
+indent = 4

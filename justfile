@@ -4,7 +4,7 @@
 # Everything a commit has to pass: format, lint, Rust tests, Lua specs.
 # Run this — not a hand-assembled cargo line — so the gate is the same every
 # time and the Lua side is never the part that gets skipped.
-check: lint test test-lua
+check: lint test test-lua check-tl
 
 # [allow-agent]
 # Build only
@@ -32,6 +32,9 @@ test:
 
 # [allow-agent]
 # Run the Lua spec fixtures (mlua-lspec) in crates/agent-block/tests/fixtures/.
+# Builds the agent-block binary first: an embedded module written in Teal has
+# no `.lua` in the tree, and the runner takes the Lua the binary embeds for it
+# (`agent-block vendor`, see the runner's `vendor_teal_modules`).
 # `cargo test` cannot host these: mlua-lspec needs mlua's `send` feature, which
 # mlua-batteries does not compile under, so the runner is its own crate outside
 # the workspace. Rationale: crates/lua-spec-runner/src/main.rs.
@@ -41,6 +44,7 @@ test:
 # inert. A contract nothing runs is a comment, so the specs are where they get
 # enforced; production stays unchecked and pays nothing.
 test-lua filter="":
+    cargo build --quiet -p agent-block
     LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- {{ filter }}
 
 # [allow-agent]
@@ -49,16 +53,36 @@ test-lua filter="":
 # with <dir>/.agent-block/lib/ first on the require path. The other half of
 # vendoring — a copy the project can edit is a copy that needs checking.
 test-lua-project dir filter="":
+    cargo build --quiet -p agent-block
     LSHAPE_CHECK=1 cargo run --quiet --manifest-path crates/lua-spec-runner/Cargo.toml -- --project {{ dir }} {{ filter }}
 
 # [allow-agent]
+# Type-check the Teal side of the embedded modules: every `.tl` under
+# `blocks/lib`, strict (a warning is an error), with `crates/agent-block-core/
+# htl.toml` saying where the checker resolves requires from. `htl` is the CLI
+# (`cargo install htl-cli`; mise pins it), on the same terms as stylua. Zero
+# `.tl` files is a pass — the gate is in `check` from before the first module
+# moves, so the day one does, nothing has to be wired.
+check-tl:
+    htl check --strict crates/agent-block-core/blocks/lib
+
+# [allow-agent]
+# Run the Teal specs: `*_test.tl` under `blocks/lib`, one state per file.
+# Not in `check` yet — `htl test` exits 1 when it finds no test file, and
+# there is none until the first module moves; it joins `check` with that one.
+test-tl filter="":
+    htl test crates/agent-block-core/blocks/lib {{ if filter == "" { "" } else { "--filter " + filter } }}
+
+# [allow-agent]
 # Format and lint. Lua goes through stylua (`cargo install stylua`; config in
-# .stylua.toml, exclusions in .styluaignore) on the same terms as `cargo fmt`:
+# .stylua.toml, exclusions in .styluaignore) and Teal through `htl fmt` (the
+# width is in crates/agent-block-core/htl.toml) on the same terms as `cargo fmt`:
 # the tree is formatted in place, and `check` runs this first so a commit made
 # after `just check` is one stylua would not touch.
 lint:
     cargo fmt --all
     stylua .
+    htl fmt crates/agent-block-core/blocks/lib
     cargo clippy --workspace --no-deps -- -D warnings
 
 # [allow-agent]

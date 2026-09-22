@@ -76,6 +76,15 @@ mlua-batteries-sqlite = "0.8"
 # Teal one `htl` ships, which is how `blocks/lib` gets typed — has to be
 # written against the mlua-pkg this chain is built on, or it cannot join it.
 mlua-pkg     = "0.11"
+# Teal on this mlua. What it is here for is `blocks/lib`: a module written as
+# `.tl` is type-checked at `cargo build` (`include_tl!`) and resolved through
+# the `require` chain above (its resolver is written against the mlua-pkg
+# this chain is built on, which is why that one is 0.11). Default features
+# are off on purpose: `std` would pull a second `mlua-batteries` (0.7) beside
+# the one above, and two of them registering `std.*` into one state is not a
+# thing this host wants. `macros` is `include_tl!` / `#[host_module]`, `pkg`
+# is the resolver, `dts` writes the `.d.tl` a `#[host_module]` declares.
+htl          = { version = "0.7", default-features = false, features = ["macros", "pkg", "dts"] }
 # The SQLite cluster, one line for everything that links it. `libsqlite3-sys`
 # declares `links = "sqlite3"`, so the graph holds exactly one major of it
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38

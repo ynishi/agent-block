@@ -82,11 +82,12 @@ dependencies = [
  "dotenvy",
  "eventsdb-core",
  "eventsdb-sqlite",
+ "htl",
  "landlock",
  "libc",
  "llm-extract",
  "mlua",
- "mlua-batteries",
+ "mlua-batteries 0.6.0",
  "mlua-batteries-sqlite",
  "mlua-isle",
  "mlua-pkg",
@@ -254,9 +255,15 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "assert_cmd"
@@ -397,6 +404,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
 dependencies = [
  "digest",
+]
+
+[[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -576,6 +596,12 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -1203,6 +1229,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "htl"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0db84127e537388baa219f563e33122b25033ad588a7a541448574cf42cc2a06"
+dependencies = [
+ "htl-core",
+ "htl-macros",
+]
+
+[[package]]
+name = "htl-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e581c2030de23d555829aca94e72615ecb72ce4865622274b5f6ec2b161e212"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "mlua",
+ "mlua-batteries 0.7.3",
+ "mlua-pkg",
+ "semver",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "toml",
+ "toml_edit",
+ "walkdir",
+]
+
+[[package]]
+name = "htl-macros"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76b6e56fe423d67c64957526332ea5469acf6ab68b8150a9cc3026de3bd8cf3e"
+dependencies = [
+ "htl-core",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1820,13 +1888,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlua-batteries"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ff8949ba32bdbb67ec75984737be6526f56a54793a810861a5b213d81c4cce"
+dependencies = [
+ "mlua",
+ "serde_json",
+]
+
+[[package]]
 name = "mlua-batteries-sqlite"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bf8ef8d8cb9afb263defa9123f0d5eacb079b005ec9845bce3381a9d16e4cad"
 dependencies = [
  "mlua",
- "mlua-batteries",
+ "mlua-batteries 0.6.0",
  "rusqlite",
  "serde_json",
  "tokio",

@@ -12,13 +12,39 @@
 --- because they are not the wire format: nothing here builds a request or
 --- parses a response, and a caller that binds MCP tools has no reason to
 --- pull in a provider protocol. The module is registered in `host.rs`
---- (EMBEDDED_LIBS) so `require("mcp_tools")` resolves in the host.
+--- (EMBEDDED_LIBS) so `require("mcp_tools")` resolves in the host — through
+--- `include_tl!`, which is what makes a type error here a `cargo build`
+--- error, and what strips these comments from the Lua the host embeds.
 ---
 --- Nothing here touches the `mcp` bridge global: these are pure functions
 --- over values a caller already has, so they load and run in a VM with no
---- MCP at all.
+--- MCP at all. The one global read is `std.json`, declared through
+--- `host_types` (see that file for why the declaration assigns nothing).
+local host = require("host_types")
+global std: host.Std
 
-local M = {}
+local record mcp_tools
+    --- One item of `mcp.list_tools(server).tools`, as the server declared it.
+    --- Both spellings of the schema key are accepted, and either may be
+    --- absent.
+    record Tool
+        name: string
+        description: string
+        inputSchema: {string:any}
+        input_schema: {string:any}
+    end
+    --- The neutral tool declaration a request carries.
+    record Decl
+        name: string
+        description: string
+        input_schema: {string:any}
+    end
+    --- One block of `mcp.call(...).content`.
+    record Block
+        type: string
+        text: string
+    end
+end
 
 --- One `tools/list` entry as the neutral tool declaration a request carries.
 ---
@@ -27,11 +53,7 @@ local M = {}
 --- snake_case name every adapter build reads, an empty description rather
 --- than a missing one, and an empty object schema for a server that declared
 --- none (a provider will reject a tool with no schema at all).
----
---- @param server string  the connected server's name
---- @param tool table  one item of `mcp.list_tools(server).tools`
---- @return table decl  { name, description, input_schema }
-function M.tool_decl(server, tool)
+function mcp_tools.tool_decl(server: string, tool: mcp_tools.Tool): mcp_tools.Decl
     return {
         name = server .. "__" .. tool.name,
         description = tool.description or "",
@@ -42,17 +64,16 @@ end
 --- An MCP call's content blocks as the text a tool_result carries: a single
 --- text block verbatim, no blocks the empty string, anything else (several
 --- blocks, or one that is not text) JSON-encoded so nothing is dropped.
----
---- @param blocks table|nil  `mcp.call(...).content`
---- @return string text
-function M.result_text(blocks)
+function mcp_tools.result_text(blocks: {mcp_tools.Block}): string
     blocks = blocks or {}
-    if #blocks == 1 and blocks[1].type == "text" then
-        return blocks[1].text
-    elseif #blocks == 0 then
+    if #blocks == 0 then
         return ""
+    end
+    local only = blocks[1]
+    if #blocks == 1 and only and only.type == "text" then
+        return only.text
     end
     return std.json.encode(blocks)
 end
 
-return M
+return mcp_tools
