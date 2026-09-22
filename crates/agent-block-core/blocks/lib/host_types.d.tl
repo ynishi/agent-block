@@ -41,8 +41,8 @@ local record host_types
         end
         --- Namespace / key → JSON-serialised value, in the host's database.
         record Kv
-            --- The value under (ns, key), or nil.
-            get: function(string, string): any
+            --- The value under (ns, key); nil when there is none.
+            get: function(string, string): any ---@nilable
             --- Write a value under (ns, key), replacing what was there.
             set: function(string, string, any)
             --- Remove (ns, key); true when a row was there to remove.
@@ -72,8 +72,8 @@ local record host_types
             --- Rows of a series under the query options (`from` / `to` /
             --- `tags` / `agg` / `bucket_ms` / `limit` / `offset`).
             query: function(string, ?{string:any}): {{string:any}}
-            --- The latest row matching the tags, or nil.
-            last: function(string, ?{string:string}): {string:any}
+            --- The latest row matching the tags; nil when there is none.
+            last: function(string, ?{string:string}): {string:any} ---@nilable
         end
         --- The file bridge (`bridge/fs.rs`): versioned reads, line-addressed
         --- edits held to a `base` version, and the rollback of the last one.
@@ -101,7 +101,9 @@ local record host_types
     --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
     --- call, by name.
     record Tool
-        record Meta
+        --- What `register` is told about a tool. Built whole at every
+        --- registration, so the check holds each literal to both fields.
+        record Meta ---@struct
             description: string
             input_schema: {string:any}
         end

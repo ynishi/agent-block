@@ -135,21 +135,23 @@ local record M
         edits: {Edit}
         content: string
     end
-    --- One tool, before it is named.
-    record Def
+    --- One tool, before it is named. Built whole in `defs`, one per op.
+    record Def ---@struct
         description: string
         input_schema: {string:any}
         handler: function(Input): {string:any}
     end
     --- One tool, named: what `tool_specs` answers, one `knl.shapes.tool_spec`.
-    record Spec
+    --- Built whole from a `Def`; a spec with a field missing is not one the
+    --- kernel accepts, and the check refuses the literal here first.
+    record Spec ---@struct
         name: string
         description: string
         input_schema: {string:any}
         handler: function(Input): {string:any}
     end
-    --- The opts contract, as data.
-    record Shapes
+    --- The opts contract, as data. Built whole, once.
+    record Shapes ---@struct
         tool_specs_opts: lshape.Schema
         register_tools_opts: lshape.Schema
     end

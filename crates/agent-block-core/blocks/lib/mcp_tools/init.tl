@@ -33,8 +33,9 @@ local record mcp_tools
         inputSchema: {string:any}
         input_schema: {string:any}
     end
-    --- The neutral tool declaration a request carries.
-    record Decl
+    --- The neutral tool declaration a request carries. Built whole by
+    --- `tool_decl`, so every field is set there, and the check says so.
+    record Decl ---@struct
         name: string
         description: string
         input_schema: {string:any}

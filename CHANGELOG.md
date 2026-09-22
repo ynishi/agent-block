@@ -511,6 +511,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses a binary older than a `.tl` it would take the Lua from, and skips
   the vendor step under `--project`.
 
+- The Teal modules carry htl's markers where they apply. `---@struct` on
+  every record a module builds whole — `mcp_tools.Decl`, each tool
+  module's `Def` and `Shapes`, `fs_tools.Spec`, and `Tool.Meta` in
+  `host_types.d.tl` — so a literal short of a field is reported where it
+  is written, not found at the first call; `---@nilable` on `std.kv.get`
+  and `std.ts.last`, the two host functions that answer nil, so indexing
+  their result directly is reported. What comes from outside — a caller's
+  `Opts`, a model's `Input`, MCP's `Tool` and `Block` — stays unmarked:
+  every field of those may be absent, which is the fact, and the loud
+  refusals that name a missing one stay in the code.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

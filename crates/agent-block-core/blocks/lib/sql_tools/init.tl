@@ -54,14 +54,15 @@ local record M
         sql: string
         params: {any}
     end
-    --- One tool, before it is named.
-    record Def
+    --- One tool, before it is named. Built whole in `defs`, one per op:
+    --- every field is set there, and the check holds each literal to it.
+    record Def ---@struct
         description: string
         input_schema: {string:any}
         handler: function(Input): {string:any}
     end
-    --- The opts contract, as data.
-    record Shapes
+    --- The opts contract, as data. Built whole, once.
+    record Shapes ---@struct
         register_tools_opts: lshape.Schema
     end
     shapes: Shapes
