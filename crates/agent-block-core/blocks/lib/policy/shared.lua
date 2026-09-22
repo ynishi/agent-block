@@ -6,7 +6,9 @@
 --- argument forms. Nothing here is a policy and nothing here is exported by
 --- `policy` itself: `policy.init` publishes the shapes, and the four policy
 --- files (`room`, `tools`, `carry`, `loop`) alias what they use from this
---- table by the names their code was written against.
+--- table by the names their code was written against. Everything a sibling
+--- may take is defined on `S` where it is written — there is no second list
+--- of exports to keep in step with the definitions.
 ---
 --- Read `policy`'s own header first — the rules about state, the log and the
 --- shapes are stated there, once, for every file under it.
@@ -31,42 +33,42 @@ local S = {}
 --- How many bytes of note `carry` may prepend. Big enough for a tool's error
 --- message and a sentence around it, small enough that a failing beat cannot
 --- push the rest of the request out of the way.
-local DEFAULT_MAX_BYTES = 512
+S.DEFAULT_MAX_BYTES = 512
 
 --- How many beats with the same signature `stagnation` calls "repeated".
 --- Two is a legitimate retry — a tool that failed once is worth calling
 --- again with the same arguments. Three is the first count at which "again"
 --- stops being a retry and starts being a pattern.
-local DEFAULT_SAME = 3
+S.DEFAULT_SAME = 3
 
 --- How many beats that produced nothing `stagnation` calls "no_progress".
 --- One empty beat happens; there is no reading under which a second
 --- consecutive beat that wrote neither a tool call nor a word of content is
 --- the run getting somewhere.
-local DEFAULT_NO_PROGRESS = 2
+S.DEFAULT_NO_PROGRESS = 2
 
 --- How many attempts `retry` allows in total, the first one included. Two
 --- retries past the original is the point where a failure the kernel called
 --- retryable has stopped looking transient.
-local DEFAULT_MAX_ATTEMPTS = 3
+S.DEFAULT_MAX_ATTEMPTS = 3
 
 --- The event kind a verdict is recorded under when the caller names none.
 --- "verify" because that is what every consumer in this tree already
 --- appends, and a second name for one thing is a second thing to query.
-local DEFAULT_VERDICT_KIND = "verify"
+S.DEFAULT_VERDICT_KIND = "verify"
 
 --- How many times one call may be made with nothing reset in between when
 --- `repeat_cap` is not told. Twice: once to see, once more in case the
 --- first answer fell out of the window; a third time is the loop.
-local DEFAULT_REPEAT_MAX = 2
+S.DEFAULT_REPEAT_MAX = 2
 
 --- How many times what a check took the next one may take, and the least
 --- it is ever given, when `verdict{ timeout }` is not told. Three covers a
 --- check that builds one more crate than the last did; a minute is the
 --- smallest span in which "it is still compiling" and "it is hung" can be
 --- told apart at all.
-local DEFAULT_TIMEOUT_FACTOR = 3
-local DEFAULT_TIMEOUT_FLOOR = 60
+S.DEFAULT_TIMEOUT_FACTOR = 3
+S.DEFAULT_TIMEOUT_FLOOR = 60
 
 --- Which check the next one's seconds are read off, when `verdict{ timeout
 --- }` does not say. The longest so far: it assumes nothing about which way
@@ -75,14 +77,14 @@ local DEFAULT_TIMEOUT_FLOOR = 60
 --- slow, whole pass that follows; but that is a tendency of one kind of
 --- repository, and the opposite (a fast green, a slow red at link time)
 --- is as real. The longest is the one reading that neither can shrink.
-local DEFAULT_TIMEOUT_MEASURE = "longest"
+S.DEFAULT_TIMEOUT_MEASURE = "longest"
 
 --- How much of the window one tool result may take when `result_cap` is not
 --- told. A quarter leaves room for three more of the same size beside the
 --- system prompt, the tools and the conversation — enough that a loop can
 --- read, edit and read again without the fold running out of beats to drop,
 --- and small enough that one answer cannot end the run on its own.
-local DEFAULT_RESULT_SHARE = 0.25
+S.DEFAULT_RESULT_SHARE = 0.25
 
 --- How deep `canonical` renders a nested value before it stops. A tool input
 --- is JSON-shaped and shallow; the cap is what keeps a cyclic hand-built one
@@ -92,17 +94,17 @@ local MAX_CANONICAL_DEPTH = 8
 --- What a trimmed note ends with, and the only thing `trim` adds. ASCII on
 --- purpose: the cut is by BYTES, and a multi-byte marker would be one more
 --- thing to get wrong at the boundary.
-local ELLIPSIS = "..."
+S.ELLIPSIS = "..."
 
 --- What `carry`'s note opens with. One sentence, so the model reads the
 --- reason as a statement about the record rather than as an instruction.
-local NOTE_PREFIX = "the previous beat did not complete: "
+S.NOTE_PREFIX = "the previous beat did not complete: "
 
 --- The JSON-array tag the bridge's converter honours (`lua_to_json` reads
 --- `__jsontype = "array"`), the same one `knl.fold` puts on every array it
 --- builds. `carry` rebuilds the messages array, so it re-tags: an array that
 --- lost the tag on the way through a filter would cross the boundary as `{}`.
-local ARRAY_TAG = { __jsontype = "array" }
+S.ARRAY_TAG = { __jsontype = "array" }
 
 -- ============================================================
 -- Shared helpers
@@ -111,7 +113,7 @@ local ARRAY_TAG = { __jsontype = "array" }
 --- Whether `v` can be called like a function (a callable table / userdata
 --- counts: a Port shim may hand back either). The same test `knl.device`
 --- makes of an `llm`, made here for the same argument.
-local function callable(v)
+function S.callable(v)
     if type(v) == "function" then
         return true
     end
@@ -126,7 +128,7 @@ end
 --- division `knl` makes for `cost`, and checked in prod for the same reason:
 --- a window of 0 beats or a retry cap of 0 attempts is a policy that silently
 --- does the opposite of what it says.
-local function whole_at_least(v, min)
+function S.whole_at_least(v, min)
     return type(v) == "number" and v % 1 == 0 and v >= min
 end
 
@@ -139,16 +141,42 @@ end
 ---
 --- A state key gets the reason rather than the bare complaint — passing a
 --- session to a factory is the one wrong guess the design invites.
-local function only(opts, allowed, who)
+function S.only(opts, allowed, who, level)
     for k in pairs(opts) do
         if not allowed[k] then
             local hint = ""
             if k == "session" or k == "store" or k == "owner" or k == "budget" then
                 hint = " (a session is an argument, never an option — see the header)"
             end
-            error(who .. ": unknown option '" .. tostring(k) .. "'" .. hint, 3)
+            error(who .. ": unknown option '" .. tostring(k) .. "'" .. hint, level or 3)
         end
     end
+end
+
+--- The opts a factory was handed, as the table every factory starts from.
+---
+--- The three checks every factory opens with, made once: an absent opts is
+--- an empty one, a non-table is refused, and a key this factory does not
+--- declare is refused by `only` — loud in both modes, for the reason `only`
+--- gives. What a declared key's VALUE may be is not judged here: each bound
+--- (a whole number, a boolean, a callable) is written beside the factory
+--- that owns it, and `shape.assert_dev` holds the whole table to its
+--- published shape after those bounds, in dev.
+---
+--- Raises point at the factory's caller, as the checks did when each
+--- factory wrote them itself.
+---
+--- @param opts table|nil  what the factory was handed
+--- @param allowed table  the keys the factory declares, `name -> true`
+--- @param who string  the factory's name, for the raise
+--- @return table  the opts, never nil
+function S.opts_of(opts, allowed, who)
+    opts = opts or {}
+    if type(opts) ~= "table" then
+        error(who .. ": opts must be a table", 3)
+    end
+    S.only(opts, allowed, who, 4)
+    return opts
 end
 
 --- The session's whole log, or a raise saying it does not fit in one read.
@@ -173,7 +201,7 @@ end
 --- @param session userdata|table  a knl session
 --- @param who string  the policy's name, for the message
 --- @return table  the events, in seq order
-local function whole_log(session, who)
+function S.whole_log(session, who)
     local events, truncated = session:events()
     if truncated then
         error(
@@ -198,7 +226,7 @@ end
 ---
 --- @param ev table  a stored event
 --- @return string|nil  the id of the beat that wrote it
-local function beat_of(ev)
+function S.beat_of(ev)
     local meta = ev.meta
     if meta == nil then
         return nil
@@ -216,10 +244,10 @@ end
 ---
 --- @param events table|nil  a session's events, in seq order
 --- @return table  an array of beat records
-local function beats_of(events)
+function S.beats_of(events)
     local order, by_id = {}, {}
     for _, ev in ipairs(events or {}) do
-        local id = beat_of(ev)
+        local id = S.beat_of(ev)
         if id ~= nil then
             local record = by_id[id]
             if record == nil then
@@ -244,7 +272,7 @@ end
 --- @param value any
 --- @param depth number|nil  how far down this call already is
 --- @return string
-local function canonical(value, depth)
+function S.canonical(value, depth)
     depth = depth or 0
     local t = type(value)
     if t == "string" then
@@ -268,7 +296,7 @@ local function canonical(value, depth)
     end)
     local parts = {}
     for _, k in ipairs(keys) do
-        parts[#parts + 1] = tostring(k) .. "=" .. canonical(value[k], depth + 1)
+        parts[#parts + 1] = tostring(k) .. "=" .. S.canonical(value[k], depth + 1)
     end
     return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -278,7 +306,7 @@ end
 --- A malformed record is read as an empty one rather than indexed: every
 --- reader below walks a whole log, and one bad event must not take the
 --- verdict with it.
-local function data_of(ev)
+function S.data_of(ev)
     return type(ev.data) == "table" and ev.data or {}
 end
 
@@ -299,14 +327,14 @@ end
 
 --- A Lua function, as a shape. `lshape.t` exposes only the five prims it
 --- names, so this is built from the same plain-data schema form.
-local FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
+S.FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
 
 --- Something a beat can call, and a session handle: the kernel's, not a
 --- second copy. Both used to be written here as well, in the same `any_of`
 --- form and with the same words around them, which is a contract with two
 --- versions waiting to disagree.
-local CALLABLE = kernel.shapes.callable
-local SESSION_HANDLE = kernel.shapes.session_handle
+S.CALLABLE = kernel.shapes.callable
+S.SESSION_HANDLE = kernel.shapes.session_handle
 
 --- Hold `session` to being one — the kernel's judgement, not a local retelling
 --- of it.
@@ -321,7 +349,7 @@ local SESSION_HANDLE = kernel.shapes.session_handle
 ---
 --- @param session any  the value a caller passed
 --- @param who string  the policy's name, for the message
-local function needs_session(session, who)
+function S.needs_session(session, who)
     if not kernel.is_session(session) then
         error(who .. ": session must be a knl session (from knl.open / knl.resume)", 3)
     end
@@ -353,14 +381,14 @@ end
 --- @param fields table  the field name -> schema map, written once
 --- @return table closed  the published contract
 --- @return table open  the same fields, for the registry
-local function opts_contract(fields)
+function S.opts_contract(fields)
     return T.shape(fields, { open = false }), T.shape(fields)
 end
 
 --- One beat, as this module derives it from the log: the id the kernel
 --- stamped, and the events carrying it in the order they were written. This
 --- is what a custom `signature` is handed.
-local BEAT_RECORD = T.shape({
+S.BEAT_RECORD = T.shape({
     id = T.string,
     events = T.array_of(kernel.shapes.event_base),
 }, { open = false })
@@ -379,7 +407,7 @@ local BEAT_RECORD = T.shape({
 --- `call_id`, `name` and `input` are optional because a `tool_result` whose
 --- `tool_call` is not in the log has nothing to take them from — an
 --- interrupted beat leaves exactly that.
-local TOOL_PAIR = T.shape({
+S.TOOL_PAIR = T.shape({
     beat = T.string,
     call_id = T.string:is_optional(),
     name = T.string:is_optional(),
@@ -391,57 +419,19 @@ local TOOL_PAIR = T.shape({
 --- What a policy answers when it has a verdict: `stagnation`'s two, and
 --- `window{ fit }`'s one. Each word is one policy's, and a word nobody
 --- answers would be a policy nobody wrote.
-local STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
+S.STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
 
 -- ============================================================
 -- The registry's argument forms
 -- ============================================================
 
 --- One declared argument: the shape it is held to, and the word for it.
-local function arg_of(schema, desc)
+function S.arg_of(schema, desc)
     return { shape = schema, desc = desc }
 end
 
-local EVENTS_ARG = arg_of(T.array_of(kernel.shapes.event_base), "events")
-local SESSION_ARG = arg_of(SESSION_HANDLE, "session")
-local OUTCOME_ARG = arg_of(kernel.shapes.outcome, "outcome")
-
--- ============================================================
--- What the siblings take
--- ============================================================
-
-S.DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES
-S.DEFAULT_SAME = DEFAULT_SAME
-S.DEFAULT_NO_PROGRESS = DEFAULT_NO_PROGRESS
-S.DEFAULT_MAX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
-S.DEFAULT_VERDICT_KIND = DEFAULT_VERDICT_KIND
-S.DEFAULT_REPEAT_MAX = DEFAULT_REPEAT_MAX
-S.DEFAULT_TIMEOUT_FACTOR = DEFAULT_TIMEOUT_FACTOR
-S.DEFAULT_TIMEOUT_FLOOR = DEFAULT_TIMEOUT_FLOOR
-S.DEFAULT_TIMEOUT_MEASURE = DEFAULT_TIMEOUT_MEASURE
-S.DEFAULT_RESULT_SHARE = DEFAULT_RESULT_SHARE
-S.ELLIPSIS = ELLIPSIS
-S.NOTE_PREFIX = NOTE_PREFIX
-S.ARRAY_TAG = ARRAY_TAG
-S.callable = callable
-S.whole_at_least = whole_at_least
-S.only = only
-S.whole_log = whole_log
-S.beat_of = beat_of
-S.beats_of = beats_of
-S.canonical = canonical
-S.data_of = data_of
-S.FUNCTION = FUNCTION
-S.CALLABLE = CALLABLE
-S.SESSION_HANDLE = SESSION_HANDLE
-S.needs_session = needs_session
-S.opts_contract = opts_contract
-S.BEAT_RECORD = BEAT_RECORD
-S.TOOL_PAIR = TOOL_PAIR
-S.STOP_REASON = STOP_REASON
-S.arg_of = arg_of
-S.EVENTS_ARG = EVENTS_ARG
-S.SESSION_ARG = SESSION_ARG
-S.OUTCOME_ARG = OUTCOME_ARG
+S.EVENTS_ARG = S.arg_of(T.array_of(kernel.shapes.event_base), "events")
+S.SESSION_ARG = S.arg_of(S.SESSION_HANDLE, "session")
+S.OUTCOME_ARG = S.arg_of(kernel.shapes.outcome, "outcome")
 
 return S

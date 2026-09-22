@@ -25,7 +25,7 @@ local NOTE_PREFIX = shared.NOTE_PREFIX
 local ARRAY_TAG = shared.ARRAY_TAG
 local callable = shared.callable
 local whole_at_least = shared.whole_at_least
-local only = shared.only
+local opts_of = shared.opts_of
 local whole_log = shared.whole_log
 local beats_of = shared.beats_of
 local canonical = shared.canonical
@@ -250,11 +250,7 @@ end
 --- @param opts table  { max_bytes? = <whole number >= 1>, failed? = fn(pair) -> boolean }
 --- @return function bind  fn(session) -> fn(request) -> request
 function M.carry(opts)
-    opts = opts or {}
-    if type(opts) ~= "table" then
-        error("policy.carry: opts must be a table", 2)
-    end
-    only(opts, { max_bytes = true, failed = true }, "policy.carry")
+    opts = opts_of(opts, { max_bytes = true, failed = true }, "policy.carry")
     if opts.max_bytes ~= nil and not whole_at_least(opts.max_bytes, 1) then
         error("policy.carry: max_bytes must be a whole number >= 1, got " .. tostring(opts.max_bytes), 2)
     end
