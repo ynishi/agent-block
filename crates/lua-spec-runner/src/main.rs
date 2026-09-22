@@ -204,14 +204,32 @@ fn vendor_teal_modules(root: &Path, names: &[String]) -> Result<Option<PathBuf>,
     if names.is_empty() {
         return Ok(None);
     }
-    let bin = root.join("target/debug/agent-block");
-    if !bin.is_file() {
-        return Err(format!(
-            "{}: not built — the specs of a Teal module ({}) run against the Lua the \
-             binary embeds; `cargo build -p agent-block` first (`just test-lua` does)",
-            bin.display(),
-            names.join(", ")
-        ));
+    let bin = root.join(format!("target/debug/agent-block{}", std::env::consts::EXE_SUFFIX));
+    let built = std::fs::metadata(&bin)
+        .and_then(|m| m.modified())
+        .map_err(|e| {
+            format!(
+                "{}: not built ({e}) — the specs of a Teal module ({}) run against the Lua \
+                 the binary embeds; `cargo build -p agent-block` first (`just test-lua` does)",
+                bin.display(),
+                names.join(", ")
+            )
+        })?;
+    // A binary older than a `.tl` embeds the Lua of an earlier version of it:
+    // the specs would pass or fail against something that is not in the tree.
+    for name in names {
+        let tl = root.join("crates/agent-block-core/blocks/lib").join(name).join("init.tl");
+        let edited = std::fs::metadata(&tl)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("{}: {e}", tl.display()))?;
+        if edited > built {
+            return Err(format!(
+                "{} is newer than {} — `cargo build -p agent-block` first (`just test-lua` \
+                 does), or the specs run against the Lua of an older {name}",
+                tl.display(),
+                bin.display()
+            ));
+        }
     }
     let dir = root.join("target/lua-spec-runner");
     if dir.exists() {
@@ -282,12 +300,16 @@ fn main() -> ExitCode {
     // the copies go last on the search path, where the embedded tier sits
     // for the host. The binary is the one `cargo build -p agent-block`
     // leaves in `target/debug`, which `just test-lua` builds first.
-    match vendor_teal_modules(&root, &teal_modules(&blocks.join("lib"))) {
-        Ok(Some(dir)) => search.push(dir.display().to_string()),
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
+    // Only for the repository's own run: with `--project`, the specs are a
+    // project's and its copies are already first on the path.
+    if cli.project.is_none() {
+        match vendor_teal_modules(&root, &teal_modules(&blocks.join("lib"))) {
+            Ok(Some(dir)) => search.push(dir.display().to_string()),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
         }
     }
     let search: Vec<&str> = search.iter().map(String::as_str).collect();

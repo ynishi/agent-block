@@ -23,6 +23,14 @@
 --- What is declared is what a Teal module has needed so far, not the whole of
 --- `std`: a field arrives with the first module that reads it. A name missing
 --- here is a type error in that module, which is the right place to learn it.
+--- A name declared here that the host does not register is the other
+--- mistake, and `crates/agent-block/tests/e2e_host_types_drift.rs` is what
+--- catches it: every function below is asked of a running VM.
+---
+--- The binary carries this file: `host.rs` writes it (and `lshape.d.tl`) to
+--- a directory named by its content at start and puts that on the checker's
+--- path, so a project's own `.tl` writes the same two lines above against
+--- the `agent-block` that runs it.
 local record host_types
     --- `std`, as registered by `mlua_batteries::register_all` in `host.rs`,
     --- with `std.kv` from the sqlite batteries behind the `sqlite` feature.

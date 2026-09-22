@@ -647,9 +647,14 @@ function M.tool_specs(opts: M.Opts): {M.Spec}
                 -- `end_line` and `total` say where and how much there is. No "next"
                 -- offset: it is `end_line + 1`, and saying it twice adds nothing.
                 local cut_by: string = nil
+                -- `tonumber` answers nil for what is not a number (`"all"`,
+                -- `true`, a table), and nil is "no limit", as it always was;
+                -- the floor is for the checker, which will not index the
+                -- lines with a fraction — and 2.5 lines was never a thing.
                 local limit: integer = nil
-                if input.limit ~= nil then
-                    limit = math.floor(tonumber(input.limit))
+                local limit_n = tonumber(input.limit)
+                if limit_n then
+                    limit = math.floor(limit_n)
                 end
                 if limit and limit >= 1 and #out > limit then
                     for i = #out, limit + 1, -1 do

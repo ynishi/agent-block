@@ -4,7 +4,7 @@
 # Everything a commit has to pass: format, lint, Rust tests, Lua specs.
 # Run this — not a hand-assembled cargo line — so the gate is the same every
 # time and the Lua side is never the part that gets skipped.
-check: lint test test-lua check-tl
+check: lint test test-lua check-tl test-tl
 
 # [allow-agent]
 # Build only
@@ -67,9 +67,10 @@ check-tl:
     htl check --strict crates/agent-block-core/blocks/lib
 
 # [allow-agent]
-# Run the Teal specs: `*_test.tl` under `blocks/lib`, one state per file.
-# Not in `check` yet — `htl test` exits 1 when it finds no test file, and
-# there is none until the first module moves; it joins `check` with that one.
+# Run the Teal specs: `*_test.tl` under `blocks/lib` (beside the module, in
+# its `spec/`, where the Lua specs are), one state per file. A test declares
+# the host's globals with a value — `global std: host.Std = { … }` — which is
+# the fake; the module beside it declares them without one.
 test-tl filter="":
     htl test crates/agent-block-core/blocks/lib {{ if filter == "" { "" } else { "--filter " + filter } }}
 

@@ -1202,6 +1202,49 @@ where
     })
 }
 
+/// The Teal checker of one Isle, parked in the VM's app data so it lives as
+/// long as the VM does (`build_isle_init`). Its own type, so it never
+/// collides with what htl keeps there.
+struct TealChecker(#[allow(dead_code)] htl::Htl);
+
+/// The declarations this binary ships for a `.tl` to be checked against —
+/// `host_types.d.tl` and `lshape.d.tl`, as text.
+const TEAL_DECLARATIONS: &[(&str, &str)] = &[
+    (
+        "host_types.d.tl",
+        include_str!("../blocks/lib/host_types.d.tl"),
+    ),
+    ("lshape.d.tl", include_str!("../blocks/lib/lshape.d.tl")),
+];
+
+/// Where the checker reads this binary's declarations from: a directory
+/// under the temp dir named by the crate version and a hash of the texts,
+/// written only when the content differs (`htl::write_if_changed`). The
+/// hash is what keeps two binaries apart — a release and a build from `main`
+/// after it share a version and differ by exactly what is declared here —
+/// and what lets two of the same share one. htl's own `lib_dir` is the same
+/// arrangement for `htl.test`'s declaration.
+fn teal_declarations_dir() -> std::io::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, text) in TEAL_DECLARATIONS {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(text.as_bytes());
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    let key: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::temp_dir().join(format!(
+        "agent-block-dts-{}-{key}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    for (name, text) in TEAL_DECLARATIONS {
+        htl::write_if_changed(&dir.join(name), text)?;
+    }
+    Ok(dir)
+}
+
 /// Build the init closure shared between the main Isle and the handler
 /// Isle.  Sets `_SCRIPT_NAME`, registers `mlua-batteries` `std.*`, and
 /// configures `package.path` / `package.searchers` so `require "agent"`
@@ -1213,13 +1256,16 @@ where
 fn build_isle_init(
     script_name: String,
     script_dir: String,
-    lib_paths: String,
-    lib_roots: Vec<PathBuf>,
+    project_root: PathBuf,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
 ) -> impl FnOnce(&mlua::Lua) -> mlua::Result<()> + Send + 'static {
     move |lua| {
+        // The module tiers and the `package.path` prefix they make, both a
+        // function of the project root (`lib_roots`, `package_path_prefix`).
+        let lib_roots = lib_roots(&project_root);
+        let lib_paths = package_path_prefix(&lib_roots);
         // Set script name before registering bridges (used by log.* for attribution)
         lua.globals().set("_SCRIPT_NAME", script_name.as_str())?;
         if let Some(ref p) = prompt {
@@ -1299,31 +1345,75 @@ fn build_isle_init(
         // files that predate the Registry and anything a script requires
         // relative to itself.
         // ── Teal ──────────────────────────────────────────────────────
-        // The checker for `.tl` modules lives in this state: `Htl::from_lua`
-        // compiles the vendored Teal compiler into it (as `package.preload`
-        // entries `tl`, `htl.lint`, `htl.fmt`) and leaves the checker's API in
-        // the Lua registry, which is where a `TealResolver` finds it from a
-        // bare `&Lua`. The `Htl` handle itself is not kept: everything the
-        // resolvers need stays in the state after it is dropped. One checker
-        // per Isle (main and handler are built from this closure), which is
-        // the same number of `std` registrations there are.
+        // Two states. The CHECKER — the vendored Teal compiler, the lints,
+        // the formatter — is a Lua state of its own (`Htl::new`); the
+        // program state, this VM, gets only the runtime prelude
+        // (`with_checker_lua`): the strict `.tl` searcher and the
+        // `type_only_module` stub, and a handle to the checker in its app
+        // data, which is where a `TealResolver` finds it. Split rather than
+        // `from_lua` on this VM for two reasons a host cares about: a script
+        // cannot `require("tl")` and reach a compiler with `io` in it, and
+        // the checker's own search path — what a `.tl`'s `require` is
+        // resolved against — is the checker's `package.path`, not this VM's,
+        // so nothing here changes what a plain `.lua` resolves to.
         //
-        // What it costs is the compile of `tl.lua` at start, and that is paid
-        // whether or not a `.tl` is ever required — traced at debug so the
-        // number is visible rather than assumed [measured 2026-09-22: 45 ms
-        // per Isle in a debug build, 18 ms in release; two Isles per
-        // process]. Until the embedded modules
-        // have declarations a checker can read (`.d.tl`), a `.tl` that
-        // requires one of them is refused with `no type information for
-        // required module`; the declarations are the step after this one.
+        // One checker per Isle (main and handler are built from this
+        // closure): a checker's tables cannot cross threads. The checker
+        // has to outlive every `require`, so it is parked in this VM's app
+        // data under its own type. What it costs is the compile of `tl.lua`
+        // at start, paid whether or not a `.tl` is ever required — traced at
+        // debug so the number is visible rather than assumed [measured
+        // 2026-09-22: 45 ms per Isle in a debug build, 18 ms in release; two
+        // Isles per process].
         let htl_started = std::time::Instant::now();
-        let htl = htl::Htl::from_lua(lua.clone()).map_err(|e| {
-            mlua::Error::external(format!("attaching the Teal checker to the VM: {e:#}"))
+        let checker = htl::Htl::new()
+            .map_err(|e| mlua::Error::external(format!("building the Teal checker: {e:#}")))?;
+        let _program = htl::Htl::with_checker_lua(&checker, lua.clone()).map_err(|e| {
+            mlua::Error::external(format!("attaching the Teal runtime to the VM: {e:#}"))
         })?;
         tracing::debug!(
             elapsed_ms = htl_started.elapsed().as_millis() as u64,
             "htl checker attached"
         );
+
+        // What the checker reads declarations from, last to first (each
+        // `add_path` prepends): the declarations this binary carries —
+        // `host_types` for the globals the host puts in a VM, `lshape` for
+        // the vendored validator — written to a directory named by their
+        // content, so a project's `.tl` can `require("host_types")` against
+        // the binary that runs it and two binaries never read each other's;
+        // then the filesystem tiers, in chain order, so a `.tl` in the
+        // project's `lib/` is typed against the nearer tier's declaration
+        // when two tiers declare one name. The tiers are search paths for
+        // the CHECKER only: the declarations directory is not a resolver
+        // root, because a `.d.tl` in a root with no `.lua` beside it would
+        // answer `require` with a stub (`htl::pkg::TealResolver`).
+        let dts_dir = teal_declarations_dir()
+            .map_err(|e| mlua::Error::external(format!("writing the Teal declarations: {e}")))?;
+        checker
+            .add_path(&dts_dir)
+            .map_err(|e| mlua::Error::external(format!("Teal checker declarations path: {e:#}")))?;
+        // A project's own `htl.toml`, if it has one, is applied to the
+        // checker the way `htl check` applies it — `[check] paths` is where
+        // a project declares the modules the host supplies at run time, and
+        // a declaration there is read by the checker without being on any
+        // `require` tier. Found by walking up from the project root, as the
+        // CLI walks up from a file; none is not an error.
+        match htl::config::HtlConfig::find(&project_root) {
+            Ok(Some((cfg_path, cfg))) => {
+                let root = cfg_path.parent().unwrap_or(&project_root).to_path_buf();
+                checker.apply_config(&root, &cfg).map_err(|e| {
+                    mlua::Error::external(format!("applying {}: {e:#}", cfg_path.display()))
+                })?;
+                tracing::debug!(path = %cfg_path.display(), "htl.toml applied to the checker");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(mlua::Error::external(format!(
+                    "reading the project's htl.toml: {e:#}"
+                )))
+            }
+        }
 
         let mut registry = mlua_pkg::Registry::new();
 
@@ -1348,12 +1438,8 @@ fn build_isle_init(
 
         let mut fs_roots: Vec<PathBuf> = vec![PathBuf::from(&script_dir)];
         fs_roots.extend(lib_roots.iter().cloned());
-        // The checker resolves the `require`s *inside* a `.tl` through its
-        // own search path, not through this registry, so every tier is put
-        // on it up front, in chain order: a `.tl` in the project's `lib/` may
-        // require a `.d.tl` the user's `lib/` holds, and the nearer tier's
-        // declaration is the one read when two tiers declare the same name.
-        htl.add_search_paths(&fs_roots)
+        checker
+            .add_search_paths(&fs_roots)
             .map_err(|e| mlua::Error::external(format!("Teal checker search path: {e:#}")))?;
         for root in &fs_roots {
             // Two resolvers per tier, Teal ahead of Lua, so that within one
@@ -1362,7 +1448,11 @@ fn build_isle_init(
             // without replacing it — the Teal resolver steps aside when a Lua
             // sibling exists, and the filesystem resolver behind it serves the
             // file. A type error in a `.tl` is `Some(Err)`: the require fails
-            // there rather than falling through to a copy in a lower tier.
+            // there rather than falling through to a copy in a lower tier. A
+            // `.d.tl` with neither a `.lua` beside it nor a preload of the
+            // name is answered with a declaration-only stub (htl's rule: the
+            // declaration of a module only the host provides), which is why
+            // every embedded name is preloaded below.
             match htl::pkg::TealResolver::new_symlink_aware(root.clone()) {
                 Ok(resolver) => {
                     registry.add(resolver);
@@ -1408,9 +1498,47 @@ fn build_isle_init(
         memory = memory.add("knl_types", crate::bridge::knl::lshape_module_source());
         registry.add(memory);
 
+        // The embedded modules are, in htl's terms, the modules the host
+        // provides — "native modules must be registered before the Teal
+        // resolver and described by a `.d.tl` for the checker" — and the
+        // place htl looks for one is `package.preload`. Each embedded name
+        // is preloaded here, answering its `embedded.<name>` alias, so that
+        // a `.d.tl` a project puts in a tier to type its own `.tl` against
+        // the kernel (`lib/knl.d.tl`, with the declaration and nothing
+        // beside it) makes the Teal resolver step aside, and the chain goes
+        // on to the tier below or the embedded module. Lua's own preload
+        // searcher never reaches these: the chain runs ahead of it and the
+        // memory resolver answers the names itself. A name the VM already
+        // preloaded is left as it is.
+        let preload: mlua::Table = lua
+            .globals()
+            .get::<mlua::Table>("package")?
+            .get("preload")?;
+        for (name, _) in EMBEDDED_BLOCKS.iter().chain(EMBEDDED_LIBS.iter()) {
+            if preload.contains_key(*name)? {
+                continue;
+            }
+            let alias = format!("{EMBEDDED_ALIAS_PREFIX}{name}");
+            let loader = lua.create_function(move |lua, ()| {
+                let require: mlua::Function = lua.globals().get("require")?;
+                require.call::<mlua::Value>(alias.as_str())
+            })?;
+            preload.set(*name, loader)?;
+        }
+        if !preload.contains_key("knl_types")? {
+            let loader = lua.create_function(|lua, ()| {
+                let require: mlua::Function = lua.globals().get("require")?;
+                require.call::<mlua::Value>(format!("{EMBEDDED_ALIAS_PREFIX}knl_types").as_str())
+            })?;
+            preload.set("knl_types", loader)?;
+        }
+
         registry
             .install(lua)
             .map_err(|e| mlua::Error::external(format!("require registry install failed: {e}")))?;
+
+        // The checker outlives every `require` this VM will make.
+        lua.set_app_data(TealChecker(checker));
 
         Ok(())
     }
@@ -1428,8 +1556,7 @@ fn build_isle_init(
 async fn spawn_handler_isle(
     script_name: String,
     script_dir: String,
-    lib_paths: String,
-    lib_roots: Vec<PathBuf>,
+    project_root: PathBuf,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: HashMap<String, serde_json::Value>,
@@ -1437,8 +1564,7 @@ async fn spawn_handler_isle(
     let init = build_isle_init(
         script_name,
         script_dir,
-        lib_paths,
-        lib_roots,
+        project_root,
         prompt,
         context,
         extra_globals,
@@ -1756,8 +1882,7 @@ struct SpawnedIsles {
 async fn spawn_isles(
     script_name: &str,
     script_dir: &str,
-    lib_paths: &str,
-    lib_roots: &[PathBuf],
+    project_root: &Path,
     prompt: Option<String>,
     context: Option<String>,
     extra_globals: &HashMap<String, serde_json::Value>,
@@ -1765,8 +1890,7 @@ async fn spawn_isles(
     let (isle, driver) = AsyncIsle::spawn(build_isle_init(
         script_name.to_string(),
         script_dir.to_string(),
-        lib_paths.to_string(),
-        lib_roots.to_vec(),
+        project_root.to_path_buf(),
         prompt.clone(),
         context.clone(),
         extra_globals.clone(),
@@ -1779,8 +1903,7 @@ async fn spawn_isles(
     let (handler_isle, handler_driver) = spawn_handler_isle(
         script_name.to_string(),
         script_dir.to_string(),
-        lib_paths.to_string(),
-        lib_roots.to_vec(),
+        project_root.to_path_buf(),
         prompt,
         context,
         extra_globals.clone(),
@@ -2264,9 +2387,6 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     // `Arc<AsyncIsle>`, which is available only after `AsyncIsle::spawn`
     // returns — classic chicken-and-egg). All bridge registrations run in a
     // second pass via `isle.exec` below.
-    let lib_roots = lib_roots(&project_root);
-    let lib_paths = package_path_prefix(&lib_roots);
-
     let prompt = prompt_resolved.clone();
     let context = context_resolved.clone();
 
@@ -2287,8 +2407,7 @@ pub async fn run_capture(config: BlockConfig) -> BlockResult<String> {
     } = spawn_isles(
         &script_name,
         &script_dir,
-        &lib_paths,
-        &lib_roots,
+        &project_root,
         prompt,
         context,
         &globals,

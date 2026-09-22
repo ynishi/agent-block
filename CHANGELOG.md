@@ -477,6 +477,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a copy that ends mid-line is one whose last line cannot be spliced
   after — the `function M.x() … end` a project adds before `return M`.
 
+- The Teal checker is a state of its own (`Htl::new` +
+  `Htl::with_checker_lua`), and the VM that runs scripts holds only the
+  runtime half: a script cannot `require("tl")` and reach the compiler, and
+  the checker's search path — what a `.tl`'s `require` is resolved against —
+  is no longer the VM's `package.path`, so a plain `.lua` resolves exactly
+  as before. The declarations the binary carries (`host_types.d.tl`,
+  `lshape.d.tl`) are written at start to a directory under the temp dir
+  named by their content (`agent-block-dts-<version>-<hash>/`) and put on
+  the checker's path, last: a project's `lib/foo.tl` can `require
+  ("host_types")` and `global std: host.Std` against the binary that runs
+  it, which before was a type error and a refused `require`. A project's
+  own `htl.toml` is applied to the checker too, as `htl check` applies it:
+  `[check] paths` is where a project declares the modules the host supplies
+  at run time. And every embedded name is in `package.preload` (answering
+  `embedded.<name>`), which is where htl looks for a module the host
+  provides: a `.d.tl` on its own in a tier — `lib/knl.d.tl`, put there to
+  type a project's `.tl` against the kernel — makes the Teal resolver step
+  aside instead of answering with its declaration-only stub, and the
+  embedded module answers. `e2e_teal_lib.rs` pins each of these, and
+  `e2e_host_types_drift.rs` holds `host_types.d.tl` to the host: every
+  function it declares on `std.*` / `tool` / `log` is one the VM registers.
+
+- `fs_tools`' `read` no longer raises on a `limit` that is not a number.
+  The move to Teal had floored `tonumber(input.limit)` without the nil
+  check, so `limit = "all"` from a model raised `bad argument #1 to
+  'floor'` where the Lua module had read the whole range; it reads the whole
+  range again. A fractional `limit` is floored (2.5 lines was never a
+  thing).
+
+- The first `*_test.tl` (`blocks/lib/mcp_tools/spec/mcp_tools_test.tl`,
+  `htl test`), and `just test-tl` is in `just check`. `lua-spec-runner`
+  refuses a binary older than a `.tl` it would take the Lua from, and skips
+  the vendor step under `--project`.
+
 - `session` is the second module written in Teal
   (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
   `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and

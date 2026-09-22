@@ -241,18 +241,32 @@ Its checks live beside it in `lib/<name>/spec/*_spec.lua` (mlua-lspec; a
 them against the copy.
 
 A module may be written in Teal instead — `lib/<name>/init.tl`, the same
-shape with types on it — and embedded through `include_tl!`, so a type error
-in it fails `cargo build`. The globals the host puts in the VM (`std`, …) are
-declared once, in `lib/host_types.d.tl`, and a module names what it reads
-from them: `local host = require("host_types")` then `global std: host.Std`,
-a declaration that generates nothing, so the global stays the host's and
-late-bound, as it is for a Lua module. `host_types.lua` beside the
-declaration is its run-time half (an empty table), which is what the
-`require` in the generated Lua resolves to wherever the module loads. What
-the host embeds is the generated Lua, comments stripped — `vendor` writes
-that, so a project reads the module's own words in the `.tl` in this
-repository. `just check-tl` type-checks the tree; a Teal module's Lua specs
-run as before, against the Lua the binary embeds.
+shape with types on it. In this repository it is embedded through
+`include_tl!`, so a type error in it fails `cargo build`; in a project it is
+type-checked and generated at the `require`, and a type error refuses the
+`require` with the file and line. The globals the host puts in the VM
+(`std`, `tool`, `log`) are declared once, in this repository's
+`lib/host_types.d.tl`, and a module names what it reads from them:
+
+```tl
+local host = require("host_types")
+global std: host.Std
+```
+
+— a declaration that generates nothing, so the global stays the host's and
+late-bound, as it is for a Lua module. The binary carries that declaration
+(and `lshape`'s) and hands it to the checker, so a project's `.tl` writes the
+same two lines against the `agent-block` that runs it; nothing has to be
+copied into the project. A declaration of a project's own for something the
+host supplies at run time goes where `htl check` would look for it: a
+project `htl.toml` with `[check] paths = ["types"]` and the `.d.tl` under
+`types/`, which the host applies to the checker at start. A `.d.tl` for an
+embedded module (`lib/knl.d.tl`) may sit in a tier too and types the kernel
+without replacing it. What the host embeds and `vendor` writes is the
+generated Lua, comments stripped; the module's own words are in the `.tl`.
+`just check-tl` type-checks the tree, `just test-tl` runs the `*_test.tl`
+beside a module (`htl test`), and a Teal module's Lua specs run as before,
+against the Lua the binary embeds.
 
 The opts a public function takes and the values it answers are lshape shapes,
 published under `M.shapes` so a caller reads the contract as data and asserted
