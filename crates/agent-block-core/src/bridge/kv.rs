@@ -51,7 +51,7 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
         lua,
         "kv_tools",
         "kv",
-        include_str!("../../blocks/lib/kv_tools/init.lua"),
+        htl::include_tl!("blocks/lib/kv_tools/init.tl"),
     )?;
 
     Ok(())

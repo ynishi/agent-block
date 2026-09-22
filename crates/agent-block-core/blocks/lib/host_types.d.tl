@@ -39,6 +39,8 @@ local record host_types
             set: function(string, string, any)
             --- Remove (ns, key); true when a row was there to remove.
             delete: function(string, string): boolean
+            --- The keys under ns, those with the prefix when one is given.
+            list: function(string, ?string): {string}
         end
         --- The SQL bridge over the host's SQLite database (`bridge/sql.rs`).
         record Sql

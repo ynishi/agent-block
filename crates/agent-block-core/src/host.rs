@@ -125,7 +125,7 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "sql_tools",
         htl::include_tl!("blocks/lib/sql_tools/init.tl"),
     ),
-    ("kv_tools", include_str!("../blocks/lib/kv_tools/init.lua")),
+    ("kv_tools", htl::include_tl!("blocks/lib/kv_tools/init.tl")),
 ];
 
 /// Prefix under which every embedded module is `require`-able a second time.
