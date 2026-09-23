@@ -301,6 +301,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the dev-mode contract, is `record_event`, because `record` is how
   Teal spells a type declaration and a local cannot take that name.
 
+- `just gen` regenerates every file in the tree a generator owns, and `just
+  check` runs it first: `gen lint test test-lua check-tl test-tl`. Two files
+  are rendered from Rust — `blocks/lib/knl_types.d.tl` for the checker and
+  `blocks/lib/knl_types.lua` for the two runners with no host — by the test
+  that also pins them byte for byte, which writes instead of comparing under
+  `AGENT_BLOCK_WRITE_DTS`. Nothing in `check` had ever run it, so the gate
+  could only REPORT that one of them was stale and leave the person to
+  remember a `cargo test` incantation. With the generator first the run
+  converges from any starting state — stale, hand-edited or clean all end at
+  the same bytes — and a second `just check` changes nothing. The paths are
+  one `generated` variable in the justfile rather than a list per consumer.
+  It converges only because the formatters leave those two alone, which is
+  what the `.styluaignore` entry is for: `stylua` reformatting one after the
+  generator wrote it is what put `just lint` and `cargo test -p
+  agent-block-core` at odds in the first place.
+
+- `.githooks/pre-commit`, tracked and opt-in, refuses a commit whose generated
+  files disagree with their generator: it runs `just gen` and stops if that
+  changed anything, naming the recipe that settles it. `just hooks` points
+  `core.hooksPath` at the directory; nothing installs it for you, because
+  `core.hooksPath` is a setting in your own clone. `git commit --no-verify` is
+  the way past it, for the commit that is changing the generator itself.
+
 - The host's globals are declared in one place, `blocks/lib/host_types.d.tl`,
   and a module written in Teal states none of its own. It used to write the
   pair — `local host = require("host_types")` and then `global std: host.Std`
