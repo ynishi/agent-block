@@ -291,7 +291,7 @@ pub fn register(lua: &Lua, isle: AsyncIsle) -> LuaResult<()> {
         lua,
         "ts_tools",
         "ts",
-        include_str!("../../blocks/lib/ts_tools/init.lua"),
+        htl::include_tl!("blocks/lib/ts_tools/init.tl"),
     )?;
 
     Ok(())

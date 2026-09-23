@@ -26,6 +26,12 @@
 --- bridge's fallback path runs this source directly on a bare `Lua::new()`).
 --- The field set is named by doc, and checked where both halves exist:
 --- `crates/agent-block/tests/e2e_embedded_blocks.rs`.
+---
+--- Written in Teal and embedded through `include_tl!` (`host.rs` and
+--- `bridge/sql.rs`); the Lua the host holds is what Teal generates from this
+--- file, without these comments. The globals it reads are declared through
+--- `host_types`, and `lshape` through `lshape.d.tl` beside the vendored copy.
+require("host_types")
 
 --- `lshape`, the tolerant way, for the one VM that has no `require` at all.
 --- See `kv_tools/init.lua` for the case this covers: the bridge's fallback
@@ -35,12 +41,35 @@ local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil
 local shape = shape_ok and lshape.check or nil
 
-local M = {}
+local record M
+    --- What `register_tools` takes.
+    record Opts
+        allowed: {string}
+        prefix: string
+    end
+    --- What both tools take: the statement, and its positional parameters.
+    record Input
+        sql: string
+        params: {any}
+    end
+    --- One tool, before it is named. Built whole in `defs`, one per op:
+    --- every field is set there, and the check holds each literal to it.
+    record Def ---@struct
+        description: string
+        input_schema: {string:any}
+        handler: function(Input): {string:any}
+    end
+    --- The opts contract, as data. Built whole, once.
+    record Shapes ---@struct
+        register_tools_opts: lshape.Schema
+    end
+    shapes: Shapes
+end
 
 --- What `register_tools` is configured with. CLOSED on purpose: an option
 --- this module does not know is a typo, and a typo that quietly became a
 --- no-op is a tool surface nobody chose.
-local REGISTER_TOOLS_OPTS
+local REGISTER_TOOLS_OPTS: lshape.Schema
 if shape_ok then
     REGISTER_TOOLS_OPTS = T.shape({
         allowed = T.array_of(T.string):describe('the ops to register: "query", "exec"; default both'):is_optional(),
@@ -53,7 +82,7 @@ M.shapes = { register_tools_opts = REGISTER_TOOLS_OPTS }
 --- Register the LLM-facing SQL tools into the global tool registry.
 ---
 --- Returns: array of registered tool names.
-function M.register_tools(opts)
+function M.register_tools(opts: M.Opts): {string}
     opts = opts or {}
     if shape ~= nil then
         shape.assert_dev(opts, REGISTER_TOOLS_OPTS, "std.sql.register_tools opts")
@@ -61,7 +90,7 @@ function M.register_tools(opts)
     local allowed = opts.allowed or { "query", "exec" }
     local prefix = opts.prefix or "sql_"
 
-    local base_schema = {
+    local base_schema: {string:any} = {
         type = "object",
         properties = {
             sql = { type = "string" },
@@ -73,11 +102,11 @@ function M.register_tools(opts)
         required = { "sql" },
     }
 
-    local defs = {
+    local defs: {string:M.Def} = {
         query = {
             description = "Run a SQL query against the agent's local SQLite database (embedded, file-backed UTF-8, persists across runs, agent-private). Use for SELECT-style reads. Returns { rows = [{ col = val, ... }, ...] }. Has a 5s default timeout (errors with 'sql.query timeout (<N>ms)' if exceeded). Type mapping: Lua booleans are stored as 0/1 integers (SQLite has no native bool); BLOB columns are unsupported; TEXT is UTF-8; NULL columns are returned as the std.sql.null sentinel (compare with `row.col == std.sql.null`).",
             input_schema = base_schema,
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local rows = std.sql.query(input.sql, input.params)
                 return { rows = rows }
             end,
@@ -85,14 +114,14 @@ function M.register_tools(opts)
         exec = {
             description = "Run a SQL statement against the agent's local SQLite database (embedded, file-backed, persists across runs, agent-private). Use for INSERT / UPDATE / DELETE / CREATE TABLE / other DDL. Returns { affected = N, last_id = M }. Has a 5s default timeout (errors with 'sql.exec timeout (<N>ms)' if exceeded). Type mapping: Lua booleans are stored as 0/1 integers (SQLite has no native bool); BLOB columns are unsupported; TEXT is UTF-8.",
             input_schema = base_schema,
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local r = std.sql.exec(input.sql, input.params)
                 return { affected = r.affected, last_id = r.last_id }
             end,
         },
     }
 
-    local registered = {}
+    local registered: {string} = {}
     for _, op in ipairs(allowed) do
         local d = defs[op]
         if d then

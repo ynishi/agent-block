@@ -17,7 +17,73 @@ local shared = require("policy.shared")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+--- What `run` answers: whether the thing under test is true, whether the
+--- check answered at all, and what it printed.
+local record RunResult
+    ok: boolean
+    ran: boolean
+    stdout: any
+    stderr: any
+    exit_code: any
+end
+--- How the seconds a check may take are read off the log
+--- (`verdict{ timeout = { ... } }`).
+local record TimeoutTable
+    first: number
+    factor: number
+    floor: number
+    measure: any
+end
+local record VerdictOpts
+    run: function(number): RunResult
+    changed: function(kernel.Session): boolean
+    kind: string
+    timeout: any
+end
+--- What the verdict answers, built whole at every return.
+local record Verdict ---@struct
+    ok: boolean
+    checked: boolean
+    ran: boolean ---@optional
+    changed: boolean ---@optional
+    result: RunResult ---@optional
+    reason: string ---@optional
+end
+local record StagnationOpts
+    same: integer
+    no_progress: integer
+    signature: function(shared.BeatRecord): string
+end
+local record RetryOpts
+    kinds: {string}
+    max: number
+end
+local record EscalateOpts
+    strong: any
+    when: function(kernel.OutcomeValue): boolean
+end
+--- One check in the log, with what it took (`checks_of`).
+local record Check ---@struct
+    seconds: number
+    ok: boolean
+    ran: boolean
+    timeout_s: number ---@optional
+end
+--- A way a check's seconds are read off the log: `fn(events, kind)`.
+local type Measure = function({shared.Event}, string): number
+
+local record M
+    type VerdictFn = function(kernel.Session, kernel.OutcomeValue): Verdict
+    type Predicate = function(kernel.Session): string
+    type RetryFn = function(kernel.OutcomeValue, number): boolean, number
+    type Next = function(kernel.OutcomeValue, kernel.Device): kernel.Device
+    type VerdictFactory = function(VerdictOpts): VerdictFn
+    type StagnationFactory = function(StagnationOpts): Predicate
+    type RetryFactory = function(RetryOpts): RetryFn
+    type EscalateFactory = function(EscalateOpts): Next
+    shapes: {string:lshape.Schema}
+    api: {string:shared.ApiEntry}
+end
 
 -- What this file shares with its siblings, by the names the code was
 -- written against (`policy.shared`).
@@ -50,18 +116,18 @@ local OUTCOME_ARG = shared.OUTCOME_ARG
 --- the loop does with the answer.
 local VERDICT_OPTS, VERDICT_ARG = opts_contract({
     run = FUNCTION
-        :describe(
-            "fn(timeout?) -> { ok, ran?, stdout?, stderr?, exit_code? }; nil = no verdict, the run is the model's word"
-        )
-        :is_optional(),
+    :describe(
+        "fn(timeout?) -> { ok, ran?, stdout?, stderr?, exit_code? }; nil = no verdict, the run is the model's word"
+    )
+    :is_optional(),
     changed = FUNCTION:describe("fn(session) -> boolean; a green with nothing changed is not a pass"):is_optional(),
     kind = T.string:describe('the event kind the answer is recorded under; default "verify"'):is_optional(),
     timeout = T.any_of({ T.number, T.table })
-        :describe(
-            "the seconds handed to run: a number is handed whole every time; "
-                .. '{ first, factor?, floor?, measure? } reads them off the log, `measure` = "longest" | "last" | "last_ok" | "first" | fn(events, kind) -> seconds|nil'
-        )
-        :is_optional(),
+    :describe(
+        "the seconds handed to run: a number is handed whole every time; "
+            .. '{ first, factor?, floor?, measure? } reads them off the log, `measure` = "longest" | "last" | "last_ok" | "first" | fn(events, kind) -> seconds|nil'
+    )
+    :is_optional(),
 })
 
 --- What `policy.stagnation` is configured with. Both thresholds count beats,
@@ -88,9 +154,9 @@ local STAGNATION_OPTS, STAGNATION_ARG = opts_contract({
 ---
 --- Both lists are read from `knl` rather than retyped: a class added on either
 --- side is available here the moment it lands.
-local RETRY_KINDS = {}
+local RETRY_KINDS: {string} = {}
 do
-    local seen = {}
+    local seen: {string:boolean} = {}
     for _, list in ipairs({ kernel.shapes.error_kinds, kernel.shapes.call_error_kinds }) do
         for _, kind in ipairs(list) do
             if not seen[kind] then
@@ -131,18 +197,20 @@ local ESCALATE_OPTS, ESCALATE_ARG = opts_contract({
 --- @param events table  a session's events, in seq order
 --- @param kind string  the kind checks are recorded under
 --- @return table  { { seconds, ok, ran, timeout_s? }, ... } in log order
-local function checks_of(events, kind)
-    local found = {}
+local function checks_of(events: {shared.Event}, kind: string): {Check}
+    local found: {Check} = {}
     for i = 2, #events do
         local ev = events[i]
         if ev.kind == kind and type(ev.data) == "table" then
-            local at, before = ev.epoch_ms, events[i - 1].epoch_ms
-            if type(at) == "number" and type(before) == "number" and at >= before then
+            local data = ev.data as {string:any}
+            local prev = events[i - 1]
+            local at, before = ev.epoch_ms, prev and prev.epoch_ms
+            if type(at) == "number" and type(before) == "number" and (at as number) >= (before as number) then
                 found[#found + 1] = {
-                    seconds = (at - before) / 1000,
-                    ok = ev.data.ok == true,
-                    ran = ev.data.ran ~= false,
-                    timeout_s = type(ev.data.timeout_s) == "number" and ev.data.timeout_s or nil,
+                    seconds = ((at as number) - (before as number)) / 1000,
+                    ok = data.ok == true,
+                    ran = data.ran ~= false,
+                    timeout_s = type(data.timeout_s) == "number" and data.timeout_s as number or nil,
                 }
             end
         end
@@ -176,10 +244,10 @@ end
 ---   first    the first check that answered, and that one for the rest of
 ---            the run. A measurement taken once — a loop that checks
 ---            before its first beat reads its baseline here
-local MEASURES = {}
+local MEASURES: {string:Measure} = {}
 
-function MEASURES.last(events, kind)
-    local taken
+MEASURES.last = function(events: {shared.Event}, kind: string): number
+    local taken: number
     for _, c in ipairs(checks_of(events, kind)) do
         if c.ran then
             taken = c.seconds
@@ -188,8 +256,8 @@ function MEASURES.last(events, kind)
     return taken
 end
 
-function MEASURES.last_ok(events, kind)
-    local taken
+MEASURES.last_ok = function(events: {shared.Event}, kind: string): number
+    local taken: number
     for _, c in ipairs(checks_of(events, kind)) do
         if c.ran and c.ok then
             taken = c.seconds
@@ -198,8 +266,8 @@ function MEASURES.last_ok(events, kind)
     return taken
 end
 
-function MEASURES.longest(events, kind)
-    local taken
+MEASURES.longest = function(events: {shared.Event}, kind: string): number
+    local taken: number
     for _, c in ipairs(checks_of(events, kind)) do
         local reading = c.ran and c.seconds or c.timeout_s
         if reading ~= nil and (taken == nil or reading > taken) then
@@ -209,7 +277,7 @@ function MEASURES.longest(events, kind)
     return taken
 end
 
-function MEASURES.first(events, kind)
+MEASURES.first = function(events: {shared.Event}, kind: string): number
     for _, c in ipairs(checks_of(events, kind)) do
         if c.ran then
             return c.seconds
@@ -220,17 +288,17 @@ end
 
 --- The measure `verdict{ timeout }` names, as a function; a function is its
 --- own. Refuses a name this module does not know, loudly, at construction.
-local function measure_of(measure)
+local function measure_of(measure: any): Measure
     if measure == nil then
         return MEASURES[DEFAULT_TIMEOUT_MEASURE]
     end
     if type(measure) == "function" then
-        return measure
+        return measure as Measure
     end
-    if type(measure) == "string" and MEASURES[measure] then
-        return MEASURES[measure]
+    if type(measure) == "string" and MEASURES[measure as string] then
+        return MEASURES[measure as string]
     end
-    local names = {}
+    local names: {string} = {}
     for name in pairs(MEASURES) do
         names[#names + 1] = '"' .. name .. '"'
     end
@@ -344,24 +412,25 @@ end
 ---
 --- @param opts table|nil  { run?, changed?, kind?, timeout? }
 --- @return function verdict  fn(session, out) -> { ok, checked, ran, changed?, result?, reason? }
-function M.verdict(opts)
+function M.verdict(opts?: VerdictOpts): M.VerdictFn
     opts = opts_of(opts, { run = true, changed = true, kind = true, timeout = true }, "policy.verdict")
     if opts.run ~= nil and type(opts.run) ~= "function" then
         error("policy.verdict: run must be a function (fn(timeout?) -> { ok, ... })", 2)
     end
     if opts.timeout ~= nil then
         if type(opts.timeout) == "number" then
-            if opts.timeout <= 0 then
+            if (opts.timeout as number) <= 0 then
                 error("policy.verdict: timeout must be a positive number of seconds", 2)
             end
         elseif type(opts.timeout) == "table" then
-            only(opts.timeout, { first = true, factor = true, floor = true, measure = true }, "policy.verdict timeout")
-            if type(opts.timeout.first) ~= "number" or opts.timeout.first <= 0 then
+            local given = opts.timeout as {string:any}
+            only(given, { first = true, factor = true, floor = true, measure = true }, "policy.verdict timeout")
+            if type(given.first) ~= "number" or (given.first as number) <= 0 then
                 error("policy.verdict: timeout.first must be a positive number of seconds", 2)
             end
             for _, k in ipairs({ "factor", "floor" }) do
-                local v = opts.timeout[k]
-                if v ~= nil and (type(v) ~= "number" or v <= 0) then
+                local v = given[k]
+                if v ~= nil and (type(v) ~= "number" or (v as number) <= 0) then
                     error("policy.verdict: timeout." .. k .. " must be a positive number", 2)
                 end
             end
@@ -385,17 +454,19 @@ function M.verdict(opts)
     -- Frozen at construction, like every other factory's opts. Nothing about
     -- a particular run lives here; what the checks took is in the log. A
     -- number is `first` with no measure: handed whole, nothing read.
-    local first, factor, floor, measure
+    local first, factor, floor: number, number, number
+    local measure: Measure
     if type(opts.timeout) == "number" then
-        first = opts.timeout
+        first = opts.timeout as number
     elseif opts.timeout then
-        first = opts.timeout.first
-        factor = opts.timeout.factor or DEFAULT_TIMEOUT_FACTOR
-        floor = opts.timeout.floor or DEFAULT_TIMEOUT_FLOOR
-        measure = measure_of(opts.timeout.measure)
+        local given = opts.timeout as TimeoutTable
+        first = given.first
+        factor = given.factor or DEFAULT_TIMEOUT_FACTOR
+        floor = given.floor or DEFAULT_TIMEOUT_FLOOR
+        measure = measure_of(given.measure)
     end
 
-    return function(session, out)
+    return function(session: kernel.Session, out: kernel.OutcomeValue): Verdict
         if run == nil then
             return { ok = false, checked = false }
         end
@@ -432,7 +503,7 @@ function M.verdict(opts)
         -- Stamped with the beat it judges, in the envelope's label bag: the
         -- id is `meta.beat`. A verdict that was handed no beat carries no
         -- label rather than an empty one.
-        local judged = type(out) == "table" and out.beat or nil
+        local judged = type(out) == "table" and (out as {string:any}).beat as string or nil
         session:append({
             kind = kind,
             meta = judged ~= nil and { beat = judged } or nil,
@@ -488,8 +559,8 @@ end
 ---
 --- @param beat table  a `policy.shapes.beat_record`
 --- @return string|nil  the signature, or nil when the beat has none
-local function default_signature(beat)
-    local parts = {}
+local function default_signature(beat: shared.BeatRecord): string
+    local parts: {string} = {}
     for _, ev in ipairs(beat.events) do
         if ev.kind == "tool_call" then
             local data = data_of(ev)
@@ -509,7 +580,7 @@ end
 --- it is loud in prod as well as dev: a signature silently read as "no
 --- signature" would turn the whole check off and look exactly like a run that
 --- is not repeating.
-local function signature_of(signature, beat)
+local function signature_of(signature: function(shared.BeatRecord): string, beat: shared.BeatRecord): string
     local value = signature(beat)
     if value ~= nil and type(value) ~= "string" then
         error("policy.stagnation: signature must return a string or nil, got " .. type(value), 0)
@@ -518,7 +589,7 @@ local function signature_of(signature, beat)
 end
 
 --- Whether the last `n` beats all carry one signature.
-local function is_repeated(order, n, signature)
+local function is_repeated(order: {shared.BeatRecord}, n: integer, signature: function(shared.BeatRecord): string): boolean
     if #order < n then
         return false
     end
@@ -546,14 +617,14 @@ end
 --- A beat that failed its call wrote no response and no tool call, so it made
 --- no progress — which is true, and is why a run of failing beats reaches
 --- `no_progress` rather than running until the budget stops it.
-local function made_progress(beat)
+local function made_progress(beat: shared.BeatRecord): boolean
     for _, ev in ipairs(beat.events) do
         if ev.kind == "tool_call" then
             return true
         end
         if ev.kind == "llm_response" then
-            for _, block in ipairs(data_of(ev).content or {}) do
-                if block.type == "text" and type(block.text) == "string" and block.text:match("%S") then
+            for _, block in ipairs((data_of(ev).content or {}) as {{string:any}}) do
+                if block.type == "text" and type(block.text) == "string" and (block.text as string):match("%S") then
                     return true
                 end
             end
@@ -563,7 +634,7 @@ local function made_progress(beat)
 end
 
 --- Whether the last `m` beats all produced nothing.
-local function is_idle(order, m)
+local function is_idle(order: {shared.BeatRecord}, m: integer): boolean
     if #order < m then
         return false
     end
@@ -619,7 +690,7 @@ end
 ---
 --- @param opts table  { same?, no_progress?, signature? }
 --- @return function predicate  fn(session) -> nil | "repeated" | "no_progress"
-function M.stagnation(opts)
+function M.stagnation(opts?: StagnationOpts): M.Predicate
     opts = opts_of(opts, { same = true, no_progress = true, signature = true }, "policy.stagnation")
     if opts.same ~= nil and not whole_at_least(opts.same, 2) then
         -- Two is the floor because one beat cannot repeat anything.
@@ -637,7 +708,7 @@ function M.stagnation(opts)
     local no_progress = opts.no_progress or DEFAULT_NO_PROGRESS
     local signature = opts.signature or default_signature
 
-    return function(session)
+    return function(session: kernel.Session): string
         local order = beats_of(whole_log(session, "policy.stagnation"))
         if is_repeated(order, same, signature) then
             return "repeated"
@@ -699,24 +770,24 @@ end
 ---
 --- @param opts table  { kinds? = { <error kind | call error kind>... }, max? = <whole number >= 1> }
 --- @return function predicate  fn(outcome, attempt) -> boolean, number?
-function M.retry(opts)
+function M.retry(opts?: RetryOpts): M.RetryFn
     opts = opts_of(opts, { kinds = true, max = true }, "policy.retry")
     if opts.max ~= nil and not whole_at_least(opts.max, 1) then
         error("policy.retry: max must be a whole number >= 1, got " .. tostring(opts.max), 2)
     end
-    local named
+    local named: {string:boolean}
     if opts.kinds ~= nil then
         if type(opts.kinds) ~= "table" then
             error("policy.retry: kinds must be an array of knl error kinds", 2)
         end
-        local known = {}
+        local known: {string:boolean} = {}
         for _, kind in ipairs(RETRY_KINDS) do
             known[kind] = true
         end
         named = {}
         for i, kind in ipairs(opts.kinds) do
             if not known[kind] then
-                error("policy.retry: kinds[" .. i .. "] is not a knl failure kind: " .. tostring(kind), 2)
+                error("policy.retry: kinds[" .. tostring(i) .. "] is not a knl failure kind: " .. tostring(kind), 2)
             end
             named[kind] = true
         end
@@ -724,7 +795,7 @@ function M.retry(opts)
     shape.assert_dev(opts, RETRY_OPTS, "policy.retry opts")
 
     local max = opts.max or DEFAULT_MAX_ATTEMPTS
-    return function(outcome, attempt)
+    return function(outcome: kernel.OutcomeValue, attempt: number): boolean, number
         -- The count is the loop's and it is required. A missing one read as
         -- zero would make every failure retryable forever, which is the one
         -- mistake a retry policy must not make quietly.
@@ -737,16 +808,16 @@ function M.retry(opts)
         if attempt >= max then
             return false
         end
-        local detail = outcome.detail
-        if type(detail) ~= "table" then
+        if type(outcome.detail) ~= "table" then
             -- Only a failure the kernel classified carries a reading; the
             -- stages whose detail is a sentence (`conf` / `filter` / `call`)
             -- name no kind, so there is nothing here to decide on.
             return false
         end
-        local worth
+        local detail = outcome.detail as {string:any}
+        local worth: boolean
         if named ~= nil then
-            worth = detail.kind ~= nil and named[detail.kind] == true
+            worth = detail.kind ~= nil and named[detail.kind as string] == true
         else
             worth = detail.retryable == true
         end
@@ -754,7 +825,7 @@ function M.retry(opts)
             return false
         end
         if type(detail.retry_after) == "number" then
-            return true, detail.retry_after
+            return true, detail.retry_after as number
         end
         return true
     end
@@ -772,7 +843,7 @@ end
 --- stronger one on a problem it has no bearing on. That is the line between
 --- this policy and `retry`: `retry` answers "the same device again", this one
 --- answers "a different device".
-local function default_when(outcome)
+local function default_when(outcome: kernel.OutcomeValue): boolean
     if type(outcome) ~= "table" then
         return false
     end
@@ -783,7 +854,7 @@ local function default_when(outcome)
         return false
     end
     local detail = outcome.detail
-    return not (type(detail) == "table" and detail.retryable == true)
+    return not (type(detail) == "table" and (detail as {string:any}).retryable == true)
 end
 
 --- Build `next(outcome, device) -> device`: the device the following beat
@@ -810,7 +881,7 @@ end
 ---
 --- @param opts table  { strong = <llm>, when? = fn(outcome) -> boolean }
 --- @return function next  fn(outcome, device) -> device
-function M.escalate(opts)
+function M.escalate(opts: EscalateOpts): M.Next
     opts = opts_of(opts, { strong = true, when = true }, "policy.escalate")
     if not callable(opts.strong) then
         error("policy.escalate: strong must be an llm (a function, or a callable)", 2)
@@ -822,7 +893,7 @@ function M.escalate(opts)
 
     local strong = opts.strong
     local when = opts.when or default_when
-    return function(outcome, device)
+    return function(outcome: kernel.OutcomeValue, device: kernel.Device): kernel.Device
         if when(outcome) then
             return device:with({ llm = strong })
         end

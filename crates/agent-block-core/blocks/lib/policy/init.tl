@@ -258,7 +258,11 @@
 ---   `tool_policy` gate, parallel or speculative beats, and any policy that
 ---   would need to write to the log to work. Each is deferred until a real
 ---   loop asks for it.
-
+---
+--- Written in Teal, all six files, and embedded through `include_tl!`
+--- (`host.rs`); the Lua the host holds is what Teal generates, without
+--- these comments. The kernel is read through its own record (`knl` is
+--- Teal too); the records the files share are `policy.shared`'s.
 local lshape = require("lshape")
 local shape = lshape.check
 local shared = require("policy.shared")
@@ -267,7 +271,39 @@ local tools = require("policy.tools")
 local carry = require("policy.carry")
 local loop = require("policy.loop")
 
-local M = {}
+--- The public contracts, as data (`policy.shapes`), and the registry
+--- (`policy.shapes.api`).
+local record Shapes
+    window_opts: lshape.Schema
+    split_opts: lshape.Schema
+    split: lshape.Schema
+    carry_opts: lshape.Schema
+    require_args_opts: lshape.Schema
+    thinking_cap_opts: lshape.Schema
+    stagnation_opts: lshape.Schema
+    retry_opts: lshape.Schema
+    escalate_opts: lshape.Schema
+    beat_record: lshape.Schema
+    tool_pair: lshape.Schema
+    stop_reason: lshape.Schema
+    api: {string:shared.ApiEntry}
+end
+
+local record M
+    window: room.WindowFactory
+    tokens: room.TokensFactory
+    result_cap: room.ResultCapFactory
+    thinking_cap: room.ThinkingCapFactory
+    split: room.SplitFn
+    repeat_cap: tools.RepeatCapFactory
+    require_args: tools.RequireArgsFactory
+    carry: carry.CarryFactory
+    verdict: loop.VerdictFactory
+    stagnation: loop.StagnationFactory
+    retry: loop.RetryFactory
+    escalate: loop.EscalateFactory
+    shapes: Shapes
+end
 
 -- ============================================================
 -- The eleven, gathered
@@ -337,8 +373,9 @@ M.shapes = {
 -- answer it first with a message of its own.
 
 M.shapes.api = {}
-for _, file in ipairs({ room, tools, carry, loop }) do
-    for name, entry in pairs(file.api) do
+local registries: {{string:shared.ApiEntry}} = { room.api, tools.api, carry.api, loop.api }
+for _, api in ipairs(registries) do
+    for name, entry in pairs(api) do
         if M.shapes.api[name] ~= nil then
             error("policy: two files declare `" .. name .. "` in the api registry", 0)
         end
@@ -372,12 +409,17 @@ M.shapes.api.shapes = {
 -- to happen (and it was one: the spec runner sets LSHAPE_CHECK=1, and three
 -- refusal cases that passed under a bare runner failed under it).
 
-local function arg_checked(name, fn, declared)
-    return function(...)
+local function arg_checked(name: string, fn: function(...: any): any..., declared: {shared.ApiArg}): function(...: any): any...
+    return function(...: any): any...
         for i = 1, #declared do
             local value = select(i, ...)
             if value ~= nil then
-                shape.assert_dev(value, declared[i].shape, name .. " arg " .. i .. " (" .. declared[i].desc .. ")")
+                local declared_arg = declared[i]
+                shape.assert_dev(
+                    value,
+                    declared_arg.shape,
+                    name .. " arg " .. tostring(i) .. " (" .. declared_arg.desc .. ")"
+                )
             end
         end
         return fn(...)
@@ -385,10 +427,11 @@ local function arg_checked(name, fn, declared)
 end
 
 if shape.is_dev_mode() then
+    local exports = M as {string:any}
     for name, entry in pairs(M.shapes.api) do
-        local export = M[name]
+        local export = exports[name]
         if type(export) == "function" then
-            M[name] = arg_checked("policy." .. name, export, entry.args)
+            exports[name] = arg_checked("policy." .. name, export as function(...: any): any..., entry.args)
         end
     end
 end

@@ -27,6 +27,11 @@
 --- The field set is named by doc, and checked where both halves exist:
 --- `crates/agent-block/tests/e2e_embedded_blocks.rs`.
 ---
+--- Written in Teal and embedded through `include_tl!` (`host.rs` and
+--- `bridge/ts.rs`); the Lua the host holds is what Teal generates from this
+--- file, without these comments. The globals it reads are declared through
+--- `host_types`, and `lshape` through `lshape.d.tl` beside the vendored copy.
+---
 --- Notes on sum/avg:
 ---   The `value` column is stored as a JSON-encoded payload.  SQLite's
 ---   CAST(value AS REAL) treats JSON objects as 0.0, so `sum`/`avg` produce
@@ -41,21 +46,50 @@
 --- See `kv_tools/init.lua` for the case this covers: the bridge's fallback
 --- runs this source on a bare `Lua::new()`, where nothing resolves, and that
 --- VM only needs `std.ts` to hold its functions.
+require("host_types")
+
 local shape_ok, lshape = pcall(require, "lshape")
 local T = shape_ok and lshape.t or nil
 local shape = shape_ok and lshape.check or nil
 
-local M = {}
+local record M
+    --- What `register_tools` takes.
+    record Opts
+        allowed: {string}
+        prefix: string
+    end
+    --- What the tools take, all three in one shape: `series` always,
+    --- `value` / `tags` / `at` for append, `opts` for query, `tags` for last.
+    record Input
+        series: string
+        value: any
+        tags: {string:string}
+        at: integer
+        opts: {string:any}
+    end
+    --- One tool, before it is named. Built whole in `defs`, one per op:
+    --- every field is set there, and the check holds each literal to it.
+    record Def ---@struct
+        description: string
+        input_schema: {string:any}
+        handler: function(Input): {string:any}
+    end
+    --- The opts contract, as data. Built whole, once.
+    record Shapes ---@struct
+        register_tools_opts: lshape.Schema
+    end
+    shapes: Shapes
+end
 
 --- What `register_tools` is configured with. CLOSED on purpose: an option
 --- this module does not know is a typo, and a typo that quietly became a
 --- no-op is a tool surface nobody chose.
-local REGISTER_TOOLS_OPTS
+local REGISTER_TOOLS_OPTS: lshape.Schema
 if shape_ok then
     REGISTER_TOOLS_OPTS = T.shape({
         allowed = T.array_of(T.string)
-            :describe('the ops to register: "append", "query", "last"; default all three')
-            :is_optional(),
+        :describe('the ops to register: "append", "query", "last"; default all three')
+        :is_optional(),
         prefix = T.string:describe('prepended to every tool name; default "ts_"'):is_optional(),
     }, { open = false })
 end
@@ -65,7 +99,7 @@ M.shapes = { register_tools_opts = REGISTER_TOOLS_OPTS }
 --- Register the LLM-facing time-series tools into the global tool registry.
 ---
 --- Returns: array of registered tool names.
-function M.register_tools(opts)
+function M.register_tools(opts: M.Opts): {string}
     opts = opts or {}
     if shape ~= nil then
         shape.assert_dev(opts, REGISTER_TOOLS_OPTS, "std.ts.register_tools opts")
@@ -73,7 +107,7 @@ function M.register_tools(opts)
     local allowed = opts.allowed or { "append", "query", "last" }
     local prefix = opts.prefix or "ts_"
 
-    local defs = {
+    local defs: {string:M.Def} = {
         append = {
             description = "Append a data point to a named time-series stream backed by "
                 .. "the agent's local SQLite database (persists across runs, agent-private). "
@@ -104,7 +138,7 @@ function M.register_tools(opts)
                 },
                 required = { "series", "value" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 std.ts.append(input.series, input.value, input.tags, input.at)
                 return { ok = true }
             end,
@@ -169,7 +203,7 @@ function M.register_tools(opts)
                 },
                 required = { "series" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local rows = std.ts.query(input.series, input.opts)
                 return { rows = rows }
             end,
@@ -195,14 +229,14 @@ function M.register_tools(opts)
                 },
                 required = { "series" },
             },
-            handler = function(input)
+            handler = function(input: M.Input): {string:any}
                 local row = std.ts.last(input.series, input.tags)
                 return { row = row }
             end,
         },
     }
 
-    local registered = {}
+    local registered: {string} = {}
     for _, op in ipairs(allowed) do
         local d = defs[op]
         if d then

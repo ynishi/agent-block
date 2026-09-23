@@ -14,9 +14,21 @@
 --- Reference: platform.claude.com/docs/en/build-with-claude/extended-thinking
 ---            platform.claude.com/docs/en/agents-and-tools/tool-use
 
+require("host_types")
+
 local proto = require("llm_proto")
 
-local M = { name = "anthropic" }
+--- The adapter, and what the specs reach into beside it: the model
+--- generation readings, exported under the names they have here.
+local record M
+    name: string
+    DEFAULT_MAX_TOKENS: integer
+    --- The readings, for the specs.
+    _model_generation: function(string): number, number
+    _thinking_form_for: function(string): string
+end
+
+M.name = "anthropic"
 
 local DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
@@ -53,8 +65,8 @@ local MIN_BUDGET_TOKENS = 1024
 --- @param model string
 --- @return number major  0 when the id carries no version
 --- @return number minor
-local function model_generation(model)
-    local major, minor = nil, 0
+local function model_generation(model: string): number, number
+    local major, minor: number, number = nil, 0
     for seg in tostring(model or ""):gmatch("[^-]+") do
         if seg:match("^%d+$") then
             if #seg >= 5 then
@@ -80,7 +92,7 @@ end
 ---
 --- @param model string
 --- @return string  "enabled" | "adaptive"
-local function thinking_form_for(model)
+local function thinking_form_for(model: string): string
     local major, minor = model_generation(model)
     if major == 0 then
         return "adaptive"
@@ -132,13 +144,13 @@ M._thinking_form_for = thinking_form_for
 --- Shallow-clones the list and its last entry so the caller's table is never
 --- mutated across calls (the cache key is byte-exact; a leaked marker would
 --- change the next request's prefix).
-local function tools_with_cache_marker(tools)
-    local out = {}
+local function tools_with_cache_marker(tools: {proto.Tool}): {{string:any}}
+    local out: {{string:any}} = {}
     for i = 1, #tools - 1 do
-        out[i] = tools[i]
+        out[i] = tools[i] as {string:any}
     end
-    local last = {}
-    for k, v in pairs(tools[#tools]) do
+    local last: {string:any} = {}
+    for k, v in pairs(tools[#tools] as {string:any}) do
         last[k] = v
     end
     last.cache_control = { type = "ephemeral" }
@@ -156,7 +168,7 @@ end
 --- }
 --- @return table|nil req  { url, headers, body }
 --- @return string|nil err
-function M.build(spec)
+function M.build(spec?: proto.Spec): proto.Wire, string
     spec = spec or {}
 
     local api_key = spec.api_key
@@ -171,9 +183,10 @@ function M.build(spec)
     local model = spec.model or std.env.get_or("ANTHROPIC_MODEL", DEFAULT_MODEL)
     local cache_on = spec.cache_control ~= false
 
-    local body = {
+    local max_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS
+    local body: {string:any} = {
         model = model,
-        max_tokens = spec.max_tokens or M.DEFAULT_MAX_TOKENS,
+        max_tokens = max_tokens,
         messages = spec.messages or {},
     }
 
@@ -195,12 +208,12 @@ function M.build(spec)
         body.tools = cache_on and tools_with_cache_marker(spec.tools) or spec.tools
     end
 
-    local headers = {
+    local headers: {string:string} = {
         ["x-api-key"] = api_key,
         ["anthropic-version"] = API_VERSION,
         ["content-type"] = "application/json",
     }
-    local betas = {}
+    local betas: {string} = {}
 
     -- ── sampling ──────────────────────────────────────────────
     -- Models after Opus 4.6 accept only temperature 1.0, so a caller value is
@@ -241,11 +254,12 @@ function M.build(spec)
     -- Structured outputs. The canonical spec uses the OpenAI shape
     -- (`response_format`), which maps onto output_config.format here.
     if spec.response_format ~= nil then
-        local rf = spec.response_format
+        local rf = spec.response_format as {string:any}
         if type(rf) == "table" and rf.type == "json_schema" then
-            local js = rf.json_schema or {}
-            body.output_config = body.output_config or {}
-            body.output_config.format = { type = "json_schema", schema = js.schema or js }
+            local js = (rf.json_schema or {}) as {string:any}
+            local output_config = (body.output_config or {}) as {string:any}
+            body.output_config = output_config
+            output_config.format = { type = "json_schema", schema = js.schema or js }
             table.insert(betas, "structured-outputs-2025-11-13")
         else
             log.warn("llm_proto.anthropic: response_format type not supported; ignored")
@@ -266,11 +280,16 @@ function M.build(spec)
         if form == "enabled" then
             local budget = thinking.budget_tokens or MIN_BUDGET_TOKENS
             if budget < MIN_BUDGET_TOKENS then
-                return nil, "thinking.budget_tokens must be >= " .. MIN_BUDGET_TOKENS .. " (got " .. budget .. ")"
-            end
-            if budget >= body.max_tokens then
                 return nil,
-                    "thinking.budget_tokens (" .. budget .. ") must be less than max_tokens (" .. body.max_tokens .. ")"
+                "thinking.budget_tokens must be >= " .. tostring(MIN_BUDGET_TOKENS) .. " (got " .. tostring(budget) .. ")"
+            end
+            if budget >= max_tokens then
+                return nil,
+                "thinking.budget_tokens ("
+                    .. tostring(budget)
+                    .. ") must be less than max_tokens ("
+                    .. tostring(max_tokens)
+                    .. ")"
             end
             body.thinking = { type = "enabled", budget_tokens = budget }
             thinking_manual = true
@@ -278,8 +297,9 @@ function M.build(spec)
             body.thinking = { type = "adaptive" }
             if thinking.effort then
                 -- output_config may already carry a structured-output format.
-                body.output_config = body.output_config or {}
-                body.output_config.effort = thinking.effort
+                local output_config = (body.output_config or {}) as {string:any}
+                body.output_config = output_config
+                output_config.effort = thinking.effort
             end
         end
     end
@@ -294,13 +314,13 @@ function M.build(spec)
         -- Catching it here turns a 400 round-trip into a local error.
         if thinking_manual and (tc.kind == "required" or tc.kind == "tool") then
             return nil,
-                "tool_choice="
-                    .. tc.kind
-                    .. " is not supported while manual extended thinking is enabled "
-                    .. "(model "
-                    .. model
-                    .. " uses thinking type=enabled; use tool_choice auto/none, "
-                    .. "or thinking.mode='adaptive' on a model that supports it)"
+            "tool_choice="
+                .. tc.kind
+                .. " is not supported while manual extended thinking is enabled "
+                .. "(model "
+                .. model
+                .. " uses thinking type=enabled; use tool_choice auto/none, "
+                .. "or thinking.mode='adaptive' on a model that supports it)"
         end
         if tc.kind == "required" then
             body.tool_choice = { type = "any" }
@@ -314,8 +334,9 @@ function M.build(spec)
     -- Anthropic carries the parallel switch inside tool_choice, unlike the
     -- OpenAI top-level `parallel_tool_calls`.
     if spec.parallel_tool_calls == false then
-        body.tool_choice = body.tool_choice or { type = "auto" }
-        body.tool_choice.disable_parallel_tool_use = true
+        local tool_choice = (body.tool_choice or { type = "auto" }) as {string:any}
+        body.tool_choice = tool_choice
+        tool_choice.disable_parallel_tool_use = true
     end
 
     -- ── context management (beta) ─────────────────────────────
@@ -347,7 +368,7 @@ function M.build(spec)
         headers = headers,
         body = body,
     },
-        nil
+    nil
 end
 
 -- ============================================================
@@ -364,7 +385,7 @@ end
 --- @param raw table  Parsed response JSON
 --- @return table|nil decoded { content, stop_reason, usage, context_management }
 --- @return string|nil err
-function M.parse(raw)
+function M.parse(raw: {string:any}): proto.Decoded, string
     if not raw then
         return nil, "invalid anthropic response: empty body"
     end
@@ -372,25 +393,25 @@ function M.parse(raw)
         return nil, "anthropic response missing content blocks"
     end
 
-    local u = raw.usage or {}
-    local details = u.output_tokens_details or {}
+    local u = (raw.usage or {}) as {string:any}
+    local details = (u.output_tokens_details or {}) as {string:any}
 
     return {
         content = raw.content,
-        stop_reason = raw.stop_reason,
+        stop_reason = raw.stop_reason as string,
         -- Present on refusals: { type = "refusal", category = ..., explanation = ... }
         stop_details = raw.stop_details,
-        stop_sequence = raw.stop_sequence,
+        stop_sequence = raw.stop_sequence as string,
         usage = {
-            input_tokens = tonumber(u.input_tokens) or 0,
-            output_tokens = tonumber(u.output_tokens) or 0,
-            cache_creation_input_tokens = tonumber(u.cache_creation_input_tokens) or 0,
-            cache_read_input_tokens = tonumber(u.cache_read_input_tokens) or 0,
-            thinking_tokens = tonumber(details.thinking_tokens) or 0,
+            input_tokens = (tonumber(u.input_tokens) or 0) as integer,
+            output_tokens = (tonumber(u.output_tokens) or 0) as integer,
+            cache_creation_input_tokens = (tonumber(u.cache_creation_input_tokens) or 0) as integer,
+            cache_read_input_tokens = (tonumber(u.cache_read_input_tokens) or 0) as integer,
+            thinking_tokens = (tonumber(details.thinking_tokens) or 0) as integer,
         },
         context_management = raw.context_management,
     },
-        nil
+    nil
 end
 
 -- ============================================================
@@ -399,7 +420,7 @@ end
 
 --- Fields of a Messages request that `count_tokens` does not take: the
 --- answer's shape, not its input.
-local NOT_COUNTED = {
+local NOT_COUNTED: {string:boolean} = {
     max_tokens = true,
     stream = true,
     temperature = true,
@@ -420,12 +441,12 @@ local NOT_COUNTED = {
 --- @param spec table  the same spec `build` takes
 --- @return integer|nil tokens
 --- @return string|nil err
-function M.count(spec)
+function M.count(spec?: proto.Spec): integer, string
     local wire, berr = M.build(spec or {})
     if not wire then
         return nil, berr
     end
-    local body = {}
+    local body: {string:any} = {}
     for key, value in pairs(wire.body) do
         if not NOT_COUNTED[key] then
             body[key] = value
@@ -439,7 +460,7 @@ function M.count(spec)
     if type(decoded.input_tokens) ~= "number" then
         return nil, "count_tokens answered no input_tokens"
     end
-    return math.floor(decoded.input_tokens), nil
+    return math.floor(decoded.input_tokens as number), nil
 end
 
 --- What the model behind `spec` can take, from `GET /v1/models/{model}`:
@@ -451,7 +472,7 @@ end
 --- @param spec table  the same spec `build` takes
 --- @return table|nil profile  { context_window = <tokens>|nil, max_output = <tokens>|nil }
 --- @return string|nil err
-function M.profile(spec)
+function M.profile(spec?: proto.Spec): proto.Profile, string
     spec = spec or {}
     local api_key = spec.api_key or std.env.get(spec.api_key_env or "ANTHROPIC_API_KEY")
     if not api_key then
@@ -476,11 +497,11 @@ function M.profile(spec)
     -- different number (what the model allows) and rides along as
     -- `max_output_limit` for a caller that wants to raise its cap.
     return {
-        context_window = math.floor(decoded.max_input_tokens),
+        context_window = math.floor(decoded.max_input_tokens as number),
         max_output = spec.max_tokens or M.DEFAULT_MAX_TOKENS,
-        max_output_limit = type(decoded.max_tokens) == "number" and math.floor(decoded.max_tokens) or nil,
+        max_output_limit = type(decoded.max_tokens) == "number" and math.floor(decoded.max_tokens as number) or nil,
     },
-        nil
+    nil
 end
 
 --- Is the API behind `spec` up and taking this key: `GET /v1/models` with
@@ -490,7 +511,7 @@ end
 ---
 --- @param spec table  the same spec `build` takes
 --- @return table  { alive, kind, status?, message? }
-function M.health(spec)
+function M.health(spec?: proto.Spec): proto.Health
     spec = spec or {}
     local api_key = spec.api_key or std.env.get(spec.api_key_env or "ANTHROPIC_API_KEY")
     local base = spec.base_url and (spec.base_url .. "/v1") or API_URL:gsub("/messages$", "")

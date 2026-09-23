@@ -275,6 +275,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `knl` is written in Teal, and its declaration is the module. The kernel was
+  the last of the embedded modules still in Lua, typed for the ones above it
+  by a hand-written `blocks/lib/knl.d.tl` that a drift test held to the
+  module's exported names. The records that file declared — `Session`,
+  `Device`, `Request`, `Outcome` and the rest — are in `blocks/lib/knl/
+  init.tl` now, beside the module's table and aliased into it with `type X =
+  X`, so `kernel.Session` still names the type from a module that requires
+  this one and the two can no longer say different things: Teal holds the
+  module to its own record at build time, which is what the declaration was
+  standing in for. They are declared BESIDE the table rather than inside it
+  because a record nested in the module record is a KEY of it in the
+  generated Lua, and `knl/spec/api_spec.lua` walks those keys — every export
+  must have a registry entry. `knl.d.tl` is gone, and the drift test now
+  reads the module's own record, which is a tighter check than before: the
+  four `Outcome` constructors the old declaration left out are declared now.
+  The bridge's types come from `knl_types` through a `local type` import, so
+  the kernel's load-time requires are the one they have always been
+  (`lshape`) — a hard `require` would raise in the VMs that have no
+  `knl_types`, which is the case the registry's `pcall` fallback exists for.
+  Nothing a caller sees moved: `require("knl")` answers the same table with
+  the same exports, `knl.shapes`, `knl.views` and `knl.Outcome` hold the same
+  names, and every spec runs unchanged against the Lua Teal generates. One
+  local function was renamed on the way — `record`, which appends an event
+  through the dev-mode contract, is `record_event`, because `record` is how
+  Teal spells a type declaration and a local cannot take that name.
+
+- `just gen` regenerates every file in the tree a generator owns, and `just
+  check` runs it first: `gen lint test test-lua check-tl test-tl`. Two files
+  are rendered from Rust — `blocks/lib/knl_types.d.tl` for the checker and
+  `blocks/lib/knl_types.lua` for the two runners with no host — by the test
+  that also pins them byte for byte, which writes instead of comparing under
+  `AGENT_BLOCK_WRITE_DTS`. Nothing in `check` had ever run it, so the gate
+  could only REPORT that one of them was stale and leave the person to
+  remember a `cargo test` incantation. With the generator first the run
+  converges from any starting state — stale, hand-edited or clean all end at
+  the same bytes — and a second `just check` changes nothing. The paths are
+  one `generated` variable in the justfile rather than a list per consumer.
+  It converges only because the formatters leave those two alone, which is
+  what the `.styluaignore` entry is for: `stylua` reformatting one after the
+  generator wrote it is what put `just lint` and `cargo test -p
+  agent-block-core` at odds in the first place.
+
+- `.githooks/pre-commit`, tracked and opt-in, refuses a commit whose generated
+  files disagree with their generator: it runs `just gen` and stops if that
+  changed anything, naming the recipe that settles it. `just hooks` points
+  `core.hooksPath` at the directory; nothing installs it for you, because
+  `core.hooksPath` is a setting in your own clone. `git commit --no-verify` is
+  the way past it, for the commit that is changing the generator itself.
+
+- The host's globals are declared in one place, `blocks/lib/host_types.d.tl`,
+  and a module written in Teal states none of its own. It used to write the
+  pair — `local host = require("host_types")` and then `global std: host.Std`
+  — and a project's own `.tl` was told to do the same; now it requires the
+  file and the globals come with it. `std`, `tool`, `sh`, `http`, `mcp` and
+  `log` are declared there against the records already beside them, and the
+  `knl` syscall bridge with them, loose (a map of syscalls) for the reason
+  `Mcp` is loose: naming its vocabulary would have the file read `knl` back.
+  The reason it has to be one place is a checker one and is written at the
+  declarations: a `global` declared in a `.tl` that other modules REQUIRE
+  splits that module's record types, so two consumers in one check run each
+  get their own `knl.Session` and a value cannot pass between them [htl
+  0.8.0]. Nothing at run time changed — a declaration generates no code, the
+  globals are still the host's, and a spec can still install a fake `std`
+  before requiring the module.
+
 - `policy` is one module in five files. `blocks/lib/policy/init.lua` had
   grown past three thousand lines, and it is now the door — the header, the
   eleven gathered by name, `policy.shapes`, the api registry and its dev-mode
@@ -404,6 +469,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENT_BLOCK_LOG_SPANS=1 RUST_LOG=eventsdb_sqlite=debug`. It is off by
   default because it is every span in the process, this binary's own
   included.
+
+- `mlua-pkg` is 0.11 (was 0.9). The `Registry` / `Resolver` / `FsResolver` /
+  `MemoryResolver` surface `host.rs` builds the `require` chain from is
+  unchanged between the two, so nothing in the chain moved; what the bump
+  buys is a resolver written against the current trait — the one a Teal
+  (`.tl`) resolver implements — being something the same `Registry` can hold,
+  which is the first step of typing `blocks/lib`.
+
+- `htl` 0.7 is a dependency of `agent-block-core`, with default features
+  off and `macros` / `pkg` / `dts` on: `include_tl!` for a module written as
+  `.tl`, the resolver that puts one into the `require` chain, and the
+  `.d.tl` a `#[host_module]` declares. Nothing uses it yet — this is the
+  graph being proven before a module moves. What it proved: mlua stays one
+  copy at 0.12.1 with `error-send` joining its features, and the batteries
+  compile under that; the second `mlua-batteries` (0.7) the proc macro
+  pulls is host-side only, so one `std.*` registers into a state, not two.
+
+- A module may be written in Teal. Every filesystem tier of the `require`
+  chain (`script_dir` > `.agent-block/lib` > `lib` > `$AGENT_BLOCK_HOME/lib`)
+  now has a Teal resolver ahead of its Lua one: `name.tl` (or `name/init.tl`)
+  is type-checked and generated at the `require`, `name.d.tl` beside a
+  `name.lua` types the Lua without replacing it, and a type error in a `.tl`
+  refuses the `require` — named with file and line — rather than falling
+  through to a copy in a lower tier. The checker is compiled into each VM at
+  start (`Htl::from_lua`; the cost is traced at debug as `htl checker
+  attached`). What a `.tl` can require is what has a `.tl` or `.d.tl` the
+  checker can see: the embedded modules have none yet, so a `.tl` that
+  requires `knl` or `policy` is refused with `no type information for
+  required module` until their declarations land. `just check-tl` (in
+  `just check`) runs `htl check --strict` over `blocks/lib`, with
+  `crates/agent-block-core/htl.toml` naming the require root; `just test-tl`
+  runs `htl test` there, outside `check` until the first `*_test.tl` exists.
+
+- `mcp_tools` is the first embedded module written in Teal
+  (`blocks/lib/mcp_tools/init.tl`, embedded through `include_tl!`): the same
+  two functions with the same behaviour, typed — `tool_decl` over a `Tool`
+  record with both spellings of the schema key, `result_text` over `Block`s
+  — and a type error or an htl lint in it is now a `cargo build` error. What
+  the host embeds and `vendor` writes is the Lua Teal generates, which
+  carries no comments; the module's own words are in the `.tl`.
+  `blocks/lib/host_types.d.tl` is where a Teal module learns the shape of
+  the globals the host owns (`std`, so far only `json.encode`, growing with
+  each module that moves): `global std: host.Std` is a declaration that
+  generates nothing, so the global stays late-bound and a spec can still
+  install a fake before requiring the module. `host_types.lua` beside it is
+  the run-time half of that `require`, an empty table, embedded like any
+  other entry. `lua-spec-runner` takes a Teal module's Lua from the binary
+  that embeds it (`agent-block vendor` into `target/lua-spec-runner/`), so
+  `just test-lua` builds `agent-block` first; `just lint` runs `htl fmt` over
+  `blocks/lib` beside stylua.
+
+- The Lua half of the four bridge tool modules is written in Teal —
+  `sql_tools`, `kv_tools`, `ts_tools`, `fs_tools` (`blocks/lib/<name>/
+  init.tl`), embedded through `include_tl!` both in `EMBEDDED_LIBS` and in
+  each bridge's fallback (`bridge/{sql,kv,ts,fs}.rs`). The same tools with
+  the same behaviour, typed: an `Opts` record per module, one `Input` shape
+  its handlers share, one `Def` per op, and `M.shapes.*` as `lshape.Schema`;
+  `fs_tools` types its helpers (`diverges_at`, `nearest_line`,
+  `line_edit_for`, `fit_lines`) and what `tool_specs` answers (`Spec`).
+  `blocks/lib/lshape.d.tl` declares the vendored validator for the checker
+  — the `t` DSL and `check` — without touching the upstream copy beside it;
+  a tool module keeps its tolerant `pcall(require, "lshape")`, and the
+  bridge's bare-VM fallback answers `require("host_types")` from
+  `package.preload` before running the source (`bridge/mod.rs`).
+  `host_types.d.tl` grows `std.sql` / `std.ts` / `std.fs` / `std.kv.list`
+  and the `tool` bridge. The 42 specs of the four modules pass against the
+  generated Lua.
+
+- `agent-block vendor` ends the copy it writes with a newline. The
+  hand-written sources did; the Lua Teal generates for a module does not,
+  and a copy that ends mid-line is one whose last line cannot be spliced
+  after — the `function M.x() … end` a project adds before `return M`.
+
+- The Teal checker is a state of its own (`Htl::new` +
+  `Htl::with_checker_lua`), and the VM that runs scripts holds only the
+  runtime half: a script cannot `require("tl")` and reach the compiler, and
+  the checker's search path — what a `.tl`'s `require` is resolved against —
+  is no longer the VM's `package.path`, so a plain `.lua` resolves exactly
+  as before. The declarations the binary carries (`host_types.d.tl`,
+  `lshape.d.tl`) are written at start to a directory under the temp dir
+  named by their content (`agent-block-dts-<version>-<hash>/`) and put on
+  the checker's path, last: a project's `lib/foo.tl` can `require
+  ("host_types")` and `global std: host.Std` against the binary that runs
+  it, which before was a type error and a refused `require`. A project's
+  own `htl.toml` is applied to the checker too, as `htl check` applies it:
+  `[check] paths` is where a project declares the modules the host supplies
+  at run time. And every embedded name is in `package.preload` (answering
+  `embedded.<name>`), which is where htl looks for a module the host
+  provides: a `.d.tl` on its own in a tier — `lib/knl.d.tl`, put there to
+  type a project's `.tl` against the kernel — makes the Teal resolver step
+  aside instead of answering with its declaration-only stub, and the
+  embedded module answers. `e2e_teal_lib.rs` pins each of these, and
+  `e2e_host_types_drift.rs` holds `host_types.d.tl` to the host: every
+  function it declares on `std.*` / `tool` / `log` is one the VM registers.
+
+- `fs_tools`' `read` no longer raises on a `limit` that is not a number.
+  The move to Teal had floored `tonumber(input.limit)` without the nil
+  check, so `limit = "all"` from a model raised `bad argument #1 to
+  'floor'` where the Lua module had read the whole range; it reads the whole
+  range again. A fractional `limit` is floored (2.5 lines was never a
+  thing).
+
+- The first `*_test.tl` (`blocks/lib/mcp_tools/spec/mcp_tools_test.tl`,
+  `htl test`), and `just test-tl` is in `just check`. `lua-spec-runner`
+  refuses a binary older than a `.tl` it would take the Lua from, and skips
+  the vendor step under `--project`.
+
+- The Teal modules carry htl's markers where they apply. `---@struct` on
+  every record a module builds whole — `mcp_tools.Decl`, each tool
+  module's `Def` and `Shapes`, `fs_tools.Spec`, and `Tool.Meta` in
+  `host_types.d.tl` — so a literal short of a field is reported where it
+  is written, not found at the first call; `---@nilable` on `std.kv.get`
+  and `std.ts.last`, the two host functions that answer nil, so indexing
+  their result directly is reported. What comes from outside — a caller's
+  `Opts`, a model's `Input`, MCP's `Tool` and `Block` — stays unmarked:
+  every field of those may be absent, which is the fact, and the loud
+  refusals that name a missing one stay in the code.
+
+- `job` is written in Teal (`blocks/lib/job/init.tl`, embedded through
+  `include_tl!`): the same four — `read` / `tick` / `run` and the records
+  they write — with the shapes named. `Decl` is `---@struct` with `every` /
+  `prompt` / `context` as `---@optional`, which is exactly what `decl`
+  promised in prose; `Facts`, `Plan` (`Start` / `Skip`), `Config` and
+  `RunResult` are built whole and say so; a `Session` record is what `job`
+  asks of the kernel's session (`append`, `query`), and a spec's fake
+  answers the same two. `host_types.d.tl` grows `sh` (`exec` with its
+  `ExecResult` / `ExecOpts`, `kill`), `std.time.now` and `std.fs.read`.
+  The 40 job specs pass against the generated Lua, and `job_test.tl`
+  (`htl test`) holds the pure half — `duration`, `decl`, `tick`.
+
+- `llm_proto` is written in Teal, the two adapters with it
+  (`blocks/lib/llm_proto/{init,openai,anthropic}.tl`, embedded through
+  `include_tl!`): the same wire format, transport and parse, with the
+  vocabulary as records. `Spec` names every field an adapter reads, in one
+  place; `ToolChoice` / `Thinking` / `Classified` / `Wire` / `Usage` /
+  `Profile` / `Health` / `Result` are `---@struct` with their optional
+  fields marked; `Decoded` is what a parse answers and `Adapter` what both
+  dialects are. The wire bodies stay `{string:any}` — they are JSON, and
+  the provider's. `host_types.d.tl` grows `http` (`request` with
+  `RequestOpts` / `Response`), `std.env` (`get` nilable, `get_or`),
+  `std.task.sleep` and `std.json.decode`. The 117 llm_proto specs pass
+  against the generated Lua, and `llm_proto_test.tl` (`htl test`) holds
+  the pure half — the two normalizers, `classify_error`, `retry_delay`,
+  `health_of`, `server_root`, `estimate_tokens`.
+
+- The kernel is declared for the checker, so a module written in Teal can
+  `require("knl")`. Two files. `blocks/lib/knl_types.d.tl` is generated:
+  the syscall types `bridge/knl.rs` declares (schema-bridge IR) rendered as
+  Teal — a record per object, an enum per closed set, a type alias for the
+  rest, a field's own object nested and named after it — by the same
+  source the lshape `knl_types` module comes from, so the two cannot
+  disagree. The tree holds a copy for the checker at `cargo build` and in
+  CI, a test pins it to the renderer (`AGENT_BLOCK_WRITE_DTS=1` regenerates
+  it), and the host hands the checker its own render at start beside
+  `host_types.d.tl`, so a project's `.tl` is checked against the binary
+  that runs it. `blocks/lib/knl.d.tl` is hand-written while `knl` is Lua:
+  the module's exports — `open` / `resume` / `session` / `device` / `beat`
+  / `fold` / `error` / `api` / `views.*` / `export` — the `Session` the
+  kernel's userdata is, `Device`, `DeviceConfig`, `OutcomeValue`, and
+  `shapes` as lshape schemas; `e2e_knl_decl_drift.rs` holds every declared
+  name to what `require("knl")` exports.
+
+- `supervisor` is written in Teal (`blocks/lib/supervisor/init.tl`,
+  embedded through `include_tl!`), the first module checked against
+  `knl.d.tl`: `child` / `parallel` / `merge` with the same contracts, typed
+  — `ChildOpts` / `ChildBudget` / `ChildEntry` / `ParallelOpts` /
+  `MergeOpts` as what a caller writes, `Slot` (`---@struct`) as what a
+  sibling's place in `parallel`'s answer holds, `ApiArg` / `ApiEntry` as
+  the registry's form, and the query options a merge freezes as the
+  kernel's own `QueryOpts`. `host_types.d.tl` grows `std.task.scope` /
+  `with_timeout` and the `Scope` a body spawns into; `lshape.d.tl` grows
+  `t._internal`. The 55 supervisor specs pass against the generated Lua,
+  and `supervisor_test.tl` (`htl test`) holds the refusals a call meets
+  before a child is opened. Two things the move settled for every module
+  after it: a record a module needs only for itself is declared beside
+  `M`, not nested in it — nested, it is a key of the module table, and a
+  spec that holds that table to the registry sees an export — and the
+  tree now carries `blocks/lib/knl_types.lua`, the lshape module the host
+  builds at start, rendered by the same generator and pinned by the same
+  test as `knl_types.d.tl`: `htl test` and `lua-spec-runner` have no host
+  to build one, and the kernel's tolerant `pcall(require, "knl_types")`
+  otherwise met htl's declaration-only stub and raised at its first index.
+
+- `policy` is written in Teal, all six files (`blocks/lib/policy/
+  {init,shared,room,tools,carry,loop}.tl`, embedded through `include_tl!`):
+  the eleven policies and `split` with the same contracts, typed. Every
+  factory's opts is a record beside the file that owns it; `shared`
+  declares what the six share — a stored `Event`, a `BeatRecord`, a
+  `ToolPair`, the registry's `ApiArg` / `ApiEntry`, and the `Port` /
+  `Profile` a room policy asks — and the door names each factory by the
+  type its file exports (`room.WindowFactory`, `loop.RetryFactory`, …),
+  aliases that generate no Lua. `Split`, `Verdict` and a `Check` are
+  `---@struct` with their optional fields marked. Two readings changed
+  form for the checker and not the reader: the profile's whole numbers are
+  floored where they are formatted, and `opts_of` is generic so a factory
+  keeps its opts' type through the prelude. The 213 policy specs pass
+  against the generated Lua, and `policy_test.tl` (`htl test`) holds
+  `split`, `retry` and `escalate`'s default judgement.
+
+- `knl_adapter` is written in Teal (`blocks/lib/knl_adapter/init.tl`,
+  embedded through `include_tl!`): the two Ports are records with the
+  metatable the Lua gave them — the same `__index` class, so
+  `LLMPort.new{...}` and `port:open(conf)` read as they did — and the
+  checker holds a provider impl to `build` / `parse` / `classify` and a
+  tool source to `declare` / `invoke`. `Verdict`, `Profile`, the count
+  cache and what the transport `Seen` are records beside `M`.
+  `host_types.d.tl` grows the `mcp` bridge (`list_tools`, `call`), and
+  `llm_proto`'s `Adapter` names `DEFAULT_MAX_TOKENS`. The 74 knl_adapter
+  specs pass against the generated Lua, and `knl_adapter_test.tl` (`htl
+  test`) holds the Port contracts and the tool binding.
+
+- `session` is the second module written in Teal
+  (`blocks/lib/session/init.tl`): the same `load` / `save` / `clear` over
+  `std.kv`, with `Messages` (`{{string:any}}`) as what `load` answers and
+  `save` takes. Its record is named `M`, so the generated module reads as a
+  hand-written one does (`M.NS = ...`, `return M`) and a vendored copy is
+  edited the same way. `host_types.d.tl` grows with it: `std.kv` (`get` /
+  `set` / `delete`) and the `log` bridge (`debug` / `info` / `warn` /
+  `error`).
 
 ### Removed
 

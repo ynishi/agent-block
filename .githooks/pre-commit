@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit whose generated files disagree with their generator.
+#
+# `just gen` renders every file in the tree a generator owns (the `generated`
+# list in the justfile, which this reads rather than repeating). If that
+# changes anything, the commit in front of us was about to record a generated
+# file that its generator does not produce — stale, or hand-edited — so we
+# stop and say which recipe settles it.
+#
+# Opt in with `just hooks`, which points `core.hooksPath` here. `git commit
+# --no-verify` skips it, which is the way through when the commit IS the
+# change to the generator.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-commit: just is not on PATH; skipping the generated-file check" >&2
+    exit 0
+fi
+
+# The one list, read from the justfile so this script carries no copy of it.
+read -r -a generated <<<"$(just --evaluate generated)"
+if [ ${#generated[@]} -eq 0 ]; then
+    exit 0
+fi
+
+before=$(git status --porcelain -- "${generated[@]}")
+just gen >/dev/null 2>&1 || {
+    echo "pre-commit: 'just gen' failed — run it yourself to see why" >&2
+    exit 1
+}
+after=$(git status --porcelain -- "${generated[@]}")
+
+if [ "$before" != "$after" ]; then
+    echo "pre-commit: a generated file was not what its generator renders." >&2
+    echo "  'just gen' has just rewritten it. Stage the change and commit again:" >&2
+    for path in "${generated[@]}"; do
+        echo "    $path" >&2
+    done
+    echo "  (or run 'just check', which does this first and then verifies it)" >&2
+    exit 1
+fi
+
+exit 0

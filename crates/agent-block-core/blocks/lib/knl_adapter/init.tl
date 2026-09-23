@@ -96,6 +96,15 @@
 ---   `open`'s conf is forwarded to llm_proto verbatim: model / api_key /
 ---   max_tokens / thinking / tool_choice / ... are llm_proto's vocabulary and
 ---   this module does not reinterpret any of them.
+---
+--- Written in Teal and embedded through `include_tl!` (`host.rs`); the Lua
+--- the host holds is what Teal generates, without these comments. The two
+--- Ports are records with a metatable — the same `__index` class the Lua
+--- was — so `LLMPort.new{...}` and `port:open(conf)` read as they did, and
+--- the checker holds a provider impl to the three methods the interface
+--- names. The kernel is read through its own record, the host globals
+--- through `host_types`.
+require("host_types")
 
 local proto = require("llm_proto")
 --- MCP's tool vocabulary (the `<server>__<tool>` namespace, the content
@@ -112,7 +121,86 @@ local lshape = require("lshape")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+--- What a Port's `classify` answers: the status, and the normalized
+--- refusal on "refused".
+local record Verdict
+    status: string
+    refusal: {string:any}
+end
+
+--- What `LLMPort:profile` answers.
+local record Profile
+    context_window: number
+    max_output: number
+    discovered: boolean
+end
+
+--- The count cache one Port keeps: the last few distinct requests.
+local record CountCache
+    order: {string}
+    by_key: {string:integer}
+end
+
+--- The provider Port: the three methods an impl brings, the two it may,
+--- and the shim every instance inherits.
+local record LLMPort
+    __index: LLMPort
+    build: function(LLMPort, kernel.Request, any): proto.Wire, string
+    parse: function(LLMPort, {string:any}): proto.Decoded, string
+    classify: function(LLMPort, proto.Decoded): Verdict
+    discover: function(LLMPort, proto.Spec): proto.Profile, string
+    tokenize: function(LLMPort, proto.Spec): integer, string
+    health: function(LLMPort, proto.Spec): proto.Health
+    default_max_output: number
+    _profiles: {string:proto.Profile}
+    _counts: CountCache
+    new: function(any): LLMPort
+    profile: function(LLMPort, ?{string:any}): Profile
+    probe: function(LLMPort, ?{string:any}): proto.Health
+    count: function(LLMPort, kernel.Request, ?{string:any}): integer
+    open: function(LLMPort, ?{string:any}): function(kernel.Request): kernel.LlmResult, kernel.CallError
+end
+
+--- What a ToolPort declares: the kernel's tool_spec less the handler.
+local record ToolDecl
+    name: string
+    description: string
+    input_schema: any
+end
+
+--- The tool-source Port: what may be called, and how.
+local record ToolPort
+    __index: ToolPort
+    declare: function(ToolPort): ToolDecl
+    invoke: function(ToolPort, any): any
+    new: function(any): ToolPort
+    lua: function(kernel.ToolSpec): ToolPort
+    mcp: function(string, mcp_tools.Tool): ToolPort
+end
+
+--- What `mcp_tools` takes beside the server.
+local record McpToolsOpts
+    allow: {string}
+end
+
+local record M
+    record Shapes
+        llm_result: lshape.Schema
+        llm_usage: lshape.Schema
+        tool_use_block: lshape.Schema
+        tool_spec: lshape.Schema
+        call_error: lshape.Schema
+        call_error_kinds: {string}
+        tool_decl: lshape.Schema
+    end
+    shapes: Shapes
+    LLMPort: LLMPort
+    ToolPort: ToolPort
+    anthropic: LLMPort
+    openai: LLMPort
+    _estimate_tokens: function(any): integer
+    _digest_of: function(any): string
+end
 
 -- ============================================================
 -- Result shape — the Port's clean-data contract
@@ -189,7 +277,7 @@ M.shapes.call_error_kinds = kernel.shapes.call_error_kinds
 --- 408 and 504 are timeouts, which is a transport failure that happened to
 --- arrive with a status attached; 503 and 529 are the two spellings of "not
 --- now" (OpenAI's Service Unavailable, Anthropic's Overloaded).
-local STATUS_KIND = {
+local STATUS_KIND: {integer:string} = {
     [400] = "invalid_request",
     [401] = "auth",
     [403] = "auth",
@@ -204,7 +292,7 @@ local STATUS_KIND = {
 }
 
 --- The kind a status maps to — the only reader of `STATUS_KIND`.
-local function kind_of_status(status)
+local function kind_of_status(status: integer): string
     if type(status) ~= "number" then
         return "unknown"
     end
@@ -224,7 +312,7 @@ end
 --- HTTP/1.1 does not promise anything. A value that is not a number of
 --- seconds (the RFC also allows a date) is left absent rather than turned
 --- into a zero a loop would read as "immediately".
-local function retry_after_of(headers)
+local function retry_after_of(headers: {string:string}): number
     for name, value in pairs(headers or {}) do
         if tostring(name):lower() == "retry-after" then
             return tonumber(value)
@@ -245,7 +333,13 @@ end
 --- @param message string  what to tell a person
 --- @param seen table  { status?, retry_after? } as the transport saw them
 --- @return table  a call_error
-local function call_error(kind, message, seen)
+--- What the transport saw of the answer, for the classification.
+local record Seen
+    status: integer
+    retry_after: number
+end
+
+local function call_error(kind: string, message: string, seen: Seen): kernel.CallError
     return {
         kind = kind,
         retryable = kernel.shapes.call_error_retryable[kind] == true,
@@ -261,7 +355,6 @@ end
 
 --- The Port. `build` / `parse` / `classify` are the per-provider methods; the
 --- shared shim `open` is inherited by every instance through `__index`.
-local LLMPort = {}
 LLMPort.__index = LLMPort
 M.LLMPort = LLMPort
 
@@ -274,16 +367,17 @@ M.LLMPort = LLMPort
 ---                       refusal = { kind, detail? } | nil }` (refusal present
 ---                       iff status == "refused").
 --- @return table port  a Port instance (impl with the LLMPort metatable)
-function LLMPort.new(impl)
+function LLMPort.new(impl: any): LLMPort
     if type(impl) ~= "table" then
         error("LLMPort.new: impl must be a table")
     end
+    local given = impl as {string:any}
     for _, method in ipairs({ "build", "parse", "classify" }) do
-        if type(impl[method]) ~= "function" then
+        if type(given[method]) ~= "function" then
             error("LLMPort.new: missing method: " .. method)
         end
     end
-    return setmetatable(impl, LLMPort)
+    return setmetatable(impl as LLMPort, LLMPort as metatable<LLMPort>)
 end
 
 -- ============================================================
@@ -312,15 +406,15 @@ end
 -- estimate needs — and says so in the profile.
 
 --- Merge conf under request, the way `build` sees them.
-local function spec_of(conf, request)
-    local spec = {}
+local function spec_of(conf: {string:any}, request: any): proto.Spec
+    local spec: {string:any} = {}
     for key, value in pairs(conf or {}) do
         spec[key] = value
     end
-    for key, value in pairs(request or {}) do
+    for key, value in pairs((request or {}) as {string:any}) do
         spec[key] = value
     end
-    return spec
+    return spec as proto.Spec
 end
 
 --- A cache key for a request: a 64-bit FNV-1a over the request's content,
@@ -345,18 +439,18 @@ end
 --- modulus FNV asks for.
 local FNV_OFFSET, FNV_PRIME = 0xcbf29ce484222325, 0x100000001b3
 
-local function digest_of(v)
+local function digest_of(v: any): string
     local h = FNV_OFFSET
-    local function feed(text)
+    local function feed(text: string)
         for i = 1, #text do
             h = (h ~ text:byte(i)) * FNV_PRIME
         end
     end
-    local function walk(value)
+    local function walk(value: any)
         local t = type(value)
         if t == "string" then
             feed("s")
-            feed(value)
+            feed(value as string)
         elseif t == "number" or t == "boolean" then
             feed("v")
             feed(tostring(value))
@@ -364,18 +458,19 @@ local function digest_of(v)
             feed("?")
             feed(t)
         else
-            local keys = {}
-            for k in pairs(value) do
+            local map = value as {any:any}
+            local keys: {any} = {}
+            for k in pairs(map) do
                 keys[#keys + 1] = k
             end
-            table.sort(keys, function(a, b)
+            table.sort(keys, function(a: any, b: any): boolean
                 return tostring(a) < tostring(b)
             end)
             feed("{")
             for _, k in ipairs(keys) do
                 feed(tostring(k))
                 feed("=")
-                walk(value[k])
+                walk(map[k])
             end
             feed("}")
         end
@@ -386,7 +481,7 @@ end
 
 --- The window a served model has is the same for every request on it: one
 --- answer per (base_url, model), kept on the Port.
-local function profile_key(conf)
+local function profile_key(conf: {string:any}): string
     return tostring(conf.base_url) .. "|" .. tostring(conf.model)
 end
 
@@ -403,25 +498,25 @@ local ESTIMATE_BYTES_PER_TOKEN = 3.2
 
 --- A fallback is worth a line in the log, where there is one: the spec
 --- runner has no `log` global and a Port must not need one to count.
-local function note(message)
+local function note(message: string)
     if type(log) == "table" and type(log.debug) == "function" then
         log.debug(message)
     end
 end
 
 --- The estimate for a request no server will count.
-local function estimate(request)
+local function estimate(request: any): integer
     local bytes = 0
-    local function walk(v)
+    local function walk(v: any)
         local t = type(v)
         if t == "string" then
-            bytes = bytes + #v
+            bytes = bytes + #(v as string)
         elseif t == "number" or t == "boolean" then
             bytes = bytes + 4
         elseif t == "table" then
-            for k, child in pairs(v) do
+            for k, child in pairs(v as {any:any}) do
                 if type(k) == "string" then
-                    bytes = bytes + #k
+                    bytes = bytes + #(k as string)
                 end
                 walk(child)
             end
@@ -446,12 +541,15 @@ end
 ---
 --- @param conf table|nil  the conf the Port is (or will be) opened with
 --- @return table profile  { context_window = <tokens>|nil, max_output = <tokens>|nil, estimated = boolean? }
-function LLMPort:profile(conf)
+function LLMPort:profile(conf?: {string:any}): Profile
     conf = conf or {}
     -- The room is what the wire will ask for: the conf's `max_tokens`, or the
     -- default the impl's build sends in its place (`default_max_output`), so a
     -- caller that names no cap is still sized for the answer it will get.
-    local profile = { context_window = conf.context_window, max_output = conf.max_tokens or self.default_max_output }
+    local profile: Profile = {
+        context_window = conf.context_window as number,
+        max_output = (conf.max_tokens as number) or self.default_max_output,
+    }
     if profile.context_window ~= nil then
         return profile
     end
@@ -503,7 +601,7 @@ end
 ---
 --- @param conf table|nil  the conf the Port is (or will be) opened with
 --- @return table  { alive = boolean|nil, kind, status?, message? }
-function LLMPort:probe(conf)
+function LLMPort:probe(conf?: {string:any}): proto.Health
     if type(self.health) ~= "function" then
         return { alive = nil, kind = "unknown", message = "this port has no health check" }
     end
@@ -532,7 +630,7 @@ end
 --- @param request table  knl.fold output: { messages, system?, tools? }
 --- @param conf table|nil  the conf the Port is opened with
 --- @return integer tokens  a whole number >= 0
-function LLMPort:count(request, conf)
+function LLMPort:count(request: kernel.Request, conf?: {string:any}): integer
     conf = conf or {}
     self._counts = self._counts or { order = {}, by_key = {} }
     local cache = self._counts
@@ -542,7 +640,7 @@ function LLMPort:count(request, conf)
         return hit
     end
 
-    local tokens
+    local tokens: integer
     if type(self.tokenize) == "function" then
         local counted, err = self:tokenize(spec_of(conf, request))
         if type(counted) == "number" then
@@ -581,12 +679,12 @@ M._digest_of = digest_of
 --- @return function llm  function(request) -> resp | nil, err, where resp is
 ---                       { status, content, usage, stop_reason, refusal? } and
 ---                       err is a `knl.shapes.call_error`
-function LLMPort:open(conf)
+function LLMPort:open(conf?: {string:any}): function(kernel.Request): kernel.LlmResult, kernel.CallError
     conf = conf or {}
     local port = self
 
     --- @param request table  knl.fold output: { messages, system?, tools? }.
-    return function(request)
+    return function(request: kernel.Request): kernel.LlmResult, kernel.CallError
         -- What the transport saw of the answer, for the classification. It is
         -- filled by `on_response`, llm_proto's observability hook, which runs
         -- once after the retry loop — so this is the status and the headers of
@@ -594,7 +692,7 @@ function LLMPort:open(conf)
         -- The hook is the shim's own: a caller's `conf.on_response` was never
         -- forwarded here and still is not, because the callbacks are
         -- `llm_proto.backend`'s vocabulary rather than the Port's.
-        local seen = {}
+        local seen: Seen = {}
 
         -- build: neutral request -> provider wire { url, headers, body }.
         local wire, berr = port:build(request, conf)
@@ -611,9 +709,9 @@ function LLMPort:open(conf)
         -- this closure's contract is `resp | nil, err`, so the raise is caught
         -- and returned rather than let out.
         local transported, raw, terr = pcall(proto.transport, wire, {
-            max_retries = conf.max_retries,
-            timeout = conf.timeout,
-            on_response = function(answer)
+            max_retries = conf.max_retries as number,
+            timeout = conf.timeout as number,
+            on_response = function(answer: proto.ResponseHook)
                 if type(answer) == "table" then
                     seen.status = answer.status
                     seen.retry_after = retry_after_of(answer.headers)
@@ -662,12 +760,12 @@ function LLMPort:open(conf)
         -- classification and holds no provider literal.
         local verdict = port:classify(result)
         local usage = result.usage
-        local mapped = {
+        local mapped: kernel.LlmResult = {
             -- Tag an empty content as a JSON array so it crosses the host bridge
             -- as `[]`, not `{}`; a non-empty content passes through untouched.
             -- llm_proto owns the tag — the Mapper reuses its export rather than
             -- reimplementing the metatable.
-            content = proto.response_blocks(result.content),
+            content = proto.response_blocks(result.content) as {any},
             -- A provider that named no counts (nil or {}) becomes zeros, so the
             -- strict USAGE shape holds without inventing a `{}`.
             usage = {
@@ -695,7 +793,7 @@ function LLMPort:open(conf)
         -- open" — a discriminated union would have to close the block
         -- vocabulary, which is the provider's and not the kernel's.
         for _, block in ipairs(mapped.content) do
-            if type(block) == "table" and block.type == "tool_use" then
+            if type(block) == "table" and (block as {string:any}).type == "tool_use" then
                 shape.assert_dev(block, TOOL_USE_BLOCK, "llm_result content tool_use")
             end
         end
@@ -719,15 +817,8 @@ local proto_anthropic = proto.adapter("anthropic")
 --- @param conf table  provider conf from `open`
 --- @return table|nil wire  { url, headers, body }
 --- @return string|nil err
-local function anthropic_build(_, request, conf)
-    local spec = {}
-    for key, value in pairs(conf or {}) do
-        spec[key] = value
-    end
-    for key, value in pairs(request or {}) do
-        spec[key] = value
-    end
-    return proto_anthropic.build(spec)
+local function anthropic_build(_: LLMPort, request: kernel.Request, conf: any): proto.Wire, string
+    return proto_anthropic.build(spec_of(conf as {string:any}, request))
 end
 
 --- Delegate to llm_proto's anthropic parse. It already returns the full neutral
@@ -737,7 +828,7 @@ end
 --- @param raw table  parsed response JSON
 --- @return table|nil result
 --- @return string|nil err
-local function anthropic_parse(_, raw)
+local function anthropic_parse(_: LLMPort, raw: {string:any}): proto.Decoded, string
     return proto_anthropic.parse(raw)
 end
 
@@ -752,10 +843,10 @@ end
 ---
 --- @param result table  a parse result
 --- @return table  { status = "refused", refusal = { kind = "model" } } | { status = "ok" }
-local function anthropic_classify(_, result)
+local function anthropic_classify(_: LLMPort, result: proto.Decoded): Verdict
     if
-        result.stop_reason == "refusal"
-        or (type(result.stop_details) == "table" and result.stop_details.type == "refusal")
+    result.stop_reason == "refusal"
+        or (type(result.stop_details) == "table" and (result.stop_details as {string:any}).type == "refusal")
     then
         return { status = "refused", refusal = { kind = "model" } }
     end
@@ -774,19 +865,19 @@ M.anthropic = LLMPort.new({
     default_max_output = proto_anthropic.DEFAULT_MAX_TOKENS,
     -- The API counts and describes its own models (count_tokens, GET
     -- /v1/models/{id}); llm_proto's anthropic adapter holds both calls.
-    tokenize = function(_, spec)
+    tokenize = function(_: LLMPort, spec: proto.Spec): integer, string
         if type(proto_anthropic.count) ~= "function" then
             return nil, "llm_proto anthropic adapter has no count"
         end
         return proto_anthropic.count(spec)
     end,
-    discover = function(_, spec)
+    discover = function(_: LLMPort, spec: proto.Spec): proto.Profile, string
         if type(proto_anthropic.profile) ~= "function" then
             return nil, "llm_proto anthropic adapter has no profile"
         end
         return proto_anthropic.profile(spec)
     end,
-    health = type(proto_anthropic.health) == "function" and function(_, spec)
+    health = type(proto_anthropic.health) == "function" and function(_: LLMPort, spec: proto.Spec): proto.Health
         return proto_anthropic.health(spec)
     end or nil,
 })
@@ -809,15 +900,8 @@ local proto_openai = proto.adapter("openai")
 --- @param conf table  provider conf from `open`
 --- @return table|nil wire  { url, headers, body }
 --- @return string|nil err
-local function openai_build(_, request, conf)
-    local spec = {}
-    for key, value in pairs(conf or {}) do
-        spec[key] = value
-    end
-    for key, value in pairs(request or {}) do
-        spec[key] = value
-    end
-    return proto_openai.build(spec)
+local function openai_build(_: LLMPort, request: kernel.Request, conf: any): proto.Wire, string
+    return proto_openai.build(spec_of(conf as {string:any}, request))
 end
 
 --- Delegate to llm_proto's openai parse. It already returns the full neutral
@@ -827,7 +911,7 @@ end
 --- @param raw table  parsed response JSON
 --- @return table|nil result
 --- @return string|nil err
-local function openai_parse(_, raw)
+local function openai_parse(_: LLMPort, raw: {string:any}): proto.Decoded, string
     return proto_openai.parse(raw)
 end
 
@@ -855,7 +939,7 @@ end
 ---
 --- @param result table  a parse result
 --- @return table  { status = "refused", refusal = { kind, detail? } } | { status = "ok" }
-local function openai_classify(_, result)
+local function openai_classify(_: LLMPort, result: proto.Decoded): Verdict
     local refusal_msg = type(result.refusal) == "string" and result.refusal ~= "" and result.refusal or nil
     if refusal_msg or result.stop_reason == "refusal" then
         return { status = "refused", refusal = { kind = "model", detail = refusal_msg } }
@@ -881,19 +965,19 @@ M.openai = LLMPort.new({
     -- /tokenize + /v1/models, llama.cpp /apply-template + /tokenize +
     -- /props, Ollama /api/show); OpenAI's own chat completions do neither,
     -- and llm_proto's openai adapter answers nil there so the shim estimates.
-    tokenize = function(_, spec)
+    tokenize = function(_: LLMPort, spec: proto.Spec): integer, string
         if type(proto_openai.count) ~= "function" then
             return nil, "llm_proto openai adapter has no count"
         end
         return proto_openai.count(spec)
     end,
-    discover = function(_, spec)
+    discover = function(_: LLMPort, spec: proto.Spec): proto.Profile, string
         if type(proto_openai.profile) ~= "function" then
             return nil, "llm_proto openai adapter has no profile"
         end
         return proto_openai.profile(spec)
     end,
-    health = type(proto_openai.health) == "function" and function(_, spec)
+    health = type(proto_openai.health) == "function" and function(_: LLMPort, spec: proto.Spec): proto.Health
         return proto_openai.health(spec)
     end or nil,
 })
@@ -932,14 +1016,13 @@ M.openai = LLMPort.new({
 --- kernel's shape. lshape has no "minus a field" combinator — `T.partial`
 --- makes every field optional, which would give up the one thing checked
 --- loudly here — so the subset is named field by field.
-local KERNEL_TOOL_FIELDS = kernel.shapes.tool_spec.fields
+local KERNEL_TOOL_FIELDS = (kernel.shapes.tool_spec as {string:any}).fields as {string:lshape.Schema}
 local TOOL_DECL = T.shape({
     name = KERNEL_TOOL_FIELDS.name,
     description = KERNEL_TOOL_FIELDS.description,
     input_schema = KERNEL_TOOL_FIELDS.input_schema,
 })
 
-local ToolPort = {}
 ToolPort.__index = ToolPort
 M.ToolPort = ToolPort
 
@@ -951,16 +1034,17 @@ M.ToolPort = ToolPort
 ---                     source's failure vocabulary is normalized to a raise
 ---                     inside invoke, never surfaced as a convention).
 --- @return table port  a Port instance (impl with the ToolPort metatable)
-function ToolPort.new(impl)
+function ToolPort.new(impl: any): ToolPort
     if type(impl) ~= "table" then
         error("ToolPort.new: impl must be a table")
     end
+    local given = impl as {string:any}
     for _, method in ipairs({ "declare", "invoke" }) do
-        if type(impl[method]) ~= "function" then
+        if type(given[method]) ~= "function" then
             error("ToolPort.new: missing method: " .. method)
         end
     end
-    return setmetatable(impl, ToolPort)
+    return setmetatable(impl as ToolPort, ToolPort as metatable<ToolPort>)
 end
 
 --- The lua Port: wrap one flat spec ({name, description?, input_schema?,
@@ -976,7 +1060,7 @@ end
 ---
 --- @param spec table  a flat tool spec
 --- @return table port
-function ToolPort.lua(spec)
+function ToolPort.lua(spec: kernel.ToolSpec): ToolPort
     if type(spec) ~= "table" then
         error("ToolPort.lua: spec must be a table")
     end
@@ -986,19 +1070,19 @@ function ToolPort.lua(spec)
     if type(spec.handler) ~= "function" then
         error("ToolPort.lua: spec.handler must be a function (tool '" .. spec.name .. "')")
     end
-    if spec.schema ~= nil then
+    if (spec as {string:any}).schema ~= nil then
         error("ToolPort.lua: the field is `input_schema`, not `schema` (tool '" .. spec.name .. "')")
     end
-    local decl = {
+    local decl: ToolDecl = {
         name = spec.name,
         description = spec.description,
         input_schema = spec.input_schema,
     }
     return ToolPort.new({
-        declare = function()
+        declare = function(): ToolDecl
             return decl
         end,
-        invoke = function(_, args)
+        invoke = function(_: ToolPort, args: any): any
             return spec.handler(args)
         end,
     })
@@ -1020,7 +1104,7 @@ end
 --- @param server string  connected MCP server name
 --- @param entry table  one entry from `mcp.list_tools(server).tools`
 --- @return table port
-function ToolPort.mcp(server, entry)
+function ToolPort.mcp(server: string, entry: mcp_tools.Tool): ToolPort
     if type(server) ~= "string" or server == "" then
         error("ToolPort.mcp: server must be a non-empty string")
     end
@@ -1029,10 +1113,10 @@ function ToolPort.mcp(server, entry)
     end
     local decl = mcp_tools.tool_decl(server, entry)
     return ToolPort.new({
-        declare = function()
+        declare = function(): mcp_tools.Decl
             return decl
         end,
-        invoke = function(_, args)
+        invoke = function(_: ToolPort, args: any): any
             if mcp == nil then
                 error("ToolPort.mcp: the mcp bridge is not available in this VM")
             end
@@ -1046,7 +1130,7 @@ function ToolPort.mcp(server, entry)
                 )
             end
             -- Content extraction, the one shared definition.
-            local text = mcp_tools.result_text(r.content)
+            local text = mcp_tools.result_text(r.content as {mcp_tools.Block})
             if r.is_error == true then
                 error("mcp tool '" .. decl.name .. "' reported error: " .. tostring(text))
             end
@@ -1063,7 +1147,7 @@ end
 --- @param opts table|nil  { allow = { "<tool name>", ... } } — unlisted
 ---                        tools are skipped; absent allow = every tool
 --- @return table ports  array of ToolPort
-function M.mcp_tools(server, opts)
+function M.mcp_tools(server: string, opts?: McpToolsOpts): {ToolPort}
     if mcp == nil then
         error("knl_adapter.mcp_tools: the mcp bridge is not available in this VM")
     end
@@ -1076,17 +1160,18 @@ function M.mcp_tools(server, opts)
                 .. tostring(type(list) == "table" and list.error or "unreadable result")
         )
     end
-    local allow = nil
+    local allow: {string:boolean} = nil
     if opts and opts.allow then
         allow = {}
         for _, n in ipairs(opts.allow) do
             allow[n] = true
         end
     end
-    local ports = {}
-    for _, t in ipairs(list.tools or {}) do
-        if allow == nil or allow[t.name] then
-            ports[#ports + 1] = ToolPort.mcp(server, t)
+    local ports: {ToolPort} = {}
+    for _, listed in ipairs(list.tools or {}) do
+        local entry = listed as mcp_tools.Tool
+        if allow == nil or allow[entry.name] then
+            ports[#ports + 1] = ToolPort.mcp(server, entry)
         end
     end
     return ports
@@ -1100,8 +1185,9 @@ end
 --- @param port table  a ToolPort
 --- @return string name
 --- @return table entry  { description?, input_schema?, handler }
-function M.tool(port)
-    if getmetatable(port) ~= ToolPort then
+function M.tool(port: ToolPort): string, kernel.ToolEntry
+    local mt: any = getmetatable(port)
+    if mt ~= ToolPort as any then
         error("knl_adapter.tool: not a ToolPort (build one with ToolPort.new / ToolPort.lua)")
     end
     local decl = port:declare()
@@ -1110,13 +1196,13 @@ function M.tool(port)
     end
     shape.assert_dev(decl, TOOL_DECL, "tool_decl")
     return decl.name,
-        {
-            description = decl.description,
-            input_schema = decl.input_schema,
-            handler = function(args)
-                return port:invoke(args)
-            end,
-        }
+    {
+        description = decl.description,
+        input_schema = decl.input_schema,
+        handler = function(args: any): any
+            return port:invoke(args)
+        end,
+    }
 end
 
 --- Bind a list into the knl tools map (`name -> entry`). Items are
@@ -1127,13 +1213,14 @@ end
 ---
 --- @param list table  array of ToolPort | flat spec
 --- @return table tools  knl's `config.tools` map
-function M.tools(list)
+function M.tools(list: {any}): {string:kernel.ToolEntry}
     if type(list) ~= "table" then
         error("knl_adapter.tools: list must be an array")
     end
-    local out = {}
+    local out: {string:kernel.ToolEntry} = {}
     for _, item in ipairs(list) do
-        local port = getmetatable(item) == ToolPort and item or ToolPort.lua(item)
+        local mt: any = getmetatable(item)
+        local port = mt == ToolPort as any and item as ToolPort or ToolPort.lua(item as kernel.ToolSpec)
         local name, entry = M.tool(port)
         if out[name] ~= nil then
             error("knl_adapter.tools: duplicate tool name '" .. name .. "'")

@@ -11,12 +11,30 @@
 --- keeps. This file is `require`d by `policy/init.lua` and not meant to be
 --- reached for directly.
 
+require("host_types")
+
+local kernel = require("knl")
 local lshape = require("lshape")
 local shared = require("policy.shared")
 local T = lshape.t
 local shape = lshape.check
 
-local M = {}
+local record RepeatCapOpts
+    max: number
+    resets: {string}
+end
+local record RequireArgsOpts
+end
+
+local record M
+    type Tools = {string:kernel.ToolEntry}
+    type Wrap = function(Tools): Tools
+    type Bind = function(kernel.Session): Wrap
+    type RepeatCapFactory = function(RepeatCapOpts): Bind
+    type RequireArgsFactory = function(RequireArgsOpts): Wrap
+    shapes: {string:lshape.Schema}
+    api: {string:shared.ApiEntry}
+end
 
 -- What this file shares with its siblings, by the names the code was
 -- written against (`policy.shared`).
@@ -33,11 +51,11 @@ local SESSION_ARG = shared.SESSION_ARG
 --- answer.
 local REPEAT_CAP_OPTS, REPEAT_CAP_ARG = opts_contract({
     max = T.number
-        :describe("how many times one call (tool + arguments) may be made with nothing reset in between; default 2")
-        :is_optional(),
+    :describe("how many times one call (tool + arguments) may be made with nothing reset in between; default 2")
+    :is_optional(),
     resets = T.table
-        :describe("tool names whose successful result starts the count over for every call; default none")
-        :is_optional(),
+    :describe("tool names whose successful result starts the count over for every call; default none")
+    :is_optional(),
 })
 
 --- What `policy.require_args` is configured with: nothing. The list of
@@ -56,18 +74,19 @@ local REQUIRE_ARGS_OPTS, REQUIRE_ARGS_ARG = opts_contract({})
 --- Key order is not promised by every encoder, so the keys are sorted here
 --- before encoding — a table read back from the log and a table handed to a
 --- handler must key alike.
-local function call_key(name, args)
+local function call_key(name: any, args: any): string
     if type(args) ~= "table" then
         return tostring(name) .. "\0" .. tostring(args)
     end
-    local keys = {}
-    for k in pairs(args) do
+    local map = args as {string:any}
+    local keys: {string} = {}
+    for k in pairs(map) do
         keys[#keys + 1] = tostring(k)
     end
     table.sort(keys)
-    local parts = {}
+    local parts: {string} = {}
     for _, k in ipairs(keys) do
-        local v = args[k]
+        local v = map[k]
         parts[#parts + 1] = k .. "=" .. (type(v) == "table" and std.json.encode(v) or tostring(v))
     end
     return tostring(name) .. "\0" .. table.concat(parts, "\1")
@@ -76,12 +95,12 @@ end
 --- Whether a `tool_result` says its tool did what it was asked. The kernel's
 --- `ok` is raise detection; a tool that refuses in its return value (`std.fs`
 --- does) says so with `result.ok == false`. Both are read.
-local function result_succeeded(data)
+local function result_succeeded(data: {string:any}): boolean
     if data.ok == false then
         return false
     end
     local result = data.result
-    if type(result) == "table" and result.ok == false then
+    if type(result) == "table" and (result as {string:any}).ok == false then
         return false
     end
     return true
@@ -118,7 +137,7 @@ end
 ---
 --- @param opts table|nil  { max?, resets? }
 --- @return function binder  fn(session) -> fn(tools) -> tools
-function M.repeat_cap(opts)
+function M.repeat_cap(opts: RepeatCapOpts): M.Bind
     opts = opts_of(opts, { max = true, resets = true }, "policy.repeat_cap")
     if opts.max ~= nil and (type(opts.max) ~= "number" or opts.max < 1 or opts.max % 1 ~= 0) then
         error("policy.repeat_cap: max must be a whole number >= 1, got " .. tostring(opts.max), 2)
@@ -129,35 +148,35 @@ function M.repeat_cap(opts)
         end
         for i, name in ipairs(opts.resets) do
             if type(name) ~= "string" or name == "" then
-                error("policy.repeat_cap: resets[" .. i .. "] must be a non-empty tool name", 2)
+                error("policy.repeat_cap: resets[" .. tostring(i) .. "] must be a non-empty tool name", 2)
             end
         end
     end
     shape.assert_dev(opts, REPEAT_CAP_OPTS, "policy.repeat_cap opts")
 
     local max = opts.max or DEFAULT_REPEAT_MAX
-    local resets = {}
+    local resets: {string:boolean} = {}
     for _, name in ipairs(opts.resets or {}) do
         resets[name] = true
     end
 
-    return function(session)
+    return function(session: kernel.Session): M.Wrap
         needs_session(session, "policy.repeat_cap")
 
         --- How many times `key` has been called since the last reset, off
         --- the log: every `tool_call` with that key after the newest
         --- successful `tool_result` of a reset tool.
-        local function count(key)
+        local function count(key: string): integer
             local events = whole_log(session, "policy.repeat_cap")
-            local reset_tools_by_call = {}
+            local reset_tools_by_call: {string:boolean} = {}
             local since = 0
             for i, ev in ipairs(events) do
-                local data = type(ev.data) == "table" and ev.data or {}
+                local data = type(ev.data) == "table" and ev.data as {string:any} or {}
                 if ev.kind == "tool_call" then
-                    if resets[data.name] and data.call_id ~= nil then
-                        reset_tools_by_call[data.call_id] = true
+                    if resets[data.name as string] and data.call_id ~= nil then
+                        reset_tools_by_call[data.call_id as string] = true
                     end
-                elseif ev.kind == "tool_result" and data.call_id ~= nil and reset_tools_by_call[data.call_id] then
+                elseif ev.kind == "tool_result" and data.call_id ~= nil and reset_tools_by_call[data.call_id as string] then
                     if result_succeeded(data) then
                         since = i
                     end
@@ -167,7 +186,7 @@ function M.repeat_cap(opts)
             for i = since + 1, #events do
                 local ev = events[i]
                 if ev.kind == "tool_call" then
-                    local data = type(ev.data) == "table" and ev.data or {}
+                    local data = type(ev.data) == "table" and ev.data as {string:any} or {}
                     if call_key(data.name, data.args) == key then
                         n = n + 1
                     end
@@ -176,21 +195,21 @@ function M.repeat_cap(opts)
             return n
         end
 
-        return function(tools)
+        return function(tools: M.Tools): M.Tools
             if type(tools) ~= "table" then
                 error("policy.repeat_cap: tools must be the device's map of name -> entry", 2)
             end
-            local out = {}
+            local out: M.Tools = {}
             for name, entry in pairs(tools) do
                 if type(entry) ~= "table" or type(entry.handler) ~= "function" then
                     error("policy.repeat_cap: tool '" .. tostring(name) .. "' has no handler", 2)
                 end
-                local capped = {}
-                for k, v in pairs(entry) do
+                local capped: {string:any} = {}
+                for k, v in pairs(entry as {string:any}) do
                     capped[k] = v
                 end
                 local handler = entry.handler
-                capped.handler = function(args)
+                capped.handler = function(args: any): any
                     local seen = count(call_key(name, args))
                     if seen <= max then
                         return handler(args)
@@ -209,7 +228,7 @@ function M.repeat_cap(opts)
                         ),
                     }
                 end
-                out[name] = capped
+                out[name] = capped as kernel.ToolEntry
             end
             return out
         end
@@ -261,39 +280,39 @@ end
 ---
 --- @param opts table|nil  no options; passing one is refused by name
 --- @return function bind  fn(tools) -> tools (a new map; the argument is not changed)
-function M.require_args(opts)
+function M.require_args(opts?: RequireArgsOpts): M.Wrap
     opts = opts_of(opts, {}, "policy.require_args")
     shape.assert_dev(opts, REQUIRE_ARGS_OPTS, "policy.require_args opts")
 
-    return function(tools)
+    return function(tools: M.Tools): M.Tools
         if type(tools) ~= "table" then
             error("policy.require_args: tools must be the device's map of name -> entry", 2)
         end
-        local out = {}
+        local out: M.Tools = {}
         for name, entry in pairs(tools) do
             if type(entry) ~= "table" or type(entry.handler) ~= "function" then
                 error("policy.require_args: tool '" .. tostring(name) .. "' has no handler", 2)
             end
             local schema = entry.input_schema
-            local declared = type(schema) == "table" and schema.required or nil
-            local required = {}
+            local declared = type(schema) == "table" and (schema as {string:any}).required or nil
+            local required: {string} = {}
             if type(declared) == "table" then
-                for _, key in ipairs(declared) do
+                for _, key in ipairs(declared as {any}) do
                     if type(key) == "string" then
-                        required[#required + 1] = key
+                        required[#required + 1] = key as string
                     end
                 end
             end
             if #required == 0 then
                 out[name] = entry
             else
-                local checked = {}
-                for key, value in pairs(entry) do
+                local checked: {string:any} = {}
+                for key, value in pairs(entry as {string:any}) do
                     checked[key] = value
                 end
                 local handler = entry.handler
-                checked.handler = function(args)
-                    local given = type(args) == "table" and args or {}
+                checked.handler = function(args: any): any
+                    local given = type(args) == "table" and args as {string:any} or {}
                     for _, key in ipairs(required) do
                         if given[key] == nil then
                             return {
@@ -309,7 +328,7 @@ function M.require_args(opts)
                     end
                     return handler(args)
                 end
-                out[name] = checked
+                out[name] = checked as kernel.ToolEntry
             end
         end
         return out

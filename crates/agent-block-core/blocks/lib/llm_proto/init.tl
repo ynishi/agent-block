@@ -35,8 +35,210 @@
 ---
 ---   local backend = proto.backend({ provider = "anthropic", model = ... })
 ---   local res, err = backend({ messages = ..., system = ..., tools = ... })
+---
+--- Written in Teal and embedded through `include_tl!` (`host.rs`), the two
+--- adapters with it; the Lua the host holds is what Teal generates, without
+--- these comments. What the checker adds is the vocabulary as records: the
+--- `Spec` an adapter reads (every field named, in one place), the canonical
+--- `ToolChoice` / `Thinking`, the `Wire` a build answers, the `Decoded` a
+--- parse answers, and the `Adapter` both dialects are. The wire bodies stay
+--- `{string:any}`: they are JSON, and the provider's, not this module's.
+local host = require("host_types")
 
-local M = {}
+local record M
+    --- One content block, in the canonical (Anthropic-shaped) vocabulary:
+    --- `text`, `tool_use` (`id` / `name` / `input`), `tool_result`
+    --- (`tool_use_id` / `content`), `thinking` (`thinking`), and whatever
+    --- else a provider sends back, carried as it came.
+    record Block
+        type: string
+        text: string
+        id: string
+        name: string
+        input: {string:any}
+        tool_use_id: string
+        content: any
+        thinking: string
+        is_error_hint: string
+    end
+    --- One message of the canonical history: `content` is a string or an
+    --- array of blocks.
+    record Message
+        role: string
+        content: any
+    end
+    --- One tool as a request declares it.
+    record Tool
+        name: string
+        description: string
+        input_schema: {string:any}
+        strict: boolean
+    end
+    --- The canonical `tool_choice`: `auto` / `none` / `required`, or one
+    --- tool by name.
+    record ToolChoice ---@struct
+        kind: string
+        name: string ---@optional
+    end
+    --- The canonical thinking spec.
+    record Thinking ---@struct
+        enabled: boolean
+        effort: string ---@optional
+        budget_tokens: number ---@optional
+        mode: string
+        --- The chat-template key a compat server reads, when the caller
+        --- names one (`openai` dialect only).
+        kwarg: string ---@optional
+    end
+    --- An HTTP failure, classified: whether to ask again, and why not.
+    record Classified ---@struct
+        kind: string
+        retryable: boolean
+        retry_after: number ---@optional
+        code: string ---@optional
+        message: string
+    end
+    --- What a provider-neutral request carries, and what configures the
+    --- backend that sends it: one vocabulary for `build`, `count`,
+    --- `profile`, `health` and `backend`. Every field may be absent — the
+    --- adapter says which it needs — and the `body`-side values are
+    --- forwarded as they are.
+    record Spec
+        provider: string
+        model: string
+        messages: {Message}
+        system: string
+        tools: {Tool}
+        max_tokens: number
+        temperature: number
+        top_p: number
+        top_k: number
+        frequency_penalty: number
+        presence_penalty: number
+        stop: any
+        timeout: number
+        tool_choice: any
+        parallel_tool_calls: boolean
+        thinking: any
+        dialect: string
+        strict_alternation: boolean
+        extra_body: {string:any}
+        api_key: string
+        api_key_env: string
+        base_url: string
+        headers: {string:any}
+        seed: any
+        n: any
+        logit_bias: any
+        logprobs: any
+        top_logprobs: any
+        metadata: any
+        service_tier: any
+        store: any
+        prompt_cache_key: any
+        safety_identifier: any
+        verbosity: any
+        response_format: any
+        cache_control: boolean
+        context_management: any
+        betas: {string}
+        --- The backend's own: held back from the adapter (`BACKEND_CONF`).
+        max_retries: number
+        on_request: function(RequestHook)
+        on_response: function(ResponseHook)
+        on_decoded: function(Decoded)
+    end
+    --- What `build` answers: where to POST, with what.
+    record Wire ---@struct
+        url: string
+        headers: {string:string}
+        body: {string:any}
+    end
+    --- What a provider counted.
+    record Usage ---@struct
+        input_tokens: integer
+        output_tokens: integer
+        cache_creation_input_tokens: integer
+        cache_read_input_tokens: integer
+        thinking_tokens: integer
+    end
+    --- What `parse` answers: the canonical decoded shape.
+    record Decoded
+        content: any
+        stop_reason: string
+        refusal: string
+        stop_details: any
+        stop_sequence: string
+        usage: Usage
+        context_management: any
+    end
+    --- What the model can take, as the server says.
+    record Profile ---@struct
+        context_window: integer
+        max_output: number ---@optional
+        max_output_limit: integer ---@optional
+    end
+    --- What `health` answers, in the one vocabulary (`health_of`).
+    record Health ---@struct
+        alive: boolean
+        kind: string
+        status: integer ---@optional
+        message: string ---@optional
+    end
+    --- The observability hooks' arguments.
+    record RequestHook ---@struct
+        url: string
+        headers: {string:string}
+        body: {string:any}
+        body_json: string
+    end
+    record ResponseHook ---@struct
+        status: integer
+        headers: {string:string}
+        body: string
+        latency_ms: integer
+    end
+    --- What `transport` answers beside the decoded JSON.
+    record TransportMeta ---@struct
+        status: integer
+        latency_ms: integer
+    end
+    --- What `transport` takes.
+    record TransportOpts
+        max_retries: number
+        timeout: number
+        on_request: function(RequestHook)
+        on_response: function(ResponseHook)
+    end
+    --- What `ping` answers.
+    record Answer ---@struct
+        status: integer
+        body: string
+        headers: {string:string}
+    end
+    --- What `backend`'s closure answers.
+    record Result ---@struct
+        content: any
+        usage: Usage
+        stop_reason: string ---@optional
+        status: integer
+        latency_ms: integer
+    end
+    --- One provider dialect: what `adapter` answers.
+    record Adapter
+        name: string
+        --- The cap `build` sends when the spec names none, on a wire that
+        --- requires one (`anthropic`); absent on a wire that sends none.
+        DEFAULT_MAX_TOKENS: integer
+        build: function(Spec): Wire, string
+        parse: function({string:any}): Decoded, string
+        count: function(Spec): integer, string
+        profile: function(Spec): Profile, string
+        health: function(Spec): Health
+    end
+    VERSION: integer
+    response_blocks: function(any): any
+end
 
 --- Protocol layer revision. Bumped when the canonical spec/decoded shape
 --- changes in a way callers can observe.
@@ -63,27 +265,29 @@ M.VERSION = 1
 --- @param tc string|table|nil
 --- @return table|nil canonical  nil when tc is nil (= leave to API default)
 --- @return string|nil err
-function M.normalize_tool_choice(tc)
+function M.normalize_tool_choice(tc: any): M.ToolChoice, string
     if tc == nil then
         return nil, nil
     end
 
     if type(tc) == "string" then
-        if tc == "auto" or tc == "none" then
-            return { kind = tc }, nil
-        elseif tc == "required" or tc == "any" then
+        local word = tc as string
+        if word == "auto" or word == "none" then
+            return { kind = word }, nil
+        elseif word == "required" or word == "any" then
             return { kind = "required" }, nil
         end
-        return nil, "invalid tool_choice string: " .. tc
+        return nil, "invalid tool_choice string: " .. word
     end
 
     if type(tc) ~= "table" then
         return nil, "tool_choice must be a string or table, got " .. type(tc)
     end
 
-    local ty = tc.type
+    local given = tc as {string:any}
+    local ty = given.type
     if ty == "auto" or ty == "none" then
-        return { kind = ty }, nil
+        return { kind = ty as string }, nil
     elseif ty == "any" then
         return { kind = "required" }, nil
     elseif ty == "required" then
@@ -92,14 +296,14 @@ function M.normalize_tool_choice(tc)
     elseif ty == "tool" or ty == "function" then
         -- Anthropic: { type = "tool", name = "x" }
         -- OpenAI:    { type = "function", function = { name = "x" } }
-        local name = tc.name
-        if not name and type(tc["function"]) == "table" then
-            name = tc["function"].name
+        local name = given.name
+        if not name and type(given["function"]) == "table" then
+            name = (given["function"] as {string:any}).name
         end
         if not name or name == "" then
             return nil, "tool_choice type=" .. tostring(ty) .. " requires a tool name"
         end
-        return { kind = "tool", name = name }, nil
+        return { kind = "tool", name = name as string }, nil
     end
 
     return nil, "invalid tool_choice: unknown type " .. tostring(ty)
@@ -109,7 +313,7 @@ end
 -- thinking / reasoning
 -- ============================================================
 
-local VALID_EFFORT = {
+local VALID_EFFORT: {string:boolean} = {
     none = true,
     minimal = true,
     low = true,
@@ -134,53 +338,55 @@ local VALID_EFFORT = {
 --- @param t boolean|table|nil
 --- @return table|nil canonical  nil when t is nil (= provider default, no field)
 --- @return string|nil err
-function M.normalize_thinking(t)
+function M.normalize_thinking(t: any): M.Thinking, string
     if t == nil then
         return nil, nil
     end
 
     if type(t) == "boolean" then
-        return { enabled = t, mode = "auto" }, nil
+        return { enabled = t as boolean, mode = "auto" }, nil
     end
 
     if type(t) ~= "table" then
         return nil, "thinking must be a boolean or table, got " .. type(t)
     end
 
+    local given = t as {string:any}
     -- `enabled` defaults to true: passing any thinking table means "I want it",
     -- and turning it off is spelled `thinking = false` / `{ enabled = false }`.
     local enabled = true
-    if t.enabled ~= nil then
-        enabled = t.enabled and true or false
+    if given.enabled ~= nil then
+        enabled = given.enabled and true or false
     end
 
-    local effort = t.effort
+    local effort = given.effort
     if effort ~= nil then
-        if type(effort) ~= "string" or not VALID_EFFORT[effort] then
+        if type(effort) ~= "string" or not VALID_EFFORT[effort as string] then
             return nil, "invalid thinking.effort: " .. tostring(effort)
         end
     end
 
-    local budget = t.budget_tokens
-    if budget ~= nil then
-        budget = tonumber(budget)
+    local budget: number
+    if given.budget_tokens ~= nil then
+        budget = tonumber(given.budget_tokens)
         if not budget or budget <= 0 then
-            return nil, "invalid thinking.budget_tokens: " .. tostring(t.budget_tokens)
+            return nil, "invalid thinking.budget_tokens: " .. tostring(given.budget_tokens)
         end
     end
 
-    local mode = t.mode or "auto"
+    local mode = given.mode or "auto"
     if mode ~= "auto" and mode ~= "adaptive" and mode ~= "enabled" then
         return nil, "invalid thinking.mode: " .. tostring(mode)
     end
 
     return {
         enabled = enabled,
-        effort = effort,
+        effort = effort as string,
         budget_tokens = budget,
-        mode = mode,
+        mode = mode as string,
+        kwarg = given.kwarg as string,
     },
-        nil
+    nil
 end
 
 -- ============================================================
@@ -191,7 +397,7 @@ end
 --- Both providers report these as 429, but retrying one of them succeeds in a
 --- moment and retrying the other cannot succeed until the billing period
 --- rolls over.
-local QUOTA_CODES = {
+local QUOTA_CODES: {string:boolean} = {
     enforced_spend_limit_reached = true, -- Anthropic
     credit_balance_exhausted = true, -- OpenAI
     organization_spend_limit_exceeded = true,
@@ -206,35 +412,36 @@ local QUOTA_CODES = {
 --- @param body string|table|nil  Response body (JSON text or decoded table)
 --- @param headers table|nil   Response headers
 --- @return table  { kind, retryable, retry_after (seconds|nil), code, message }
-function M.classify_error(status, body, headers)
-    local decoded = body
+function M.classify_error(status: integer, body: any, headers?: {string:any}): M.Classified
+    local decoded: any = body
     if type(body) == "string" and body ~= "" then
-        local ok, parsed = pcall(std.json.decode, body)
+        local ok, parsed = pcall(std.json.decode, body as string)
         decoded = ok and parsed or nil
     end
     if type(decoded) ~= "table" then
         decoded = {}
     end
+    local answered = decoded as {string:any}
 
-    local err = decoded.error or {}
+    local err = (answered.error or {}) as {string:any}
     local code = err.code
     if not code and type(err.details) == "table" then
-        code = err.details.error_code
+        code = (err.details as {string:any}).error_code
     end
     -- OpenAI-compat nests the explanation under `error.message`; vLLM answers
     -- with a top-level `message`. Either is the server saying what went wrong.
-    local message = err.message or decoded.message or ("HTTP " .. tostring(status))
+    local message = err.message or answered.message or ("HTTP " .. tostring(status))
 
-    local retry_after
+    local retry_after: number
     for k, v in pairs(headers or {}) do
         if tostring(k):lower() == "retry-after" then
             retry_after = tonumber(v)
         end
     end
 
-    local kind, retryable
+    local kind, retryable: string, boolean
     if status == 429 then
-        if code and QUOTA_CODES[code] then
+        if code and QUOTA_CODES[code as string] then
             kind, retryable = "quota", false
         else
             kind, retryable = "rate_limit", true
@@ -259,8 +466,8 @@ function M.classify_error(status, body, headers)
         kind = kind,
         retryable = retryable,
         retry_after = retry_after,
-        code = code,
-        message = message,
+        code = code as string,
+        message = tostring(message),
     }
 end
 
@@ -288,7 +495,7 @@ local RETRY_AFTER_MAX_S = 60
 --- @param classified table  Result of `classify_error`
 --- @param salt number|nil   Distinguishes concurrent callers (e.g. call index)
 --- @return number seconds
-function M.retry_delay(attempt, classified, salt)
+function M.retry_delay(attempt: number, classified: M.Classified, salt?: number): number
     local after = classified and classified.retry_after
     if type(after) == "number" and after > 0 and after <= RETRY_AFTER_MAX_S then
         return after
@@ -316,7 +523,7 @@ end
 --- @param headers table  The adapter's headers (mutated in place)
 --- @param extra table|nil  Caller headers, name -> value
 --- @return table headers
-function M.merge_headers(headers, extra)
+function M.merge_headers(headers: {string:string}, extra?: {string:any}): {string:string}
     if type(extra) ~= "table" then
         return headers
     end
@@ -330,34 +537,34 @@ end
 -- Adapter registry
 -- ============================================================
 
-local ADAPTERS = {
+local ADAPTERS: {string:string} = {
     openai = "llm_proto.openai",
     anthropic = "llm_proto.anthropic",
 }
 
-local loaded = {}
+local loaded: {string:M.Adapter} = {}
 
 --- Resolve a provider name to its adapter module.
 ---
 --- @param provider string|nil  "anthropic" (default) | "openai"
 --- @return table|nil adapter  { name, build, parse }
 --- @return string|nil err
-function M.adapter(provider)
+function M.adapter(provider?: string): M.Adapter, string
     local key = provider or "anthropic"
     local modname = ADAPTERS[key]
     if not modname then
         return nil, "unsupported provider: " .. tostring(provider)
     end
     if not loaded[key] then
-        loaded[key] = require(modname)
+        loaded[key] = require(modname) as M.Adapter
     end
     return loaded[key], nil
 end
 
 --- List the provider names this build understands.
 --- @return table  Array of provider name strings
-function M.providers()
-    local out = {}
+function M.providers(): {string}
+    local out: {string} = {}
     for name, _ in pairs(ADAPTERS) do
         table.insert(out, name)
     end
@@ -387,7 +594,7 @@ local DEFAULT_TIMEOUT = 120
 --- does not know, but forwarding a callback as if it were a wire field is the
 --- kind of thing that stops being harmless the day an adapter grows a field of
 --- the same name.
-local BACKEND_CONF = {
+local BACKEND_CONF: {string:boolean} = {
     max_retries = true,
     on_request = true,
     on_response = true,
@@ -397,7 +604,7 @@ local BACKEND_CONF = {
 --- The first line of what the host's http device raised: the sentence, not
 --- the traceback that rides behind it in dev mode. That is what a warning
 --- line and a health answer carry; the raise itself is let out whole.
-local function first_line(raised)
+local function first_line(raised: any): string
     return (tostring(raised):match("^[^\n]*"))
 end
 
@@ -419,11 +626,11 @@ end
 --- net/http) refuse to retry a non-idempotent method past that point; the
 --- LLM SDKs retry it, and so does this, on the same reading: a generation
 --- the client never received cost a call and nothing else.
-local function post_with_retry(url, request_opts, max_retries)
+local function post_with_retry(url: string, request_opts: host.Http.RequestOpts, max_retries: number): host.Http.Response
     local attempt = 0
     while true do
         local sent, resp = pcall(http.request, url, request_opts)
-        local classified
+        local classified: M.Classified
         if sent then
             if resp.status == 200 or attempt >= max_retries then
                 return resp
@@ -445,9 +652,9 @@ local function post_with_retry(url, request_opts, max_retries)
                 .. classified.kind
                 .. (sent and (" (HTTP " .. tostring(resp.status) .. ")") or (" (" .. classified.message .. ")"))
                 .. "; retry "
-                .. attempt
+                .. tostring(attempt)
                 .. "/"
-                .. max_retries
+                .. tostring(max_retries)
         )
         std.task.sleep(delay * 1000)
     end
@@ -479,7 +686,7 @@ end
 --- @return table|nil raw  the decoded response JSON
 --- @return string|nil err
 --- @return table|nil meta  { status, latency_ms } on the success path
-function M.transport(wire, opts)
+function M.transport(wire: M.Wire, opts?: M.TransportOpts): {string:any}, string, M.TransportMeta
     opts = opts or {}
 
     local body_json = std.json.encode(wire.body)
@@ -516,7 +723,7 @@ function M.transport(wire, opts)
         -- "invalid_request" leaves the caller with no way to tell a context
         -- overflow from a malformed body.
         return nil,
-            "API error " .. tostring(resp.status) .. " (" .. classified.kind .. "): " .. tostring(classified.message)
+        "API error " .. tostring(resp.status) .. " (" .. classified.kind .. "): " .. tostring(classified.message)
     end
 
     local ok_decode, raw = pcall(std.json.decode, resp.body)
@@ -524,13 +731,13 @@ function M.transport(wire, opts)
         return nil, "response JSON decode failed"
     end
 
-    return raw, nil, { status = resp.status, latency_ms = latency_ms }
+    return raw as {string:any}, nil, { status = resp.status, latency_ms = latency_ms }
 end
 
 --- Marks a table as a JSON array, for the one case Lua cannot express: an
 --- empty table is an array and a mapping at once, and the host bridge reads
 --- an untagged one as a mapping.
-local ARRAY_TAG = { __jsontype = "array" }
+local ARRAY_TAG: {string:string} = { __jsontype = "array" }
 
 --- The content blocks of a model response, as they arrived.
 ---
@@ -548,9 +755,10 @@ local ARRAY_TAG = { __jsontype = "array" }
 --- Anything that is not a table is handed on untouched: the kernel refuses it
 --- and notes the call as failed, which is the honest ending for a response
 --- nobody can read.
-local function response_blocks(content)
-    if type(content) == "table" and #content == 0 then
-        return setmetatable({}, ARRAY_TAG)
+local function response_blocks(content: any): any
+    if type(content) == "table" and #(content as {any}) == 0 then
+        local empty: any = {}
+        return setmetatable(empty, ARRAY_TAG as metatable<any>)
     end
     return content
 end
@@ -590,7 +798,7 @@ end
 --- }
 --- @return function|nil backend  function(req) -> result | nil, err
 --- @return string|nil err  when the provider is not one this build speaks
-function M.backend(conf)
+function M.backend(conf?: M.Spec): function(M.Spec): (M.Result, string), string
     conf = conf or {}
 
     local adapter, aerr = M.adapter(conf.provider)
@@ -600,8 +808,8 @@ function M.backend(conf)
 
     -- Resolved once: the conf is fixed for the life of the closure, and only
     -- the request changes per call.
-    local base = {}
-    for key, value in pairs(conf) do
+    local base: {string:any} = {}
+    for key, value in pairs(conf as {string:any}) do
         if not BACKEND_CONF[key] then
             base[key] = value
         end
@@ -609,19 +817,20 @@ function M.backend(conf)
     local max_retries = tonumber(conf.max_retries) or DEFAULT_MAX_RETRIES
 
     --- @param req table  { messages, system, tools, ... } — provider-neutral
-    return function(req)
+    return function(req: M.Spec): M.Result, string
         req = req or {}
 
         -- The request wins over the conf, field by field: the conf says how to
         -- reach the provider, the request says what to ask it, and a caller
         -- that wants to override a knob for one call can.
-        local spec = {}
+        local merged: {string:any} = {}
         for key, value in pairs(base) do
-            spec[key] = value
+            merged[key] = value
         end
-        for key, value in pairs(req) do
-            spec[key] = value
+        for key, value in pairs(req as {string:any}) do
+            merged[key] = value
         end
+        local spec = merged as M.Spec
         -- No cap when neither the request nor the conf names one: what an
         -- answer may cost is the caller's to say, and a number invented here
         -- would be a second, smaller ceiling under the server's own. Each
@@ -667,7 +876,7 @@ function M.backend(conf)
             latency_ms = meta.latency_ms,
         }
     end,
-        nil
+    nil
 end
 
 --- The empty-array tagging above, as an export: an adapter that builds a
@@ -705,8 +914,8 @@ local PROBE_TIMEOUT = 15
 --- @param timeout number|nil
 --- @return table|nil decoded
 --- @return string|nil err
-function M.probe(method, url, headers, body, timeout)
-    local opts = {
+function M.probe(method: string, url: string, headers: {string:string}, body?: {string:any}, timeout?: number): {string:any}, string
+    local opts: host.Http.RequestOpts = {
         method = method,
         headers = headers,
         timeout = timeout or PROBE_TIMEOUT,
@@ -726,7 +935,7 @@ function M.probe(method, url, headers, body, timeout)
     if not decoded_ok or type(decoded) ~= "table" then
         return nil, "probe " .. url .. ": response JSON decode failed"
     end
-    return decoded, nil
+    return decoded as {string:any}, nil
 end
 
 --- One round trip, read as a liveness answer rather than as data: what the
@@ -745,7 +954,7 @@ end
 --- @param timeout number|nil
 --- @return table|nil answer  { status, body, headers }
 --- @return string|nil err  when nothing answered
-function M.ping(url, headers, timeout)
+function M.ping(url: string, headers?: {string:string}, timeout?: number): M.Answer, string
     local ok, resp = pcall(http.request, url, {
         method = "GET",
         headers = headers or {},
@@ -774,11 +983,11 @@ end
 --- @param answer table|nil  from `ping`
 --- @param err string|nil  from `ping`
 --- @return table  { alive, kind, status?, message? }
-function M.health_of(answer, err)
+function M.health_of(answer: M.Answer, err?: string): M.Health
     if not answer then
         return { alive = false, kind = "unreachable", message = tostring(err) }
     end
-    local kind
+    local kind: string
     if answer.status == 200 then
         kind = "ok"
     elseif answer.status == 503 then
@@ -795,7 +1004,7 @@ end
 ---
 --- @param base_url string  e.g. "http://localhost:8000/v1"
 --- @return string root  e.g. "http://localhost:8000"
-function M.server_root(base_url)
+function M.server_root(base_url: string): string
     local root = base_url:gsub("/+$", "")
     root = root:gsub("/v1$", "")
     return root
@@ -811,19 +1020,19 @@ end
 --- @param request table  knl.fold output: { messages, system?, tools? }
 --- @param bytes_per_token number|nil  default 3.2
 --- @return integer tokens
-function M.estimate_tokens(request, bytes_per_token)
+function M.estimate_tokens(request: any, bytes_per_token?: number): integer
     local per = bytes_per_token or 3.2
     local bytes = 0
-    local function walk(v)
+    local function walk(v: any)
         local t = type(v)
         if t == "string" then
-            bytes = bytes + #v
+            bytes = bytes + #(v as string)
         elseif t == "number" or t == "boolean" then
             bytes = bytes + 4
         elseif t == "table" then
-            for k, child in pairs(v) do
+            for k, child in pairs(v as {any:any}) do
                 if type(k) == "string" then
-                    bytes = bytes + #k
+                    bytes = bytes + #(k as string)
                 end
                 walk(child)
             end

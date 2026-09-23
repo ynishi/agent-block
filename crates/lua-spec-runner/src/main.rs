@@ -173,6 +173,87 @@ fn project_spec_dirs(project: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// The embedded modules written in Teal: every `<lib>/<name>/init.tl`, by
+/// name, sorted.
+fn teal_modules(lib: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(lib) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            path.join("init.tl").is_file().then(|| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Write the Lua the binary embeds for `names` under
+/// `target/lua-spec-runner/.agent-block/lib/`, via `agent-block vendor`, and
+/// answer that `lib/` directory — `None` when there is nothing to write. The
+/// directory is emptied first, so a module that stopped being Teal leaves no
+/// stale copy behind, and it is left in place after the run for a reader who
+/// wants to see what the specs ran against.
+fn vendor_teal_modules(root: &Path, names: &[String]) -> Result<Option<PathBuf>, String> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let bin = root.join(format!("target/debug/agent-block{}", std::env::consts::EXE_SUFFIX));
+    let built = std::fs::metadata(&bin)
+        .and_then(|m| m.modified())
+        .map_err(|e| {
+            format!(
+                "{}: not built ({e}) — the specs of a Teal module ({}) run against the Lua \
+                 the binary embeds; `cargo build -p agent-block` first (`just test-lua` does)",
+                bin.display(),
+                names.join(", ")
+            )
+        })?;
+    // A binary older than a `.tl` embeds the Lua of an earlier version of it:
+    // the specs would pass or fail against something that is not in the tree.
+    for name in names {
+        let tl = root.join("crates/agent-block-core/blocks/lib").join(name).join("init.tl");
+        let edited = std::fs::metadata(&tl)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("{}: {e}", tl.display()))?;
+        if edited > built {
+            return Err(format!(
+                "{} is newer than {} — `cargo build -p agent-block` first (`just test-lua` \
+                 does), or the specs run against the Lua of an older {name}",
+                tl.display(),
+                bin.display()
+            ));
+        }
+    }
+    let dir = root.join("target/lua-spec-runner");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let output = std::process::Command::new(&bin)
+        .arg("vendor")
+        .arg("--path")
+        .arg(&dir)
+        .args(names)
+        .output()
+        .map_err(|e| format!("{}: {e}", bin.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "agent-block vendor {} failed ({}):\n{}",
+            names.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(Some(dir.join(".agent-block").join("lib")))
+}
+
 fn main() -> ExitCode {
     let cli = match parse_args() {
         Ok(cli) => cli,
@@ -209,6 +290,28 @@ fn main() -> ExitCode {
             .iter()
             .map(|sub| blocks.join(sub).display().to_string()),
     );
+    // An embedded module written in Teal (`blocks/lib/<name>/init.tl`) has no
+    // `.lua` for `require` to find here: what the host embeds is the Lua that
+    // `include_tl!` generated at `cargo build`. This runner cannot generate
+    // it — it sits outside the workspace on an older mlua than htl's, and
+    // `htl gen` resolves a module's requires from its own directory only — so
+    // it takes the Lua from the binary that embeds it, the way a project does:
+    // `agent-block vendor` writes each such module out under `target/`, and
+    // the copies go last on the search path, where the embedded tier sits
+    // for the host. The binary is the one `cargo build -p agent-block`
+    // leaves in `target/debug`, which `just test-lua` builds first.
+    // Only for the repository's own run: with `--project`, the specs are a
+    // project's and its copies are already first on the path.
+    if cli.project.is_none() {
+        match vendor_teal_modules(&root, &teal_modules(&blocks.join("lib"))) {
+            Ok(Some(dir)) => search.push(dir.display().to_string()),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let search: Vec<&str> = search.iter().map(String::as_str).collect();
 
     let dirs = match &cli.project {

@@ -12,12 +12,82 @@
 ---
 --- Read `policy`'s own header first — the rules about state, the log and the
 --- shapes are stated there, once, for every file under it.
-
+---
+--- Written in Teal with the rest of `policy` (`include_tl!`); the Lua the
+--- host holds is what Teal generates, without these comments. This file is
+--- also where the records the six files share are declared — a stored
+--- event, a beat, a tool pair, the registry's entry — so a sibling types
+--- against `shared.BeatRecord` rather than declaring its own.
 local kernel = require("knl")
 local lshape = require("lshape")
 local T = lshape.t
 
-local S = {}
+local record S
+    --- A stored event, as `session:events()` answers it: the envelope's
+    --- fields, and `data` as the writer left it.
+    type Event = {string:any}
+    --- One beat, as this module derives it from the log
+    --- (`policy.shapes.beat_record`).
+    record BeatRecord
+        id: string
+        events: {Event}
+    end
+    --- One answered tool call (`policy.shapes.tool_pair`).
+    record ToolPair
+        beat: string
+        call_id: string
+        name: string
+        input: any
+        result: any
+        ok: boolean
+    end
+    --- One declared argument of the registry.
+    record ApiArg
+        shape: lshape.Schema
+        desc: string
+    end
+    --- One entry of the registry: what goes in, what comes out, and the
+    --- functions a factory hands back or a caller supplies.
+    record ApiEntry
+        args: {ApiArg}
+        returns: any
+        members: {string:ApiEntry}
+    end
+    --- What a Port answers for the window: `profile(conf)`.
+    record Profile
+        context_window: number
+        max_output: number
+    end
+    --- An LLM Port, as the policies ask it: a count and a profile, both
+    --- with the conf the Port is opened with.
+    record Port
+        count: function(Port, any, any): number
+        profile: function(Port, any): Profile
+    end
+
+    DEFAULT_MAX_BYTES: integer
+    DEFAULT_SAME: integer
+    DEFAULT_NO_PROGRESS: integer
+    DEFAULT_MAX_ATTEMPTS: integer
+    DEFAULT_VERDICT_KIND: string
+    DEFAULT_REPEAT_MAX: integer
+    DEFAULT_TIMEOUT_FACTOR: number
+    DEFAULT_TIMEOUT_FLOOR: number
+    DEFAULT_TIMEOUT_MEASURE: string
+    DEFAULT_RESULT_SHARE: number
+    ELLIPSIS: string
+    NOTE_PREFIX: string
+    ARRAY_TAG: {string:string}
+    FUNCTION: lshape.Schema
+    CALLABLE: lshape.Schema
+    SESSION_HANDLE: lshape.Schema
+    BEAT_RECORD: lshape.Schema
+    TOOL_PAIR: lshape.Schema
+    STOP_REASON: lshape.Schema
+    EVENTS_ARG: ApiArg
+    SESSION_ARG: ApiArg
+    OUTCOME_ARG: ApiArg
+end
 
 -- ============================================================
 -- Defaults — every threshold is a parameter, and this is where the
@@ -113,11 +183,11 @@ S.ARRAY_TAG = { __jsontype = "array" }
 --- Whether `v` can be called like a function (a callable table / userdata
 --- counts: a Port shim may hand back either). The same test `knl.device`
 --- makes of an `llm`, made here for the same argument.
-function S.callable(v)
+function S.callable(v: any): boolean
     if type(v) == "function" then
         return true
     end
-    local mt = getmetatable(v)
+    local mt = getmetatable(v) as {string:any}
     return type(mt) == "table" and mt.__call ~= nil
 end
 
@@ -128,8 +198,8 @@ end
 --- division `knl` makes for `cost`, and checked in prod for the same reason:
 --- a window of 0 beats or a retry cap of 0 attempts is a policy that silently
 --- does the opposite of what it says.
-function S.whole_at_least(v, min)
-    return type(v) == "number" and v % 1 == 0 and v >= min
+function S.whole_at_least(v: any, min: number): boolean
+    return type(v) == "number" and (v as number) % 1 == 0 and (v as number) >= min
 end
 
 --- Reject an option this factory does not know.
@@ -141,7 +211,7 @@ end
 ---
 --- A state key gets the reason rather than the bare complaint — passing a
 --- session to a factory is the one wrong guess the design invites.
-function S.only(opts, allowed, who, level)
+function S.only(opts: {string:any}, allowed: {string:boolean}, who: string, level?: integer)
     for k in pairs(opts) do
         if not allowed[k] then
             local hint = ""
@@ -170,12 +240,14 @@ end
 --- @param allowed table  the keys the factory declares, `name -> true`
 --- @param who string  the factory's name, for the raise
 --- @return table  the opts, never nil
-function S.opts_of(opts, allowed, who)
-    opts = opts or {}
+function S.opts_of<O>(opts: O, allowed: {string:boolean}, who: string): O
+    if opts == nil then
+        opts = {} as O
+    end
     if type(opts) ~= "table" then
         error(who .. ": opts must be a table", 3)
     end
-    S.only(opts, allowed, who, 4)
+    S.only(opts as {string:any}, allowed, who, 4)
     return opts
 end
 
@@ -201,7 +273,7 @@ end
 --- @param session userdata|table  a knl session
 --- @param who string  the policy's name, for the message
 --- @return table  the events, in seq order
-function S.whole_log(session, who)
+function S.whole_log(session: kernel.Session, who: string): {S.Event}
     local events, truncated = session:events()
     if truncated then
         error(
@@ -226,12 +298,12 @@ end
 ---
 --- @param ev table  a stored event
 --- @return string|nil  the id of the beat that wrote it
-function S.beat_of(ev)
-    local meta = ev.meta
+function S.beat_of(ev: S.Event): string
+    local meta = ev.meta as {string:any}
     if meta == nil then
         return nil
     end
-    return meta.beat
+    return meta.beat as string
 end
 
 --- The beats of an event list, in the order they first appear:
@@ -244,18 +316,18 @@ end
 ---
 --- @param events table|nil  a session's events, in seq order
 --- @return table  an array of beat records
-function S.beats_of(events)
-    local order, by_id = {}, {}
+function S.beats_of(events: {S.Event}): {S.BeatRecord}
+    local order, by_id: {S.BeatRecord}, {string:S.BeatRecord} = {}, {}
     for _, ev in ipairs(events or {}) do
         local id = S.beat_of(ev)
         if id ~= nil then
-            local record = by_id[id]
-            if record == nil then
-                record = { id = id, events = {} }
-                by_id[id] = record
-                order[#order + 1] = record
+            local beat = by_id[id]
+            if beat == nil then
+                beat = { id = id, events = {} }
+                by_id[id] = beat
+                order[#order + 1] = beat
             end
-            record.events[#record.events + 1] = ev
+            beat.events[#beat.events + 1] = ev
         end
     end
     return order
@@ -272,11 +344,11 @@ end
 --- @param value any
 --- @param depth number|nil  how far down this call already is
 --- @return string
-function S.canonical(value, depth)
+function S.canonical(value: any, depth?: integer): string
     depth = depth or 0
     local t = type(value)
     if t == "string" then
-        return string.format("%q", value)
+        return string.format("%q", value as string)
     elseif t == "number" or t == "boolean" or t == "nil" then
         return tostring(value)
     elseif t ~= "table" then
@@ -287,16 +359,17 @@ function S.canonical(value, depth)
     if depth >= MAX_CANONICAL_DEPTH then
         return "<deep>"
     end
-    local keys = {}
-    for k in pairs(value) do
+    local map = value as {any:any}
+    local keys: {any} = {}
+    for k in pairs(map) do
         keys[#keys + 1] = k
     end
-    table.sort(keys, function(a, b)
+    table.sort(keys, function(a: any, b: any): boolean
         return tostring(a) < tostring(b)
     end)
-    local parts = {}
+    local parts: {string} = {}
     for _, k in ipairs(keys) do
-        parts[#parts + 1] = tostring(k) .. "=" .. S.canonical(value[k], depth + 1)
+        parts[#parts + 1] = tostring(k) .. "=" .. S.canonical(map[k], depth + 1)
     end
     return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -306,8 +379,8 @@ end
 --- A malformed record is read as an empty one rather than indexed: every
 --- reader below walks a whole log, and one bad event must not take the
 --- verdict with it.
-function S.data_of(ev)
-    return type(ev.data) == "table" and ev.data or {}
+function S.data_of(ev: S.Event): {string:any}
+    return type(ev.data) == "table" and ev.data as {string:any} or {}
 end
 
 -- ============================================================
@@ -327,7 +400,7 @@ end
 
 --- A Lua function, as a shape. `lshape.t` exposes only the five prims it
 --- names, so this is built from the same plain-data schema form.
-S.FUNCTION = setmetatable({ kind = "prim", prim = "function" }, lshape.t._internal.schema_mt)
+S.FUNCTION = setmetatable({ kind = "prim", prim = "function" } as any, lshape.t._internal.schema_mt) as lshape.Schema
 
 --- Something a beat can call, and a session handle: the kernel's, not a
 --- second copy. Both used to be written here as well, in the same `any_of`
@@ -349,7 +422,7 @@ S.SESSION_HANDLE = kernel.shapes.session_handle
 ---
 --- @param session any  the value a caller passed
 --- @param who string  the policy's name, for the message
-function S.needs_session(session, who)
+function S.needs_session(session: any, who: string)
     if not kernel.is_session(session) then
         error(who .. ": session must be a knl session (from knl.open / knl.resume)", 3)
     end
@@ -381,7 +454,7 @@ end
 --- @param fields table  the field name -> schema map, written once
 --- @return table closed  the published contract
 --- @return table open  the same fields, for the registry
-function S.opts_contract(fields)
+function S.opts_contract(fields: {string:lshape.Schema}): lshape.Schema, lshape.Schema
     return T.shape(fields, { open = false }), T.shape(fields)
 end
 
@@ -426,7 +499,7 @@ S.STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
 -- ============================================================
 
 --- One declared argument: the shape it is held to, and the word for it.
-function S.arg_of(schema, desc)
+function S.arg_of(schema: lshape.Schema, desc: string): S.ApiArg
     return { shape = schema, desc = desc }
 end
 

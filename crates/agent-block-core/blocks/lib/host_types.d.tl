@@ -1,0 +1,248 @@
+--- host_types — what the host puts in a VM's globals, declared for the checker.
+---
+--- A module written in Teal (`lib/<name>/init.tl`) reads the same globals a
+--- Lua one does: `std.*` from mlua-batteries, and the bridges beside it. The
+--- checker has to be told their shape, and told in a way that generates no
+--- code — the global is the host's, set before any module loads, and a module
+--- that assigned it would be the second owner of one name. So the shapes are
+--- records here, and the globals are DECLARED here too, at the foot of this
+--- file. A module asks for them by requiring it:
+---
+---     require("host_types")
+---
+--- and then reads `std.json.encode` as it always did. The declarations are
+--- not assignments: the generated Lua carries nothing for them, and the
+--- module reads the global at call time, late-bound, exactly as the Lua
+--- module did — which is what lets a spec install a fake `std` before
+--- requiring the module.
+---
+--- One declaration point, and it has to be this one. A `global` declared in
+--- a `.tl` that other modules REQUIRE splits that module's record types: two
+--- consumers in one check run each get their own instance, and a value
+--- cannot pass between them [htl 0.8.0; `knl` is the module this surfaced
+--- on, being the one that is both required widely and reads a host global].
+--- Declared in a `.d.tl` the same files check clean, so a module states no
+--- global of its own — it requires this file and gets all of them.
+---
+--- The `require` line is what the generated Lua does carry, so this
+--- declaration has a run-time half beside it, `host_types.lua`, an empty
+--- table: the checker reads the `.d.tl`, the run loads the `.lua` (the host
+--- embeds it, and `vendor` writes it), and neither is confused for the other.
+---
+--- What is declared is what a Teal module has needed so far, not the whole of
+--- `std`: a field arrives with the first module that reads it. A name missing
+--- here is a type error in that module, which is the right place to learn it.
+--- A name declared here that the host does not register is the other
+--- mistake, and `crates/agent-block/tests/e2e_host_types_drift.rs` is what
+--- catches it: every function below is asked of a running VM.
+---
+--- The binary carries this file: `host.rs` writes it (and `lshape.d.tl`) to
+--- a directory named by its content at start and puts that on the checker's
+--- path, so a project's own `.tl` writes the same one line above against
+--- the `agent-block` that runs it.
+local record host_types
+    --- `std`, as registered by `mlua_batteries::register_all` in `host.rs`,
+    --- with `std.kv` from the sqlite batteries behind the `sqlite` feature.
+    record Std
+        record Json
+            --- JSON text for a value.
+            encode: function(any): string
+            --- The value JSON text holds; raises on text that is not JSON.
+            decode: function(string): any
+        end
+        --- Namespace / key → JSON-serialised value, in the host's database.
+        record Kv
+            --- The value under (ns, key); nil when there is none.
+            get: function(string, string): any ---@nilable
+            --- Write a value under (ns, key), replacing what was there.
+            set: function(string, string, any)
+            --- Remove (ns, key); true when a row was there to remove.
+            delete: function(string, string): boolean
+            --- The keys under ns, those with the prefix when one is given.
+            list: function(string, ?string): {string}
+        end
+        --- The SQL bridge over the host's SQLite database (`bridge/sql.rs`).
+        record Sql
+            record ExecResult
+                affected: integer
+                last_id: integer
+            end
+            --- Rows of a SELECT, each a column → value table.
+            query: function(string, ?{any}): {{string:any}}
+            --- A statement; how many rows it touched and the last rowid.
+            exec: function(string, ?{any}): ExecResult
+            --- The sentinel a NULL column comes back as.
+            null: any
+        end
+        --- The time-series bridge over the host's SQLite database
+        --- (`bridge/ts.rs`): named streams of timestamped JSON values.
+        record Ts
+            --- Append a point: series, value, optional flat tags, optional
+            --- Unix-ms timestamp (now when absent).
+            append: function(string, any, ?{string:string}, ?integer)
+            --- Rows of a series under the query options (`from` / `to` /
+            --- `tags` / `agg` / `bucket_ms` / `limit` / `offset`).
+            query: function(string, ?{string:any}): {{string:any}}
+            --- The latest row matching the tags; nil when there is none.
+            last: function(string, ?{string:string}): {string:any} ---@nilable
+        end
+        --- The file bridge (`bridge/fs.rs`): versioned reads, line-addressed
+        --- edits held to a `base` version, and the rollback of the last one.
+        record Fs
+            record ReadVersioned
+                content: string
+                version: string
+                lines: integer
+            end
+            --- The file's content.
+            read: function(string): string
+            --- The file, its content fingerprint, and its line count.
+            read_versioned: function(string): ReadVersioned
+            --- `{ base?, edits = {...} }`; answers the bridge's result table.
+            edit: function(string, {string:any}): {string:any}
+            --- Write the whole file.
+            write: function(string, string)
+            --- Restore the content the last successful edit replaced.
+            rollback: function(string): {string:any}
+        end
+        --- The environment.
+        record Env
+            --- The variable's value; nil when it is unset.
+            get: function(string): string ---@nilable
+            --- The variable's value, or the default.
+            get_or: function(string, string): string
+        end
+        --- Cooperative tasks: what yields to the runtime.
+        record Task
+            --- A nursery: what a scope's body spawns into, and cancels.
+            record Scope
+                spawn: function(Scope, function())
+                cancel: function(Scope)
+            end
+            --- Sleep for this many milliseconds, without parking the VM.
+            sleep: function(number)
+            --- Run the body in a scope that waits for everything it spawned.
+            scope: function(function(Scope)): any...
+            --- The same, cancelled at the deadline (milliseconds).
+            with_timeout: function(number, function(Scope)): any...
+        end
+        --- The clock.
+        record Time
+            --- Seconds since the epoch, fractional.
+            now: function(): number
+        end
+        json: Json
+        kv: Kv
+        sql: Sql
+        ts: Ts
+        fs: Fs
+        time: Time
+        env: Env
+        task: Task
+    end
+    --- `http`, the client bridge (`bridge/http.rs`): one request, one
+    --- answer. A transport failure — refused, unresolved, a deadline —
+    --- RAISES; a status is an answer.
+    record Http
+        record RequestOpts
+            method: string
+            headers: {string:string}
+            body: string
+            --- Seconds.
+            timeout: number
+            stream: boolean
+            on_data: function(string)
+        end
+        record Response
+            status: integer
+            headers: {string:string}
+            body: string
+        end
+        request: function(string, ?RequestOpts): Response
+    end
+    --- `sh`, the process bridge (`bridge/sh.rs`): one command in a shell,
+    --- in a process group of its own.
+    record Sh
+        --- What `exec` answers: `ok` with the exit `code` and both streams,
+        --- `killed` when `kill` ended it; or `ok = false` with `error`, and
+        --- `timed_out` when that is what the error was.
+        record ExecResult
+            ok: boolean
+            code: integer
+            stdout: string
+            stderr: string
+            killed: boolean
+            error: string
+            timed_out: boolean
+        end
+        --- What `exec` takes beside the command: the directory, the
+        --- timeout in seconds, and the label `kill` reaches the group by.
+        record ExecOpts
+            cwd: string
+            timeout: number
+            label: string
+        end
+        exec: function(string, ?ExecOpts): ExecResult
+        --- End the group started under a label.
+        kill: function(string)
+    end
+    --- `tool`, the tool registry bridge (`bridge/tool.rs`): what a model may
+    --- call, by name.
+    record Tool
+        --- What `register` is told about a tool. Built whole at every
+        --- registration, so the check holds each literal to both fields.
+        record Meta ---@struct
+            description: string
+            input_schema: {string:any}
+        end
+        --- Register one tool: its name, what it takes, and the handler.
+        register: function(string, Meta, function(any): any)
+    end
+    --- `mcp`, the client bridge (`bridge/mcp.rs`): the tools a connected
+    --- server lists, and one call to one of them.
+    record Mcp
+        --- The blocks and the tool entries are MCP's own vocabulary, which
+        --- `mcp_tools` closes; they are loose here so that this file, which
+        --- `mcp_tools` reads, does not read it back.
+        record CallResult
+            ok: boolean
+            error: string
+            content: {{string:any}}
+            is_error: boolean
+        end
+        record ListResult
+            ok: boolean
+            error: string
+            tools: {{string:any}}
+        end
+        list_tools: function(string): ListResult
+        call: function(string, string, any): CallResult
+    end
+    --- `log`, the tracing bridge (`bridge/log.rs`): one message per call,
+    --- attributed to the running script.
+    record Log
+        debug: function(string)
+        info: function(string)
+        warn: function(string)
+        error: function(string)
+    end
+end
+
+-- The globals themselves, declared once for every module that requires this
+-- file. Each names a record above; a module adds no `global` line of its own
+-- (see the header).
+global std: host_types.Std
+global tool: host_types.Tool
+global sh: host_types.Sh
+global http: host_types.Http
+global mcp: host_types.Mcp
+global log: host_types.Log
+
+--- `knl`, the kernel's syscall bridge (`bridge/knl.rs`), as the host installs
+--- it. A map of syscalls rather than a record, and loose for the reason `Mcp`
+--- above is loose: its vocabulary is the `knl` module's, which reads this
+--- file, so naming it here would have this file read `knl` back. The module
+--- reaches it by a name held in a variable anyway, which is what a map is.
+global knl: {string:any}
+
+return host_types

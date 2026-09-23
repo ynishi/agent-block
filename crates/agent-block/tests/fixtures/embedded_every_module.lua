@@ -29,6 +29,7 @@ local NAMES = {
     "lshape.reflect",
     "lshape.luacats",
     "mcp_tools",
+    "host_types",
     "knl",
     "knl_adapter",
     "policy",
