@@ -256,7 +256,30 @@ fn startup() -> anyhow::Result<()> {
     // Parsed before tracing is installed because the destination depends on the
     // subcommand: `mcp` speaks JSON-RPC on stdout, so a log line written there
     // is a protocol violation, not noise. Nothing logs before this point.
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // The project root, resolved once, here, for every consumer below.
+    //
+    // `-p/--project` defaults to `.`, and `.` is a path that means "wherever
+    // the process happens to be". Most of what reads it is happy with that —
+    // `{project}/.env` and `{project}/blocks/` open the same files either way
+    // — but two consumers are not, and they fail in opposite directions. The
+    // sandbox turns the root into a Landlock rule, and the kernel's database
+    // is placed by `project_slug`, which is a NAME derived from the root's
+    // text: `.` slugs to `.`, so `knl sessions` with no `-p` looked for a
+    // database under `projects/./` that nothing had ever written, and said so
+    // in terms of a path the reader had never seen. `project_slug`'s own doc
+    // states the precondition — the caller passes a root it resolved, because
+    // a relative path would slug two different projects to the same name —
+    // and the host honours it by canonicalizing in `host::run`. That left
+    // every path that does NOT go through the host, which is every
+    // subcommand.
+    //
+    // So it is resolved at the one point they all come through rather than in
+    // each of them. Before `.env`, before the sandbox — a canonicalize after
+    // the boundary is installed is a read the boundary may refuse — and
+    // before the host, whose own canonicalize then has nothing left to do.
+    cli.project = resolve_project(&cli.project)?;
+    let cli = cli;
     // stdio MCP owns stdout; a long-lived manager's logs are what a service
     // manager collects, and stderr is where it looks; `knl export` writes JSON
     // Lines there, where a log line would be a malformed record; and `vendor`
@@ -318,6 +341,33 @@ fn startup() -> anyhow::Result<()> {
         .context("failed to build the tokio runtime")?;
 
     runtime.block_on(run_cli(cli))
+}
+
+/// The absolute, symlink-free form of the root `-p/--project` named.
+///
+/// A root that cannot be resolved is a refusal rather than something to carry
+/// on with: every path built from it — the blocks directories, `.env`, the
+/// sandbox's writable set, the kernel database's slug — would be built from a
+/// directory that is not there, and each of those fails later in its own
+/// vocabulary, about a file rather than about the root. Named here, the
+/// message is about the thing the caller actually got wrong.
+fn resolve_project(project: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = project.canonicalize().with_context(|| {
+        format!(
+            "the project root named by --project ('{}') could not be resolved \
+             (AGENT_BLOCK_PROJECT names the same root)",
+            project.display()
+        )
+    })?;
+    if !resolved.is_dir() {
+        anyhow::bail!(
+            "the project root named by --project ('{}') is not a directory \
+             (it resolves to '{}')",
+            project.display(),
+            resolved.display()
+        );
+    }
+    Ok(resolved)
 }
 
 async fn run_cli(cli: Cli) -> anyhow::Result<()> {

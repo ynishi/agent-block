@@ -201,16 +201,33 @@ pub async fn run(args: KnlArgs, project: &Path) -> anyhow::Result<()> {
 /// *creates*: a mistyped path would otherwise leave an empty database behind
 /// and then answer out of it, which is true and useless.
 fn store_path(store: Option<PathBuf>, project: &Path) -> anyhow::Result<PathBuf> {
-    let path = match store {
-        Some(path) => path,
-        None => knl_path(project).map_err(|reason| {
+    let Some(named) = store else {
+        let path = knl_path(project).map_err(|reason| {
             anyhow::anyhow!("the project's kernel database could not be located: {reason}")
-        })?,
+        })?;
+        if !path.exists() {
+            // The project's root is named beside the file, because the file's
+            // name is DERIVED from that root (`project_slug`) and a reader
+            // cannot un-slug it at a glance. Without the root, a project whose
+            // log has genuinely never been written and a command run from the
+            // wrong directory produce the same sentence — and they are not the
+            // same mistake, nor fixed the same way.
+            anyhow::bail!(
+                "no kernel database for the project at '{}' (looked in '{}'): \
+                 nothing has opened a session there yet, or this is not the project you meant \
+                 (-p/--project names another)",
+                project.display(),
+                path.display()
+            );
+        }
+        return Ok(path);
     };
-    if !path.exists() {
-        anyhow::bail!("no kernel database at '{}'", path.display());
+    // A path the caller typed is reported back as the path the caller typed:
+    // it was not derived from anything, so there is nothing to explain.
+    if !named.exists() {
+        anyhow::bail!("no kernel database at '{}'", named.display());
     }
-    Ok(path)
+    Ok(named)
 }
 
 /// `agent-block knl export`: read one session and print it.

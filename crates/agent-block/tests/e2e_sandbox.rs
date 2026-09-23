@@ -177,6 +177,13 @@ fn without_sandbox_writes_outside_the_project_succeed() {
 fn sandbox_with_unresolvable_project_root_fails_at_startup() {
     // The project root is the primary write grant; a typo'd `--project` must
     // abort before anything runs, not surface later as a distant EACCES.
+    //
+    // The refusal comes from the shared resolution step in `main.rs` now
+    // rather than from the allowlist's own canonicalize, so it happens before
+    // the boundary is installed and it happens for an unsandboxed run too.
+    // Asserted here all the same: this is the mode where carrying on with an
+    // unresolvable root would be worst, since the grant would silently not be
+    // made and every write after it would fail somewhere else.
     let home = tempfile::tempdir().expect("tempdir for AGENT_BLOCK_HOME");
     let mut cmd = common::agent_block_cmd();
     cmd.env_remove("AGENT_BLOCK_SANDBOX")

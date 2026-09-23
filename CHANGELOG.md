@@ -709,6 +709,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the Rust types; a filesystem copy of it wins over the generated one, and
   `vendor knl_types` now says that rather than calling it sealed.
 
+### Fixed
+
+- `agent-block knl sessions` / `export` / `backup` with no `-p` read the
+  project they are run in, instead of failing with `no kernel database at
+  '<home>/.agent-block/projects/./knl.sqlite'`. `-p/--project` defaults to `.`,
+  and the kernel database is placed under a name DERIVED from the root's text
+  (`project_slug`), so `.` slugged to `.` and the reader looked somewhere
+  nothing had ever written. `project_slug`'s doc states the precondition — the
+  caller passes a root it resolved, because a relative path would slug two
+  different projects to the same name — and the host honoured it by
+  canonicalizing in `host::run`, which left every path that does not go
+  through the host: all four subcommands. `-p` with an absolute path always
+  worked, which is why this survived.
+
+  The root is now resolved once, in `main.rs`, right after parsing and before
+  `.env`, the sandbox and the host, so every consumer gets the same absolute
+  root and the host's own canonicalize has nothing left to do. A `--project`
+  that cannot be resolved is refused in those terms rather than carried into a
+  path built from it: `--project '<path>' could not be resolved`, naming the
+  flag the caller got wrong instead of a file they have never heard of.
+
+- `knl <verb>` on a project whose log has never been written names the project
+  it looked for, not only the file it did not find. The path is the slug of a
+  root, which a reader cannot un-slug at a glance, so "nothing here yet" and
+  "you are in the wrong directory" used to produce the same sentence. A
+  `--store` the caller typed is still reported back as typed — it was derived
+  from nothing, so there is nothing to explain.
+
 ### Docs
 
 - The README's "Overriding a block or a module" says what a vendored copy's
