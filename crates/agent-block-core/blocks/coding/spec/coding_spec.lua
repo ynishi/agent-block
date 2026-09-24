@@ -25,9 +25,10 @@
 --     opens;
 --   6 run, strict: `strict = true` with an Exec knob left unnamed is refused
 --     and the refusal names the knob; one that names them all gets past it;
---   7 decide: what ends a run — the model answering with no tool call while an
---     edit has landed and the verify is green, and, in plan mode, every check
---     it filed passing; a green verify alone never ends one;
+--   7 decide: what ends a run — in declare mode the model answering with no
+--     tool call while an edit has landed and the verify is green; in plan mode
+--     every check it filed passing, declaration or not, and never on a plan
+--     with no checks in it; a green verify alone never ends one;
 --   8 plan_of: the plan tool's input, as an array or as a JSON string, and
 --     what it refuses;
 --   9 plan_report: the counts, the failing check with its exit and tail, and
@@ -369,13 +370,37 @@ describe("coding.decide — what ends a run", function()
         expect(coding.decide("declare", with({ edits_applied = 0 }))).to.be(false)
     end)
 
-    it("plan: needs a filed plan with every check passing, on top of declare's facts", function()
+    it("plan: needs a filed plan with every check passing", function()
         expect(coding.decide("plan", base)).to.be(false)
         expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 } }))).to.be(true)
         expect(coding.decide("plan", with({ plan = { total = 3, passed = 2 } }))).to.be(false)
-        expect(coding.decide("plan", with({ plan = { total = 0, passed = 0 } }))).to.be(false)
-        expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, declared = false }))).to.be(false)
         expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, verify_ok = false }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 3, passed = 3 }, edits_applied = 0 }))).to.be(false)
+    end)
+
+    -- The defect this mode had: a model that keeps calling tools never
+    -- answers without one, so a run whose plan was filed, whose every check
+    -- passed and whose verify was green ran to the iteration cap and
+    -- reported `max_iters` with every fact green. The checks are the
+    -- statement the declaration was standing in for, so they end the run on
+    -- their own.
+    it("plan: every check passing ends the run whether or not the model said so", function()
+        local green = { plan = { total = 7, passed = 7 } }
+        expect(coding.decide("plan", with(green))).to.be(true)
+        green.declared = false
+        expect(coding.decide("plan", with(green))).to.be(true)
+    end)
+
+    -- And what the declaration was carrying has to be carried by something:
+    -- a plan that described nothing describes nothing about being finished.
+    it("plan: a plan with no checks in it never ends a run", function()
+        expect(coding.decide("plan", with({ plan = { total = 0, passed = 0 } }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = { total = 0, passed = 0 }, declared = true }))).to.be(false)
+        expect(coding.decide("plan", with({ plan = nil }))).to.be(false)
+    end)
+
+    it("declare: the declaration is still the only way in, plan's checks being another mode's", function()
+        expect(coding.decide("declare", with({ declared = false, plan = { total = 3, passed = 3 } }))).to.be(false)
     end)
 end)
 
@@ -506,10 +531,14 @@ describe("coding.system — states how the run ends", function()
         expect(sys:find("`plan` tool", 1, true)).to.be(nil)
     end)
 
-    it("plan: names the plan tool and the checks", function()
+    it("plan: names the plan tool and the checks, and that no declaration is waited for", function()
         local sys = coding.system("fs_read", "fs_search_replace", "plan")
         expect(sys:find("file a plan with the `plan` tool", 1, true) ~= nil).to.be(true)
         expect(sys:find("every check passes", 1, true) ~= nil).to.be(true)
+        -- What the model is told has to match what `decide` does, or a model
+        -- reading it keeps calling tools waiting for an ending that already
+        -- happened.
+        expect(sys:find("you do not have to announce it", 1, true) ~= nil).to.be(true)
     end)
 
     it("no mode is declare, and a mode it does not know fails", function()
