@@ -29,8 +29,11 @@
 --     tool call while an edit has landed and the verify is green; in plan mode
 --     every check it filed passing, declaration or not, and never on a plan
 --     with no checks in it; a green verify alone never ends one;
---   8 plan_of: the plan tool's input, as an array or as a JSON string, and
---     what it refuses;
+--   8 plan_of: the plan tool's input, as an array or as a JSON string, what
+--     it refuses, and the one wrong path it refuses at the filing — a check
+--     that percent-encodes one of the run's targets, caught by decoding and
+--     comparing rather than by a list of characters, so a check carrying a
+--     per cent sign of its own still files;
 --   9 plan_report: the counts, the failing check with its exit and tail, and
 --     the note a check that printed nothing gets;
 --  10 system: which ending paragraph each mode states, that no mode means
@@ -489,6 +492,68 @@ describe("coding.plan_of — the plan tool's input", function()
         expect(s).to.be(nil)
         expect(err:find("steps%[1%].step") ~= nil).to.be(true)
         expect(coding.plan_of(nil)).to.be(nil)
+    end)
+
+    -- A check whose path is percent-encoded names a file that does not exist
+    -- and can never pass, so it is refused at the filing rather than run
+    -- every iteration until the cap. The test is decode-and-compare: no list
+    -- of characters to keep current, and a `%` that is just a `%` decodes to
+    -- itself.
+    local REPO = "/repo"
+    local TARGETS = { "/repo/web/src/routes/ns/[ns]/+page.svelte", "/repo/src/lib.rs" }
+    local function filed(check)
+        return coding.plan_of({ steps = { { step = "s", check = check } } }, TARGETS, REPO)
+    end
+
+    it("refuses a check that percent-encodes a target, naming what was written", function()
+        local s, err = filed("grep -q data.ns web/src/routes/ns/%5Bns%5D/+page.svelte")
+        expect(s).to.be(nil)
+        expect(err:find("steps%[1%].check") ~= nil).to.be(true)
+        -- What the model wrote, and what it means.
+        expect(err:find("web/src/routes/ns/%5Bns%5D/+page.svelte", 1, true) ~= nil).to.be(true)
+        expect(err:find("web/src/routes/ns/[ns]/+page.svelte", 1, true) ~= nil).to.be(true)
+        expect(err:find("exactly as written", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("refuses the absolute form too, and says every offending check at once", function()
+        local s, err = coding.plan_of({
+            steps = {
+                { step = "a", check = "test -f /repo/web/src/routes/ns/%5Bns%5D/+page.svelte" },
+                { step = "b", check = "grep -q double src%2Flib.rs" },
+            },
+        }, TARGETS, REPO)
+        expect(s).to.be(nil)
+        -- One refusal, both checks in it: the model refiles once.
+        expect(err:find("steps%[1%].check") ~= nil).to.be(true)
+        expect(err:find("steps%[2%].check") ~= nil).to.be(true)
+    end)
+
+    it("takes a check that names the target verbatim, in either form", function()
+        expect(#filed("grep -q data.ns web/src/routes/ns/[ns]/+page.svelte")).to.be(1)
+        expect(#filed("grep -q data.ns /repo/web/src/routes/ns/[ns]/+page.svelte")).to.be(1)
+    end)
+
+    it("takes a check carrying a per cent sign that encodes nothing", function()
+        -- A lone `%`, and a `%` with no two hex digits after it, decode to
+        -- themselves, so neither can look like an encoded path.
+        expect(#filed("grep -qF '100%' /repo/src/lib.rs")).to.be(1)
+        expect(#filed([[awk '{printf "%s\n", $1}' /repo/src/lib.rs]])).to.be(1)
+        -- An escape that decodes to something which is not a target is not
+        -- this module's business: the check is run and reported like any other.
+        expect(#filed("grep -q '%41%42' /repo/src/lib.rs")).to.be(1)
+    end)
+
+    it("takes a plan when the run named no targets to hold it against", function()
+        local steps = coding.plan_of({ steps = { { step = "s", check = "test -f a%5Bb%5D.txt" } } })
+        expect(#steps).to.be(1)
+    end)
+
+    it("catches an encoded target that has no brackets in it at all", function()
+        -- The rule is about encoding, not about brackets: a slash encoded in
+        -- a plain path is the same mistake and the same dead check.
+        local s, err = filed("grep -q double /repo/src%2Flib.rs")
+        expect(s).to.be(nil)
+        expect(err:find("/repo/src/lib.rs", 1, true) ~= nil).to.be(true)
     end)
 end)
 

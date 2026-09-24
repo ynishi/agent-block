@@ -716,9 +716,81 @@ function M.cut_at_limit(stop_reason)
     return type(stop_reason) == "string" and CUT_STOP_REASONS[stop_reason] == true
 end
 
+--- `text` with every `%XX` escape in it turned back into the byte it names.
+---
+--- A lone `%`, and a `%` followed by anything that is not two hex digits, is
+--- left exactly as it was: the pattern only matches a complete escape. That
+--- is what lets the caller below tell "this path was percent-encoded" from
+--- "this command contains a per cent sign", which a shell command may very
+--- well do (`awk '{print $1"%"}'`, a grep for "100%").
+local function percent_decoded(text)
+    return (text:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+--- The forms of the run's target paths a check may name: each target as it
+--- was resolved, and — when it sits under the repository — the path relative
+--- to it, which is how a model usually writes one.
+local function target_forms(targets, repo)
+    local forms = {}
+    local prefix = repo and (tostring(repo):gsub("/+$", "") .. "/") or nil
+    for _, t in ipairs(targets or {}) do
+        local target = tostring(t)
+        forms[#forms + 1] = target
+        if prefix and target:sub(1, #prefix) == prefix then
+            forms[#forms + 1] = target:sub(#prefix + 1)
+        end
+    end
+    return forms
+end
+
+--- The word in `check` that carries the escape, for a refusal that can show
+--- the model what it wrote. Nil when the encoding is not inside one word.
+local function encoded_word(check, form)
+    for word in check:gmatch("[^%s\"']*%%%x%x[^%s\"']*") do
+        if percent_decoded(word):find(form, 1, true) then
+            return word
+        end
+    end
+    return nil
+end
+
 --- The `plan` tool's input, checked: a non-empty array of { step, check },
---- both non-empty strings. Returns the steps, or nil and why.
-function M.plan_of(input)
+--- both non-empty strings, no check naming a target path percent-encoded.
+--- Returns the steps, or nil and why.
+---
+--- Why one wrong path is refused here rather than simply run
+---   Every other failing check is run and reported: a check can fail because
+---   the work is not done yet, which is the normal state of a plan, and the
+---   loop exists to let the model finish it. A check whose path is
+---   percent-encoded is not that. `web/src/routes/ns/%5Bns%5D/+page.svelte`
+---   names a file that does not exist and that no edit the model makes will
+---   bring into being, so the check cannot pass in this run or any other —
+---   and the run then spends every remaining iteration re-running it and
+---   ends at the cap. Every framework with dynamic routes has these paths
+---   (`[id]`, `[...slug]`), so this is not a rare shape.
+---
+---   What the model gets back from running it is the shell's own answer,
+---   `No such file or directory`, and that has been shown not to be enough
+---   to make the model write the path differently. So it is said at the
+---   filing instead, in the one form that names the mistake: this is the
+---   path you wrote, this is the path it means, use that one.
+---
+---   The refusal is the FILING's, like a malformed plan: the tool answers
+---   `bad_plan`, no plan is stored, and the model refiles. It lands no edit
+---   and counts as no progress, because nothing about the repository changed.
+---
+---   Only an encoding of a path this run is actually about is refused. The
+---   test is a decode-and-compare rather than a list of characters: if a
+---   target path appears in the check once its escapes are resolved and did
+---   not appear before, the model encoded it, whatever it encoded. A check
+---   that merely contains a `%` decodes to itself and cannot trip it.
+---
+--- @param input table  the tool's arguments
+--- @param targets table|nil  the run's target paths, as resolved
+--- @param repo string|nil  the repository they sit under
+function M.plan_of(input, targets, repo)
     local steps = type(input) == "table" and input.steps or nil
     -- The array as a JSON string is the same plan, and models do send it that
     -- way; refusing it costs a beat and a re-file for nothing.
@@ -740,6 +812,27 @@ function M.plan_of(input)
             return nil, ("steps[%d].check must be a non-empty shell command"):format(i)
         end
         out[i] = { step = st.step, check = st.check }
+    end
+    -- Every offending check in one message: a plan with three encoded paths
+    -- is one refusal and one re-file, not three of each.
+    local forms = target_forms(targets, repo)
+    local encoded = {}
+    for i, st in ipairs(out) do
+        local decoded = percent_decoded(st.check)
+        if decoded ~= st.check then
+            for _, form in ipairs(forms) do
+                if decoded:find(form, 1, true) and not st.check:find(form, 1, true) then
+                    encoded[#encoded + 1] = (
+                        "steps[%d].check names '%s', which is '%s' percent-encoded: "
+                        .. "that path does not exist, so the check can never pass. Use %s exactly as written."
+                    ):format(i, encoded_word(st.check, form) or form, form, form)
+                    break
+                end
+            end
+        end
+    end
+    if #encoded > 0 then
+        return nil, table.concat(encoded, " ")
     end
     return out
 end
@@ -1366,7 +1459,10 @@ function M._run_impl(opts)
                 required = { "steps" },
             },
             handler = function(input)
-                local steps, err = M.plan_of(input)
+                -- The targets and the repository are what a check's path is
+                -- held against; the loop resolved both before the model was
+                -- ever asked.
+                local steps, err = M.plan_of(input, targets, repo)
                 if not steps then
                     return { ok = false, reason = "bad_plan", error = err }
                 end

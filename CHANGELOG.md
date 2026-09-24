@@ -711,6 +711,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `coding.run` plan check that percent-encodes one of the run's target
+  paths is refused when the plan is filed, rather than run every iteration
+  until the cap. A framework's dynamic-route directory — `[ns]`, `[id]`,
+  `[...slug]` — reaching a check as `%5Bns%5D` names a file that does not
+  exist and that no edit will bring into being, so the check cannot pass in
+  this run or any other; the run then spends every remaining iteration
+  re-running it. What the model got back from running it was the shell's own
+  `No such file or directory`, which has been shown not to be enough to make
+  it write the path differently.
+
+  So `M.plan_of` says it at the filing, in the terms the model has to act on:
+  `steps[1].check names '<what was written>', which is '<the path>'
+  percent-encoded: that path does not exist, so the check can never pass. Use
+  <the path> exactly as written.` The refusal is the filing's, like a
+  malformed plan — the tool answers `bad_plan`, no plan is stored, the model
+  refiles, and nothing counts as an edit or as progress. Every offending check
+  in a plan is named in the one message, so a plan with three of them is one
+  round trip. `declare` mode files no plan and is untouched.
+
+  The test is a decode-and-compare rather than a list of characters: if a
+  target path appears in a check once its escapes are resolved and did not
+  appear before, the model encoded it, whatever it encoded — an encoded slash
+  in a path with no brackets at all is the same mistake and is caught the same
+  way. A check that merely contains a `%` decodes to itself and cannot trip
+  it. `M.plan_of` takes the targets and the repository to hold a check
+  against; called without them it checks what it always did.
+
+
 - `coding.run` with `done = "plan"` ends the run when every check the model
   filed passes, instead of running to the iteration cap. `M.decide` required a
   declaration — an answer with no tool call — in every mode, and a model that
