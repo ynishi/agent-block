@@ -211,15 +211,9 @@ async fn coding_run_does_not_end_on_a_green_verify_while_tools_are_still_called(
     );
 }
 
-/// `done = "plan"`: the checks the model filed have to pass as well.
-///
-/// The model files two steps through the `plan` tool, then edits, then
-/// declares. The harness runs both checks after each iteration; they pass once
-/// the edit has landed, and the run ends with `plan.passed == plan.total`.
-#[tokio::test]
-async fn coding_run_in_plan_mode_ends_when_every_filed_check_passes() {
-    let (dir, target) = make_repo();
-    let plan = tool_call(
+/// The two steps a plan-mode run needs, as a `plan` tool call.
+fn plan_turn() -> Value {
+    tool_call(
         "call_plan_1",
         "plan",
         json!({
@@ -228,8 +222,20 @@ async fn coding_run_in_plan_mode_ends_when_every_filed_check_passes() {
                 { "step": "the module still exports double", "check": "grep -qF 'function M.double' lib.lua" }
             ]
         }),
-    );
-    let script = vec![plan, edit_turn(&target), answer_turn("Plan done.")];
+    )
+}
+
+/// `done = "plan"`: the checks the model filed are what end the run.
+///
+/// The model files two steps through the `plan` tool, then edits. The harness
+/// runs both checks after each iteration; they pass once the edit has landed,
+/// and the run ends there — on the checks, with no declaration asked for. The
+/// script carries a third turn that is never reached, which is what says so:
+/// the mock would have served it.
+#[tokio::test]
+async fn coding_run_in_plan_mode_ends_when_every_filed_check_passes() {
+    let (dir, target) = make_repo();
+    let script = vec![plan_turn(), edit_turn(&target), answer_turn("Plan done.")];
 
     let ran = run_fixture(
         script,
@@ -242,7 +248,55 @@ async fn coding_run_in_plan_mode_ends_when_every_filed_check_passes() {
     says(&ran.stdout, "ok=true");
     says(&ran.stdout, "done=plan");
     says(&ran.stdout, "plan.total=2 plan.passed=2 plan.filed=true");
-    assert_eq!(ran.calls, 3, "the plan, the edit, the answer");
+    assert_eq!(
+        ran.calls, 2,
+        "the plan and the edit: the third scripted turn was never needed"
+    );
+}
+
+/// A plan-mode model that never stops calling tools still ends the run.
+///
+/// The reported failure: a model files its plan, edits, and then keeps calling
+/// tools — reading files, checking its work — as models do. It never produces
+/// the bare answer that used to be required on top of the checks, so the run
+/// went to the iteration cap and reported `max_iters` with the plan complete
+/// and the verify green. Here every turn after the edit is another read, and
+/// the mock is scripted with more of them than the run may take: reaching the
+/// end of the script at all would mean the loop was still going.
+#[tokio::test]
+async fn coding_run_in_plan_mode_ends_without_a_declaration_from_the_model() {
+    let (dir, target) = make_repo();
+    let read = || tool_call("call_read_n", "fs_read", json!({ "path": target }));
+    let script = vec![
+        plan_turn(),
+        edit_turn(&target),
+        read(),
+        read(),
+        read(),
+        read(),
+    ];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[("CODING_DONE_TEST", "plan")],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "done=plan");
+    says(&ran.stdout, "plan.total=2 plan.passed=2 plan.filed=true");
+    // The symptom, named: this is what the run used to report.
+    assert!(
+        !ran.stdout.contains("max_iters"),
+        "the run ended on its checks, not at the iteration cap:\n{}",
+        ran.stdout
+    );
+    assert_eq!(
+        ran.calls, 2,
+        "the plan and the edit; the reads scripted after them were never asked for"
+    );
 }
 
 /// A call that arrived without one of its required arguments is refused by

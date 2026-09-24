@@ -711,6 +711,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `coding.run` with `done = "plan"` ends the run when every check the model
+  filed passes, instead of running to the iteration cap. `M.decide` required a
+  declaration — an answer with no tool call — in every mode, and a model that
+  keeps calling tools never produces one: a run whose plan was filed, whose
+  seven checks all passed and whose verify was green burned all ten iterations
+  and reported `ok = false, failure_reason = "max_iters"` with every fact
+  green.
+
+  The declaration is there because a green verify is not enough by itself — a
+  spec spanning a function and the tests it asked for goes green before the
+  tests exist — but plan mode already has that covered, and has it in a better
+  form: the checks are the model's own description of what finished looks
+  like, filed in advance, in shell commands, and confirmed by the harness
+  rather than taken on the model's word. The test a green verify cannot see is
+  one of the checks. So the declaration is no longer waited for in that mode;
+  it still ends the run when the checks agree, being the same condition. A
+  plan with no checks in it still never ends a run — zero of zero passing
+  describes nothing — and `declare` mode is untouched. The seed says the new
+  rule too, since a model told to announce an ending that has already happened
+  keeps calling tools.
+
+
 - `agent-block knl sessions` / `export` / `backup` with no `-p` read the
   project they are run in, instead of failing with `no kernel database at
   '<home>/.agent-block/projects/./knl.sqlite'`. `-p/--project` defaults to `.`,

@@ -127,9 +127,11 @@
 --     what a failure says `policy.carry` — one note about an edit the tool refused
 --     when to stop        `policy.verdict{ run = run_verify, changed, timeout }` after
 --                         every iteration — green counts only with an edit landed —
---                         and `M.decide` over it: the run ends when the model
---                         answers with no tool call while those facts agree and,
---                         in `done = "plan"`, every check it filed passes.
+--                         and `M.decide` over it: in `done = "declare"` the run
+--                         ends when the model answers with no tool call while
+--                         those facts agree; in `done = "plan"` it ends when
+--                         every check the model filed passes, which is the same
+--                         statement made in advance and in commands.
 --                         `policy.stagnation` on the verify output and the grant
 --                         of beats on the session say when to give up instead
 --
@@ -306,8 +308,8 @@ local RUN_OPTS = T.shape({
                 .. 'verify is green and an edit has landed. "plan": the model first files a plan — steps, each '
                 .. "with a shell check — through the `plan` tool; the harness runs every check after each "
                 .. "iteration and hands the results back, and the run ends when every check passes, the verify "
-                .. "is green, and the model answers without a tool call. A green verify alone never ends a run. "
-                .. "Required under `strict`"
+                .. "is green and an edit has landed — the checks say the work is done, so no declaration is "
+                .. "waited for. A green verify alone never ends a run in either mode. Required under `strict`"
         )
         :is_optional(),
     check_timeout = T.number
@@ -589,8 +591,10 @@ function M.system(read_tool, edit_tool, done)
         ending = "How this run ends: first file a plan with the `plan` tool — the steps you will take, each with a "
             .. "shell command (run in the repository) that exits 0 once that step is done. After every one of "
             .. "your turns the harness runs the verify command and every check in your plan, and their results "
-            .. "come back. The run ends when you answer without a tool call while every check passes and the "
-            .. "verify is green. The verify passing by itself does not end the run.\n"
+            .. "come back. The run ends as soon as every check passes and the verify is green — you do not have "
+            .. "to announce it, and you will not be asked again. The verify passing by itself does not end the "
+            .. "run: your checks are what say the work is done, so file the ones that would catch it not "
+            .. "being.\n"
     else
         ending = "How this run ends: you answer without a tool call. After every one of your turns the verify "
             .. "command runs and its output comes back; the run ends when you answer without a tool call "
@@ -622,17 +626,48 @@ end
 -- Pure helpers — how a run ends
 -- ============================================================
 
---- Whether the run is over, from facts alone. The verify passing is one of
---- them and never enough by itself: what ends a run is the model saying so
---- (an answer with no tool call) with the facts agreeing — an edit landed,
---- the verify is green, and (done = "plan") every check the model filed
---- passes.
+--- Whether the run is over, from facts alone. Two facts every mode needs —
+--- an edit landed and the verify is green — and then, per mode, the thing
+--- that says the TASK is done rather than that the code builds.
+---
+--- Why the verify is never enough by itself
+---   A spec spanning two files, or one file and the tests it asked for, goes
+---   green on the part that had to compile while the rest is not written
+---   [measured 2026-09-11/12: of 9 runs, the 4 that landed a single edit
+---   converged on a green before the tests existed]. So something has to say
+---   the work is finished, and the two modes have different things to say it
+---   with.
+---
+--- `declare`: the model saying so
+---   An answer with no tool call, which is the only statement available: the
+---   harness holds no description of what finished looks like, so the
+---   model's word, with the two facts agreeing, is what it has.
+---
+--- `plan`: the checks the model filed
+---   Plan mode HAS that description, and the model wrote it first: each step
+---   carries a shell command that exits 0 once that step is done, filed in
+---   advance and run by the harness after every turn. Every one of them
+---   passing is the same statement the declaration makes — "the work is
+---   finished" — except made in advance, in commands, and confirmed rather
+---   than taken on the model's word. The test that a green verify cannot see
+---   is one of the checks; that is what a check is for.
+---
+---   So the declaration is NOT required here, and requiring it was a defect:
+---   a model that keeps calling tools never produces a bare answer, so a run
+---   whose plan was filed, whose every check passed and whose verify was
+---   green went on to the iteration cap and reported `max_iters` with every
+---   fact green. A declaration still ends the run when the checks agree — it
+---   is the same condition — it is simply not the only way in.
+---
+---   A plan with no checks in it is not that statement and does not end a
+---   run: zero passing out of zero is a plan that described nothing, and
+---   there is nothing left to carry what the declaration was carrying.
 ---
 --- @param mode string  "declare" | "plan"
 --- @param f table  { declared, verify_ok, edits_applied, plan = { total, passed }|nil }
 --- @return boolean
 function M.decide(mode, f)
-    if not f.declared or not f.verify_ok or (f.edits_applied or 0) <= 0 then
+    if not f.verify_ok or (f.edits_applied or 0) <= 0 then
         return false
     end
     if mode == "plan" then
@@ -641,6 +676,9 @@ function M.decide(mode, f)
             return false
         end
         return plan.passed == plan.total
+    end
+    if not f.declared then
+        return false
     end
     return true
 end
@@ -1437,8 +1475,9 @@ function M._run_impl(opts)
             -- green on the part that had to compile while the rest is not
             -- written [measured 2026-09-11/12: of 9 runs, the 4 that landed a
             -- single edit converged on a green before the tests existed]. What
-            -- ends the run is the model answering without a tool call while
-            -- the facts agree (`M.decide`).
+            -- ends a run is the statement its mode has for "the work is
+            -- finished" — the model's answer, or the checks it filed — with
+            -- the facts agreeing (`M.decide`).
             local checks = done_mode == "plan" and run_checks(st.plan_steps, repo, check_timeout) or nil
             local plan_facts = nil
             if checks then
