@@ -299,6 +299,71 @@ async fn coding_run_in_plan_mode_ends_without_a_declaration_from_the_model() {
     );
 }
 
+/// A plan check whose path is percent-encoded is refused at the filing, and
+/// the model refiles.
+///
+/// The shape that prompted it: a framework's dynamic-route directory
+/// (`[ns]`, `[id]`) reaching a check as `%5Bns%5D`, naming a file that does
+/// not exist. Such a check cannot pass in this run or any other, so the run
+/// spent every iteration re-running it and ended at the cap. Here the same
+/// mistake — a path escape in a check — is answered at the filing: the model
+/// is told what it wrote and what it means, files the plan again, and the run
+/// ends on that plan in the SAME iteration. No plan is stored for the refused
+/// filing and no edit is attributed to it.
+#[tokio::test]
+async fn coding_run_refuses_a_plan_check_whose_path_is_percent_encoded() {
+    let (dir, target) = make_repo();
+    let repo = dir.path().to_string_lossy().into_owned();
+    let encoded = tool_call(
+        "call_plan_bad",
+        "plan",
+        json!({
+            "steps": [
+                { "step": "double returns n * 2", "check": format!("test -f {repo}%2Flib.lua") }
+            ]
+        }),
+    );
+    let good = tool_call(
+        "call_plan_good",
+        "plan",
+        json!({
+            "steps": [
+                { "step": "double returns n * 2", "check": "grep -qF 'return n * 2' lib.lua" }
+            ]
+        }),
+    );
+    let script = vec![
+        encoded,
+        good,
+        edit_turn(&target),
+        answer_turn("Plan refiled and done."),
+    ];
+
+    let ran = run_fixture(script, &repo, &[("CODING_DONE_TEST", "plan")]).await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "done=plan");
+    // The refiled plan is the one that was stored: one check, and it passed.
+    says(&ran.stdout, "plan.total=1 plan.passed=1 plan.filed=true");
+    // The refusal cost an iteration nothing: the whole exchange — refused
+    // filing, refiling, edit — happened inside the first.
+    says(&ran.stdout, "iters=1");
+    // And it reached the model, in the terms it has to act on.
+    assert!(
+        ran.a_later_request_says("percent-encoded"),
+        "the refusal was not sent back to the model"
+    );
+    assert!(
+        ran.a_later_request_says("exactly as written"),
+        "the refusal did not tell the model what to write instead"
+    );
+    assert!(
+        ran.a_later_request_says("bad_plan"),
+        "the refusal was not the filing's own"
+    );
+}
+
 /// A call that arrived without one of its required arguments is refused by
 /// name, and the run goes on.
 ///
