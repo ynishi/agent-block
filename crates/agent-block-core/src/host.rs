@@ -1403,8 +1403,8 @@ fn build_isle_init(
         // project's `lib/` is typed against the nearer tier's declaration
         // when two tiers declare one name. The tiers are search paths for
         // the CHECKER only: the declarations directory is not a resolver
-        // root, because a `.d.tl` in a root with no `.lua` beside it would
-        // answer `require` with a stub (`htl::pkg::TealResolver`).
+        // root — it holds declarations and nothing `require` could run, and
+        // the modules they declare are served by the preloads below.
         let dts_dir = teal_declarations_dir()
             .map_err(|e| mlua::Error::external(format!("writing the Teal declarations: {e}")))?;
         checker
@@ -1462,14 +1462,14 @@ fn build_isle_init(
             // Two resolvers per tier, Teal ahead of Lua, so that within one
             // directory `name.tl` (checked and generated at require) wins over
             // `name.lua`, and `name.d.tl` beside a `name.lua` types the Lua
-            // without replacing it — the Teal resolver steps aside when a Lua
-            // sibling exists, and the filesystem resolver behind it serves the
-            // file. A type error in a `.tl` is `Some(Err)`: the require fails
-            // there rather than falling through to a copy in a lower tier. A
-            // `.d.tl` with neither a `.lua` beside it nor a preload of the
-            // name is answered with a declaration-only stub (htl's rule: the
-            // declaration of a module only the host provides), which is why
-            // every embedded name is preloaded below.
+            // without replacing it. A `.d.tl` is a declaration and not a
+            // module: the Teal resolver steps aside for it (htl 0.10), and
+            // whatever implements the name behind it — the `.lua` beside it
+            // through the filesystem resolver, or the preload below for an
+            // embedded name — is what `require` gets; a name nothing
+            // implements fails at `require`, naming the `.d.tl`. A type error
+            // in a `.tl` is `Some(Err)`: the require fails there rather than
+            // falling through to a copy in a lower tier.
             match htl::pkg::TealResolver::new_symlink_aware(root.clone()) {
                 Ok(resolver) => {
                     registry.add(resolver);

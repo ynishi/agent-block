@@ -258,9 +258,10 @@ late-bound, as it is for a Lua module. The binary carries that declaration
 (and `lshape`'s) and hands it to the checker, so a project's `.tl` writes the
 same two lines against the `agent-block` that runs it; nothing has to be
 copied into the project. A declaration of a project's own for something the
-host supplies at run time goes where `htl check` would look for it: a
-project `htl.toml` with `[check] paths = ["types"]` and the `.d.tl` under
-`types/`, which the host applies to the checker at start. A `.d.tl` for an
+host supplies at run time goes where `htl check` would look for it: the
+`.d.tl` under the project's `types/`, which htl reads without configuration
+(`[layout] types` in the project's `htl.toml` names another directory) and
+which the host applies to the checker at start. A `.d.tl` for an
 embedded module (`lib/knl.d.tl`) may sit in a tier too and types the kernel
 without replacing it. What the host embeds and `vendor` writes is the
 generated Lua, comments stripped; the module's own words are in the `.tl`.
