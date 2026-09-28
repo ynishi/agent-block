@@ -2,13 +2,15 @@
 # `.tl` under `blocks/`, by `htl check` / `htl test` / `htl fmt` and by
 # `include_tl!`.
 
-# Where the checker looks for what a module requires. `blocks/lib` is the
-# `require` root the host uses for the embedded modules (`require("policy")`
-# is `blocks/lib/policy/init.*`), so it is the root here too; a module that
-# has no `.tl` or `.d.tl` under it is not visible to the checker, whatever the
-# host resolves at run time.
-[check]
-paths = ["blocks/lib"]
+# Where this crate's own modules live. `blocks/lib` is the `require` root the
+# host uses for the embedded modules (`require("policy")` is
+# `blocks/lib/policy/init.*`), so it is the source root here too: `htl check`,
+# `htl test`, `htl resolve` and `include_tl!` name a file by its path under it,
+# and a module that has no `.tl` or `.d.tl` under it is not visible to the
+# checker, whatever the host resolves at run time. A `.d.tl` beside a `.lua`
+# (`host_types`, `lshape`, `knl_types`) types the Lua without replacing it.
+[layout]
+source = "blocks/lib"
 
 # `global std: host.Std` is how a module names a global the host owns
 # (`blocks/lib/host_types.d.tl`): a declaration that generates nothing, so the

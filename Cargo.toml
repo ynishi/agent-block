@@ -83,8 +83,9 @@ mlua-pkg     = "0.11"
 # are off on purpose: `std` would pull a second `mlua-batteries` (0.7) beside
 # the one above, and two of them registering `std.*` into one state is not a
 # thing this host wants. `macros` is `include_tl!` / `#[host_module]`, `pkg`
-# is the resolver, `dts` writes the `.d.tl` a `#[host_module]` declares.
-htl          = { version = "0.7", default-features = false, features = ["macros", "pkg", "dts"] }
+# is the resolver. `dts` (the `.d.tl` a `#[host_module]` declares) is off: this
+# host declares no `#[host_module]` and renders its own `knl_types.d.tl`.
+htl          = { version = "0.10", default-features = false, features = ["macros", "pkg"] }
 # The SQLite cluster, one line for everything that links it. `libsqlite3-sys`
 # declares `links = "sqlite3"`, so the graph holds exactly one major of it
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38

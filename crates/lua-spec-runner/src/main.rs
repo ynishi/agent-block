@@ -293,9 +293,8 @@ fn main() -> ExitCode {
     // An embedded module written in Teal (`blocks/lib/<name>/init.tl`) has no
     // `.lua` for `require` to find here: what the host embeds is the Lua that
     // `include_tl!` generated at `cargo build`. This runner cannot generate
-    // it — it sits outside the workspace on an older mlua than htl's, and
-    // `htl gen` resolves a module's requires from its own directory only — so
-    // it takes the Lua from the binary that embeds it, the way a project does:
+    // it — it sits outside the workspace on an older mlua than htl's — so it
+    // takes the Lua from the binary that embeds it, the way a project does:
     // `agent-block vendor` writes each such module out under `target/`, and
     // the copies go last on the search path, where the embedded tier sits
     // for the host. The binary is the one `cargo build -p agent-block`

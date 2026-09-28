@@ -51,7 +51,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "mlua",
- "mlua-isle",
+ "mlua-isle 0.6.0",
  "nix 0.29.0",
  "predicates",
  "reqwest 0.12.28",
@@ -89,7 +89,7 @@ dependencies = [
  "mlua",
  "mlua-batteries 0.6.0",
  "mlua-batteries-sqlite",
- "mlua-isle",
+ "mlua-isle 0.6.0",
  "mlua-pkg",
  "nix 0.29.0",
  "reqwest 0.12.28",
@@ -117,7 +117,7 @@ dependencies = [
  "agent-block-types",
  "async-trait",
  "mlua",
- "mlua-isle",
+ "mlua-isle 0.6.0",
  "rmcp",
  "rustls",
  "serde_json",
@@ -1230,9 +1230,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "htl"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0db84127e537388baa219f563e33122b25033ad588a7a541448574cf42cc2a06"
+checksum = "90b60f475726f8a032241b7c04d1b90bca25fea5d645a0fc2297b6b954c1ad68"
 dependencies = [
  "htl-core",
  "htl-macros",
@@ -1240,19 +1240,21 @@ dependencies = [
 
 [[package]]
 name = "htl-core"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e581c2030de23d555829aca94e72615ecb72ce4865622274b5f6ec2b161e212"
+checksum = "3de497f01ce972214091e3d1d8ff9fb75564d5c5b09b7152ddb6fd8bde91f4bc"
 dependencies = [
  "anyhow",
  "blake3",
  "mlua",
  "mlua-batteries 0.7.3",
+ "mlua-isle 0.8.0",
  "mlua-pkg",
  "semver",
  "serde",
  "serde_json",
  "syn 2.0.117",
+ "tokio",
  "toml",
  "toml_edit",
  "walkdir",
@@ -1260,9 +1262,9 @@ dependencies = [
 
 [[package]]
 name = "htl-macros"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76b6e56fe423d67c64957526332ea5469acf6ab68b8150a9cc3026de3bd8cf3e"
+checksum = "359abe7b77dee3fb7f5d753ad91b8bddb6cf8dc996a72ff47f57af3e614daa6f"
 dependencies = [
  "htl-core",
  "proc-macro2",
@@ -1916,6 +1918,17 @@ name = "mlua-isle"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf7641e30cfedce0fc9b84a0eeae78175bd02afb9f04e63bbe295c72c5479daa"
+dependencies = [
+ "mlua",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "mlua-isle"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aceee08080f0cbc1e0ec6e878e799f7fad84baa547273f6ac7262298b3b2b97d"
 dependencies = [
  "mlua",
  "thiserror",
