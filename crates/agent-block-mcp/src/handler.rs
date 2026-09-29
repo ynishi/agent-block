@@ -315,13 +315,9 @@ impl AgentBlockClientHandler {
             while let Some(item) = rx.recv().await {
                 let result = item
                     .isle
-                    .coroutine_call(
+                    .coroutine_call::<_, ()>(
                         MCP_DISPATCH_NOTIFY,
-                        &[
-                            item.cbs_table,
-                            item.server_name.as_str(),
-                            item.ev_json.as_str(),
-                        ],
+                        (item.cbs_table, item.server_name.clone(), item.ev_json),
                     )
                     .await;
                 if let Err(e) = result {
@@ -551,10 +547,10 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
 
     // ── JSON wrappers (what the host actually calls) ───────────────────────────
     //
-    // `coroutine_call` returns whatever the function returned, stringified by
-    // the Isle — and a table stringifies to `table: 0x…`. So the encode has to
-    // happen in Lua, after the handler returns and outside the frames it might
-    // yield from. `lua_json::lua_to_json` stays the encoder, reached through
+    // `coroutine_call` hands back the function's result converted to a Rust
+    // type on the VM thread, and a table cannot cross (it is not `Send`). So
+    // the encode has to happen in Lua, after the handler returns and outside
+    // the frames it might yield from. `lua_json::lua_to_json` stays the encoder, reached through
     // `__mcp_json_encode`, so the wire shape is byte-for-byte what the previous
     // `exec`-side conversion produced.
     let encode = lua.create_function(|lua, val: LuaValue| {
@@ -563,9 +559,10 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
     })?;
     lua.globals().set(MCP_JSON_ENCODE, encode)?;
 
-    // `nil` -> "" is the "no handler registered" signal the callers already
-    // read; anything that is neither nil nor a table is the handler breaking
-    // its contract and is raised as a Lua error.
+    // `nil` passes through as the "no handler registered" signal (the callers
+    // ask for `Option<String>` and read `None`); anything that is neither nil
+    // nor a table is the handler breaking its contract and is raised as a Lua
+    // error.
     let wrappers = [
         (
             MCP_DISPATCH_SAMPLING_JSON,
@@ -594,7 +591,7 @@ pub fn install_mcp_dispatcher_on_handler_isle(lua: &mlua::Lua) -> mlua::Result<(
             return function({params})
                 local r = _G[INNER]({params})
                 if r == nil then
-                    return ""
+                    return nil
                 end
                 if type(r) ~= "table" then
                     error("{caller}: handler must return table or nil, got: " .. type(r))
@@ -642,7 +639,8 @@ pub fn install_mcp_notify_dispatcher_on_main_isle(lua: &mlua::Lua) -> mlua::Resu
 
     // A missing table or a missing callback is not an error: the notification
     // simply has nowhere to go (the server was never wired, or the script
-    // unregistered). Returning "" matches what the old `exec` closure did.
+    // unregistered). The function returns nothing either way; the dispatch
+    // task asks for `()` and only looks at whether the call raised.
     //
     // A callback that raises is *not* swallowed here. The error travels out
     // as `IsleError::Lua` and the dispatch task logs it — same warn, one
@@ -653,14 +651,13 @@ pub fn install_mcp_notify_dispatcher_on_main_isle(lua: &mlua::Lua) -> mlua::Resu
         return function(cbs_name, server_name, ev_json)
             local cbs = _G[cbs_name]
             if type(cbs) ~= "table" then
-                return ""
+                return
             end
             local cb = cbs[server_name]
             if type(cb) ~= "function" then
-                return ""
+                return
             end
             cb(_G[DECODE](ev_json))
-            return ""
         end
     "#
     );
@@ -701,9 +698,9 @@ fn isle_dispatch(
 ) {
     tokio::spawn(async move {
         let result = isle
-            .coroutine_call(
+            .coroutine_call::<_, ()>(
                 MCP_DISPATCH_NOTIFY,
-                &[cbs_table, server_name.as_str(), ev_json.as_str()],
+                (cbs_table, server_name.clone(), ev_json),
             )
             .await;
         if let Err(e) = result {
@@ -1247,9 +1244,9 @@ impl ClientHandler for AgentBlockClientHandler {
             // await an async battery, which only works if there is no C-call
             // boundary between it and the coroutine (module doc).
             let result_json = isle
-                .coroutine_call(
+                .coroutine_call::<_, Option<String>>(
                     MCP_DISPATCH_SAMPLING_JSON,
-                    &[sn.as_str(), params_json.as_str()],
+                    (sn.clone(), params_json),
                 )
                 .await;
 
@@ -1266,13 +1263,13 @@ impl ClientHandler for AgentBlockClientHandler {
                         None,
                     ))
                 }
-                Ok(json_str) if json_str.is_empty() => {
+                Ok(None) => {
                     // Lua returned nil — no handler registered in dispatcher
                     Err(McpError::method_not_found::<
                         rmcp::model::CreateMessageRequestMethod,
                     >())
                 }
-                Ok(json_str) => {
+                Ok(Some(json_str)) => {
                     // Parse Lua response into CreateMessageResult fields.
                     let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
                         McpError::internal_error(
@@ -1373,7 +1370,7 @@ impl ClientHandler for AgentBlockClientHandler {
             // Dispatch to the Lua roots handler and await its result (see
             // `create_message` for why this is a coroutine call).
             let result_val = isle
-                .coroutine_call(MCP_DISPATCH_ROOTS_JSON, &[sn.as_str()])
+                .coroutine_call::<_, Option<String>>(MCP_DISPATCH_ROOTS_JSON, (sn.clone(),))
                 .await;
 
             match result_val {
@@ -1389,13 +1386,13 @@ impl ClientHandler for AgentBlockClientHandler {
                         None,
                     ))
                 }
-                Ok(json_str) if json_str.is_empty() => {
+                Ok(None) => {
                     // Lua returned nil — no handler registered in dispatcher
                     Err(McpError::method_not_found::<
                         rmcp::model::ListRootsRequestMethod,
                     >())
                 }
-                Ok(json_str) => {
+                Ok(Some(json_str)) => {
                     // Parse Lua response into Vec<Root>.
                     let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
                         McpError::internal_error(format!("roots handler result parse: {e}"), None)
@@ -1507,9 +1504,9 @@ impl ClientHandler for AgentBlockClientHandler {
             // Dispatch to the Lua elicitation handler and await its result (see
             // `create_message` for why this is a coroutine call).
             let result_val = isle
-                .coroutine_call(
+                .coroutine_call::<_, Option<String>>(
                     MCP_DISPATCH_ELICITATION_JSON,
-                    &[sn.as_str(), message.as_str(), schema_json.as_str()],
+                    (sn.clone(), message.clone(), schema_json),
                 )
                 .await;
 
@@ -1526,11 +1523,11 @@ impl ClientHandler for AgentBlockClientHandler {
                         None,
                     ))
                 }
-                Ok(json_str) if json_str.is_empty() => {
+                Ok(None) => {
                     // Lua returned nil — no handler registered in dispatcher → Decline.
                     Ok(ElicitResult::new(ElicitationAction::Decline))
                 }
-                Ok(json_str) => {
+                Ok(Some(json_str)) => {
                     // ── Crux: 3-action response contract validation ────────────────
                     let v: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
                         McpError::internal_error(
@@ -1802,9 +1799,8 @@ mod tests {
                 _G.get_hits = function() return hits end
             "#,
             )
-            .exec()
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("setup: {e}")))?;
-            Ok(String::new())
+            .exec()?;
+            Ok(())
         })
         .await
         .expect("setup exec");
@@ -1813,39 +1809,25 @@ mod tests {
         for _ in 0..3 {
             isle.exec(|lua| {
                 use mlua::prelude::*;
-                let cbs: LuaTable = lua
-                    .globals()
-                    .get(MCP_USER_PROGRESS_CBS)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cbs: {e}")))?;
-                let cb: LuaFunction = cbs
-                    .get("test-srv")
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cb: {e}")))?;
-                let ev = lua
-                    .create_table()
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create ev: {e}")))?;
+                let cbs: LuaTable = lua.globals().get(MCP_USER_PROGRESS_CBS)?;
+                let cb: LuaFunction = cbs.get("test-srv")?;
+                let ev = lua.create_table()?;
                 let _ = cb.call::<()>(ev);
-                Ok(String::new())
+                Ok(())
             })
             .await
             .expect("dispatch exec");
         }
 
         // Verify the upvalue was incremented 3 times.
-        let hits_str = isle
+        let hits: i64 = isle
             .exec(|lua| {
                 use mlua::prelude::*;
-                let get_hits: LuaFunction = lua
-                    .globals()
-                    .get("get_hits")
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get_hits: {e}")))?;
-                let n: i64 = get_hits
-                    .call(())
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("call get_hits: {e}")))?;
-                Ok(n.to_string())
+                let get_hits: LuaFunction = lua.globals().get("get_hits")?;
+                Ok(get_hits.call::<i64>(())?)
             })
             .await
             .expect("read hits exec");
-        let hits: i64 = hits_str.parse().expect("hits must be integer");
         assert_eq!(hits, 3, "upvalue counter must reach 3");
 
         driver.shutdown().await.expect("shutdown");
@@ -1896,19 +1878,11 @@ mod tests {
         // (1) exec — a Rust frame between the callback and the coroutine.
         let via_exec = isle
             .exec(|lua| {
-                let cbs: LuaTable = lua
-                    .globals()
-                    .get(MCP_USER_PROGRESS_CBS)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cbs: {e}")))?;
-                let cb: LuaFunction = cbs
-                    .get("srv")
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("get cb: {e}")))?;
-                let ev = lua
-                    .create_table()
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("create ev: {e}")))?;
-                cb.call::<()>(ev)
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("call: {e}")))?;
-                Ok(String::new())
+                let cbs: LuaTable = lua.globals().get(MCP_USER_PROGRESS_CBS)?;
+                let cb: LuaFunction = cbs.get("srv")?;
+                let ev = lua.create_table()?;
+                cb.call::<()>(ev)?;
+                Ok(())
             })
             .await;
         let err = via_exec.expect_err("a yield inside an exec closure must fail");
@@ -1918,18 +1892,18 @@ mod tests {
         );
 
         // (2) coroutine_call — only Lua frames, so the same callback lands.
-        isle.coroutine_call(
+        isle.coroutine_call::<_, ()>(
             MCP_DISPATCH_NOTIFY,
-            &[
+            (
                 MCP_USER_PROGRESS_CBS,
                 "srv",
                 r#"{"type":"progress","server":"srv"}"#,
-            ],
+            ),
         )
         .await
         .expect("the callback must run to completion through the coroutine path");
 
-        let hits = isle
+        let hits: String = isle
             .eval("return tostring(hits) .. ':' .. tostring(seen_type)")
             .await
             .expect("read back");
@@ -1939,8 +1913,7 @@ mod tests {
     }
 
     /// A notification for a server with no registered callback is not an
-    /// error — the dispatcher returns the empty string and the dispatch task
-    /// moves on.
+    /// error — the dispatcher returns nothing and the dispatch task moves on.
     #[tokio::test]
     async fn notify_dispatcher_is_silent_when_no_callback_is_registered() {
         use mlua_isle::AsyncIsle;
@@ -1953,42 +1926,34 @@ mod tests {
         .expect("spawn the isle");
 
         // Table absent entirely.
-        let out = isle
-            .coroutine_call(
-                MCP_DISPATCH_NOTIFY,
-                &[MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#],
-            )
-            .await
-            .expect("a missing table is not an error");
-        assert_eq!(out, "");
+        isle.coroutine_call::<_, ()>(
+            MCP_DISPATCH_NOTIFY,
+            (MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#),
+        )
+        .await
+        .expect("a missing table is not an error");
 
         // Table present, server absent.
         isle.exec(|lua| {
-            let t = lua
-                .create_table()
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("create: {e}")))?;
-            lua.globals()
-                .set(MCP_USER_LOG_CBS, t)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set: {e}")))?;
-            Ok(String::new())
+            let t = lua.create_table()?;
+            lua.globals().set(MCP_USER_LOG_CBS, t)?;
+            Ok(())
         })
         .await
         .expect("install the table");
 
-        let out = isle
-            .coroutine_call(
-                MCP_DISPATCH_NOTIFY,
-                &[MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#],
-            )
-            .await
-            .expect("a missing callback is not an error");
-        assert_eq!(out, "");
+        isle.coroutine_call::<_, ()>(
+            MCP_DISPATCH_NOTIFY,
+            (MCP_USER_LOG_CBS, "ghost", r#"{"type":"log"}"#),
+        )
+        .await
+        .expect("a missing callback is not an error");
 
         driver.shutdown().await.expect("shutdown");
     }
 
     /// The `_json` wrapper the host calls returns the encoded handler result,
-    /// `""` for "no handler", and raises when the handler breaks its contract.
+    /// `nil` for "no handler", and raises when the handler breaks its contract.
     #[test]
     fn sampling_json_wrapper_encodes_nil_table_and_rejects_the_rest() {
         let lua = mlua::Lua::new();
@@ -1996,9 +1961,9 @@ mod tests {
 
         let wrapper: mlua::Function = lua.globals().get(MCP_DISPATCH_SAMPLING_JSON).unwrap();
 
-        // No handler registered -> "" (what the caller reads as method_not_found).
-        let out: String = wrapper.call(("no-srv", "{}")).unwrap();
-        assert_eq!(out, "");
+        // No handler registered -> nil (what the caller reads as method_not_found).
+        let out: Option<String> = wrapper.call(("no-srv", "{}")).unwrap();
+        assert_eq!(out, None);
 
         lua.load(
             r#"

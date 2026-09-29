@@ -48,6 +48,26 @@ pub use agent_block_types::obs;
 // (llm / mesh / mcp.lua) that historically reached `crate::bridge::*`.
 pub use agent_block_mcp::lua_json::{json_to_lua, lua_to_json};
 
+/// The error an isle request (an `AsyncIsle::exec` closure) returns when an
+/// `mlua` call inside it fails, with `ctx` put in front of the message.
+///
+/// Goes through `IsleError::from`, so a cancel that surfaces from the call
+/// stays [`IsleError::Cancelled`](mlua_isle::IsleError::Cancelled)
+/// (mlua-isle recognises it by downcast, not by message). Anything else is
+/// [`IsleError::Lua`](mlua_isle::IsleError::Lua) carrying the
+/// [`LuaFailure`](mlua_isle::LuaFailure) built from the `mlua::Error` — its
+/// kind and traceback kept — with only the message prefixed:
+/// `"<ctx>: <message>"`.
+pub(crate) fn isle_err(ctx: &str) -> impl FnOnce(LuaError) -> mlua_isle::IsleError + '_ {
+    move |e| match mlua_isle::IsleError::from(e) {
+        mlua_isle::IsleError::Lua(mut failure) => {
+            failure.message = format!("{ctx}: {}", failure.message);
+            mlua_isle::IsleError::Lua(failure)
+        }
+        other => other,
+    }
+}
+
 /// Register bridge APIs shared between main VM and handler VM.
 ///
 /// Registers everything except `bus::*`.  Split out from `register_all` so

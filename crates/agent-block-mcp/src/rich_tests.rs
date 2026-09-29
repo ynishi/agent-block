@@ -871,14 +871,10 @@ async fn attach_roots_server_with_isle(
 
     let name_owned = name.to_string();
     isle.exec(move |lua| {
-        handler::install_mcp_dispatcher_on_handler_isle(lua)
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("setup dispatcher: {e}")))?;
+        handler::install_mcp_dispatcher_on_handler_isle(lua)?;
         // Pre-install the Lua roots handler for `name_owned`.
         use mlua::prelude::*;
-        let handlers: LuaTable = lua
-            .globals()
-            .get("__mcp_roots_handlers")
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("get handlers: {e}")))?;
+        let handlers: LuaTable = lua.globals().get("__mcp_roots_handlers")?;
         let cb: LuaFunction = lua
             .load(
                 r#"
@@ -890,12 +886,9 @@ async fn attach_roots_server_with_isle(
             "#,
             )
             .set_name("@test_roots_handler")
-            .eval()
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("eval: {e}")))?;
-        handlers
-            .set(name_owned.as_str(), cb)
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
-        Ok(String::new())
+            .eval()?;
+        handlers.set(name_owned.as_str(), cb)?;
+        Ok(())
     })
     .await
     .expect("isle setup must succeed");
@@ -1188,14 +1181,10 @@ async fn attach_elicitation_server_with_isle(
     let name_owned = name.to_string();
     let action_owned = action.to_string();
     isle.exec(move |lua| {
-        handler::install_mcp_dispatcher_on_handler_isle(lua)
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("setup dispatcher: {e}")))?;
+        handler::install_mcp_dispatcher_on_handler_isle(lua)?;
         // Pre-install the Lua elicitation handler for `name_owned`.
         use mlua::prelude::*;
-        let handlers: LuaTable = lua
-            .globals()
-            .get("__mcp_elicitation_handlers")
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("get handlers: {e}")))?;
+        let handlers: LuaTable = lua.globals().get("__mcp_elicitation_handlers")?;
 
         // Build a handler that returns the requested action.
         let handler_src = match action_owned.as_str() {
@@ -1232,12 +1221,9 @@ async fn attach_elicitation_server_with_isle(
         let cb: LuaFunction = lua
             .load(handler_src)
             .set_name("@test_elicitation_handler")
-            .eval()
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("eval: {e}")))?;
-        handlers
-            .set(name_owned.as_str(), cb)
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
-        Ok(String::new())
+            .eval()?;
+        handlers.set(name_owned.as_str(), cb)?;
+        Ok(())
     })
     .await
     .expect("isle setup must succeed");
