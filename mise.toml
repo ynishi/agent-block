@@ -3,4 +3,4 @@
 # puts that release on PATH here, whatever `htl` is elsewhere. CI installs the
 # same version by reading it from this line (.github/workflows/teal.yml).
 [tools]
-"cargo:htl-cli" = "0.10.0"
+"cargo:htl-cli" = "0.11.0"
