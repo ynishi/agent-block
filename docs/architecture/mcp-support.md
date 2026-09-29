@@ -104,8 +104,8 @@ first-class wire format, add it as an accepted alias in
 - `README.md` — `mcp.*` Lua API reference, `agent.run` MCP options,
   tool group usage
 - `docs/runbooks/e2e-mcp-resource-subscribe.md` — resource subscribe E2E
-- `blocks/agent/init.lua` — `connect_mcp_servers` / `build_tools` /
-  `dispatch_tool` / `M._resolve_mcp_group`
+- `crates/agent-block-core/blocks/lib/agent/init.tl` — `connect_mcp_servers` /
+  `build_tools` / `M._resolve_mcp_group`
 - MCP spec: https://modelcontextprotocol.io/specification/2025-11-25
 - SEP-986: https://modelcontextprotocol.io/seps/986-specify-format-for-tool-names
 - SEP-2084 (rejected): https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2084

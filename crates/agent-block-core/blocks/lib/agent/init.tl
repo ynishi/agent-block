@@ -1,4 +1,4 @@
--- blocks/agent/init.lua — the SDK's agent: MCP wiring, and a loop over `knl`.
+-- blocks/lib/agent/init.tl — the SDK's agent: MCP wiring, and a loop over `knl`.
 --
 -- Usage:
 --   local agent = require("agent")
@@ -48,8 +48,16 @@
 --   The loop's decisions are all in `run_loop`, in the four `Outcome.match`
 --   arms and nowhere else: what ends a run (a settled answer, an exhausted
 --   grant, a failed or refused beat, a caller's `on_turn` answering false),
---   and what the token budget does when it is crossed. Everything above
---   `run_loop` prepares its arguments; everything below reads its result.
+--   and what the token budget does when it is crossed.
+--
+--   A run is three steps, and the file is in their order. `prepare` turns the
+--   opts into a `Run` — the checked opts, the connected servers, the device
+--   built from the provider Port and the one tools map — and everything above
+--   it is what it calls. `run_loop` beats over that `Run`, with the readers it
+--   takes each beat apart with just above it. `result_of` reads what the loop
+--   ended with into the result. `M.run` is the three in a row, and nothing
+--   else: everything above `run_loop` prepares its arguments; everything below
+--   reads its result.
 --
 --   The vocabulary below is the kernel's — session, device, beat, Outcome,
 --   budget. "Turn" survives in one place only: the keys of the `on_turn`
@@ -81,8 +89,14 @@
 --   - tool.call() is sync. tool.schema() is sync.
 --   - NEVER throws. All errors returned as { ok=false, error=... }.
 --   - on_turn payload keys: turn_number, content, tool_calls, usage.
-
-local M = {}
+--
+-- Written in Teal and embedded through `include_tl!` (`host.rs`, as one of
+-- the two EMBEDDED_BLOCKS); the Lua the host holds is what Teal generates,
+-- without these comments. What crosses the module's boundary — the opts, the
+-- result, the `on_turn` payload, an MCP server declaration, a tool candidate
+-- — is a record here. The kernel is read through its own record, the host
+-- globals (`tool`, `mcp`, `std`, `log`) through `host_types`.
+local host = require("host_types")
 
 --- The kernel. Named `kernel` because the bare `knl` is the syscall bridge
 --- global in a host VM and shadowing it here would read as the wrong one.
@@ -93,21 +107,157 @@ local Outcome = kernel.Outcome
 local adapter = require("knl_adapter")
 
 local proto = require("llm_proto")
+local type openai = require("llm_proto.openai")
+local type mcp_tools = require("mcp_tools")
 
 --- Re-exported through `M._test_helpers` only.
-local proto_openai = proto.adapter("openai")
+local proto_openai = proto.adapter("openai") as openai
 
 local lshape = require("lshape")
 local T = lshape.t
 local shape = lshape.check
 
+-- ============================================================
+-- What crosses the boundary
+-- ============================================================
+
+--- One MCP server to connect: `{ name, command, args? }` over stdio, or
+--- `{ name, url }` over HTTP.
+local record McpServer
+    name: string
+    command: string
+    args: {string}
+    url: string
+    transport_opts: {string:any}
+    trace_context: boolean
+end
+
+--- The nested half of the nested `extra_tools` shape.
+local record ToolSchema
+    description: string
+    input_schema: any
+end
+
+--- One entry of `extra_tools`, in either of its two shapes (see
+--- `extra_candidates`).
+local record ExtraTool
+    name: string
+    description: string
+    input_schema: any
+    schema: ToolSchema
+    handler: function(any): any
+    group: string
+end
+
+--- One candidate: the binding, and the group the filter reads beside it.
+local record Candidate ---@struct
+    group: string
+    bind: any
+end
+
+--- A flat spec, as this module builds one for `knl_adapter.tools`. `schema`
+--- rides along only on the `extra_tools` path that has to reach the binder's
+--- loud error (see `extra_candidates`).
+local record FlatBind ---@struct
+    name: string
+    description: string
+    input_schema: any
+    schema: ToolSchema ---@optional
+    handler: function(any): any
+end
+
+--- Token accounting, as a result and an `on_turn` payload carry it.
+local record Usage ---@struct
+    input_tokens: number
+    output_tokens: number
+    total_tokens: number
+    thinking_tokens: number
+end
+
+--- What `on_turn` is handed, once per beat that reached the provider.
+local record TurnInfo ---@struct
+    turn_number: number
+    content: {proto.Block}
+    tool_calls: {proto.Block}
+    usage: kernel.Usage
+end
+
+--- What `run` takes. The keys this module reads are named; every other key
+--- is forwarded to the provider Port verbatim (see `port_conf`).
+local record RunOpts
+    prompt: string
+    history: {proto.Message}
+    system: any
+    store: any
+    timeout: number
+    max_tokens: number
+    max_iterations: number
+    max_tokens_budget: number
+    provider: string
+    mcp_servers: {McpServer}
+    extra_tools: {ExtraTool}
+    tool_groups: {string}
+    on_turn: function(TurnInfo): any
+    sampling: function(any): any
+    on_progress: function(host.Mcp.Notification): any
+    progress_to_log: boolean
+    on_log: function(host.Mcp.Notification): any
+    log_to_stderr: boolean
+    enable_resources: boolean
+    enable_prompts: boolean
+    context_management: any
+    context_management_config: {string:any}
+end
+
+--- What `run` answers: `content` on success, `error` on failure, never both
+--- (the check is `M.shapes.run_result`).
+local record RunResult
+    ok: boolean
+    content: string
+    error: string
+    usage: Usage
+    num_turns: number
+    messages: {any}
+end
+
+--- The provider Port, as far as this module reaches into it.
+local record Port
+    open: function(Port, ?{string:any}): function(kernel.Request): kernel.LlmResult, kernel.CallError
+end
+
+--- The contracts `M.shapes` publishes.
+local record Shapes ---@struct
+    usage: lshape.Schema
+    run_result: lshape.Schema
+    mcp_call_result: lshape.Schema
+end
+
+--- What `_test_helpers` answers.
+local record TestHelpers ---@struct
+    map_finish_reason: function(any): string
+    normalize_openai_response: function({string:any}): proto.Decoded, string
+    convert_messages_to_openai: function({proto.Message}, ?string): {openai.OaiMessage}
+    tool_use_blocks: function({proto.Block}): {proto.Block}
+    text_of: function({proto.Block}): string
+end
+
+local record M
+    shapes: Shapes
+    run: function(RunOpts): RunResult
+    _build_tools: function({Candidate}, {string}): {string:kernel.ToolEntry}
+    _registry_candidates: function(): {Candidate}
+    _extra_candidates: function({ExtraTool}): {Candidate}
+    _resolve_mcp_group: function({string:any}, string): string
+    _test_helpers: function(): TestHelpers
+end
+
 --- The provider Ports, by the name `opts.provider` uses. The Port is chosen
 --- here and nowhere else: a caller who picked `openai` is not holding
 --- anthropic's conf by accident, because the adapter it reaches drops what its
 --- provider does not accept.
-local PORTS = {
-    anthropic = adapter.anthropic,
-    openai = adapter.openai,
+local PORTS: {string:Port} = {
+    anthropic = adapter.anthropic as Port,
+    openai = adapter.openai as Port,
 }
 
 --- Token accounting. `thinking_tokens` is optional because a caller may hold a
@@ -164,39 +314,13 @@ local MCP_CALL_RESULT = T.shape({
     structured_content = T.any:is_optional(),
 }, { open = false })
 
--- ============================================================
--- Reading an answer
--- ============================================================
---
--- `text_of` here and `error_text` / `refusal_text` below are consumer
--- plumbing: reading an Outcome is the caller's job, and every loop written
--- over the kernel does it the same way. A loop of your own writes its own,
--- or copies these — they are short on purpose.
-
---- The `tool_use` blocks of a response, in block order. This is what
---- `on_turn` has always been handed as `tool_calls`, and what the loop counts
---- to decide whether the model asked for anything.
-local function tool_use_blocks(content)
-    local out = {}
-    for _, block in ipairs(content or {}) do
-        if block.type == "tool_use" then
-            out[#out + 1] = block
-        end
-    end
-    return out
+local function zero_usage(): Usage
+    return { input_tokens = 0, output_tokens = 0, total_tokens = 0, thinking_tokens = 0 }
 end
 
---- The text blocks of a response, joined — the run's "final answer" string.
---- The kernel keeps blocks because the provider does; a caller who wants one
---- string gets it here.
-local function text_of(content)
-    local parts = {}
-    for _, block in ipairs(content or {}) do
-        if block.type == "text" and block.text then
-            parts[#parts + 1] = block.text
-        end
-    end
-    return table.concat(parts, "\n")
+--- A failure that happened before, or instead of, a run.
+local function failed(err: string): RunResult
+    return { ok = false, error = err, usage = zero_usage(), num_turns = 0, messages = {} }
 end
 
 -- ============================================================
@@ -221,11 +345,11 @@ end
 -- @param tool_json   table   Raw tool object from mcp.list_tools
 -- @param server_name string  MCP server name (fallback)
 -- @return string             Resolved group label
-local function resolve_mcp_group(tool_json, server_name)
+local function resolve_mcp_group(tool_json: {string:any}, server_name: string): string
     local meta = tool_json._meta
-    if type(meta) == "table" then
+    if meta is {string:any} then
         local g = meta.group
-        if type(g) == "string" and g ~= "" then
+        if g is string and g ~= "" then
             return g
         end
     end
@@ -233,11 +357,11 @@ local function resolve_mcp_group(tool_json, server_name)
 end
 
 --- The active-group set, or nil when every group passes.
-local function group_set_of(active_groups)
+local function group_set_of(active_groups: {string}): {string:boolean}
     if not active_groups or #active_groups == 0 then
         return nil
     end
-    local set = {}
+    local set: {string:boolean} = {}
     for _, g in ipairs(active_groups) do
         set[g] = true
     end
@@ -246,7 +370,7 @@ end
 
 --- Whether a candidate's group is one the caller asked for. A tool with no
 --- group is in "default", as it always was.
-local function in_groups(group, group_set)
+local function in_groups(group: string, group_set: {string:boolean}): boolean
     if group_set == nil then
         return true
     end
@@ -257,21 +381,19 @@ end
 --- and the registry runs it, so the handler is `tool.call` — a raise from it
 --- is closed by the kernel as an `ok = false` tool_result, which is how the
 --- model gets to see the failure and pick something else.
-local function registry_candidates()
-    local out = {}
+local function registry_candidates(): {Candidate}
+    local out: {Candidate} = {}
     for _, spec in ipairs(tool.schema()) do
         local name = spec.name
-        out[#out + 1] = {
-            group = spec.group,
-            bind = {
-                name = name,
-                description = spec.description,
-                input_schema = spec.input_schema,
-                handler = function(input)
-                    return tool.call(name, input)
-                end,
-            },
+        local bind: FlatBind = {
+            name = name,
+            description = spec.description,
+            input_schema = spec.input_schema,
+            handler = function(input: any): any
+                return tool.call(name, input)
+            end,
         }
+        out[#out + 1] = { group = spec.group, bind = bind }
     end
     return out
 end
@@ -289,11 +411,11 @@ end
 --- Lua registry exactly as it did before — including the case where nothing
 --- registered it, which the kernel closes as a failed tool_result the model
 --- can answer.
-local function extra_candidates(extra_tools)
-    local out = {}
+local function extra_candidates(extra_tools: {ExtraTool}): {Candidate}
+    local out: {Candidate} = {}
     for _, t in ipairs(extra_tools or {}) do
         local name = t.name
-        local bind
+        local bind: FlatBind
         if t.schema and t.handler then
             bind = {
                 name = name,
@@ -307,7 +429,7 @@ local function extra_candidates(extra_tools)
                 description = t.description,
                 input_schema = t.input_schema,
                 schema = t.schema,
-                handler = t.handler or function(input)
+                handler = t.handler or function(input: any): any
                     return tool.call(name, input)
                 end,
             }
@@ -327,9 +449,9 @@ end
 --- @param candidates table  array of { group?, bind }
 --- @param active_groups table|nil  group names to include (nil = all)
 --- @return table tools  knl's `config.tools` map (name -> entry)
-local function build_tools(candidates, active_groups)
+local function build_tools(candidates: {Candidate}, active_groups: {string}): {string:kernel.ToolEntry}
     local group_set = group_set_of(active_groups)
-    local binds = {}
+    local binds: {any} = {}
     for _, c in ipairs(candidates) do
         if in_groups(c.group, group_set) then
             binds[#binds + 1] = c.bind
@@ -342,93 +464,88 @@ end
 -- MCP: connect, bind, notify, disconnect
 -- ============================================================
 
+--- One meta-tool a server's capability admits, as a candidate in the
+--- server's group.
+local function meta_candidate(sn: string, bind: FlatBind): Candidate
+    return { group = sn, bind = bind }
+end
+
 --- The meta-tools that let a model reach a server's resources, as candidates.
 --- Agent-provided tools bound through `knl_adapter.tools` like any other —
 --- they are not put in the global `tool` registry, because a second run in one
 --- process would then meet its own first run as a duplicate name.
-local function resource_candidates(sn)
+local function resource_candidates(sn: string): {Candidate}
     return {
-        {
-            group = sn,
-            bind = {
-                name = sn .. "__mcp_list_resources",
-                description = "List available resources on MCP server '" .. sn .. "'",
-                input_schema = { type = "object", properties = {} },
-                handler = function(_input)
-                    local r = mcp.list_resources(sn)
-                    if not r.ok then
-                        return std.json.encode({ error = r.error })
-                    end
-                    return std.json.encode(r.resources)
-                end,
+        meta_candidate(sn, {
+            name = sn .. "__mcp_list_resources",
+            description = "List available resources on MCP server '" .. sn .. "'",
+            input_schema = { type = "object", properties = {} },
+            handler = function(_input: any): any
+                local r = mcp.list_resources(sn)
+                if not r.ok then
+                    return std.json.encode({ error = r.error })
+                end
+                return std.json.encode(r.resources)
+            end,
+        }),
+        meta_candidate(sn, {
+            name = sn .. "__mcp_read_resource",
+            description = "Read a resource by URI from MCP server '" .. sn .. "'",
+            input_schema = {
+                type = "object",
+                properties = { uri = { type = "string" } },
+                required = { "uri" },
             },
-        },
-        {
-            group = sn,
-            bind = {
-                name = sn .. "__mcp_read_resource",
-                description = "Read a resource by URI from MCP server '" .. sn .. "'",
-                input_schema = {
-                    type = "object",
-                    properties = { uri = { type = "string" } },
-                    required = { "uri" },
-                },
-                handler = function(input)
-                    local r = mcp.read_resource(sn, input.uri)
-                    if not r.ok then
-                        return std.json.encode({ error = r.error })
-                    end
-                    return std.json.encode(r.contents)
-                end,
-            },
-        },
+            handler = function(input: any): any
+                local r = mcp.read_resource(sn, (input as {string:string}).uri)
+                if not r.ok then
+                    return std.json.encode({ error = r.error })
+                end
+                return std.json.encode(r.contents)
+            end,
+        }),
     }
 end
 
 --- The same for a server's prompts.
-local function prompt_candidates(sn)
+local function prompt_candidates(sn: string): {Candidate}
     return {
-        {
-            group = sn,
-            bind = {
-                name = sn .. "__mcp_list_prompts",
-                description = "List available prompts on MCP server '" .. sn .. "'",
-                input_schema = { type = "object", properties = {} },
-                handler = function(_input)
-                    local r = mcp.list_prompts(sn)
-                    if not r.ok then
-                        return std.json.encode({ error = r.error })
-                    end
-                    return std.json.encode(r.prompts)
-                end,
-            },
-        },
-        {
-            group = sn,
-            bind = {
-                name = sn .. "__mcp_get_prompt",
-                description = "Get a prompt by name from MCP server '" .. sn .. "'",
-                input_schema = {
-                    type = "object",
-                    properties = {
-                        name = { type = "string" },
-                        args = { type = "object" },
-                    },
-                    required = { "name" },
+        meta_candidate(sn, {
+            name = sn .. "__mcp_list_prompts",
+            description = "List available prompts on MCP server '" .. sn .. "'",
+            input_schema = { type = "object", properties = {} },
+            handler = function(_input: any): any
+                local r = mcp.list_prompts(sn)
+                if not r.ok then
+                    return std.json.encode({ error = r.error })
+                end
+                return std.json.encode(r.prompts)
+            end,
+        }),
+        meta_candidate(sn, {
+            name = sn .. "__mcp_get_prompt",
+            description = "Get a prompt by name from MCP server '" .. sn .. "'",
+            input_schema = {
+                type = "object",
+                properties = {
+                    name = { type = "string" },
+                    args = { type = "object" },
                 },
-                handler = function(input)
-                    local r = mcp.get_prompt(sn, input.name, input.args or {})
-                    if not r.ok then
-                        return std.json.encode({ error = r.error })
-                    end
-                    return std.json.encode(r.messages)
-                end,
+                required = { "name" },
             },
-        },
+            handler = function(input: any): any
+                local args = input as {string:any}
+                local r = mcp.get_prompt(sn, args.name as string, (args.args or {}) as {string:any})
+                if not r.ok then
+                    return std.json.encode({ error = r.error })
+                end
+                return std.json.encode(r.messages)
+            end,
+        }),
     }
 end
 
-local function append_all(into, more)
+local function append_all(into: {Candidate}, more: {Candidate})
     for _, item in ipairs(more) do
         into[#into + 1] = item
     end
@@ -436,20 +553,20 @@ end
 
 --- Register the progress notification handler for one server (no capability
 --- gate; all servers). `opts.on_progress` wins over `progress_to_log`.
-local function wire_progress(sn, opts)
+local function wire_progress(sn: string, opts: RunOpts)
     if opts.on_progress then
         local user_cb = opts.on_progress
         -- Registered directly on the main Isle (no bytecode dump needed): the
         -- callback runs with upvalues intact because the main Isle is never
         -- crossed; only the event table `ev` is built on the Rust side.
-        mcp.on_progress(sn, function(ev)
+        mcp.on_progress(sn, function(ev: host.Mcp.Notification)
             local ok, cb_err = pcall(user_cb, ev)
             if not ok then
                 log.warn("agent: on_progress callback error: " .. tostring(cb_err))
             end
         end)
     elseif opts.progress_to_log then
-        mcp.on_progress(sn, function(ev)
+        mcp.on_progress(sn, function(ev: host.Mcp.Notification)
             local msg = "mcp progress: server="
                 .. tostring(ev.server)
                 .. " token="
@@ -468,17 +585,17 @@ end
 
 --- Register the log notification handler for one server. `opts.on_log` wins
 --- over `log_to_stderr`; both are gated on the logging capability.
-local function wire_log(sn, opts)
+local function wire_log(sn: string, opts: RunOpts)
     if opts.on_log then
         local user_cb = opts.on_log
-        mcp.on_log(sn, function(ev)
+        mcp.on_log(sn, function(ev: host.Mcp.Notification)
             local ok, cb_err = pcall(user_cb, ev)
             if not ok then
                 log.warn("agent: on_log callback error: " .. tostring(cb_err))
             end
         end)
     else
-        mcp.on_log(sn, function(ev)
+        mcp.on_log(sn, function(ev: host.Mcp.Notification)
             local msg = "mcp log: server="
                 .. tostring(ev.server)
                 .. " logger="
@@ -502,8 +619,8 @@ end
 --- handler. One `server_info` call serves all three.
 ---
 --- @return table candidates  the meta-tools this server admitted
-local function wire_capabilities(sn, opts)
-    local candidates = {}
+local function wire_capabilities(sn: string, opts: RunOpts): {Candidate}
+    local candidates: {Candidate} = {}
     if not (opts.enable_resources or opts.enable_prompts or opts.on_log or opts.log_to_stderr) then
         return candidates
     end
@@ -512,7 +629,7 @@ local function wire_capabilities(sn, opts)
         log.warn("agent: mcp.server_info failed for '" .. sn .. "': " .. tostring(si_result.error))
         return candidates
     end
-    local caps = (si_result.server_info and si_result.server_info.capabilities) or {}
+    local caps = ((si_result.server_info and si_result.server_info.capabilities) or {}) as {string:any}
 
     if opts.enable_resources then
         if caps.resources ~= nil then
@@ -555,17 +672,17 @@ end
 ---
 --- @return table|nil candidates
 --- @return string|nil err
-local function mcp_tool_candidates(sn, active_groups)
+local function mcp_tool_candidates(sn: string, active_groups: {string}): {Candidate}, string
     local list = mcp.list_tools(sn)
     if not list.ok then
         return nil, "mcp list_tools failed for '" .. sn .. "': " .. tostring(list.error)
     end
     local group_set = group_set_of(active_groups)
-    local candidates = {}
+    local candidates: {Candidate} = {}
     for _, entry in ipairs(list.tools or {}) do
         local group = resolve_mcp_group(entry, sn)
         if in_groups(group, group_set) then
-            candidates[#candidates + 1] = { group = group, bind = adapter.ToolPort.mcp(sn, entry) }
+            candidates[#candidates + 1] = { group = group, bind = adapter.ToolPort.mcp(sn, entry as mcp_tools.Tool) }
         end
     end
     return candidates
@@ -578,28 +695,35 @@ end
 --- @return table|nil     candidates
 --- @return string|nil    Error string on failure
 --- @return table         connected server names (for cleanup on failure)
-local function connect_mcp_servers(servers, opts)
-    local candidates = {}
-    local connected = {}
+local function connect_mcp_servers(servers: {McpServer}, opts: RunOpts): {Candidate}, string, {string}
+    local candidates: {Candidate} = {}
+    local connected: {string} = {}
 
     for _, srv in ipairs(servers) do
         local name = srv.name
 
         -- HTTP transport when srv.url is set, otherwise stdio.
-        local ok, err
+        local ok: boolean
+        local err: any
         if srv.url then
             -- Merge server-level trace_context into transport_opts when not already set.
-            local transport_opts = {}
+            local transport_opts: {string:any} = {}
             for k, v in pairs(srv.transport_opts or {}) do
                 transport_opts[k] = v
             end
             if transport_opts.trace_context == nil then
                 transport_opts.trace_context = not not srv.trace_context
             end
-            ok, err = pcall(mcp.connect_http, name, srv.url, transport_opts)
+            ok, err = pcall((mcp.connect_http as function(string, string, {string:any}): any), name, srv.url, transport_opts)
         else
-            local connect_opts = { trace_context = not not srv.trace_context }
-            ok, err = pcall(mcp.connect, name, srv.command, srv.args or {}, connect_opts)
+            local connect_opts: {string:any} = { trace_context = not not srv.trace_context }
+            ok, err = pcall(
+                (mcp.connect as function(string, string, {string}, {string:any}): any),
+                name,
+                srv.command,
+                srv.args or {},
+                connect_opts
+            )
         end
         if not ok then
             return nil, "mcp connect failed for '" .. name .. "': " .. tostring(err), connected
@@ -607,7 +731,11 @@ local function connect_mcp_servers(servers, opts)
         table.insert(connected, name)
 
         if opts.sampling then
-            local sampling_ok, sampling_err = pcall(mcp.set_sampling_handler, name, opts.sampling)
+            local sampling_ok, sampling_err = pcall(
+                (mcp.set_sampling_handler as function(string, function(any): any): any),
+                name,
+                opts.sampling
+            )
             if not sampling_ok then
                 log.warn("agent: mcp set_sampling_handler failed for '" .. name .. "': " .. tostring(sampling_err))
             end
@@ -628,9 +756,9 @@ end
 
 --- Gracefully disconnect from MCP servers. Logs errors but does not throw.
 --- @param server_names table  Array of server name strings
-local function disconnect_mcp_servers(server_names)
+local function disconnect_mcp_servers(server_names: {string})
     for _, name in ipairs(server_names) do
-        local ok, err = pcall(mcp.disconnect, name)
+        local ok, err = pcall((mcp.disconnect as function(string): any), name)
         if not ok then
             log.warn("agent: mcp disconnect error for '" .. name .. "': " .. tostring(err))
         end
@@ -643,7 +771,7 @@ end
 
 -- Anthropic server-side rolling history via clear_tool_uses_20250919.
 -- Trigger at 80K input_tokens, keep last 3 tool_uses, clear at least 10K.
-local DEFAULT_CONTEXT_MANAGEMENT = {
+local DEFAULT_CONTEXT_MANAGEMENT: {string:any} = {
     edits = {
         {
             type = "clear_tool_uses_20250919",
@@ -659,7 +787,7 @@ local DEFAULT_CONTEXT_MANAGEMENT = {
 --- llm_proto upstream, which is the bug this list is inverted to avoid.
 --- `system` is not a conf key: it is the device's, composed into the request
 --- by `knl.fold` each beat.
-local AGENT_OPTS = {
+local AGENT_OPTS: {string:boolean} = {
     prompt = true,
     history = true,
     system = true,
@@ -683,7 +811,7 @@ local AGENT_OPTS = {
 
 --- `opts.context_management == false` opts out entirely (no beta header, no
 --- body field). Strict equality, so nil (unset) is default-on.
-local function resolve_context_management(opts)
+local function resolve_context_management(opts: RunOpts): {string:any}
     if opts.context_management == false then
         return nil
     end
@@ -693,9 +821,9 @@ end
 --- Everything the Port is opened with: the caller's knobs verbatim, the two
 --- request defaults this module has always supplied, and the resolved
 --- context-management config on the provider that has one.
-local function port_conf(opts, provider)
-    local conf = {}
-    for key, value in pairs(opts) do
+local function port_conf(opts: RunOpts, provider: string): {string:any}
+    local conf: {string:any} = {}
+    for key, value in pairs(opts as {string:any}) do
         if not AGENT_OPTS[key] then
             conf[key] = value
         end
@@ -715,12 +843,13 @@ local function port_conf(opts, provider)
 end
 
 --- Anthropic-only knobs are warned about rather than dropped in silence.
-local function warn_anthropic_only(opts, provider)
+local function warn_anthropic_only(opts: RunOpts, provider: string)
     if provider ~= "openai" then
         return
     end
+    local raw = opts as {string:any}
     for _, name in ipairs({ "cache_control", "context_management", "context_management_config" }) do
-        if opts[name] ~= nil then
+        if raw[name] ~= nil then
             log.warn("agent: " .. name .. " is anthropic-only; ignored for provider=openai")
         end
     end
@@ -738,29 +867,30 @@ end
 --- result that stayed inside a `msg_user` would leave its call unanswered — so
 --- the fold's repair would close it a second time and the provider would see
 --- two results for one id.
-local function seed_message(session, message)
+local function seed_message(session: kernel.Session, message: proto.Message)
     local content = message.content
     if message.role == "assistant" then
         session:append({ kind = "llm_response", data = { content = content } })
         return
     end
-    if type(content) ~= "table" then
+    if not (content is table) then
         session:append({ kind = "msg_user", data = { content = content } })
         return
     end
-    local rest = {}
-    for _, block in ipairs(content) do
-        if type(block) == "table" and block.type == "tool_result" then
+    local rest: {any} = {}
+    for _, item in ipairs(content as {any}) do
+        local block = item as proto.Block
+        if item is table and block.type == "tool_result" then
             session:append({
                 kind = "tool_result",
                 data = {
                     call_id = block.tool_use_id,
-                    ok = block.is_error ~= true,
+                    ok = (block as {string:any}).is_error ~= true,
                     result = block.content or "",
                 },
             })
         else
-            rest[#rest + 1] = block
+            rest[#rest + 1] = item
         end
     end
     if #rest > 0 then
@@ -768,12 +898,18 @@ local function seed_message(session, message)
     end
 end
 
+--- One correlation id: the `meta` key, and the env var it is read from.
+local record Correlation ---@struct
+    key: string
+    var: string
+end
+
 --- The four correlation ids, as the env var each is read from and the `meta`
 --- key it becomes. These are the same variables `obs::obs_context` reads for
 --- the `ab.obs` http_request / http_response lines the http bridge writes, so
 --- a run's log events and its model calls carry one set of ids rather than
 --- two.
-local CORRELATION_ENV = {
+local CORRELATION_ENV: {Correlation} = {
     { key = "trace_id", var = "AGENT_BLOCK_TRACE_ID" },
     { key = "run_id", var = "AGENT_BLOCK_RUN_ID" },
     { key = "agent_id", var = "AGENT_BLOCK_AGENT_ID" },
@@ -793,8 +929,8 @@ local CORRELATION_ENV = {
 --- it: the http bridge falls back to a per-process id (`obs::process_agent_id`)
 --- that Lua is not given a reader for. Set `AGENT_BLOCK_AGENT_ID` and both
 --- sides say the same thing.
-local function prompt_meta()
-    local meta = { label = "prompt" }
+local function prompt_meta(): {string:string | number | boolean}
+    local meta: {string:string | number | boolean} = { label = "prompt" }
     for _, entry in ipairs(CORRELATION_ENV) do
         local value = std.env.get(entry.var)
         if value ~= nil and value ~= "" then
@@ -807,7 +943,7 @@ end
 --- The caller's prior thread, then the prompt. History is a durable record
 --- here rather than an argument: what `blocks/lib/session` saved is what this
 --- lays back down, and the fold reads the two the same way.
-local function seed(session, opts)
+local function seed(session: kernel.Session, opts: RunOpts)
     for _, message in ipairs(opts.history or {}) do
         seed_message(session, message)
     end
@@ -815,21 +951,161 @@ local function seed(session, opts)
 end
 
 -- ============================================================
--- Reading the run
+-- Preparing the run
 -- ============================================================
 
-local function zero_usage()
-    return { input_tokens = 0, output_tokens = 0, total_tokens = 0, thinking_tokens = 0 }
+--- What the loop needs, prepared once: the checked opts, the session it is
+--- opened with, the device, and the servers to disconnect afterwards.
+local record Run
+    opts: RunOpts
+    --- `knl.session`'s opts: the owner, the grant, the store.
+    session: kernel.OpenOpts
+    --- The provider Port the device's `llm` closure was opened from.
+    port: Port
+    candidates: {Candidate}
+    device: kernel.Device
+    --- The session's grant: one unit per beat.
+    max_iter: number
+    on_turn: function(TurnInfo): any
+    --- `max_tokens_budget`: nil is unlimited.
+    budget: number
+    --- The servers `M.run` disconnects, whatever the loop did.
+    connected: {string}
 end
+
+--- The opts, checked, and everything the loop runs on built from them.
+---
+--- Answers the `Run`, or nil and the failure a run that never started comes
+--- back as. A server that connected before one that failed is disconnected
+--- here; on success, the connected ones ride on the `Run` for `M.run` to
+--- disconnect once the loop is done.
+local function prepare(opts: RunOpts): Run, RunResult
+    opts = opts or {}
+
+    if not opts.prompt or opts.prompt == "" then
+        return nil, failed("prompt is required")
+    end
+    local history = opts.history as any
+    if history ~= nil and not (history is table) then
+        return nil, failed("history must be a table (messages array)")
+    end
+    -- Both are the run's own: how long this model's reply may take, and how
+    -- many beats the session is granted. Neither is a number this module
+    -- could know, so neither has one here.
+    local timeout = opts.timeout as any
+    if not (timeout is number) then
+        return nil, failed("timeout (seconds) is required")
+    end
+    local max_iterations = opts.max_iterations as any
+    if not (max_iterations is number) then
+        return nil, failed("max_iterations is required")
+    end
+
+    local provider = opts.provider or "anthropic"
+    if PORTS[provider] == nil then
+        return nil, failed("unknown provider '" .. tostring(provider) .. "' (anthropic | openai)")
+    end
+    warn_anthropic_only(opts, provider)
+
+    local candidates = registry_candidates()
+    local connected: {string} = {}
+    if opts.mcp_servers and #opts.mcp_servers > 0 then
+        local bound, err, partial = connect_mcp_servers(opts.mcp_servers, opts)
+        if err then
+            -- Disconnect any servers that did connect before the failure.
+            disconnect_mcp_servers(partial)
+            return nil, failed(err)
+        end
+        connected = partial
+        append_all(candidates, bound)
+    end
+    append_all(candidates, extra_candidates(opts.extra_tools))
+
+    -- The device raises for exactly the things a caller got wrong at wiring
+    -- time — a duplicate tool name, a spec with no schema field it knows.
+    -- `run` never throws, so those come back as the failure they are.
+    local port = PORTS[provider]
+    local built, device = pcall(function(): kernel.Device
+        return kernel.device({
+            llm = port:open(port_conf(opts, provider)),
+            tools = build_tools(candidates, opts.tool_groups),
+            system = opts.system,
+        })
+    end)
+    if not built then
+        -- Always disconnect, regardless of outcome.
+        disconnect_mcp_servers(connected)
+        return nil, failed(tostring(device))
+    end
+
+    local max_iter = opts.max_iterations
+    return {
+        opts = opts,
+        session = {
+            owner = "agent",
+            -- One unit per beat (the device's default cost), so the grant IS the
+            -- iteration cap: the beat after the last one the caller allowed comes
+            -- back `stopped` with nothing called and nothing recorded.
+            budget = { amount = max_iter, tag = "beats", desc = "one unit per beat" },
+            store = opts.store,
+        },
+        port = port,
+        candidates = candidates,
+        device = device as kernel.Device,
+        max_iter = max_iter,
+        on_turn = opts.on_turn,
+        budget = opts.max_tokens_budget,
+        connected = connected,
+    }, nil
+end
+
+-- ============================================================
+-- Reading an answer
+-- ============================================================
+--
+-- `text_of` here and `error_text` / `refusal_text` below are consumer
+-- plumbing: reading an Outcome is the caller's job, and every loop written
+-- over the kernel does it the same way. A loop of your own writes its own,
+-- or copies these — they are short on purpose.
+
+--- The `tool_use` blocks of a response, in block order. This is what
+--- `on_turn` has always been handed as `tool_calls`, and what the loop counts
+--- to decide whether the model asked for anything.
+local function tool_use_blocks(content: {proto.Block}): {proto.Block}
+    local out: {proto.Block} = {}
+    for _, block in ipairs(content or {}) do
+        if block.type == "tool_use" then
+            out[#out + 1] = block
+        end
+    end
+    return out
+end
+
+--- The text blocks of a response, joined — the run's "final answer" string.
+--- The kernel keeps blocks because the provider does; a caller who wants one
+--- string gets it here.
+local function text_of(content: {proto.Block}): string
+    local parts: {string} = {}
+    for _, block in ipairs(content or {}) do
+        if block.type == "text" and block.text then
+            parts[#parts + 1] = block.text
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
+-- ============================================================
+-- Reading a beat
+-- ============================================================
 
 --- The token spend so far, read off the log.
 ---
 --- A reading apart from the budget: the grant counts beats and the kernel
 --- never folds usage back into it, so this is one SELECT over the counts every
 --- `llm_response` already carries.
-local function usage_of(session)
+local function usage_of(session: kernel.Session): Usage
     local rows = kernel.views.usage(session)
-    local row = (rows and rows[1]) or {}
+    local row: {string:any} = (rows and rows[1]) or {}
     local input = tonumber(row.input_tokens) or 0
     local output = tonumber(row.output_tokens) or 0
     return {
@@ -842,14 +1118,15 @@ end
 
 --- A failed beat as one sentence: the stage, the classification the port or
 --- the kernel put on it, and the message.
-local function error_text(o)
+local function error_text(o: kernel.OutcomeValue): string
     local detail = o.detail
-    if type(detail) ~= "table" then
+    if not (detail is table) then
         return tostring(o.kind) .. ": " .. tostring(detail)
     end
-    local message = tostring(detail.message or "unknown failure")
-    if detail.kind ~= nil then
-        return tostring(o.kind) .. ": " .. tostring(detail.kind) .. ": " .. message
+    local d = detail as {string:any}
+    local message = tostring(d.message or "unknown failure")
+    if d.kind ~= nil then
+        return tostring(o.kind) .. ": " .. tostring(d.kind) .. ": " .. message
     end
     return tostring(o.kind) .. ": " .. message
 end
@@ -857,11 +1134,17 @@ end
 --- A refusal names its class. `reason` is the adapter's provider-neutral
 --- classification ("model" / "content_filter"); the provider's own message,
 --- when it sent one, is on the normalized refusal.
-local function refusal_text(o)
+local function refusal_text(o: kernel.OutcomeValue): string
     local text = "model refused to respond (kind=" .. tostring(o.reason) .. ")"
     local detail = o.detail
-    local said = type(detail) == "table" and type(detail.refusal) == "table" and detail.refusal.detail or nil
-    if type(said) == "string" and said ~= "" then
+    local said: any = nil
+    if detail is table then
+        local refusal = (detail as {string:any}).refusal
+        if refusal is table then
+            said = (refusal as {string:any}).detail
+        end
+    end
+    if said is string and said ~= "" then
         text = text .. ": " .. said
     end
     return text
@@ -869,16 +1152,22 @@ end
 
 --- The caller's per-beat hook. A broken callback must not take the run down,
 --- and a callback that answers `false` stops it.
-local function fire_on_turn(on_turn, turn_number, answer, calls)
+local function fire_on_turn(
+    on_turn: function(TurnInfo): any,
+    turn_number: number,
+    answer: kernel.LlmResult,
+    calls: {proto.Block}
+): any
     if not on_turn then
         return nil
     end
-    local ok, verdict = pcall(on_turn, {
+    local info: TurnInfo = {
         turn_number = turn_number,
-        content = answer.content,
+        content = answer.content as {proto.Block},
         tool_calls = calls,
         usage = answer.usage,
-    })
+    }
+    local ok, verdict = pcall(on_turn, info)
     if not ok then
         log.warn("agent: on_turn callback error: " .. tostring(verdict))
         return nil
@@ -887,119 +1176,131 @@ local function fire_on_turn(on_turn, turn_number, answer, calls)
 end
 
 -- ============================================================
--- Public: agent.run(opts)
+-- The loop
 -- ============================================================
+
+--- What the loop ended with: the beats that reached the provider, the last
+--- answer's text, the failure that ended it (nil for a settled answer), and
+--- the spend read after the last beat.
+local record Tally ---@struct
+    turns: number
+    content: string
+    failure: string
+    usage: Usage
+end
 
 --- Run the loop: one beat, then decide, until something ends it.
 ---
---- @return table  the RUN_OK / RUN_ERR result
-local function run_loop(opts, provider, candidates, max_iter)
-    local device = kernel.device({
-        llm = PORTS[provider]:open(port_conf(opts, provider)),
-        tools = build_tools(candidates, opts.tool_groups),
-        system = opts.system,
-    })
-    local limit = opts.max_tokens_budget
+--- @return Tally  what `result_of` reads the result out of
+local function run_loop(s: kernel.Session, run: Run): Tally
+    local max_iter = run.max_iter
+    local limit = run.budget
+    local turns, content, failure: number, string, string = 0, "", nil
+    local usage = zero_usage()
 
-    return kernel.session({
-        owner = "agent",
-        -- One unit per beat (the device's default cost), so the grant IS the
-        -- iteration cap: the beat after the last one the caller allowed comes
-        -- back `stopped` with nothing called and nothing recorded.
-        budget = { amount = max_iter, tag = "beats", desc = "one unit per beat" },
-        store = opts.store,
-    }, function(s)
-        seed(s, opts)
-
-        local turns, content, failure = 0, "", nil
-        local usage = zero_usage()
-
-        while true do
-            local going = Outcome.match(kernel.beat(s, device), {
-                stopped = function(o)
-                    -- Not a failure and not the model's doing: the quota would
-                    -- not cover another beat. The only grant here is the
-                    -- iteration cap, so that is what it says.
-                    if o.reason == "budget" then
-                        failure = "max_iterations (" .. max_iter .. ") reached"
-                    else
-                        failure = "stopped: " .. tostring(o.reason)
-                    end
+    while true do
+        local going = Outcome.match(kernel.beat(s, run.device), {
+            stopped = function(o: kernel.OutcomeValue): any
+                -- Not a failure and not the model's doing: the quota would
+                -- not cover another beat. The only grant here is the
+                -- iteration cap, so that is what it says.
+                if o.reason == "budget" then
+                    failure = "max_iterations (" .. max_iter .. ") reached"
+                else
+                    failure = "stopped: " .. tostring(o.reason)
+                end
+                return false
+            end,
+            error = function(o: kernel.OutcomeValue): any
+                turns = turns + 1
+                usage = usage_of(s)
+                failure = error_text(o)
+                return false
+            end,
+            refused = function(o: kernel.OutcomeValue): any
+                turns = turns + 1
+                usage = usage_of(s)
+                failure = refusal_text(o)
+                return false
+            end,
+            ok = function(o: kernel.OutcomeValue): any
+                turns = turns + 1
+                usage = usage_of(s)
+                local answer = o.out as kernel.LlmResult
+                local blocks = answer.content as {proto.Block}
+                content = text_of(blocks)
+                local calls = tool_use_blocks(blocks)
+                if fire_on_turn(run.on_turn, turns, answer, calls) == false then
                     return false
-                end,
-                error = function(o)
-                    turns = turns + 1
-                    usage = usage_of(s)
-                    failure = error_text(o)
+                end
+                -- Settled: the answer asked for no tool, so there is
+                -- nothing left for another beat to carry forward. A
+                -- `pause_turn` is the server pausing its own tool loop —
+                -- the turn is unfinished, so the loop goes on.
+                if #calls == 0 and answer.stop_reason ~= "pause_turn" then
                     return false
-                end,
-                refused = function(o)
-                    turns = turns + 1
-                    usage = usage_of(s)
-                    failure = refusal_text(o)
+                end
+                if limit ~= nil and usage.total_tokens >= limit then
+                    failure = "token budget exceeded (" .. usage.total_tokens .. "/" .. limit .. ")"
                     return false
-                end,
-                ok = function(o)
-                    turns = turns + 1
-                    usage = usage_of(s)
-                    local answer = o.out
-                    content = text_of(answer.content)
-                    local calls = tool_use_blocks(answer.content)
-                    if fire_on_turn(opts.on_turn, turns, answer, calls) == false then
-                        return false
-                    end
-                    -- Settled: the answer asked for no tool, so there is
-                    -- nothing left for another beat to carry forward. A
-                    -- `pause_turn` is the server pausing its own tool loop —
-                    -- the turn is unfinished, so the loop goes on.
-                    if #calls == 0 and answer.stop_reason ~= "pause_turn" then
-                        return false
-                    end
-                    if limit ~= nil and usage.total_tokens >= limit then
-                        failure = "token budget exceeded (" .. usage.total_tokens .. "/" .. limit .. ")"
-                        return false
-                    end
-                    return true
-                end,
-            })
-            if not going then
-                break
-            end
+                end
+                return true
+            end,
+        })
+        if not going then
+            break
         end
+    end
 
-        -- The thread, rebuilt from the log by the same fold the requests were
-        -- built with, so what a caller saves and hands back as `history` is
-        -- what this run actually sent.
-        --
-        -- The read is bounded and says when it cut (knl's header). A run can
-        -- cross the cap on its last beat — the beat itself read the log before
-        -- writing its request, response and tool pairs — so this readback is
-        -- where it shows up. There is no half-history worth handing over:
-        -- `messages` is what a caller feeds back as `history`, and a prefix
-        -- missing the newest turns would seed the next run with a conversation
-        -- that stops in the middle. So the run reports it and carries none.
-        local recorded, truncated = s:events()
-        if truncated then
-            local cut = "the session log is longer than one read of it ("
-                .. #recorded
-                .. " events, the kernel's row cap), so this run's history cannot be rebuilt whole"
-            return {
-                ok = false,
-                -- A failure that already ended the loop is what the caller
-                -- needs first; this is why there are no messages beside it.
-                error = failure ~= nil and (failure .. "; " .. cut) or cut,
-                usage = usage,
-                num_turns = turns,
-                messages = {},
-            }
-        end
-        local messages = kernel.fold(recorded, device).messages
-        if failure ~= nil then
-            return { ok = false, error = failure, usage = usage, num_turns = turns, messages = messages }
-        end
-        return { ok = true, content = content, usage = usage, num_turns = turns, messages = messages }
-    end)
+    return { turns = turns, content = content, failure = failure, usage = usage }
 end
+
+-- ============================================================
+-- Reading the run
+-- ============================================================
+
+--- The loop's tally, and the thread it leaves in the log, as the result.
+---
+--- @return RunResult  the RUN_OK / RUN_ERR result
+local function result_of(s: kernel.Session, run: Run, tally: Tally): RunResult
+    local failure, usage, turns = tally.failure, tally.usage, tally.turns
+
+    -- The thread, rebuilt from the log by the same fold the requests were
+    -- built with, so what a caller saves and hands back as `history` is
+    -- what this run actually sent.
+    --
+    -- The read is bounded and says when it cut (knl's header). A run can
+    -- cross the cap on its last beat — the beat itself read the log before
+    -- writing its request, response and tool pairs — so this readback is
+    -- where it shows up. There is no half-history worth handing over:
+    -- `messages` is what a caller feeds back as `history`, and a prefix
+    -- missing the newest turns would seed the next run with a conversation
+    -- that stops in the middle. So the run reports it and carries none.
+    local recorded, truncated = s:events()
+    if truncated then
+        local cut = "the session log is longer than one read of it ("
+            .. #recorded
+            .. " events, the kernel's row cap), so this run's history cannot be rebuilt whole"
+        return {
+            ok = false,
+            -- A failure that already ended the loop is what the caller
+            -- needs first; this is why there are no messages beside it.
+            error = failure ~= nil and (failure .. "; " .. cut) or cut,
+            usage = usage,
+            num_turns = turns,
+            messages = {},
+        }
+    end
+    local messages = kernel.fold(recorded as {any}, run.device).messages
+    if failure ~= nil then
+        return { ok = false, error = failure, usage = usage, num_turns = turns, messages = messages }
+    end
+    return { ok = true, content = tally.content, usage = usage, num_turns = turns, messages = messages }
+end
+
+-- ============================================================
+-- Public: agent.run(opts)
+-- ============================================================
 
 --- Run a ReAct agent loop.
 ---
@@ -1058,70 +1359,37 @@ end
 ---
 --- Only the variables that are set become labels; see `prompt_meta`.
 ---
+--- The three steps in a row: `prepare`, then `run_loop` inside the session
+--- the `Run` names (seeded first), then `result_of` inside the same bracket,
+--- since the thread is read back out of the session before it closes.
+---
 --- The contract is checked on the way out in dev mode (LSHAPE_CHECK=1); see
---- `M.shapes.run_result`. Wrapped rather than asserted at each `return` because
---- there are five of them and a sixth added later would be the one that skips
---- the check.
-function M.run(opts)
-    return shape.assert_dev(M._run_impl(opts), RUN_RESULT, "agent.run result")
-end
+--- `M.shapes.run_result`. Checked once, on the one value every path leaves
+--- through, rather than asserted at each `return` — there are five of them,
+--- and a sixth added later would be the one that skips the check.
+function M.run(opts: RunOpts): RunResult
+    local result: RunResult
+    local run, refused = prepare(opts)
+    if run == nil then
+        result = refused
+    else
+        -- The loop raises for a store that would not take the log; `run`
+        -- never throws, so that comes back as the failure it is.
+        local ran, out = pcall(kernel.session, run.session, function(s: kernel.Session): RunResult
+            seed(s, run.opts)
+            return result_of(s, run, run_loop(s, run))
+        end)
 
---- A failure that happened before, or instead of, a run.
-local function failed(err)
-    return { ok = false, error = err, usage = zero_usage(), num_turns = 0, messages = {} }
-end
+        -- Always disconnect, regardless of outcome.
+        disconnect_mcp_servers(run.connected)
 
-function M._run_impl(opts)
-    opts = opts or {}
-
-    if not opts.prompt or opts.prompt == "" then
-        return failed("prompt is required")
-    end
-    if opts.history ~= nil and type(opts.history) ~= "table" then
-        return failed("history must be a table (messages array)")
-    end
-    -- Both are the run's own: how long this model's reply may take, and how
-    -- many beats the session is granted. Neither is a number this module
-    -- could know, so neither has one here.
-    if type(opts.timeout) ~= "number" then
-        return failed("timeout (seconds) is required")
-    end
-    if type(opts.max_iterations) ~= "number" then
-        return failed("max_iterations is required")
-    end
-
-    local provider = opts.provider or "anthropic"
-    if PORTS[provider] == nil then
-        return failed("unknown provider '" .. tostring(provider) .. "' (anthropic | openai)")
-    end
-    warn_anthropic_only(opts, provider)
-
-    local candidates = registry_candidates()
-    local connected = {}
-    if opts.mcp_servers and #opts.mcp_servers > 0 then
-        local bound, err, partial = connect_mcp_servers(opts.mcp_servers, opts)
-        if err then
-            -- Disconnect any servers that did connect before the failure.
-            disconnect_mcp_servers(partial)
-            return failed(err)
+        if ran then
+            result = out as RunResult
+        else
+            result = failed(tostring(out))
         end
-        connected = partial
-        append_all(candidates, bound)
     end
-    append_all(candidates, extra_candidates(opts.extra_tools))
-
-    -- The loop raises for exactly the things a caller got wrong at wiring time
-    -- — a duplicate tool name, a spec with no schema field it knows — and for
-    -- a store that would not take the log. `run` never throws, so those come
-    -- back as the failure they are.
-    local ran, result = pcall(run_loop, opts, provider, candidates, opts.max_iterations)
-
-    -- Always disconnect, regardless of outcome.
-    disconnect_mcp_servers(connected)
-
-    if not ran then
-        return failed(tostring(result))
-    end
+    shape.assert_dev(result, RUN_RESULT, "agent.run result")
     return result
 end
 
@@ -1156,7 +1424,7 @@ M.shapes = {
 --- message conversion have, and they are reached through here because that is
 --- where the spec that covers them already runs. The tool-set builders are NOT
 --- here — `M._build_tools` and friends above are their one surface.
-function M._test_helpers()
+function M._test_helpers(): TestHelpers
     return {
         map_finish_reason = proto_openai.map_finish_reason,
         normalize_openai_response = proto_openai.parse,

@@ -1,4 +1,4 @@
--- agent_helpers_spec.lua — mlua-lspec unit tests for pure helpers in blocks/agent/init.lua.
+-- agent_helpers_spec.lua — mlua-lspec unit tests for pure helpers in blocks/lib/agent/init.tl.
 --
 -- Run via:
 --   just test-lua agent_helpers_spec   # this file

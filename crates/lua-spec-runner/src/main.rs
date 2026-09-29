@@ -13,7 +13,7 @@
 //! `.agent-block/lib/` first on the require path — the same order the host
 //! uses — so the copy the project edited is the one they check.
 //!
-//! Both are Lua unit tests for the Lua side of the runtime (`blocks/agent`,
+//! Both are Lua unit tests for the Lua side of the runtime (`blocks/lib/agent`,
 //! `blocks/lib/llm_proto`, `blocks/lib/knl`, `blocks/lib/policy`).
 //! They were reachable only by hand, through the lua-debugger MCP, so nothing
 //! ran them on the way to a commit — which is how eight of them came to be
@@ -76,9 +76,9 @@ fn is_spec(source: &str) -> bool {
 fn spec_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![root.join("crates/agent-block/tests/fixtures")];
 
-    // Both places a module lives: `blocks/<name>/` (the blocks, `agent` and
-    // `coding`) and `blocks/lib/<name>/` (the libraries). A spec sits in the
-    // `spec/` of whichever its module is in.
+    // Both places a module lives: `blocks/lib/<name>/` (the libraries, and
+    // `agent`) and `blocks/<name>/` (`coding`, until it moves under `lib/`
+    // too). A spec sits in the `spec/` of whichever its module is in.
     let blocks = root.join("crates/agent-block-core/blocks");
     let mut block_specs: Vec<PathBuf> = Vec::new();
     for parent in [blocks.clone(), blocks.join("lib")] {

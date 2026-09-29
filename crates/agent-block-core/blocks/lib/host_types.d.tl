@@ -195,8 +195,22 @@ local record host_types
             description: string
             input_schema: {string:any}
         end
+        --- One entry of `schema`: a registered tool as a request declares
+        --- it, with the group it was registered under when it has one.
+        record Def
+            name: string
+            description: string
+            input_schema: {string:any}
+            group: string
+        end
         --- Register one tool: its name, what it takes, and the handler.
         register: function(string, Meta, function(any): any)
+        --- Run a registered tool by name on this input, and answer what its
+        --- handler answered. A name nothing registered RAISES ("tool not
+        --- found"), and so does a handler that raised.
+        call: function(string, any): any
+        --- Every registered tool, as the declarations a request carries.
+        schema: function(): {Def}
     end
     --- `mcp`, the client bridge (`bridge/mcp.rs`): the tools a connected
     --- server lists, and one call to one of them.
@@ -215,8 +229,47 @@ local record host_types
             error: string
             tools: {{string:any}}
         end
+        --- What the listing and reading calls below answer: `ok`, and
+        --- `error` or the one field the call names. Loose for the reason
+        --- `CallResult` is.
+        record Answer
+            ok: boolean
+            error: string
+            server_info: {string:any}
+            resources: any
+            contents: any
+            prompts: any
+            messages: any
+        end
+        --- A progress or log notification, as a handler is handed it.
+        record Notification
+            server: string
+            token: any
+            progress: any
+            total: any
+            message: string
+            logger: any
+            data: any
+            level: string
+        end
+        --- Connect over stdio (name, command, args, opts) or over HTTP
+        --- (name, url, opts); both RAISE on failure.
+        connect: function(string, string, ?{string}, ?{string:any})
+        connect_http: function(string, string, ?{string:any})
+        --- Disconnect a server; RAISES on failure.
+        disconnect: function(string)
         list_tools: function(string): ListResult
         call: function(string, string, any): CallResult
+        --- The handshake's server info, `capabilities` included.
+        server_info: function(string): Answer
+        list_resources: function(string): Answer
+        read_resource: function(string, string): Answer
+        list_prompts: function(string): Answer
+        get_prompt: function(string, string, ?{string:any}): Answer
+        --- The handler a server's `sampling/createMessage` reaches.
+        set_sampling_handler: function(string, function(any): any)
+        on_progress: function(string, function(Notification))
+        on_log: function(string, function(Notification))
     end
     --- `log`, the tracing bridge (`bridge/log.rs`): one message per call,
     --- attributed to the running script.
