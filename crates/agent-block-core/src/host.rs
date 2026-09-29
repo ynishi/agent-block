@@ -92,6 +92,8 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
     // declaration the modules below read: the records `knl.d.tl` used to
     // hold are in the module now, beside its table.
     ("knl", htl::include_tl!("blocks/lib/knl/init.tl")),
+    // Its contracts, as data: the shapes `knl` publishes as `knl.shapes`.
+    ("knl.shapes", htl::include_tl!("blocks/lib/knl/shapes.tl")),
     // Written in Teal, against `knl` (`include_tl!`).
     (
         "knl_adapter",

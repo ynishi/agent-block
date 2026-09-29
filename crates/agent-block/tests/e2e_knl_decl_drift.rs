@@ -3,8 +3,8 @@
 //! `knl.shapes`, `knl.Outcome` — is one a running VM finds on it.
 //!
 //! The module is written in Teal (`crates/agent-block-core/blocks/lib/knl/
-//! init.tl`) and its own record is the declaration, so this reads that
-//! record's fields, asks a VM what `require("knl")` holds
+//! init.tl`, with its shapes in `knl/shapes.tl` beside it) and its own
+//! records are the declaration, so this reads those records' fields, asks a VM what `require("knl")` holds
 //! (`fixtures/knl_decl_keys.lua`), and names any field that is declared and
 //! not there. Teal holds the module to its record at build time, which is
 //! what makes the two agree in the first place; what it cannot see is the
@@ -16,7 +16,13 @@ mod common;
 
 use std::collections::BTreeMap;
 
-const DECLARATION: &str = include_str!("../../agent-block-core/blocks/lib/knl/init.tl");
+/// The files the records are declared in: the module, and the shapes file it
+/// publishes as `knl.shapes` (whose `Shapes` record is declared there, beside
+/// the table it types).
+const DECLARATION: &[&str] = &[
+    include_str!("../../agent-block-core/blocks/lib/knl/init.tl"),
+    include_str!("../../agent-block-core/blocks/lib/knl/shapes.tl"),
+];
 
 /// Which of the module's file-scope records are tables it exports, and the
 /// label the fixture prints each one under. `M` is the module itself and is
@@ -30,15 +36,15 @@ const TABLES: &[(&str, &str)] = &[
 
 /// `label -> declared names`.
 ///
-/// The records are all at the top level of the file — a record nested in `M`
-/// would be a KEY of the module in the generated Lua, which is why they are
-/// declared beside it and aliased in with `type X = X`. So this walks
+/// The records are all at the top level of their file — a record nested in
+/// `M` would be a KEY of the module in the generated Lua, which is why they
+/// are declared beside it and aliased in with `type X = X`. So this walks
 /// top-level `local record <Name>` blocks and takes their indented fields;
 /// an alias line carries no `:` and falls out on its own.
 fn declared() -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut current: Option<String> = None;
-    for raw in DECLARATION.lines() {
+    for raw in DECLARATION.iter().flat_map(|file| file.lines()) {
         let indent = raw.len() - raw.trim_start().len();
         let line = raw.trim();
         if line.starts_with("--") || line.is_empty() {
