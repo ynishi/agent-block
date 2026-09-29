@@ -28,7 +28,7 @@ with the code it describes.
 The entry points for the kernel are the module docs of
 `crates/agent-block-core/src/knl/mod.rs` (the kernel's invariants),
 `crates/agent-block-core/src/bridge/knl.rs` (the syscall surface Lua sees) and
-`crates/agent-block-core/blocks/lib/knl/init.lua` (the Lua kernel: session, device,
+`crates/agent-block-core/blocks/lib/knl/init.tl` (the Lua kernel: session, device,
 beat, Outcome), with its shapes beside it in `knl/shapes.tl`. `cargo doc --open`
 renders the Rust side.
 
@@ -1143,7 +1143,7 @@ spans are at `debug` and this binary logs at `info`.
 The design is in three module docs: `crates/agent-block-core/src/knl/mod.rs`
 (the kernel's invariants), `crates/agent-block-core/src/bridge/knl.rs` (the
 syscall surface Lua sees) and
-`crates/agent-block-core/blocks/lib/knl/init.lua` (this half: beat, device,
+`crates/agent-block-core/blocks/lib/knl/init.tl` (this half: beat, device,
 Outcome, views; the shapes are its sub-module `knl/shapes.tl`).
 
 ### log.*
