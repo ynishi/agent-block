@@ -267,7 +267,8 @@ without replacing it. What the host embeds and `vendor` writes is the
 generated Lua, comments stripped; the module's own words are in the `.tl`.
 `just check-tl` type-checks the tree, `just test-tl` runs the `*_test.tl`
 beside a module (`htl test`), and a Teal module's Lua specs run as before,
-against the Lua the binary embeds.
+against the Lua the binary embeds. The `htl` both recipes run is the release
+`mise.toml` pins (`mise install` puts it on PATH), and CI runs them too.
 
 The opts a public function takes and the values it answers are lshape shapes,
 published under `M.shapes` so a caller reads the contract as data and asserted
