@@ -85,7 +85,7 @@ mlua-pkg     = "0.11"
 # thing this host wants. `macros` is `include_tl!` / `#[host_module]`, `pkg`
 # is the resolver. `dts` (the `.d.tl` a `#[host_module]` declares) is off: this
 # host declares no `#[host_module]` and renders its own `knl_types.d.tl`.
-htl          = { version = "0.10", default-features = false, features = ["macros", "pkg"] }
+htl          = { version = "0.11", default-features = false, features = ["macros", "pkg"] }
 # The SQLite cluster, one line for everything that links it. `libsqlite3-sys`
 # declares `links = "sqlite3"`, so the graph holds exactly one major of it
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38
