@@ -1949,9 +1949,8 @@ async fn register_bridges(
     {
         let ctx = ctx.clone();
         isle.exec(move |lua| {
-            bridge::register_all(lua, &ctx)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("bridge register failed: {e}")))?;
-            Ok(String::new())
+            bridge::register_all(lua, &ctx).map_err(bridge::isle_err("bridge register failed"))?;
+            Ok(())
         })
         .await
         .map_err(|e| BlockError::Runtime(format!("bridge register: {e}")))?;
@@ -1961,10 +1960,9 @@ async fn register_bridges(
         let ctx = ctx.clone();
         handler_isle
             .exec(move |lua| {
-                bridge::register_all_handler_side(lua, &ctx).map_err(|e| {
-                    mlua_isle::IsleError::Lua(format!("handler bridge register failed: {e}"))
-                })?;
-                Ok(String::new())
+                bridge::register_all_handler_side(lua, &ctx)
+                    .map_err(bridge::isle_err("handler bridge register failed"))?;
+                Ok(())
             })
             .await
             .map_err(|e| BlockError::Runtime(format!("handler bridge register: {e}")))?;
@@ -1989,33 +1987,33 @@ async fn inject_host_tools(isle: &Arc<AsyncIsle>, host_tools: &[HostToolSpec]) -
         let registry: mlua::Table = lua
             .globals()
             .get("_TOOL_REGISTRY")
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("get _TOOL_REGISTRY: {e}")))?;
+            .map_err(bridge::isle_err("get _TOOL_REGISTRY"))?;
         for tool in host_tools {
             let entry = lua
                 .create_table()
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("create entry: {e}")))?;
+                .map_err(bridge::isle_err("create entry"))?;
             entry
                 .set("name", tool.name.as_str())
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set name: {e}")))?;
+                .map_err(bridge::isle_err("set name"))?;
             // schema = { description, input_schema } — Anthropic shape
             let schema = lua
                 .create_table()
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("create schema: {e}")))?;
+                .map_err(bridge::isle_err("create schema"))?;
             schema
                 .set("description", tool.description.as_str())
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set description: {e}")))?;
+                .map_err(bridge::isle_err("set description"))?;
             let input_schema_lua = crate::bridge::json_to_lua(lua, tool.input_schema.clone())
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("input_schema: {e}")))?;
+                .map_err(bridge::isle_err("input_schema"))?;
             schema
                 .set("input_schema", input_schema_lua)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set input_schema: {e}")))?;
+                .map_err(bridge::isle_err("set input_schema"))?;
             entry
                 .set("schema", schema)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set schema: {e}")))?;
+                .map_err(bridge::isle_err("set schema"))?;
             if let Some(group) = &tool.group {
                 entry
                     .set("group", group.as_str())
-                    .map_err(|e| mlua_isle::IsleError::Lua(format!("set group: {e}")))?;
+                    .map_err(bridge::isle_err("set group"))?;
             }
             let handler_arc = Arc::clone(&tool.handler);
             let handler_fn = lua
@@ -2030,15 +2028,15 @@ async fn inject_host_tools(isle: &Arc<AsyncIsle>, host_tools: &[HostToolSpec]) -
                         crate::bridge::json_to_lua(&lua, result)
                     }
                 })
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("create handler: {e}")))?;
+                .map_err(bridge::isle_err("create handler"))?;
             entry
                 .set("handler", handler_fn)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("set handler: {e}")))?;
+                .map_err(bridge::isle_err("set handler"))?;
             registry
                 .set(tool.name.as_str(), entry)
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("registry set: {e}")))?;
+                .map_err(bridge::isle_err("registry set"))?;
         }
-        Ok(String::new())
+        Ok(())
     })
     .await
     .map_err(|e| BlockError::Runtime(format!("host_tools inject: {e}")))?;
@@ -2050,10 +2048,10 @@ async fn inject_host_tools(isle: &Arc<AsyncIsle>, host_tools: &[HostToolSpec]) -
 /// optional caller `shutdown_token`. On cancellation the Isle is unwound via
 /// its own cancel token before returning [`BlockError::Cancelled`].
 ///
-/// The returned string is the chunk's value, stringified by the Isle: a Lua
-/// string passes through unchanged, `nil` becomes empty, and a table becomes
-/// `table: 0x…`. A caller that wants structured data back therefore has the
-/// script `return std.json.encode(t)` — see [`run_capture`].
+/// The returned string is the chunk's value, stringified by [`ChunkValue`]: a
+/// Lua string passes through unchanged, `nil` becomes empty, and a table
+/// becomes `table: 0x…`. A caller that wants structured data back therefore
+/// has the script `return std.json.encode(t)` — see [`run_capture`].
 async fn execute_script(
     isle: &Arc<AsyncIsle>,
     script_source: &str,
@@ -2062,7 +2060,7 @@ async fn execute_script(
 ) -> BlockResult<String> {
     let _exec_span = info_span!("execute", script = %script_name);
 
-    let mut task = isle.spawn_coroutine_eval(script_source);
+    let mut task = isle.spawn_coroutine_eval::<ChunkValue>(script_source);
     let task_cancel = task.cancel_token().clone();
     match shutdown_token {
         Some(token) => {
@@ -2077,10 +2075,59 @@ async fn execute_script(
                     info!("shutdown_token: cancelled by caller");
                     Err(BlockError::Cancelled)
                 }
-                res = &mut task => res.map_err(script_failure),
+                res = &mut task => res.map(|v| v.0).map_err(|e| script_failure(isle_error_text(&e))),
             }
         }
-        None => (&mut task).await.map_err(script_failure),
+        None => (&mut task)
+            .await
+            .map(|v| v.0)
+            .map_err(|e| script_failure(isle_error_text(&e))),
+    }
+}
+
+/// `e` as the text a failed script reports: its `Display`, and for a Lua
+/// error the traceback on the lines after it when there is one.
+///
+/// mlua-isle up to 0.6 carried the traceback inside the message; from 0.8 it
+/// is [`LuaFailure::traceback`](mlua_isle::LuaFailure::traceback) and the
+/// `Display` stops at the message. Appending it keeps what a failed block
+/// prints the way it was.
+fn isle_error_text(e: &mlua_isle::IsleError) -> String {
+    match e {
+        mlua_isle::IsleError::Lua(failure) => match &failure.traceback {
+            Some(traceback) => format!("{e}\n{traceback}"),
+            None => e.to_string(),
+        },
+        _ => e.to_string(),
+    }
+}
+
+/// The chunk's value as the string [`run_capture`] promises: a Lua string
+/// unchanged, `nil` as `""`, a number or boolean as its text, anything else
+/// (a table, a function) as Lua's `tostring` of it. Only the first return
+/// value counts.
+///
+/// mlua-isle up to 0.6 converted every result this way itself; from 0.8 a
+/// request asks for a typed result, and a plain `String` would reject `nil`,
+/// booleans and tables. A block whose chunk ends in `return M` or
+/// `return true` is still a successful run, so the conversion is kept here,
+/// on the VM thread, where the value can still be `tostring`-ed.
+struct ChunkValue(String);
+
+impl mlua::FromLua for ChunkValue {
+    fn from_lua(value: mlua::Value, lua: &mlua::Lua) -> mlua::Result<Self> {
+        let text = match value {
+            mlua::Value::Nil => String::new(),
+            mlua::Value::String(s) => s.to_str()?.to_string(),
+            mlua::Value::Integer(n) => n.to_string(),
+            mlua::Value::Number(n) => n.to_string(),
+            mlua::Value::Boolean(b) => b.to_string(),
+            other => lua
+                .globals()
+                .get::<mlua::Function>("tostring")?
+                .call::<String>(other)?,
+        };
+        Ok(Self(text))
     }
 }
 
@@ -2614,5 +2661,61 @@ mod tests {
             BlockError::Script(text) => assert!(text.contains("attempt to index nil")),
             other => panic!("expected Script, got {other:?}"),
         }
+    }
+
+    /// What [`run_capture`] promises about the chunk's value, through the
+    /// same request `execute_script` makes: `nil` is empty, numbers and
+    /// booleans are their text, only the first value counts, and a table is
+    /// its `tostring` rather than a failed run.
+    #[tokio::test]
+    async fn chunk_value_is_the_stringified_first_result() {
+        let (isle, driver) = AsyncIsle::spawn(|_lua: &mlua::Lua| Ok(()))
+            .await
+            .expect("spawn the isle");
+        for (code, want) in [
+            ("return nil", ""),
+            ("return", ""),
+            ("return 'x'", "x"),
+            ("return 42", "42"),
+            ("return 1.5", "1.5"),
+            ("return true", "true"),
+            ("return 'a', 'b'", "a"),
+        ] {
+            let got = isle
+                .coroutine_eval::<ChunkValue>(code)
+                .await
+                .unwrap_or_else(|e| panic!("{code}: {e}"))
+                .0;
+            assert_eq!(got, want, "{code}");
+        }
+        let table = isle
+            .coroutine_eval::<ChunkValue>("return {}")
+            .await
+            .expect("a table is a result, not a failure")
+            .0;
+        assert!(table.starts_with("table: "), "got {table:?}");
+        driver.shutdown().await.expect("shutdown");
+    }
+
+    /// A raise in the script reaches the caller with its message and the
+    /// traceback after it, as it did when mlua-isle kept the traceback in the
+    /// message.
+    #[tokio::test]
+    async fn a_failed_script_keeps_its_message_and_traceback() {
+        let (isle, driver) = AsyncIsle::spawn(|_lua: &mlua::Lua| Ok(()))
+            .await
+            .expect("spawn the isle");
+        let e = match isle
+            .coroutine_eval::<ChunkValue>("local function f() error('boom') end f()")
+            .await
+        {
+            Ok(_) => panic!("the script raised"),
+            Err(e) => e,
+        };
+        let text = isle_error_text(&e);
+        assert!(text.contains("boom"), "got {text:?}");
+        assert!(text.contains("\nstack traceback:"), "got {text:?}");
+        assert!(text.contains("in local 'f'"), "got {text:?}");
+        driver.shutdown().await.expect("shutdown");
     }
 }

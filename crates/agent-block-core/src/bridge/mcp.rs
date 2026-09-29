@@ -20,10 +20,10 @@
 //! ambient inheritance.
 
 use mlua::prelude::*;
-use mlua_isle::IsleError;
 use serde_json::Map;
 use std::sync::Arc;
 
+use super::isle_err;
 use crate::host::HostContext;
 use agent_block_mcp::handler::{
     install_mcp_notify_dispatcher_on_main_isle, MCP_USER_LOG_CBS, MCP_USER_PROGRESS_CBS,
@@ -844,19 +844,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                 .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("set_sampling_handler load: {e}"))
-                                })?;
+                                .map_err(isle_err("set_sampling_handler load"))?;
                             let tbl: LuaTable = lua
                                 .globals()
                                 .get("__mcp_sampling_handlers")
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("set_sampling_handler get table: {e}"))
-                                })?;
-                            tbl.set(server_for_exec.as_str(), loaded).map_err(|e| {
-                                IsleError::Lua(format!("set_sampling_handler set: {e}"))
-                            })?;
-                            Ok(String::new())
+                                .map_err(isle_err("set_sampling_handler get table"))?;
+                            tbl.set(server_for_exec.as_str(), loaded)
+                                .map_err(isle_err("set_sampling_handler set"))?;
+                            Ok(())
                         })
                         .await
                         .map_err(|e| {
@@ -912,19 +907,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                 .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("set_roots_handler load: {e}"))
-                                })?;
+                                .map_err(isle_err("set_roots_handler load"))?;
                             let tbl: LuaTable = lua
                                 .globals()
                                 .get("__mcp_roots_handlers")
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("set_roots_handler get table: {e}"))
-                                })?;
-                            tbl.set(server_for_exec.as_str(), loaded).map_err(|e| {
-                                IsleError::Lua(format!("set_roots_handler set: {e}"))
-                            })?;
-                            Ok(String::new())
+                                .map_err(isle_err("set_roots_handler get table"))?;
+                            tbl.set(server_for_exec.as_str(), loaded)
+                                .map_err(isle_err("set_roots_handler set"))?;
+                            Ok(())
                         })
                         .await
                         .map_err(|e| {
@@ -981,21 +971,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                                 .set_mode(mlua::chunk::ChunkMode::Binary)
                                 .set_name(&bytecode_name)
                                 .into_function()
-                                .map_err(|e| {
-                                    IsleError::Lua(format!("set_elicitation_handler load: {e}"))
-                                })?;
+                                .map_err(isle_err("set_elicitation_handler load"))?;
                             let tbl: LuaTable = lua
                                 .globals()
                                 .get("__mcp_elicitation_handlers")
-                                .map_err(|e| {
-                                    IsleError::Lua(format!(
-                                        "set_elicitation_handler get table: {e}"
-                                    ))
-                                })?;
-                            tbl.set(server_for_exec.as_str(), loaded).map_err(|e| {
-                                IsleError::Lua(format!("set_elicitation_handler set: {e}"))
-                            })?;
-                            Ok(String::new())
+                                .map_err(isle_err("set_elicitation_handler get table"))?;
+                            tbl.set(server_for_exec.as_str(), loaded)
+                                .map_err(isle_err("set_elicitation_handler set"))?;
+                            Ok(())
                         })
                         .await
                         .map_err(|e| {

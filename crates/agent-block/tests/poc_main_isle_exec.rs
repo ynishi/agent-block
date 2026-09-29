@@ -30,49 +30,26 @@ _G.get_counter = function() return counter end
 /// Run `__user_cbs["test"]` on the main Isle via `exec`, passing an empty
 /// table as the event argument.  Returns the value returned by the Lua closure
 /// (the current counter value after increment).
-///
-/// `exec` returns `Result<String, IsleError>`, so the counter is serialised to
-/// a decimal string and parsed back by the caller.
 async fn call_user_cb(isle: &AsyncIsle) -> i64 {
-    let s = isle
-        .exec(|lua| {
-            let tbl: mlua::Table = lua
-                .globals()
-                .get("__user_cbs")
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("get __user_cbs: {e}")))?;
-            let cb: mlua::Function = tbl
-                .get("test")
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("get __user_cbs[\"test\"]: {e}")))?;
-            // Pass an empty table as the `ev` argument — the POC closure ignores it.
-            let ev = lua
-                .create_table()
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("create ev table: {e}")))?;
-            let n: i64 = cb.call(ev).map_err(|e| {
-                mlua_isle::IsleError::Lua(format!("call __user_cbs[\"test\"]: {e}"))
-            })?;
-            Ok(n.to_string())
-        })
-        .await
-        .expect("exec should not fail");
-    s.parse::<i64>().expect("counter must be a valid integer")
+    isle.exec(|lua| {
+        let tbl: mlua::Table = lua.globals().get("__user_cbs")?;
+        let cb: mlua::Function = tbl.get("test")?;
+        // Pass an empty table as the `ev` argument — the POC closure ignores it.
+        let ev = lua.create_table()?;
+        Ok(cb.call::<i64>(ev)?)
+    })
+    .await
+    .expect("exec should not fail")
 }
 
 /// Read `_G.get_counter()` from the main Isle to verify the upvalue state.
 async fn read_counter(isle: &AsyncIsle) -> i64 {
-    let s = isle
-        .exec(|lua| {
-            let get_counter: mlua::Function = lua
-                .globals()
-                .get("get_counter")
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("get get_counter: {e}")))?;
-            let n: i64 = get_counter
-                .call(())
-                .map_err(|e| mlua_isle::IsleError::Lua(format!("call get_counter: {e}")))?;
-            Ok(n.to_string())
-        })
-        .await
-        .expect("exec should not fail");
-    s.parse::<i64>().expect("counter must be a valid integer")
+    isle.exec(|lua| {
+        let get_counter: mlua::Function = lua.globals().get("get_counter")?;
+        Ok(get_counter.call::<i64>(())?)
+    })
+    .await
+    .expect("exec should not fail")
 }
 
 #[tokio::test]
@@ -84,10 +61,8 @@ async fn main_isle_exec_preserves_upvalue() {
 
     // ── Load the setup script that registers the upvalue-capturing closure ──
     isle.exec(|lua| {
-        lua.load(SETUP_SCRIPT)
-            .exec()
-            .map_err(|e| mlua_isle::IsleError::Lua(format!("setup script: {e}")))?;
-        Ok(String::new())
+        lua.load(SETUP_SCRIPT).exec()?;
+        Ok(())
     })
     .await
     .expect("setup script exec should succeed");

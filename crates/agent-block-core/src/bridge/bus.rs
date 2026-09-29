@@ -108,10 +108,11 @@ pub fn is_serving() -> bool {
 
 use async_trait::async_trait;
 use mlua::prelude::*;
-use mlua_isle::{AsyncIsle, CancelToken, IsleError};
+use mlua_isle::{AsyncIsle, IsleError};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use super::isle_err;
 use crate::bus::{AckResult, Event, EventBus, Handler};
 use crate::host::HostContext;
 use agent_block_types::error::BlockError;
@@ -145,10 +146,10 @@ struct LuaHandler {
 #[async_trait]
 impl Handler for LuaHandler {
     async fn call(&self, kind: String, id: String, payload: Value, meta: Value) -> AckResult {
-        // Encode payload and meta as JSON strings — AsyncIsle's coroutine
-        // call channel only carries `&[&str]` arguments. The Lua-side
-        // dispatcher re-decodes them with `std.json.decode` before invoking
-        // the user handler.
+        // Encode payload and meta as JSON strings — the arguments cross to
+        // the Isle thread, and a Lua table cannot be built on this side. The
+        // Lua-side dispatcher re-decodes them with `std.json.decode` before
+        // invoking the user handler.
         let payload_str = serde_json::to_string(&payload).map_err(|e| {
             tracing::error!(%kind, %id, error = %e, "bus: payload JSON encode failed");
             BlockError::Bus(format!("payload encode: {e}"))
@@ -158,22 +159,20 @@ impl Handler for LuaHandler {
             BlockError::Bus(format!("meta encode: {e}"))
         })?;
 
-        let args: [&str; 4] = [&kind, &id, &payload_str, &meta_str];
-        // Spawn the coroutine call as an AsyncTask so we retain a cancel
-        // handle. If this future is dropped (e.g. `run_with_grace` timed
-        // out and is dropping the dispatcher chain), the Drop guard fires
-        // the cancel token, which the Isle's debug hook picks up at the
-        // next HOOK_INTERVAL. Without this guard the Isle thread would
-        // run the Lua handler to completion — defeating the grace window.
-        let task = self.isle.spawn_coroutine_call(BUS_DISPATCH_FN, &args);
-        struct CancelOnDrop(CancelToken);
-        impl Drop for CancelOnDrop {
-            fn drop(&mut self) {
-                self.0.cancel();
-            }
-        }
-        let guard = CancelOnDrop(task.cancel_token().clone());
-        let result_str = task.await.map_err(|e| {
+        let args = (kind.clone(), id.clone(), payload_str, meta_str);
+        // If this future is dropped before the handler finishes (e.g.
+        // `run_with_grace` timed out and is dropping the dispatcher chain),
+        // the Lua handler must stop too, or the Isle thread would run it to
+        // completion — defeating the grace window. The `AsyncTask` does that
+        // itself: dropping one that has not resolved cancels its token
+        // (mlua-isle 0.7+), which the Isle's debug hook picks up at the next
+        // hook interval. A resolved task is released and its drop cancels
+        // nothing. So no guard of our own, and no `.detach()` — detaching is
+        // exactly the behaviour this path must not have.
+        let task = self
+            .isle
+            .spawn_coroutine_call::<_, Option<String>>(BUS_DISPATCH_FN, args);
+        let result = task.await.map_err(|e| {
             tracing::error!(%kind, %id, error = %e, "bus: Lua dispatch failed");
             match e {
                 IsleError::Cancelled => BlockError::Bus("handler cancelled".into()),
@@ -181,15 +180,11 @@ impl Handler for LuaHandler {
                 other => BlockError::Bus(format!("isle error: {other}")),
             }
         })?;
-        // Normal completion: the coroutine already finished, so cancelling
-        // is a no-op but sends a spurious signal to the next caller if the
-        // CancelToken is later reused. Forget the guard to skip cancel.
-        std::mem::forget(guard);
 
-        // Empty string ≈ Lua nil (see `lua_value_to_string` in mlua-isle).
-        if result_str.is_empty() {
+        // `nil` from the dispatcher means the handler returned nothing.
+        let Some(result_str) = result else {
             return Ok(Value::Null);
-        }
+        };
 
         match serde_json::from_str::<Value>(&result_str) {
             Ok(v) => Ok(v),
@@ -316,14 +311,14 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             .set_mode(mlua::chunk::ChunkMode::Binary)
                             .set_name(&bytecode_name)
                             .into_function()
-                            .map_err(|e| IsleError::Lua(format!("bus.on load: {e}")))?;
+                            .map_err(isle_err("bus.on load"))?;
                         let tbl: LuaTable = lua
                             .globals()
                             .get(BUS_HANDLERS_TBL)
-                            .map_err(|e| IsleError::Lua(format!("bus.on handlers tbl: {e}")))?;
+                            .map_err(isle_err("bus.on handlers tbl"))?;
                         tbl.set(kind_for_exec.as_str(), loaded)
-                            .map_err(|e| IsleError::Lua(format!("bus.on set: {e}")))?;
-                        Ok(String::new())
+                            .map_err(isle_err("bus.on set"))?;
+                        Ok(())
                     })
                     .await
                     .map_err(|e| {
@@ -395,11 +390,11 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
                             .set_mode(mlua::chunk::ChunkMode::Binary)
                             .set_name(&bytecode_name)
                             .into_function()
-                            .map_err(|e| IsleError::Lua(format!("bus.on_any load: {e}")))?;
+                            .map_err(isle_err("bus.on_any load"))?;
                         lua.globals()
                             .set(BUS_ON_ANY_GLOBAL, loaded)
-                            .map_err(|e| IsleError::Lua(format!("bus.on_any set: {e}")))?;
-                        Ok(String::new())
+                            .map_err(isle_err("bus.on_any set"))?;
+                        Ok(())
                     })
                     .await
                     .map_err(|e| {
@@ -550,7 +545,9 @@ pub fn register(lua: &Lua, ctx: &HostContext) -> LuaResult<()> {
 /// 2. Decodes `payload_json` and `meta_json` into Lua tables.
 /// 3. Calls the handler with `(event_table)` where `event_table` contains
 ///    `kind`, `id`, `payload`, `meta`.
-/// 4. JSON-encodes the return value and returns it as a string.
+/// 4. JSON-encodes the return value and returns it as a string, or returns
+///    `nil` when the handler returned `nil` ([`LuaHandler::call`] asks for
+///    `Option<String>` and acks `null`).
 ///
 /// Errors are propagated as Lua errors — the Isle converts them into
 /// [`IsleError::Lua`], which [`LuaHandler::call`] wraps into
@@ -607,7 +604,7 @@ pub(crate) fn install_bus_dispatcher_on_handler_isle(lua: &Lua) -> LuaResult<()>
             }
             local ret = h(ev)
             if ret == nil then
-                return ""
+                return nil
             end
             return std.json.encode(ret)
         end
@@ -907,12 +904,15 @@ mod tests {
 
         // Both submitted before either is awaited, so the Isle's receive loop
         // spawn_locals them onto the same LocalSet and they interleave.
-        let handler = isle.spawn_coroutine_call(BUS_DISPATCH_FN, &["slow", "e1", "{}", "{}"]);
-        let ticker = isle.spawn_coroutine_call("__tick_loop", &[]);
+        let handler = isle
+            .spawn_coroutine_call::<_, Option<String>>(BUS_DISPATCH_FN, ("slow", "e1", "{}", "{}"));
+        let ticker = isle.spawn_coroutine_call::<_, i64>("__tick_loop", ());
         let (handled, ticked) = tokio::join!(handler, ticker);
 
         ticked.expect("the ticker coroutine ran to completion");
-        let out = handled.expect("the handler coroutine ran to completion");
+        let out = handled
+            .expect("the handler coroutine ran to completion")
+            .expect("the handler returned a table, so the dispatcher returns JSON");
         let got: Value = serde_json::from_str(&out).expect("handler returned JSON");
         let during = got["during"].as_i64().expect("during is a number");
 
