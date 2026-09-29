@@ -169,7 +169,7 @@ mod tests {
             .contains("lust."));
         assert!(specs_of("session").is_empty(), "session has no spec/");
         assert!(specs_of("no_such_module").is_empty());
-        // `agent` and `coding` are blocks, not under `lib/`, and are listed too.
+        // `agent` and `coding`, the two blocks, are listed too.
         assert!(!specs_of("agent").is_empty());
         assert!(!specs_of("coding").is_empty());
     }

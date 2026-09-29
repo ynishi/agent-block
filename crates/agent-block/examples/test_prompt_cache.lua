@@ -28,7 +28,8 @@
 --     edits from the byte-exact cache key. When caching is primary,
 --     run without the cm beta.
 --
--- See blocks/agent/init.lua `llm_call` for the full caching spec notes.
+-- See blocks/lib/llm_proto/anthropic.tl (`cache_control`) for the full caching
+-- spec notes; `agent.run` forwards the knob to the provider Port verbatim.
 
 local agent = require("agent")
 

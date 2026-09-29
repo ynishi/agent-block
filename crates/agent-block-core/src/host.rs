@@ -28,12 +28,15 @@ use tokio_util::sync::CancellationToken;
 /// Embedded Lua sources for the blocks that expose a tool surface.
 ///
 /// Baked into the binary at compile time so `cargo install` works without any
-/// extra file distribution. The `require` name on the left is independent of
-/// the path on the right: `blocks/` is laid out by role (`agent/` runtime,
-/// `lib/`) while callers keep writing `require("agent")`.
+/// extra file distribution. The two names here are the tool surface
+/// [`inspect_tools`] reports; that is the whole difference from
+/// [`EMBEDDED_LIBS`]. Where the source sits is not: every embedded module
+/// lives under `blocks/lib/<name>/`, the two blocks included, and
+/// `require("agent")` answers the same table either way.
 pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
-    ("agent", include_str!("../blocks/agent/init.lua")),
-    ("coding", include_str!("../blocks/coding/init.lua")),
+    // Written in Teal, against `knl` (`include_tl!`).
+    ("agent", htl::include_tl!("blocks/lib/agent/init.tl")),
+    ("coding", htl::include_tl!("blocks/lib/coding/init.tl")),
 ];
 
 /// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]
@@ -1480,12 +1483,13 @@ fn build_isle_init(
                     warn!(root = %root.display(), error = %e, "TealResolver init skipped");
                 }
             }
-            // Symlink-aware, not the plain constructor: this repo's own
-            // `blocks/agent` is a symlink into `crates/agent-block-core/blocks/`,
-            // and the default sandbox rejects anything whose canonical path
-            // leaves the root. That rejection is `Some(Err)`, which does not
-            // fall through to the next resolver, so one symlinked block
-            // directory would break `require` for every module.
+            // Symlink-aware, not the plain constructor: a project may link a
+            // module directory in from elsewhere (`lib/<name>` pointing at a
+            // checkout of its own), and the default sandbox rejects anything
+            // whose canonical path leaves the root. That rejection is
+            // `Some(Err)`, which does not fall through to the next resolver,
+            // so one symlinked module directory would break `require` for
+            // every module.
             match mlua_pkg::resolvers::FsResolver::new_symlink_aware(root.clone()) {
                 Ok(resolver) => {
                     registry.add(resolver);

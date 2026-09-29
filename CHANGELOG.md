@@ -275,6 +275,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The two consumers, `agent` and `coding`, are written in Teal and live
+  under `blocks/lib/` with every other embedded module
+  (`blocks/lib/agent/init.tl`, `blocks/lib/coding/init.tl`). They were the
+  last embedded modules in Lua, and they sat where `htl check` could not
+  see them: the checker reads the modules under `blocks/lib`, and a block
+  at `blocks/<name>/` belongs to none of them. Nothing changes for a
+  caller — `require("agent")` and `require("coding")` answer the same
+  tables, `agent-block vendor agent` still writes `lib/agent/init.lua` (the
+  Lua the binary embeds, as for every Teal module), and `inspect_tools`
+  reports the same two blocks. Both take one shape now, stated in the code
+  rather than the header: `prepare` takes the opts to a `Run` — for `agent`
+  the provider, the MCP servers connected and every tool source bound into
+  one map; for `coding` the tripwires, the targets, the fs tools locked to
+  them, the seed, the system line and the seams — `run_loop` drives the
+  beats, and `result_of` reads what it answered into the result callers
+  have always read. `host_types.d.tl` declares what the two read of the
+  host that nothing had declared: `tool.call` / `tool.schema`, the `mcp`
+  functions, and `std.fs.tool_specs`. `policy.require_args`'s published
+  type takes its opts as optional, as the function always did.
+
 - The kernel's shapes are a sub-module, `knl.shapes` (`blocks/lib/knl/
   shapes.tl`). `knl/init.tl` held the code and, in the middle of it, a
   thousand lines of data — every public contract as an lshape and the
