@@ -87,7 +87,7 @@ dependencies = [
  "libc",
  "llm-extract",
  "mlua",
- "mlua-batteries 0.6.0",
+ "mlua-batteries",
  "mlua-batteries-sqlite",
  "mlua-isle",
  "mlua-pkg",
@@ -1247,7 +1247,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "mlua",
- "mlua-batteries 0.7.3",
+ "mlua-batteries",
  "mlua-isle",
  "mlua-pkg",
  "semver",
@@ -1877,9 +1877,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-batteries"
-version = "0.6.0"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95078e19c6755dedecec60695252efad5f1b9ec4804780664d98b000e6c43956"
+checksum = "a3ff8949ba32bdbb67ec75984737be6526f56a54793a810861a5b213d81c4cce"
 dependencies = [
  "globset",
  "mlua",
@@ -1890,23 +1890,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "mlua-batteries"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3ff8949ba32bdbb67ec75984737be6526f56a54793a810861a5b213d81c4cce"
-dependencies = [
- "mlua",
- "serde_json",
-]
-
-[[package]]
 name = "mlua-batteries-sqlite"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bf8ef8d8cb9afb263defa9123f0d5eacb079b005ec9845bce3381a9d16e4cad"
+checksum = "16a0fb54ac50cdfabf847878ce62f9128764331be8a5744807b5bc8d1142afbf"
 dependencies = [
  "mlua",
- "mlua-batteries 0.6.0",
+ "mlua-batteries",
  "rusqlite",
  "serde_json",
  "tokio",

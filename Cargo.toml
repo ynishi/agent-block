@@ -51,7 +51,13 @@ mlua         = { version = "0.12", features = ["lua54", "vendored", "async", "se
 # `std.http.*` / `std.fs.*` entries with async ones so a script cannot park the
 # VM thread; the host installs it right after `register_all` (see `host.rs`).
 # It lives behind the `task` feature, which is in the list below.
-mlua-batteries = { version = "0.6.0", features = ["json", "fs", "env", "path", "time", "task"] }
+#
+# 0.7 is the version htl-core 0.11 builds against (its proc macros' checker
+# reads the `std.*` declarations mlua-batteries ships), so one version here
+# means one copy in the graph. Default features are off and the list is
+# spelled out: 0.7's defaults add `pretty` and `argparse`, and the modules a
+# script sees under `std.*` are exactly the eight below, as they were on 0.6.
+mlua-batteries = { version = "0.7.3", default-features = false, features = ["json", "env", "path", "time", "string", "validate", "fs", "task"] }
 # The `std.sql` / `std.kv` batteries, split out of mlua-batteries at 0.5. Kept
 # out of the workspace-wide default set and pulled in only under the
 # agent-block-core `sqlite` feature, which is what that feature has always
@@ -65,8 +71,9 @@ mlua-batteries = { version = "0.6.0", features = ["json", "fs", "env", "path", "
 #
 # 0.8 is the rusqlite 0.40 track (API unchanged); it moves with `rusqlite` /
 # `rusqlite-isle` / `eventsdb-sqlite` below, because `libsqlite3-sys` declares
-# `links = "sqlite3"` and a graph holds exactly one of it.
-mlua-batteries-sqlite = "0.8"
+# `links = "sqlite3"` and a graph holds exactly one of it. 0.8.1 is the one
+# that takes mlua-batteries 0.7 (0.8.0 wanted 0.6).
+mlua-batteries-sqlite = "0.8.1"
 # Composable `require` resolution (Registry / FsResolver / MemoryResolver).
 # Owns module lookup for blocks/ so embedded sources and filesystem overrides
 # share one priority chain instead of two parallel mechanisms.
@@ -80,9 +87,11 @@ mlua-pkg     = "0.11"
 # `.tl` is type-checked at `cargo build` (`include_tl!`) and resolved through
 # the `require` chain above (its resolver is written against the mlua-pkg
 # this chain is built on, which is why that one is 0.11). Default features
-# are off on purpose: `std` would pull a second `mlua-batteries` (0.7) beside
-# the one above, and two of them registering `std.*` into one state is not a
-# thing this host wants. `macros` is `include_tl!` / `#[host_module]`, `pkg`
+# are off on purpose: `std` is `Htl::install_std`, which would register a second
+# `std.*` into a state this host already fills from mlua-batteries above (the
+# proc macros' checker builds against mlua-batteries whatever this says, which
+# is why the two lines name the same version). `macros` is `include_tl!` /
+# `#[host_module]`, `pkg`
 # is the resolver. `dts` (the `.d.tl` a `#[host_module]` declares) is off: this
 # host declares no `#[host_module]` and renders its own `knl_types.d.tl`.
 htl          = { version = "0.11", default-features = false, features = ["macros", "pkg"] }
