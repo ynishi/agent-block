@@ -1,5 +1,5 @@
 //! Runs the repository's mlua-lspec specs: each module's own
-//! `crates/agent-block-core/blocks/{,lib/}<module>/spec/`, plus any lspec
+//! `crates/agent-block-core/blocks/lib/<module>/spec/`, plus any lspec
 //! fixture left in `crates/agent-block/tests/fixtures/`.
 //!
 //! ```text
@@ -67,7 +67,7 @@ fn is_spec(source: &str) -> bool {
 }
 
 /// Every directory a spec may live in: the shared fixture directory, then one
-/// `spec/` per block that has one.
+/// `spec/` per module under `blocks/lib/` that has one.
 ///
 /// A block without a `spec/` is skipped rather than reported: not every block
 /// has unit tests, and a missing directory there is not a broken layout. The
@@ -76,19 +76,16 @@ fn is_spec(source: &str) -> bool {
 fn spec_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![root.join("crates/agent-block/tests/fixtures")];
 
-    // Both places a module lives: `blocks/lib/<name>/` (the libraries, and
-    // `agent`) and `blocks/<name>/` (`coding`, until it moves under `lib/`
-    // too). A spec sits in the `spec/` of whichever its module is in.
-    let blocks = root.join("crates/agent-block-core/blocks");
-    let mut block_specs: Vec<PathBuf> = Vec::new();
-    for parent in [blocks.clone(), blocks.join("lib")] {
-        let entries =
-            std::fs::read_dir(&parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
-        block_specs.extend(entries.filter_map(|entry| {
+    // The one place a module lives: `blocks/lib/<name>/`, the libraries and
+    // the two blocks alike. A spec sits in its module's `spec/`.
+    let lib = root.join("crates/agent-block-core/blocks/lib");
+    let entries = std::fs::read_dir(&lib).unwrap_or_else(|e| panic!("{}: {e}", lib.display()));
+    let mut block_specs: Vec<PathBuf> = entries
+        .filter_map(|entry| {
             let spec = entry.expect("readable directory entry").path().join("spec");
             spec.is_dir().then_some(spec)
-        }));
-    }
+        })
+        .collect();
     // read_dir order is the filesystem's; sort so a run is reproducible.
     block_specs.sort();
 

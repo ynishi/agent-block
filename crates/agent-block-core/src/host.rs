@@ -30,14 +30,13 @@ use tokio_util::sync::CancellationToken;
 /// Baked into the binary at compile time so `cargo install` works without any
 /// extra file distribution. The two names here are the tool surface
 /// [`inspect_tools`] reports; that is the whole difference from
-/// [`EMBEDDED_LIBS`]. Where the source sits is not: an embedded module lives
-/// under `blocks/lib/<name>/`, a block included, and `require("agent")`
-/// answers the same table either way. `coding` is the one still at
-/// `blocks/coding/`, on `include_str!`, until it takes the same form.
+/// [`EMBEDDED_LIBS`]. Where the source sits is not: every embedded module
+/// lives under `blocks/lib/<name>/`, the two blocks included, and
+/// `require("agent")` answers the same table either way.
 pub(crate) const EMBEDDED_BLOCKS: &[(&str, &str)] = &[
     // Written in Teal, against `knl` (`include_tl!`).
     ("agent", htl::include_tl!("blocks/lib/agent/init.tl")),
-    ("coding", include_str!("../blocks/coding/init.lua")),
+    ("coding", htl::include_tl!("blocks/lib/coding/init.tl")),
 ];
 
 /// Embedded Lua support libraries — `require`-able like [`EMBEDDED_BLOCKS`]

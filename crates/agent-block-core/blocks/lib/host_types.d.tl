@@ -104,6 +104,25 @@ local record host_types
             write: function(string, string)
             --- Restore the content the last successful edit replaced.
             rollback: function(string): {string:any}
+            --- What `tool_specs` takes: `fs_tools`' `Opts`, which the
+            --- bridge installs its functions from.
+            record ToolSpecsOpts
+                allowed: {string}
+                prefix: string
+                path_lock: {string}
+                limits: any
+            end
+            --- One file tool, as `tool_specs` hands it out: `fs_tools`'
+            --- `Spec`, one `knl.shapes.tool_spec`.
+            record ToolSpec
+                name: string
+                description: string
+                input_schema: {string:any}
+                handler: function(any): {string:any}
+            end
+            --- The file tools a model is handed, one per op `allowed`
+            --- names that the library builds (`fs_tools.tool_specs`).
+            tool_specs: function(ToolSpecsOpts): {ToolSpec}
         end
         --- The environment.
         record Env

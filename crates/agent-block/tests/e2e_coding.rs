@@ -1,6 +1,6 @@
 //! `coding.run` end to end, against a scripted in-process model.
 //!
-//! The specs in `blocks/coding/spec/` cover the module's pure parts — what the
+//! The specs in `blocks/lib/coding/spec/` cover the module's pure parts — what the
 //! seed is made of, what the opts refuse, what `decide` decides. Nothing ran
 //! the loop itself: the tests here do, through the real binary, the real
 //! bridges (`sh.exec` runs the verify, `std.fs` applies the edit) and a mock
