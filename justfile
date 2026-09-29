@@ -113,7 +113,9 @@ test-lua-project dir filter="":
 # Type-check the Teal side of the embedded modules: every `.tl` under
 # `blocks/lib`, strict (a warning is an error), with `crates/agent-block-core/
 # htl.toml` saying where the checker resolves requires from. `htl` is the CLI
-# (`cargo install htl-cli`; mise pins it), on the same terms as stylua. Zero
+# (`htl-cli` on crates.io), pinned in `mise.toml`: `mise install`, or
+# `cargo install htl-cli --version <that> --locked`. CI runs this and `test-tl`
+# against that same version (.github/workflows/teal.yml). Zero
 # `.tl` files is a pass — the gate is in `check` from before the first module
 # moves, so the day one does, nothing has to be wired.
 check-tl:

@@ -1,0 +1,36 @@
+# The Teal gate: `just check-tl` and `just test-tl`, run as the two htl
+# commands those recipes are (the runner has no `just`). Neither needs the
+# network or an API key: `htl check` reads the `.tl` / `.d.tl` under
+# `blocks/lib` with `crates/agent-block-core/htl.toml`, and `htl test` runs
+# each `*_test.tl` in a Lua state of its own.
+#
+# The htl version is read from `mise.toml`, the one place it is pinned, so a
+# bump there is a bump here.
+
+name: Teal
+permissions:
+  "contents": "read"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  teal:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install htl
+        shell: bash
+        run: |
+          version=$(sed -n 's/^"cargo:htl-cli" = "\(.*\)"$/\1/p' mise.toml)
+          test -n "$version" || { echo "mise.toml pins no cargo:htl-cli" >&2; exit 1; }
+          cargo install htl-cli --version "$version" --locked
+      - name: Type-check the Teal modules (just check-tl)
+        run: htl check --strict crates/agent-block-core/blocks/lib
+      - name: Run the Teal specs (just test-tl)
+        run: htl test crates/agent-block-core/blocks/lib
