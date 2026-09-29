@@ -275,6 +275,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The kernel's shapes are a sub-module, `knl.shapes` (`blocks/lib/knl/
+  shapes.tl`). `knl/init.tl` held the code and, in the middle of it, a
+  thousand lines of data — every public contract as an lshape and the
+  registry that names the shape of each export. The data reads nothing of the
+  code's, so it is in a file of its own now, required by `init.tl` and
+  published as `knl.shapes` unchanged: a caller reads `require("knl").shapes`
+  as before and the 33 keys are the ones they were. What is visible from
+  outside is `agent-block vendor knl`, which writes `lib/knl/shapes.lua`
+  beside `lib/knl/init.lua` as it writes every module with its sub-modules,
+  and the spec runner, whose freshness check reads every `.tl` beside a
+  module's `init.tl` rather than that file alone. `fs_tools.tool_specs` is
+  one builder per op behind a `<total>` map and a context built once, from a
+  single 725-line function, and answers the same specs in the same order.
+  The Lua specs stand in for the `knl` bridge with one fake,
+  `knl/spec/fake_bridge.lua`, where four carried their own; a spec of the
+  fake pins what it mirrors.
+
 - `knl` is written in Teal, and its declaration is the module. The kernel was
   the last of the embedded modules still in Lua, typed for the ones above it
   by a hand-written `blocks/lib/knl.d.tl` that a drift test held to the
