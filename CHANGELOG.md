@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.40.0] - 2026-09-29
+
+### Added
+
 - `policy.split({ port, conf?, reserve?, used? })` hands the window's split
   back as a value: `{ window, max_output, limit, held }` — the profile's
   window and the wire's cap (0 for none), the most a request may cost, and
