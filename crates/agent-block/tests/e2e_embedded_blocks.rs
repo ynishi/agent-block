@@ -87,7 +87,7 @@ fn every_embedded_module_answers_a_table() {
         .args(["-s", &common::fixture("embedded_every_module.lua")])
         .assert()
         .success()
-        .stdout(predicate::str::contains("checked=28"))
+        .stdout(predicate::str::contains("checked=29"))
         .stdout(predicate::str::contains("FAIL").not())
         .stdout(predicate::str::contains("ok"));
 }

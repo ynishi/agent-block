@@ -15,96 +15,15 @@
 --   4 end-to-end over the kernel: a beat whose model answers with tool_use
 --     runs the bound handler and closes the pair (ok=true / raise=>ok=false).
 --
--- A fake `knl` bridge stands in for the Rust syscall layer (same fake as
--- knl/spec/device_spec.lua), installed BEFORE require("knl").
+-- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
+-- the shared stand-in (knl/spec/fake_bridge.lua, which says which bridge
+-- facts it mirrors) is installed BEFORE require("knl"). No case here grants a
+-- budget, so every reservation is allowed and nothing is recorded — the
+-- kernel's "no budget, no ledger" answer.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Fake `knl` bridge
--- ─────────────────────────────────────────────────────────────────────────────
-
-local minted = 0
-local opened = 0
-
-local function fake_session(opts)
-    opts = opts or {}
-    opened = opened + 1
-    local id = string.format("sess-%06d", opened)
-    local s = {
-        _events = {},
-        -- One entry per `query` call: { sql, params, opts }.
-        _queries = {},
-        -- What every `query` answers, until a case puts rows here.
-        _query_rows = {},
-        _seq = 0,
-        _owner = opts.owner or "anon",
-    }
-    -- Identity: the three readings the kernel answers. They are here because
-    -- `knl.beat` asks a value for the whole session surface before it treats
-    -- it as a session — a fake that answered less would not be one.
-    function s:id()
-        return id
-    end
-    function s:scope_id()
-        return "scope-" .. id
-    end
-    function s:owner()
-        return self._owner
-    end
-    -- An append records: the kernel stamps seq and stores every other field
-    -- as written, `beat` (the shell's declared id) included.
-    function s:append(ev)
-        self._seq = self._seq + 1
-        ev.seq = self._seq
-        self._events[#self._events + 1] = ev
-        return ev.seq
-    end
-    function s:events()
-        return self._events
-    end
-    function s:len()
-        return #self._events
-    end
-    -- The one named fold. Nothing here folds anything — what `tail` answers
-    -- is the kernel's — and the method is carried because the surface has it.
-    function s:view(_name, _opts)
-        error("knl: view: validation: unknown view")
-    end
-    -- The SQL read. No SQLite stands behind this: the fake records the
-    -- statement and answers whatever a case queued, exactly as the sibling
-    -- fakes in `knl/spec` do. No case here reads the log with SQL; the method
-    -- is part of the surface, so the stand-in answers it.
-    function s:query(sql, params, opts)
-        self._queries[#self._queries + 1] = { sql = sql, params = params, opts = opts }
-        return self._query_rows, false
-    end
-    -- No grant here, so every reservation is allowed and nothing is
-    -- recorded — the kernel's "no budget, no ledger" answer.
-    function s:reserve(_n)
-        return true
-    end
-    -- The write IS the result: spend answers nothing (the kernel's surface).
-    function s:spend(_n) end
-    function s:remaining()
-        return nil
-    end
-    function s:exhausted()
-        return false
-    end
-    function s:close() end
-    return s
-end
-
-knl = {
-    open = function(o)
-        return fake_session(o)
-    end,
-    new_beat_id = function()
-        minted = minted + 1
-        return string.format("beat-%06d", minted)
-    end,
-}
+require("knl.spec.fake_bridge").install()
 
 local kernel = require("knl")
 local adapter = require("knl_adapter")

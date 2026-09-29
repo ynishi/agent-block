@@ -31,6 +31,7 @@ local NAMES = {
     "mcp_tools",
     "host_types",
     "knl",
+    "knl.shapes",
     "knl_adapter",
     "policy",
     "policy.shared",

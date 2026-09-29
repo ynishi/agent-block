@@ -16,199 +16,30 @@
 --     pairs carry the same declared id as the response.
 --
 -- The Rust `knl` syscall bridge is not present in the pure lspec runner, so
--- a faithful Lua fake stands in below. It reproduces the facts the model
--- rests on, mirroring crates/agent-block-core/src/bridge/knl.rs:
---   * append overwrites the kernel-owned seq/epoch_ms and passes every other
---     field through untouched — `beat` included (there is no author field,
---     and no beat numbering: the kernel stores the id it is given);
---   * reserve is the only decision point: it deducts, or refuses with the
---     grant's tag and leaves the balance alone;
---   * query records the statement it was given and answers whatever the case
---     queued (no SQLite stands behind it — what a statement SELECTS is asked
---     in crates/agent-block/tests/fixtures/knl_beat_test.lua);
---   * new_beat_id mints a fresh, time-ordered id per call.
+-- the shared stand-in (knl/spec/fake_bridge.lua, which says which bridge
+-- facts it mirrors) is installed below. This file asks it for the kernel's
+-- lifecycle writes (`session_opened` / `session_closed`) and a clock, so the
+-- log a beat leaves reads the way the kernel's does around it; the ledger
+-- writes stay off, because the balance is read here with `remaining()`.
 -- The e2e coverage against the *real* bridge lives in
 -- crates/agent-block/tests/fixtures/knl_beat_test.lua.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Fake `knl` bridge (installed as a global BEFORE require("knl"), which is
--- what the module captures as its syscall layer at load time).
--- ─────────────────────────────────────────────────────────────────────────────
-
-local uuid_counter = 0
-local minted = 0
-
-local COUNTERS = { "input_tokens", "output_tokens", "thinking_tokens" }
-
-local function fake_session(opts)
-    opts = opts or {}
-    local owner = opts.owner or "anon"
-    local grant = opts.budget or {}
-    uuid_counter = uuid_counter + 1
-    local id = string.format("sess-%08d-0000-4000-8000-000000000000", uuid_counter)
-    local events = {}
-    local seq = 0
-    local remaining = grant.amount
-    local tag = grant.tag
-    local closed = false
-
-    local function deep_copy(v)
-        if type(v) ~= "table" then
-            return v
-        end
-        local out = {}
-        for k, val in pairs(v) do
-            out[k] = deep_copy(val)
-        end
-        return out
-    end
-
-    -- Kernel-owned seq/epoch_ms overwrite any caller value; every other
-    -- field passes through. There is no author.
-    local function store(event)
-        seq = seq + 1
-        local rec = deep_copy(event)
-        rec.seq = seq
-        rec.epoch_ms = 1000 + seq
-        events[#events + 1] = rec
-        return seq
-    end
-
-    -- The kernel's own kinds go in the same envelope as everybody's: what
-    -- the kind is about lives under `data`.
-    store({ kind = "session_opened", data = { scope_id = "scope-" .. id, owner = owner } })
-
-    local s = {}
-
-    -- Identity: the three readings the kernel answers. The fake carries the
-    -- whole session surface because `knl.beat` asks for the whole surface
-    -- before it treats a value as a session.
-    function s:id()
-        return id
-    end
-
-    function s:scope_id()
-        return "scope-" .. id
-    end
-
-    function s:owner()
-        return owner
-    end
-
-    -- The one write path. Nothing is numbered here and the budget does not
-    -- move (mirrors the Rust Session::append): the `meta` labels a caller
-    -- declared are stored exactly as given, `meta.beat` among them, and a
-    -- top-level `beat` is refused rather than stored.
-    function s:append(event)
-        assert(not closed, "knl: append: session is closed")
-        assert(type(event) == "table", "knl: append: event must be a table")
-        assert(type(event.kind) == "string", "knl: append: kind is required")
-        assert(event.beat == nil, "knl: append: unknown field: beat (the id is meta.beat)")
-        assert(event.meta == nil or type(event.meta) == "table", "knl: append: meta must be a table")
-        assert(
-            event.meta == nil or event.meta.beat == nil or type(event.meta.beat) == "string",
-            "knl: append: meta.beat must be a string"
-        )
-        return store(event)
-    end
-
-    -- The decision point: allow and deduct, or refuse (naming the grant)
-    -- and leave the balance exactly where it was.
-    function s:reserve(n)
-        assert(not closed, "knl: reserve: session is closed")
-        assert(type(n) == "number" and n >= 0, "knl: reserve: amount must be non-negative")
-        if remaining == nil then
-            return true
-        end
-        if remaining < n then
-            return false, tag
-        end
-        remaining = remaining - n
-        return true
-    end
-
-    function s:events(from)
-        from = from or 0
-        local out = {}
-        for _, e in ipairs(events) do
-            if e.seq >= from then
-                out[#out + 1] = deep_copy(e)
-            end
-        end
-        return out
-    end
-
-    -- The write IS the result: spend answers nothing, and a caller that
-    -- wants the balance reads it with `remaining()` (the kernel's surface,
-    -- mirrored here so the fake cannot promise more than the bridge does).
-    function s:spend(n)
-        assert(not closed, "knl: spend: session is closed")
-        assert(type(n) == "number" and n >= 0, "knl: spend: amount must be non-negative")
-        if remaining == nil then
-            return
-        end
-        remaining = math.max(0, remaining - n)
-    end
-
-    function s:len()
-        return #events
-    end
-
-    -- The one named fold. Nothing here folds anything — what `tail` answers
-    -- is the kernel's — and the method is carried because the surface has it:
-    -- a stand-in missing one is not a session.
-    function s:view(_name, _opts)
-        error("knl: view: validation: unknown view")
-    end
-
-    function s:remaining()
-        return remaining
-    end
-
-    function s:exhausted()
-        if remaining == nil then
-            return false
-        end
-        return remaining <= 0
-    end
-
-    function s:close(reason)
-        if not closed then
-            store({ kind = "session_closed", data = { reason = reason or "closed" } })
-            closed = true
-        end
-    end
-
-    -- The SQL read, which is how token usage is read
-    -- now: a view is a named function that runs one SELECT, and this fake
-    -- records the statement rather than running one. What a statement
-    -- selects is a question only a database can answer, and it is asked
-    -- where there is one (knl_beat_test.lua inv11).
-    s._queries = {}
-    s._query_rows = {}
-
-    function s:query(sql, params, opts)
-        assert(not closed, "knl: query: session is closed")
-        assert(type(sql) == "string", "knl: query: sql must be a string")
-        self._queries[#self._queries + 1] = { sql = sql, params = params, opts = opts }
-        return self._query_rows, false
-    end
-
-    return s
-end
-
--- Global the module captures as `local syscall = knl` at load time. The
--- bridge publishes `open` / `resume` / `new_beat_id` / `error` / `api` and
--- no `session`: the bracket is the Lua module's, built on `open`.
-knl = {
-    open = fake_session,
-    new_beat_id = function()
-        minted = minted + 1
-        return string.format("beat-%06d", minted)
+-- The fake bridge, installed as the global `knl` BEFORE require("knl"), which
+-- is what the module captures as its syscall layer at load time. The clock is
+-- a counter: the kernel stamps `epoch_ms`, and nothing here reads the time.
+local now_ms = 1000
+require("knl.spec.fake_bridge").install({
+    writes = { lifecycle = true },
+    clock = function()
+        now_ms = now_ms + 1
+        return now_ms
     end,
-}
+})
+
+-- The three counts a provider reports, each named by the usage view's statement.
+local COUNTERS = { "input_tokens", "output_tokens", "thinking_tokens" }
 
 local kernel = require("knl")
 local Outcome = kernel.Outcome

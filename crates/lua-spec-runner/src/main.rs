@@ -194,6 +194,23 @@ fn teal_modules(lib: &Path) -> Vec<String> {
     names
 }
 
+/// The Teal sources of the module in `dir`: every `*.tl` directly in it —
+/// `init.tl` and the sub-modules beside it — sorted. A `.d.tl` is a
+/// declaration and generates nothing the binary embeds, and `spec/` is a
+/// directory of its own that this does not descend into.
+fn module_sources(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut sources: Vec<PathBuf> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let file = path.file_name()?.to_str()?;
+            (path.is_file() && file.ends_with(".tl") && !file.ends_with(".d.tl")).then_some(path)
+        })
+        .collect();
+    sources.sort();
+    Ok(sources)
+}
+
 /// Write the Lua the binary embeds for `names` under
 /// `target/lua-spec-runner/.agent-block/lib/`, via `agent-block vendor`, and
 /// answer that `lib/` directory — `None` when there is nothing to write. The
@@ -217,18 +234,22 @@ fn vendor_teal_modules(root: &Path, names: &[String]) -> Result<Option<PathBuf>,
         })?;
     // A binary older than a `.tl` embeds the Lua of an earlier version of it:
     // the specs would pass or fail against something that is not in the tree.
+    // Every source of the module counts — `init.tl` and each sub-module beside
+    // it (`knl/shapes.tl`, `policy/room.tl`) — because `vendor` writes them
+    // all and the specs run against all of them.
     for name in names {
-        let tl = root.join("crates/agent-block-core/blocks/lib").join(name).join("init.tl");
-        let edited = std::fs::metadata(&tl)
-            .and_then(|m| m.modified())
-            .map_err(|e| format!("{}: {e}", tl.display()))?;
-        if edited > built {
-            return Err(format!(
-                "{} is newer than {} — `cargo build -p agent-block` first (`just test-lua` \
-                 does), or the specs run against the Lua of an older {name}",
-                tl.display(),
-                bin.display()
-            ));
+        for tl in module_sources(&root.join("crates/agent-block-core/blocks/lib").join(name))? {
+            let edited = std::fs::metadata(&tl)
+                .and_then(|m| m.modified())
+                .map_err(|e| format!("{}: {e}", tl.display()))?;
+            if edited > built {
+                return Err(format!(
+                    "{} is newer than {} — `cargo build -p agent-block` first (`just test-lua` \
+                     does), or the specs run against the Lua of an older {name}",
+                    tl.display(),
+                    bin.display()
+                ));
+            }
         }
     }
     let dir = root.join("target/lua-spec-runner");

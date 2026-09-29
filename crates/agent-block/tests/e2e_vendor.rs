@@ -196,6 +196,13 @@ fn the_kernel_is_written_with_the_specs_that_check_it() {
         written.contains("require(\"embedded.knl\")"),
         "the header names the original: {written}"
     );
+    // The kernel requires its shapes by name, so they come with it.
+    let shapes = project.path().join(".agent-block/lib/knl/shapes.lua");
+    assert!(
+        shapes.is_file(),
+        "`knl.shapes` is written with the kernel: {}",
+        shapes.display()
+    );
 
     let specs = project.path().join(".agent-block/lib/knl/spec");
     let written_specs: Vec<String> = std::fs::read_dir(&specs)
