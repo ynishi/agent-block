@@ -54,6 +54,10 @@ end
 
 local lshape = require("lshape")
 local check = lshape.check
+-- The kernel's syscall layer is the shared fake (knl/spec/fake_bridge.lua), so
+-- the session the bracket hands the body carries the whole declared surface:
+-- a run with `compact` asks `knl.is_session` of it before every beat.
+require("knl.spec.fake_bridge").install()
 local kernel = require("knl")
 local Outcome = kernel.Outcome
 local agent = require("agent")
@@ -92,19 +96,20 @@ local last_session = nil
 -- readback of its own thread is the one place in `agent.run` that flag reaches.
 local truncate_reads = false
 
---- A session that records what is appended and hands it back verbatim: enough
---- for `seed` to write into and for the real fold to read out of.
+--- A session on the fake kernel's in-memory store, with the whole declared
+--- surface: `seed` writes into it, the real fold reads out of it, and the
+--- policies a compacting run consults accept it as a session. With
+--- `truncate_reads` its reads answer the rows it holds and `true` beside
+--- them, the way the kernel does when the row cap cut one short.
 local function new_session()
-    local events = {}
-    return {
-        append = function(_self, ev)
-            events[#events + 1] = ev
-            return #events
-        end,
-        events = function(_self)
-            return events, truncate_reads
-        end,
-    }
+    local s = kernel.open({ owner = "spec", budget = { amount = 1000, tag = "beats" }, store = { memory = true } })
+    if truncate_reads then
+        local rows = s._events
+        s.events = function()
+            return rows, true
+        end
+    end
+    return s
 end
 
 kernel.session = function(opts, fn)
@@ -177,6 +182,60 @@ describe("agent.run result contract", function()
         local res = agent_run({ prompt = "ask", history = "nope" })
         expect(res.ok).to.equal(false)
         expect(res.error).to.equal("history must be a table (messages array)")
+    end)
+
+    it("refuses `compact` without the model's window or the reply's room, rather than guessing either", function()
+        -- The two facts about the model this module cannot answer: a run
+        -- that compacts sizes its window by them, so a conf that names
+        -- neither is refused before a beat.
+        local blind = agent_run({
+            prompt = "ask",
+            compact = true,
+            provider = "openai",
+            base_url = "http://x",
+            dialect = "openai",
+        })
+        expect(blind.ok).to.equal(false)
+        expect(blind.error:find("compact needs the model's window", 1, true) ~= nil).to.equal(true)
+        local roomless = agent_run({
+            prompt = "ask",
+            compact = true,
+            provider = "openai",
+            base_url = "http://x",
+            dialect = "openai",
+            context_window = 32768,
+        })
+        expect(roomless.ok).to.equal(false)
+        expect(roomless.error:find("compact needs the reply's room", 1, true) ~= nil).to.equal(true)
+        local shaped = agent_run({
+            prompt = "ask",
+            compact = "yes",
+            provider = "openai",
+            base_url = "http://x",
+            dialect = "openai",
+        })
+        expect(shaped.ok).to.equal(false)
+        expect(shaped.error:find("compact must be true or", 1, true) ~= nil).to.equal(true)
+    end)
+
+    it("runs with `compact` once the window and the reply's room are named, and asks the predicate first", function()
+        -- A run that compacts asks `due` and `fits` before every beat; on
+        -- this fake session the log is two events long, so neither fires
+        -- and the beat goes through as before. What this proves is the
+        -- wiring: the device took the fold and the filter, and the loop
+        -- reached the beat.
+        beats = { answered("the answer") }
+        local res = agent_run({
+            prompt = "ask",
+            compact = { at = 0.5, reserve = 1024 },
+            provider = "openai",
+            base_url = "http://x",
+            dialect = "openai",
+            context_window = 32768,
+        })
+        expect(res.ok).to.equal(true)
+        expect(res.content).to.equal("the answer")
+        expect(res.num_turns).to.equal(1)
     end)
 
     it("returns content on the success path", function()

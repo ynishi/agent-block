@@ -53,7 +53,12 @@
 --     output limit, and that a reply which finished is not one;
 --  16 _beat_outcome: the kernel's four statuses as the loop reads them — the
 --     answer, `max_iters` for a stop on the grant, `llm_call` for an error or
---     a refusal.
+--     a refusal;
+--  17 compact: the opt is false or { at?, min_beats? } with the bounds
+--     policy.compact keeps, `strict` requires it, `config_of` names it as
+--     resolved (the default on, false when turned off), and the result
+--     counts the compactions when the run could compact and says nothing
+--     when it could not.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -316,6 +321,7 @@ describe("coding.run — what it refuses", function()
             done = "declare",
             ops = { read = "read", edit = { "search_replace" } },
             seed = "full",
+            compact = { at = 0.8 },
         }
         local without_iters = {}
         for k, v in pairs(named) do
@@ -326,6 +332,26 @@ describe("coding.run — what it refuses", function()
         expect(about(said, "these are not: iters")).to.be(true)
         named.iters = 5
         expect(about(refusal(named), "strict = true")).to.be(false)
+    end)
+
+    it("holds `compact` to false or { at?, min_beats? }, and takes true as the default", function()
+        local base = { spec = "x", verify = "true", targets = { "a" }, llm = llm }
+        local function with(compact)
+            local opts = {}
+            for k, v in pairs(base) do
+                opts[k] = v
+            end
+            opts.compact = compact
+            return refusal(opts)
+        end
+        expect(about(with("yes"), "`compact` must be false or")).to.be(true)
+        expect(about(with({ at = 2 }), "`compact.at` must be a number in (0, 1]")).to.be(true)
+        expect(about(with({ at = 0 }), "`compact.at` must be a number in (0, 1]")).to.be(true)
+        expect(about(with({ min_beats = 0 }), "`compact.min_beats` must be a whole number >= 1")).to.be(true)
+        expect(about(with({ share = 0.5 }), "`compact` takes `at` and `min_beats`, not `share`")).to.be(true)
+        for _, fine in ipairs({ false, true, { at = 0.5 }, { min_beats = 3 }, {} }) do
+            expect(about(with(fine), "`compact")).to.be(false)
+        end
     end)
 
     it("declares its opts and result shapes, baseline and no_edits included", function()
@@ -672,14 +698,34 @@ describe("coding.config_of — what the run was configured with", function()
         system = "SYS",
         targets = { "/r/a.rs" },
         window = 32768,
+        compact = { at = 0.8 },
     }
-    local function config(over)
+    local function config(over, resolved_over)
         local opts = { llm = { port = {}, conf = conf }, verify = "true" }
         for k, v in pairs(over or {}) do
             opts[k] = v
         end
-        return coding.config_of(opts, resolved)
+        local r = {}
+        for k, v in pairs(resolved) do
+            r[k] = v
+        end
+        for k, v in pairs(resolved_over or {}) do
+            r[k] = v
+        end
+        return coding.config_of(opts, r)
     end
+
+    it("carries the compaction as the run resolved it: the default on, false when turned off", function()
+        local taken = config({})
+        expect(taken.values.compact.from).to.be("default")
+        expect(taken.values.compact.value).to.equal({ at = 0.8 })
+        local off = config({ compact = false }, { compact = false })
+        expect(off.values.compact.from).to.be("caller")
+        expect(off.values.compact.value).to.be(false)
+        local tuned = config({ compact = { at = 0.5 } }, { compact = { at = 0.5 } })
+        expect(tuned.values.compact.from).to.be("caller")
+        expect(tuned.values.compact.value.at).to.be(0.5)
+    end)
 
     it("says caller for a knob the caller named and default for one it did not", function()
         local c = config({ iters = 5 })
@@ -789,6 +835,40 @@ describe("coding.result_of — the result out of the state the loop left", funct
         expect(r.failure_reason).to.be("no_edits")
         expect(r.last_error).to.be("error: nope")
         expect(check.check(r, coding.shapes.run_result)).to.be(true)
+    end)
+
+    it("counts the compactions when the run could compact, and says nothing when it could not", function()
+        local on = coding.result_of(
+            state({
+                converged = true,
+                iters = 4,
+                compactions = 2,
+                config = { strict = false, values = { compact = { value = { at = 0.8 }, from = "default" } } },
+            }),
+            5
+        )
+        expect(on.compactions).to.be(2)
+        expect(check.check(on, coding.shapes.run_result)).to.be(true)
+        local none = coding.result_of(
+            state({
+                converged = true,
+                iters = 1,
+                compactions = 0,
+                config = { strict = false, values = { compact = { value = { at = 0.8 }, from = "default" } } },
+            }),
+            5
+        )
+        expect(none.compactions).to.be(0)
+        local off = coding.result_of(
+            state({
+                converged = true,
+                iters = 1,
+                compactions = 0,
+                config = { strict = false, values = { compact = { value = false, from = "caller" } } },
+            }),
+            5
+        )
+        expect(off.compactions).to.be(nil)
     end)
 
     it("plan mode: the counts and the checks still failing, or a plan nobody filed", function()

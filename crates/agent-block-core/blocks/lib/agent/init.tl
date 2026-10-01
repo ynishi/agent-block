@@ -21,6 +21,11 @@
 --       tool_choice = "required",
 --       thinking    = { effort = "medium" },
 --       max_retries = 2,
+--       compact = { at = 0.8, reserve = 4096 },
+--                               -- fold the record into a summary once the last request
+--                               -- took `at` of the window (policy.compact); needs
+--                               -- context_window beside the model, and max_tokens or
+--                               -- `reserve` for the reply's room. Off unless given
 --   })
 --
 -- result: { ok, content, usage, num_turns, error, messages }
@@ -105,6 +110,12 @@ local Outcome = kernel.Outcome
 
 --- The Ports a device is built from: the `llm` closure and the tools map.
 local adapter = require("knl_adapter")
+--- The policies a run with `compact` plugs in: the window from the summary
+--- on, the compaction, the ledger, the window line.
+local policy = require("policy")
+local type shared = require("policy.shared")
+local type room = require("policy.room")
+local type pcompact = require("policy.compact")
 
 local proto = require("llm_proto")
 local type openai = require("llm_proto.openai")
@@ -207,6 +218,16 @@ local record RunOpts
     enable_prompts: boolean
     context_management: any
     context_management_config: {string:any}
+    compact: any
+end
+
+--- `compact`, as a table: `policy.compact`'s `at` and `min_beats`, and the
+--- tokens the window holds back for the reply when `max_tokens` names no
+--- cap on the wire.
+local record CompactOpt
+    at: number
+    min_beats: integer
+    reserve: number
 end
 
 --- What `run` answers: `content` on success, `error` on failure, never both
@@ -220,9 +241,13 @@ local record RunResult
     messages: {any}
 end
 
---- The provider Port, as far as this module reaches into it.
+--- The provider Port, as far as this module reaches into it: the call it
+--- opens, and — for a run that compacts — the two questions the window
+--- policies ask it.
 local record Port
     open: function(Port, ?{string:any}): function(kernel.Request): kernel.LlmResult, kernel.CallError
+    count: function(Port, any, any): number
+    profile: function(Port, any): shared.Profile
 end
 
 --- The contracts `M.shapes` publishes.
@@ -807,6 +832,7 @@ local AGENT_OPTS: {string:boolean} = {
     enable_prompts = true,
     context_management = true,
     context_management_config = true,
+    compact = true,
 }
 
 --- `opts.context_management == false` opts out entirely (no beta header, no
@@ -971,6 +997,75 @@ local record Run
     budget: number
     --- The servers `M.run` disconnects, whatever the loop did.
     connected: {string}
+    --- With `compact`: the window's predicate, the compaction, and the
+    --- ledger read beside every summary. All nil otherwise.
+    fits: room.Fits
+    compaction: Compaction
+    ledger: pcompact.LedgerFn
+end
+
+--- The compaction, when the run has one: the question asked before every
+--- beat, and the device the one beat that writes the summary runs with.
+local record Compaction
+    due: pcompact.Due
+    writer: kernel.Device
+end
+
+--- `compact` as a table: nil when off, the caller's table, or an empty one
+--- for `true`.
+local function compact_of(given: any): CompactOpt
+    if given == nil or given == false then
+        return nil
+    end
+    if given == true then
+        return {}
+    end
+    return given as CompactOpt
+end
+
+--- What a run that compacts needs beyond the plain device, or the failure
+--- it comes back with: the window fold from the summary on, the fit
+--- predicate, the compaction and the ledger. The window and the reply's
+--- room are the two facts about the model this module cannot answer, so a
+--- conf that names neither is refused rather than filled in.
+local record Seams
+    fold: room.Fold
+    filters: {room.Filter}
+    fits: room.Fits
+    compaction: Compaction
+    ledger: pcompact.LedgerFn
+end
+
+local function compaction_of(port: Port, conf: {string:any}, system: any, compact: CompactOpt): Seams, string
+    if type(compact) ~= "table" then
+        return nil, "compact must be true or { at?, min_beats?, reserve? }"
+    end
+    local profile = port:profile(conf)
+    if type(profile) ~= "table" or type(profile.context_window) ~= "number" then
+        return nil, "compact needs the model's window: declare context_window beside the model"
+    end
+    if conf.max_tokens == nil and compact.reserve == nil then
+        return nil, "compact needs the reply's room: max_tokens, or compact.reserve (tokens held back for the reply)"
+    end
+    local fold, fits = policy.window({
+        fit = { port = port as shared.Port, conf = conf, reserve = compact.reserve },
+        keep_seed = true,
+        from_summary = true,
+    })
+    local due, summarise = policy.compact({ at = compact.at, min_beats = compact.min_beats, fold = fold })
+    local llm = port:open(conf)
+    local writer = kernel.device({ llm = llm, system = system, fold = summarise })
+    -- No check kinds: this loop records no verdicts. The tools' `path`
+    -- arguments are what a summary of a run over files most often loses.
+    local ledger = policy.ledger({ track = { "path" }, kinds = {} })
+    return {
+        fold = fold,
+        filters = { policy.room_note({ port = port as shared.Port, conf = conf }) },
+        fits = fits,
+        compaction = { due = due, writer = writer },
+        ledger = ledger,
+    },
+    nil
 end
 
 --- The opts, checked, and everything the loop runs on built from them.
@@ -1023,14 +1118,29 @@ local function prepare(opts: RunOpts): Run, RunResult
 
     -- The device raises for exactly the things a caller got wrong at wiring
     -- time — a duplicate tool name, a spec with no schema field it knows.
-    -- `run` never throws, so those come back as the failure they are.
+    -- `run` never throws, so those come back as the failure they are. With
+    -- `compact`, the window seams go on it: the fold from the summary on
+    -- and the window line, both sized by the Port.
     local port = PORTS[provider]
+    local conf = port_conf(opts, provider)
+    local compact = compact_of(opts.compact)
+    local fits, compaction, ledger: room.Fits, Compaction, pcompact.LedgerFn = nil, nil, nil
     local built, device = pcall(function(): kernel.Device
-        return kernel.device({
-            llm = port:open(port_conf(opts, provider)),
+        local config: kernel.DeviceConfig = {
+            llm = port:open(conf),
             tools = build_tools(candidates, opts.tool_groups),
             system = opts.system,
-        })
+        }
+        if compact ~= nil then
+            local seams, why = compaction_of(port, conf, opts.system, compact)
+            if seams == nil then
+                error(why, 0)
+            end
+            config.fold = seams.fold
+            config.filters = seams.filters
+            fits, compaction, ledger = seams.fits, seams.compaction, seams.ledger
+        end
+        return kernel.device(config)
     end)
     if not built then
         -- Always disconnect, regardless of outcome.
@@ -1041,6 +1151,9 @@ local function prepare(opts: RunOpts): Run, RunResult
     local max_iter = opts.max_iterations
     return {
         opts = opts,
+        fits = fits,
+        compaction = compaction,
+        ledger = ledger,
         session = {
             owner = "agent",
             -- One unit per beat (the device's default cost), so the grant IS the
@@ -1198,7 +1311,53 @@ local function run_loop(s: kernel.Session, run: Run): Tally
     local turns, content, failure: number, string, string = 0, "", nil
     local usage = zero_usage()
 
+    --- One compaction: the summarising beat, and the `summary` event with
+    --- the ledger beside what the model wrote. Answers the failure that
+    --- ends the run, or nil.
+    local function compact_once(why: string): string
+        local o = kernel.beat(s, run.compaction.writer)
+        if o.status == "stopped" then
+            return "max_iterations (" .. run.max_iter .. ") reached"
+        elseif o.status == "error" then
+            return error_text(o)
+        elseif o.status == "refused" then
+            return refusal_text(o)
+        end
+        local text = text_of((o.out as kernel.LlmResult).content as {proto.Block})
+        if not text:match("%S") then
+            -- Nothing to fold from: the run goes on over the window it had.
+            return nil
+        end
+        s:append({
+            kind = "summary",
+            meta = { label = "compact", reason = why },
+            data = { content = text, ledger = run.ledger(s) },
+        })
+        return nil
+    end
+
     while true do
+        if run.compaction ~= nil then
+            -- Before the beat: a request the window could no longer hold is
+            -- the request a summary makes room in, so the compaction is
+            -- asked first and the fit is read on what it left.
+            local why = run.compaction.due(s)
+            if why ~= nil then
+                failure = compact_once(why)
+                if failure ~= nil then
+                    break
+                end
+            end
+            local over, tokens, allowed = run.fits(s, run.device)
+            if over ~= nil then
+                failure = string.format(
+                    "context: the request does not fit the model's window (%d tokens, %d allowed)",
+                    tokens as integer,
+                    allowed as integer
+                )
+                break
+            end
+        end
         local going = Outcome.match(kernel.beat(s, run.device), {
             stopped = function(o: kernel.OutcomeValue): any
                 -- Not a failure and not the model's doing: the quota would
