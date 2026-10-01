@@ -15,10 +15,12 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The eleven, and where each one plugs in
+--- The fourteen, and where each one plugs in
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
----                                         fit the model's window
+---                                         fit the model's window; from a
+---                                         `summary` on, the summary in the
+---                                         place of the beats it stands for
 ---     policy.carry       -> a `filter`    one bounded note about the beat
 ---                                         that failed
 ---     policy.stagnation  -> a predicate   the loop asks it between beats:
@@ -40,38 +42,58 @@
 ---                                         the handler runs
 ---     policy.thinking_cap-> a `filter`    where the reasoning has to stop for
 ---                                         the tool call after it to still fit
+---     policy.room_note   -> a `filter`    one line at the end of the request:
+---                                         what it took of the window, and
+---                                         what is left for the reply
 ---     policy.verdict     -> a check       the loop runs it after every beat:
 ---                                         is the thing outside the
 ---                                         conversation true yet?
+---     policy.compact     -> a predicate   the loop asks it between beats: is
+---                           + a `fold`    the window nearly full? — and the
+---                                         fold the one beat that writes the
+---                                         summary runs with
+---     policy.ledger      -> a reading     the facts of the run off the log —
+---                                         tools, files, checks — appended
+---                                         beside the summary so it cannot
+---                                         misremember them
 ---
----   `window`, `carry`, `tokens`, `result_cap`, `repeat_cap`, `require_args`
----   and `thinking_cap` are device
+---   `window`, `carry`, `tokens`, `result_cap`, `repeat_cap`, `require_args`,
+---   `thinking_cap` and `room_note` are device
 ---   fields (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
----   `stagnation`, `retry`, `escalate` and `verdict` are the loop's own and
----   the kernel never sees them. That
+---   `stagnation`, `retry`, `escalate`, `verdict`, `compact` and `ledger` are
+---   the loop's own and the kernel never sees them. That
 ---   split is the whole shape of this module: a policy either changes what
 ---   one beat SENDS (or reserves), or it decides what the loop does BETWEEN
 ---   beats. Nothing here decides what a beat does while it runs — that is the
 ---   kernel's, and it is not a seam.
 ---
+---   The one event this module names and does not write is `summary`
+---   (`policy.shapes.summary`): the loop appends it after the beat
+---   `compact` hands the fold for, and `window{ from_summary }` folds from
+---   it. Three values in three seams, and the loop between them — the rule
+---   that nothing here appends holds, and the record is compacted all the
+---   same.
+---
 --- Where each one lives
----   `policy` is one module in five files, and this one is the door: it
----   gathers the eleven, publishes `policy.shapes`, and runs the registry
+---   `policy` is one module in six files, and this one is the door: it
+---   gathers the fourteen, publishes `policy.shapes`, and runs the registry
 ---   gate. The policies are grouped by what they read —
 ---
----     policy/room.lua     window, tokens, result_cap, thinking_cap — the
----                         four that size against the model's window, and
----                         the one split of it they all read (`request_limit`
----                         for the prompt, `reply_room` for the reply), off
----                         the Port's profile; `policy.split` hands that
----                         split back as a value, for a caller that wants to
----                         see the numbers a run is sized by — a reading,
----                         not a twelfth policy
+---     policy/room.lua     window, tokens, result_cap, thinking_cap, room_note
+---                         — the five that size against the model's window,
+---                         and the one split of it they all read
+---                         (`request_limit` for the prompt, `reply_room` for
+---                         the reply), off the Port's profile; `policy.split`
+---                         hands that split back as a value, for a caller
+---                         that wants to see the numbers a run is sized by —
+---                         a reading, not a fifteenth policy
 ---     policy/tools.lua    repeat_cap, require_args — the two that wrap the
 ---                         device's tools map
 ---     policy/carry.lua    carry — the one filter that reads the log
 ---     policy/loop.lua     verdict, stagnation, retry, escalate — what the
 ---                         loop asks between beats
+---     policy/compact.lua  compact, ledger — when the window is nearly full,
+---                         and the facts a summary must not lose
 ---     policy/shared.lua   the defaults, the log readers, the contract
 ---                         prelude and the shapes more than one file hands
 ---                         out; not a policy, not exported
@@ -166,14 +188,21 @@
 ---                 `required` list the tool already declares
 ---     thinking_cap reads NO log: the request it is handed, counted by the
 ---                 Port, against the room the Port's profile leaves the reply
+---     room_note   reads NO log: the same request and the same two numbers,
+---                 said to the model instead of acted on
 ---     verdict     reads the log — `session:events()`, per call, and only
 ---                 when `timeout` is a table: what the checks took are gaps
 ---                 between the kernel's stamps, read by the `measure` the
 ---                 caller chose, not a number the factory kept. A number
 ---                 for `timeout` reads nothing
+---     compact     reads the log — `session:events()`, per call: the window
+---                 report `knl.beat` wrote on the `llm_request`s since the
+---                 last summary. Its fold reads what every fold reads
+---     ledger      reads the log — `session:events()`, per call, the whole
+---                 of it: counts and names, never kept between calls
 ---
 ---   The escape hatch the design allows — an explicit `run` table the CALLER
----   creates and owns for one shell run — is not used by any of the five,
+---   creates and owns for one shell run — is not used by any of the fourteen,
 ---   because nothing any of them needs is missing from the log or from an
 ---   argument. If a later policy does need one, it takes that table as an
 ---   argument like any other; a module-level global would be the same state
@@ -254,12 +283,16 @@
 ---   the right shape (dev only). `opts_contract` is where that split is made.
 ---
 --- Deliberately not here
----   Summarising a window instead of dropping it, a cost policy, a
----   `tool_policy` gate, parallel or speculative beats, and any policy that
----   would need to write to the log to work. Each is deferred until a real
----   loop asks for it.
+---   A cost policy, a `tool_policy` gate, parallel or speculative beats, and
+---   any policy that would need to write to the log to work. Each is
+---   deferred until a real loop asks for it. Summarising a window instead
+---   of dropping it was on this list until a loop did ask — a sibling lane
+---   that ran out of window on every long task and grew its own — and it
+---   came in the shape the list required: the summary is written by a beat
+---   the loop runs and appended by the loop, and the three policies around
+---   it (`compact`, `ledger`, `window{ from_summary }`) read.
 ---
---- Written in Teal, all six files, and embedded through `include_tl!`
+--- Written in Teal, all seven files, and embedded through `include_tl!`
 --- (`host.rs`); the Lua the host holds is what Teal generates, without
 --- these comments. The kernel is read through its own record (`knl` is
 --- Teal too); the records the files share are `policy.shared`'s.
@@ -270,6 +303,7 @@ local room = require("policy.room")
 local tools = require("policy.tools")
 local carry = require("policy.carry")
 local loop = require("policy.loop")
+local compact = require("policy.compact")
 
 --- The public contracts, as data (`policy.shapes`), and the registry
 --- (`policy.shapes.api`).
@@ -280,9 +314,14 @@ local record Shapes
     carry_opts: lshape.Schema
     require_args_opts: lshape.Schema
     thinking_cap_opts: lshape.Schema
+    room_note_opts: lshape.Schema
     stagnation_opts: lshape.Schema
     retry_opts: lshape.Schema
     escalate_opts: lshape.Schema
+    compact_opts: lshape.Schema
+    ledger_opts: lshape.Schema
+    ledger: lshape.Schema
+    summary: lshape.Schema
     beat_record: lshape.Schema
     tool_pair: lshape.Schema
     stop_reason: lshape.Schema
@@ -294,6 +333,7 @@ local record M
     tokens: room.TokensFactory
     result_cap: room.ResultCapFactory
     thinking_cap: room.ThinkingCapFactory
+    room_note: room.RoomNoteFactory
     split: room.SplitFn
     repeat_cap: tools.RepeatCapFactory
     require_args: tools.RequireArgsFactory
@@ -302,11 +342,13 @@ local record M
     stagnation: loop.StagnationFactory
     retry: loop.RetryFactory
     escalate: loop.EscalateFactory
+    compact: compact.CompactFactory
+    ledger: compact.LedgerFactory
     shapes: Shapes
 end
 
 -- ============================================================
--- The eleven, gathered
+-- The fourteen, gathered
 -- ============================================================
 --
 -- Each file exports the policies it owns; this table is the one a caller
@@ -318,7 +360,8 @@ M.window = room.window
 M.tokens = room.tokens
 M.result_cap = room.result_cap
 M.thinking_cap = room.thinking_cap
--- The window's split as a value — a reading beside the four, not a policy.
+M.room_note = room.room_note
+-- The window's split as a value — a reading beside the five, not a policy.
 M.split = room.split
 M.repeat_cap = tools.repeat_cap
 M.require_args = tools.require_args
@@ -327,6 +370,8 @@ M.verdict = loop.verdict
 M.stagnation = loop.stagnation
 M.retry = loop.retry
 M.escalate = loop.escalate
+M.compact = compact.compact
+M.ledger = compact.ledger
 
 -- ============================================================
 -- shapes — the public contracts of this module
@@ -344,9 +389,14 @@ M.shapes = {
     carry_opts = carry.shapes.carry_opts,
     require_args_opts = tools.shapes.require_args_opts,
     thinking_cap_opts = room.shapes.thinking_cap_opts,
+    room_note_opts = room.shapes.room_note_opts,
     stagnation_opts = loop.shapes.stagnation_opts,
     retry_opts = loop.shapes.retry_opts,
     escalate_opts = loop.shapes.escalate_opts,
+    compact_opts = compact.shapes.compact_opts,
+    ledger_opts = compact.shapes.ledger_opts,
+    ledger = shared.LEDGER,
+    summary = shared.SUMMARY,
     beat_record = shared.BEAT_RECORD,
     tool_pair = shared.TOOL_PAIR,
     stop_reason = shared.STOP_REASON,
@@ -373,7 +423,7 @@ M.shapes = {
 -- answer it first with a message of its own.
 
 M.shapes.api = {}
-local registries: {{string:shared.ApiEntry}} = { room.api, tools.api, carry.api, loop.api }
+local registries: {{string:shared.ApiEntry}} = { room.api, tools.api, carry.api, loop.api, compact.api }
 for _, api in ipairs(registries) do
     for name, entry in pairs(api) do
         if M.shapes.api[name] ~= nil then

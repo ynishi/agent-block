@@ -64,8 +64,29 @@ local record S
         count: function(Port, any, any): number
         profile: function(Port, any): Profile
     end
+    --- What `ledger` says about the checks of one kind.
+    record CheckTally ---@struct
+        count: integer
+        passed: integer
+        last_ok: boolean ---@optional
+    end
+    --- The facts of a run, read off the log (`policy.shapes.ledger`).
+    record Ledger ---@struct
+        beats: integer
+        summaries: integer
+        calls: {string:integer}
+        touched: {string:{string:{string}}}
+        checks: {string:CheckTally}
+    end
 
     DEFAULT_MAX_BYTES: integer
+    DEFAULT_COMPACT_AT: number
+    DEFAULT_COMPACT_MIN_BEATS: integer
+    DEFAULT_COMPACT_PROMPT: string
+    DEFAULT_LEDGER_TRACK: {string}
+    DEFAULT_LEDGER_KINDS: {string}
+    SUMMARY_KIND: string
+    SUMMARY_PREFIX: string
     DEFAULT_SAME: integer
     DEFAULT_NO_PROGRESS: integer
     DEFAULT_MAX_ATTEMPTS: integer
@@ -84,6 +105,8 @@ local record S
     BEAT_RECORD: lshape.Schema
     TOOL_PAIR: lshape.Schema
     STOP_REASON: lshape.Schema
+    LEDGER: lshape.Schema
+    SUMMARY: lshape.Schema
     EVENTS_ARG: ApiArg
     SESSION_ARG: ApiArg
     OUTCOME_ARG: ApiArg
@@ -155,6 +178,51 @@ S.DEFAULT_TIMEOUT_MEASURE = "longest"
 --- read, edit and read again without the fold running out of beats to drop,
 --- and small enough that one answer cannot end the run on its own.
 S.DEFAULT_RESULT_SHARE = 0.25
+
+--- How much of the fold's room the last request may take before `compact`
+--- says a summary is due. Four fifths: the harnesses that compact by a
+--- threshold sit at 0.8 (Goose) and 0.9 (Codex) as documented, and the
+--- lower of the two leaves a beat's worth of tool results between "due" and
+--- the fold starting to drop — which is the moment the summary is still
+--- written from a request that holds everything.
+S.DEFAULT_COMPACT_AT = 0.8
+
+--- How many beats must follow the last summary before another is due. Two:
+--- one beat after a summary is the model reading the summary, and a run
+--- whose seed and summary alone fill the window would otherwise compact
+--- on every beat.
+S.DEFAULT_COMPACT_MIN_BEATS = 2
+
+--- The instruction the summarising request ends with when the caller
+--- names none. It asks for what the next request will be built from and
+--- nothing else: the task, what was done, what is left, and what must not
+--- be lost. Plain prose — a summary that came back as a tool call would be
+--- one more call with no tool to run it.
+S.DEFAULT_COMPACT_PROMPT = "Stop and write a summary of this conversation so far, for yourself: the earlier "
+    .. "part will be replaced by what you write, and the next request will begin from it. "
+    .. "State the task; what has been done and what the results were; what is still to do, "
+    .. "in order; and every decision, fact, path or value you must not lose. Write prose, "
+    .. "no tool call."
+
+--- The tool-call argument keys `ledger` keeps distinct values of per tool,
+--- when the caller names none. `path` is the key every `std.fs` tool takes
+--- its file under, and a file's name is the fact a summary most often gets
+--- wrong.
+S.DEFAULT_LEDGER_TRACK = { "path" }
+
+--- The event kinds `ledger` reads as checks when the caller names none:
+--- the one `verdict` records under, for the reason `DEFAULT_VERDICT_KIND`
+--- gives.
+S.DEFAULT_LEDGER_KINDS = { "verify" }
+
+--- The kind the loop appends a summary under, and `window{ from_summary }`
+--- reads. One name, read in two files, so it lives in the one both see.
+S.SUMMARY_KIND = "summary"
+
+--- What the rendered summary opens with, so the model reads it as the
+--- record's compaction rather than as a message somebody sent.
+S.SUMMARY_PREFIX = "The earlier part of this conversation was compacted. What follows is the summary "
+    .. "written at that point, and a ledger of facts read off the record."
 
 --- How deep `canonical` renders a nested value before it stops. A tool input
 --- is JSON-shaped and shallow; the cap is what keeps a cyclic hand-built one
@@ -383,6 +451,66 @@ function S.data_of(ev: S.Event): {string:any}
     return type(ev.data) == "table" and ev.data as {string:any} or {}
 end
 
+--- The keys of a map, sorted, so a rendering of it is one rendering.
+local function sorted_keys(map: {string:any}): {string}
+    local keys: {string} = {}
+    for k in pairs(map) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    return keys
+end
+
+--- A ledger as lines of text, one fact per line, in a fixed order.
+---
+--- Read by the model under a summary, so it is prose-shaped and not JSON:
+--- the names and counts, nothing nested to parse. Sorted throughout — two
+--- renderings of one ledger are the same text, which is what keeps a
+--- compacted request's prefix stable between compactions.
+---
+--- @param ledger table  policy.shapes.ledger
+--- @return string
+function S.render_ledger(ledger: S.Ledger): string
+    local lines: {string} = {}
+    lines[#lines + 1] = string.format("beats so far: %d; summaries before this one: %d", ledger.beats, ledger.summaries)
+    local calls = ledger.calls or {}
+    for _, name in ipairs(sorted_keys(calls as {string:any})) do
+        local line = string.format("%s: called %d time%s", name, calls[name], calls[name] == 1 and "" or "s")
+        local by_key = (ledger.touched or {})[name]
+        if by_key ~= nil then
+            for _, key in ipairs(sorted_keys(by_key as {string:any})) do
+                line = line .. string.format("; %s: %s", key, table.concat(by_key[key], ", "))
+            end
+        end
+        lines[#lines + 1] = line
+    end
+    local checks = ledger.checks or {}
+    for _, kind in ipairs(sorted_keys(checks as {string:any})) do
+        local tally = checks[kind]
+        local last = "none ran"
+        if tally.last_ok == true then
+            last = "the last one passed"
+        elseif tally.last_ok == false then
+            last = "the last one failed"
+        end
+        lines[#lines + 1] = string.format("%s: %d run, %d passed, %s", kind, tally.count, tally.passed, last)
+    end
+    return table.concat(lines, "\n")
+end
+
+--- A `summary` event's `data` as the one user message the model reads in
+--- its place: the prefix, the summary, and the ledger when one was recorded.
+---
+--- @param data table  policy.shapes.summary
+--- @return string
+function S.render_summary(data: {string:any}): string
+    local parts: {string} = { S.SUMMARY_PREFIX, "Summary:\n" .. tostring(data.content) }
+    if type(data.ledger) == "table" then
+        parts[#parts + 1] = "Ledger:\n" .. S.render_ledger(data.ledger as S.Ledger)
+    end
+    return table.concat(parts, "\n\n")
+end
+
 -- ============================================================
 -- The contract prelude — what every policy's opts are declared with
 -- ============================================================
@@ -493,6 +621,26 @@ S.TOOL_PAIR = T.shape({
 --- `window{ fit }`'s one. Each word is one policy's, and a word nobody
 --- answers would be a policy nobody wrote.
 S.STOP_REASON = T.one_of({ "repeated", "no_progress", "context" })
+
+--- What `ledger` answers: counts and names read off the log, and nothing
+--- interpreted (`policy.shapes.ledger`). `touched` is tool -> argument key
+--- -> the distinct values that tool was handed under it; `checks` is kind ->
+--- how many were recorded, how many passed, and the last one's answer.
+S.LEDGER = T.shape({
+    beats = T.number:describe("distinct beats in the log"),
+    summaries = T.number:describe("summary events before this reading"),
+    calls = T.table:describe("tool name -> how many times it was called"),
+    touched = T.table:describe("tool name -> argument key -> sorted distinct values"),
+    checks = T.table:describe("event kind -> { count, passed, last_ok? }"),
+}, { open = false })
+
+--- What the loop appends under `summary` (`policy.shapes.summary`): the text
+--- the summarising beat answered, and the ledger as the loop read it then.
+--- `window{ from_summary }` renders both in the summary's place.
+S.SUMMARY = T.shape({
+    content = T.string:describe("the summary, as the model wrote it"),
+    ledger = S.LEDGER:is_optional(),
+}, { open = false })
 
 -- ============================================================
 -- The registry's argument forms

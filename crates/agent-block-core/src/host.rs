@@ -102,7 +102,7 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         "knl_adapter",
         htl::include_tl!("blocks/lib/knl_adapter/init.tl"),
     ),
-    // Written in Teal, all six files, against `knl` (`include_tl!`).
+    // Written in Teal, all seven files, against `knl` (`include_tl!`).
     ("policy", htl::include_tl!("blocks/lib/policy/init.tl")),
     (
         "policy.shared",
@@ -118,6 +118,10 @@ pub(crate) const EMBEDDED_LIBS: &[(&str, &str)] = &[
         htl::include_tl!("blocks/lib/policy/carry.tl"),
     ),
     ("policy.loop", htl::include_tl!("blocks/lib/policy/loop.tl")),
+    (
+        "policy.compact",
+        htl::include_tl!("blocks/lib/policy/compact.tl"),
+    ),
     // Written in Teal, against `knl` (`include_tl!`).
     (
         "supervisor",

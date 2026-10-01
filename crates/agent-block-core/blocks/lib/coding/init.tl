@@ -29,6 +29,9 @@
 --                                               -- tool call after it; absent = no stop point is sent;
 --                                               -- given, llm.conf.thinking must turn reasoning on
 --       check_timeout = 120,                    -- seconds one plan check may take; done = "plan" only
+--       compact = { at = 0.8 },                 -- fold the record into a summary once the last request
+--                                               -- took this share of the window (default); false turns
+--                                               -- it off
 --       strict  = false,                        -- true: every Exec knob below must be named here
 --   })
 --
@@ -82,7 +85,8 @@
 --
 --   EXEC is loop policy — the iterations, the turns, the verify's timeout
 --   curve, the two caps, `done`, the `ops` the model is handed, the shape of
---   the `seed` — and every one of them has a default, stated above.
+--   the `seed`, when the record is `compact`ed — and every one of them has a
+--   default, stated above.
 --   `strict = true` gives those defaults
 --   up: each Exec knob with a number, a mode or a tool set behind it must then
 --   be named by the caller, and the run refuses while any is not, listing all
@@ -124,6 +128,18 @@
 --                         when `call_reserve` is named: the reasoning's stop
 --                         point, sized per request off the reply's room so
 --                         the call after it fits
+--     when the window fills `policy.compact{ at, fold }` asked before every
+--                         beat, unless `compact = false`: once the last
+--                         request took `at` of the window, or the fold began
+--                         dropping beats, one beat writes a summary and the
+--                         loop appends it as a `summary` event with
+--                         `policy.ledger`'s facts (the files the tools were
+--                         handed, the verify's answers) beside it; the fold
+--                         is `policy.window{ from_summary }`, so every request
+--                         after it is the seed, the summary and the beats
+--                         since. `policy.room_note` ends every request with
+--                         what it took of the window, so the model can read
+--                         less before it is told to
 --     what a failure says `policy.carry` — one note about an edit the tool refused
 --     when to stop        `policy.verdict{ run = run_verify, changed, timeout }` after
 --                         every iteration — green counts only with an edit landed —
@@ -147,9 +163,10 @@
 --   the seams built, the `config` value named — and everything above it is
 --   what it calls. `run_loop` drives that `Run` inside the session: it binds
 --   the seams that need the session (`device_of`: the window's fold,
---   `carry`, `repeat_cap`, `thinking_cap`) into the device, runs the
---   baseline verify, then the iterations, the verdict after each, the plan's
---   checks and `M.decide` over them. `M.result_of` reads the state the loop
+--   `carry`, `repeat_cap`, `thinking_cap`, and the compaction's predicate and
+--   writer) into the device, runs the baseline verify, then the iterations
+--   — each beat asked for by `compact` first — the verdict after each, the
+--   plan's checks and `M.decide` over them. `M.result_of` reads the state the loop
 --   left into the result. `M.run` is the three in a row inside the session
 --   bracket, and nothing else.
 --
@@ -189,6 +206,7 @@ local type shared = require("policy.shared")
 local type room = require("policy.room")
 local type ptools = require("policy.tools")
 local type loop = require("policy.loop")
+local type pcompact = require("policy.compact")
 local lshape = require("lshape")
 
 local T = lshape.t
@@ -234,6 +252,13 @@ local record Llm
     conf: {string:any}
 end
 
+--- `compact`, as a table: when the record is folded into a summary
+--- (`policy.compact`'s `at` and `min_beats`). `false` turns it off.
+local record CompactOpt ---@struct
+    at: number ---@optional
+    min_beats: integer ---@optional
+end
+
 --- What `run` takes (`M.shapes.run_opts`; the header's Usage block says what
 --- each one is for).
 local record RunOpts
@@ -257,6 +282,7 @@ local record RunOpts
     baseline: boolean
     done: string
     check_timeout: number
+    compact: CompactOpt | boolean
     strict: boolean
 end
 
@@ -285,6 +311,8 @@ local record Resolved ---@struct
     system: string
     targets: {string}
     window: number
+    --- The compaction as it runs, or `false` when the caller turned it off.
+    compact: CompactOpt | boolean
 end
 
 --- One step of a plan: what it does, and the shell command that says it is
@@ -365,6 +393,7 @@ local record RunResult ---@struct
     done: string ---@optional
     config: Config ---@optional
     plan: PlanSummary ---@optional
+    compactions: number ---@optional
 end
 
 --- A beat's answer, as far as the loop reads it: the beat's id, the tools it
@@ -407,6 +436,7 @@ local record State ---@struct
     plan_steps: {Step}
     last_plan: PlanFacts
     last_checks: {CheckResult}
+    compactions: number
 end
 
 --- The contracts `M.shapes` publishes.
@@ -442,6 +472,13 @@ local DEFAULT_TURNS = 8
 local DEFAULT_TIMEOUT: TimeoutCurve = { first = 900, factor = 3, floor = 60 }
 local DEFAULT_RESULT_SHARE = 0.25
 local DEFAULT_REPEAT_MAX = 2
+-- The share of the window the last request may take before the record is
+-- folded into a summary: `policy.compact`'s own default, named here as well
+-- because this module's `config` says what the run ran at. Compaction is on
+-- unless the caller says `compact = false`: a run long enough to fill the
+-- window is the run this loop exists for, and a model working from a
+-- conversation that begins in the middle is the failure the summary answers.
+local DEFAULT_COMPACT_AT = 0.8
 local STAGNATION_WINDOW = 3
 local VERIFY_TAIL = 6000
 local FEEDBACK_TAIL = 2000
@@ -475,7 +512,17 @@ local DEFAULT_OWNER = "coding"
 -- `repo` / `baseline` / `owner` / `system` / `store` are deliberately absent —
 -- a single self-evident value is not a knob to tune. `check_timeout` is absent
 -- too: `done = "plan"` already requires it of every caller, strict or not.
-local STRICT_KNOBS: {string} = { "iters", "turns", "timeout", "result_share", "repeat_max", "done", "ops", "seed" }
+local STRICT_KNOBS: {string} = {
+    "iters",
+    "turns",
+    "timeout",
+    "result_share",
+    "repeat_max",
+    "done",
+    "ops",
+    "seed",
+    "compact",
+}
 
 -- ============================================================
 -- Shapes
@@ -583,6 +630,16 @@ local RUN_OPTS = T.shape({
     check_timeout = T.number
     :describe('done = "plan": seconds one plan check may take; required in that mode, ignored otherwise')
     :is_optional(),
+    compact = T.any_of({ T.boolean, T.table })
+    :describe(
+        "when the window is nearly full, fold the record into a summary (policy.compact): false turns it "
+            .. "off; { at?, min_beats? } sets the share of the window the last request may take before one "
+            .. "is due (default 0.8) and the beats that must follow a summary before another (default 2). "
+            .. "On by default: the summarising beat is one beat out of the grant, the `summary` event it "
+            .. "appends carries the model's text and policy.ledger's facts, and every request after it is "
+            .. "the seed, the summary, and the beats since. Required under `strict`"
+    )
+    :is_optional(),
     strict = T.boolean
     :describe(
         "true: every Exec knob with a default (iters, turns, timeout, result_share, repeat_max, done, ops, "
@@ -620,6 +677,9 @@ local RUN_RESULT = T.shape({
             .. "a plan was filed at all, and the checks still failing when the run ended "
             .. "({ step, check, exit_code, tail } each)"
     )
+    :is_optional(),
+    compactions = T.number
+    :describe("how many times the record was folded into a summary (policy.compact); absent when off")
     :is_optional(),
 })
 
@@ -1337,13 +1397,13 @@ end
 --- five because the caller said so and one where five was this module's own
 --- number.
 ---
---- `opts` says what the caller named; `resolved` carries the seven values the
---- run worked out for itself, which are not read off `opts` — the defaults
+--- `opts` says what the caller named; `resolved` carries the values the run
+--- worked out for itself, which are not read off `opts` — the defaults
 --- applied, the repo with its trailing slash gone, the targets as absolute
---- paths, the system line, and the window.
+--- paths, the system line, the window, and the compaction as it runs.
 ---
 --- @param opts table  the caller's opts, as `run` received them
---- @param resolved table  { iters, turns, done, repo, system, targets, window }
+--- @param resolved table  { iters, turns, done, ops, seed, repo, system, targets, window, compact }
 --- @return table  { strict = <boolean>, values = { <knob> = { value, from } ... } }
 function M.config_of(opts: RunOpts, resolved: Resolved): Config
     local conf: {string:any} = (type(opts.llm) == "table" and opts.llm.conf) or {}
@@ -1363,6 +1423,9 @@ function M.config_of(opts: RunOpts, resolved: Resolved): Config
         -- a caller may have written them in.
         ops = named(resolved.ops, opts.ops ~= nil),
         seed = named(resolved.seed, opts.seed ~= nil),
+        -- As the run resolved it: `{ at, min_beats }`, or `false` when the
+        -- caller turned it off.
+        compact = named(resolved.compact, opts.compact ~= nil),
         -- No default to name: absent, no stop point is sent at all, so the
         -- entry reads as a `from` alone — like `store` and `check_timeout`.
         call_reserve = named(opts.call_reserve, opts.call_reserve ~= nil),
@@ -1445,6 +1508,27 @@ local function check_opts(opts: RunOpts)
     end
     if opts.strict ~= nil and type(opts.strict) ~= "boolean" then
         error("coding.run: `strict` must be a boolean, got " .. tostring(opts.strict), 3)
+    end
+    -- `compact` is `false`, or a table with the two numbers `policy.compact`
+    -- takes; `true` means the default, and anything else is a typo.
+    local compact = opts.compact as any
+    if compact ~= nil and compact ~= true and compact ~= false then
+        if not (compact is table) then
+            error("coding.run: `compact` must be false or { at?, min_beats? }, got " .. tostring(compact), 3)
+        end
+        for k in pairs(compact as {string:any}) do
+            if k ~= "at" and k ~= "min_beats" then
+                error("coding.run: `compact` takes `at` and `min_beats`, not `" .. tostring(k) .. "`", 3)
+            end
+        end
+        local at = (compact as CompactOpt).at
+        if at ~= nil and (not (at is number) or at <= 0 or at > 1) then
+            error("coding.run: `compact.at` must be a number in (0, 1], got " .. tostring(at), 3)
+        end
+        local min_beats = (compact as CompactOpt).min_beats
+        if min_beats ~= nil and not whole_at_least(min_beats, 1) then
+            error("coding.run: `compact.min_beats` must be a whole number >= 1, got " .. tostring(min_beats), 3)
+        end
     end
 
     -- The tripwires: facts about the model that nothing in this module can
@@ -1590,8 +1674,31 @@ local record Run
     args_present: ptools.Wrap
     verdict: loop.VerdictFn
     stalled: loop.Predicate
+    --- The compaction, when on: `policy.compact`'s opts as resolved, and the
+    --- ledger read beside every summary. The predicate and the fold are
+    --- built with the window's fold, inside the session (`device_of`).
+    compact: CompactOpt
+    ledger: pcompact.LedgerFn
     --- `knl.session`'s opts: the owner, the grant, the store.
     session: kernel.OpenOpts
+end
+
+--- `compact` as the run uses it: the default on, `false` off, a table as
+--- named with the default filled in under it.
+local function compact_of(given: CompactOpt | boolean): CompactOpt
+    if given == false then
+        return nil
+    end
+    local out: CompactOpt = { at = DEFAULT_COMPACT_AT }
+    if given is CompactOpt then
+        if given.at ~= nil then
+            out.at = given.at
+        end
+        if given.min_beats ~= nil then
+            out.min_beats = given.min_beats
+        end
+    end
+    return out
 end
 
 --- The opts, checked, and everything the loop runs on built from them —
@@ -1607,6 +1714,7 @@ local function prepare(opts: RunOpts): Run
     local done_mode = opts.done or DEFAULT_DONE
     local ops = M.ops_of(opts.ops)
     local seed_mode = opts.seed or DEFAULT_SEED
+    local compact = compact_of(opts.compact)
 
     -- The third tripwire, the window: the conf declares it, or the port's
     -- profile asks its server for it. `policy.window` raises for this too,
@@ -1657,6 +1765,7 @@ local function prepare(opts: RunOpts): Run
             system = system,
             targets = targets,
             window = window,
+            compact = compact or false,
         }),
         iters = 0,
         converged = false,
@@ -1672,6 +1781,7 @@ local function prepare(opts: RunOpts): Run
         plan_steps = nil,
         last_plan = nil,
         last_checks = nil,
+        compactions = 0,
     }
 
     local tool_list: {kernel.ToolSpec} = { as_tool(read_spec) }
@@ -1733,8 +1843,15 @@ local function prepare(opts: RunOpts): Run
         args_present = args_present,
         verdict = verdict,
         stalled = stalled,
+        compact = compact,
+        -- The facts beside a summary: the files the fs tools were handed
+        -- (`path`), and the verify's answers.
+        ledger = compact and policy.ledger({ track = { "path" }, kinds = { "verify" } }) or nil,
         session = {
             owner = opts.owner or DEFAULT_OWNER,
+            -- The summarising beats come out of the same grant: one per
+            -- compaction, and a run cannot compact more often than once per
+            -- `min_beats`, so the grant still bounds the run.
             budget = { amount = max_iters * max_turns, tag = "beats" },
             store = opts.store,
         },
@@ -1745,14 +1862,25 @@ end
 -- The loop
 -- ============================================================
 
+--- The compaction, bound: the question the loop asks before a beat, and the
+--- device the one beat that writes the summary runs with.
+local record Compaction
+    due: pcompact.Due
+    writer: kernel.Device
+end
+
 --- The device, bound to the session: the seams that read the session or
 --- size against the window are built here, as it opens, and the device out
---- of them and the `Run`.
-local function device_of(s: kernel.Session, run: Run): kernel.Device, room.Fits
+--- of them and the `Run`. With compaction on, the compaction beside it.
+local function device_of(s: kernel.Session, run: Run): kernel.Device, room.Fits, Compaction
     local port, conf, opts = run.port, run.conf, run.opts
+    local compact = run.compact
+    -- From the latest summary on, when the run compacts: the seed, the
+    -- summary in place of the beats it stands for, and the beats since.
     local fold, fits = policy.window({
         fit = { port = port as shared.Port, conf = conf, reserve = opts.reserve },
         keep_seed = true,
+        from_summary = compact ~= nil,
     })
     -- The note about the beat that failed, and — when the caller named a
     -- `call_reserve` — where this beat's reasoning has to stop for the
@@ -1761,25 +1889,97 @@ local function device_of(s: kernel.Session, run: Run): kernel.Device, room.Fits
     -- request as well. The reply's room it is measured against comes off
     -- the same profile the fold above split the window by (`max_tokens`,
     -- or what `reserve` held back), so nothing about the room is named
-    -- twice.
+    -- twice. With compaction on, the window line goes between them: it is
+    -- part of the request the stop point is sized on.
     local filters: {function(any): any} = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) }
+    if compact ~= nil then
+        filters[#filters + 1] = policy.room_note({ port = port as shared.Port, conf = conf })
+    end
+    local thinking_cap: function(any): any = nil
     if opts.call_reserve ~= nil then
         local thinking = conf.thinking
-        filters[#filters + 1] = policy.thinking_cap({
+        thinking_cap = policy.thinking_cap({
             port = port as shared.Port,
             conf = conf,
             call_reserve = opts.call_reserve,
             budget = thinking is {string:any} and thinking.budget_tokens as integer or nil,
         })
+        filters[#filters + 1] = thinking_cap
     end
+    local llm = port:open(conf)
     local device = kernel.device({
-        llm = port:open(conf),
+        llm = llm,
         system = run.system,
         tools = run.args_present(run.repeat_cap(s)(run.size_cap(run.raw_tools))),
         fold = fold,
         filters = filters,
     })
-    return device, fits
+    if compact == nil then
+        return device, fits, nil
+    end
+    -- The summarising beat: the same model and system line over the same
+    -- windowed request, with the instruction last and no tools — a summary
+    -- is prose, and a request that offered the tools would get one more
+    -- call. The reasoning's stop point still applies, the failure note and
+    -- the window line do not: the summary is about the run, not the beat.
+    local due, summarise = policy.compact({ at = compact.at, min_beats = compact.min_beats, fold = fold })
+    local writer = kernel.device({
+        llm = llm,
+        system = run.system,
+        fold = summarise,
+        filters = thinking_cap and { thinking_cap } or {},
+    })
+    return device, fits, { due = due, writer = writer }
+end
+
+--- The text of a beat's answer, for the `summary` event: every text block,
+--- joined. A summary that came back empty — the model answered with
+--- nothing, or only with blocks that are not text — is not a summary, and
+--- recording it would hand the next request an empty past.
+local function summary_text(o: kernel.OutcomeValue): string
+    local out = o.out as kernel.LlmResult
+    local parts: {string} = {}
+    for _, block in ipairs((out and out.content or {}) as {{string:any}}) do
+        if block.type == "text" and type(block.text) == "string" and (block.text as string):match("%S") then
+            parts[#parts + 1] = block.text as string
+        end
+    end
+    if #parts == 0 then
+        return nil
+    end
+    return table.concat(parts, "\n")
+end
+
+--- One compaction: the summarising beat, and the `summary` event with the
+--- ledger beside what the model wrote. Answers whether the run goes on —
+--- a beat that did not come off ends it, by the same reading as any beat.
+---
+--- @param st table  the loop's state
+--- @param s table  the session
+--- @param run table  the `Run`, for the ledger
+--- @param compaction table  the predicate's answer is `why`; the writer runs
+--- @param why string  what `due` answered: "dropped" | "share"
+--- @return boolean  false when the run must halt (`st.failure_reason` says why)
+local function compact_once(st: State, s: kernel.Session, run: Run, compaction: Compaction, why: string): boolean
+    local o = kernel.beat(s, compaction.writer)
+    local answer, reason, err = beat_outcome(o)
+    if not answer then
+        stop(st, reason, err)
+        return false
+    end
+    local text = summary_text(o)
+    if text == nil then
+        -- Nothing to fold from. The run goes on over the window it had; the
+        -- beat is in the record, and `due` will ask again after `min_beats`.
+        return true
+    end
+    s:append({
+        kind = "summary",
+        meta = { label = "compact", reason = why },
+        data = { content = text, ledger = run.ledger(s) },
+    })
+    st.compactions = st.compactions + 1
+    return true
 end
 
 --- One iteration: beats until an edit lands, the model stops asking for
@@ -1791,23 +1991,33 @@ end
 ---
 --- @param st table  the loop's state
 --- @param s table  the session
+--- @param run table  the `Run`
 --- @param device table
 --- @param fits function|nil  policy.window's second return
---- @param max_turns number
---- @param edits table  the edit tools: { set = { <name> = true }, prose = <string> }
+--- @param compaction table|nil  `device_of`'s third return, when the run compacts
 --- @return table|nil answer  the last beat's `out`
 --- @return boolean declared  the answer asked for no tool: the model saying it is done
 --- @return number applied_here  edits this iteration landed
 local function run_iteration(
     st: State,
     s: kernel.Session,
+    run: Run,
     device: kernel.Device,
     fits: room.Fits,
-    max_turns: number,
-    edits: Edits
+    compaction: Compaction
 ): Answer, boolean, number
+    local max_turns, edits = run.max_turns, run.edits
     local applied_here, answer, declared: number, Answer, boolean = 0, nil, false
     for turn = 1, max_turns do
+        -- Before the beat, and before `fits`: a request the window could no
+        -- longer hold is the request a summary makes room in, so the
+        -- compaction is asked first and the fit is read on what it left.
+        if compaction ~= nil then
+            local why = compaction.due(s)
+            if why ~= nil and not compact_once(st, s, run, compaction, why) then
+                return nil
+            end
+        end
         if fits then
             local over, tokens, limit = fits(s, device)
             if over ~= nil then
@@ -1872,7 +2082,7 @@ local function run_loop(s: kernel.Session, run: Run): State
     local seed = run.seed
 
     st.session_id = tostring(s:id())
-    local device, fits = device_of(s, run)
+    local device, fits, compaction = device_of(s, run)
     -- The state before any edit: the verify once, recorded like the ones
     -- the iterations make (under no beat), so the record has the run's
     -- starting point, `timeout` learns its first measurement from it, an
@@ -1901,7 +2111,7 @@ local function run_loop(s: kernel.Session, run: Run): State
     s:append({ kind = "config", data = st.config })
 
     while true do
-        local answer, declared, applied_here = run_iteration(st, s, device, fits, run.max_turns, run.edits)
+        local answer, declared, applied_here = run_iteration(st, s, run, device, fits, compaction)
         if answer == nil then
             break
         end
@@ -2034,6 +2244,12 @@ function M.result_of(st: State, max_iters: number): RunResult
         last_error = (not converged) and st.last_error or nil,
         done = st.done,
         config = st.config,
+        -- How many times the record was folded into a summary; absent when
+        -- the run did not compact, the count (zero included) when it could.
+        compactions = st.config.values.compact ~= nil
+            and st.config.values.compact.value ~= false
+            and st.compactions
+            or nil,
         -- Which checks were still failing, by name: a count alone (3/4) does
         -- not say which step the run never finished, and the one it never
         -- finished is the one a caller has to look at.

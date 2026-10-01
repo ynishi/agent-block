@@ -9,7 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.compact({ at?, min_beats?, prompt?, fold })` answers the question a
+  loop asks before a beat — is the window nearly full? — and the fold the one
+  beat that writes a summary runs with. `due(session)` reads the window report
+  `knl.beat` already records on every `llm_request` since the latest summary:
+  `"dropped"` when the last fold left beats out, `"share"` when the last
+  request took `at` of the fold's limit or more (default 0.8), nil below that
+  and until `min_beats` beats (default 2) have followed the last summary. The
+  fold is the caller's own with the instruction appended as the last user
+  message and the tools left off: a summary is prose. Nothing here appends —
+  the summarising beat is the loop's, and the `summary` event
+  (`policy.shapes.summary`: the model's text and a ledger) is the loop's to
+  append — and `policy.window{ from_summary = true }` is the reader: from the
+  latest `summary` on, the request is the seed, the summary as one user
+  message, and the beats after it, windowed as before. The summary's place in
+  the log is the cut, so the summarising beat is behind it, and the log keeps
+  every event. Every harness that runs long compacts this way past a share of
+  the window [Claude Code, Codex, OpenHands, pi, Goose; surveyed 2026-10-01];
+  what was missing here was the shape the module's rules allow, and this is
+  it: three values in three seams, the loop between them. Between
+  compactions the request's head does not move, which is also what keeps a
+  provider's prompt cache warm — a window that only dropped beats moved its
+  head on every beat once full.
+
+- `policy.ledger({ track?, kinds? })` reads the facts of a run off the log —
+  the beats and summaries so far, how many times each tool was called, the
+  distinct values each tool was handed under the `track` keys (default
+  `path`: the files read and edited), and for each `kinds` event (default
+  `verify`) how many checks ran, how many passed, and what the last one said
+  — as counts and names, never sentences, so there is nothing in it to
+  disagree with the record. A summary is the model's account of its own run
+  and the facts it most often loses are the ones it got wrong; the ledger goes
+  beside the summary in the `summary` event and `window{ from_summary }`
+  renders it under the summary, one line per fact (`policy.shapes.ledger`).
+
+- `policy.room_note({ port, conf? })` ends every request with one line —
+  `[window] 24984 of 32768 tokens used; 7784 left for the reply` — off the
+  Port's count of the request and the split its profile gives, so the model
+  can read less, edit now, or stop re-reading before it is told to. The
+  sibling lane has sent this line since 2026-09-14; it is a filter like
+  `thinking_cap`, reads no log, and appends after a tool_result batch rather
+  than into one.
+
+- `coding.run{ compact = { at?, min_beats? } | false }` folds the record into
+  a summary when the window is nearly full, and it is on by default: before
+  every beat the loop asks `policy.compact`, and when it answers the loop
+  runs one beat with the summarising device (the same model and system line,
+  the window's own fold, no tools), appends the `summary` event with
+  `policy.ledger`'s facts — the files the `std.fs` tools were handed and the
+  verify's answers — and every request after it is the seed, the summary and
+  the beats since (`policy.window{ from_summary }`). `policy.room_note` ends
+  every request with what it took of the window. `compact` is an Exec knob —
+  `strict` requires it, the `config` event and `result.config` name it — and
+  the result carries `compactions`, how many times the record was folded.
+  The summarising beats come out of the same grant of beats, one per
+  compaction. A summary that came back empty is not recorded, and the run
+  goes on over the window it had.
+
+- `agent.run{ compact = true | { at?, min_beats?, reserve? } }` is the same
+  for the generic agent, opt-in: it needs `context_window` beside the model
+  and the reply's room — `max_tokens`, or `compact.reserve` — and refuses the
+  run otherwise rather than filling either in. With it, the device folds with
+  `policy.window{ fit, keep_seed, from_summary }` and ends each request with
+  the window line, the loop asks `policy.compact` before every beat, and a
+  request that would not fit even compacted ends the run with `context:` as
+  the error instead of the provider's 400.
+
 ### Changed
+
+- `policy` is fourteen in seven files: `policy/compact.lua` (`compact`,
+  `ledger`) joins `room` (which gains `room_note` and `window`'s
+  `from_summary`), `tools`, `carry`, `loop` and `shared`. The module header's
+  "deliberately not here" no longer lists summarising a window: a loop asked
+  for it, and it came in the shape the header requires — the policies read,
+  the loop writes.
 
 ### Deprecated
 

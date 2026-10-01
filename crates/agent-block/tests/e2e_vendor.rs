@@ -492,7 +492,7 @@ fn a_module_vendors_with_its_specs_beside_it() {
         .success()
         .stdout(
             predicate::str::is_match(
-                r"(?m)^policy \(\+shared, room, tools, carry, loop\) \(spec/: \d+\).*vendored$",
+                r"(?m)^policy \(\+shared, room, tools, carry, loop, compact\) \(spec/: \d+\).*vendored$",
             )
             .expect("re"),
         );

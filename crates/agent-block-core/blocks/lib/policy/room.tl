@@ -1,14 +1,17 @@
 --- policy.room — the policies that size things against the model's window.
 ---
---- Four of the eleven, and the one split they all read: where the prompt ends
---- and the reply begins, decided off the Port's profile (`context_window`,
---- `max_output`) by `request_limit` for the prompt's side and `reply_room`
---- for the reply's. `window` is the fold that keeps as many beats as fit,
---- `tokens` the cost that charges a beat its request, `result_cap` the wrap
---- that keeps one tool result under a share of the window, and
---- `thinking_cap` the filter that tells the model where its reasoning has to
---- stop for the call after it to fit. None of them holds a number about the
---- window of its own — the Port declares it, and this file asks.
+--- Five of the fourteen, and the one split they all read: where the prompt
+--- ends and the reply begins, decided off the Port's profile
+--- (`context_window`, `max_output`) by `request_limit` for the prompt's side
+--- and `reply_room` for the reply's. `window` is the fold that keeps as many
+--- beats as fit (and, from a `summary` on, the summary in place of the beats
+--- it stands for), `tokens` the cost that charges a beat its request,
+--- `result_cap` the wrap that keeps one tool result under a share of the
+--- window, `thinking_cap` the filter that tells the model where its
+--- reasoning has to stop for the call after it to fit, and `room_note` the
+--- filter that tells the model how much of the window its request has
+--- taken. None of them holds a number about the window of its own — the Port
+--- declares it, and this file asks.
 ---
 --- Exported through `policy`; see that header for the rules every policy
 --- keeps. This file is `require`d by `policy/init.lua` and not meant to be
@@ -33,6 +36,11 @@ local record WindowOpts
     tail: number
     keep_seed: boolean
     fit: Fit
+    from_summary: boolean
+end
+local record RoomNoteOpts
+    port: shared.Port
+    conf: any
 end
 local record SplitOpts
     port: shared.Port
@@ -78,6 +86,7 @@ local record M
     type TokensFactory = function(TokensOpts): Cost
     type ResultCapFactory = function(ResultCapOpts): ToolsWrap
     type ThinkingCapFactory = function(ThinkingCapOpts): Filter
+    type RoomNoteFactory = function(RoomNoteOpts): Filter
     shapes: {string:lshape.Schema}
     api: {string:shared.ApiEntry}
 end
@@ -90,11 +99,14 @@ local whole_at_least = shared.whole_at_least
 local opts_of = shared.opts_of
 local whole_log = shared.whole_log
 local beat_of = shared.beat_of
+local data_of = shared.data_of
 local needs_session = shared.needs_session
 local opts_contract = shared.opts_contract
 local arg_of = shared.arg_of
 local EVENTS_ARG = shared.EVENTS_ARG
 local SESSION_ARG = shared.SESSION_ARG
+local SUMMARY_KIND = shared.SUMMARY_KIND
+local render_summary = shared.render_summary
 
 --- What `policy.window` is configured with.
 local WINDOW_OPTS, WINDOW_ARG = opts_contract({
@@ -110,6 +122,19 @@ local WINDOW_OPTS, WINDOW_ARG = opts_contract({
             .. "cap; it holds back only what profile.max_output does not already cover"
     )
     :is_optional(),
+    from_summary = T.boolean
+    :describe(
+        "fold from the latest `summary` event on: the seed, the summary as one user message, and the beats "
+            .. "after it; needs keep_seed. default false"
+    )
+    :is_optional(),
+})
+
+--- What `policy.room_note` is configured with: the Port whose count and
+--- profile the numbers come from.
+local ROOM_NOTE_OPTS, ROOM_NOTE_ARG = opts_contract({
+    port = T.table:describe("an LLM Port: profile(conf) for the window and the cap, count(request, conf) for the request"),
+    conf = T.table:describe("the conf the port is opened with"):is_optional(),
 })
 
 --- What `policy.split` is asked with: the Port and conf the numbers come
@@ -251,6 +276,52 @@ local function window_slice(events: {shared.Event}, tail: number, keep_seed?: bo
         slice[#slice + 1] = events[i]
     end
     return slice, { dropped = dropped, kept = tail, seed_kept = keep_seed == true }
+end
+
+--- `events` from the latest `summary` on: the seed (everything before the
+--- first beat), the summary rendered as one user message in the place the
+--- beats it stands for had, and every event after it. A log with no summary
+--- is handed back as it is.
+---
+--- The summary's position in the log is the cut, and nothing in its data
+--- says what it covers: everything before it is what it stands for, the
+--- summarising beat included — that beat's request and answer are in the
+--- log under their own id, and in the request they are what the summary
+--- is. An older summary is before the latest one and goes with the rest.
+---
+--- The rendered message carries no `meta.beat`, so to `window_slice` it is
+--- part of the seed and stays ahead of the window under `keep_seed`, and
+--- the beats after it are counted and dropped as beats always were. The
+--- request then says something the log does not — a conversation that
+--- begins with a summary of itself — which is the whole point, and it is
+--- said in the message's first line (`shared.SUMMARY_PREFIX`).
+---
+--- @param events table  a session's events, in seq order
+--- @return table  the events to fold, in seq order
+local function from_latest_summary(events: {shared.Event}): {shared.Event}
+    local at: integer = nil
+    for i = #events, 1, -1 do
+        local ev = events[i]
+        if ev ~= nil and ev.kind == SUMMARY_KIND then
+            at = i
+            break
+        end
+    end
+    if at == nil then
+        return events
+    end
+    local out: {shared.Event} = {}
+    for i = 1, at - 1 do
+        if beat_of(events[i]) ~= nil then
+            break
+        end
+        out[#out + 1] = events[i]
+    end
+    out[#out + 1] = { kind = "msg_user", data = { content = render_summary(data_of(events[at])) } }
+    for i = at + 1, #events do
+        out[#out + 1] = events[i]
+    end
+    return out
 end
 
 --- How many beats `events` holds.
@@ -665,11 +736,30 @@ end
 ---   event as `data.window`, so what a run dropped is in the log rather than
 ---   only in the moment. Nothing in the kernel decides anything on it.
 ---
---- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf?, reserve = <whole number >= 0>? }? } — `tail` is required without `fit`
+--- From a summary on
+---   With `from_summary = true` the fold reads the log from the latest
+---   `summary` event (`policy.shapes.summary`, the one a loop appends after
+---   a `policy.compact` beat): the request is the seed, the summary rendered
+---   as one user message, and the beats after it, windowed as above. The
+---   summary's place in the log is the cut — everything before it is what it
+---   stands for — and the events it stands for stay in the log untouched;
+---   this changes what is SENT, as every window does, and nothing about what
+---   is recorded. It needs `keep_seed`, because the summary is kept the way
+---   the seed is: ahead of the window, and never dropped.
+---
+---       policy.window({ fit = { port = port, conf = conf, reserve = 4096 },
+---                       keep_seed = true, from_summary = true })
+---
+---   Between compactions the request's head — seed and summary — does not
+---   move, which is also what keeps a provider's prompt cache warm across
+---   the beats between them; a window that only dropped beats moved its
+---   head on every beat once it was full.
+---
+--- @param opts table  { tail = <whole number >= 1>?, keep_seed = <boolean>?, fit = { port, conf?, reserve = <whole number >= 0>? }?, from_summary = <boolean>? } — `tail` is required without `fit`
 --- @return function fold  fn(events, device) -> request, report
 --- @return function|nil fits  fn(session, device) -> nil | "context", tokens, limit (with `fit` only)
 function M.window(opts: WindowOpts): M.Fold, M.Fits
-    opts = opts_of(opts, { tail = true, keep_seed = true, fit = true }, "policy.window")
+    opts = opts_of(opts, { tail = true, keep_seed = true, fit = true, from_summary = true }, "policy.window")
     if opts.fit == nil and not whole_at_least(opts.tail, 1) then
         error("policy.window: tail must be a whole number >= 1, got " .. tostring(opts.tail), 2)
     end
@@ -679,6 +769,12 @@ function M.window(opts: WindowOpts): M.Fold, M.Fits
     if opts.keep_seed ~= nil and type(opts.keep_seed) ~= "boolean" then
         error("policy.window: keep_seed must be a boolean, got " .. tostring(opts.keep_seed), 2)
     end
+    if opts.from_summary ~= nil and type(opts.from_summary) ~= "boolean" then
+        error("policy.window: from_summary must be a boolean, got " .. tostring(opts.from_summary), 2)
+    end
+    if opts.from_summary == true and opts.keep_seed ~= true then
+        error("policy.window: from_summary needs keep_seed = true — the summary is kept the way the seed is", 2)
+    end
     local port, conf, reserve: shared.Port, any, number
     if opts.fit ~= nil then
         port, conf, reserve = port_for_fit(opts.fit, "policy.window")
@@ -687,9 +783,17 @@ function M.window(opts: WindowOpts): M.Fold, M.Fits
 
     local tail = opts.tail
     local keep_seed = opts.keep_seed == true
+    -- What the fold is handed, as this window reads it: the whole log, or
+    -- the log from its latest summary on.
+    local read: function({shared.Event}): {shared.Event} = function(events: {shared.Event}): {shared.Event}
+        return events or {}
+    end
+    if opts.from_summary == true then
+        read = from_latest_summary
+    end
     if port == nil then
         return function(events: {shared.Event}, device: kernel.Device): kernel.Request, kernel.WindowReport
-            local slice, report = window_slice(events, tail, keep_seed)
+            local slice, report = window_slice(read(events), tail, keep_seed)
             -- No `before` / `after` / `limit`: this form counts nothing, and
             -- a number here would be one this fold never asked for.
             return kernel.fold(slice, device), report
@@ -698,7 +802,7 @@ function M.window(opts: WindowOpts): M.Fold, M.Fits
 
     local fold = function(events: {shared.Event}, device: kernel.Device): kernel.Request, kernel.WindowReport
         local request, report, tokens, limit, counted =
-            largest_fitting(events, device, port, conf, reserve, tail, keep_seed)
+            largest_fitting(read(events), device, port, conf, reserve, tail, keep_seed)
         if request then
             return request, report
         end
@@ -733,7 +837,7 @@ function M.window(opts: WindowOpts): M.Fold, M.Fits
     local fits = function(session: kernel.Session, device: kernel.Device): string, number, number
         needs_session(session, "policy.window fits")
         local request, _, tokens, limit = largest_fitting(
-            whole_log(session, "policy.window fits"),
+            read(whole_log(session, "policy.window fits")),
             device or {},
             port,
             conf,
@@ -1060,10 +1164,83 @@ function M.thinking_cap(opts: ThinkingCapOpts): M.Filter
     end
 end
 
+-- ============================================================
+-- room_note — what the request took of the window, said to the model
+-- ============================================================
+
+--- Build a `filter` that ends every request with one line about the window:
+--- what the request took of it, and what is left for the reply.
+---
+---     filters = { policy.room_note({ port = port, conf = conf }) }
+---
+--- THE MODEL CANNOT SEE ITS ROOM (the reasoning `thinking_cap` gives), and
+--- the one thing it can do about a window that is nearly full — read less,
+--- edit now, stop re-reading — it can only do when told. This says it, in
+--- the request, as a fact: `[window] 24984 of 32768 tokens used; 7784 left
+--- for the reply`. The numbers are the Port's — its count of the request
+--- it is handed, and the split `reply_room` reads off its profile — so the
+--- line and the fold agree by construction, and nothing here holds a number
+--- of its own.
+---
+--- The note is one more user message at the end of the request, where the
+--- `window:` line the sibling lane has sent since 2026-09-14 went; it
+--- follows a tool_result batch rather than being written into one, so no
+--- `tool_use` / `tool_result` pairing is touched. It is counted AFTER the
+--- fold sized the request, so the request goes over the fold's limit by the
+--- note's own length — a few dozen tokens, which `fit.reserve` is already
+--- sized in whole thousands against; and a filter after this one that counts
+--- the request (`thinking_cap`) counts the note with it, which is right,
+--- because the note goes on the wire.
+---
+--- It reads no log and holds nothing between beats. The request is not
+--- changed in place: what comes back is a copy with the note appended.
+---
+--- @param opts table  { port, conf? }
+--- @return function filter  fn(request) -> request
+function M.room_note(opts: RoomNoteOpts): M.Filter
+    opts = opts_of(opts, { port = true, conf = true }, "policy.room_note")
+    if type(opts.port) ~= "table" or type(opts.port.count) ~= "function" or type(opts.port.profile) ~= "function" then
+        error("policy.room_note: port must answer count(request, conf) and profile(conf)", 2)
+    end
+    if opts.conf ~= nil and type(opts.conf) ~= "table" then
+        error("policy.room_note: conf must be a table when given", 2)
+    end
+    shape.assert_dev(opts, ROOM_NOTE_OPTS, "policy.room_note opts")
+
+    local port, conf = opts.port, opts.conf
+    return function(request: kernel.Request): kernel.Request
+        local used = port:count(request, conf)
+        if type(used) ~= "number" then
+            error("policy.room_note: port:count must answer a number, got " .. tostring(used), 0)
+        end
+        local profile = port:profile(conf)
+        local window = profile_split(profile, "policy.room_note", 0)
+        local room = reply_room(profile, "policy.room_note", used, 0)
+        local note = string.format(
+            "[window] %d of %d tokens used; %d left for the reply",
+            math.floor(used),
+            window,
+            math.floor(math.max(0, room))
+        )
+        local out: {string:any} = {}
+        for key, value in pairs(request as {string:any}) do
+            out[key] = value
+        end
+        local messages = setmetatable({} as any, ARRAY_TAG as metatable<any>) as {any}
+        for _, message in ipairs(request.messages or {}) do
+            messages[#messages + 1] = message
+        end
+        messages[#messages + 1] = { role = "user", content = note }
+        out.messages = messages
+        return out as kernel.Request
+    end
+end
+
 --- The contracts this file publishes; `policy.shapes` gathers them.
 M.shapes = {
     window_opts = WINDOW_OPTS,
     thinking_cap_opts = THINKING_CAP_OPTS,
+    room_note_opts = ROOM_NOTE_OPTS,
     split_opts = SPLIT_OPTS,
     split = SPLIT,
 }
@@ -1113,6 +1290,16 @@ M.api = {
     },
     thinking_cap = {
         args = { arg_of(THINKING_CAP_ARG, "opts") },
+        returns = "filter — fn(request) -> request",
+        members = {
+            filter = {
+                args = { arg_of(kernel.shapes.request, "request") },
+                returns = kernel.shapes.request,
+            },
+        },
+    },
+    room_note = {
+        args = { arg_of(ROOM_NOTE_ARG, "opts") },
         returns = "filter — fn(request) -> request",
         members = {
             filter = {
