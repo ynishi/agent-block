@@ -1969,8 +1969,12 @@ local function compact_once(st: State, s: kernel.Session, run: Run, compaction: 
     end
     local text = summary_text(o)
     if text == nil then
-        -- Nothing to fold from. The run goes on over the window it had; the
-        -- beat is in the record, and `due` will ask again after `min_beats`.
+        -- Nothing to fold from. The run goes on over the window it had, and
+        -- the mark says so: `due` counts `min_beats` from it, so the model
+        -- is not asked again before the next beat [measured 2026-10-01: a
+        -- model that answered the summary prompt with nothing was asked on
+        -- every beat until this mark existed, one wasted call per beat].
+        s:append({ kind = "compact_skipped", meta = { label = "compact", reason = why }, data = { why = "empty" } })
         return true
     end
     s:append({

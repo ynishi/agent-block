@@ -86,6 +86,7 @@ local record S
     DEFAULT_LEDGER_TRACK: {string}
     DEFAULT_LEDGER_KINDS: {string}
     SUMMARY_KIND: string
+    COMPACT_SKIPPED_KIND: string
     SUMMARY_PREFIX: string
     DEFAULT_SAME: integer
     DEFAULT_NO_PROGRESS: integer
@@ -107,6 +108,7 @@ local record S
     STOP_REASON: lshape.Schema
     LEDGER: lshape.Schema
     SUMMARY: lshape.Schema
+    COMPACT_SKIPPED: lshape.Schema
     EVENTS_ARG: ApiArg
     SESSION_ARG: ApiArg
     OUTCOME_ARG: ApiArg
@@ -219,10 +221,22 @@ S.DEFAULT_LEDGER_KINDS = { "verify" }
 --- reads. One name, read in two files, so it lives in the one both see.
 S.SUMMARY_KIND = "summary"
 
+--- The kind the loop appends where a summary was asked for and came back
+--- empty: `compact` counts `min_beats` from it, the fold ignores it.
+S.COMPACT_SKIPPED_KIND = "compact_skipped"
+
 --- What the rendered summary opens with, so the model reads it as the
---- record's compaction rather than as a message somebody sent.
+--- record's compaction rather than as a message somebody sent. The last
+--- sentence is there because the seed stays ahead of the summary and may
+--- describe a state the run has since changed — a build that was red at the
+--- start and is green now [measured 2026-10-01: after a compaction, a model
+--- read the seed's "build status: FAILING" as current while the ledger
+--- beside it said the last verify passed, and set out to fix a build that
+--- was not broken].
 S.SUMMARY_PREFIX = "The earlier part of this conversation was compacted. What follows is the summary "
-    .. "written at that point, and a ledger of facts read off the record."
+    .. "written at that point, and a ledger of facts read off the record. Where the task "
+    .. "message above describes a state of the files or the build, the ledger below is "
+    .. "newer and is what holds now."
 
 --- How deep `canonical` renders a nested value before it stops. A tool input
 --- is JSON-shaped and shallow; the cap is what keeps a cyclic hand-built one
@@ -640,6 +654,14 @@ S.LEDGER = T.shape({
 S.SUMMARY = T.shape({
     content = T.string:describe("the summary, as the model wrote it"),
     ledger = S.LEDGER:is_optional(),
+}, { open = false })
+
+--- What the loop appends under `compact_skipped`
+--- (`policy.shapes.compact_skipped`): why no summary was recorded where one
+--- was due. `compact` counts `min_beats` from it; `window{ from_summary }`
+--- does not read it.
+S.COMPACT_SKIPPED = T.shape({
+    why = T.one_of({ "empty" }):describe("the summarising beat answered no text"),
 }, { open = false })
 
 -- ============================================================
