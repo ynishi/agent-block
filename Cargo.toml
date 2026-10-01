@@ -52,7 +52,7 @@ mlua         = { version = "0.12", features = ["lua54", "vendored", "async", "se
 # VM thread; the host installs it right after `register_all` (see `host.rs`).
 # It lives behind the `task` feature, which is in the list below.
 #
-# 0.7 is the version htl-core 0.11 builds against (its proc macros' checker
+# 0.7 is the version htl-core 0.12 builds against (its proc macros' checker
 # reads the `std.*` declarations mlua-batteries ships), so one version here
 # means one copy in the graph. Default features are off and the list is
 # spelled out: 0.7's defaults add `pretty` and `argparse`, and the modules a
@@ -94,7 +94,7 @@ mlua-pkg     = "0.11"
 # `#[host_module]`, `pkg`
 # is the resolver. `dts` (the `.d.tl` a `#[host_module]` declares) is off: this
 # host declares no `#[host_module]` and renders its own `knl_types.d.tl`.
-htl          = { version = "0.11", default-features = false, features = ["macros", "pkg"] }
+htl          = { version = "0.12", default-features = false, features = ["macros", "pkg"] }
 # The SQLite cluster, one line for everything that links it. `libsqlite3-sys`
 # declares `links = "sqlite3"`, so the graph holds exactly one major of it
 # however the `sqlite` feature is set: rusqlite 0.40 → libsqlite3-sys 0.38
