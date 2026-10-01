@@ -1325,7 +1325,9 @@ local function run_loop(s: kernel.Session, run: Run): Tally
         end
         local text = text_of((o.out as kernel.LlmResult).content as {proto.Block})
         if not text:match("%S") then
-            -- Nothing to fold from: the run goes on over the window it had.
+            -- Nothing to fold from: the run goes on over the window it had,
+            -- and the mark keeps `due` from asking again on the next beat.
+            s:append({ kind = "compact_skipped", meta = { label = "compact", reason = why }, data = { why = "empty" } })
             return nil
         end
         s:append({

@@ -275,6 +275,40 @@ describe("policy.compact — due", function()
         expect(due(later)).to.be("share")
     end)
 
+    it("counts `min_beats` from a compact_skipped mark as it would from a summary", function()
+        -- The mark the loop leaves where the summary came back empty: one
+        -- beat after it is not due, two are — the same reading a summary
+        -- gets, so an empty answer is not asked for again on the next beat.
+        local skipped = { { kind = "compact_skipped", data = { why = "empty" }, seq = 6 } }
+        local one = log_of(
+            concat(
+                seed("task", 1),
+                answered("b1", "one", 2, report(nil, 90, 100)),
+                answered("b2", "two", 4, report(nil, 95, 100)),
+                skipped,
+                answered("b3", "three", 7, report(nil, 90, 100))
+            )
+        )
+        expect(due(one)).to.be(nil)
+        local two = log_of(
+            concat(
+                seed("task", 1),
+                answered("b1", "one", 2, report(nil, 90, 100)),
+                answered("b2", "two", 4, report(nil, 95, 100)),
+                skipped,
+                answered("b3", "three", 7, report(nil, 90, 100)),
+                answered("b4", "four", 9, report(nil, 90, 100))
+            )
+        )
+        expect(due(two)).to.be("share")
+        -- The fold reads through the mark: nothing was summarised.
+        local fold = policy.window({ tail = 10, keep_seed = true, from_summary = true })
+        local request = fold(concat(seed("task", 1), answered("b1", "one", 2), skipped, answered("b2", "two", 7)), {})
+        expect(#request.messages).to.be(3)
+        expect(request.messages[1].content).to.be("task")
+        expect(request.messages[2].role).to.be("assistant")
+    end)
+
     it("reads only the requests since the latest summary", function()
         local s = log_of(
             concat(

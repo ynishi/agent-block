@@ -63,8 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `strict` requires it, the `config` event and `result.config` name it — and
   the result carries `compactions`, how many times the record was folded.
   The summarising beats come out of the same grant of beats, one per
-  compaction. A summary that came back empty is not recorded, and the run
-  goes on over the window it had.
+  compaction. A summary that came back empty is not recorded; the loop
+  appends `compact_skipped` (`policy.shapes.compact_skipped`) in its place,
+  `compact` counts `min_beats` from that mark as from a summary, and the run
+  goes on over the window it had [measured 2026-10-01 against
+  gemini-2.5-flash over its OpenAI-compatible endpoint, window declared at
+  8,000: three compactions in one run, each cutting the next request from
+  ~5,200 to ~3,100 tokens by the Port's count, with the ledger naming the
+  files read and edited and the verify's answers; 9 of 12 summary requests
+  came back with 0 output tokens, which is what the mark is for]. The
+  rendered summary says the ledger is newer than any state the task message
+  describes [measured in the same run: after a compaction the model read the
+  seed's red baseline as current while the ledger said the last verify
+  passed].
 
 - `agent.run{ compact = true | { at?, min_beats?, reserve? } }` is the same
   for the generic agent, opt-in: it needs `context_window` beside the model

@@ -67,12 +67,14 @@
 ---   beats. Nothing here decides what a beat does while it runs — that is the
 ---   kernel's, and it is not a seam.
 ---
----   The one event this module names and does not write is `summary`
----   (`policy.shapes.summary`): the loop appends it after the beat
----   `compact` hands the fold for, and `window{ from_summary }` folds from
----   it. Three values in three seams, and the loop between them — the rule
----   that nothing here appends holds, and the record is compacted all the
----   same.
+---   The two events this module names and does not write are `summary`
+---   (`policy.shapes.summary`) and `compact_skipped`
+---   (`policy.shapes.compact_skipped`): the loop appends the first after the
+---   beat `compact` hands the fold for, and the second where that beat
+---   answered nothing; `window{ from_summary }` folds from the first and
+---   `compact` counts from either. Three values in three seams, and the loop
+---   between them — the rule that nothing here appends holds, and the record
+---   is compacted all the same.
 ---
 --- Where each one lives
 ---   `policy` is one module in six files, and this one is the door: it
@@ -322,6 +324,7 @@ local record Shapes
     ledger_opts: lshape.Schema
     ledger: lshape.Schema
     summary: lshape.Schema
+    compact_skipped: lshape.Schema
     beat_record: lshape.Schema
     tool_pair: lshape.Schema
     stop_reason: lshape.Schema
@@ -397,6 +400,7 @@ M.shapes = {
     ledger_opts = compact.shapes.ledger_opts,
     ledger = shared.LEDGER,
     summary = shared.SUMMARY,
+    compact_skipped = shared.COMPACT_SKIPPED,
     beat_record = shared.BEAT_RECORD,
     tool_pair = shared.TOOL_PAIR,
     stop_reason = shared.STOP_REASON,

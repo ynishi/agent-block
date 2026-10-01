@@ -58,6 +58,7 @@ local DEFAULT_COMPACT_PROMPT = shared.DEFAULT_COMPACT_PROMPT
 local DEFAULT_LEDGER_TRACK = shared.DEFAULT_LEDGER_TRACK
 local DEFAULT_LEDGER_KINDS = shared.DEFAULT_LEDGER_KINDS
 local SUMMARY_KIND = shared.SUMMARY_KIND
+local SKIPPED_KIND = shared.COMPACT_SKIPPED_KIND
 local ARRAY_TAG = shared.ARRAY_TAG
 local whole_at_least = shared.whole_at_least
 local opts_of = shared.opts_of
@@ -100,11 +101,13 @@ local LEDGER_OPTS, LEDGER_ARG = opts_contract({
 -- compact — when the window is nearly full
 -- ============================================================
 
---- The index of the latest `summary` event, or 0 when there is none.
-local function last_summary_at(events: {shared.Event}): integer
+--- The index of the latest compaction mark — a `summary`, or a
+--- `compact_skipped` the loop left where a summary came back empty — or 0
+--- when there is none.
+local function last_cut_at(events: {shared.Event}): integer
     for i = #events, 1, -1 do
         local ev = events[i]
-        if ev ~= nil and ev.kind == SUMMARY_KIND then
+        if ev ~= nil and (ev.kind == SUMMARY_KIND or ev.kind == SKIPPED_KIND) then
             return i
         end
     end
@@ -124,6 +127,15 @@ end
 --- beats will start dropping, and a summary written now is written from a
 --- request that still holds everything.
 ---
+--- `min_beats` counts from the latest `summary` OR `compact_skipped`. The
+--- second is the mark a loop leaves when the summarising beat answered
+--- nothing (`policy.shapes.compact_skipped`); without it a model that
+--- answers the summary prompt with an empty reply would be asked again
+--- before every beat, one wasted call per beat [measured 2026-10-01 against
+--- gemini-2.5-flash over its OpenAI-compatible endpoint: 9 of 12 summary
+--- requests in one run came back with 0 output tokens, and each was
+--- re-asked on the next beat until this mark existed].
+---
 --- A fold that counts nothing (`window{ tail }` alone) reports no numbers,
 --- and then only `"dropped"` can ever be answered.
 ---
@@ -132,7 +144,7 @@ end
 --- @param min_beats number  how many beats must follow the last summary first
 --- @return string|nil  "dropped" | "share" | nil
 local function due_of(events: {shared.Event}, at: number, min_beats: integer): string
-    local from = last_summary_at(events) + 1
+    local from = last_cut_at(events) + 1
     local beats, seen: integer, {string:boolean} = 0, {}
     local last_report: kernel.WindowReport = nil
     for i = from, #events do
@@ -231,7 +243,13 @@ end
 --- dropped and what the request cost against the fold's limit, and that is
 --- the whole reading. It answers nil until `min_beats` beats have followed
 --- the last summary, so a seed that alone fills `at` of the window cannot
---- make every beat a compaction.
+--- make every beat a compaction. A SUMMARY THAT CAME BACK EMPTY is the
+--- loop's to mark: it appends `compact_skipped`
+--- (`policy.shapes.compact_skipped`) in the summary's place, `due` counts
+--- `min_beats` from that mark as it would from a summary, and
+--- `window{ from_summary }` folds through it as if it were not there — the
+--- request stays what it was, and the model is not asked again on the very
+--- next beat.
 ---
 --- The fold it answers is the caller's `fold` with `prompt` appended as the
 --- last user message and the tools left off the request; the report beside
@@ -409,6 +427,7 @@ end
 M.shapes = {
     compact_opts = COMPACT_OPTS,
     ledger_opts = LEDGER_OPTS,
+    compact_skipped = shared.COMPACT_SKIPPED,
 }
 
 --- This file's entries in `policy.shapes.api`, gathered there.
