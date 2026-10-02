@@ -1027,15 +1027,17 @@ fn refused_with(stdout: &str, text: &str) {
 /// around it — on the real file system, where symlinks and `..` are real.
 ///
 /// The parent runs in `<base>/repo` (an edit that turns the verify green,
-/// then its answer). While that directory holds the file, every alias of it
-/// is refused before anything is made — it holds files. A new directory in
-/// it, reached directly or through a symlink, is made, resolved, and refused
-/// as inside the parent's repo, and left there empty. A sibling whose name
-/// starts with the parent's, a nested directory not there yet, and a
-/// symlink to an empty directory are taken, the last recorded in the
-/// child's config as the directory it points to. Then the parent's file is
-/// removed, so an empty alias of it, and a directory around it, reach the
-/// comparison — which refuses them.
+/// then its answer). Every alias of that directory — a symlink, `..`, a
+/// trailing slash — is resolved and refused by the comparison as the
+/// parent's repo, its file untouched. A new directory in it, reached
+/// directly or through a symlink, is made, resolved, and refused as inside
+/// the parent's repo, and left there empty. A directory that already holds
+/// a file of its own is taken — the caller provides the tree — and its file
+/// is left as it was. A sibling whose name starts with the parent's, a
+/// nested directory not there yet, and a symlink to an empty directory are
+/// taken, the last recorded in the child's config as the directory it
+/// points to. Then the parent's file is removed, so an empty alias of it,
+/// and a directory around it, are refused by the comparison too.
 #[cfg(unix)]
 #[tokio::test]
 async fn coding_fork_refuses_the_parents_repo_under_any_alias_and_takes_a_sibling() {
@@ -1070,18 +1072,37 @@ async fn coding_fork_refuses_the_parents_repo_under_any_alias_and_takes_a_siblin
         async move { fork_into(&repo, &knl, &events, &parent).await }
     };
 
-    // The parent's repo holds its file: every alias of it stops at step 1.
+    // The parent's repo holds its file: every alias of it is resolved and
+    // refused as the parent's repo, and the file is not touched.
     let alias = base.join("alias");
     std::os::unix::fs::symlink(&parent_repo, &alias).expect("symlink to the parent's repo");
     let by_dots = base.join("repo").join("..").join("repo");
     let slashed = std::path::PathBuf::from(format!("{}/", parent_repo.display()));
     for repo in [alias.clone(), by_dots, slashed] {
-        refused_with(&fork(repo).await, "already holds files");
+        refused_with(
+            &fork(repo).await,
+            "is the repo a run in this history edited",
+        );
     }
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read the parent's file"),
+        parent_after,
+        "no refused alias touched the parent's file"
+    );
+    // A directory holding a file of its own is taken: the targets are
+    // written, its file is left as it was.
     let other = base.join("other");
     std::fs::create_dir(&other).expect("make another directory");
     std::fs::write(other.join("notes.txt"), "x").expect("write a file into it");
-    refused_with(&fork(other.clone()).await, "already holds files");
+    says(&fork(other.clone()).await, "ok=true");
+    assert_eq!(
+        std::fs::read_to_string(other.join("notes.txt")).expect("its own file"),
+        "x"
+    );
+    assert_eq!(
+        std::fs::read_to_string(other.join("lib.lua")).expect("the restored target"),
+        parent_after
+    );
 
     // A new directory in the parent's repo, directly or through the symlink:
     // made, resolved, refused, and left there empty.
@@ -1171,8 +1192,11 @@ async fn coding_fork_refuses_the_parents_repo_under_any_alias_and_takes_a_siblin
 /// with `src -> <parent>/src` is refused on `src/x.lua`; `lib.lua`, which
 /// sorts first and lies in the child itself, is not written either — the
 /// check covers every file before any is written. The child with `lib.lua ->
-/// <parent>/lib.lua` is refused on that file. The parent's files are as the
-/// parent left them.
+/// <parent>/lib.lua` is refused on that file. The child with `lib.lua` a
+/// hard link to the parent's — what `cp -al` of the parent's checkout makes,
+/// no symlink and inside the child by its string — is refused by identity
+/// (the same device and inode). The parent's files are as the parent left
+/// them.
 #[cfg(unix)]
 #[tokio::test]
 async fn coding_fork_refuses_a_symlink_in_the_child_repo_that_leads_out_and_writes_nothing() {
@@ -1243,9 +1267,21 @@ async fn coding_fork_refuses_a_symlink_in_the_child_repo_that_leads_out_and_writ
     std::os::unix::fs::symlink(&target, by_file.join("lib.lua"))
         .expect("symlink to the parent's file");
     let out = fork(by_file.clone()).await;
-    refused_with(&out, "lib.lua leads to");
+    refused_with(&out, "lib.lua is a symlink (to ");
     assert!(
         !by_file.join("src").join("x.lua").exists(),
+        "no file written before the refusal"
+    );
+
+    // A hard link to the parent's `lib.lua`, in a tree the caller copied.
+    let by_link = base.join("by-link");
+    std::fs::create_dir_all(by_link.join("src")).expect("make the child's repo");
+    std::fs::hard_link(&target, by_link.join("lib.lua")).expect("hard link to the parent's file");
+    let out = fork(by_link.clone()).await;
+    refused_with(&out, "the parent's file, under another name (a hard link)");
+    refused_with(&out, "nothing was restored");
+    assert!(
+        !by_link.join("src").join("x.lua").exists(),
         "no file written before the refusal"
     );
 
@@ -1256,5 +1292,257 @@ async fn coding_fork_refuses_a_symlink_in_the_child_repo_that_leads_out_and_writ
     assert_eq!(
         std::fs::read_to_string(&nested).expect("the parent's nested file"),
         parent_nested
+    );
+}
+
+/// A symlink that leads to nothing, planted in an otherwise empty child repo
+/// at a target's own path, or at a target's directory, is refused before the
+/// restore writes anything — the write would follow it, and create the file
+/// at its far end.
+///
+/// The parent's targets are `lib.lua` and `src/x.lua`. The child with
+/// `lib.lua -> <base>/outside/lib.lua` (`outside` there, the file not) is
+/// refused on that file; the child with `src -> <base>/gone` (nothing there)
+/// is refused on `src`. Neither child got a file, nothing was created at the
+/// links' far ends, and the parent's files are as the parent left them.
+///
+/// Not exercised here, on any test: the identity comparison catching an
+/// alias whose canonical string differs — a bind mount of the parent's repo
+/// (needs root, or an unprivileged user namespace, which the host this was
+/// written on refuses) and a Linux casefold directory (needs a file system
+/// made with the feature; the temp dir is tmpfs without it). The comparison
+/// is covered on fork_spec's fake disk, and `std.fs.inspect`'s identity on a
+/// real disk by a hard link (two strings, one inode) in `bridge::fs`'s unit
+/// tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn coding_fork_refuses_a_dangling_symlink_at_a_target_and_writes_nothing() {
+    let base_dir = tempdir().expect("tempdir for the layout");
+    let base = base_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize the layout");
+    let parent_repo = base.join("repo");
+    std::fs::create_dir_all(parent_repo.join("src")).expect("make the parent's repo");
+    let target = parent_repo.join("lib.lua");
+    std::fs::write(&target, LIB_BEFORE).expect("write the parent's file");
+    let nested = parent_repo.join("src").join("x.lua");
+    std::fs::write(&nested, "return 1\n").expect("write the parent's nested file");
+    let target = target.to_string_lossy().into_owned();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let extra = ("CODING_EXTRA_TARGETS_TEST", "src/x.lua");
+
+    let parent = run_fixture(
+        vec![edit_turn(&target), answer_turn("Done.")],
+        &parent_repo.to_string_lossy(),
+        &[("AGENT_BLOCK_KNL_PATH", &knl_env), extra],
+    )
+    .await;
+    says(&parent.stdout, "ok=true");
+    let parent_session = marker(&parent.stdout, "session").to_string();
+    let events_file = store.path().join("parent.jsonl");
+    std::fs::write(&events_file, export_events(&knl, &parent_session)).expect("write the export");
+    let events = events_file.to_string_lossy().into_owned();
+    let parent_lib = std::fs::read_to_string(&target).expect("read the parent's file");
+    let parent_nested = std::fs::read_to_string(&nested).expect("read the parent's nested file");
+    let fork = |repo: std::path::PathBuf| {
+        let (knl, events, parent) = (knl_env.clone(), events.clone(), parent_session.clone());
+        async move {
+            run_fixture(
+                vec![answer_turn("Done, from the fork.")],
+                &repo.to_string_lossy(),
+                &[
+                    ("AGENT_BLOCK_KNL_PATH", &knl),
+                    ("CODING_FORK_EVENTS_TEST", &events),
+                    ("CODING_FORK_PARENT_TEST", &parent),
+                    extra,
+                ],
+            )
+            .await
+            .stdout
+        }
+    };
+
+    // At a target's own path: a write would create `outside/lib.lua`.
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).expect("make the directory the link points into");
+    let at_file = base.join("at-file");
+    std::fs::create_dir(&at_file).expect("make the child's repo");
+    std::os::unix::fs::symlink(outside.join("lib.lua"), at_file.join("lib.lua"))
+        .expect("a symlink to a file not there");
+    let out = fork(at_file.clone()).await;
+    refused_with(&out, "lib.lua is a symlink (to nothing)");
+    refused_with(&out, "nothing was restored");
+    assert!(
+        std::fs::read_dir(&outside)
+            .expect("list the far end")
+            .next()
+            .is_none(),
+        "nothing created at the link's far end"
+    );
+    assert!(
+        !at_file.join("src").join("x.lua").exists(),
+        "no file written before the refusal"
+    );
+
+    // At a target's directory: `src` leads to nothing.
+    let at_dir = base.join("at-dir");
+    std::fs::create_dir(&at_dir).expect("make the child's repo");
+    std::os::unix::fs::symlink(base.join("gone"), at_dir.join("src"))
+        .expect("a symlink to a directory not there");
+    let out = fork(at_dir.clone()).await;
+    refused_with(&out, "src is a symlink that leads to nothing");
+    assert!(
+        !base.join("gone").exists(),
+        "nothing made at the link's far end"
+    );
+    assert!(
+        !at_dir.join("lib.lua").exists(),
+        "no file written before the refusal, not even the one at the repo's root"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the parent's file"),
+        parent_lib
+    );
+    assert_eq!(
+        std::fs::read_to_string(&nested).expect("the parent's nested file"),
+        parent_nested
+    );
+}
+
+/// The caller provides the rest of the tree: a fork into a directory that
+/// already holds the files the verify reads — here a check script, which no
+/// checkpoint records, because it is not a target — restores the targets
+/// over it and leaves the rest as it was, and the child's first verify runs
+/// on both.
+///
+/// The parent's verify is `sh test/check.sh`, which greps `lib.lua` for the
+/// edit. The parent edits and is green. The child is forked at that edit's
+/// beat into a directory holding `test/check.sh`, a `README` and a stale
+/// `lib.lua` (as a clone of an older checkout would): `lib.lua` is restored,
+/// the other two are not touched, and the verify the fork runs before the
+/// child's first beat is green — so the child that declares at once
+/// converges. The same fork into an empty directory has no `test/check.sh`,
+/// and that first verify is red: what made the first one green is the tree
+/// the caller put there.
+#[cfg(unix)]
+#[tokio::test]
+async fn coding_fork_into_a_tree_the_caller_provided_verifies_with_its_non_target_files() {
+    const CHECK: &str = "grep -qF 'return n * 2' lib.lua\n";
+    let base_dir = tempdir().expect("tempdir for the layout");
+    let base = base_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize the layout");
+    let parent_repo = base.join("repo");
+    std::fs::create_dir_all(parent_repo.join("test")).expect("make the parent's repo");
+    std::fs::write(parent_repo.join("test").join("check.sh"), CHECK).expect("write the check");
+    let target = parent_repo.join("lib.lua");
+    std::fs::write(&target, LIB_BEFORE).expect("write the parent's file");
+    let target = target.to_string_lossy().into_owned();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let verify = ("CODING_VERIFY_TEST", "sh test/check.sh");
+
+    let parent = run_fixture(
+        vec![edit_turn(&target), answer_turn("Done.")],
+        &parent_repo.to_string_lossy(),
+        &[("AGENT_BLOCK_KNL_PATH", &knl_env), verify],
+    )
+    .await;
+    says(&parent.stdout, "ok=true");
+    let parent_session = marker(&parent.stdout, "session").to_string();
+    let events_file = store.path().join("parent.jsonl");
+    std::fs::write(&events_file, export_events(&knl, &parent_session)).expect("write the export");
+    let events = events_file.to_string_lossy().into_owned();
+    let parent_after = std::fs::read_to_string(&target).expect("read the parent's file");
+
+    // What the fork's own verify said: the last `verify` before the note it
+    // puts in the seed's place.
+    let first_verify_ok = |session: &str| -> bool {
+        let record = decoded(&export_events(&knl, session));
+        let note = record
+            .iter()
+            .position(|ev| ev["kind"] == "msg_user" && ev["meta"]["label"] == "fork")
+            .expect("the fork's note");
+        let verify = record[..note]
+            .iter()
+            .rev()
+            .find(|ev| ev["kind"] == "verify")
+            .expect("the fork's verify, before its note");
+        verify["data"]["ok"] == true
+    };
+    let fork = |repo: std::path::PathBuf, script: Vec<Value>| {
+        let (knl, events, parent) = (knl_env.clone(), events.clone(), parent_session.clone());
+        async move {
+            run_fixture(
+                script,
+                &repo.to_string_lossy(),
+                &[
+                    ("AGENT_BLOCK_KNL_PATH", &knl),
+                    ("CODING_FORK_EVENTS_TEST", &events),
+                    ("CODING_FORK_PARENT_TEST", &parent),
+                    verify,
+                ],
+            )
+            .await
+            .stdout
+        }
+    };
+
+    // Pre-populated by the caller: the check, a README, a stale target.
+    let child = base.join("child");
+    std::fs::create_dir_all(child.join("test")).expect("make the child's repo");
+    std::fs::write(child.join("test").join("check.sh"), CHECK).expect("copy the check");
+    std::fs::write(child.join("README"), "the caller's\n").expect("write a README");
+    std::fs::write(child.join("lib.lua"), "-- stale\n").expect("write a stale target");
+    let out = fork(child.clone(), vec![answer_turn("Done, from the fork.")]).await;
+    says(&out, "ok=true");
+    says(&out, "iters=1");
+    assert!(
+        first_verify_ok(marker(&out, "session")),
+        "the fork's first verify ran the caller's check on the restored target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child.join("lib.lua")).expect("the restored target"),
+        parent_after,
+        "the target is restored over the stale one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child.join("test").join("check.sh")).expect("the check"),
+        CHECK,
+        "a non-target file is left as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child.join("README")).expect("the README"),
+        "the caller's\n",
+        "a non-target file is left as it was"
+    );
+
+    // The same fork into an empty directory: no check to run, a red verify.
+    let bare = base.join("bare");
+    let script = (0..6).map(|_| answer_turn("Done.")).collect();
+    let out = fork(bare.clone(), script).await;
+    says(&out, "CODING_MOCK_DONE");
+    assert!(
+        !first_verify_ok(marker(&out, "session")),
+        "without the caller's tree the check is not there and the verify is red"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bare.join("lib.lua")).expect("the restored target"),
+        parent_after
+    );
+    assert!(
+        !bare.join("test").exists(),
+        "the fork writes the targets and nothing else"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the parent's file"),
+        parent_after,
+        "no fork touched the parent's file"
     );
 }

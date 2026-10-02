@@ -114,6 +114,21 @@ local record host_types
             --- Every file under the directory, recursively; raises when it
             --- cannot be listed or holds more than the host's walk limit.
             walk: function(string): {string}
+            --- What `inspect` answers. `kind` is of the path itself, a
+            --- symlink not followed: "file" | "dir" | "symlink" | "other" |
+            --- "missing". `dangling` is set on a symlink only (true when it
+            --- leads to nothing); `canonical` when the path resolves; `dev`
+            --- / `ino` of what it resolves to, on Unix only.
+            record Inspected
+                kind: string
+                dangling: boolean
+                canonical: string
+                dev: integer
+                ino: integer
+            end
+            --- What is at the path, without following it; raises on any
+            --- error but not-found.
+            inspect: function(string): Inspected
             --- What `tool_specs` takes: `fs_tools`' `Opts`, which the
             --- bridge installs its functions from.
             record ToolSpecsOpts

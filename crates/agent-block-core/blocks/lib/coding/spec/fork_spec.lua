@@ -35,18 +35,29 @@
 --     verify over restored edits converges;
 --   7 the refusals, by name and before a session opens: a beat not in the
 --     log, "baseline", the parent's repo (as written, with a trailing slash,
---     through `..`, and emptied so the comparison is what catches it), a
---     directory inside it, a directory that already holds a file, an empty
---     repo holding a symlink to the parent's file (nothing written), a `spec`,
+--     through `..`, holding its file or emptied), a directory inside it, a
+--     repo holding a symlink at a target's path — to the parent's file, or
+--     to nothing — or a hard link to the parent's file there (nothing
+--     written in any of them), the parent's repo under a
+--     name whose string differs and whose identity does not (a mount-like
+--     alias of it, a new directory inside that alias, an alias of a
+--     directory around it), a `spec`,
 --     an array with no `parent`, a `parent` that is not the session handed
 --     in, and a parent run that recorded no state of the files;
 --   8 what is taken: a sibling whose name starts with the parent's
---     (`/parent2`), and a nested directory not there yet.
+--     (`/parent2`), a nested directory not there yet, a directory the caller
+--     filled with the rest of the tree (the target restored over a stale
+--     one, the other files left as they were), and — where the host
+--     gives no identity, as off Unix — the mount-like alias, which only the
+--     strings are compared for then.
 --
 -- The fake disk folds `.` and `..` and follows the links a case plants, which
 -- is enough for a file symlink inside the child's repo; symlinks to
 -- directories, and a directory around the parent's, are proved against the
--- real file system in crates/agent-block/tests/e2e_coding.rs.
+-- real file system in crates/agent-block/tests/e2e_coding.rs. Its mounts are
+-- the stand-in for a bind mount or a casefold name, which an unprivileged
+-- test cannot build on a real disk: the strings stay apart and only
+-- `std.fs.inspect`'s `dev` / `ino` say the two are one.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -101,6 +112,32 @@ local function real(p)
         end
     end
     return p
+end
+
+-- The root is there, as on a real disk, so the walk up a path ends on it.
+dirs["/"] = true
+
+-- Mounts: `mounts[at] = of` — a directory that is another one under a
+-- different string. Nothing folds `at` into `of`, as canonicalize does not for
+-- a bind mount; only the identity `std.fs.inspect` gives is shared.
+local mounts = {}
+-- Set by a case to answer as a host with no identity does (off Unix).
+local no_identity = false
+local inodes, last_inode = {}, 0
+
+--- The inode a real path stands for: its mount's target's, else its own.
+local function inode_of(p)
+    for at, of in pairs(mounts) do
+        if p == at or under(at, p) then
+            p = folded(of .. p:sub(#at + 1))
+            break
+        end
+    end
+    if inodes[p] == nil then
+        last_inode = last_inode + 1
+        inodes[p] = last_inode
+    end
+    return inodes[p]
 end
 
 local function exists(p)
@@ -176,6 +213,32 @@ _G.std = {
         mkdir = function(p)
             dirs[folded(p)] = true
             return true
+        end,
+        -- What is at the path, its last component not followed: a planted
+        -- link is a symlink, dangling when nothing is at its end.
+        inspect = function(p)
+            local f = folded(p)
+            local self = f
+            if f ~= "/" then
+                local dir, name = f:match("^(.*)/([^/]*)$")
+                self = (dir == "" and "" or real(dir)) .. "/" .. name
+            end
+            local function identified(t, at)
+                if not no_identity then
+                    t.dev, t.ino = 1, inode_of(at)
+                end
+                return t
+            end
+            if links[self] ~= nil then
+                if not exists(p) then
+                    return { kind = "symlink", dangling = true }
+                end
+                return identified({ kind = "symlink", dangling = false, canonical = real(p) }, real(p))
+            end
+            if not exists(self) then
+                return { kind = "missing" }
+            end
+            return identified({ kind = files[self] ~= nil and "file" or "dir", canonical = self }, self)
         end,
         walk = function(p)
             local out = {}
@@ -471,11 +534,34 @@ describe("coding.fork — the directories it takes", function()
         expect(r.config.values.repo.value).to.be("/parent2")
     end)
 
+    it("a directory the caller filled with the rest of the tree: the target restored, the rest as it was", function()
+        files["/tree/a.lua"] = "stale"
+        files["/tree/test/run.lua"] = "the check"
+        files["/tree/README"] = "the caller's"
+        local r = forked("/tree")
+        expect(files["/tree/a.lua"]).to.be("v2")
+        expect(files["/tree/test/run.lua"]).to.be("the check")
+        expect(files["/tree/README"]).to.be("the caller's")
+        expect(r.config.values.repo.value).to.be("/tree")
+    end)
+
     it("a nested directory not there yet, made for the run", function()
         local r = forked("/new/nested/repo/")
         expect(dirs["/new/nested/repo"]).to.be(true)
         expect(files["/new/nested/repo/a.lua"]).to.be("v2")
         expect(r.config.values.repo.value).to.be("/new/nested/repo")
+    end)
+
+    it("where the host gives no identity, the alias the strings miss is taken: the fallback", function()
+        mounts["/view2"] = "/parent"
+        no_identity = true
+        local ok, r = pcall(forked, "/view2")
+        no_identity = false
+        mounts["/view2"] = nil
+        expect(ok).to.be(true)
+        expect(files["/view2/a.lua"]).to.be("v2")
+        expect(r.config.values.repo.value).to.be("/view2")
+        files["/view2/a.lua"] = nil
     end)
 
     it("the path it resolved to is the child's repo: `..` folded in the run's config", function()
@@ -520,10 +606,13 @@ describe("coding.fork — what it refuses, before a session opens", function()
         says(refused(parent_events, "baseline"), '"baseline" is the state before the first beat')
     end)
 
-    it("the parent's repo, however it is written: it holds files, so it is refused as it stands", function()
-        says(refused(parent_events, b2, { repo = "/parent" }), "repo /parent already holds files (/parent/a.lua)")
-        says(refused(parent_events, b2, { repo = "/parent/" }), "repo /parent already holds files")
-        says(refused(parent_events, b2, { repo = "/parent/../parent" }), "repo /parent/../parent already holds files")
+    it("the parent's repo, however it is written, holding its file: refused, the file untouched", function()
+        local kept = files["/parent/a.lua"]
+        local said = "is the repo a run in this history edited (/parent)"
+        says(refused(parent_events, b2, { repo = "/parent" }), "repo /parent " .. said)
+        says(refused(parent_events, b2, { repo = "/parent/" }), "repo /parent " .. said)
+        says(refused(parent_events, b2, { repo = "/parent/../parent" }), "repo /parent/../parent " .. said)
+        expect(files["/parent/a.lua"]).to.be(kept)
     end)
 
     it("the parent's repo emptied: the comparison catches it, as written or through `..`", function()
@@ -550,16 +639,51 @@ describe("coding.fork — what it refuses, before a session opens", function()
         local kept = files["/parent/a.lua"]
         local err = refused(parent_events, b2, { repo = "/linked" })
         links["/linked/a.lua"] = nil
-        says(err, "coding.fork: /linked/a.lua leads to /parent/a.lua, outside the repo /linked")
+        says(err, "coding.fork: /linked/a.lua is a symlink (to /parent/a.lua)")
         expect(files["/parent/a.lua"]).to.be(kept)
         expect(files["/linked/a.lua"]).to.be(nil)
     end)
 
-    it("a directory that already holds a file, whoever's it is", function()
-        files["/other/notes.txt"] = "x"
-        local err = refused(parent_events, b2, { repo = "/other" })
-        files["/other/notes.txt"] = nil
-        says(err, "repo /other already holds files (/other/notes.txt)")
+    it("an empty repo holding a symlink to nothing at a target's path: refused, nothing written", function()
+        dirs["/dangling"] = true
+        links["/dangling/a.lua"] = "/nowhere/a.lua"
+        local err = refused(parent_events, b2, { repo = "/dangling" })
+        links["/dangling/a.lua"] = nil
+        says(err, "coding.fork: /dangling/a.lua is a symlink (to nothing)")
+        says(err, "nothing was restored")
+        expect(files["/dangling/a.lua"]).to.be(nil)
+        expect(files["/nowhere/a.lua"]).to.be(nil)
+    end)
+
+    it("the parent's repo under a name the strings do not match: refused by identity", function()
+        mounts["/view"] = "/parent"
+        dirs["/view"] = true
+        local same = refused(parent_events, b2, { repo = "/view" })
+        local inside = refused(parent_events, b2, { repo = "/view/sub" })
+        mounts["/view"] = nil
+        says(same, "repo /view is the repo a run in this history edited (/parent)")
+        says(inside, "repo /view/sub lies inside /parent, the repo a run in this history edited")
+        expect(files["/view/a.lua"]).to.be(nil)
+        expect(files["/view/sub/a.lua"]).to.be(nil)
+    end)
+
+    it("a directory around the parent's repo under a name the strings do not match: refused by identity", function()
+        mounts["/rootview"] = "/"
+        local err = refused(parent_events, b2, { repo = "/rootview" })
+        mounts["/rootview"] = nil
+        says(err, "repo /rootview contains /parent, the repo a run in this history edited")
+    end)
+
+    it("a hard link at a target's path to the parent's file: refused by identity, nothing written", function()
+        files["/linkcopy/a.lua"] = "v3"
+        mounts["/linkcopy/a.lua"] = "/parent/a.lua"
+        local kept = files["/parent/a.lua"]
+        local err = refused(parent_events, b2, { repo = "/linkcopy" })
+        mounts["/linkcopy/a.lua"] = nil
+        says(err, "/linkcopy/a.lua is /parent/a.lua, the parent's file, under another name (a hard link)")
+        expect(files["/linkcopy/a.lua"]).to.be("v3")
+        expect(files["/parent/a.lua"]).to.be(kept)
+        files["/linkcopy/a.lua"] = nil
     end)
 
     it("a spec, and no repo", function()

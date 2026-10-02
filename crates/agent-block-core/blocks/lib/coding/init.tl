@@ -49,8 +49,8 @@
 --
 -- coding.fork(log, beat, opts) starts a NEW run that continues an earlier one
 -- from the end of `beat`, under new conditions (another model, another room,
--- other knobs), with the files put back as they were then in a fresh
--- directory: see "Forking a run" below.
+-- other knobs), with the files put back as they were then in a directory of
+-- the caller's, apart from the parent's: see "Forking a run" below.
 --
 -- The verify runs once BEFORE the first beat (unless `baseline = false`), so
 -- the record has the run's starting point, a table `timeout` takes its first
@@ -243,7 +243,11 @@
 --   middle of a run, continued by another model or under other knobs, which
 --   is what comparing two of them from one point needs. `log` is the parent's
 --   session or its events (a finished run's export, as for `restore`);
---   `opts` are `coding.run`'s, less `spec`, with `repo` required, plus
+--   `opts` are `coding.run`'s, less `spec`, with `repo` required — the
+--   child's directory, which the caller may fill beforehand with the rest of
+--   the tree the verify needs (a clone or worktree of the parent's checkout,
+--   or a copy; the record holds the targets only), and of which the fork
+--   writes the targets and nothing else — plus
 --   `parent` (the parent's session id, required when `log` is an array —
 --   an export does not name its own session) and `reason` (a word for the
 --   record). It answers what `coding.run` answers, for the child.
@@ -289,13 +293,17 @@
 --     are whatever happens to be on disk is not the run it claims to
 --     continue. The directories the targets sit in are made, for the
 --     check below.
---   - The files go into a fresh directory, and never into a repo a run in
---     the copied history recorded as its own, under any name it can be
---     handed by. In this order, after every other check:
---       1. `repo` that exists and holds any file (`std.fs.walk`) is refused
---          as it stands — so a refused call has made nothing yet, and the
---          parent's repo under any alias holds files and stops here;
---       2. `repo` is made (`std.fs.mkdir`; an empty directory is taken);
+--   - The files go into the caller's directory, and never into a repo a run
+--     in the copied history recorded as its own, under any name it can be
+--     handed by. The record holds the targets and nothing else, and a
+--     verify reads more than the targets (the tests, their fixtures), so
+--     the caller provides the rest of the tree: `repo` may be empty, absent
+--     or already hold a clone, worktree or copy of the parent's checkout,
+--     and the fork writes the targets into it and touches no other file. In
+--     this order, after every other check:
+--       1. `repo` that exists and is not a directory is refused;
+--       2. `repo` is made when it is not there (`std.fs.mkdir`), and taken
+--          as it is when it is, whatever it holds;
 --       3. it is resolved with `std.path.absolute` (canonicalize: symlinks
 --          and `..` resolved), and so is each `config` repo up to the cut
 --          that still exists; one that no longer does is compared as
@@ -303,27 +311,48 @@
 --       4. the two are compared a whole component at a time, and the same
 --          place, `repo` inside a parent's repo, or `repo` containing one,
 --          is refused (`/a/repo2` is neither inside nor around `/a/repo`);
+--          where the strings say neither, they are compared again by
+--          identity: `std.fs.inspect` gives the device and inode each
+--          resolves to, and of every directory above each that is there,
+--          and the same identity, the parent's among `repo`'s and those
+--          above it (inside), or `repo`'s among the parent's and those above
+--          it (around), is refused just the same — so a bind mount of the
+--          parent's repo, or a casefold directory named in another case,
+--          which canonicalize to another string, is refused too;
 --       5. the resolved path is the child's repo from then on: the files
 --          are restored under it, the tools are locked to it, and the
 --          child's `config` records it;
 --       6. before any file is written, every file the restore will write is
---          checked: its directory is made and resolved and must be the repo
---          or lie inside it, and a file already at the path must resolve
---          inside it — so a symlink planted in the empty `repo`, to a
---          directory or to a file, is refused, and a refusal leaves no
---          partial restore.
+--          checked: its directory must not be a symlink to nothing, is made
+--          and resolved, and must be the repo or lie inside it; the file's
+--          own path must not be a symlink — dangling or not, read with
+--          `std.fs.inspect`, which does not follow it, since the restore
+--          writes regular files and a write follows a link; and a file
+--          already at the path must not be the parent's file there under
+--          another name (the same device and inode: a hard link, as `cp
+--          -al` makes) and must resolve inside it — so a symlink in `repo`,
+--          to a directory, to a file or to nothing, or a hard link to the
+--          parent's file at a target's path, is refused, and a refusal
+--          leaves no partial restore.
 --     Caught so: a symlink to the parent's repo or to a directory in it,
 --     `a/../a`, a trailing slash, a new directory inside the parent's repo,
---     one around it, any directory already holding files, and a symlink
---     inside the `repo` that leads out of it. Not caught:
---     a bind mount of the parent's repo, and a Linux casefold directory
---     named in another case — both canonicalize to a different string, and
---     only comparing the files' identity (device and inode) would see them;
---     no caller has needed that yet. Nor a dangling symlink at a target's
---     own path: nothing is there to resolve, and `std.fs` has no call that
---     reads a link, so a write follows it. The check makes directories: a
+--     one around it, a symlink inside the `repo` that leads out of it, a
+--     symlink at a target's own path (one that leads nowhere included), a
+--     hard link at a target's path to the parent's file there, and — on Unix, where the host
+--     gives a device and inode — a bind mount of the parent's repo, or of a
+--     directory above or below it, and a Linux casefold directory named in
+--     another case. Where the host gives no identity (off Unix), step 4 is
+--     the string comparison alone, and those two are not caught. Not caught
+--     anywhere: a mount inside the `repo` itself, under a target's
+--     directory (that directory resolves, by its string, inside the repo,
+--     and only the repo and the directories above it are compared by
+--     identity), and a hard link at a target's path to a parent's file at
+--     another path (only the file the target was recorded as is compared).
+--     A tree the caller copied in is the caller's: nothing but the targets
+--     is checked, and nothing but the targets is written. The check makes
+--     directories: a
 --     refusal at step 4 or 6 (or `coding.run`'s own refusal of the opts,
---     which comes after) leaves them there, holding no file. It is not removed: the host's
+--     which comes after) leaves them there, holding no file the fork wrote. They are not removed: the host's
 --     `std.fs.remove` falls back to a recursive delete on a directory, and
 --     a recursive delete inside what was just found to be a parent's repo
 --     is the worse mistake. Nor is the gap between the check and the writes
@@ -351,7 +380,8 @@
 --   - Not restored, and not restorable from this record: anything outside
 --     the targets — what a verify or a plan check built, cached or deleted,
 --     and every other effect of a shell command. The child starts with
---     whatever the fresh directory holds besides the targets.
+--     whatever the caller's directory holds besides the targets, and the
+--     caller is the one who puts the rest of the tree there.
 --
 -- What it does not do
 --   No retry policy of its own, no branch on a model's name, no reading of
@@ -2893,12 +2923,93 @@ local function resolved(p: string): string
     return got as string
 end
 
+--- `std.fs.inspect(p)`, its failure (anything but not-found) raised with the
+--- fork's name on it, so the check fails closed.
+local function inspected(p: string): host.Std.Fs.Inspected
+    local ok, got = pcall(std.fs.inspect, p)
+    if not ok then
+        error("coding.fork: cannot inspect " .. p .. " (" .. tostring(got) .. ")", 0)
+    end
+    return got as host.Std.Fs.Inspected
+end
+
+--- What `p` resolves to, as one comparable `dev:ino` key; nil when nothing
+--- is there or the host gives no identity (off Unix).
+local function identity(p: string): string
+    local got = inspected(p)
+    if got.dev == nil or got.ino == nil then
+        return nil
+    end
+    return tostring(got.dev) .. ":" .. tostring(got.ino)
+end
+
+--- The identities of `p` and of every directory above it that is there,
+--- nearest first, walking the path's own string upward (`p` is resolved, so
+--- each prefix is a real directory with no link in it; a parent repo that
+--- is gone keeps its ancestors that are not). Empty where the host gives no
+--- identity.
+local function identities_up(p: string): {string}
+    local out: {string} = {}
+    local at = p
+    while at ~= nil and at ~= "" do
+        local id = identity(at)
+        if id ~= nil then
+            out[#out + 1] = id
+        end
+        if at == "/" then
+            break
+        end
+        local up = at:match("^(.*)/[^/]*$") as string
+        if up == "" then
+            up = "/"
+        end
+        at = up
+    end
+    return out
+end
+
+local function holds(ids: {string}, id: string): boolean
+    for _, x in ipairs(ids) do
+        if x == id then
+            return true
+        end
+    end
+    return false
+end
+
+--- How `child` stands to `parent` by the files' identity (`dev`, `ino`)
+--- rather than by their strings: `"same"` when both resolve to one
+--- directory, `"inside"` when the parent's directory is the child's or one
+--- above it, `"contains"` when the child's is the parent's or one above it,
+--- nil otherwise. Catches what `overlap` cannot: a bind mount, a casefold
+--- directory named in another case. Nil throughout where the host gives no
+--- identity, which leaves `overlap` the only comparison.
+local function overlap_by_identity(child: string, parent: string): string
+    local mine, theirs = identities_up(child), identities_up(parent)
+    local me, them = identity(child), identity(parent)
+    if me ~= nil and me == them then
+        return "same"
+    end
+    if them ~= nil and holds(mine, them) then
+        return "inside"
+    end
+    if me ~= nil and holds(theirs, me) then
+        return "contains"
+    end
+    return nil
+end
+
 --- Check every file a fork's restore will write, before it writes any: each
---- file's directory is made (`std.fs.mkdir`) and resolved, and must be the
---- resolved `repo` or lie inside it; a file already at the path must resolve
---- inside it too. So a symlink planted in an empty `repo` — to a directory
---- or to a file — is refused before anything is written through it, and a
---- refusal leaves no partial restore. `files` is the recorded state's,
+--- file's directory, unless it is a symlink that leads to nothing, is made
+--- (`std.fs.mkdir`) and resolved, and must be the resolved `repo` or lie
+--- inside it; the file's own path must not be a symlink at all (read with
+--- `std.fs.inspect`, which does not follow it — the restore writes regular
+--- files, and a write follows a link, dangling or not); a file already at
+--- the path must not be the parent's file there under another name (a hard
+--- link: the same device and inode), and must resolve inside it too. So a
+--- symlink in `repo` — to a directory, to a file, or to nothing — or a hard
+--- link to the parent's file is refused before anything is written through
+--- it, and a refusal leaves no partial restore. `files` is the recorded state's,
 --- its paths under `from`, the repo they were recorded under. Raises from the
 --- caller's caller.
 local function check_writes(repo: string, from: string, files: {string:string})
@@ -2914,6 +3025,14 @@ local function check_writes(repo: string, from: string, files: {string:string})
         end
         local target = repo .. "/" .. path:sub(#prefix + 1)
         local dir = target:match("^(.*)/[^/]*$") as string
+        local at_dir = inspected(dir)
+        if at_dir.kind == "symlink" and at_dir.dangling then
+            error(
+                "coding.fork: " .. dir .. " is a symlink that leads to nothing, and " .. target
+                    .. " would be written through it; nothing was restored",
+                3
+            )
+        end
         std.fs.mkdir(dir)
         local there = resolved(dir)
         local how = overlap(there, repo)
@@ -2924,7 +3043,29 @@ local function check_writes(repo: string, from: string, files: {string:string})
                 3
             )
         end
-        if std.fs.exists(target) then
+        local at = inspected(target)
+        if at.kind == "symlink" then
+            local to = at.dangling and "to nothing" or ("to " .. tostring(at.canonical))
+            error(
+                "coding.fork: " .. target .. " is a symlink (" .. to .. "), and the restore writes regular files "
+                    .. "only: the write would follow it; nothing was restored",
+                3
+            )
+        end
+        -- A hard link is no symlink and resolves inside the repo, yet a write
+        -- through it lands in the parent's file: the target's identity must
+        -- not be the parent's file's at the path it was recorded under.
+        if at.kind == "file" then
+            local mine = identity(target)
+            if mine ~= nil and mine == identity(path) then
+                error(
+                    "coding.fork: " .. target .. " is " .. path .. ", the parent's file, under another name (a hard "
+                        .. "link): the restore would write into it; nothing was restored",
+                    3
+                )
+            end
+        end
+        if at.kind ~= "missing" then
             local real = resolved(target)
             if overlap(real, repo) ~= "inside" then
                 error(
@@ -2938,35 +3079,17 @@ local function check_writes(repo: string, from: string, files: {string:string})
 end
 
 --- The directory a fork restores into, made and resolved: what the child's
---- run takes as its repo from here on. Raises (from the caller's caller)
---- when `repo` already holds a file, or when, resolved, it is, lies inside
---- or contains the repo a `config` event up to `cut` names, resolved the
---- same way. See "Forking a run" in the header for what this catches and
+--- run takes as its repo from here on. It may already hold the caller's
+--- tree. Raises (from the caller's caller) when `repo` is there and is not a
+--- directory, or when, resolved, it is, lies inside or contains the repo a
+--- `config` event up to `cut` names, resolved the same way — by the strings (`overlap`), and where they differ, by the
+--- directories' identity (`overlap_by_identity`). See "Forking a run" in the header for what this catches and
 --- what it does not.
 local function fork_repo(repo: string, events: {shared.Event}, cut: integer): string
-    -- Before anything is made: a directory that holds a file is refused as it
-    -- stands, so a refused call creates nothing inside a parent's repo, under
-    -- whatever name it was handed.
-    if std.fs.exists(repo) then
-        if not std.fs.is_dir(repo) then
-            error("coding.fork: repo " .. repo .. " exists and is not a directory", 3)
-        end
-        local ok, found = pcall(std.fs.walk, repo)
-        if not ok then
-            error(
-                "coding.fork: repo " .. repo .. " cannot be listed (" .. tostring(found)
-                    .. "), so it cannot be shown to hold no file",
-                3
-            )
-        end
-        local first = (found as {string})[1]
-        if first ~= nil then
-            error(
-                "coding.fork: repo " .. repo .. " already holds files (" .. first .. "); a fork restores into a "
-                    .. "fresh directory — an empty one, or one not there yet",
-                3
-            )
-        end
+    -- A repo that is there may hold anything — the caller provides the tree
+    -- the targets sit in — but it has to be a directory.
+    if std.fs.exists(repo) and not std.fs.is_dir(repo) then
+        error("coding.fork: repo " .. repo .. " exists and is not a directory", 3)
     end
     std.fs.mkdir(repo)
     local here = resolved(repo)
@@ -2974,11 +3097,11 @@ local function fork_repo(repo: string, events: {shared.Event}, cut: integer): st
         local theirs = config_repo(events[i])
         if theirs ~= nil then
             local there = resolved(theirs)
-            local how = overlap(here, there)
+            local how = overlap(here, there) or overlap_by_identity(here, there)
             if how == "same" then
                 error(
                     "coding.fork: repo " .. repo .. " is the repo a run in this history edited (" .. there
-                        .. "); restore into a fresh directory, so the parent's files stay as they are",
+                        .. "); restore into a directory apart from it, so the parent's files stay as they are",
                     3
                 )
             elseif how == "inside" then
@@ -3107,7 +3230,7 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
         error("coding.fork: `spec` is not taken — the task is the parent's seed, copied with its history", 2)
     end
     if type(opts.repo) ~= "string" or opts.repo == "" then
-        error("coding.fork: `repo` is required — the fresh directory the files are restored into", 2)
+        error("coding.fork: `repo` is required — the directory, apart from the parent's, the targets are restored into", 2)
     end
     if opts.reason ~= nil and type(opts.reason) ~= "string" then
         error("coding.fork: `reason` must be a string, got " .. tostring(opts.reason), 2)
