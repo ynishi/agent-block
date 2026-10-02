@@ -167,6 +167,13 @@ mod tests {
             .expect("api_spec")
             .source
             .contains("lust."));
+        // A file in a sub-directory of `spec/` is carried too, named by its
+        // path under `spec/`: `replay_spec.lua` requires these.
+        assert!(
+            policy.iter().any(|s| s.file == "replay/parallel_read.lua"),
+            "{:?}",
+            policy.iter().map(|s| s.file).collect::<Vec<_>>()
+        );
         assert!(specs_of("session").is_empty(), "session has no spec/");
         assert!(specs_of("no_such_module").is_empty());
         // `agent` and `coding`, the two blocks, are listed too.

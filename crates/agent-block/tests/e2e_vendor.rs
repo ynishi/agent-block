@@ -459,7 +459,13 @@ fn a_module_vendors_with_its_specs_beside_it() {
         .success()
         .stdout(predicate::str::contains("policy/init.lua"))
         .stdout(predicate::str::contains("policy/spec/api_spec.lua"))
-        .stdout(predicate::str::contains("policy/spec/support.lua"));
+        .stdout(predicate::str::contains("policy/spec/support.lua"))
+        .stdout(predicate::str::contains(
+            "policy/spec/replay/parallel_read.lua",
+        ));
+    // A spec's support in a sub-directory of `spec/` lands where its spec
+    // requires it from.
+    assert!(lib.join("policy/spec/replay/parallel_read.lua").is_file());
 
     let spec = std::fs::read_to_string(lib.join("policy/spec/api_spec.lua")).expect("the spec");
     let mut lines = spec.lines();
