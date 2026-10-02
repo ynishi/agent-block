@@ -362,10 +362,14 @@ local EVENT_DATA: {string:lshape.Schema} = {
         request = REQUEST,
         window = WINDOW_REPORT:is_optional(),
     }, { open = false }),
+    -- `finish_reason` is the provider's raw reason where the dialect mapped
+    -- it onto `stop_reason` (an OpenAI-compatible server's `finish_reason`),
+    -- kept because the map folds several onto one word; absent otherwise.
     llm_response = T.shape({
         content = T.array_of(T.table),
         usage = T.table,
         stop_reason = T.string:is_optional(),
+        finish_reason = T.string:is_optional(),
     }, { open = false }),
     -- The note a call that did not come off leaves behind. `error` is the
     -- sentence (a person reads it, and `policy.carry` puts it in front of the
@@ -561,7 +565,10 @@ local TOOL_USE_BLOCK = T.shape({
 --- cannot leak past the boundary: `content` is an array of blocks (tagged
 --- as an empty array when the model said nothing, so it crosses the JSON
 --- bridge as `[]`), `usage` is the strict count above, and `stop_reason` is
---- absent when no reason was given.
+--- absent when no reason was given. `finish_reason` is the provider's raw
+--- reason where the dialect mapped it onto `stop_reason` (OpenAI's
+--- `finish_reason`: `"stop"` and an absent reason both map to `end_turn`),
+--- and absent where `stop_reason` is already the provider's word.
 ---
 --- The per-block rule above rides beside this shape rather than inside it:
 --- it applies to one `type` of block and lshape has no combinator for
@@ -573,12 +580,14 @@ local LLM_RESULT = T.discriminated("status", {
         content = T.array_of(T.table),
         usage = USAGE,
         stop_reason = T.string:is_optional(),
+        finish_reason = T.string:is_optional(),
     }, { open = false }),
     refused = T.shape({
         status = T.literal("refused"),
         content = T.array_of(T.table),
         usage = USAGE,
         stop_reason = T.string:is_optional(),
+        finish_reason = T.string:is_optional(),
         refusal = REFUSAL,
     }, { open = false }),
 })

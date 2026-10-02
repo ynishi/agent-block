@@ -776,6 +776,10 @@ function LLMPort:open(conf?: {string:any}): function(kernel.Request): kernel.Llm
             -- Absent when the provider named no reason — kept nil, not
             -- fabricated to "".
             stop_reason = result.stop_reason,
+            -- The provider's raw reason where the dialect mapped it (an
+            -- OpenAI-compatible `finish_reason`), so the log can tell apart
+            -- what the map made one word; absent otherwise.
+            finish_reason = result.finish_reason,
             -- The Port's verdict: status plus, on a refusal, the normalized
             -- reason. `refusal` is nil on "ok" (absent from the RESULT shape).
             status = verdict.status,

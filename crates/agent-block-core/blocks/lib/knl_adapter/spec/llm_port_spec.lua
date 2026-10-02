@@ -521,6 +521,20 @@ describe("knl_adapter Port", function()
         http_script.resp = { status = 200, body = "{}", headers = {} }
         local resp = port:open({})({ messages = {} })
         expect(resp.stop_reason).to.equal(nil)
+        expect(resp.finish_reason).to.equal(nil)
+    end)
+
+    it("9b: a parse's raw finish_reason crosses the Mapper beside stop_reason, and the result shape holds", function()
+        local port = make_test_port({
+            wire = { url = "http://example", headers = {}, body = {} },
+            result = { content = {}, usage = {}, stop_reason = "end_turn", finish_reason = "stop" },
+            verdict = "ok",
+        })
+        http_script.resp = { status = 200, body = "{}", headers = {} }
+        local resp = port:open({})({ messages = {} })
+        expect(resp.stop_reason).to.equal("end_turn")
+        expect(resp.finish_reason).to.equal("stop")
+        expect(shape.check(resp, knl_adapter.shapes.llm_result)).to.equal(true)
     end)
 
     it("10: the result shape validates a well-formed mapped result and rejects a malformed one", function()

@@ -91,7 +91,7 @@
 ---   dynamic-language stand-in for a compiler's exhaustiveness check.
 ---
 ---     ok       the beat ran. `out` is the call's answer (content / usage /
----              stop_reason) plus the `beat` id and the tool summary
+---              stop_reason / finish_reason?) plus the `beat` id and the tool summary
 ---     refused  the model answered and declined to make progress. `reason`
 ---              is the adapter's provider-neutral classification of the
 ---              refusal ("model" / "content_filter") and `detail` is the
@@ -442,6 +442,7 @@ local record LlmResult
     content: {any}
     usage: Usage
     stop_reason: string
+    finish_reason: string
     refusal: any
 end
 
@@ -2175,7 +2176,7 @@ function M.beat(session: Session, device: Device): OutcomeValue
 
     -- [5] beat calls the llm directly ------------------------------------
     -- resp = an `llm_result`: { status = "ok"|"refused", content, usage,
-    -- stop_reason?, refusal? }.  The status is the adapter's judgement; beat
+    -- stop_reason?, finish_reason?, refusal? }.  The status is the adapter's judgement; beat
     -- reads it, it does not invent one (status is llm-supplied).  The call is
     -- caught: an adapter that raises (instead of returning nil, err) is still
     -- a call failure, not an escape from the Outcome contract — and it is the
@@ -2255,6 +2256,7 @@ function M.beat(session: Session, device: Device): OutcomeValue
                 content = (resp as {string:any}).content,
                 usage = (resp as {string:any}).usage,
                 stop_reason = (resp as {string:any}).stop_reason,
+                finish_reason = (resp as {string:any}).finish_reason,
             },
         }, beat_id)
     )

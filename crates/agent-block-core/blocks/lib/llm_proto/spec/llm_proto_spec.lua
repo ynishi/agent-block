@@ -717,6 +717,20 @@ describe("llm_proto.openai response", function()
         expect(decoded.refusal).to.equal("cannot help")
     end)
 
+    it("keeps the server's own finish_reason beside the mapped stop_reason", function()
+        -- The map folds "stop" and an absent reason onto one word; the raw
+        -- value is what tells the two apart afterwards.
+        local stopped = openai.parse(response({ content = "x" }, "stop"))
+        expect(stopped.stop_reason).to.equal("end_turn")
+        expect(stopped.finish_reason).to.equal("stop")
+        local unnamed = openai.parse(response({ content = "x" }, nil))
+        expect(unnamed.stop_reason).to.equal("end_turn")
+        expect(unnamed.finish_reason).to.equal(nil)
+        local cut = openai.parse(response({ content = "x" }, "length"))
+        expect(cut.stop_reason).to.equal("max_tokens")
+        expect(cut.finish_reason).to.equal("length")
+    end)
+
     it("keeps content_filter distinct from a normal stop", function()
         local decoded = openai.parse(response({ content = "x" }, "content_filter"))
         expect(decoded.stop_reason).to.equal("content_filter")

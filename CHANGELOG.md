@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was allowed, and reading a refusal's `limit` back to its cause meant
   redoing the room's arithmetic from the profile. Nothing that was in
   `config` moved.
+- `finish_reason` on an `llm_response` (and on the `llm_result` an
+  OpenAI-compatible Port answers): the server's own reason, as it sent it,
+  beside the mapped `stop_reason`. The map folds `"stop"` and an absent reason
+  onto one `end_turn`, so an empty answer that came back as either left no
+  trace of which; now the log says. Absent where the provider sent no string,
+  and on the Anthropic side, whose `stop_reason` already is the provider's
+  word. `stop_reason` and its vocabulary are unchanged.
 
 ### Changed
 
