@@ -16,6 +16,14 @@
 --   CODING_CALL_RESERVE_TEST  tokens kept out of the reasoning for the call;
 --                         set, the conf also asks for thinking, so the vllm
 --                         dialect puts `thinking_token_budget` on the wire
+--   CODING_DIALECT_TEST   the conf's dialect; default "vllm", whose count is
+--                         the mock's fixed `/tokenize` answer. "openai" asks
+--                         the server for no count, so the Port estimates from
+--                         the bytes and a result's size is what it costs
+--   CODING_EXTRA_TARGETS_TEST  comma-separated files in the repository the
+--                         run may also touch, after `lib.lua` (the tools are
+--                         path-locked to the targets, so a read of any other
+--                         file is refused before a cap sees it)
 --
 -- One marker line per fact, so a Rust assertion names the fact and not a
 -- position in the output.
@@ -29,6 +37,8 @@ local omit_reserve = std.env.get("CODING_OMIT_RESERVE") == "1"
 local edit_ops = std.env.get("CODING_EDIT_OPS_TEST")
 local seed_mode = std.env.get("CODING_SEED_TEST")
 local call_reserve = tonumber(std.env.get("CODING_CALL_RESERVE_TEST") or "")
+local extra_targets = std.env.get("CODING_EXTRA_TARGETS_TEST")
+local dialect = std.env.get("CODING_DIALECT_TEST") or "vllm"
 
 local coding = require("coding")
 local adapter = require("knl_adapter")
@@ -46,7 +56,7 @@ local opts = {
             base_url = base_url,
             api_key = "dummy",
             model = "mock",
-            dialect = "vllm",
+            dialect = dialect,
             timeout = 30,
             -- Declared rather than discovered, so `config.values.context_window`
             -- reads `from = "caller"` and the assertion has something to name.
@@ -70,6 +80,11 @@ if call_reserve then
     -- The budget only reaches the wire when the request asks for reasoning at
     -- all, and only on the vllm dialect this conf already names.
     opts.llm.conf.thinking = { enabled = true }
+end
+if extra_targets then
+    for name in extra_targets:gmatch("[^,]+") do
+        opts.targets[#opts.targets + 1] = name
+    end
 end
 if edit_ops then
     local edit = {}
@@ -108,6 +123,7 @@ print("config.values.context_window.from=" .. tostring(result.config.values.cont
 -- The room's numbers ride beside `values`: the window the room was built
 -- over, and a result limit inside the beat's budget.
 print("config.room.window=" .. tostring(result.config.room.window))
+print("config.room.beat_budget=" .. tostring(result.config.room.beat_budget))
 print(
     "config.room.result_within_beat="
         .. tostring(

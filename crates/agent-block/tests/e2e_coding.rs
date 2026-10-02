@@ -50,6 +50,21 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
     })
 }
 
+/// An assistant turn that asks for several tool calls at once, in order.
+fn tool_calls(calls: &[(&str, &str, Value)]) -> Value {
+    let calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, arguments)| {
+            json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments.to_string() }
+            })
+        })
+        .collect();
+    json!({ "role": "assistant", "content": null, "tool_calls": calls })
+}
+
 /// The edit that makes the verify pass.
 fn edit_turn(target: &str) -> Value {
     tool_call(
@@ -595,4 +610,90 @@ async fn coding_run_refuses_when_the_replys_room_is_not_named() {
     says(&ran.stdout, "CODING_MOCK_REFUSED");
     says(&ran.stdout, "the reply's room is not named");
     assert_eq!(ran.calls, 0, "the refusal comes before any model call");
+}
+
+/// One turn that asks for three reads at once, of files sized so the third
+/// crosses the beat's budget: `policy.beat_cap` refuses that one, answers the
+/// model with the refusal in the call's place, and the run carries on to the
+/// edit and the declaration.
+///
+/// The decision itself is replayed from a real run's log in
+/// `policy/spec/replay_spec.lua`; this is the wiring — that `coding.run` puts
+/// the cap on the tools the model calls, over the room it built. The conf
+/// names the `openai` dialect so the Port counts by its byte estimate (the
+/// mock's `/tokenize` answers a fixed count, under which every result costs
+/// the same). With `reserve = 1024` and no `max_tokens` the room's limit is
+/// 32768 - 1024 = 31744: one result may take 7936 tokens and one beat's
+/// results 15872 together. Each file renders to about 5,800 tokens — under
+/// one result's limit, two of them under the beat's, the third over it.
+#[tokio::test]
+async fn coding_run_refuses_the_read_that_crosses_the_beats_budget_and_carries_on() {
+    let (dir, target) = make_repo();
+    let names = ["one.lua", "two.lua", "three.lua"];
+    let body: String = (0..400)
+        .map(|i| format!("-- line {i:04}: {}\n", "x".repeat(30)))
+        .collect();
+    let mut reads = Vec::new();
+    for (n, name) in names.iter().enumerate() {
+        let path = dir.path().join(name);
+        std::fs::write(&path, &body).expect("write a file to read");
+        reads.push((
+            format!("call_read_{}", n + 1),
+            json!({ "path": path.to_string_lossy() }),
+        ));
+    }
+    let script = vec![
+        tool_calls(
+            &reads
+                .iter()
+                .map(|(id, args)| (id.as_str(), "fs_read", args.clone()))
+                .collect::<Vec<_>>(),
+        ),
+        edit_turn(&target),
+        answer_turn("Done: double returns n * 2."),
+    ];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[
+            ("CODING_DIALECT_TEST", "openai"),
+            ("CODING_EXTRA_TARGETS_TEST", &names.join(",")),
+        ],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "config.room.beat_budget=15872");
+    // Refused, not stopped: the run reaches the edit and converges.
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "failure_reason=nil");
+    assert_eq!(ran.calls, 3, "the reads, the edit, the declaration");
+
+    // What the model was told about the three reads is in the request after
+    // them, one tool message per call.
+    let answered = |id: &str| -> String {
+        ran.bodies[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
+            .unwrap_or_else(|| panic!("no tool message for {id} in:\n{:#?}", ran.bodies[1]))
+            ["content"]
+            .as_str()
+            .expect("a tool message's content is text")
+            .to_string()
+    };
+    for id in ["call_read_1", "call_read_2"] {
+        let content = answered(id);
+        assert!(
+            content.contains("line 0399") && !content.contains("beat_budget"),
+            "{id} should be the file itself; it was:\n{content}"
+        );
+    }
+    let third = answered("call_read_3");
+    assert!(
+        third.contains("\"reason\":\"beat_budget\"") && third.contains("\"limit\":15872"),
+        "the third read should be the beat_budget refusal; it was:\n{third}"
+    );
 }
