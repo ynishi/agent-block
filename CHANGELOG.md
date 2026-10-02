@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.41.0] - 2026-10-02
+
+### Added
+
 - `policy.room({ port, conf?, reserve?, result_share?, beat_share?,
   call_reserve? })` is the window as one value: the Port's profile read once,
   and the one division of it every window policy reads — `limit` and `held`
