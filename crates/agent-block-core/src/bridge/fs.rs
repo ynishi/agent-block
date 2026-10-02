@@ -44,9 +44,41 @@
 //! `rollback` restores the content captured before the last successful edit,
 //! which is what lets a loop discard an iteration it decided was wrong.
 //!
+//! # `inspect`: what is at a path, without following it
+//!
+//! `std.fs.exists` / `is_dir` follow a symlink, and say nothing when it
+//! leads nowhere, so a caller that is about to write a path cannot tell a
+//! free path from a dangling link the write would follow. `inspect(path)`
+//! answers both questions in one call:
+//!
+//! * `kind`: `"file"`, `"dir"`, `"symlink"`, `"other"` (a FIFO, a socket, a
+//!   device) or `"missing"` — of the path itself, the last component not
+//!   followed (`symlink_metadata`).
+//! * `dangling`: `true` for a symlink whose target does not resolve (any
+//!   link along the way leads to nothing); `false` for any other symlink;
+//!   absent for every other kind.
+//! * `canonical`: the path canonicalized (absolute, every symlink and `..`
+//!   resolved), when it resolves — absent for `"missing"` and a dangling
+//!   link.
+//! * `dev` / `ino`: the device and inode of what the path resolves to, on
+//!   Unix, absent where the path does not resolve. They are an identity the
+//!   canonical string is not: a bind mount, or a Linux casefold directory
+//!   named in another case, is the same directory under a different
+//!   canonical string, and only `(dev, ino)` says so. Both are the host's
+//!   `u64` values carried bit for bit as Lua integers (a value past
+//!   `i64::MAX` reads negative), which is enough for comparing them, the
+//!   only thing they are for. **Not on other platforms**: std exposes no
+//!   stable file identity there, so `dev` / `ino` are absent and a caller
+//!   falls back to comparing `canonical`.
+//!
+//! Not-found is an answer (`"missing"`, or a dangling link); every other
+//! failure — a directory that cannot be searched, a symlink loop — raises,
+//! so a guard built on this fails closed rather than reading an error as
+//! "nothing there".
+//!
 //! # Where the waiting happens
 //!
-//! All three entries are async functions, and every `read` / `write` they do
+//! All four entries are async functions, and every `read` / `write` they do
 //! runs in `tokio::task::spawn_blocking`. The VM thread keeps the parts that
 //! need the Lua state or are pure CPU work — reading the options table,
 //! hashing, the range / `expect` / overlap checks, splicing the lines, and
@@ -61,7 +93,8 @@
 //! A plain `Lua::load(...).eval()` cannot call them.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mlua::prelude::*;
@@ -180,6 +213,109 @@ async fn write_string(op: &'static str, path: String, content: String) -> LuaRes
     })
     .await?
     .map_err(LuaError::external)
+}
+
+/// What `std.fs.inspect` reports a path as: the path itself, its last
+/// component not followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+    Missing,
+}
+
+impl Kind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::File => "file",
+            Kind::Dir => "dir",
+            Kind::Symlink => "symlink",
+            Kind::Other => "other",
+            Kind::Missing => "missing",
+        }
+    }
+}
+
+/// One answer of `std.fs.inspect`; see the module doc for each field.
+#[derive(Debug)]
+struct Inspected {
+    kind: Kind,
+    /// Meaningful for `Kind::Symlink` only.
+    dangling: bool,
+    canonical: Option<PathBuf>,
+    /// `(dev, ino)` of what the path resolves to; `None` off Unix, and where
+    /// it does not resolve.
+    id: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
+fn identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// No stable file identity in std off Unix: callers fall back to the
+/// canonical path.
+#[cfg(not(unix))]
+fn identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// What is at `path`, without following its last component. Not-found is
+/// an answer; any other error is returned, for the caller to raise.
+fn inspect_path(path: &Path) -> std::io::Result<Inspected> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(Inspected {
+                kind: Kind::Missing,
+                dangling: false,
+                canonical: None,
+                id: None,
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    let ft = meta.file_type();
+    let kind = if ft.is_symlink() {
+        Kind::Symlink
+    } else if ft.is_dir() {
+        Kind::Dir
+    } else if ft.is_file() {
+        Kind::File
+    } else {
+        Kind::Other
+    };
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        // The link is there and leads to nothing. Anything else that stops
+        // the resolution (a loop, a directory that cannot be searched) is an
+        // error, not an answer.
+        Err(e) if kind == Kind::Symlink && e.kind() == ErrorKind::NotFound => {
+            return Ok(Inspected {
+                kind,
+                dangling: true,
+                canonical: None,
+                id: None,
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    // A link's identity is its target's; anything else's is its own, which
+    // `symlink_metadata` already read.
+    let id = if kind == Kind::Symlink {
+        identity(&std::fs::metadata(&canonical)?)
+    } else {
+        identity(&meta)
+    };
+    Ok(Inspected {
+        kind,
+        dangling: false,
+        canonical: Some(canonical),
+        id,
+    })
 }
 
 /// Build the `{ ok = false, reason = ..., ... }` table returned for every
@@ -403,6 +539,34 @@ pub fn register(lua: &Lua, snapshots: SnapshotStore) -> LuaResult<()> {
         })?,
     )?;
 
+    // ── inspect ───────────────────────────────────────────────────
+    fs_tbl.set(
+        "inspect",
+        lua.create_async_function(|lua: Lua, path: String| async move {
+            let shown = path.clone();
+            let got = blocking("fs.inspect", move || {
+                inspect_path(Path::new(&path))
+                    .map_err(|e| format!("fs.inspect: cannot inspect {shown}: {e}"))
+            })
+            .await?
+            .map_err(LuaError::external)?;
+            let t = lua.create_table()?;
+            t.set("kind", got.kind.as_str())?;
+            if got.kind == Kind::Symlink {
+                t.set("dangling", got.dangling)?;
+            }
+            if let Some(canonical) = got.canonical.as_deref() {
+                t.set("canonical", canonical.to_string_lossy().as_ref())?;
+            }
+            if let Some((dev, ino)) = got.id {
+                // Bit for bit: equality is all these are compared for.
+                t.set("dev", dev as i64)?;
+                t.set("ino", ino as i64)?;
+            }
+            Ok(t)
+        })?,
+    )?;
+
     // The Lua half — the `fs_tools` library, whose exported functions are
     // installed onto the `std.fs` built above as `tool_specs` /
     // `register_tools`. Through `require`, so a vendored `fs_tools` wins.
@@ -580,5 +744,215 @@ mod tests {
             during >= AT_LEAST,
             "the VM stopped while the read was waiting: only {during} tick(s) ran"
         );
+    }
+
+    // -- inspect ------------------------------------------------------------
+
+    /// A fresh directory, canonicalized so the expected `canonical` values
+    /// are comparable on a host whose temp dir sits behind a symlink.
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize the tempdir");
+        (dir, base)
+    }
+
+    #[cfg(unix)]
+    fn id_of(p: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).expect("metadata");
+        (m.dev(), m.ino())
+    }
+
+    /// A regular file and a directory answer their kind, their canonical
+    /// path and (on Unix) their own `(dev, ino)`.
+    #[test]
+    fn inspect_reports_a_file_and_a_directory_as_themselves() {
+        let (_keep, base) = scratch();
+        let file = base.join("a.txt");
+        std::fs::write(&file, "x").expect("write");
+        let got = inspect_path(&file).expect("inspect the file");
+        assert_eq!(got.kind, Kind::File);
+        assert_eq!(got.canonical.as_deref(), Some(file.as_path()));
+        let got = inspect_path(&base).expect("inspect the directory");
+        assert_eq!(got.kind, Kind::Dir);
+        assert_eq!(got.canonical.as_deref(), Some(base.as_path()));
+        #[cfg(unix)]
+        {
+            assert_eq!(inspect_path(&file).unwrap().id, Some(id_of(&file)));
+            assert_eq!(got.id, Some(id_of(&base)));
+        }
+        #[cfg(not(unix))]
+        assert_eq!(got.id, None, "no identity off Unix");
+    }
+
+    /// Nothing at the path is an answer, not an error: `missing`, with no
+    /// canonical path and no identity.
+    #[test]
+    fn inspect_reports_nothing_there_as_missing() {
+        let (_keep, base) = scratch();
+        let got = inspect_path(&base.join("nope")).expect("not-found is an answer");
+        assert_eq!(got.kind, Kind::Missing);
+        assert!(got.canonical.is_none() && got.id.is_none());
+    }
+
+    /// A symlink is reported as one — not followed — and, when it resolves,
+    /// carries its target's canonical path and identity.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_a_resolving_symlink_as_a_symlink_with_its_targets_identity() {
+        let (_keep, base) = scratch();
+        let target = base.join("real");
+        std::fs::create_dir(&target).expect("mkdir");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let got = inspect_path(&link).expect("inspect the link");
+        assert_eq!(got.kind, Kind::Symlink);
+        assert!(!got.dangling);
+        assert_eq!(got.canonical.as_deref(), Some(target.as_path()));
+        assert_eq!(got.id, Some(id_of(&target)));
+    }
+
+    /// A symlink to nothing — directly, or through another link — is a
+    /// dangling symlink, not `missing` and not an error: a write to the path
+    /// would follow it.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_a_dangling_symlink_as_dangling() {
+        let (_keep, base) = scratch();
+        let link = base.join("dangling");
+        std::os::unix::fs::symlink(base.join("not-there"), &link).expect("symlink");
+        let got = inspect_path(&link).expect("a dangling link is an answer");
+        assert_eq!(got.kind, Kind::Symlink);
+        assert!(got.dangling);
+        assert!(got.canonical.is_none() && got.id.is_none());
+
+        let chained = base.join("chained");
+        std::os::unix::fs::symlink(&link, &chained).expect("symlink to the dangling link");
+        let got = inspect_path(&chained).expect("a chain to nothing is an answer");
+        assert_eq!(got.kind, Kind::Symlink);
+        assert!(got.dangling);
+    }
+
+    /// A FIFO is neither a file nor a directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspect_reports_a_fifo_as_other() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_keep, base) = scratch();
+        let fifo = base.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no interior NUL");
+        // SAFETY: `c` is a valid NUL-terminated path inside a fresh tempdir.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        assert_eq!(inspect_path(&fifo).expect("inspect").kind, Kind::Other);
+    }
+
+    /// Two names for one object answer two canonical strings and one
+    /// `(dev, ino)`. A hard link is the case an unprivileged test can build;
+    /// a bind mount (root) and a casefold directory (a file system created
+    /// with the feature) are the directory cases this identity is for, and
+    /// are not built here.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_gives_two_names_for_one_file_one_identity() {
+        let (_keep, base) = scratch();
+        let a = base.join("a.txt");
+        std::fs::write(&a, "x").expect("write");
+        let b = base.join("b.txt");
+        std::fs::hard_link(&a, &b).expect("hard link");
+        let (ga, gb) = (inspect_path(&a).unwrap(), inspect_path(&b).unwrap());
+        assert_ne!(ga.canonical, gb.canonical, "the strings differ");
+        assert_eq!(ga.id, gb.id, "the identity does not");
+        let other = base.join("c.txt");
+        std::fs::write(&other, "x").expect("write");
+        assert_ne!(inspect_path(&other).unwrap().id, ga.id);
+    }
+
+    /// An error other than not-found is returned, so the bridge raises: a
+    /// path under a directory that cannot be searched is not "missing".
+    /// Skipped as root, which searches any directory.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_fails_closed_on_an_error_that_is_not_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_keep, base) = scratch();
+        let shut = base.join("shut");
+        std::fs::create_dir(&shut).expect("mkdir");
+        std::fs::write(shut.join("x"), "x").expect("write");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let got = inspect_path(&shut.join("x"));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        let err = got.expect_err("a permission error is not an answer");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// The Lua face: the table's fields, `dangling` only on a symlink, and a
+    /// raise for an error that is not not-found.
+    #[cfg(unix)]
+    #[test]
+    fn std_fs_inspect_answers_the_table_and_raises_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (_keep, base) = scratch();
+        let file = base.join("f.txt");
+        std::fs::write(&file, "x").expect("write");
+        std::os::unix::fs::symlink(base.join("none"), base.join("dl")).expect("symlink");
+        let lua = Lua::new();
+        let std_tbl = lua.create_table().expect("std table");
+        std_tbl
+            .set("fs", lua.create_table().expect("fs table"))
+            .expect("set std.fs");
+        lua.globals().set("std", std_tbl).expect("set std");
+        register(&lua, SnapshotStore::default()).expect("register");
+        lua.globals()
+            .set("BASE", base.to_string_lossy().as_ref())
+            .expect("set BASE");
+        let (dev, ino) = id_of(&file);
+        lua.globals().set("DEV", dev as i64).expect("set DEV");
+        lua.globals().set("INO", ino as i64).expect("set INO");
+        rt.block_on(
+            lua.load(
+                r#"
+                local f = std.fs.inspect(BASE .. "/f.txt")
+                assert(f.kind == "file", f.kind)
+                assert(f.canonical == BASE .. "/f.txt", tostring(f.canonical))
+                assert(f.dangling == nil, "dangling only on a symlink")
+                assert(f.dev == DEV and f.ino == INO, "dev/ino of the file")
+                local d = std.fs.inspect(BASE .. "/dl")
+                assert(d.kind == "symlink" and d.dangling == true, d.kind)
+                assert(d.canonical == nil and d.dev == nil and d.ino == nil)
+                local m = std.fs.inspect(BASE .. "/none")
+                assert(m.kind == "missing" and m.canonical == nil and m.dangling == nil)
+                assert(std.fs.inspect(BASE).kind == "dir")
+            "#,
+            )
+            .exec_async(),
+        )
+        .expect("the Lua assertions");
+
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let shut = base.join("shut");
+        std::fs::create_dir(&shut).expect("mkdir");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let raised = rt.block_on(
+            lua.load(r#"local ok, err = pcall(std.fs.inspect, BASE .. "/shut/x"); return ok, tostring(err)"#)
+                .eval_async::<(bool, String)>(),
+        );
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        let (ok, msg) = raised.expect("pcall returns");
+        assert!(!ok, "raised");
+        assert!(msg.contains("fs.inspect: cannot inspect"), "{msg}");
     }
 }

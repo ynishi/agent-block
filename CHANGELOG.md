@@ -109,10 +109,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be the repo or inside it, and a file already at the path must resolve
   inside it, so a symlink planted in the empty `repo` (to a directory or a
   file) is refused and a refusal leaves no partial restore. A refusal
-  leaves the made directories behind, holding no file. Not caught: a bind
-  mount, a Linux casefold directory named in another case, and a dangling
-  symlink at a target's own path. `host_types.d.tl` declares `std.fs.exists` / `is_dir` / `mkdir` /
-  `walk` and `std.path.absolute`.
+  leaves the made directories behind, holding no file. `host_types.d.tl`
+  declares `std.fs.exists` / `is_dir` / `mkdir` / `walk` and
+  `std.path.absolute`.
+- `coding.fork` also refuses the aliases a canonical string cannot show.
+  A symlink at a target's own path that leads to nothing went through
+  (`std.fs.exists` follows it and answers false) and the restore wrote
+  through it, creating the file at its far end; now any symlink at a
+  target's path is refused, dangling or not — the restore writes regular
+  files — and so is a target directory that is a symlink to nothing. A bind
+  mount of the parent's repo, or a Linux casefold directory named in
+  another case, canonicalizes to another string; now, where the strings say
+  neither the same, inside nor around, the child's repo and every directory
+  above it that is there are compared with the parent's by device and inode
+  in both directions, and the same, inside or around is refused just the
+  same. Where the host gives no identity (off Unix) the comparison is the
+  strings alone, as before. Still not caught: a mount inside the child's
+  repo under a target's directory, and the gap between the check and the
+  writes. The identity comes from a new host call, `std.fs.inspect(path)`:
+  `{ kind = "file" | "dir" | "symlink" | "other" | "missing", dangling?,
+  canonical?, dev?, ino? }` — the path itself, a symlink not followed;
+  `dangling` on a symlink only; `dev` / `ino` of what it resolves to, on
+  Unix only. Not-found is an answer; any other error raises.
 - The summarising request `policy.compact` builds sends the run's tool
   history as prose. It used to carry the `tool_use` / `tool_result` blocks
   with no tools offered, and a model reading a history of calls continues it
