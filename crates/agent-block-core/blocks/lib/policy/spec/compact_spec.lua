@@ -27,8 +27,8 @@
 --     older summary and the summarising beat are behind the cut; a log with
 --     no summary folds as before; `keep_seed` is required;
 --   6 room_note appends one user message naming what the request took and
---     what is left, off the Port's count and profile, without touching the
---     request it was handed.
+--     what is left, off the room it was given (the Port's count and
+--     profile), without touching the request it was handed.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -552,13 +552,14 @@ describe("policy.window — from_summary", function()
             summary("short", 7),
             answered("b2", "two", 8)
         )
-        local fold, fits = policy.window({ fit = { port = port }, keep_seed = true, from_summary = true })
+        local room = policy.room({ port = port })
+        local fold, fits = policy.window({ room = room, keep_seed = true, from_summary = true })
         local request, rep = fold(long, {})
         expect(#request.messages).to.be(3)
         expect(#rep.dropped).to.be(0)
         expect(fits(log_of(long), {})).to.be(nil)
         -- The same window without the summary has to drop a beat to fit.
-        local _, plain = policy.window({ fit = { port = port }, keep_seed = true })(long, {})
+        local _, plain = policy.window({ room = room, keep_seed = true })(long, {})
         expect(plain.dropped).to.equal({ "b0" })
     end)
 
@@ -578,7 +579,7 @@ end)
 
 describe("policy.room_note", function()
     it("appends one user message naming what the request took and what is left", function()
-        local filter = policy.room_note({ port = port_of(100, 0) })
+        local filter = policy.room_note({ room = policy.room({ port = port_of(100, 0) }) })
         local request = { messages = { { role = "user", content = string.rep("x", 40) } }, system = "SYS" }
         local out = filter(request)
         expect(#out.messages).to.be(2)
@@ -589,21 +590,23 @@ describe("policy.room_note", function()
     end)
 
     it("bounds what is left by the wire's cap, and never says less than nothing", function()
-        local capped = policy.room_note({ port = port_of(100, 20) })({
+        local capped = policy.room_note({ room = policy.room({ port = port_of(100, 20) }) })({
             messages = { { role = "user", content = string.rep("x", 40) } },
         })
         expect(capped.messages[2].content).to.be("[window] 40 of 100 tokens used; 20 left for the reply")
-        local over = policy.room_note({ port = port_of(100, 0) })({
+        local over = policy.room_note({ room = policy.room({ port = port_of(100, 0) }) })({
             messages = { { role = "user", content = string.rep("x", 120) } },
         })
         expect(over.messages[2].content).to.be("[window] 120 of 100 tokens used; 0 left for the reply")
     end)
 
-    it("refuses a port that cannot count or answer a profile, and an unknown option", function()
-        local ok, err = pcall(policy.room_note, { port = {} })
+    it("refuses no room and an unknown option, and the room a port that cannot count or answer a profile", function()
+        local ok, err = pcall(policy.room, { port = {} })
         expect(ok).to.be(false)
         expect(tostring(err):find("port must answer count", 1, true)).to.exist()
-        local ok2, err2 = pcall(policy.room_note, { port = port_of(100, 0), share = 1 })
+        local ok0 = pcall(policy.room_note, {})
+        expect(ok0).to.be(false)
+        local ok2, err2 = pcall(policy.room_note, { room = policy.room({ port = port_of(100, 0) }), share = 1 })
         expect(ok2).to.be(false)
         expect(tostring(err2):find("unknown option 'share'", 1, true)).to.exist()
     end)

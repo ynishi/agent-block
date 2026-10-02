@@ -190,8 +190,8 @@ local REQUEST = T.shape({
 ---
 --- The last three are optional together: a fold that windows by a count of
 --- beats never counts tokens at all, and a number invented there would be one
---- nobody measured. `policy.window` is the fold that fills them
---- (`fit = { port }`); the plain `tail` form leaves all three out.
+--- nobody measured. `policy.window` is the fold that fills them (sized by a
+--- `room`); the plain `tail` form leaves all three out.
 ---
 --- Closed, like every other `data` shape: this is a path `knl.views.beats`
 --- selects, and a key that arrived by accident is a column somebody will

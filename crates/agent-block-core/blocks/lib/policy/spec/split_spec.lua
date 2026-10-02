@@ -77,9 +77,10 @@ describe("policy.split — the numbers", function()
         -- thinking_cap sends is the room less call_reserve.
         local port = port_of(32768, nil, 24984)
         local conf = { thinking = true }
-        local stop = policy.thinking_cap({ port = port, conf = conf, call_reserve = 3072 })({ messages = {} })
-        local room = policy.split({ port = port, conf = conf, used = 24984 }).room
-        expect(stop.thinking.budget_tokens).to.be(room - 3072)
+        local room = policy.room({ port = port, conf = conf, call_reserve = 3072 })
+        local stop = policy.thinking_cap({ room = room })({ messages = {} })
+        local reply = policy.split({ port = port, conf = conf, used = 24984 }).room
+        expect(stop.thinking.budget_tokens).to.be(reply - 3072)
     end)
 end)
 
