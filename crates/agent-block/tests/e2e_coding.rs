@@ -697,3 +697,142 @@ async fn coding_run_refuses_the_read_that_crosses_the_beats_budget_and_carries_o
         "the third read should be the beat_budget refusal; it was:\n{third}"
     );
 }
+
+/// The value of the marker line `key=...` the fixture printed.
+fn marker<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}=");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("expected a `{key}=` line; the fixture printed:\n{stdout}"))
+}
+
+/// A finished run's events, as `agent-block knl export --as events` prints
+/// them: one JSON object a line. The run's session is closed by the time
+/// `coding.run` returns and the kernel does not resume a closed stream, so
+/// this is how its record reaches a reader after the fact.
+fn export_events(knl: &std::path::Path, session: &str) -> String {
+    let home = tempdir().expect("tempdir for AGENT_BLOCK_HOME");
+    let out = common::agent_block_cmd()
+        .env("AGENT_BLOCK_HOME", home.path())
+        .args(["knl", "export", "--session", session, "--as", "events"])
+        .args(["--store", &knl.to_string_lossy()])
+        .assert()
+        .success();
+    String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+}
+
+/// How many of an export's events are of `kind`.
+fn kinds_in(events: &str, kind: &str) -> usize {
+    events
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).expect("an export line is JSON")["kind"] == kind
+        })
+        .count()
+}
+
+/// The state of the files is on the record: one checkpoint before the first
+/// beat and one after the beat that landed the edit, and `coding.restore`
+/// puts the file back as it was before the run touched it.
+///
+/// The run is the declare case (an edit, then the answer), against a store
+/// the test names so the finished run can be exported. The edit is the only
+/// beat that landed one, so two states are recorded — the declaring beat
+/// edited nothing and records none. Two contents, two blobs. The restore runs
+/// in a second process over the export, as a caller after the fact would.
+#[tokio::test]
+async fn coding_run_records_the_files_and_restore_puts_the_baseline_back() {
+    let (dir, target) = make_repo();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let script = vec![edit_turn(&target), answer_turn("Done.")];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[("AGENT_BLOCK_KNL_PATH", &knl_env)],
+    )
+    .await;
+
+    says(&ran.stdout, "CODING_MOCK_DONE");
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "checkpoints=2");
+    let after = std::fs::read_to_string(&target).expect("read the target back");
+    assert!(after.contains(LIB_AFTER_LINE), "the edit landed:\n{after}");
+
+    let events = export_events(&knl, marker(&ran.stdout, "session"));
+    assert_eq!(
+        kinds_in(&events, "checkpoint"),
+        2,
+        "before the first beat, and after the edit"
+    );
+    assert_eq!(
+        kinds_in(&events, "checkpoint_blob"),
+        2,
+        "the content before, and after"
+    );
+    let events_file = store.path().join("events.jsonl");
+    std::fs::write(&events_file, &events).expect("write the export");
+
+    let restored = tokio::task::spawn_blocking({
+        let repo = dir.path().to_string_lossy().into_owned();
+        let events_file = events_file.to_string_lossy().into_owned();
+        move || {
+            let home = tempdir().expect("tempdir for AGENT_BLOCK_HOME");
+            let out = common::agent_block_cmd()
+                .args(["-s", &common::fixture("coding_openai_mock.lua")])
+                .env("CODING_REPO_TEST", &repo)
+                .env("CODING_RESTORE_EVENTS_TEST", &events_file)
+                .env("CODING_RESTORE_BEAT_TEST", "baseline")
+                .env("AGENT_BLOCK_HOME", home.path())
+                .assert()
+                .success();
+            String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+        }
+    })
+    .await
+    .expect("the restore process should not panic");
+
+    says(&restored, "CODING_MOCK_RESTORED");
+    let beats = marker(&restored, "checkpoint.beats");
+    assert!(
+        beats.starts_with("baseline,") && beats.split(',').count() == 2,
+        "the baseline, then the edit's beat: {beats}"
+    );
+    says(&restored, &format!("restored={target}"));
+    says(&restored, "restore.missing=0");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read the target back"),
+        LIB_BEFORE,
+        "restore to the baseline puts the original content back"
+    );
+}
+
+/// `checkpoint = false` records no state of the files: the result has no
+/// count and the record has neither kind.
+#[tokio::test]
+async fn coding_run_records_no_checkpoint_when_turned_off() {
+    let (dir, target) = make_repo();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let script = vec![edit_turn(&target), answer_turn("Done.")];
+
+    let ran = run_fixture(
+        script,
+        &dir.path().to_string_lossy(),
+        &[
+            ("AGENT_BLOCK_KNL_PATH", &knl_env),
+            ("CODING_CHECKPOINT_TEST", "0"),
+        ],
+    )
+    .await;
+
+    says(&ran.stdout, "ok=true");
+    says(&ran.stdout, "checkpoints=nil");
+    let events = export_events(&knl, marker(&ran.stdout, "session"));
+    assert_eq!(kinds_in(&events, "checkpoint"), 0);
+    assert_eq!(kinds_in(&events, "checkpoint_blob"), 0);
+}

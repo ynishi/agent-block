@@ -24,14 +24,46 @@
 --                         run may also touch, after `lib.lua` (the tools are
 --                         path-locked to the targets, so a read of any other
 --                         file is refused before a cap sees it)
+--   CODING_CHECKPOINT_TEST  "0": run with `checkpoint = false`
+--   CODING_RESTORE_EVENTS_TEST  a file of a finished run's events, one JSON
+--                         object a line (`agent-block knl export --as
+--                         events`): no run and no model — the fixture lists
+--                         the recorded states and restores the one
+--                         CODING_RESTORE_BEAT_TEST names ("baseline", or
+--                         "last" for the latest one recorded)
 --
 -- One marker line per fact, so a Rust assertion names the fact and not a
 -- position in the output.
 
-local base_url = std.env.get("OPENAI_BASE_URL_TEST")
-assert(base_url, "OPENAI_BASE_URL_TEST must be set")
 local repo = std.env.get("CODING_REPO_TEST")
 assert(repo, "CODING_REPO_TEST must be set")
+
+local restore_from = std.env.get("CODING_RESTORE_EVENTS_TEST")
+if restore_from then
+    local coding = require("coding")
+    local policy = require("policy")
+    local events = {}
+    for line in std.fs.read(restore_from):gmatch("[^\n]+") do
+        events[#events + 1] = std.json.decode(line)
+    end
+    local beats = {}
+    for _, point in ipairs(policy.checkpoints(events)) do
+        beats[#beats + 1] = point.beat
+    end
+    print("checkpoint.beats=" .. table.concat(beats, ","))
+    local beat = std.env.get("CODING_RESTORE_BEAT_TEST") or "baseline"
+    if beat == "last" then
+        beat = beats[#beats]
+    end
+    local r = coding.restore(events, beat)
+    print("restored=" .. table.concat(r.restored, ","))
+    print("restore.missing=" .. #r.missing)
+    print("CODING_MOCK_RESTORED")
+    return
+end
+
+local base_url = std.env.get("OPENAI_BASE_URL_TEST")
+assert(base_url, "OPENAI_BASE_URL_TEST must be set")
 local done_mode = std.env.get("CODING_DONE_TEST") or "declare"
 local omit_reserve = std.env.get("CODING_OMIT_RESERVE") == "1"
 local edit_ops = std.env.get("CODING_EDIT_OPS_TEST")
@@ -39,6 +71,7 @@ local seed_mode = std.env.get("CODING_SEED_TEST")
 local call_reserve = tonumber(std.env.get("CODING_CALL_RESERVE_TEST") or "")
 local extra_targets = std.env.get("CODING_EXTRA_TARGETS_TEST")
 local dialect = std.env.get("CODING_DIALECT_TEST") or "vllm"
+local checkpoint_off = std.env.get("CODING_CHECKPOINT_TEST") == "0"
 
 local coding = require("coding")
 local adapter = require("knl_adapter")
@@ -96,6 +129,9 @@ end
 if omit_reserve then
     opts.reserve = nil
 end
+if checkpoint_off then
+    opts.checkpoint = false
+end
 
 local ok, result = pcall(coding.run, opts)
 if not ok then
@@ -109,6 +145,8 @@ print("iters=" .. tostring(result.iters))
 print("failure_reason=" .. tostring(result.failure_reason))
 print("done=" .. tostring(result.done))
 print("baseline_ok=" .. tostring(result.baseline_ok))
+print("session=" .. tostring(result.session))
+print("checkpoints=" .. tostring(result.checkpoints))
 if result.plan then
     print(
         ("plan.total=%s plan.passed=%s plan.filed=%s"):format(

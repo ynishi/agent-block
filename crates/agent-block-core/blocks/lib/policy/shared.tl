@@ -15,7 +15,7 @@
 ---
 --- Written in Teal with the rest of `policy` (`include_tl!`); the Lua the
 --- host holds is what Teal generates, without these comments. This file is
---- also where the records the six files share are declared — a stored
+--- also where the records the files share are declared — a stored
 --- event, a beat, a tool pair, the registry's entry — so a sibling types
 --- against `shared.BeatRecord` rather than declaring its own.
 local kernel = require("knl")
@@ -87,6 +87,9 @@ local record S
     DEFAULT_LEDGER_KINDS: {string}
     SUMMARY_KIND: string
     COMPACT_SKIPPED_KIND: string
+    CHECKPOINT_KIND: string
+    CHECKPOINT_BLOB_KIND: string
+    CHECKPOINT_BASELINE: string
     SUMMARY_PREFIX: string
     DEFAULT_SAME: integer
     DEFAULT_NO_PROGRESS: integer
@@ -110,6 +113,8 @@ local record S
     LEDGER: lshape.Schema
     SUMMARY: lshape.Schema
     COMPACT_SKIPPED: lshape.Schema
+    CHECKPOINT: lshape.Schema
+    CHECKPOINT_BLOB: lshape.Schema
     EVENTS_ARG: ApiArg
     SESSION_ARG: ApiArg
     OUTCOME_ARG: ApiArg
@@ -236,6 +241,20 @@ S.SUMMARY_KIND = "summary"
 --- The kind the loop appends where a summary was asked for and came back
 --- empty: `compact` counts `min_beats` from it, the fold ignores it.
 S.COMPACT_SKIPPED_KIND = "compact_skipped"
+
+--- The kinds the loop appends the state of the files under, and
+--- `policy.checkpoints` / `policy.checkpoint_at` read: one `checkpoint` per
+--- recorded state, and one `checkpoint_blob` per distinct content.
+S.CHECKPOINT_KIND = "checkpoint"
+S.CHECKPOINT_BLOB_KIND = "checkpoint_blob"
+
+--- What the readers call the checkpoint that carries no `meta.beat`: the
+--- state of the files before the first beat. It carries none on purpose —
+--- every reader that counts beats (`stagnation`, `compact`, `ledger`,
+--- `window`) counts the distinct `meta.beat` ids, and a made-up id there
+--- would be a beat that never ran, an idle one to `stagnation`'s
+--- `no_progress`.
+S.CHECKPOINT_BASELINE = "baseline"
 
 --- What the rendered summary opens with, so the model reads it as the
 --- record's compaction rather than as a message somebody sent. The last
@@ -674,6 +693,32 @@ S.SUMMARY = T.shape({
 --- does not read it.
 S.COMPACT_SKIPPED = T.shape({
     why = T.one_of({ "empty" }):describe("the summarising beat answered no text"),
+}, { open = false })
+
+--- What the loop appends under `checkpoint` (`policy.shapes.checkpoint`): the
+--- state of EVERY target at one point of the run, so one event is the whole
+--- state and a reader never has to replay earlier ones. `files` maps a path
+--- to the `version` its content had then — the fingerprint
+--- `std.fs.read_versioned` answers, the first 16 hex digits of the content's
+--- SHA-256 — and `missing` lists the targets that could not be read as text
+--- then (not created yet, deleted, or not text): recorded, so a reader can
+--- tell "absent" from "not recorded". The beat the state follows is the
+--- envelope's `meta.beat`; the state before the first beat carries none
+--- (`CHECKPOINT_BASELINE` says why).
+S.CHECKPOINT = T.shape({
+    files = T.table:describe("target path -> the version its content had (std.fs.read_versioned's fingerprint)"),
+    missing = T.array_of(T.string)
+    :describe("targets that could not be read as text at this point; absent when none")
+    :is_optional(),
+}, { open = false })
+
+--- What the loop appends under `checkpoint_blob`
+--- (`policy.shapes.checkpoint_blob`): one content, once per session — the
+--- first time a `checkpoint` names its version. Every later `checkpoint`
+--- naming the same version is resolved from this one.
+S.CHECKPOINT_BLOB = T.shape({
+    version = T.string:describe("the fingerprint a checkpoint's `files` names this content by"),
+    content = T.string:describe("the file's content, whole"),
 }, { open = false })
 
 -- ============================================================

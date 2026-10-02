@@ -816,7 +816,7 @@ agent-block vendor --force        overwrite a copy that is already there
 carries is a module to a project), a `pack`
 when it is one, and `vendored` when this project has a copy — with sub-modules
 folded under the root they belong to (`lshape (+t, check, reflect, luacats)`) and the
-spec count beside it (`policy (+shared, room, tools, carry, loop, compact) (spec/: 15)`). An
+spec count beside it (`policy (+shared, room, tools, carry, loop, compact, checkpoint) (spec/: 22)`). An
 existing copy is never overwritten without `--force`, because by then it is the
 project's own and likely edited; with it the copy is replaced outright, and the edits
 it had are wherever you committed them.

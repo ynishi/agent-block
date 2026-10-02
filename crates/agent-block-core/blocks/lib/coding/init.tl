@@ -34,11 +34,18 @@
 --       compact = { at = 0.8 },                 -- fold the record into a summary once the last request
 --                                               -- took this share of the window (default); false turns
 --                                               -- it off
+--       checkpoint = true,                      -- record every target's content before the first beat
+--                                               -- and after each beat that landed an edit (default);
+--                                               -- false records none
 --       strict  = false,                        -- true: every Exec knob below must be named here
 --   })
 --
 -- result: { ok, iters, summary, done, config, session, baseline_ok?,
---           failure_reason?, last_error?, plan? }
+--           failure_reason?, last_error?, plan?, compactions?, checkpoints? }
+--
+-- coding.restore(log, beat, repo?) writes the targets back as they were after
+-- `beat` (or before the first beat, `"baseline"`), read off the run's record:
+-- see "The state of the files" below.
 --
 -- The verify runs once BEFORE the first beat (unless `baseline = false`), so
 -- the record has the run's starting point, a table `timeout` takes its first
@@ -88,8 +95,8 @@
 --   EXEC is loop policy — the iterations, the turns, the verify's timeout
 --   curve, the three caps (`result_share`, `beat_share`, `repeat_max`),
 --   `done`, the `ops` the model is handed, the shape of the `seed`, when the
---   record is `compact`ed — and every one of them has a default, stated
---   above.
+--   record is `compact`ed, whether the files are `checkpoint`ed — and every
+--   one of them has a default, stated above.
 --   `strict = true` gives those defaults
 --   up: each Exec knob with a number, a mode or a tool set behind it must then
 --   be named by the caller, and the run refuses while any is not, listing all
@@ -188,6 +195,41 @@
 --   plan's checks and `M.decide` over them. `M.result_of` reads the state the loop
 --   left into the result. `M.run` is the three in a row inside the session
 --   bracket, and nothing else.
+--
+-- The state of the files
+--   The log holds the conversation, every tool call and what it answered,
+--   and not what the files were: after the run, "what did beat 4 leave on
+--   disk" had no answer but the disk itself, which by then holds only the
+--   end. With `checkpoint` on (the default) the loop records it: once before
+--   the first beat, and after every beat that landed an edit, it reads every
+--   target (`std.fs.read_versioned`) and appends a `checkpoint` event naming
+--   each one's version, with a `checkpoint_blob` for each content the session
+--   has not recorded yet (`policy.shapes.checkpoint` / `checkpoint_blob`).
+--   The one after a beat carries that beat's `meta.beat`; the one before the
+--   first carries none and reads back as `"baseline"`. A target that cannot
+--   be read then is listed as `missing`. `policy.checkpoints` and
+--   `policy.checkpoint_at` read the record — the loop appends, the policy
+--   reads, as with `summary`.
+--
+--   The cost is the log's size: every distinct content of every target is in
+--   it once, so a run that edits a large file often grows by about that file
+--   per edit-landing beat. A beat that landed no edit records nothing, and a
+--   file an edit did not touch costs a map entry, not its content again.
+--   `checkpoint = false` records none.
+--
+--   `coding.restore(log, beat, repo?)` is the one function here that WRITES a
+--   recorded state: each target's content as it was after `beat`, written
+--   back with `std.fs.write`. It is the caller's to call — the loop never
+--   does — and it NEVER DELETES: a target that was missing at that beat is
+--   reported under `missing` and left as it is. What the verify wrote (build
+--   artifacts, caches) was never recorded and is not restored. `log` is the
+--   run's session, or its events — after `coding.run` returns, its session
+--   is closed, and the record reaches a caller as an export (`agent-block knl
+--   export --session <result.session> --as events`). `repo`, when given,
+--   writes under that directory instead: each path is re-rooted from the
+--   repo the run recorded in its `config` event, so a recorded state can be
+--   laid into a fresh copy of the repository rather than over the one the
+--   run edited.
 --
 -- What it does not do
 --   No retry policy of its own, no branch on a model's name, no reading of
@@ -303,6 +345,7 @@ local record RunOpts
     done: string
     check_timeout: number
     compact: CompactOpt | boolean
+    checkpoint: boolean
     strict: boolean
 end
 
@@ -432,6 +475,14 @@ local record RunResult ---@struct
     config: Config ---@optional
     plan: PlanSummary ---@optional
     compactions: number ---@optional
+    checkpoints: number ---@optional
+end
+
+--- What `restore` answers: the paths it wrote, and the ones the state
+--- recorded as missing and it left alone.
+local record Restored ---@struct
+    restored: {string}
+    missing: {string}
 end
 
 --- A beat's answer, as far as the loop reads it: the beat's id, the tools it
@@ -475,6 +526,7 @@ local record State ---@struct
     last_plan: PlanFacts
     last_checks: {CheckResult}
     compactions: number
+    checkpoints: number
 end
 
 --- The contracts `M.shapes` publishes.
@@ -502,6 +554,7 @@ local record M
     config_of: function(RunOpts, Resolved): Config
     result_of: function(State, number): RunResult
     run: function(RunOpts): RunResult
+    restore: function(any, string, ?string): Restored
     _beat_outcome: function(kernel.OutcomeValue): Answer, string, string
 end
 
@@ -567,6 +620,7 @@ local STRICT_KNOBS: {string} = {
     "ops",
     "seed",
     "compact",
+    "checkpoint",
 }
 
 -- ============================================================
@@ -691,10 +745,19 @@ local RUN_OPTS = T.shape({
             .. "the seed, the summary, and the beats since. Required under `strict`"
     )
     :is_optional(),
+    checkpoint = T.boolean
+    :describe(
+        "record the state of the files: every target's content before the first beat and after each beat "
+            .. "that landed an edit, as `checkpoint` events (each distinct content once, as a "
+            .. "`checkpoint_blob`) that policy.checkpoints / policy.checkpoint_at read and coding.restore "
+            .. "writes back; default true, required under `strict`. The cost is the log's size — each "
+            .. "distinct content of every target, once"
+    )
+    :is_optional(),
     strict = T.boolean
     :describe(
         "true: every Exec knob with a default (iters, turns, timeout, result_share, beat_share, repeat_max, done, "
-            .. 'ops, seed, compact, and check_timeout under done = "plan") must be named by the caller, and the run '
+            .. 'ops, seed, compact, checkpoint, and check_timeout under done = "plan") must be named by the caller, and the run '
             .. "refuses while any is not; default false. A lever the top level pulls on itself — never "
             .. "read from the "
             .. "environment here"
@@ -732,6 +795,12 @@ local RUN_RESULT = T.shape({
     :is_optional(),
     compactions = T.number
     :describe("how many times the record was folded into a summary (policy.compact); absent when off")
+    :is_optional(),
+    checkpoints = T.number
+    :describe(
+        "how many states of the files the run recorded (`checkpoint` events, the one before the first beat "
+            .. "included); absent when `checkpoint = false`"
+    )
     :is_optional(),
 })
 
@@ -1482,6 +1551,8 @@ function M.config_of(opts: RunOpts, resolved: Resolved): Config
         -- As the run resolved it: `{ at, min_beats }`, or `false` when the
         -- caller turned it off.
         compact = named(resolved.compact, opts.compact ~= nil),
+        -- On unless the caller said `false`.
+        checkpoint = named(opts.checkpoint ~= false, opts.checkpoint ~= nil),
         -- No default to name: absent, no stop point is sent at all, so the
         -- entry reads as a `from` alone — like `store` and `check_timeout`.
         call_reserve = named(opts.call_reserve, opts.call_reserve ~= nil),
@@ -1579,6 +1650,9 @@ local function check_opts(opts: RunOpts)
     end
     if opts.call_reserve ~= nil and not whole_at_least(opts.call_reserve, 0) then
         error("coding.run: `call_reserve` must be a whole number >= 0 (tokens), got " .. tostring(opts.call_reserve), 3)
+    end
+    if opts.checkpoint ~= nil and type(opts.checkpoint) ~= "boolean" then
+        error("coding.run: `checkpoint` must be a boolean, got " .. tostring(opts.checkpoint), 3)
     end
     if opts.strict ~= nil and type(opts.strict) ~= "boolean" then
         error("coding.run: `strict` must be a boolean, got " .. tostring(opts.strict), 3)
@@ -1758,6 +1832,8 @@ local record Run
     --- built with the window's fold, inside the session (`device_of`).
     compact: CompactOpt
     ledger: pcompact.LedgerFn
+    --- Whether the state of the files is recorded (`checkpoint`).
+    checkpoint: boolean
     --- `knl.session`'s opts: the owner, the grant, the store.
     session: kernel.OpenOpts
 end
@@ -1880,6 +1956,7 @@ local function prepare(opts: RunOpts): Run
         last_plan = nil,
         last_checks = nil,
         compactions = 0,
+        checkpoints = 0,
     }
 
     local tool_list: {kernel.ToolSpec} = { as_tool(read_spec) }
@@ -1946,6 +2023,7 @@ local function prepare(opts: RunOpts): Run
         -- The facts beside a summary: the files the fs tools were handed
         -- (`path`), and the verify's answers.
         ledger = compact and policy.ledger({ track = { "path" }, kinds = { "verify" } }) or nil,
+        checkpoint = opts.checkpoint ~= false,
         session = {
             owner = opts.owner or DEFAULT_OWNER,
             -- The summarising beats come out of the same grant: one per
@@ -2088,6 +2166,76 @@ local function compact_once(st: State, s: kernel.Session, run: Run, compaction: 
     return true
 end
 
+--- The versions the session already holds a `checkpoint_blob` for, as a set.
+---
+--- Read off the log rather than kept on the state, so a version is written
+--- once per SESSION whoever wrote it. A read the kernel cut short answers the
+--- front of the log, and a version recorded after the cut is written again
+--- — a second copy of a content, which the readers take as the same one.
+local function recorded_versions(s: kernel.Session): {string:boolean}
+    local have: {string:boolean} = {}
+    for _, ev in ipairs((s:events())) do
+        if ev.kind == "checkpoint_blob" and type(ev.data) == "table" then
+            local version = (ev.data as {string:any}).version
+            if type(version) == "string" then
+                have[version as string] = true
+            end
+        end
+    end
+    return have
+end
+
+--- Record the state of the files: every target read, each content the
+--- session has not recorded yet appended as a `checkpoint_blob`, then one
+--- `checkpoint` naming every target's version (`policy.shapes.checkpoint`).
+---
+--- `beat` is the beat the state follows, stamped as `meta.beat` so the state
+--- sits in that beat's record; nil is the state before the first beat, which
+--- carries no beat id — a made-up one would be a beat that never ran to every
+--- reader that counts them (`policy.shared.CHECKPOINT_BASELINE`).
+---
+--- A target `read_versioned` cannot answer — not created yet, deleted, not
+--- text — goes under `missing`: the run's record says it was absent, which a
+--- target left out would not.
+---
+--- @param st table  the loop's state (`checkpoints` is counted here)
+--- @param s table  the session
+--- @param run table  the `Run`, for the targets
+--- @param beat string|nil  the beat id, or nil before the first beat
+local function record_checkpoint(st: State, s: kernel.Session, run: Run, beat: string)
+    local have = recorded_versions(s)
+    local files: {string:string} = {}
+    local missing: {string} = {}
+    for _, path in ipairs(run.targets) do
+        local ok, got = pcall(std.fs.read_versioned, path)
+        local read = got as host.Std.Fs.ReadVersioned
+        if ok and type(got) == "table" and type(read.content) == "string" and type(read.version) == "string" then
+            files[path] = read.version
+            if not have[read.version] then
+                have[read.version] = true
+                s:append({
+                    kind = "checkpoint_blob",
+                    meta = { label = "checkpoint" },
+                    data = { version = read.version, content = read.content },
+                })
+            end
+        else
+            missing[#missing + 1] = path
+        end
+    end
+    local data: {string:any} = { files = files }
+    if #missing > 0 then
+        data.missing = missing
+    end
+    shape.assert_dev(data, policy.shapes.checkpoint, "coding checkpoint")
+    local meta: {string:string | number | boolean} = { label = "checkpoint" }
+    if beat ~= nil then
+        meta.beat = beat
+    end
+    s:append({ kind = "checkpoint", meta = meta, data = data })
+    st.checkpoints = st.checkpoints + 1
+end
+
 --- One iteration: beats until an edit lands, the model stops asking for
 --- tools, or the turn cap — then the caller verifies, whatever the model
 --- said.
@@ -2152,7 +2300,13 @@ local function run_iteration(
             return nil
         end
         answer = out
-        applied_here = applied_here + edits_in(s, answer.beat, edits.set)
+        local landed = edits_in(s, answer.beat, edits.set)
+        applied_here = applied_here + landed
+        if landed > 0 and run.checkpoint then
+            -- The state this beat left, before the verify runs: what the
+            -- model's edits made of the files, under the beat that made it.
+            record_checkpoint(st, s, run, answer.beat)
+        end
         local no_tools = not (answer.tools and #answer.tools > 0)
         if applied_here > 0 or no_tools then
             -- An answer with no tool call is the model saying it is done;
@@ -2215,6 +2369,11 @@ local function run_loop(s: kernel.Session, run: Run): State
     -- fold skips a kind it does not know, so the record gains the event
     -- and the request the model sees is the one it would have been.
     s:append({ kind = "config", data = st.config })
+    -- The files as the run found them — after the baseline verify, before
+    -- the first beat — so every later state has the one it started from.
+    if run.checkpoint then
+        record_checkpoint(st, s, run, nil)
+    end
 
     while true do
         local answer, declared, applied_here = run_iteration(st, s, run, device, fits, compaction)
@@ -2356,6 +2515,13 @@ function M.result_of(st: State, max_iters: number): RunResult
             and st.config.values.compact.value ~= false
             and st.compactions
             or nil,
+        -- How many states of the files were recorded; absent when the run
+        -- recorded none by configuration, the count (zero included) when
+        -- it could.
+        checkpoints = st.config.values.checkpoint ~= nil
+            and st.config.values.checkpoint.value == true
+            and (st.checkpoints or 0)
+            or nil,
         -- Which checks were still failing, by name: a count alone (3/4) does
         -- not say which step the run never finished, and the one it never
         -- finished is the one a caller has to look at.
@@ -2366,6 +2532,110 @@ function M.result_of(st: State, max_iters: number): RunResult
             failing = failing_of(st.last_checks),
         } as PlanSummary or { total = 0, passed = 0, filed = false, failing = {} } as PlanSummary) or nil,
     }
+end
+
+-- ============================================================
+-- Public: coding.restore(log, beat, repo?)
+-- ============================================================
+
+--- An array that encodes as one even when it is empty, so a block handing
+--- `restore`'s answer to `std.json.encode` gets `[]` rather than `{}`.
+local ARRAY_TAG: {string:string} = { __jsontype = "array" }
+
+--- The repo the run recorded in its `config` event, for re-rooting.
+local function recorded_repo(events: {shared.Event}): string
+    for _, ev in ipairs(events) do
+        if ev.kind == "config" and type(ev.data) == "table" then
+            local values = (ev.data as {string:any}).values
+            if type(values) == "table" then
+                local repo = (values as {string:any}).repo
+                if type(repo) == "table" and type((repo as {string:any}).value) == "string" then
+                    return (repo as {string:any}).value as string
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--- The events of `log`: a session's, read whole, or the array as handed in.
+--- The policy reader holds a truncated read to account; this one only needs
+--- the `config` event, which is near the front of any log.
+local function events_in(source: any): {shared.Event}
+    if kernel.is_session(source) then
+        return ((source as kernel.Session):events()) as {shared.Event}
+    end
+    return source as {shared.Event}
+end
+
+--- Write the targets back as they were after `beat` — or before the first
+--- beat, `"baseline"` — from the run's record (see "The state of the files"
+--- in the header).
+---
+---     local r = coding.restore(events, "baseline")
+---     -- r.restored: the paths written; r.missing: absent then, left alone
+---
+--- It never deletes. A target recorded as missing at that beat is named in
+--- `missing` and not touched, whatever is on disk now; what the verify wrote
+--- outside the targets was never recorded and is not restored. With `repo`,
+--- each path is re-rooted from the repo the run recorded in its `config`
+--- event to `repo`, and a recorded path outside that repo is refused rather
+--- than written somewhere it was never meant to go.
+---
+--- A beat with no recorded state (it landed no edit, or the run ran with
+--- `checkpoint = false`) is refused, by name: an empty answer would read as
+--- a restore that worked.
+---
+--- @param source any  the run's session, or its events in seq order
+--- @param beat string  the beat id, or "baseline"
+--- @param repo string|nil  write under this directory instead of the run's repo
+--- @return table  { restored = { path ... }, missing = { path ... } }
+function M.restore(source: any, beat: string, repo?: string): Restored
+    if type(beat) ~= "string" or beat == "" then
+        error('coding.restore: beat must be a beat id or "baseline", got ' .. tostring(beat), 2)
+    end
+    if repo ~= nil and (type(repo) ~= "string" or repo == "") then
+        error("coding.restore: repo must be a directory path, got " .. tostring(repo), 2)
+    end
+    local state = policy.checkpoint_at(source, beat)
+    if state == nil then
+        error("coding.restore: the log records no state of the files after beat " .. beat, 2)
+    end
+    local from: string = nil
+    local to: string = nil
+    if repo ~= nil then
+        from = recorded_repo(events_in(source))
+        if from == nil then
+            error("coding.restore: the log carries no `config` event naming the run's repo, so its paths cannot be re-rooted", 2)
+        end
+        to = repo:gsub("/+$", "")
+    end
+    local function placed(path: string): string
+        if from == nil then
+            return path
+        end
+        local prefix = from .. "/"
+        if path:sub(1, #prefix) ~= prefix then
+            error("coding.restore: " .. path .. " is not under the run's repo " .. from .. ", so it has no place under " .. to, 3)
+        end
+        return to .. "/" .. path:sub(#prefix + 1)
+    end
+    local paths: {string} = {}
+    for path in pairs(state.files) do
+        paths[#paths + 1] = path
+    end
+    table.sort(paths)
+    local restored = setmetatable({} as {string}, ARRAY_TAG as metatable<{string}>)
+    for _, path in ipairs(paths) do
+        local target = placed(path)
+        std.fs.write(target, state.files[path])
+        restored[#restored + 1] = target
+    end
+    local missing = setmetatable({} as {string}, ARRAY_TAG as metatable<{string}>)
+    for _, path in ipairs(state.missing) do
+        missing[#missing + 1] = placed(path)
+    end
+    return { restored = restored, missing = missing }
 end
 
 -- ============================================================
