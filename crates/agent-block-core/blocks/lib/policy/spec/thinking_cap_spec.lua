@@ -231,12 +231,15 @@ describe("policy.thinking_cap — the stop point", function()
         expect(out.messages).to.be(request.messages)
     end)
 
-    it("asks the port for the profile and the count on every request", function()
+    it("asks the port for the count on every request, and for the profile once — the room's reading", function()
+        -- The older form builds a room at the first call, and a room reads
+        -- the profile once (policy.room's header); the count is per request.
         local port = port_of(1000, 100)
         local filter = policy.thinking_cap({ port = port, conf = conf_on(), call_reserve = 100 })
+        expect(port.asked.profile).to.be(0)
         filter(request_of())
         filter(request_of())
-        expect(port.asked.profile).to.be(2)
+        expect(port.asked.profile).to.be(1)
         expect(port.asked.count).to.be(2)
     end)
 

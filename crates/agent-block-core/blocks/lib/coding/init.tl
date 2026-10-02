@@ -10,6 +10,8 @@
 --       verify  = "cargo test --quiet",         -- runs in repo after every iteration
 --       repo    = "/path/to/repo",              -- default: the process's directory
 --       llm     = { port = adapter.openai, conf = { base_url = ..., model = ..., ... } },
+--       beat_share = 0.5,                       -- the most of the window one turn's tool results may
+--                                              -- take together (policy.beat_cap); default 0.5
 --       reserve = 6144,                         -- tokens the fold holds back for the reply,
 --                                               -- when llm.conf carries no max_tokens cap
 --       iters   = 5,                            -- iterations, each ending in a verify
@@ -84,9 +86,10 @@
 --   is invented for them either.
 --
 --   EXEC is loop policy — the iterations, the turns, the verify's timeout
---   curve, the two caps, `done`, the `ops` the model is handed, the shape of
---   the `seed`, when the record is `compact`ed — and every one of them has a
---   default, stated above.
+--   curve, the three caps (`result_share`, `beat_share`, `repeat_max`),
+--   `done`, the `ops` the model is handed, the shape of the `seed`, when the
+--   record is `compact`ed — and every one of them has a default, stated
+--   above.
 --   `strict = true` gives those defaults
 --   up: each Exec knob with a number, a mode or a tool set behind it must then
 --   be named by the caller, and the run refuses while any is not, listing all
@@ -113,12 +116,21 @@
 --
 --     the task            `spec`, pinned as the seed the fold keeps — with
 --                         the targets whole, or by name alone (`seed`)
---     the files           `std.fs.tool_specs`, path-locked to the targets —
---                         the ops `ops` names, read / search_replace by
---                         default
---     what one beat sends `policy.window{ fit, keep_seed }`
---     what a tool answers `policy.result_cap` (a result may not outgrow a share
---                         of the window), `policy.repeat_cap` (the same read
+--     the window          `policy.room{ port, conf, reserve, result_share,
+--                         beat_share, call_reserve }`, built once in `prepare`:
+--                         the one division of the window the fold, the caps,
+--                         the stop point, the window line and the file tools'
+--                         own limit all read
+--     the files           `std.fs.tool_specs`, path-locked to the targets and
+--                         told the room's limit for one result (`limits`), so
+--                         a read fits itself and says where to resume — the
+--                         ops `ops` names, read / search_replace by default
+--     what one beat sends `policy.window{ room, keep_seed }`
+--     what a tool answers `policy.result_cap` (a result may not outgrow its
+--                         share of the window), `policy.beat_cap` (one turn's
+--                         results may not outgrow theirs together — the shape
+--                         several reads in one answer took past the first cap
+--                         [measured 2026-10-01]), `policy.repeat_cap` (the same read
 --                         again, with no edit between, is refused) and
 --                         `policy.require_args` (a call whose required
 --                         arguments did not all arrive is refused before the
@@ -275,6 +287,7 @@ local record RunOpts
     owner: string
     system: string
     result_share: number
+    beat_share: number
     repeat_max: number
     ops: Ops
     call_reserve: number
@@ -471,6 +484,12 @@ local DEFAULT_ITERS = 5
 local DEFAULT_TURNS = 8
 local DEFAULT_TIMEOUT: TimeoutCurve = { first = 900, factor = 3, floor = 60 }
 local DEFAULT_RESULT_SHARE = 0.25
+-- What one BEAT's tool results may take together, as `policy.room` divides
+-- the window: `policy.beat_cap` refuses the result that would cross it, so a
+-- model answering with several reads at once cannot overrun the next
+-- request by their sum [measured 2026-10-01: three reads each under the
+-- result share, 6,534 together with the seed against a limit of 5,952].
+local DEFAULT_BEAT_SHARE = 0.5
 local DEFAULT_REPEAT_MAX = 2
 -- The share of the window the last request may take before the record is
 -- folded into a summary: `policy.compact`'s own default, named here as well
@@ -517,6 +536,7 @@ local STRICT_KNOBS: {string} = {
     "turns",
     "timeout",
     "result_share",
+    "beat_share",
     "repeat_max",
     "done",
     "ops",
@@ -568,6 +588,12 @@ local RUN_OPTS = T.shape({
     system = T.string:describe("the system line; default: the one below, naming the two tools"):is_optional(),
     result_share = T.number
     :describe("policy.result_cap's share of the window per tool result; default 0.25, required under `strict`")
+    :is_optional(),
+    beat_share = T.number
+    :describe(
+        "policy.beat_cap's share of the window for one beat's tool results together, at least result_share; "
+            .. "default 0.5, required under `strict`"
+    )
     :is_optional(),
     repeat_max = T.number:describe("policy.repeat_cap's max; default 2, required under `strict`"):is_optional(),
     ops = T.shape({
@@ -642,8 +668,8 @@ local RUN_OPTS = T.shape({
     :is_optional(),
     strict = T.boolean
     :describe(
-        "true: every Exec knob with a default (iters, turns, timeout, result_share, repeat_max, done, ops, "
-            .. 'seed, and check_timeout under done = "plan") must be named by the caller, and the run '
+        "true: every Exec knob with a default (iters, turns, timeout, result_share, beat_share, repeat_max, done, "
+            .. 'ops, seed, compact, and check_timeout under done = "plan") must be named by the caller, and the run '
             .. "refuses while any is not; default false. A lever the top level pulls on itself — never "
             .. "read from the "
             .. "environment here"
@@ -1416,6 +1442,7 @@ function M.config_of(opts: RunOpts, resolved: Resolved): Config
         turns = named(resolved.turns, opts.turns ~= nil),
         timeout = named(opts.timeout or DEFAULT_TIMEOUT, opts.timeout ~= nil),
         result_share = named(opts.result_share or DEFAULT_RESULT_SHARE, opts.result_share ~= nil),
+        beat_share = named(opts.beat_share or DEFAULT_BEAT_SHARE, opts.beat_share ~= nil),
         repeat_max = named(opts.repeat_max or DEFAULT_REPEAT_MAX, opts.repeat_max ~= nil),
         done = named(resolved.done, opts.done ~= nil),
         -- The ops as the run resolved them — `{ read = <op>, edit = { <op> ... } }`,
@@ -1592,8 +1619,8 @@ end
 --- have is refused here, by name: `tool_specs` answers only for the ops it
 --- knows and says nothing about the rest, so a typo would otherwise be a
 --- tool quietly missing from the model's hand.
-local function fs_spec(op: string, targets: {string}): host.Std.Fs.ToolSpec
-    local built = std.fs.tool_specs({ allowed = { op }, path_lock = targets })[1]
+local function fs_spec(op: string, targets: {string}, limits: any): host.Std.Fs.ToolSpec
+    local built = std.fs.tool_specs({ allowed = { op }, path_lock = targets, limits = limits })[1]
     if built == nil then
         error("coding.run: `ops` names '" .. tostring(op) .. "', which is not a std.fs op", 3)
     end
@@ -1669,7 +1696,12 @@ local record Run
     --- caps that need no session; `repeat_cap` is bound to the session in
     --- `device_of`.
     raw_tools: {string:kernel.ToolEntry}
+    --- The window as one value (`policy.room`): what the fold, the two
+    --- caps, the stop point, the window line and the file tools' own limit
+    --- all read, built once here from the model's facts and the shares.
+    room: room.Room
     size_cap: room.ToolsWrap
+    beat_cap: room.Bind
     repeat_cap: ptools.Bind
     args_present: ptools.Wrap
     verdict: loop.VerdictFn
@@ -1730,13 +1762,31 @@ local function prepare(opts: RunOpts): Run
         )
     end
 
-    -- Tools: std.fs, path-locked to the targets, declared as the adapter
-    -- takes them, then wrapped by the caps. repeat_cap needs the session, so
-    -- it is bound inside the session (`device_of`).
-    local read_spec = fs_spec(ops.read, targets)
+    -- The window as one value: the Port's profile read once, and the
+    -- division of it — the prompt's limit, what one result may take, what
+    -- one beat's results may take together, where the reasoning stops —
+    -- declared here and read by every seam below. A division that cannot
+    -- hold is refused here, before any command runs.
+    local the_room = policy.room({
+        port = port as shared.Port,
+        conf = conf,
+        reserve = opts.reserve as integer,
+        result_share = opts.result_share or DEFAULT_RESULT_SHARE,
+        beat_share = opts.beat_share or DEFAULT_BEAT_SHARE,
+        call_reserve = opts.call_reserve as integer,
+    })
+
+    -- Tools: std.fs, path-locked to the targets and told the room's limit
+    -- for one result — so a read fits itself to it, answering the lines that
+    -- fit and where to resume, instead of being refused whole — declared as
+    -- the adapter takes them, then wrapped by the caps. The two caps that
+    -- read the session (`repeat_cap`, `beat_cap`) are bound inside it
+    -- (`device_of`).
+    local limits = the_room:limits_for_tools()
+    local read_spec = fs_spec(ops.read, targets, limits)
     local edit_specs, edit_names, edit_set: {host.Std.Fs.ToolSpec}, {string}, {string:boolean} = {}, {}, {}
     for i, op in ipairs(ops.edit) do
-        local spec = fs_spec(op, targets)
+        local spec = fs_spec(op, targets, limits)
         edit_specs[i] = spec
         edit_names[i] = spec.name
         edit_set[spec.name] = true
@@ -1792,11 +1842,10 @@ local function prepare(opts: RunOpts): Run
         tool_list[#tool_list + 1] = plan_tool(st, targets, repo)
     end
     local raw_tools = adapter.tools(tool_list)
-    local size_cap = policy.result_cap({
-        port = port as shared.Port,
-        conf = conf,
-        share = opts.result_share or DEFAULT_RESULT_SHARE,
-    })
+    -- One result under the room's result_limit; one beat's results under its
+    -- beat_budget. The second reads the session and is bound in `device_of`.
+    local size_cap = policy.result_cap({ room = the_room })
+    local beat_cap = policy.beat_cap({ room = the_room })
     -- Every edit tool resets the count, not just the first: what makes an old
     -- read new again is the file having changed, and any of them changes it.
     local repeat_cap = policy.repeat_cap({ max = opts.repeat_max or DEFAULT_REPEAT_MAX, resets = edit_names })
@@ -1838,7 +1887,9 @@ local function prepare(opts: RunOpts): Run
         system = system,
         st = st,
         raw_tools = raw_tools,
+        room = the_room,
         size_cap = size_cap,
+        beat_cap = beat_cap,
         repeat_cap = repeat_cap,
         args_present = args_present,
         verdict = verdict,
@@ -1875,10 +1926,12 @@ end
 local function device_of(s: kernel.Session, run: Run): kernel.Device, room.Fits, Compaction
     local port, conf, opts = run.port, run.conf, run.opts
     local compact = run.compact
+    local the_room = run.room
     -- From the latest summary on, when the run compacts: the seed, the
     -- summary in place of the beats it stands for, and the beats since.
+    -- Sized by the room every other seam here reads.
     local fold, fits = policy.window({
-        fit = { port = port as shared.Port, conf = conf, reserve = opts.reserve },
+        room = the_room,
         keep_seed = true,
         from_summary = compact ~= nil,
     })
@@ -1893,24 +1946,25 @@ local function device_of(s: kernel.Session, run: Run): kernel.Device, room.Fits,
     -- part of the request the stop point is sized on.
     local filters: {function(any): any} = { policy.carry({ max_bytes = 512, failed = failed_pair })(s) }
     if compact ~= nil then
-        filters[#filters + 1] = policy.room_note({ port = port as shared.Port, conf = conf })
+        filters[#filters + 1] = policy.room_note({ room = the_room })
     end
     local thinking_cap: function(any): any = nil
     if opts.call_reserve ~= nil then
         local thinking = conf.thinking
         thinking_cap = policy.thinking_cap({
-            port = port as shared.Port,
-            conf = conf,
-            call_reserve = opts.call_reserve,
+            room = the_room,
             budget = thinking is {string:any} and thinking.budget_tokens as integer or nil,
         })
         filters[#filters + 1] = thinking_cap
     end
     local llm = port:open(conf)
+    -- Innermost to outermost: one result's own limit, then the beat's sum
+    -- over what the first let through, then the repeat count, then the
+    -- arguments — the order `prepare` explains.
     local device = kernel.device({
         llm = llm,
         system = run.system,
-        tools = run.args_present(run.repeat_cap(s)(run.size_cap(run.raw_tools))),
+        tools = run.args_present(run.repeat_cap(s)(run.beat_cap(s)(run.size_cap(run.raw_tools)))),
         fold = fold,
         filters = filters,
     })

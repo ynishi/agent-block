@@ -97,6 +97,7 @@ local record S
     DEFAULT_TIMEOUT_FLOOR: number
     DEFAULT_TIMEOUT_MEASURE: string
     DEFAULT_RESULT_SHARE: number
+    DEFAULT_BEAT_SHARE: number
     ELLIPSIS: string
     NOTE_PREFIX: string
     ARRAY_TAG: {string:string}
@@ -180,6 +181,17 @@ S.DEFAULT_TIMEOUT_MEASURE = "longest"
 --- read, edit and read again without the fold running out of beats to drop,
 --- and small enough that one answer cannot end the run on its own.
 S.DEFAULT_RESULT_SHARE = 0.25
+
+--- How much of the window one BEAT's tool results may take together when
+--- `room` is not told. Half: a model that answers with several calls at
+--- once — three reads of a file each — gets two of them whole and the third
+--- refused with the reason, where the window would otherwise be overrun by
+--- the sum of results each under its own limit [measured 2026-10-01: three
+--- reads of ~1,480 tokens, each under 0.3 of a 5,952 limit, 6,534 together
+--- with the seed; at 0.5 the third is refused and the request stays under
+--- the limit]. At least the result share, so one result always fits an
+--- empty beat.
+S.DEFAULT_BEAT_SHARE = 0.5
 
 --- How much of the fold's room the last request may take before `compact`
 --- says a summary is due. Four fifths: the harnesses that compact by a

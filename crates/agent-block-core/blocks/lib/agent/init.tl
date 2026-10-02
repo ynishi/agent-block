@@ -1047,11 +1047,9 @@ local function compaction_of(port: Port, conf: {string:any}, system: any, compac
     if conf.max_tokens == nil and compact.reserve == nil then
         return nil, "compact needs the reply's room: max_tokens, or compact.reserve (tokens held back for the reply)"
     end
-    local fold, fits = policy.window({
-        fit = { port = port as shared.Port, conf = conf, reserve = compact.reserve },
-        keep_seed = true,
-        from_summary = true,
-    })
+    -- The window as one value, read by the fold and the window line alike.
+    local the_room = policy.room({ port = port as shared.Port, conf = conf, reserve = compact.reserve as integer })
+    local fold, fits = policy.window({ room = the_room, keep_seed = true, from_summary = true })
     local due, summarise = policy.compact({ at = compact.at, min_beats = compact.min_beats, fold = fold })
     local llm = port:open(conf)
     local writer = kernel.device({ llm = llm, system = system, fold = summarise })
@@ -1060,7 +1058,7 @@ local function compaction_of(port: Port, conf: {string:any}, system: any, compac
     local ledger = policy.ledger({ track = { "path" }, kinds = {} })
     return {
         fold = fold,
-        filters = { policy.room_note({ port = port as shared.Port, conf = conf }) },
+        filters = { policy.room_note({ room = the_room }) },
         fits = fits,
         compaction = { due = due, writer = writer },
         ledger = ledger,

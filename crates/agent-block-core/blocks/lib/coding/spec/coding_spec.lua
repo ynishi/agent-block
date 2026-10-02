@@ -322,6 +322,7 @@ describe("coding.run — what it refuses", function()
             ops = { read = "read", edit = { "search_replace" } },
             seed = "full",
             compact = { at = 0.8 },
+            beat_share = 0.5,
         }
         local without_iters = {}
         for k, v in pairs(named) do
@@ -714,6 +715,13 @@ describe("coding.config_of — what the run was configured with", function()
         end
         return coding.config_of(opts, r)
     end
+
+    it("carries the beat share — the default half, or the caller's", function()
+        expect(config({}).values.beat_share.from).to.be("default")
+        expect(config({}).values.beat_share.value).to.be(0.5)
+        expect(config({ beat_share = 0.4 }).values.beat_share.from).to.be("caller")
+        expect(config({ beat_share = 0.4 }).values.beat_share.value).to.be(0.4)
+    end)
 
     it("carries the compaction as the run resolved it: the default on, false when turned off", function()
         local taken = config({})

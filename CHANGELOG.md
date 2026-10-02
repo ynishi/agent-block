@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `policy.room({ port, conf?, reserve?, result_share?, beat_share?,
+  call_reserve? })` is the window as one value: the Port's profile read once,
+  and the one division of it every window policy reads — `limit` and `held`
+  for the prompt's side, `result_limit` for one tool result, `beat_budget`
+  for one beat's results together, `reply(used)` for the reply's side,
+  `thinking_stop(used, budget?)` for the reasoning, `count` / `count_text`
+  through the Port, `split(used?)` as the value `policy.split` has always
+  answered, and `limits_for_tools()` in the shape `std.fs.tool_specs{ limits
+  }` takes. It is frozen like a device and checked where it is declared: a
+  share outside (0, 1], a `beat_share` under the `result_share`, a reserve
+  that leaves no room, a profile naming no window are errors at construction,
+  in the caller's frame, before any beat. `policy.is_room(v)` tells one from a
+  table. `window`, `tokens`, `result_cap`, `thinking_cap` and `room_note` take
+  `room` in place of `{ port, conf, <their share> }` — one or the other, not
+  both — and the older form builds a room of its own, so nothing a caller
+  wrote changes; a caller that builds one room and hands it to every seam has
+  the division stated once, which the five opts never did [the shape that
+  found the gap, measured 2026-10-01: three reads in one beat, each under
+  0.3 of a 5,952 limit, 6,534 together with the seed; no cap saw the sum].
+
+- `policy.beat_cap({ room })` holds one beat's tool results together under the
+  room's `beat_budget` (default half of `limit`). A binder like `repeat_cap`:
+  bound to the session, it reads the results the beat now running has already
+  recorded off the log — the kernel writes each pair as it runs, in response
+  order — and answers the call that would cross the line `{ ok = false, reason
+  = "beat_budget", tokens, used, limit, error }`, naming what this result cost,
+  what the beat had taken, and what a beat may take, so the model asks again on
+  its next turn. The first result of a beat is never refused by it alone
+  (`beat_share >= result_share`). It goes outside `result_cap`: one result's
+  own limit first, the sum over what that let through. `coding.run` installs
+  it, with `beat_share` as an Exec knob (default 0.5, under `strict`, in
+  `config`), and hands the room's `limits_for_tools()` to `std.fs.tool_specs`,
+  so a read fits itself to the result limit and says where to resume instead
+  of being refused whole — the mechanism `std.fs` has carried since 0.38 for a
+  `policy.result_budget` that did not exist until this room did.
+
 - `policy.compact({ at?, min_beats?, prompt?, fold })` answers the question a
   loop asks before a beat — is the window nearly full? — and the fold the one
   beat that writes a summary runs with. `due(session)` reads the window report
@@ -88,12 +124,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `policy` is fourteen in seven files: `policy/compact.lua` (`compact`,
-  `ledger`) joins `room` (which gains `room_note` and `window`'s
-  `from_summary`), `tools`, `carry`, `loop` and `shared`. The module header's
-  "deliberately not here" no longer lists summarising a window: a loop asked
-  for it, and it came in the shape the header requires — the policies read,
-  the loop writes.
+- `policy` is fifteen in seven files, and a room: `policy/compact.lua`
+  (`compact`, `ledger`) joins `room` (which gains the room itself,
+  `beat_cap`, `room_note` and `window`'s `from_summary`), `tools`, `carry`,
+  `loop` and `shared`. The module header's "deliberately not here" no longer
+  lists summarising a window: a loop asked for it, and it came in the shape
+  the header requires — the policies read, the loop writes. The five window
+  policies derive nothing of their own any more: the arithmetic that was
+  three private functions each of them called is the room's, and
+  `policy.split` is `room:split()` over a room built on the spot.
+
+- `coding.run` builds one `policy.room` in `prepare` from `reserve`,
+  `result_share`, `beat_share` and `call_reserve`, and hands it to the fold,
+  the two caps, the stop point, the window line and the file tools. The
+  three `{ port, conf, <share> }` wirings it had are gone; what each seam is
+  sized by is written once. `agent.run{ compact }` does the same for the fold
+  and the window line.
 
 ### Deprecated
 
