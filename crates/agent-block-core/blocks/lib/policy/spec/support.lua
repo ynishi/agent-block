@@ -16,10 +16,18 @@
 -- rows a beat appended, and writes `epoch_ms` itself when it needs history —
 -- and adds only what a policy case is built from: a session with an allowance,
 -- a seed, a truncated read, readings of the log, and the llm and tool stubs.
+--
+-- `std.json.encode` is the shared stand-in too (knl/spec/json_stub.lua, which
+-- says why its length grows with the value and its text is the same for the
+-- same value): the caps count and key results by it, so it is installed here
+-- once, when no `std` is there yet, and handed back as `M.json`. A policy spec
+-- writes no encoder of its own.
 
 local M = {}
 
 require("knl.spec.fake_bridge").install()
+
+M.json = { encode = require("knl.spec.json_stub").install().encode }
 
 local kernel = require("knl")
 

@@ -166,6 +166,10 @@ local record M
     record Decoded
         content: any
         stop_reason: string
+        --- The provider's own word for why it stopped, where the dialect
+        --- maps it onto `stop_reason` (OpenAI's `finish_reason`); absent
+        --- where `stop_reason` already is the provider's word.
+        finish_reason: string
         refusal: string
         stop_details: any
         stop_sequence: string

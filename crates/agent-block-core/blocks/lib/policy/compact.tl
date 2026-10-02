@@ -181,14 +181,72 @@ end
 --- whole breaks no `tool_use` / `tool_result` pairing. The request is rebuilt
 --- rather than edited, for the reason `carry` gives: a filter's table reaches
 --- the fold's caller and, through the `llm_request` record, the log.
+---
+--- THE TOOL HISTORY GOES IN AS PROSE. A summarising request still carried
+--- the run's `tool_use` / `tool_result` blocks, with no tools offered — and a
+--- model reading a history of calls continues it with another call, which it
+--- then cannot make. Gemini answers that request with nothing at all
+--- [measured 2026-10-02, gemini-2.5-flash, one recorded summary request sent
+--- again: 10 of 10 empty as recorded; 10 of 10 empty with the tools offered
+--- and `tool_choice = "none"`; 5 of 5 `UNEXPECTED_TOOL_CALL` on the native
+--- endpoint with function calling mode NONE; 0 of 5 empty with the same
+--- history written as prose]. What makes the model reach for a call is the
+--- call blocks in the history, not the tools on the request, so the blocks
+--- are rewritten: a `tool_use` as one line naming the tool and its input, a
+--- `tool_result` as one line carrying its result, inside the turn that held
+--- it. Text blocks are kept, and anything else (a reasoning block) is left
+--- out — the summary is about what was done. The log keeps the blocks; this
+--- changes what the summarising request SENDS, as every fold does.
+---
+--- The rewritten request is about the size the window fitted — the same
+--- names, inputs and results, with JSON's punctuation exchanged for a few
+--- words — and it carries no tool definitions, which the fitted request did.
+
+--- One value as the text the prose names it by: a string verbatim, anything
+--- else as JSON.
+local function as_text(value: any): string
+    if type(value) == "string" then
+        return value as string
+    end
+    if value == nil then
+        return ""
+    end
+    return std.json.encode(value)
+end
+
+--- A message's content as prose: text blocks verbatim, a tool call and a
+--- tool result as one line each, everything else left out.
+local function prose_of(content: any): string
+    if type(content) ~= "table" then
+        return as_text(content)
+    end
+    local lines: {string} = {}
+    for _, item in ipairs(content as {any}) do
+        local block = (type(item) == "table" and item or {}) as {string:any}
+        if block.type == "text" and type(block.text) == "string" then
+            lines[#lines + 1] = block.text as string
+        elseif block.type == "tool_use" then
+            lines[#lines + 1] = "[called " .. tostring(block.name) .. " with " .. as_text(block.input) .. "]"
+        elseif block.type == "tool_result" then
+            local mark = block.is_error == true and "[tool failed] " or "[tool result] "
+            lines[#lines + 1] = mark .. as_text(block.content)
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
 local function append_prompt(request: kernel.Request, prompt: string): kernel.Request
     local out: {string:any} = {}
     for k, v in pairs(request as {string:any}) do
         out[k] = v
     end
     local messages = setmetatable({} as any, ARRAY_TAG as metatable<any>) as {any}
-    for _, message in ipairs(request.messages or {}) do
-        messages[#messages + 1] = message
+    for _, item in ipairs(request.messages or {}) do
+        local message = item as {string:any}
+        local text = prose_of(message.content)
+        if text ~= "" then
+            messages[#messages + 1] = { role = message.role, content = text }
+        end
     end
     messages[#messages + 1] = { role = "user", content = prompt }
     out.messages = messages

@@ -6,10 +6,12 @@
 --   just test-lua fs_tools
 --
 -- The pure runner has no host bridges, so the primitives the code paths under
--- test reach — `std.fs.read_versioned`, `std.json.encode`, `log.debug`,
+-- test reach — `std.fs.read_versioned`, `std.fs.write`, `log.debug`,
 -- `tool.register` — are stubbed here, each doing the least the path needs and
--- recording what it was handed. The stubs stay in this file rather than a
--- shared `support.lua`: they are four lines, and no other spec wants them.
+-- recording what it was handed; they stay in this file because no other spec
+-- wants them. `std.json.encode` is the exception: the read's `limits` count
+-- the encoded result, so it is the shared encoder (knl/spec/json_stub.lua),
+-- whose length grows with the value, and not one written here.
 --
 -- What this proves:
 --   1 `require("fs_tools")` answers a table — the module's exports and its
@@ -26,7 +28,14 @@
 --   5 `register_tools` puts the same specs in the registry and answers their
 --     names;
 --   6 `append` adds to the end of a file that is there, refuses one that is
---     not by pointing at `write`, and is path-locked like every other op.
+--     not by pointing at `write`, and is path-locked like every other op;
+--   7 a read under `limits` fits ITSELF to the budget: within it nothing is
+--     marked; over it the result keeps the longest whole-line prefix whose
+--     encoding the counter puts within the budget, says `truncated` and
+--     `cut_by = "budget"`, and its `end_line` is the last line it holds; a
+--     caller's smaller `max_tokens` wins and is named as the cut; a first line
+--     that alone is over is `result_too_large`, not an empty page; and a
+--     `result_tokens` given as a function is asked at each call.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -63,11 +72,7 @@ _G.std = {
             files[path] = content
         end,
     },
-    json = {
-        encode = function(value)
-            return tostring(value)
-        end,
-    },
+    json = { encode = require("knl.spec.json_stub").encode },
 }
 
 _G.log = { debug = function() end }
@@ -259,6 +264,114 @@ describe("fs_tools.tool_specs — append", function()
     it("declares both its arguments required, so a call cut short is caught", function()
         local schema = append_spec().input_schema
         expect(schema.required).to.equal({ "path", "content" })
+    end)
+end)
+
+describe("fs_tools.tool_specs — read under `limits`", function()
+    -- Twenty lines of the same width, so the budget below lands mid-file. The
+    -- counter is one token per character of the ENCODED result, which is what
+    -- the read measures (the shared encoder grows with the value, so a longer
+    -- page costs more).
+    local lines = {}
+    for i = 1, 20 do
+        lines[i] = string.format("line %02d of the long file", i)
+    end
+    files["/work/long.txt"] = table.concat(lines, "\n") .. "\n"
+
+    local function count(text)
+        return #text
+    end
+
+    --- The read spec under `limits = { result_tokens = budget, count }`.
+    local function read_under(budget)
+        return fs_tools.tool_specs({ allowed = { "read" }, limits = { result_tokens = budget, count = count } })[1]
+    end
+
+    --- What the counter makes of `answer` as the shell would render it.
+    local function cost(answer)
+        return count(std.json.encode(answer))
+    end
+
+    it("(a) marks nothing when the whole file is within the budget", function()
+        local answer = read_under(10000).handler({ path = "/work/long.txt" })
+
+        expect(answer.ok).to.be(nil)
+        expect(answer.truncated).to.be(nil)
+        expect(answer.cut_by).to.be(nil)
+        expect(answer.start_line).to.be(1)
+        expect(answer.end_line).to.be(20)
+        expect(answer.total).to.be(20)
+    end)
+
+    it("(b) keeps the longest prefix within the budget, says it was cut, and ends where it stopped", function()
+        local budget = 200
+        local answer = read_under(budget).handler({ path = "/work/long.txt" })
+
+        expect(answer.truncated).to.be(true)
+        expect(answer.cut_by).to.be("budget")
+        expect(answer.start_line).to.be(1)
+        expect(answer.total).to.be(20)
+        expect(answer.end_line > 0 and answer.end_line < 20).to.be(true)
+        -- `end_line` is the last line the content holds — the resume point is
+        -- `end_line + 1`, so the two must agree.
+        local _, newlines = answer.content:gsub("\n", "")
+        expect(newlines + 1).to.be(answer.end_line)
+        expect(answer.content).to.be(table.concat(lines, "\n", 1, answer.end_line))
+        -- Within the budget as returned, and the longest such: the same answer
+        -- one line longer is over.
+        expect(cost(answer) <= budget).to.be(true)
+        local longer = {}
+        for k, v in pairs(answer) do
+            longer[k] = v
+        end
+        longer.end_line = answer.end_line + 1
+        longer.content = table.concat(lines, "\n", 1, answer.end_line + 1)
+        expect(cost(longer) > budget).to.be(true)
+    end)
+
+    it("(c) names `max_tokens` as the cut when the caller asked for less than the budget", function()
+        local answer = read_under(10000).handler({ path = "/work/long.txt", max_tokens = 200 })
+
+        expect(answer.truncated).to.be(true)
+        expect(answer.cut_by).to.be("max_tokens")
+        expect(answer.end_line < 20).to.be(true)
+        expect(cost(answer) <= 200).to.be(true)
+    end)
+
+    it("(d) refuses as `result_too_large` when the first line alone is over", function()
+        local answer = read_under(10).handler({ path = "/work/long.txt" })
+
+        expect(answer.ok).to.be(false)
+        expect(answer.reason).to.be("result_too_large")
+        expect(answer.budget).to.be(10)
+        expect(answer.total).to.be(20)
+        expect(answer.content).to.be(nil)
+        expect(answer.error:find("Line 1 alone", 1, true) ~= nil).to.be(true)
+    end)
+
+    it("(e) asks a `result_tokens` function at each call, not once", function()
+        local budget, asked = 10000, 0
+        local spec = fs_tools.tool_specs({
+            allowed = { "read" },
+            limits = {
+                result_tokens = function()
+                    asked = asked + 1
+                    return budget
+                end,
+                count = count,
+            },
+        })[1]
+
+        local whole = spec.handler({ path = "/work/long.txt" })
+        expect(whole.truncated).to.be(nil)
+        expect(whole.end_line).to.be(20)
+
+        budget = 200
+        local cut = spec.handler({ path = "/work/long.txt" })
+        expect(cut.truncated).to.be(true)
+        expect(cut.cut_by).to.be("budget")
+        expect(cut.end_line < 20).to.be(true)
+        expect(asked).to.be(2)
     end)
 end)
 

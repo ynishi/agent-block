@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `result.config.room` (and the `config` event's `room`): the numbers the
+  run's room worked out — `{ window, max_output, limit, held, reserve,
+  result_limit, beat_budget, call_reserve? }`, in tokens — beside `values`,
+  not inside it. `values` stays the table of knobs a caller can name and
+  where each came from; `room` is what was computed from them, so it has no
+  `from`, and `call_reserve` is absent when the run gave none. Before this a
+  run's log said which shares it ran at but not what one result or one beat
+  was allowed, and reading a refusal's `limit` back to its cause meant
+  redoing the room's arithmetic from the profile. Nothing that was in
+  `config` moved.
+- `finish_reason` on an `llm_response` (and on the `llm_result` an
+  OpenAI-compatible Port answers): the server's own reason, as it sent it,
+  beside the mapped `stop_reason`. The map folds `"stop"` and an absent reason
+  onto one `end_turn`, so an empty answer that came back as either left no
+  trace of which; now the log says. Absent where the provider sent no string,
+  and on the Anthropic side, whose `stop_reason` already is the provider's
+  word. `stop_reason` and its vocabulary are unchanged.
+
 ### Changed
 
 ### Deprecated
@@ -33,6 +51,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before moving its binary to this version.
 
 ### Fixed
+
+- The summarising request `policy.compact` builds sends the run's tool
+  history as prose. It used to carry the `tool_use` / `tool_result` blocks
+  with no tools offered, and a model reading a history of calls continues it
+  with a call it cannot make: Gemini answered with nothing [measured
+  2026-10-02, gemini-2.5-flash, one recorded summary request sent again: 10
+  of 10 empty as recorded; 10 of 10 empty with the tools offered and
+  `tool_choice = "none"`; 5 of 5 `UNEXPECTED_TOOL_CALL` on the native
+  endpoint with function calling mode NONE; 0 of 5 empty with the history as
+  prose]. Offering the tools and forbidding the call does not help — what
+  makes the model reach for one is the call blocks — so the fold rewrites
+  them: a call as one line naming the tool and its input, a result as one
+  line carrying it, text kept, reasoning blocks left out. The log keeps the
+  blocks; only what the summarising beat sends changes. `compact_skipped`
+  stays as the mark for a summary that still comes back empty.
 
 ### Security
 

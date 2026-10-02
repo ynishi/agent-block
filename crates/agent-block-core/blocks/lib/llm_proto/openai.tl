@@ -632,8 +632,14 @@ end
 ---     older vLLM) or `reasoning` (current vLLM), surfaced as a `thinking`
 ---     content block
 ---
+--- `finish_reason` is carried as the server sent it, beside the mapped
+--- `stop_reason`: the map folds `"stop"` and an absent reason into the same
+--- `end_turn`, and a compatibility layer that answers an empty turn with one
+--- of those leaves no other trace of which it was. Absent when the server
+--- sent no string.
+---
 --- @param raw table  Parsed response JSON
---- @return table|nil decoded { content, stop_reason, usage, context_management }
+--- @return table|nil decoded { content, stop_reason, finish_reason?, usage, context_management }
 --- @return string|nil err
 function M.parse(raw: {string:any}): proto.Decoded, string
     local choices = raw and raw.choices as {{string:any}}
@@ -760,6 +766,7 @@ function M.parse(raw: {string:any}): proto.Decoded, string
     return {
         content = content,
         stop_reason = stop_reason,
+        finish_reason = type(choice.finish_reason) == "string" and choice.finish_reason as string or nil,
         refusal = message.refusal as string,
         stop_details = message.refusal and { type = "refusal", explanation = message.refusal } or nil,
         usage = {

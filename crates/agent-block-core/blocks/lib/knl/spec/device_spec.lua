@@ -466,6 +466,37 @@ describe("knl.beat — the primitive", function()
         expect(called[3]).to.be("weak") -- the original device is untouched
     end)
 
+    it("records the provider's raw finish_reason on the llm_response, beside stop_reason", function()
+        local function answering(finish)
+            return function(_req)
+                return {
+                    status = "ok",
+                    content = {},
+                    usage = { input_tokens = 1, output_tokens = 0, thinking_tokens = 0 },
+                    stop_reason = "end_turn",
+                    finish_reason = finish,
+                }
+            end
+        end
+        local s = K.open({})
+        s:append({ kind = "msg_user", data = { content = "q" } })
+        expect(Outcome.is_ok(K.beat(s, K.device({ llm = answering("stop") })))).to.be(true)
+        expect(Outcome.is_ok(K.beat(s, K.device({ llm = answering(nil) })))).to.be(true)
+        local responses = {}
+        for _, ev in ipairs(s:events()) do
+            if ev.kind == "llm_response" then
+                responses[#responses + 1] = ev.data
+            end
+        end
+        expect(#responses).to.be(2)
+        expect(responses[1].stop_reason).to.be("end_turn")
+        expect(responses[1].finish_reason).to.be("stop")
+        expect(responses[2].finish_reason).to.be(nil)
+        -- The data shape is closed, so the field has to be declared there.
+        local check = require("lshape").check
+        expect(check.check(responses[1], K.shapes.events.llm_response)).to.be(true)
+    end)
+
     it("one device drives two sessions independently", function()
         local d = K.device({ llm = stub_llm("shared") })
         local a, b = K.open({}), K.open({})
