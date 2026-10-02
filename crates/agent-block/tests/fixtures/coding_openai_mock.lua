@@ -25,6 +25,13 @@
 --                         path-locked to the targets, so a read of any other
 --                         file is refused before a cap sees it)
 --   CODING_CHECKPOINT_TEST  "0": run with `checkpoint = false`
+--   CODING_FORK_EVENTS_TEST  a file of a finished run's events, one JSON
+--                         object a line: the run is `coding.fork` from them
+--                         instead of `coding.run`, into CODING_REPO_TEST (a
+--                         fresh directory), at the beat CODING_FORK_BEAT_TEST
+--                         names ("first" for the first one that recorded a
+--                         state), with CODING_FORK_PARENT_TEST as the parent's
+--                         session id
 --   CODING_RESTORE_EVENTS_TEST  a file of a finished run's events, one JSON
 --                         object a line (`agent-block knl export --as
 --                         events`): no run and no model — the fixture lists
@@ -133,7 +140,27 @@ if checkpoint_off then
     opts.checkpoint = false
 end
 
-local ok, result = pcall(coding.run, opts)
+local fork_from = std.env.get("CODING_FORK_EVENTS_TEST")
+local ok, result
+if fork_from then
+    local policy = require("policy")
+    local events = {}
+    for line in std.fs.read(fork_from):gmatch("[^\n]+") do
+        events[#events + 1] = std.json.decode(line)
+    end
+    local beat = std.env.get("CODING_FORK_BEAT_TEST") or "first"
+    if beat == "first" then
+        beat = policy.checkpoints(events)[2].beat
+    end
+    -- The task is the parent's seed, copied with its history.
+    opts.spec = nil
+    opts.parent = std.env.get("CODING_FORK_PARENT_TEST")
+    opts.reason = "e2e"
+    print("fork.beat=" .. beat)
+    ok, result = pcall(coding.fork, events, beat, opts)
+else
+    ok, result = pcall(coding.run, opts)
+end
 if not ok then
     print("refused=" .. tostring(result))
     print("CODING_MOCK_REFUSED")

@@ -15,6 +15,12 @@
 ---                                         one state, `files` mapping a path
 ---                                         to its CONTENT: the beat named, or
 ---                                         the latest when none is
+---     policy.lineage(source)           -> { session, upto_seq, beat,
+---                                         reason?, spent? } | nil
+---                                         where the record came from: the
+---                                         `forked_from` a forked run opens
+---                                         with, or nil for a run that was
+---                                         not forked
 ---
 --- Neither appends — the rule every file here keeps. The `checkpoint` and
 --- `checkpoint_blob` events are the LOOP's to append (`coding`'s
@@ -24,7 +30,20 @@
 --- files back is the caller's too (`coding.restore`), because a reader that
 --- wrote to disk would be a loop pretending to be a value.
 ---
---- Readings, not policies: neither plugs into a seam of the device, and the
+--- The third reading is about the record rather than the files, and sits
+--- here because the two travel together: a fork (`coding.fork`) restores the
+--- files off `checkpoint_at` and opens the child's record with a
+--- `forked_from` event (`policy.shapes.forked_from`) naming the parent
+--- session, the `seq` of the last event it copied and the beat that event
+--- closed. `lineage` answers that event's data. A fork of a fork copies its
+--- parent's `forked_from` along with the rest of the parent's history, so the
+--- FIRST one in a log is the log's own and any later one came in with the
+--- copy — the ancestors', nearest first. `lineage` answers the first. The
+--- event is the caller's record, not the kernel's: the kernel lets any
+--- caller append the kind, so it says where the copy came from as far as
+--- the loop that wrote it is trusted, and no further.
+---
+--- Readings, not policies: none of them plugs into a seam of the device, and the
 --- loop does not consult them between beats. They sit beside the fifteen the
 --- way `policy.split` does — for a caller reading a run, during it or after.
 ---
@@ -91,8 +110,22 @@ local record M
     end
     type CheckpointsFn = function(any): {Checkpoint}
     type CheckpointAtFn = function(any, ?string): State
+    --- Where a forked record came from (`policy.shapes.forked_from`).
+    record Lineage ---@struct
+        record Spent ---@struct
+            amount: number
+            tag: string ---@optional
+        end
+        session: string
+        upto_seq: integer
+        beat: string
+        reason: string ---@optional
+        spent: Spent ---@optional
+    end
+    type LineageFn = function(any): Lineage
     checkpoints: CheckpointsFn
     checkpoint_at: CheckpointAtFn
+    lineage: LineageFn
     shapes: {string:lshape.Schema}
     api: {string:shared.ApiEntry}
 end
@@ -259,6 +292,27 @@ function M.checkpoint_at(source: any, beat?: string): M.State
     return { beat = point.beat, files = files, missing = point.missing }
 end
 
+--- Where the record came from: the data of the first `forked_from` event in
+--- the log, or nil when there is none — a run that was not forked.
+---
+---     local from = policy.lineage(child_events)
+---     -- from.session, from.upto_seq, from.beat: the parent, and where it was cut
+---
+--- The first, because a fork of a fork carries its parent's `forked_from`
+--- too, copied with the rest of the history: the first one is this log's
+--- own, and any after it are its ancestors', nearest first.
+---
+--- @param source any  a knl session, or its events in seq order
+--- @return table|nil  { session, upto_seq, beat, reason?, spent? }, or nil
+function M.lineage(source: any): M.Lineage
+    for _, ev in ipairs(events_of(source, "policy.lineage")) do
+        if ev.kind == shared.FORKED_FROM_KIND then
+            return data_of(ev) as M.Lineage
+        end
+    end
+    return nil
+end
+
 --- The two arguments, as the registry declares them. Both are `any` on
 --- purpose: what either may be is judged by the reader itself, loud in both
 --- modes (`events_of`, and `checkpoint_at`'s beat check), and a narrower
@@ -272,6 +326,7 @@ local BEAT_ARG = arg_of(T.any, 'beat — an id, or "baseline"; nil for the lates
 M.shapes = {
     checkpoint = shared.CHECKPOINT,
     checkpoint_blob = shared.CHECKPOINT_BLOB,
+    forked_from = shared.FORKED_FROM,
 }
 
 --- This file's entries in `policy.shapes.api`, gathered there.
@@ -283,6 +338,10 @@ M.api = {
     checkpoint_at = {
         args = { LOG_ARG, BEAT_ARG },
         returns = "nil | { beat, files = { [path] = content }, missing = { path ... } }",
+    },
+    lineage = {
+        args = { LOG_ARG },
+        returns = "nil | { session, upto_seq, beat, reason?, spent? = { amount, tag? } } — the first forked_from",
     },
 }
 

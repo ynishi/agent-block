@@ -97,6 +97,10 @@
 ---   content once). The loop appends both; `policy.checkpoints` and
 ---   `policy.checkpoint_at` read them back — two readings beside the fifteen,
 ---   like `split`, that plug into no seam and that the loop does not consult.
+---   The last is `forked_from` (`policy.shapes.forked_from`): a forked run
+---   (`coding.fork`) opens its record with it, naming the parent session and
+---   where it was cut, and `policy.lineage` reads it back — a third reading
+---   of the same kind.
 ---
 --- Where each one lives
 ---   `policy` is one module in eight files, and this one is the door: it
@@ -118,9 +122,10 @@
 ---                         loop asks between beats
 ---     policy/compact.lua  compact, ledger — when the window is nearly full,
 ---                         and the facts a summary must not lose
----     policy/checkpoint.lua  checkpoints, checkpoint_at — the state of the
----                         files, read back off the `checkpoint` record the
----                         loop appends; readings, not policies
+---     policy/checkpoint.lua  checkpoints, checkpoint_at, lineage — the state
+---                         of the files, read back off the `checkpoint`
+---                         record the loop appends, and where a forked record
+---                         came from; readings, not policies
 ---     policy/shared.lua   the defaults, the log readers, the contract
 ---                         prelude and the shapes more than one file hands
 ---                         out; not a policy, not exported
@@ -233,7 +238,7 @@
 ---                 last summary. Its fold reads what every fold reads
 ---     ledger      reads the log — `session:events()`, per call, the whole
 ---                 of it: counts and names, never kept between calls
----     checkpoints / checkpoint_at  read the log — `session:events()`, the
+---     checkpoints / checkpoint_at / lineage  read the log — `session:events()`, the
 ---                 whole of it, or the events a caller hands in (a finished
 ---                 run's export); nothing kept between calls
 ---
@@ -364,6 +369,7 @@ local record Shapes
     compact_skipped: lshape.Schema
     checkpoint: lshape.Schema
     checkpoint_blob: lshape.Schema
+    forked_from: lshape.Schema
     beat_record: lshape.Schema
     tool_pair: lshape.Schema
     stop_reason: lshape.Schema
@@ -391,6 +397,7 @@ local record M
     ledger: compact.LedgerFactory
     checkpoints: checkpoint.CheckpointsFn
     checkpoint_at: checkpoint.CheckpointAtFn
+    lineage: checkpoint.LineageFn
     shapes: Shapes
 end
 
@@ -428,6 +435,9 @@ M.ledger = compact.ledger
 -- beside the fifteen, not policies.
 M.checkpoints = checkpoint.checkpoints
 M.checkpoint_at = checkpoint.checkpoint_at
+-- Where a forked record came from, off the `forked_from` the fork appends —
+-- a reading beside them, not a policy.
+M.lineage = checkpoint.lineage
 
 -- ============================================================
 -- shapes — the public contracts of this module
@@ -458,6 +468,7 @@ M.shapes = {
     compact_skipped = shared.COMPACT_SKIPPED,
     checkpoint = checkpoint.shapes.checkpoint,
     checkpoint_blob = checkpoint.shapes.checkpoint_blob,
+    forked_from = checkpoint.shapes.forked_from,
     beat_record = shared.BEAT_RECORD,
     tool_pair = shared.TOOL_PAIR,
     stop_reason = shared.STOP_REASON,

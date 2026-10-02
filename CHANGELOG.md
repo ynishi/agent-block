@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `coding.fork(log, beat, opts)`: a new run that continues an earlier one
+  from the end of `beat` under new conditions — another model, another room,
+  other knobs — so two of them can be compared from the same middle of a run
+  instead of from the start. The child opens its own session, appends a
+  `forked_from` event (`policy.shapes.forked_from`: the parent session, the
+  `seq` of the last event copied, the beat, the caller's `reason`, and the
+  parent's spend up to there as a reference value), copies the parent's
+  record up to the beat's last event — every event but the six only the
+  kernel writes — puts the files back as the latest state recorded at or
+  before the cut under `opts.repo`, a fresh directory, and runs the loop on
+  from there. Copied, not referenced: the record's only links between events
+  are `call_id` and `meta.beat`, so nothing needs re-pointing and the child
+  reads alone. The budget is the child's own grant. Refused before any
+  session opens: a beat the log does not carry, `"baseline"`, a `repo` a run
+  in the history recorded, a `spec` (the task is the copied seed), an export
+  with no `parent` id, and a parent run with `checkpoint = false`. What a
+  shell command did outside the targets is not restored.
+  `policy.lineage(log)` reads the `forked_from` back. `coding.run` itself is
+  unchanged; the loop gained an internal entry that starts from a history.
 - `coding.run` records the state of the files, on by default (`checkpoint =
   true`, an Exec knob `strict` requires and `config` names). The log held
   every tool call and what it answered but not what the files were, so what
@@ -46,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word. `stop_reason` and its vocabulary are unchanged.
 
 ### Changed
+
+- `coding.restore(log, beat, repo)` re-roots from the repo the LAST `config`
+  event names rather than the first. A run's own log has one, so nothing
+  changes for it; a forked run's log holds the parent's, copied, and then
+  its own, and the run the log belongs to is the one that wrote the last.
 
 ### Deprecated
 

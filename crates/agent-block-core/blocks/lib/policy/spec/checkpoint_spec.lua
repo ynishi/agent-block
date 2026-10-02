@@ -24,7 +24,10 @@
 --   5 a truncated read is refused like every reader's, and the events of a
 --     log (an export) are taken in place of a session;
 --   6 the shapes the loop appends are published and closed, and neither
---     reader appends.
+--     reader appends;
+--   7 lineage: the first `forked_from` in a log (its own, ahead of the ones
+--     a fork of a fork copies in), nil for a log with none, from a session or
+--     its events, and the shape closed.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -179,5 +182,35 @@ describe("policy.shapes — what the loop appends", function()
         expect(check.check({ files = {}, beat = "b1" }, cp)).to.be(false)
         expect(check.check({ version = "v", content = "" }, b)).to.be(true)
         expect(check.check({ version = "v" }, b)).to.be(false)
+    end)
+end)
+
+describe("policy.lineage — where a forked record came from", function()
+    local own = { session = "s-child", upto_seq = 12, beat = "b2", reason = "another model" }
+    local copied = { session = "s-root", upto_seq = 7, beat = "b1" }
+
+    it("answers the first forked_from: the log's own, not the ones copied in after it", function()
+        local s = support.session()
+        s:append({ kind = "forked_from", data = own })
+        s:append({ kind = "forked_from", data = copied })
+        s:append({ kind = "msg_user", data = { content = "the copied seed" } })
+        expect(policy.lineage(s)).to.equal(own)
+        expect(policy.lineage(s:events())).to.equal(own)
+        expect(#s:events()).to.be(3)
+    end)
+
+    it("answers nil for a log that was not forked", function()
+        expect(policy.lineage(support.seed(support.session(), "a task"))).to.be(nil)
+        expect(policy.lineage({})).to.be(nil)
+    end)
+
+    it("publishes the shape closed, with the parent's spend optional", function()
+        local f = policy.shapes.forked_from
+        expect(check.check(own, f)).to.be(true)
+        expect(check.check({ session = "s", upto_seq = 3, beat = "b", spent = { amount = 2, tag = "beats" } }, f)).to.be(
+            true
+        )
+        expect(check.check({ session = "s", beat = "b" }, f)).to.be(false)
+        expect(check.check({ session = "s", upto_seq = 3, beat = "b", parent_budget = 9 }, f)).to.be(false)
     end)
 end)
