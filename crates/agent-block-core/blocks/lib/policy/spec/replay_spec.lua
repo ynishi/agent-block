@@ -49,6 +49,18 @@
 --     window), replace the text with filler of the length it rendered to, so
 --     the count comes out as it did. Say in the file's header what was
 --     exported and what, if anything, was reconstructed;
+--     a run with `coding`'s `checkpoint` on (the default) also recorded the
+--     files: a `checkpoint` per state (`files` mapping each path to its
+--     version, `missing` naming what could not be read) and a
+--     `checkpoint_blob` per distinct content. Keep them where the decision
+--     depends on what a file held, rewrite their paths to /repo like the
+--     rest, and cut a blob's `content` as you would any text — the reader
+--     looks a content up by its recorded `version` and does not hash it
+--     again, so a stand-in reads back in its place. The case then takes
+--     the files with `policy.checkpoint_at(fixture.events, beat)` instead
+--     of rebuilding them by hand. Only a target's content is recorded:
+--     a read of any other file is still answered from its `tool_result`,
+--     or reconstructed and said so (as `parallel_read`'s gamma is);
 --   3 add a `describe` here that loads the prefix with `load_prefix`, asks
 --     the policy built with the run's numbers (its `config` event has the
 --     room), and asserts what the run decided — the recorded values where
