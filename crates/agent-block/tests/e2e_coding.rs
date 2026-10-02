@@ -1161,3 +1161,100 @@ async fn coding_fork_refuses_the_parents_repo_under_any_alias_and_takes_a_siblin
     );
     refused_with(&fork(base.clone()).await, "contains");
 }
+
+/// A symlink planted in an otherwise empty child repo — one to a directory
+/// of the parent's repo, one to a parent's file — is refused before the
+/// restore writes anything through it, and before it writes any other file.
+///
+/// The parent's targets are `lib.lua` and `src/x.lua`, so its recorded
+/// state has a file at the repo's root and one in a directory. The child
+/// with `src -> <parent>/src` is refused on `src/x.lua`; `lib.lua`, which
+/// sorts first and lies in the child itself, is not written either — the
+/// check covers every file before any is written. The child with `lib.lua ->
+/// <parent>/lib.lua` is refused on that file. The parent's files are as the
+/// parent left them.
+#[cfg(unix)]
+#[tokio::test]
+async fn coding_fork_refuses_a_symlink_in_the_child_repo_that_leads_out_and_writes_nothing() {
+    let base_dir = tempdir().expect("tempdir for the layout");
+    let base = base_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize the layout");
+    let parent_repo = base.join("repo");
+    std::fs::create_dir_all(parent_repo.join("src")).expect("make the parent's repo");
+    let target = parent_repo.join("lib.lua");
+    std::fs::write(&target, LIB_BEFORE).expect("write the parent's file");
+    let nested = parent_repo.join("src").join("x.lua");
+    std::fs::write(&nested, "return 1\n").expect("write the parent's nested file");
+    let target = target.to_string_lossy().into_owned();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let extra = ("CODING_EXTRA_TARGETS_TEST", "src/x.lua");
+
+    let parent = run_fixture(
+        vec![edit_turn(&target), answer_turn("Done.")],
+        &parent_repo.to_string_lossy(),
+        &[("AGENT_BLOCK_KNL_PATH", &knl_env), extra],
+    )
+    .await;
+    says(&parent.stdout, "ok=true");
+    let parent_session = marker(&parent.stdout, "session").to_string();
+    let events_file = store.path().join("parent.jsonl");
+    std::fs::write(&events_file, export_events(&knl, &parent_session)).expect("write the export");
+    let events = events_file.to_string_lossy().into_owned();
+    let parent_lib = std::fs::read_to_string(&target).expect("read the parent's file");
+    let parent_nested = std::fs::read_to_string(&nested).expect("read the parent's nested file");
+    let fork = |repo: std::path::PathBuf| {
+        let (knl, events, parent) = (knl_env.clone(), events.clone(), parent_session.clone());
+        async move {
+            run_fixture(
+                vec![answer_turn("Done, from the fork.")],
+                &repo.to_string_lossy(),
+                &[
+                    ("AGENT_BLOCK_KNL_PATH", &knl),
+                    ("CODING_FORK_EVENTS_TEST", &events),
+                    ("CODING_FORK_PARENT_TEST", &parent),
+                    extra,
+                ],
+            )
+            .await
+            .stdout
+        }
+    };
+
+    // A directory symlink to the parent's `src`.
+    let by_dir = base.join("by-dir");
+    std::fs::create_dir(&by_dir).expect("make the child's repo");
+    std::os::unix::fs::symlink(parent_repo.join("src"), by_dir.join("src"))
+        .expect("symlink to the parent's directory");
+    let out = fork(by_dir.clone()).await;
+    refused_with(&out, "src/x.lua would be written into");
+    refused_with(&out, "nothing was restored");
+    assert!(
+        !by_dir.join("lib.lua").exists(),
+        "no file written before the refusal, not even the one inside the child"
+    );
+
+    // A file symlink to the parent's `lib.lua`.
+    let by_file = base.join("by-file");
+    std::fs::create_dir(&by_file).expect("make the child's repo");
+    std::os::unix::fs::symlink(&target, by_file.join("lib.lua"))
+        .expect("symlink to the parent's file");
+    let out = fork(by_file.clone()).await;
+    refused_with(&out, "lib.lua leads to");
+    assert!(
+        !by_file.join("src").join("x.lua").exists(),
+        "no file written before the refusal"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the parent's file"),
+        parent_lib
+    );
+    assert_eq!(
+        std::fs::read_to_string(&nested).expect("the parent's nested file"),
+        parent_nested
+    );
+}

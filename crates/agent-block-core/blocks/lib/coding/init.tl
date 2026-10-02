@@ -287,8 +287,8 @@
 --     state was recorded under to `repo`. A log with no state at all (a
 --     parent run with `checkpoint = false`) is refused: a fork whose files
 --     are whatever happens to be on disk is not the run it claims to
---     continue. The directories the targets sit in must exist, as for
---     `restore`.
+--     continue. The directories the targets sit in are made, for the
+--     check below.
 --   - The files go into a fresh directory, and never into a repo a run in
 --     the copied history recorded as its own, under any name it can be
 --     handed by. In this order, after every other check:
@@ -305,18 +305,25 @@
 --          is refused (`/a/repo2` is neither inside nor around `/a/repo`);
 --       5. the resolved path is the child's repo from then on: the files
 --          are restored under it, the tools are locked to it, and the
---          child's `config` records it.
+--          child's `config` records it;
+--       6. before any file is written, every file the restore will write is
+--          checked: its directory is made and resolved and must be the repo
+--          or lie inside it, and a file already at the path must resolve
+--          inside it — so a symlink planted in the empty `repo`, to a
+--          directory or to a file, is refused, and a refusal leaves no
+--          partial restore.
 --     Caught so: a symlink to the parent's repo or to a directory in it,
 --     `a/../a`, a trailing slash, a new directory inside the parent's repo,
---     one around it, and any directory already holding files. Not caught:
+--     one around it, any directory already holding files, and a symlink
+--     inside the `repo` that leads out of it. Not caught:
 --     a bind mount of the parent's repo, and a Linux casefold directory
 --     named in another case — both canonicalize to a different string, and
 --     only comparing the files' identity (device and inode) would see them;
---     no caller has needed that yet. Nor a symlink planted inside an
---     otherwise empty `repo`: `std.fs.walk` lists files, not links, and a
---     restore writes through one. The check makes the directory: a
---     refusal at step 4 (or `coding.run`'s own refusal of the opts, which
---     comes after) leaves it there, empty. It is not removed: the host's
+--     no caller has needed that yet. Nor a dangling symlink at a target's
+--     own path: nothing is there to resolve, and `std.fs` has no call that
+--     reads a link, so a write follows it. The check makes directories: a
+--     refusal at step 4 or 6 (or `coding.run`'s own refusal of the opts,
+--     which comes after) leaves them there, holding no file. It is not removed: the host's
 --     `std.fs.remove` falls back to a recursive delete on a directory, and
 --     a recursive delete inside what was just found to be a parent's repo
 --     is the worse mistake. Nor is the gap between the check and the writes
@@ -2886,6 +2893,50 @@ local function resolved(p: string): string
     return got as string
 end
 
+--- Check every file a fork's restore will write, before it writes any: each
+--- file's directory is made (`std.fs.mkdir`) and resolved, and must be the
+--- resolved `repo` or lie inside it; a file already at the path must resolve
+--- inside it too. So a symlink planted in an empty `repo` — to a directory
+--- or to a file — is refused before anything is written through it, and a
+--- refusal leaves no partial restore. `files` is the recorded state's,
+--- its paths under `from`, the repo they were recorded under. Raises from the
+--- caller's caller.
+local function check_writes(repo: string, from: string, files: {string:string})
+    local prefix = from .. "/"
+    local paths: {string} = {}
+    for path in pairs(files) do
+        paths[#paths + 1] = path
+    end
+    table.sort(paths)
+    for _, path in ipairs(paths) do
+        if path:sub(1, #prefix) ~= prefix then
+            error("coding.fork: " .. path .. " is not under the run's repo " .. from .. ", so it has no place under " .. repo, 3)
+        end
+        local target = repo .. "/" .. path:sub(#prefix + 1)
+        local dir = target:match("^(.*)/[^/]*$") as string
+        std.fs.mkdir(dir)
+        local there = resolved(dir)
+        local how = overlap(there, repo)
+        if how ~= "same" and how ~= "inside" then
+            error(
+                "coding.fork: " .. target .. " would be written into " .. there .. ", outside the repo " .. repo
+                    .. " (a symlink in it leads out); nothing was restored",
+                3
+            )
+        end
+        if std.fs.exists(target) then
+            local real = resolved(target)
+            if overlap(real, repo) ~= "inside" then
+                error(
+                    "coding.fork: " .. target .. " leads to " .. real .. ", outside the repo " .. repo
+                        .. " (a symlink in it); nothing was restored",
+                    3
+                )
+            end
+        end
+    end
+end
+
 --- The directory a fork restores into, made and resolved: what the child's
 --- run takes as its repo from here on. Raises (from the caller's caller)
 --- when `repo` already holds a file, or when, resolved, it is, lies inside
@@ -3023,9 +3074,10 @@ end
 ---
 --- Refused, by name and before any session opens: a beat no event in the log
 --- carries, `"baseline"` (not a beat), a `repo` missing, one that already
---- holds a file, or one that, resolved, is, lies inside or contains a repo
---- the copied history recorded as a run's (the directory is made for that
---- check — see the header), a `spec` (the task is the copied seed),
+--- holds a file, one that, resolved, is, lies inside or contains a repo
+--- the copied history recorded as a run's, and one in which a file to be
+--- restored would be written outside it through a symlink (the directories
+--- are made for those checks — see the header), a `spec` (the task is the copied seed),
 --- an array of events with no `parent` to say whose they are, and a log that
 --- records no state of the files at or before the cut — a parent run with
 --- `checkpoint = false`. The rest of `opts` is refused as `coding.run`
@@ -3117,7 +3169,10 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
     local state_beat = type(state_meta) == "table" and (state_meta as {string:any}).beat as string or "baseline"
     -- Resolved here, before a session opens, so a log missing a blob is
     -- refused now and not halfway through the copy.
-    policy.checkpoint_at(upto_state, state_beat)
+    local state = policy.checkpoint_at(upto_state, state_beat)
+    if state == nil then
+        error("coding.fork: the log records no state of the files after beat " .. state_beat, 2)
+    end
     if recorded_repo(upto_state) == nil then
         error("coding.fork: the log carries no `config` event naming the run's repo, so its paths cannot be re-rooted", 2)
     end
@@ -3154,6 +3209,7 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
     -- because it is the one that makes a directory; from here on the child's
     -- repo is the path it resolved to, so the run's `config` records that.
     repo = fork_repo(repo, events, cut)
+    check_writes(repo, recorded_repo(upto_state), state.files)
 
     local run_opts: {string:any} = {}
     for k, v in pairs(opts) do

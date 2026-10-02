@@ -36,14 +36,16 @@
 --   7 the refusals, by name and before a session opens: a beat not in the
 --     log, "baseline", the parent's repo (as written, with a trailing slash,
 --     through `..`, and emptied so the comparison is what catches it), a
---     directory inside it, a directory that already holds a file, a `spec`,
+--     directory inside it, a directory that already holds a file, an empty
+--     repo holding a symlink to the parent's file (nothing written), a `spec`,
 --     an array with no `parent`, a `parent` that is not the session handed
 --     in, and a parent run that recorded no state of the files;
 --   8 what is taken: a sibling whose name starts with the parent's
 --     (`/parent2`), and a nested directory not there yet.
 --
--- The fake disk has no links, so `std.path.absolute` here only folds `.` and
--- `..`: symlinks, and a directory around the parent's, are proved against the
+-- The fake disk folds `.` and `..` and follows the links a case plants, which
+-- is enough for a file symlink inside the child's repo; symlinks to
+-- directories, and a directory around the parent's, are proved against the
 -- real file system in crates/agent-block/tests/e2e_coding.rs.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
@@ -78,8 +80,31 @@ local function under(dir, path)
     return path:sub(1, #dir + 1) == dir .. "/"
 end
 
-local function exists(p)
+-- Symlinks: `links[from] = to`. Only `exists` and `std.path.absolute`
+-- follow them, which is all the fork's check reads; `walk` lists files, not
+-- links, as the host's does.
+local links = {}
+
+local function real(p)
     p = folded(p)
+    for _ = 1, 8 do
+        local hit = false
+        for from, to in pairs(links) do
+            if p == from or under(from, p) then
+                p = folded(to .. p:sub(#from + 1))
+                hit = true
+                break
+            end
+        end
+        if not hit then
+            break
+        end
+    end
+    return p
+end
+
+local function exists(p)
+    p = real(p)
     if dirs[p] or files[p] ~= nil then
         return true
     end
@@ -168,7 +193,7 @@ _G.std = {
             if not exists(p) then
                 error("not found: " .. p)
             end
-            return folded(p)
+            return real(p)
         end,
     },
 }
@@ -517,6 +542,17 @@ describe("coding.fork — what it refuses, before a session opens", function()
             refused(parent_events, b2, { repo = "/parent/sub/" }),
             "repo /parent/sub lies inside /parent, the repo a run in this history edited"
         )
+    end)
+
+    it("an empty repo holding a symlink to the parent's file: refused, nothing written", function()
+        dirs["/linked"] = true
+        links["/linked/a.lua"] = "/parent/a.lua"
+        local kept = files["/parent/a.lua"]
+        local err = refused(parent_events, b2, { repo = "/linked" })
+        links["/linked/a.lua"] = nil
+        says(err, "coding.fork: /linked/a.lua leads to /parent/a.lua, outside the repo /linked")
+        expect(files["/parent/a.lua"]).to.be(kept)
+        expect(files["/linked/a.lua"]).to.be(nil)
     end)
 
     it("a directory that already holds a file, whoever's it is", function()

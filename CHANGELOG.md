@@ -104,10 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time against each recorded repo, resolved the same way while it still
   exists: the same place, inside, or around it is refused (`/a/repo2` is not
   inside `/a/repo`). The child's repo is the resolved path from then on,
-  and its `config` records that. A refusal at the comparison leaves the
-  made directory behind, empty. Not caught: a bind mount, a Linux casefold
-  directory named in another case, and a symlink planted inside an empty
-  `repo`. `host_types.d.tl` declares `std.fs.exists` / `is_dir` / `mkdir` /
+  and its `config` records that. Before any file is written, every file the
+  restore will write is checked: its directory is made, resolved, and must
+  be the repo or inside it, and a file already at the path must resolve
+  inside it, so a symlink planted in the empty `repo` (to a directory or a
+  file) is refused and a refusal leaves no partial restore. A refusal
+  leaves the made directories behind, holding no file. Not caught: a bind
+  mount, a Linux casefold directory named in another case, and a dangling
+  symlink at a target's own path. `host_types.d.tl` declares `std.fs.exists` / `is_dir` / `mkdir` /
   `walk` and `std.path.absolute`.
 - The summarising request `policy.compact` builds sends the run's tool
   history as prose. It used to carry the `tool_use` / `tool_result` blocks
