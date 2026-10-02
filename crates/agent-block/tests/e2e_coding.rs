@@ -836,3 +836,157 @@ async fn coding_run_records_no_checkpoint_when_turned_off() {
     assert_eq!(kinds_in(&events, "checkpoint"), 0);
     assert_eq!(kinds_in(&events, "checkpoint_blob"), 0);
 }
+
+/// One `search_replace` from `search` to `replace` in `target`.
+fn replace_turn(id: &str, target: &str, search: &str, replace: &str) -> Value {
+    tool_call(
+        id,
+        "fs_search_replace",
+        json!({ "path": target, "edits": [{ "search": search, "replace": replace }] }),
+    )
+}
+
+/// The events of an export, decoded, in order.
+fn decoded(events: &str) -> Vec<Value> {
+    events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("an export line is JSON"))
+        .collect()
+}
+
+/// `coding.fork` from a finished run's export: the child copies the parent's
+/// record up to the end of its first beat, finds the file as that beat left
+/// it under a fresh directory, and goes on under a different script.
+///
+/// The parent takes a wrong step first (`n + 1`, red), corrects it (`n * 2`,
+/// green) and declares — three beats. The fork is at the first: the child's
+/// file reads `n + 1`, its model corrects it its own way and declares. The
+/// child's record opens with `forked_from` naming the parent and that beat,
+/// carries the parent's first edit and none of its second, and names the
+/// child's directory in its last `config`; the parent's file is untouched.
+#[tokio::test]
+async fn coding_fork_continues_a_finished_run_from_its_first_beat_under_another_script() {
+    let (dir, target) = make_repo();
+    let store = tempdir().expect("tempdir for the store");
+    let knl = store.path().join("knl.sqlite");
+    let knl_env = knl.to_string_lossy().into_owned();
+    let parent_script = vec![
+        replace_turn("call_p1", &target, "    return nil", "    return n + 1"),
+        replace_turn("call_p2", &target, "    return n + 1", "    return n * 2"),
+        answer_turn("Done."),
+    ];
+    let parent = run_fixture(
+        parent_script,
+        &dir.path().to_string_lossy(),
+        &[("AGENT_BLOCK_KNL_PATH", &knl_env)],
+    )
+    .await;
+    says(&parent.stdout, "ok=true");
+    says(&parent.stdout, "iters=3");
+    let parent_session = marker(&parent.stdout, "session").to_string();
+    let parent_after = std::fs::read_to_string(&target).expect("read the parent's file");
+
+    let events = export_events(&knl, &parent_session);
+    let events_file = store.path().join("parent.jsonl");
+    std::fs::write(&events_file, &events).expect("write the export");
+
+    // The child's directory is fresh: the fork writes the file into it.
+    let child_dir = tempdir().expect("tempdir for the child's repo");
+    let child_target = child_dir.path().join("lib.lua");
+    let child_target = child_target.to_string_lossy().into_owned();
+    let child_script = vec![
+        replace_turn(
+            "call_c1",
+            &child_target,
+            "    return n + 1",
+            "    return n * 2 -- forked",
+        ),
+        answer_turn("Done, from the fork."),
+    ];
+    let events_env = events_file.to_string_lossy().into_owned();
+    let child = run_fixture(
+        child_script,
+        &child_dir.path().to_string_lossy(),
+        &[
+            ("AGENT_BLOCK_KNL_PATH", &knl_env),
+            ("CODING_FORK_EVENTS_TEST", &events_env),
+            ("CODING_FORK_PARENT_TEST", &parent_session),
+        ],
+    )
+    .await;
+
+    says(&child.stdout, "CODING_MOCK_DONE");
+    says(&child.stdout, "ok=true");
+    says(&child.stdout, "iters=2");
+    assert_eq!(child.calls, 2, "the child's edit, then its answer");
+    let beat = marker(&child.stdout, "fork.beat").to_string();
+    // The first request the child sent carries the parent's first edit and
+    // the note in the seed's place, and not the parent's second edit.
+    let first = child.bodies[0].to_string();
+    assert!(
+        first.contains("return n + 1"),
+        "the copied edit is in the request:\n{first}"
+    );
+    assert!(
+        first.contains("This run continues another"),
+        "the fork's note is in the request:\n{first}"
+    );
+    assert!(
+        !first.contains("call_p2"),
+        "the parent's second beat was not copied:\n{first}"
+    );
+
+    let child_file = std::fs::read_to_string(&child_target).expect("read the child's file");
+    assert!(
+        child_file.contains("return n * 2 -- forked"),
+        "the child's own edit, over beat 1's file:\n{child_file}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read the parent's file again"),
+        parent_after,
+        "the fork does not touch the parent's file"
+    );
+
+    let record = decoded(&export_events(&knl, marker(&child.stdout, "session")));
+    let opened = record
+        .iter()
+        .find(|ev| {
+            !matches!(
+                ev["kind"].as_str(),
+                Some("session_opened" | "budget_granted")
+            )
+        })
+        .expect("the child's record has a caller event");
+    assert_eq!(
+        opened["kind"], "forked_from",
+        "the record opens with its lineage"
+    );
+    assert_eq!(opened["data"]["session"], parent_session.as_str());
+    assert_eq!(opened["data"]["beat"], beat.as_str());
+    assert_eq!(opened["data"]["reason"], "e2e");
+    let calls: Vec<&str> = record
+        .iter()
+        .filter(|ev| ev["kind"] == "tool_call")
+        .filter_map(|ev| ev["data"]["call_id"].as_str())
+        .collect();
+    assert_eq!(
+        calls,
+        ["call_p1", "call_c1"],
+        "the parent's first edit, then the child's"
+    );
+    let repos: Vec<&str> = record
+        .iter()
+        .filter(|ev| ev["kind"] == "config")
+        .filter_map(|ev| ev["data"]["values"]["repo"]["value"].as_str())
+        .collect();
+    assert_eq!(
+        repos.len(),
+        2,
+        "the parent's config, copied, then the child's"
+    );
+    assert_eq!(
+        *repos.last().expect("a config"),
+        child_dir.path().to_string_lossy(),
+        "the last config names the child's repo"
+    );
+}

@@ -90,6 +90,7 @@ local record S
     CHECKPOINT_KIND: string
     CHECKPOINT_BLOB_KIND: string
     CHECKPOINT_BASELINE: string
+    FORKED_FROM_KIND: string
     SUMMARY_PREFIX: string
     DEFAULT_SAME: integer
     DEFAULT_NO_PROGRESS: integer
@@ -115,6 +116,7 @@ local record S
     COMPACT_SKIPPED: lshape.Schema
     CHECKPOINT: lshape.Schema
     CHECKPOINT_BLOB: lshape.Schema
+    FORKED_FROM: lshape.Schema
     EVENTS_ARG: ApiArg
     SESSION_ARG: ApiArg
     OUTCOME_ARG: ApiArg
@@ -255,6 +257,10 @@ S.CHECKPOINT_BLOB_KIND = "checkpoint_blob"
 --- would be a beat that never ran, an idle one to `stagnation`'s
 --- `no_progress`.
 S.CHECKPOINT_BASELINE = "baseline"
+
+--- The kind a forked run opens its record with, and `policy.lineage` reads:
+--- which session it was copied from, and up to where.
+S.FORKED_FROM_KIND = "forked_from"
 
 --- What the rendered summary opens with, so the model reads it as the
 --- record's compaction rather than as a message somebody sent. The last
@@ -719,6 +725,27 @@ S.CHECKPOINT = T.shape({
 S.CHECKPOINT_BLOB = T.shape({
     version = T.string:describe("the fingerprint a checkpoint's `files` names this content by"),
     content = T.string:describe("the file's content, whole"),
+}, { open = false })
+
+--- What a forked run appends under `forked_from` (`policy.shapes.forked_from`),
+--- before anything else: the session whose record it copied, the `seq` of the
+--- last event it copied in that record, and the beat that event closed.
+--- `reason` is the caller's word for why. `spent` is what the parent's ledger
+--- had taken up to that point — a reference value for a reader comparing the
+--- two runs, and nothing more: the child's own grant is fresh, and no reader
+--- here holds it to the parent's. Absent when the copied log carried no
+--- ledger (an array of events a caller assembled by hand).
+S.FORKED_FROM = T.shape({
+    session = T.string:describe("the id of the session whose record was copied"),
+    upto_seq = T.integer:describe("the parent's seq of the last event copied — the end of the beat forked at"),
+    beat = T.string:describe("the beat forked at: everything up to its last event was copied, nothing after"),
+    reason = T.string:describe("the caller's word for why the run was forked"):is_optional(),
+    spent = T.shape({
+        amount = T.number:describe("what the parent's ledger had reserved and spent by the cut, summed"),
+        tag = T.string:describe("the tag the parent's grant was in"):is_optional(),
+    }, { open = false })
+    :describe("the parent's spend up to the cut, as a reference; never enforced on the child")
+    :is_optional(),
 }, { open = false })
 
 -- ============================================================

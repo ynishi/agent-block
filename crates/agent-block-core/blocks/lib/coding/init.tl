@@ -47,6 +47,11 @@
 -- `beat` (or before the first beat, `"baseline"`), read off the run's record:
 -- see "The state of the files" below.
 --
+-- coding.fork(log, beat, opts) starts a NEW run that continues an earlier one
+-- from the end of `beat`, under new conditions (another model, another room,
+-- other knobs), with the files put back as they were then in a fresh
+-- directory: see "Forking a run" below.
+--
 -- The verify runs once BEFORE the first beat (unless `baseline = false`), so
 -- the record has the run's starting point, a table `timeout` takes its first
 -- measurement from it, a green on unmodified code is read as the fact it is,
@@ -230,6 +235,85 @@
 --   repo the run recorded in its `config` event, so a recorded state can be
 --   laid into a fresh copy of the repository rather than over the one the
 --   run edited.
+--
+-- Forking a run
+--   `coding.fork(log, beat, opts)` opens a new session, copies the earlier
+--   run's record into it up to the end of `beat`, puts the files back as they
+--   were then, and runs the loop on from there under `opts` — the same
+--   middle of a run, continued by another model or under other knobs, which
+--   is what comparing two of them from one point needs. `log` is the parent's
+--   session or its events (a finished run's export, as for `restore`);
+--   `opts` are `coding.run`'s, less `spec`, with `repo` required, plus
+--   `parent` (the parent's session id, required when `log` is an array —
+--   an export does not name its own session) and `reason` (a word for the
+--   record). It answers what `coding.run` answers, for the child.
+--
+--   What the child's record is, in order:
+--     forked_from   `{ session, upto_seq, beat, reason?, spent? }`
+--                   (`policy.shapes.forked_from`; `policy.lineage` reads it)
+--     the copy      every event of the parent's record up to and including
+--                   the LAST event carrying `meta.beat == beat` — the events
+--                   between beats too — in order, each as `{ kind, meta,
+--                   data }`, except the six kinds only the kernel writes
+--                   (its boundaries and its ledger), which it refuses from a
+--                   caller and the child's session writes for itself
+--     verify        the verify, once, on the files as they were put back
+--     msg_user      a harness note under `label = "fork"`: where the record
+--                   above was cut, that the files sit under a new directory,
+--                   and what the verify just said — in the seed's place, so
+--                   the request the model reads ends with what is true now
+--     config        the child's own; `restore` reads the LAST `config`, so a
+--                   forked log answers the child's repo
+--     checkpoint    the files as put back, under `meta.beat = beat`
+--   — and then the loop's beats, exactly as in `coding.run`.
+--
+--   Decided, and why:
+--   - Copied, not referenced. The record's only links between events are
+--     `call_id` (a tool call to its result) and `meta.beat`, both carried in
+--     the event itself, so a copy has nothing to re-point, and the child
+--     reads alone: every reader here works on it unchanged, and the parent
+--     is never read again. Its cost is the log: the prefix is stored once
+--     per fork. `seq` and `epoch_ms` are the child's own — the kernel stamps
+--     both — so the gaps between copied events measure the copy, not the
+--     parent's run; the child's own verify before its first beat is what a
+--     `timeout` curve reads first.
+--   - The cut is the end of a beat, nothing finer: a beat is the unit the
+--     record is written in, and a state of the files is recorded only at its
+--     end. `"baseline"` is not a beat; the start of a run is a new
+--     `coding.run` over `restore(log, "baseline", repo)`.
+--   - The files are the latest state recorded at or before the cut — after
+--     `beat` when it landed an edit, else the one before it, which a beat
+--     that edited nothing left as it was — re-rooted from the repo that
+--     state was recorded under to `repo`. A log with no state at all (a
+--     parent run with `checkpoint = false`) is refused: a fork whose files
+--     are whatever happens to be on disk is not the run it claims to
+--     continue. So is a `repo` any run in the copied history recorded as
+--     its own, compared as written: the parent's files are not touched. The
+--     directories the targets sit in must exist, as for `restore`, and a
+--     file already at a restored path is overwritten.
+--   - The budget is the child's own grant, from its own `iters` and `turns`,
+--     as `coding.run` would open it. What the parent's ledger had taken by
+--     the cut goes into `forked_from.spent` as a reference value for a
+--     reader comparing the runs; nothing holds the child to it.
+--   - The edits the history landed count: `edits_applied` starts at the
+--     number of copied beats that recorded a state after an edit, so a green
+--     verify on the restored files is a green on edited files, and a child
+--     that declares at once on one converges. The iteration count, the
+--     no-edit streak and the plan start fresh. The policies that read the
+--     log (`stagnation`, `repeat_cap`, `compact`, `carry`) read the copied
+--     part like any other, because it is the run's history.
+--   - The copy keeps the parent's paths in every message and tool call;
+--     the child's tools are locked to the targets under `repo`, and the note
+--     says which directory became which. Nothing is rewritten.
+--   - The lineage is the caller's event, not the kernel's: the kernel lets
+--     any caller append the kind, so `forked_from` is as trustworthy as the
+--     loop that wrote it. A fork the kernel itself records would need its
+--     budget and lineage rules settled first, and this one loop is not
+--     reason enough to settle them.
+--   - Not restored, and not restorable from this record: anything outside
+--     the targets — what a verify or a plan check built, cached or deleted,
+--     and every other effect of a shell command. The child starts with
+--     whatever the fresh directory holds besides the targets.
 --
 -- What it does not do
 --   No retry policy of its own, no branch on a model's name, no reading of
@@ -529,6 +613,20 @@ local record State ---@struct
     checkpoints: number
 end
 
+--- What a run that continues a history starts from, in place of the seed
+--- (`run_loop`'s `history`): the harness note that opens the run's own part
+--- of the record, the beat the files were put back to, and how many beats of
+--- the history landed an edit.
+local record Opening ---@struct
+    note: string
+    beat: string
+    edits: number
+end
+
+--- Writes the history a run continues into its session, puts the files that
+--- history ends with on disk, and answers the `Opening`.
+local type History = function(kernel.Session): Opening
+
 --- The contracts `M.shapes` publishes.
 local record Shapes ---@struct
     run_opts: lshape.Schema
@@ -555,6 +653,7 @@ local record M
     result_of: function(State, number): RunResult
     run: function(RunOpts): RunResult
     restore: function(any, string, ?string): Restored
+    fork: function(any, string, {string:any}): RunResult
     _beat_outcome: function(kernel.OutcomeValue): Answer, string, string
 end
 
@@ -1858,7 +1957,10 @@ end
 
 --- The opts, checked, and everything the loop runs on built from them —
 --- in the order the run has always built it, and before any command runs.
-local function prepare(opts: RunOpts): Run
+---
+--- `continuing` is a run that starts from a history rather than a seed
+--- (`coding.fork`): the seed is in that history already, so none is written.
+local function prepare(opts: RunOpts, continuing?: boolean): Run
     check_opts(opts)
 
     local repo = tostring(opts.repo or "."):gsub("/+$", "")
@@ -1919,7 +2021,7 @@ local function prepare(opts: RunOpts): Run
         or (table.concat(edit_names, ", ", 1, #edit_names - 1) .. " or " .. edit_names[#edit_names])
     local edits: Edits = { set = edit_set, prose = edit_prose }
 
-    local seed = M.seed(opts.spec, targets, { mode = seed_mode })
+    local seed = not continuing and M.seed(opts.spec, targets, { mode = seed_mode }) or nil
     local system = opts.system or M.system(read_spec.name, edit_names, done_mode)
 
     -- Everything the run holds, in one table. The first two are fixed at the
@@ -2334,14 +2436,29 @@ end
 
 --- Run the loop over a prepared `Run`, inside its session.
 ---
+--- `history`, when given, is a run that does not start from the seed: it is
+--- called first, writes the record the run continues into the session (and
+--- the files that record ends with onto disk), and answers the `Opening`
+--- that takes the seed's place — see `coding.fork`. Without it the run is
+--- the one `coding.run` has always been.
+---
 --- @return State  the state `result_of` reads the result out of
-local function run_loop(s: kernel.Session, run: Run): State
+local function run_loop(s: kernel.Session, run: Run, history?: History): State
     local st, opts = run.st, run.opts
     local done_mode, repo, max_iters = run.done, run.repo, run.max_iters
     local verdict, stalled = run.verdict, run.stalled
     local seed = run.seed
 
     st.session_id = tostring(s:id())
+    -- Before anything else, so the record it writes comes first. The edits
+    -- the history landed are this run's starting point: a green on files
+    -- they made is a green on edited files, which `verdict`'s `changed`
+    -- and `M.decide` read as such.
+    local opening: Opening = nil
+    if history ~= nil then
+        opening = history(s)
+        st.edits_applied = opening.edits
+    end
     local device, fits, compaction = device_of(s, run)
     -- The state before any edit: the verify once, recorded like the ones
     -- the iterations make (under no beat), so the record has the run's
@@ -2352,10 +2469,12 @@ local function run_loop(s: kernel.Session, run: Run): State
     -- the fold keeps — with the output that names the lines; a
     -- continuation run over an earlier attempt's worktree is red this
     -- way as a matter of course.
+    local baseline: VerifyResult = nil
     if opts.baseline ~= false then
         local b = verdict(s, {})
+        baseline = b.result as VerifyResult
         st.baseline_ok = b.result.ok == true
-        if not st.baseline_ok then
+        if not st.baseline_ok and opening == nil then
             seed = seed
                 .. "\n\n## Current build status: FAILING\nThe verify command ALREADY fails on the current state "
                 .. "of the files, before any edit of yours. Fix these errors FIRST — the output names the "
@@ -2363,16 +2482,33 @@ local function run_loop(s: kernel.Session, run: Run): State
                 .. tail(b.result.stderr, FEEDBACK_TAIL)
         end
     end
-    s:append({ kind = "msg_user", meta = { label = "spec" }, data = { content = seed } })
+    if opening == nil then
+        s:append({ kind = "msg_user", meta = { label = "spec" }, data = { content = seed } })
+    else
+        -- The seed is in the history already. What takes its place is the
+        -- opening's note, and the verify's answer on the files as they were
+        -- put back — so the request the model reads next ends with what is
+        -- true now, wherever in an iteration the history was cut.
+        local text = opening.note
+        if baseline ~= nil then
+            text = text
+                .. (baseline.ok and "\nThe verify passes on these files."
+                or ("\nThe verify fails on these files:\n" .. tail(baseline.stderr, FEEDBACK_TAIL)))
+        end
+        s:append({ kind = "msg_user", meta = { label = "fork" }, data = { content = text } })
+    end
     -- Under no beat, like the baseline verify above: this is what the run
     -- was configured with, not a turn of the conversation. The kernel's
     -- fold skips a kind it does not know, so the record gains the event
     -- and the request the model sees is the one it would have been.
     s:append({ kind = "config", data = st.config })
     -- The files as the run found them — after the baseline verify, before
-    -- the first beat — so every later state has the one it started from.
+    -- the first beat — so every later state has the one it started from. A
+    -- run that continues a history found them as they were after the beat
+    -- it continues from, and records them under that beat: the same state,
+    -- at the paths this run's targets name.
     if run.checkpoint then
-        record_checkpoint(st, s, run, nil)
+        record_checkpoint(st, s, run, opening and opening.beat or nil)
     end
 
     while true do
@@ -2542,25 +2678,38 @@ end
 --- `restore`'s answer to `std.json.encode` gets `[]` rather than `{}`.
 local ARRAY_TAG: {string:string} = { __jsontype = "array" }
 
---- The repo the run recorded in its `config` event, for re-rooting.
-local function recorded_repo(events: {shared.Event}): string
-    for _, ev in ipairs(events) do
-        if ev.kind == "config" and type(ev.data) == "table" then
-            local values = (ev.data as {string:any}).values
-            if type(values) == "table" then
-                local repo = (values as {string:any}).repo
-                if type(repo) == "table" and type((repo as {string:any}).value) == "string" then
-                    return (repo as {string:any}).value as string
-                end
-            end
-        end
+--- The repo one `config` event names, or nil when it names none.
+local function config_repo(ev: shared.Event): string
+    if ev.kind ~= "config" or type(ev.data) ~= "table" then
+        return nil
+    end
+    local values = (ev.data as {string:any}).values
+    if type(values) ~= "table" then
+        return nil
+    end
+    local repo = (values as {string:any}).repo
+    if type(repo) == "table" and type((repo as {string:any}).value) == "string" then
+        return (repo as {string:any}).value as string
     end
     return nil
 end
 
+--- The repo the run recorded in its `config` event, for re-rooting: the
+--- LAST one in the log. A run records one; a forked run's log holds the
+--- parent's, copied with its history, and then its own — and the run the
+--- log belongs to is the one that wrote the last.
+local function recorded_repo(events: {shared.Event}): string
+    local found: string = nil
+    for _, ev in ipairs(events) do
+        found = config_repo(ev) or found
+    end
+    return found
+end
+
 --- The events of `log`: a session's, read whole, or the array as handed in.
 --- The policy reader holds a truncated read to account; this one only needs
---- the `config` event, which is near the front of any log.
+--- the `config` events, which are near the front of any log (a forked run's
+--- own sits right after the history it copied).
 local function events_in(source: any): {shared.Event}
     if kernel.is_session(source) then
         return ((source as kernel.Session):events()) as {shared.Event}
@@ -2579,8 +2728,9 @@ end
 --- `missing` and not touched, whatever is on disk now; what the verify wrote
 --- outside the targets was never recorded and is not restored. With `repo`,
 --- each path is re-rooted from the repo the run recorded in its `config`
---- event to `repo`, and a recorded path outside that repo is refused rather
---- than written somewhere it was never meant to go.
+--- event — the last one, which in a forked run's log is the child's own — to
+--- `repo`, and a recorded path outside that repo is refused rather than
+--- written somewhere it was never meant to go.
 ---
 --- A beat with no recorded state (it landed no edit, or the run ran with
 --- `checkpoint = false`) is refused, by name: an empty answer would read as
@@ -2636,6 +2786,281 @@ function M.restore(source: any, beat: string, repo?: string): Restored
         missing[#missing + 1] = placed(path)
     end
     return { restored = restored, missing = missing }
+end
+
+-- ============================================================
+-- Public: coding.fork(log, beat, opts)
+-- ============================================================
+
+--- The kinds only the kernel writes — the session's boundaries and its
+--- ledger, the kernel's own `is_kernel_only`. A fork copies none of them:
+--- the kernel refuses each one from a caller, and the child's are the ones
+--- its own session writes.
+local KERNEL_ONLY: {string:boolean} = {
+    session_opened = true,
+    session_closed = true,
+    budget_granted = true,
+    budget_reserved = true,
+    budget_refused = true,
+    budget_spent = true,
+}
+
+--- The opts `fork` takes beside `coding.run`'s, and keeps out of the run's.
+local FORK_ONLY: {string:boolean} = { reason = true, parent = true }
+
+--- The parent's log, and its session id when the source is a session.
+local function fork_log(source: any): {shared.Event}, string
+    if kernel.is_session(source) then
+        local s = source as kernel.Session
+        local events, truncated = s:events()
+        if truncated then
+            error(
+                "coding.fork: the session's log is longer than one read of it, so the history cannot be copied "
+                    .. "whole; fork from its export (agent-block knl export --as events)",
+                3
+            )
+        end
+        return events as {shared.Event}, tostring(s:id())
+    end
+    if type(source) ~= "table" then
+        error(
+            "coding.fork: takes a knl session, or the events of one in seq order (knl.export(s), or the lines "
+                .. "of `agent-block knl export --as events` decoded), got "
+                .. type(source),
+            3
+        )
+    end
+    for i, ev in ipairs(source as {any}) do
+        if type(ev) ~= "table" then
+            error("coding.fork: log[" .. tostring(i) .. "] is not an event (" .. type(ev) .. ")", 3)
+        end
+    end
+    return source as {shared.Event}, nil
+end
+
+--- What the parent's ledger had taken by the end of `events` — every
+--- reservation and every spend, summed — and the tag of its grant; nil when
+--- the events carry no ledger at all.
+local function spent_in(events: {shared.Event}): {string:any}
+    local amount, tag, seen: number, string, boolean = 0, nil, false
+    for _, ev in ipairs(events) do
+        local data = (type(ev.data) == "table" and ev.data or {}) as {string:any}
+        if ev.kind == "budget_granted" then
+            seen = true
+            if tag == nil and type(data.tag) == "string" then
+                tag = data.tag as string
+            end
+        elseif ev.kind == "budget_reserved" or ev.kind == "budget_spent" then
+            seen = true
+            if type(data.amount) == "number" then
+                amount = amount + data.amount as number
+            end
+        end
+    end
+    if not seen then
+        return nil
+    end
+    return { amount = amount, tag = tag }
+end
+
+--- The events `1 .. last` of `events`, as a new array.
+local function prefix_of(events: {shared.Event}, last: integer): {shared.Event}
+    local out: {shared.Event} = {}
+    for i = 1, last do
+        out[i] = events[i]
+    end
+    return out
+end
+
+--- A new run that continues an earlier one from the end of `beat`, under
+--- new conditions (see "Forking a run" in the header).
+---
+---     local child = coding.fork(parent_events, beat, {
+---         repo = "/fresh/copy", parent = parent_session_id, reason = "same point, another model",
+---         targets = { "src/lib.rs" }, verify = "cargo test --quiet", llm = { port = ..., conf = ... },
+---         reserve = 6144,
+---     })
+---
+--- Refused, by name and before any session opens: a beat no event in the log
+--- carries, `"baseline"` (not a beat), a `repo` missing or one the copied
+--- history recorded as a run's repo, a `spec` (the task is the copied seed),
+--- an array of events with no `parent` to say whose they are, and a log that
+--- records no state of the files at or before the cut — a parent run with
+--- `checkpoint = false`. The rest of `opts` is refused as `coding.run`
+--- refuses it.
+---
+--- @param source any  the parent's session, or its events in seq order
+--- @param beat string  the beat to continue from
+--- @param opts table  `coding.run`'s opts without `spec`, with `repo`
+---                    required, plus `parent` (the session id, for an array)
+---                    and `reason` (a word for the record)
+--- @return table  the child run's result, as `coding.run` answers it
+function M.fork(source: any, beat: string, opts: {string:any}): RunResult
+    if type(beat) ~= "string" or beat == "" then
+        error("coding.fork: beat must be a beat id, got " .. tostring(beat), 2)
+    end
+    if beat == "baseline" then
+        error(
+            'coding.fork: "baseline" is the state before the first beat, not a beat to continue from — '
+                .. 'restore it (coding.restore(log, "baseline", repo)) and start a new coding.run there',
+            2
+        )
+    end
+    if type(opts) ~= "table" then
+        error("coding.fork: opts must be a table", 2)
+    end
+    if opts.spec ~= nil then
+        error("coding.fork: `spec` is not taken — the task is the parent's seed, copied with its history", 2)
+    end
+    if type(opts.repo) ~= "string" or opts.repo == "" then
+        error("coding.fork: `repo` is required — the fresh directory the files are restored into", 2)
+    end
+    if opts.reason ~= nil and type(opts.reason) ~= "string" then
+        error("coding.fork: `reason` must be a string, got " .. tostring(opts.reason), 2)
+    end
+    if opts.parent ~= nil and (type(opts.parent) ~= "string" or opts.parent == "") then
+        error("coding.fork: `parent` must be a session id, got " .. tostring(opts.parent), 2)
+    end
+    local repo = (opts.repo as string):gsub("/+$", "")
+
+    local events, id = fork_log(source)
+    if id ~= nil and opts.parent ~= nil and opts.parent ~= id then
+        error("coding.fork: `parent` names " .. tostring(opts.parent) .. " but the session handed in is " .. id, 2)
+    end
+    local parent = id or opts.parent as string
+    if parent == nil then
+        error(
+            "coding.fork: an array of events does not say which session it is — name it as `parent` "
+                .. "(the id the export was taken with)",
+            2
+        )
+    end
+
+    -- The cut: the last event of the beat. Everything up to it is copied,
+    -- the events between beats included; nothing after it is.
+    local cut: integer = nil
+    for i, ev in ipairs(events) do
+        local meta = ev.meta
+        if type(meta) == "table" and (meta as {string:any}).beat == beat then
+            cut = i
+        end
+    end
+    if cut == nil then
+        error("coding.fork: beat " .. beat .. " is not in the log — no event carries meta.beat = " .. beat, 2)
+    end
+
+    -- Where the files come from: the latest state recorded at or before the
+    -- cut. A beat that landed no edit recorded none, and the state before it
+    -- is the state after it.
+    local at: integer = nil
+    for i = 1, cut do
+        local ev = events[i]
+        if ev ~= nil and ev.kind == "checkpoint" then
+            at = i
+        end
+    end
+    if at == nil then
+        error(
+            "coding.fork: the log records no state of the files at or before beat " .. beat
+                .. " (a run with checkpoint = false records none), so there is nothing to restore the files from",
+            2
+        )
+    end
+    -- What `restore` reads is the log up to that state: the latest `config`
+    -- in it is the one the state's paths were recorded under.
+    local upto_state = prefix_of(events, at)
+    local state_ev = events[at] or {}
+    local state_meta = state_ev.meta
+    local state_beat = type(state_meta) == "table" and (state_meta as {string:any}).beat as string or "baseline"
+    -- Resolved here, before a session opens, so a log missing a blob is
+    -- refused now and not halfway through the copy.
+    policy.checkpoint_at(upto_state, state_beat)
+    if recorded_repo(upto_state) == nil then
+        error("coding.fork: the log carries no `config` event naming the run's repo, so its paths cannot be re-rooted", 2)
+    end
+    -- Never into a directory a run in this history edited: the point of the
+    -- fork is that the parent's files are not touched.
+    local seed_text: string = nil
+    local edit_beats = 0
+    for i = 1, cut do
+        local ev = events[i]
+        if config_repo(ev) == repo then
+            error(
+                "coding.fork: repo " .. repo .. " is the repo a run in this history edited; restore into a "
+                    .. "fresh directory, so the parent's files stay as they are",
+                2
+            )
+        end
+        local meta = (type(ev.meta) == "table" and ev.meta or {}) as {string:any}
+        if seed_text == nil and ev.kind == "msg_user" and meta.label == "spec" and type(ev.data) == "table" then
+            seed_text = (ev.data as {string:any}).content as string
+        end
+        if ev.kind == "checkpoint" and meta.beat ~= nil then
+            edit_beats = edit_beats + 1
+        end
+    end
+    if type(seed_text) ~= "string" or seed_text == "" then
+        error("coding.fork: the log up to beat " .. beat .. " carries no seed (a msg_user labelled spec) — not a coding run's record", 2)
+    end
+    local from = recorded_repo(upto_state)
+
+    local cut_ev = events[cut] or {}
+    local cut_seq = cut_ev.seq
+    local lineage: {string:any} = {
+        session = parent,
+        upto_seq = type(cut_seq) == "number" and math.tointeger(cut_seq as number) or cut,
+        beat = beat,
+        reason = opts.reason,
+        spent = spent_in(prefix_of(events, cut)),
+    }
+    shape.assert_dev(lineage, policy.shapes.forked_from, "coding.fork forked_from")
+
+    local run_opts: {string:any} = {}
+    for k, v in pairs(opts) do
+        if not FORK_ONLY[k as string] then
+            run_opts[k as string] = v
+        end
+    end
+    -- The run's opts need the task; it is the copied seed's, and nothing is
+    -- written from it — `prepare` writes no seed for a run that continues.
+    run_opts.spec = seed_text
+    local run = prepare(run_opts as RunOpts, true)
+
+    local function history(s: kernel.Session): Opening
+        s:append({ kind = "forked_from", data = lineage })
+        for i = 1, cut do
+            local ev = events[i]
+            if not KERNEL_ONLY[ev.kind as string] then
+                s:append({
+                    kind = ev.kind as string,
+                    meta = ev.meta as {string:string | number | boolean},
+                    data = ev.data,
+                })
+            end
+        end
+        M.restore(upto_state, state_beat, repo)
+        return {
+            note = "<harness>This run continues another from the end of its beat "
+                .. beat
+                .. ": everything above is that run's record up to there, and what it did after was not "
+                .. "copied. The files are as they were then, under a new directory — every path above under "
+                .. from
+                .. " is the same file under "
+                .. repo
+                .. ", and the tools take the paths under "
+                .. repo
+                .. ".</harness>",
+            beat = beat,
+            edits = edit_beats,
+        }
+    end
+
+    local st = kernel.session(run.session, function(s: kernel.Session): State
+        return run_loop(s, run, history)
+    end) as State
+    local result = M.result_of(st, run.max_iters)
+    shape.assert_dev(result, RUN_RESULT, "coding.fork result")
+    return result
 end
 
 -- ============================================================

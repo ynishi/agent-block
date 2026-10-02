@@ -65,7 +65,9 @@
 --     counts the recorded states when it was on and says nothing when off;
 --     and `restore` writes a recorded state back — every target the state
 --     names, re-rooted under another repo when asked, never deleting the
---     one recorded missing — and refuses a beat with no recorded state.
+--     one recorded missing — and refuses a beat with no recorded state; the
+--     repo it re-roots from is the LAST `config` in the log, which in a
+--     forked run's log is the child's own, after the parent's it copied.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -1098,6 +1100,31 @@ describe("coding.restore — a recorded state, written back", function()
         expect(written["/copy/sub/b.lua"]).to.be("B1")
         expect(written["/run/a.lua"]).to.be(nil)
         expect(r.restored).to.equal({ "/copy/a.lua", "/copy/sub/b.lua" })
+    end)
+
+    it("re-roots from the last config: a forked log names the parent's repo first and the child's after", function()
+        local forked = {
+            { seq = 1, kind = "config", data = { values = { repo = { value = "/parent", from = "caller" } } } },
+            { seq = 2, kind = "config", data = { values = { repo = { value = "/child", from = "caller" } } } },
+            {
+                seq = 3,
+                kind = "checkpoint_blob",
+                meta = { label = "checkpoint" },
+                data = { version = "c1", content = "C1" },
+            },
+            {
+                seq = 4,
+                kind = "checkpoint",
+                meta = { label = "checkpoint", beat = "beat-1" },
+                data = { files = { ["/child/a.lua"] = "c1" } },
+            },
+        }
+        local r
+        local written = writing(function()
+            r = coding.restore(forked, "beat-1", "/copy")
+        end)
+        expect(written["/copy/a.lua"]).to.be("C1")
+        expect(r.restored).to.equal({ "/copy/a.lua" })
     end)
 
     it("refuses a beat with no recorded state, and a beat that is not a string", function()
