@@ -139,9 +139,10 @@ describe("policy.window — construction", function()
 end)
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- fit: the window sized by a Port's profile rather than a beat count. The fake
--- Port counts the rendered request's characters, so the limits below are
--- computed from what the kernel's own fold produces rather than guessed.
+-- room: the window sized by a room — a Port's profile, read once by
+-- `policy.room` — rather than a beat count. The fake Port counts the rendered
+-- request's characters, so the limits below are computed from what the
+-- kernel's own fold produces rather than guessed.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 --- A session holding these events, for the predicate to read them back.
@@ -170,29 +171,29 @@ local function counting_port(window, output)
     }
 end
 
-describe("policy.window — fit", function()
+describe("policy.window — room", function()
     local events =
         concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4), answered("b3", "three", 6))
 
-    it("is constructed without a tail, and refuses a port that cannot count", function()
-        expect(type(policy.window({ fit = { port = counting_port(1000, 10) } }))).to.be("function")
+    it("is constructed from a room without a tail, and a port that cannot count is refused by the room", function()
+        expect(type(policy.window({ room = policy.room({ port = counting_port(1000, 10) }) }))).to.be("function")
         expect(function()
-            policy.window({ fit = { port = {} } })
+            policy.room({ port = {} })
         end).to.fail()
         expect(function()
-            policy.window({ fit = "port" })
+            policy.window({ room = "port" })
         end).to.fail()
     end)
 
     it("keeps every beat when the whole log fits", function()
-        local fold = policy.window({ fit = { port = counting_port(10000, 10) } })
+        local fold = policy.window({ room = policy.room({ port = counting_port(10000, 10) }) })
         expect(rendered(fold(events, {}))).to.be(rendered(kernel.fold(events, {})))
     end)
 
     it("drops the oldest beats, whole, until the request fits the window less the answer's room", function()
         -- The limit is exactly what the last two beats cost, so three do not fit.
         local two = #rendered(kernel.fold({ events[4], events[5], events[6], events[7] }, {}))
-        local fold = policy.window({ fit = { port = counting_port(two + 10, 10) } })
+        local fold = policy.window({ room = policy.room({ port = counting_port(two + 10, 10) }) })
         local text = rendered(fold(events, {}))
         expect(text:find("two", 1, true) ~= nil).to.be(true)
         expect(text:find("three", 1, true) ~= nil).to.be(true)
@@ -202,30 +203,31 @@ describe("policy.window — fit", function()
 
     it("keeps the seed ahead of what fits when keep_seed is set", function()
         local seeded = #rendered(kernel.fold({ events[1], events[6], events[7] }, {}))
-        local fold = policy.window({ fit = { port = counting_port(seeded + 10, 10) }, keep_seed = true })
+        local fold = policy.window({ room = policy.room({ port = counting_port(seeded + 10, 10) }), keep_seed = true })
         local text = rendered(fold(events, {}))
         expect(text:find("first", 1, true) ~= nil).to.be(true)
         expect(text:find("three", 1, true) ~= nil).to.be(true)
         expect(text:find("two", 1, true)).to.be(nil)
     end)
 
-    it("tail is a cap on top of fit", function()
-        local fold = policy.window({ fit = { port = counting_port(10000, 10) }, tail = 1 })
+    it("tail is a cap on top of the room", function()
+        local fold = policy.window({ room = policy.room({ port = counting_port(10000, 10) }), tail = 1 })
         local text = rendered(fold(events, {}))
         expect(text:find("three", 1, true) ~= nil).to.be(true)
         expect(text:find("two", 1, true)).to.be(nil)
     end)
 
     it("raises when nothing left to drop still does not fit, naming the numbers", function()
-        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) }, keep_seed = true }), events, {})
+        local room = policy.room({ port = counting_port(12, 10) })
+        local ok, err = pcall(policy.window({ room = room, keep_seed = true }), events, {})
         expect(ok).to.be(false)
         expect(tostring(err):find("does not fit", 1, true) ~= nil).to.be(true)
-        local ok2 = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), events, {})
+        local ok2 = pcall(policy.window({ room = room }), events, {})
         expect(ok2).to.be(false)
     end)
 
     it("hands back a predicate beside the fold, and it answers nil while the log fits", function()
-        local fold, fits = policy.window({ fit = { port = counting_port(10000, 10) } })
+        local fold, fits = policy.window({ room = policy.room({ port = counting_port(10000, 10) }) })
         expect(type(fold)).to.be("function")
         expect(type(fits)).to.be("function")
         expect(fits(log_of(events), {})).to.be(nil)
@@ -233,7 +235,7 @@ describe("policy.window — fit", function()
 
     it('the predicate answers "context" where the fold would have raised', function()
         local port = counting_port(12, 10)
-        local fold, fits = policy.window({ fit = { port = port }, keep_seed = true })
+        local fold, fits = policy.window({ room = policy.room({ port = port }), keep_seed = true })
         local answer, tokens, limit = fits(log_of(events), {})
         expect(answer).to.be("context")
         -- By how much: the smallest candidate's count and the room the
@@ -272,7 +274,7 @@ describe("policy.window — fit", function()
                 return #rendered(request)
             end,
         }
-        local fold = policy.window({ fit = { port = port } })
+        local fold = policy.window({ room = policy.room({ port = port }) })
         local text = rendered(fold(many, {}))
         expect(text:find("body8", 1, true) ~= nil).to.be(true)
         expect(text:find("body6", 1, true) ~= nil).to.be(true)
@@ -282,23 +284,28 @@ describe("policy.window — fit", function()
         expect(asked < 6).to.be(true)
     end)
 
-    it("raises when the port's profile names no window — a guess would be the overflow one step later", function()
-        local port = {
-            profile = function()
-                return {}
-            end,
-            count = function()
-                return 1
-            end,
-        }
-        local ok, err = pcall(policy.window({ fit = { port = port } }), events, {})
-        expect(ok).to.be(false)
-        expect(tostring(err):find("context_window", 1, true) ~= nil).to.be(true)
-    end)
+    it(
+        "refuses at room construction a profile naming no window — a guess would be the overflow one step later",
+        function()
+            local port = {
+                profile = function()
+                    return {}
+                end,
+                count = function()
+                    return 1
+                end,
+            }
+            -- The room reads the profile once, at construction, so the raise
+            -- is there and not at the first fold.
+            local ok, err = pcall(policy.room, { port = port })
+            expect(ok).to.be(false)
+            expect(tostring(err):find("names no context_window", 1, true) ~= nil).to.be(true)
+        end
+    )
 end)
 
 describe("policy.window — reserve", function()
-    -- `fit.reserve` is the room held back for the REPLY. A port that sends no
+    -- The room's `reserve` is what is held back for the REPLY. A port that sends no
     -- answer cap leaves the whole window to the request, and a fold that
     -- filled it would leave the model nowhere to answer — measured 2026-09-13
     -- in a sibling lane: in=32,718 / out=50 for two beats in a row.
@@ -312,11 +319,11 @@ describe("policy.window — reserve", function()
 
         -- No cap on the wire and no reserve: the window is the whole of it,
         -- and the whole log fits — which is the beat that starves the reply.
-        local open = policy.window({ fit = { port = counting_port(whole) } })
+        local open = policy.window({ room = policy.room({ port = counting_port(whole) }) })
         expect(rendered(open(events, {})):find("one", 1, true) ~= nil).to.be(true)
 
         -- The same port and the same window, with the reply's room held back.
-        local fold = policy.window({ fit = { port = counting_port(whole), reserve = held } })
+        local fold = policy.window({ room = policy.room({ port = counting_port(whole), reserve = held }) })
         local request, report = fold(events, {})
         local text = rendered(request)
         expect(text:find("three", 1, true) ~= nil).to.be(true)
@@ -333,59 +340,58 @@ describe("policy.window — reserve", function()
         -- The cap bounds the reply by itself, and `request_limit` has already
         -- taken it out of the window: a reserve at or under it is not a
         -- second subtraction.
-        local at = policy.window({ fit = { port = counting_port(10000, 8), reserve = 8 } })
+        local at = policy.window({ room = policy.room({ port = counting_port(10000, 8), reserve = 8 }) })
         local _, at_report = at(events, {})
         expect(at_report.reserve).to.be(0)
         expect(at_report.limit).to.be(9992)
 
         -- Over the cap, only the difference is held.
-        local over = policy.window({ fit = { port = counting_port(10000, 8), reserve = 12 } })
+        local over = policy.window({ room = policy.room({ port = counting_port(10000, 8), reserve = 12 }) })
         local _, over_report = over(events, {})
         expect(over_report.reserve).to.be(4)
         expect(over_report.limit).to.be(9988)
     end)
 
-    it("refuses a reserve that is not a whole number of tokens, naming what came", function()
+    it("the room refuses a reserve that is not a whole number of tokens, naming what came", function()
         -- A function is the tempting wrong shape — a reserve read off the log
         -- per fold — and the raise says which of the two mistakes this is.
-        local ok, err = pcall(policy.window, {
-            fit = {
-                port = counting_port(10000, 10),
-                reserve = function()
-                    return 8
-                end,
-            },
+        local ok, err = pcall(policy.room, {
+            port = counting_port(10000, 10),
+            reserve = function()
+                return 8
+            end,
         })
         expect(ok).to.be(false)
-        expect(tostring(err):find("fit.reserve", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("reserve", 1, true) ~= nil).to.be(true)
         expect(tostring(err):find("function", 1, true) ~= nil).to.be(true)
 
-        local ok2, err2 = pcall(policy.window, { fit = { port = counting_port(10000, 10), reserve = "8" } })
+        local ok2, err2 = pcall(policy.room, { port = counting_port(10000, 10), reserve = "8" })
         expect(ok2).to.be(false)
         expect(tostring(err2):find("string", 1, true) ~= nil).to.be(true)
 
         -- and a negative one is named by its value, which is what is wrong
         -- with it
-        local ok3, err3 = pcall(policy.window, { fit = { port = counting_port(10000, 10), reserve = -1 } })
+        local ok3, err3 = pcall(policy.room, { port = counting_port(10000, 10), reserve = -1 })
         expect(ok3).to.be(false)
         expect(tostring(err3):find("-1", 1, true) ~= nil).to.be(true)
     end)
 
-    it("raises when the reserve leaves the request no room at all", function()
+    it("the room refuses, at construction, a reserve that leaves the request no room at all", function()
         -- Held back to nothing: 100 less the cap of 10 less the 90 the
         -- reserve adds on top of that cap is zero, and a window of zero is
-        -- not a window.
-        local fold = policy.window({ fit = { port = counting_port(100, 10), reserve = 100 } })
-        local ok, err = pcall(fold, events, {})
+        -- not a window. The room divides the window where it is built, so
+        -- this is refused there and not at the first fold.
+        local ok, err = pcall(policy.room, { port = counting_port(100, 10), reserve = 100 })
         expect(ok).to.be(false)
-        expect(tostring(err):find("fit.reserve", 1, true) ~= nil).to.be(true)
+        expect(tostring(err):find("reserve (100)", 1, true) ~= nil).to.be(true)
         expect(tostring(err):find("context_window", 1, true) ~= nil).to.be(true)
     end)
 
     it("the predicate is held against the same limit the fold is", function()
         -- 22 tokens of window, 20 of them the reply's: 2 for the request, and
         -- the newest beat costs more than that.
-        local _, fits = policy.window({ fit = { port = counting_port(22), reserve = 20 }, keep_seed = true })
+        local _, fits =
+            policy.window({ room = policy.room({ port = counting_port(22), reserve = 20 }), keep_seed = true })
         local answer, tokens, limit = fits(log_of(events), {})
         expect(answer).to.be("context")
         expect(limit).to.be(2)
@@ -507,7 +513,7 @@ describe("policy.window — the two ways it can fail to fit", function()
     -- reader is sent to look at, so the sentences are different.
     it("says the newest beat does not fit when the history has beats", function()
         local events = concat(seed("first", 1), answered("b1", "one", 2), answered("b2", "two", 4))
-        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), events, {})
+        local ok, err = pcall(policy.window({ room = policy.room({ port = counting_port(12, 10) }) }), events, {})
         expect(ok).to.be(false)
         expect(tostring(err):find("the newest beat does not fit", 1, true) ~= nil).to.be(true)
         expect(tostring(err):find("result_cap", 1, true) ~= nil).to.be(true)
@@ -518,7 +524,7 @@ describe("policy.window — the two ways it can fail to fit", function()
         -- of the whole list, and telling this caller to cap a tool result
         -- would send them after a beat that is not there.
         local unmarked = concat(seed("first", 1), seed("second", 2))
-        local ok, err = pcall(policy.window({ fit = { port = counting_port(12, 10) } }), unmarked, {})
+        local ok, err = pcall(policy.window({ room = policy.room({ port = counting_port(12, 10) }) }), unmarked, {})
         expect(ok).to.be(false)
         expect(tostring(err):find("no event in this history is marked with a beat", 1, true) ~= nil).to.be(true)
         expect(tostring(err):find("meta.beat", 1, true) ~= nil).to.be(true)
@@ -567,9 +573,9 @@ describe("policy.window — what the fold reports", function()
         expect(getmetatable(report.dropped).__jsontype).to.be("array")
     end)
 
-    it("counts what was sent and what it was held against (fit)", function()
+    it("counts what was sent and what it was held against (room)", function()
         local two = #rendered(kernel.fold({ events[4], events[5], events[6], events[7] }, {}))
-        local _, report = policy.window({ fit = { port = counting_port(two + 10, 10) } })(events, {})
+        local _, report = policy.window({ room = policy.room({ port = counting_port(two + 10, 10) }) })(events, {})
         expect(#report.dropped).to.be(1)
         expect(report.dropped[1]).to.be("b1")
         expect(report.kept).to.be(2)
@@ -584,7 +590,7 @@ describe("policy.window — what the fold reports", function()
 
     it("reports before == after when the fitted window dropped nothing", function()
         local whole = #rendered(kernel.fold(events, {}))
-        local _, report = policy.window({ fit = { port = counting_port(10000, 10) } })(events, {})
+        local _, report = policy.window({ room = policy.room({ port = counting_port(10000, 10) }) })(events, {})
         expect(#report.dropped).to.be(0)
         expect(report.kept).to.be(3)
         expect(report.before).to.be(whole)

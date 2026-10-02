@@ -16,10 +16,11 @@
 --     cap, thinking_stop (under the room, under the caller's budget, nil when
 --     nothing is left, refused on a room with no call_reserve), count and
 --     count_text through the Port, limits_for_tools in the std.fs shape;
---   4 the six take `room` in place of the older form, refuse both at once,
---     and size by the room — the fold's limit, the cost, the result cap's
---     limit, the stop point, the window line; `policy.split` answers what
---     `room:split` answers.
+--   4 the six take `room` and nothing else about the window — a key of the
+--     older form beside it (`fit`, `port`, `share`, `call_reserve`, `conf`)
+--     is refused as an unknown option — and size by the room: the fold's
+--     limit, the cost, the result cap's limit, the stop point, the window
+--     line; `policy.split` answers what `room:split` answers.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -240,9 +241,11 @@ describe("the policies read the room", function()
         expect(report.limit).to.be(room.limit)
         expect(report.reserve).to.be(room.held)
         expect(report.after).to.be(4)
-        local ok, err = pcall(policy.window, { room = room, fit = { port = port_of(100, 0) } })
+        -- The older form's `fit`, beside a room: not a second way in.
+        local older = { port = port_of(100, 0) }
+        local ok, err = pcall(policy.window, { room = room, fit = older })
         expect(ok).to.be(false)
-        expect(tostring(err):find("pass `room` or `fit`, not both", 1, true)).to.exist()
+        expect(tostring(err):find("policy.window: unknown option 'fit'", 1, true)).to.exist()
         local ok2, err2 = pcall(policy.window, { room = { limit = 1 } })
         expect(ok2).to.be(false)
         expect(tostring(err2):find("room must be a value from policy.room", 1, true)).to.exist()
@@ -252,9 +255,9 @@ describe("the policies read the room", function()
         local cost = policy.tokens({ room = policy.room({ port = port_of(100, 0) }) })
         expect(cost(request_of("abcdef"))).to.be(6)
         expect(cost({ messages = {} })).to.be(1)
-        expect(pcall(policy.tokens, { room = policy.room({ port = port_of(100, 0) }), port = port_of(100, 0) })).to.be(
-            false
-        )
+        local ok, err = pcall(policy.tokens, { room = policy.room({ port = port_of(100, 0) }), port = port_of(100, 0) })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("policy.tokens: unknown option 'port'", 1, true)).to.exist()
     end)
 
     it("result_cap{ room } holds one result to the room's result_limit", function()
@@ -267,7 +270,9 @@ describe("the policies read the room", function()
         expect(answer.tokens).to.be(12)
         local fits = policy.result_cap({ room = room })(support.tool("t", string.rep("x", 10)))
         expect(fits.t.handler({})).to.be(string.rep("x", 10))
-        expect(pcall(policy.result_cap, { room = room, share = 0.5 })).to.be(false)
+        local ok, err = pcall(policy.result_cap, { room = room, share = 0.5 })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("policy.result_cap: unknown option 'share'", 1, true)).to.exist()
     end)
 
     it("thinking_cap{ room } sends the room's stop point, and needs a room with call_reserve", function()
@@ -285,13 +290,17 @@ describe("the policies read the room", function()
         local ok2, err2 = pcall(policy.thinking_cap, { room = policy.room({ port = port, call_reserve = 1 }) })
         expect(ok2).to.be(false)
         expect(tostring(err2):find("does not turn reasoning on", 1, true)).to.exist()
-        expect(pcall(policy.thinking_cap, { room = room, call_reserve = 5 })).to.be(false)
+        local ok3, err3 = pcall(policy.thinking_cap, { room = room, call_reserve = 5 })
+        expect(ok3).to.be(false)
+        expect(tostring(err3):find("policy.thinking_cap: unknown option 'call_reserve'", 1, true)).to.exist()
     end)
 
     it("room_note{ room } says what the request took off the room's numbers", function()
         local room = policy.room({ port = port_of(100, 0) })
         local out = policy.room_note({ room = room })(request_of(string.rep("x", 40)))
         expect(out.messages[2].content).to.be("[window] 40 of 100 tokens used; 60 left for the reply")
-        expect(pcall(policy.room_note, { room = room, conf = {} })).to.be(false)
+        local ok, err = pcall(policy.room_note, { room = room, conf = {} })
+        expect(ok).to.be(false)
+        expect(tostring(err):find("policy.room_note: unknown option 'conf'", 1, true)).to.exist()
     end)
 end)

@@ -203,8 +203,8 @@ end
 --- question it asks between beats, and the fold the summarising beat runs
 --- with.
 ---
----     local fold, fits = policy.window({ fit = { port = port, conf = conf, reserve = 4096 },
----                                        keep_seed = true, from_summary = true })
+---     local room = policy.room({ port = port, conf = conf, reserve = 4096 })
+---     local fold, fits = policy.window({ room = room, keep_seed = true, from_summary = true })
 ---     local due, summarise = policy.compact({ at = 0.8, fold = fold })
 ---     local device = knl.device({ llm = llm, tools = tools, fold = fold })
 ---     local writer = knl.device({ llm = llm, fold = summarise })   -- no tools

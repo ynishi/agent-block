@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The window policies no longer take a Port, a conf or a share of their own:
+  `policy.window{ fit = { port, conf, reserve } }`, `policy.tokens{ port,
+  conf }`, `policy.result_cap{ port, conf, share }`, `policy.thinking_cap{
+  port, conf, call_reserve }` and `policy.room_note{ port, conf }` are gone,
+  and each of the five takes `room` — a value from `policy.room{ port, conf,
+  reserve, result_share, beat_share, call_reserve }` — and nothing else about
+  the window (`thinking_cap` keeps `budget`). 0.41.0 took both forms for one
+  version and said the older one was on its way out; with it gone the
+  division of the window is written in exactly one place per run, which is
+  what the room was for. A caller on the older form gets `unknown option
+  'port'` (or `'fit'`, `'share'`, `'call_reserve'`) at the line that built
+  the policy: build one room and hand it to every seam. `policy.split{ port,
+  conf, reserve, used }` is unchanged — it is a reading, and builds the room
+  it reads from on the spot. A project whose vendored copy of `coding` still
+  wires the older form (the sibling lane's fork does) has to sync that copy
+  before moving its binary to this version.
+
 ### Fixed
 
 ### Security

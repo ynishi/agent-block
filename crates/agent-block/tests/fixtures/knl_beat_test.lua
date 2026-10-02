@@ -1179,8 +1179,9 @@ do
     assert(kernel.shapes.session_handle ~= nil, "the handle's shape is published for the packs")
     assert(kernel.shapes.callable ~= nil, "callable is published for the packs")
 
-    -- A Port that counts characters and declares a window wide enough for
-    -- this log: `fits` has to reach `s:events()` through the handle.
+    -- A Port that answers a fixed count and declares a window wide enough
+    -- for this log, read into a room: `fits` has to reach `s:events()`
+    -- through the handle.
     local port = {
         profile = function()
             return { context_window = 100000, max_output = 100 }
@@ -1189,8 +1190,9 @@ do
             return 10
         end,
     }
-    local fold, fits = policy.window({ fit = { port = port }, keep_seed = true })
-    assert(type(fold) == "function" and type(fits) == "function", "fit answers a fold and a predicate")
+    local room = policy.room({ port = port })
+    local fold, fits = policy.window({ room = room, keep_seed = true })
+    assert(type(fold) == "function" and type(fits) == "function", "a window over a room answers a fold and a predicate")
     assert(fits(s, {}) == nil, "the predicate must accept the kernel's own session")
 
     local d = kernel.device({

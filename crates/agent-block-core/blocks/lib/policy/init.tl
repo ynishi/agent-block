@@ -130,8 +130,9 @@
 ---   one loop — each of these is answered where the kernel already left a
 ---   seam for it, and by what the Port already knows:
 ---
----     the window            the Port declares it (`LLMPort:profile`), and
----                           `window{ fit }` / `tokens` ask it; `fit.reserve`
+---     the window            the Port declares it (`LLMPort:profile`), the
+---                           room divides it once (`policy.room`), and
+---                           `window` / `tokens` read the room; its `reserve`
 ---                           is the reply's room, for a wire that sends no
 ---                           cap of its own
 ---     what a tool may do    `tool_policy` on the device, reading the log
