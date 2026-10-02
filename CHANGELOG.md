@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent's spend up to there as a reference value), copies the parent's
   record up to the beat's last event — every event but the six only the
   kernel writes — puts the files back as the latest state recorded at or
-  before the cut under `opts.repo`, a fresh directory, and runs the loop on
+  before the cut under `opts.repo` — a directory apart from the parent's,
+  which the caller may fill beforehand with the rest of the tree the verify
+  reads, since the record holds the targets only — and runs the loop on
   from there. Copied, not referenced: the record's only links between events
   are `call_id` and `meta.beat`, so nothing needs re-pointing and the child
   reads alone. The budget is the child's own grant. Refused before any
@@ -98,8 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name. It refused `opts.repo` only when the string equalled a repo the
   copied history recorded, so a symlink to it or `a/../a` went through and
   the restore wrote over the parent's files; a directory inside it, and one
-  around it (whose tree holds the parent's repo), went through as well. Now a `repo` that already holds a file is refused before anything
-  is made; otherwise the directory is made, resolved with
+  around it (whose tree holds the parent's repo), went through as well. Now
+  the directory is made when it is not there, resolved with
   `std.path.absolute` (canonicalize), and compared a whole component at a
   time against each recorded repo, resolved the same way while it still
   exists: the same place, inside, or around it is refused (`/a/repo2` is not
@@ -107,9 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its `config` records that. Before any file is written, every file the
   restore will write is checked: its directory is made, resolved, and must
   be the repo or inside it, and a file already at the path must resolve
-  inside it, so a symlink planted in the empty `repo` (to a directory or a
-  file) is refused and a refusal leaves no partial restore. A refusal
-  leaves the made directories behind, holding no file. `host_types.d.tl`
+  inside it, so a symlink planted in the `repo` (to a directory or a file)
+  is refused and a refusal leaves no partial restore. A refusal leaves the
+  made directories behind, holding no file the fork wrote. `host_types.d.tl`
   declares `std.fs.exists` / `is_dir` / `mkdir` / `walk` and
   `std.path.absolute`.
 - `coding.fork` also refuses the aliases a canonical string cannot show.
@@ -131,6 +133,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical?, dev?, ino? }` — the path itself, a symlink not followed;
   `dangling` on a symlink only; `dev` / `ino` of what it resolves to, on
   Unix only. Not-found is an answer; any other error raises.
+- `coding.fork` is usable when the verify reads files that are not
+  targets — tests, fixtures, a check script. A checkpoint records the
+  targets only, so the fresh directory the fork demanded held nothing else
+  and every verify in the child failed; and a directory the caller had
+  filled with the rest of the tree was refused as already holding files.
+  Now `repo` may be empty, absent, or hold a clone, worktree or copy of the
+  parent's checkout: the fork writes the recorded targets into it and
+  touches no other file, so the child's first verify runs on the restored
+  targets and the caller's tree. Everything else is kept: `repo` is made
+  when it is not there and resolved, it is refused when it is, lies inside
+  or contains a parent's repo by string or by identity, and every target is
+  checked before any is written. One check is added, because a copied tree
+  can carry it: a target that is the parent's file at the path it was
+  recorded under, under another name (a hard link, the same device and
+  inode, as `cp -al` makes), is refused — a write through it lands in the
+  parent's file. A hard link to a parent's file at another path is not
+  caught; what else the caller copied in is the caller's.
 - The summarising request `policy.compact` builds sends the run's tool
   history as prose. It used to carry the `tool_use` / `tool_result` blocks
   with no tools offered, and a model reading a history of calls continues it

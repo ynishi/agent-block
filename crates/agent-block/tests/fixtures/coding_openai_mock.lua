@@ -25,10 +25,14 @@
 --                         path-locked to the targets, so a read of any other
 --                         file is refused before a cap sees it)
 --   CODING_CHECKPOINT_TEST  "0": run with `checkpoint = false`
+--   CODING_VERIFY_TEST    the verify command, in place of the grep over
+--                         `lib.lua` — for a case whose verify reads a file
+--                         that is not a target
 --   CODING_FORK_EVENTS_TEST  a file of a finished run's events, one JSON
 --                         object a line: the run is `coding.fork` from them
 --                         instead of `coding.run`, into CODING_REPO_TEST (a
---                         fresh directory), at the beat CODING_FORK_BEAT_TEST
+--                         directory apart from the parent's, empty or holding
+--                         the rest of the tree), at the beat CODING_FORK_BEAT_TEST
 --                         names ("first" for the first one that recorded a
 --                         state), with CODING_FORK_PARENT_TEST as the parent's
 --                         session id
@@ -88,7 +92,7 @@ local opts = {
     targets = { "lib.lua" },
     -- A fixed-string grep, so the verify is the file's content and nothing
     -- else: no toolchain, no network, and the same answer on every machine.
-    verify = "grep -qF 'return n * 2' lib.lua",
+    verify = std.env.get("CODING_VERIFY_TEST") or "grep -qF 'return n * 2' lib.lua",
     repo = repo,
     llm = {
         port = adapter.openai,
