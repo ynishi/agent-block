@@ -23,30 +23,9 @@
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
--- `call_key` encodes table-valued arguments with `std.json.encode`; the pure
--- spec environment may not have `std`, so a small encoder stands in.
-if rawget(_G, "std") == nil then
-    local function encode(value)
-        local t = type(value)
-        if t == "string" then
-            return '"' .. value .. '"'
-        elseif t ~= "table" then
-            return tostring(value)
-        end
-        local keys = {}
-        for k in pairs(value) do
-            keys[#keys + 1] = tostring(k)
-        end
-        table.sort(keys)
-        local parts = {}
-        for _, k in ipairs(keys) do
-            parts[#parts + 1] = k .. ":" .. encode(value[k])
-        end
-        return "{" .. table.concat(parts, ",") .. "}"
-    end
-    _G.std = { json = { encode = encode } }
-end
-
+-- `call_key` encodes table-valued arguments with `std.json.encode`; `support`
+-- installs the shared encoder (knl/spec/json_stub.lua), which sorts keys, so
+-- the same arguments in any key order give the same text.
 local support = require("policy.spec.support")
 local policy = require("policy")
 

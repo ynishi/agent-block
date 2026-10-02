@@ -21,31 +21,8 @@
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
 -- A refusal is a table, and the kernel's fold and this cap's own count render
--- a table result through `std.json.encode`; the pure runner has no host, so
--- the one call is stood in for with a rendering whose length is stable.
-if rawget(_G, "std") == nil then
-    local function render(v)
-        local t = type(v)
-        if t == "table" then
-            local keys = {}
-            for k in pairs(v) do
-                keys[#keys + 1] = tostring(k)
-            end
-            table.sort(keys)
-            local parts = {}
-            for _, k in ipairs(keys) do
-                parts[#parts + 1] = string.format("%q:%s", k, render(v[k]))
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-        if t == "string" then
-            return string.format("%q", v)
-        end
-        return tostring(v)
-    end
-    std = { json = { encode = render } }
-end
-
+-- a table result through `std.json.encode`; `support` installs the shared
+-- encoder (knl/spec/json_stub.lua), whose length grows with the value.
 local support = require("policy.spec.support")
 local kernel = require("knl")
 local policy = require("policy")

@@ -25,29 +25,9 @@
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
 -- The cap measures a table result as the JSON the kernel would render it
--- into, so the spec has to supply an encoder whose OUTPUT LENGTH tracks the
--- value — the memo codec the other pure specs use answers a short token and
--- would hide exactly what is being tested. Real enough for that: strings
--- quoted, tables braced, keys included.
-if rawget(_G, "std") == nil then
-    local function encode(value)
-        local t = type(value)
-        if t == "string" then
-            return '"' .. value .. '"'
-        elseif t == "number" or t == "boolean" then
-            return tostring(value)
-        elseif t ~= "table" then
-            return '"<' .. t .. '>"'
-        end
-        local parts = {}
-        for k, v in pairs(value) do
-            parts[#parts + 1] = '"' .. tostring(k) .. '":' .. encode(v)
-        end
-        return "{" .. table.concat(parts, ",") .. "}"
-    end
-    _G.std = { json = { encode = encode } }
-end
-
+-- into; the shared encoder `support` installs (knl/spec/json_stub.lua) grows
+-- with the value, which is what this spec needs of it.
+require("policy.spec.support")
 local policy = require("policy")
 
 --- A Port whose window is `window`, whose answer takes `output`, and which
