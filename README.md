@@ -1179,6 +1179,13 @@ Rust e2e suite in the full host (`tests/e2e_knl_beat.rs`) and the specs cover
 what sits around it. Each spec file's header documents how to run it on its
 own.
 
+A failure found in a real run becomes a replay case: a policy reads only the
+log, so the recorded prefix of the run's log is the whole input to the decision
+it made there. `policy/spec/replay_spec.lua` loads such prefixes (exported with
+`agent-block knl export --as events`, paths rewritten, long text cut, kept as
+Lua modules under `policy/spec/replay/`) and asserts what the policy decided —
+no model is called. Its header gives the three steps for adding a case.
+
 ## License
 
 Licensed under either of
