@@ -15,7 +15,19 @@
 ---   which is what keeps the kernel free of the shell's habits rather than
 ---   growing them a beat at a time.
 ---
---- The fourteen, and where each one plugs in
+--- The room, and the fifteen that plug in
+---
+---   `policy.room{ port, conf, reserve?, result_share?, beat_share?,
+---   call_reserve? }` is the window as ONE VALUE: the Port's profile read
+---   once, and the division of it — the prompt's limit, the reply's room,
+---   what one tool result may take, what one beat's results may take
+---   together, where the reasoning stops — written and checked in one place.
+---   It is not a policy (it plugs into no seam) and it is frozen like a
+---   device; the six policies that size against the window take it as
+---   `room` and read, where each used to take `{ port, conf, <its share> }`
+---   and derive its own number. A caller builds one room per run and hands
+---   the same one to every seam, and to `std.fs.tool_specs{ limits =
+---   room:limits_for_tools() }` so a tool can fit its own answer.
 ---
 ---     policy.window      -> a `fold`      the last n beats, or as many as
 ---                                         fit the model's window; from a
@@ -34,6 +46,8 @@
 ---                                         tagged "tokens"
 ---     policy.result_cap  -> `tools`       one tool result may not outgrow a
 ---                                         share of the model's window
+---     policy.beat_cap    -> `tools`       one beat's results together may not
+---                                         outgrow their share of the window
 ---     policy.repeat_cap  -> `tools`       the same call, again, with nothing
 ---                                         changed in between, is refused
 ---                                         past a count
@@ -57,8 +71,8 @@
 ---                                         beside the summary so it cannot
 ---                                         misremember them
 ---
----   `window`, `carry`, `tokens`, `result_cap`, `repeat_cap`, `require_args`,
----   `thinking_cap` and `room_note` are device
+---   `window`, `carry`, `tokens`, `result_cap`, `beat_cap`, `repeat_cap`,
+---   `require_args`, `thinking_cap` and `room_note` are device
 ---   fields (`knl.device{ fold = ..., filters = { ... }, cost = ..., tools = ... }`);
 ---   `stagnation`, `retry`, `escalate`, `verdict`, `compact` and `ledger` are
 ---   the loop's own and the kernel never sees them. That
@@ -78,17 +92,16 @@
 ---
 --- Where each one lives
 ---   `policy` is one module in six files, and this one is the door: it
----   gathers the fourteen, publishes `policy.shapes`, and runs the registry
----   gate. The policies are grouped by what they read —
+---   gathers the fifteen and the room, publishes `policy.shapes`, and runs
+---   the registry gate. The policies are grouped by what they read —
 ---
----     policy/room.lua     window, tokens, result_cap, thinking_cap, room_note
----                         — the five that size against the model's window,
----                         and the one split of it they all read
----                         (`request_limit` for the prompt, `reply_room` for
----                         the reply), off the Port's profile; `policy.split`
----                         hands that split back as a value, for a caller
----                         that wants to see the numbers a run is sized by —
----                         a reading, not a fifteenth policy
+---     policy/room.lua     the room (`policy.room` / `is_room`), and window,
+---                         tokens, result_cap, beat_cap, thinking_cap,
+---                         room_note — the six that size against the model's
+---                         window, all reading the room's one division of it;
+---                         `policy.split` hands that division back as a value
+---                         for a caller that wants to see the numbers a run
+---                         is sized by — a reading, not a sixteenth policy
 ---     policy/tools.lua    repeat_cap, require_args — the two that wrap the
 ---                         device's tools map
 ---     policy/carry.lua    carry — the one filter that reads the log
@@ -186,6 +199,11 @@
 ---     escalate    reads NO log: the `Outcome` it is given
 ---     repeat_cap  reads the log — `session:events()`, through the binder,
 ---                 on every call it is asked to answer
+---     result_cap  reads NO log: the result it is handed, counted by the
+---                 room's Port, against the room's result_limit
+---     beat_cap    reads the log — `session:events()`, through the binder,
+---                 on every call: the results the beat now running has
+---                 already recorded, against the room's beat_budget
 ---     require_args reads NO log: the arguments it is handed, against the
 ---                 `required` list the tool already declares
 ---     thinking_cap reads NO log: the request it is handed, counted by the
@@ -310,6 +328,8 @@ local compact = require("policy.compact")
 --- The public contracts, as data (`policy.shapes`), and the registry
 --- (`policy.shapes.api`).
 local record Shapes
+    room_opts: lshape.Schema
+    beat_cap_opts: lshape.Schema
     window_opts: lshape.Schema
     split_opts: lshape.Schema
     split: lshape.Schema
@@ -332,9 +352,12 @@ local record Shapes
 end
 
 local record M
+    room: room.RoomFactory
+    is_room: room.IsRoom
     window: room.WindowFactory
     tokens: room.TokensFactory
     result_cap: room.ResultCapFactory
+    beat_cap: room.BeatCapFactory
     thinking_cap: room.ThinkingCapFactory
     room_note: room.RoomNoteFactory
     split: room.SplitFn
@@ -359,9 +382,14 @@ end
 -- surface of `policy` is written down here, once, and a function a file
 -- happens to export beside its policies does not become part of it.
 
+-- The window as one value, and the test for one — not policies, the thing
+-- the six below read.
+M.room = room.room
+M.is_room = room.is_room
 M.window = room.window
 M.tokens = room.tokens
 M.result_cap = room.result_cap
+M.beat_cap = room.beat_cap
 M.thinking_cap = room.thinking_cap
 M.room_note = room.room_note
 -- The window's split as a value — a reading beside the five, not a policy.
@@ -386,6 +414,8 @@ M.ledger = compact.ledger
 -- listed, not by being found.
 
 M.shapes = {
+    room_opts = room.shapes.room_opts,
+    beat_cap_opts = room.shapes.beat_cap_opts,
     window_opts = room.shapes.window_opts,
     split_opts = room.shapes.split_opts,
     split = room.shapes.split,
