@@ -52,6 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The summarising request `policy.compact` builds sends the run's tool
+  history as prose. It used to carry the `tool_use` / `tool_result` blocks
+  with no tools offered, and a model reading a history of calls continues it
+  with a call it cannot make: Gemini answered with nothing [measured
+  2026-10-02, gemini-2.5-flash, one recorded summary request sent again: 10
+  of 10 empty as recorded; 10 of 10 empty with the tools offered and
+  `tool_choice = "none"`; 5 of 5 `UNEXPECTED_TOOL_CALL` on the native
+  endpoint with function calling mode NONE; 0 of 5 empty with the history as
+  prose]. Offering the tools and forbidding the call does not help — what
+  makes the model reach for one is the call blocks — so the fold rewrites
+  them: a call as one line naming the tool and its input, a result as one
+  line carrying it, text kept, reasoning blocks left out. The log keeps the
+  blocks; only what the summarising beat sends changes. `compact_skipped`
+  stays as the mark for a summary that still comes back empty.
+
 ### Security
 
 ## [0.41.0] - 2026-10-02

@@ -379,6 +379,46 @@ describe("policy.compact — the summarising fold", function()
         expect(request.tools).to.exist()
     end)
 
+    it("sends the tool history as prose: a call and a result as one line each, no call blocks left", function()
+        -- A model reading call blocks continues with a call it cannot make
+        -- (the fold's header has the measurement), so the summarising
+        -- request carries the same facts as text.
+        local request = {
+            messages = {
+                { role = "user", content = "task" },
+                {
+                    role = "assistant",
+                    content = {
+                        { type = "thinking", thinking = "hmm" },
+                        { type = "text", text = "reading" },
+                        { type = "tool_use", id = "c1", name = "fs_read", input = { path = "a.lua" } },
+                    },
+                },
+                {
+                    role = "user",
+                    content = {
+                        { type = "tool_result", tool_use_id = "c1", content = "line one" },
+                        { type = "tool_result", tool_use_id = "c2", content = { ok = false }, is_error = true },
+                    },
+                },
+            },
+        }
+        local inner = recording_fold(request, report(nil, 1, 10))
+        local _, fold = policy.compact({ fold = inner, prompt = "Summarise." })
+        local out = fold({}, {})
+        expect(#out.messages).to.be(4)
+        for _, message in ipairs(out.messages) do
+            expect(type(message.content)).to.be("string")
+        end
+        expect(out.messages[2].role).to.be("assistant")
+        expect(out.messages[2].content).to.be('reading\n[called fs_read with {"path":"a.lua"}]')
+        expect(out.messages[3].role).to.be("user")
+        expect(out.messages[3].content).to.be('[tool result] line one\n[tool failed] {"ok":false}')
+        expect(out.messages[4].content).to.be("Summarise.")
+        -- The caller's request keeps its blocks.
+        expect(request.messages[2].content[3].type).to.be("tool_use")
+    end)
+
     it("ends with the default instruction when the caller names none", function()
         local inner = recording_fold({ messages = {} }, report(nil, 1, 10))
         local _, fold = policy.compact({ fold = inner })
