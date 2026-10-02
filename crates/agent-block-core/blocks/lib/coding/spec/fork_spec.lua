@@ -34,9 +34,19 @@
 --   6 the copied edits count: a child that declares at once on a green
 --     verify over restored edits converges;
 --   7 the refusals, by name and before a session opens: a beat not in the
---     log, "baseline", the parent's repo (with or without a trailing slash),
---     a `spec`, an array with no `parent`, a `parent` that is not the
---     session handed in, and a parent run that recorded no state of the files.
+--     log, "baseline", the parent's repo (as written, with a trailing slash,
+--     through `..`, and emptied so the comparison is what catches it), a
+--     directory inside it, a directory that already holds a file, an empty
+--     repo holding a symlink to the parent's file (nothing written), a `spec`,
+--     an array with no `parent`, a `parent` that is not the session handed
+--     in, and a parent run that recorded no state of the files;
+--   8 what is taken: a sibling whose name starts with the parent's
+--     (`/parent2`), and a nested directory not there yet.
+--
+-- The fake disk folds `.` and `..` and follows the links a case plants, which
+-- is enough for a file symlink inside the child's repo; symlinks to
+-- directories, and a directory around the parent's, are proved against the
+-- real file system in crates/agent-block/tests/e2e_coding.rs.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -48,6 +58,63 @@ local json = require("knl.spec.json_stub")
 -- ─────────────────────────────────────────────────────────────────────────────
 
 local files = {}
+-- Directories made by `std.fs.mkdir`; a directory also exists while a file
+-- sits under it.
+local dirs = {}
+
+--- The path with `.` and `..` folded — all that resolving does on a disk
+--- with no links.
+local function folded(p)
+    local out = {}
+    for part in p:gmatch("[^/]+") do
+        if part == ".." then
+            out[#out] = nil
+        elseif part ~= "." then
+            out[#out + 1] = part
+        end
+    end
+    return "/" .. table.concat(out, "/")
+end
+
+local function under(dir, path)
+    return path:sub(1, #dir + 1) == dir .. "/"
+end
+
+-- Symlinks: `links[from] = to`. Only `exists` and `std.path.absolute`
+-- follow them, which is all the fork's check reads; `walk` lists files, not
+-- links, as the host's does.
+local links = {}
+
+local function real(p)
+    p = folded(p)
+    for _ = 1, 8 do
+        local hit = false
+        for from, to in pairs(links) do
+            if p == from or under(from, p) then
+                p = folded(to .. p:sub(#from + 1))
+                hit = true
+                break
+            end
+        end
+        if not hit then
+            break
+        end
+    end
+    return p
+end
+
+local function exists(p)
+    p = real(p)
+    if dirs[p] or files[p] ~= nil then
+        return true
+    end
+    for path in pairs(files) do
+        if under(p, path) then
+            return true
+        end
+    end
+    return false
+end
 
 local function fs_tool(op, lock)
     local allowed = {}
@@ -101,6 +168,32 @@ _G.std = {
         end,
         write = function(path, content)
             files[path] = content
+        end,
+        exists = exists,
+        is_dir = function(p)
+            return files[folded(p)] == nil and exists(p)
+        end,
+        mkdir = function(p)
+            dirs[folded(p)] = true
+            return true
+        end,
+        walk = function(p)
+            local out = {}
+            for path in pairs(files) do
+                if under(folded(p), path) then
+                    out[#out + 1] = path
+                end
+            end
+            table.sort(out)
+            return out
+        end,
+    },
+    path = {
+        absolute = function(p)
+            if not exists(p) then
+                error("not found: " .. p)
+            end
+            return real(p)
         end,
     },
 }
@@ -364,6 +457,34 @@ describe("coding.fork — the same point of a run, continued", function()
     end)
 end)
 
+describe("coding.fork — the directories it takes", function()
+    local parent, parent_events = run_parent()
+    local b2 = state_beats(parent_events)[3]
+
+    local function forked(repo)
+        return coding.fork(parent_events, b2, opts_of(repo, { text("x") }, { iters = 1, parent = parent.session }))
+    end
+
+    it("a sibling whose name starts with the parent's: /parent2 is not inside /parent", function()
+        local r = forked("/parent2")
+        expect(files["/parent2/a.lua"]).to.be("v2")
+        expect(r.config.values.repo.value).to.be("/parent2")
+    end)
+
+    it("a nested directory not there yet, made for the run", function()
+        local r = forked("/new/nested/repo/")
+        expect(dirs["/new/nested/repo"]).to.be(true)
+        expect(files["/new/nested/repo/a.lua"]).to.be("v2")
+        expect(r.config.values.repo.value).to.be("/new/nested/repo")
+    end)
+
+    it("the path it resolved to is the child's repo: `..` folded in the run's config", function()
+        local r = forked("/new/../folded")
+        expect(files["/folded/a.lua"]).to.be("v2")
+        expect(r.config.values.repo.value).to.be("/folded")
+    end)
+end)
+
 describe("coding.fork — what it refuses, before a session opens", function()
     local parent, parent_events = run_parent()
     local b2 = state_beats(parent_events)[3]
@@ -399,9 +520,46 @@ describe("coding.fork — what it refuses, before a session opens", function()
         says(refused(parent_events, "baseline"), '"baseline" is the state before the first beat')
     end)
 
-    it("the parent's repo, written either way", function()
-        says(refused(parent_events, b2, { repo = "/parent" }), "repo /parent is the repo a run in this history edited")
-        says(refused(parent_events, b2, { repo = "/parent/" }), "repo /parent is the repo a run in this history edited")
+    it("the parent's repo, however it is written: it holds files, so it is refused as it stands", function()
+        says(refused(parent_events, b2, { repo = "/parent" }), "repo /parent already holds files (/parent/a.lua)")
+        says(refused(parent_events, b2, { repo = "/parent/" }), "repo /parent already holds files")
+        says(refused(parent_events, b2, { repo = "/parent/../parent" }), "repo /parent/../parent already holds files")
+    end)
+
+    it("the parent's repo emptied: the comparison catches it, as written or through `..`", function()
+        local kept = files["/parent/a.lua"]
+        files["/parent/a.lua"] = nil
+        dirs["/parent"] = true
+        local as_written = refused(parent_events, b2, { repo = "/parent/" })
+        local through = refused(parent_events, b2, { repo = "/x/../parent" })
+        files["/parent/a.lua"] = kept
+        says(as_written, "repo /parent is the repo a run in this history edited (/parent)")
+        says(through, "repo /x/../parent is the repo a run in this history edited (/parent)")
+    end)
+
+    it("a directory inside the parent's repo, not there before", function()
+        says(
+            refused(parent_events, b2, { repo = "/parent/sub/" }),
+            "repo /parent/sub lies inside /parent, the repo a run in this history edited"
+        )
+    end)
+
+    it("an empty repo holding a symlink to the parent's file: refused, nothing written", function()
+        dirs["/linked"] = true
+        links["/linked/a.lua"] = "/parent/a.lua"
+        local kept = files["/parent/a.lua"]
+        local err = refused(parent_events, b2, { repo = "/linked" })
+        links["/linked/a.lua"] = nil
+        says(err, "coding.fork: /linked/a.lua leads to /parent/a.lua, outside the repo /linked")
+        expect(files["/parent/a.lua"]).to.be(kept)
+        expect(files["/linked/a.lua"]).to.be(nil)
+    end)
+
+    it("a directory that already holds a file, whoever's it is", function()
+        files["/other/notes.txt"] = "x"
+        local err = refused(parent_events, b2, { repo = "/other" })
+        files["/other/notes.txt"] = nil
+        says(err, "repo /other already holds files (/other/notes.txt)")
     end)
 
     it("a spec, and no repo", function()

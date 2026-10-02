@@ -104,6 +104,16 @@ local record host_types
             write: function(string, string)
             --- Restore the content the last successful edit replaced.
             rollback: function(string): {string:any}
+            --- Whether anything is at the path (a symlink is followed).
+            exists: function(string): boolean
+            --- Whether the path is a directory (a symlink is followed).
+            is_dir: function(string): boolean
+            --- Make the directory and its parents; true when it is there,
+            --- including when it already was.
+            mkdir: function(string): boolean
+            --- Every file under the directory, recursively; raises when it
+            --- cannot be listed or holds more than the host's walk limit.
+            walk: function(string): {string}
             --- What `tool_specs` takes: `fs_tools`' `Opts`, which the
             --- bridge installs its functions from.
             record ToolSpecsOpts
@@ -123,6 +133,12 @@ local record host_types
             --- The file tools a model is handed, one per op `allowed`
             --- names that the library builds (`fs_tools.tool_specs`).
             tool_specs: function(ToolSpecsOpts): {ToolSpec}
+        end
+        --- Paths.
+        record Path
+            --- The path canonicalized: absolute, symlinks and `..`
+            --- resolved. Raises when nothing is there.
+            absolute: function(string): string
         end
         --- The environment.
         record Env
@@ -155,6 +171,7 @@ local record host_types
         sql: Sql
         ts: Ts
         fs: Fs
+        path: Path
         time: Time
         env: Env
         task: Task
