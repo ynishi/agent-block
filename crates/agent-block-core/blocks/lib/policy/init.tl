@@ -90,10 +90,19 @@
 ---   between them — the rule that nothing here appends holds, and the record
 ---   is compacted all the same.
 ---
+---   Two more it names and does not write are the state of the files:
+---   `checkpoint` (`policy.shapes.checkpoint`, every target's version after a
+---   beat that landed an edit, and before the first beat) and
+---   `checkpoint_blob` (`policy.shapes.checkpoint_blob`, each distinct
+---   content once). The loop appends both; `policy.checkpoints` and
+---   `policy.checkpoint_at` read them back — two readings beside the fifteen,
+---   like `split`, that plug into no seam and that the loop does not consult.
+---
 --- Where each one lives
----   `policy` is one module in six files, and this one is the door: it
----   gathers the fifteen and the room, publishes `policy.shapes`, and runs
----   the registry gate. The policies are grouped by what they read —
+---   `policy` is one module in eight files, and this one is the door: it
+---   gathers the fifteen, the room and the readings beside them, publishes
+---   `policy.shapes`, and runs the registry gate. The policies are grouped by
+---   what they read —
 ---
 ---     policy/room.lua     the room (`policy.room` / `is_room`), and window,
 ---                         tokens, result_cap, beat_cap, thinking_cap,
@@ -109,6 +118,9 @@
 ---                         loop asks between beats
 ---     policy/compact.lua  compact, ledger — when the window is nearly full,
 ---                         and the facts a summary must not lose
+---     policy/checkpoint.lua  checkpoints, checkpoint_at — the state of the
+---                         files, read back off the `checkpoint` record the
+---                         loop appends; readings, not policies
 ---     policy/shared.lua   the defaults, the log readers, the contract
 ---                         prelude and the shapes more than one file hands
 ---                         out; not a policy, not exported
@@ -221,6 +233,9 @@
 ---                 last summary. Its fold reads what every fold reads
 ---     ledger      reads the log — `session:events()`, per call, the whole
 ---                 of it: counts and names, never kept between calls
+---     checkpoints / checkpoint_at  read the log — `session:events()`, the
+---                 whole of it, or the events a caller hands in (a finished
+---                 run's export); nothing kept between calls
 ---
 ---   The escape hatch the design allows — an explicit `run` table the CALLER
 ---   creates and owns for one shell run — is not used by any of the fourteen,
@@ -313,7 +328,7 @@
 ---   the loop runs and appended by the loop, and the three policies around
 ---   it (`compact`, `ledger`, `window{ from_summary }`) read.
 ---
---- Written in Teal, all seven files, and embedded through `include_tl!`
+--- Written in Teal, all eight files, and embedded through `include_tl!`
 --- (`host.rs`); the Lua the host holds is what Teal generates, without
 --- these comments. The kernel is read through its own record (`knl` is
 --- Teal too); the records the files share are `policy.shared`'s.
@@ -325,6 +340,7 @@ local tools = require("policy.tools")
 local carry = require("policy.carry")
 local loop = require("policy.loop")
 local compact = require("policy.compact")
+local checkpoint = require("policy.checkpoint")
 
 --- The public contracts, as data (`policy.shapes`), and the registry
 --- (`policy.shapes.api`).
@@ -346,6 +362,8 @@ local record Shapes
     ledger: lshape.Schema
     summary: lshape.Schema
     compact_skipped: lshape.Schema
+    checkpoint: lshape.Schema
+    checkpoint_blob: lshape.Schema
     beat_record: lshape.Schema
     tool_pair: lshape.Schema
     stop_reason: lshape.Schema
@@ -371,6 +389,8 @@ local record M
     escalate: loop.EscalateFactory
     compact: compact.CompactFactory
     ledger: compact.LedgerFactory
+    checkpoints: checkpoint.CheckpointsFn
+    checkpoint_at: checkpoint.CheckpointAtFn
     shapes: Shapes
 end
 
@@ -404,6 +424,10 @@ M.retry = loop.retry
 M.escalate = loop.escalate
 M.compact = compact.compact
 M.ledger = compact.ledger
+-- The state of the files, off the record the loop appends — two readings
+-- beside the fifteen, not policies.
+M.checkpoints = checkpoint.checkpoints
+M.checkpoint_at = checkpoint.checkpoint_at
 
 -- ============================================================
 -- shapes — the public contracts of this module
@@ -432,6 +456,8 @@ M.shapes = {
     ledger = shared.LEDGER,
     summary = shared.SUMMARY,
     compact_skipped = shared.COMPACT_SKIPPED,
+    checkpoint = checkpoint.shapes.checkpoint,
+    checkpoint_blob = checkpoint.shapes.checkpoint_blob,
     beat_record = shared.BEAT_RECORD,
     tool_pair = shared.TOOL_PAIR,
     stop_reason = shared.STOP_REASON,
@@ -458,7 +484,7 @@ M.shapes = {
 -- answer it first with a message of its own.
 
 M.shapes.api = {}
-local registries: {{string:shared.ApiEntry}} = { room.api, tools.api, carry.api, loop.api, compact.api }
+local registries: {{string:shared.ApiEntry}} = { room.api, tools.api, carry.api, loop.api, compact.api, checkpoint.api }
 for _, api in ipairs(registries) do
     for name, entry in pairs(api) do
         if M.shapes.api[name] ~= nil then

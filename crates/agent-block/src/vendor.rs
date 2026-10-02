@@ -508,7 +508,7 @@ mod tests {
     fn a_pack_warns_and_is_written_anyway() {
         let plan = resolve("policy").expect("policy is embedded");
         // The module and every file under it, in the order they are embedded:
-        // a pack vendors whole, the door first and its six files after.
+        // a pack vendors whole, the door first and its seven files after.
         assert_eq!(
             module_rels(&plan),
             [
@@ -519,6 +519,7 @@ mod tests {
                 "lib/policy/carry.lua",
                 "lib/policy/loop.lua",
                 "lib/policy/compact.lua",
+                "lib/policy/checkpoint.lua",
             ]
         );
         let warning = plan.warning.expect("a pack warns");

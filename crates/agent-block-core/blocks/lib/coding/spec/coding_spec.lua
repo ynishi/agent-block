@@ -59,7 +59,13 @@
 --     policy.compact keeps, `strict` requires it, `config_of` names it as
 --     resolved (the default on, false when turned off), and the result
 --     counts the compactions when the run could compact and says nothing
---     when it could not.
+--     when it could not;
+--  18 checkpoint: the opt is a boolean, `strict` requires it, `config_of`
+--     names it (on by default, false when the caller says so), the result
+--     counts the recorded states when it was on and says nothing when off;
+--     and `restore` writes a recorded state back — every target the state
+--     names, re-rooted under another repo when asked, never deleting the
+--     one recorded missing — and refuses a beat with no recorded state.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -324,6 +330,7 @@ describe("coding.run — what it refuses", function()
             seed = "full",
             compact = { at = 0.8 },
             beat_share = 0.5,
+            checkpoint = true,
         }
         local without_iters = {}
         for k, v in pairs(named) do
@@ -334,6 +341,15 @@ describe("coding.run — what it refuses", function()
         expect(about(said, "these are not: iters")).to.be(true)
         named.iters = 5
         expect(about(refusal(named), "strict = true")).to.be(false)
+        named.checkpoint = nil
+        expect(about(refusal(named), "these are not: checkpoint")).to.be(true)
+    end)
+
+    it("holds `checkpoint` to a boolean", function()
+        local opts = { spec = "x", verify = "true", targets = { "a" }, llm = llm, checkpoint = "yes" }
+        expect(about(refusal(opts), "`checkpoint` must be a boolean")).to.be(true)
+        opts.checkpoint = false
+        expect(about(refusal(opts), "`checkpoint`")).to.be(false)
     end)
 
     it("holds `compact` to false or { at?, min_beats? }, and takes true as the default", function()
@@ -730,14 +746,14 @@ describe("coding.config_of — what the run was configured with", function()
         local c = config({})
         expect(c.room).to.equal(resolved.room)
         expect(c.room.call_reserve).to.be(nil)
-        -- No room number became a knob: `values` holds the 21 knobs it always
+        -- No room number became a knob: `values` holds the 22 knobs it always
         -- has plus the conf's `model` and `max_tokens`, as before the room
         -- was carried.
         local n = 0
         for _ in pairs(c.values) do
             n = n + 1
         end
-        expect(n).to.be(23)
+        expect(n).to.be(24)
         for _, key in ipairs({ "limit", "held", "result_limit", "beat_budget", "window", "max_output" }) do
             expect(c.values[key]).to.be(nil)
         end
@@ -762,6 +778,15 @@ describe("coding.config_of — what the run was configured with", function()
         local tuned = config({ compact = { at = 0.5 } }, { compact = { at = 0.5 } })
         expect(tuned.values.compact.from).to.be("caller")
         expect(tuned.values.compact.value.at).to.be(0.5)
+    end)
+
+    it("carries the checkpoint knob: on by default, false when the caller turns it off", function()
+        local taken = config({})
+        expect(taken.values.checkpoint.from).to.be("default")
+        expect(taken.values.checkpoint.value).to.be(true)
+        local off = config({ checkpoint = false })
+        expect(off.values.checkpoint.from).to.be("caller")
+        expect(off.values.checkpoint.value).to.be(false)
     end)
 
     it("says caller for a knob the caller named and default for one it did not", function()
@@ -908,6 +933,30 @@ describe("coding.result_of — the result out of the state the loop left", funct
         expect(off.compactions).to.be(nil)
     end)
 
+    it("counts the recorded states when checkpoint was on, and says nothing when it was off", function()
+        local on = coding.result_of(
+            state({
+                converged = true,
+                iters = 2,
+                checkpoints = 2,
+                config = { strict = false, values = { checkpoint = { value = true, from = "default" } } },
+            }),
+            5
+        )
+        expect(on.checkpoints).to.be(2)
+        expect(check.check(on, coding.shapes.run_result)).to.be(true)
+        local off = coding.result_of(
+            state({
+                converged = true,
+                iters = 2,
+                checkpoints = 0,
+                config = { strict = false, values = { checkpoint = { value = false, from = "caller" } } },
+            }),
+            5
+        )
+        expect(off.checkpoints).to.be(nil)
+    end)
+
     it("plan mode: the counts and the checks still failing, or a plan nobody filed", function()
         local checks = {
             { step = "a", check = "true", ok = true, exit_code = 0, tail = "" },
@@ -971,5 +1020,94 @@ describe("coding._beat_outcome — a beat's Outcome, as the loop reads it", func
         expect(c).to.be(nil)
         expect(r3).to.be("llm_call")
         expect(e3).to.be("refusal: declined")
+    end)
+end)
+
+describe("coding.restore — a recorded state, written back", function()
+    -- A finished run's events, as an export hands them over: the config the
+    -- run recorded its repo in, the state before the first beat (b.lua not
+    -- created yet), and the state after the beat that wrote both.
+    local events = {
+        { seq = 1, kind = "config", data = { values = { repo = { value = "/run", from = "caller" } } } },
+        {
+            seq = 2,
+            kind = "checkpoint_blob",
+            meta = { label = "checkpoint" },
+            data = { version = "a0", content = "A0" },
+        },
+        {
+            seq = 3,
+            kind = "checkpoint",
+            meta = { label = "checkpoint" },
+            data = { files = { ["/run/a.lua"] = "a0" }, missing = { "/run/b.lua" } },
+        },
+        {
+            seq = 4,
+            kind = "checkpoint_blob",
+            meta = { label = "checkpoint" },
+            data = { version = "a1", content = "A1" },
+        },
+        {
+            seq = 5,
+            kind = "checkpoint_blob",
+            meta = { label = "checkpoint" },
+            data = { version = "b1", content = "B1" },
+        },
+        {
+            seq = 6,
+            kind = "checkpoint",
+            meta = { label = "checkpoint", beat = "beat-1" },
+            data = { files = { ["/run/a.lua"] = "a1", ["/run/sub/b.lua"] = "b1" } },
+        },
+    }
+
+    --- Run `fn` with `std.fs.write` recording what it was asked to write.
+    local function writing(fn)
+        local saved = std.fs
+        local written = {}
+        std.fs = {
+            write = function(path, content)
+                written[path] = content
+            end,
+        }
+        local ok, err = pcall(fn)
+        std.fs = saved
+        if not ok then
+            error(err, 0)
+        end
+        return written
+    end
+
+    it("writes every target the state names, and leaves the one recorded missing alone", function()
+        local r
+        local written = writing(function()
+            r = coding.restore(events, "baseline")
+        end)
+        expect(written["/run/a.lua"]).to.be("A0")
+        expect(written["/run/b.lua"]).to.be(nil)
+        expect(r.restored).to.equal({ "/run/a.lua" })
+        expect(r.missing).to.equal({ "/run/b.lua" })
+    end)
+
+    it("re-roots every path under another repo when one is given", function()
+        local r
+        local written = writing(function()
+            r = coding.restore(events, "beat-1", "/copy/")
+        end)
+        expect(written["/copy/a.lua"]).to.be("A1")
+        expect(written["/copy/sub/b.lua"]).to.be("B1")
+        expect(written["/run/a.lua"]).to.be(nil)
+        expect(r.restored).to.equal({ "/copy/a.lua", "/copy/sub/b.lua" })
+    end)
+
+    it("refuses a beat with no recorded state, and a beat that is not a string", function()
+        local ok, err = pcall(writing, function()
+            coding.restore(events, "beat-2")
+        end)
+        expect(ok).to.be(false)
+        expect(tostring(err):find("records no state of the files after beat beat-2", 1, true) ~= nil).to.be(true)
+        local ok2, err2 = pcall(coding.restore, events, nil)
+        expect(ok2).to.be(false)
+        expect(tostring(err2):find("beat must be", 1, true) ~= nil).to.be(true)
     end)
 end)

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `coding.run` records the state of the files, on by default (`checkpoint =
+  true`, an Exec knob `strict` requires and `config` names). The log held
+  every tool call and what it answered but not what the files were, so what
+  beat N left on disk had no answer once the run moved on. Now the loop
+  appends a `checkpoint` event before the first beat and after every beat
+  that landed an edit — every target's version (the fingerprint
+  `std.fs.read_versioned` answers), the beat in `meta.beat`, the targets it
+  could not read under `missing` — and a `checkpoint_blob` for each content
+  the session has not recorded yet (`policy.shapes.checkpoint` /
+  `checkpoint_blob`). The loop appends and the policy reads:
+  `policy.checkpoints(log)` lists the states and `policy.checkpoint_at(log,
+  beat?)` resolves one to contents, from a session or from a finished run's
+  export. `coding.restore(log, beat, repo?)` writes a recorded state back —
+  under another directory when `repo` is given — and never deletes: a target
+  recorded missing is reported and left alone, and what the verify wrote
+  outside the targets was never recorded. `result.checkpoints` counts the
+  states. The cost is the log's size: each distinct content of every target,
+  once. `checkpoint = false` records none.
 - `result.config.room` (and the `config` event's `room`): the numbers the
   run's room worked out — `{ window, max_output, limit, held, reserve,
   result_limit, beat_budget, call_reserve? }`, in tokens — beside `values`,
