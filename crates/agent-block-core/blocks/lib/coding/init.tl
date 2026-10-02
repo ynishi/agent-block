@@ -105,7 +105,14 @@
 --   event and comes back as `result.config`: every knob with the value it ran
 --   at and where that value came from — `caller`, `default`, or `discovered`
 --   (the window a port asked its server for) — so what a run did is read off
---   its own log instead of reconstructed from the caller's source.
+--   its own log instead of reconstructed from the caller's source. Beside
+--   `values` sits `room`: the numbers the run's room worked out of those
+--   values — the window and the reply's cap, the prompt's `limit` and what
+--   `reserve` held back, one result's `result_limit`, one beat's
+--   `beat_budget`, and `call_reserve` when one was given. They are not knobs
+--   and have no `from`; where they came from is the `values` they were
+--   computed from (`context_window`, `max_tokens`, `reserve`, `result_share`,
+--   `beat_share`, `call_reserve`).
 --
 -- What this module is
 --   A CONSUMER of the kernel, beside `agent`: the kernel provides one beat and
@@ -306,11 +313,27 @@ local record Setting ---@struct
     from: string
 end
 
+--- The numbers the run's room worked out (`policy.room`), as `config.room`
+--- carries them: computed from `values`, not named by anyone, so with no
+--- `from`. `call_reserve` is absent when the room was built without one.
+local record RoomFigures ---@struct
+    window: integer
+    max_output: integer
+    limit: integer
+    held: integer
+    reserve: integer
+    result_limit: integer
+    beat_budget: integer
+    call_reserve: integer ---@optional
+end
+
 --- What the run was configured with: the `config` event's data, and
---- `result.config`.
+--- `result.config`. `values` is what the run ran at and where each came from;
+--- `room` is what the room computed from them.
 local record Config ---@struct
     strict: boolean
     values: {string:Setting}
+    room: RoomFigures
 end
 
 --- The values `config_of` is handed because the run worked them out itself.
@@ -326,6 +349,8 @@ local record Resolved ---@struct
     window: number
     --- The compaction as it runs, or `false` when the caller turned it off.
     compact: CompactOpt | boolean
+    --- The room's numbers, read off the room `prepare` built.
+    room: RoomFigures
 end
 
 --- One step of a plan: what it does, and the shell command that says it is
@@ -694,7 +719,8 @@ local RUN_RESULT = T.shape({
     :describe(
         "what the run was configured with, the same table the `config` event carries: "
             .. '{ strict = <boolean>, values = { <knob> = { value = <v>, from = "caller" | "default" | '
-            .. '"discovered" } ... } }'
+            .. '"discovered" } ... }, room = { window, max_output, limit, held, reserve, result_limit, '
+            .. "beat_budget, call_reserve? } } — `room` is what the room computed from `values`, in tokens"
     )
     :is_optional(),
     plan = T.table
@@ -1426,11 +1452,14 @@ end
 --- `opts` says what the caller named; `resolved` carries the values the run
 --- worked out for itself, which are not read off `opts` — the defaults
 --- applied, the repo with its trailing slash gone, the targets as absolute
---- paths, the system line, the window, and the compaction as it runs.
+--- paths, the system line, the window, the compaction as it runs, and the
+--- numbers the room worked out — which come back as `room`, beside `values`
+--- and not in it: they are computed from the knobs, not knobs themselves, so
+--- a reader walking `values` meets only what a caller can name.
 ---
 --- @param opts table  the caller's opts, as `run` received them
---- @param resolved table  { iters, turns, done, ops, seed, repo, system, targets, window, compact }
---- @return table  { strict = <boolean>, values = { <knob> = { value, from } ... } }
+--- @param resolved table  { iters, turns, done, ops, seed, repo, system, targets, window, compact, room }
+--- @return table  { strict = <boolean>, values = { <knob> = { value, from } ... }, room = { window, ... } }
 function M.config_of(opts: RunOpts, resolved: Resolved): Config
     local conf: {string:any} = (type(opts.llm) == "table" and opts.llm.conf) or {}
     local values: {string:Setting} = {
@@ -1485,7 +1514,25 @@ function M.config_of(opts: RunOpts, resolved: Resolved): Config
     } as {string:any}) do
         values[key] = named(value, true)
     end
-    return { strict = opts.strict == true, values = values }
+    return { strict = opts.strict == true, values = values, room = resolved.room }
+end
+
+--- The numbers `config.room` carries, read off the room: the division
+--- `split()` answers (window, reply cap, limit, held) and the rest of what
+--- the room worked out. Reads only — the room is frozen — and leaves
+--- `call_reserve` out when the room was built without one.
+local function figures_of(r: room.Room): RoomFigures
+    local split = r:split()
+    return {
+        window = split.window as integer,
+        max_output = split.max_output as integer,
+        limit = split.limit as integer,
+        held = split.held as integer,
+        reserve = r.reserve,
+        result_limit = r.result_limit,
+        beat_budget = r.beat_budget,
+        call_reserve = r.call_reserve,
+    }
 end
 
 -- ============================================================
@@ -1816,6 +1863,7 @@ local function prepare(opts: RunOpts): Run
             targets = targets,
             window = window,
             compact = compact or false,
+            room = figures_of(the_room),
         }),
         iters = 0,
         converged = false,

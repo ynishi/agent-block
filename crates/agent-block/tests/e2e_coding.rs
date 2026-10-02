@@ -171,6 +171,8 @@ async fn coding_run_converges_when_the_model_declares_on_a_green_verify() {
     says(&ran.stdout, "baseline_ok=false");
     says(&ran.stdout, "config.values.iters.from=caller");
     says(&ran.stdout, "config.values.context_window.from=caller");
+    says(&ran.stdout, "config.room.window=32768");
+    says(&ran.stdout, "config.room.result_within_beat=true");
     assert_eq!(ran.calls, 2, "one beat per turn: the edit, then the answer");
 
     // The edit landed on disk, which is the only place it could have.

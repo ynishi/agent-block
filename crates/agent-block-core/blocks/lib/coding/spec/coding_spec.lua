@@ -42,7 +42,8 @@
 --     carrying the `config` the run was started with;
 --  12 config_of: where each value came from — `caller` for one the caller
 --     named, `default` for one it did not, `discovered` for a window the conf
---     left to the port, and no entry at all for a value nobody gave;
+--     left to the port, and no entry at all for a value nobody gave; and the
+--     room's numbers beside `values` as `room`, not among them;
 --  13 result_of: the result out of a converged state and out of one that gave
 --     up, and what plan mode puts on it — the counts, the checks still
 --     failing, and a plan nobody filed;
@@ -700,6 +701,15 @@ describe("coding.config_of — what the run was configured with", function()
         targets = { "/r/a.rs" },
         window = 32768,
         compact = { at = 0.8 },
+        room = {
+            window = 32768,
+            max_output = 4096,
+            limit = 28672,
+            held = 4096,
+            reserve = 0,
+            result_limit = 8601,
+            beat_budget = 14336,
+        },
     }
     local function config(over, resolved_over)
         local opts = { llm = { port = {}, conf = conf }, verify = "true" }
@@ -715,6 +725,25 @@ describe("coding.config_of — what the run was configured with", function()
         end
         return coding.config_of(opts, r)
     end
+
+    it("carries the room's numbers as `room`, beside `values` and not in it", function()
+        local c = config({})
+        expect(c.room).to.equal(resolved.room)
+        expect(c.room.call_reserve).to.be(nil)
+        -- No room number became a knob: `values` holds the 21 knobs it always
+        -- has plus the conf's `model` and `max_tokens`, as before the room
+        -- was carried.
+        local n = 0
+        for _ in pairs(c.values) do
+            n = n + 1
+        end
+        expect(n).to.be(23)
+        for _, key in ipairs({ "limit", "held", "result_limit", "beat_budget", "window", "max_output" }) do
+            expect(c.values[key]).to.be(nil)
+        end
+        local reserved = config({ call_reserve = 3072 }, { room = { call_reserve = 3072 } })
+        expect(reserved.room.call_reserve).to.be(3072)
+    end)
 
     it("carries the beat share — the default half, or the caller's", function()
         expect(config({}).values.beat_share.from).to.be("default")

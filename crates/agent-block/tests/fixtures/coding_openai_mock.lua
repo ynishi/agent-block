@@ -105,4 +105,13 @@ if result.plan then
 end
 print("config.values.iters.from=" .. tostring(result.config.values.iters.from))
 print("config.values.context_window.from=" .. tostring(result.config.values.context_window.from))
+-- The room's numbers ride beside `values`: the window the room was built
+-- over, and a result limit inside the beat's budget.
+print("config.room.window=" .. tostring(result.config.room.window))
+print(
+    "config.room.result_within_beat="
+        .. tostring(
+            result.config.room.result_limit > 0 and result.config.room.result_limit <= result.config.room.beat_budget
+        )
+)
 print("CODING_MOCK_DONE")

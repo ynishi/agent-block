@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `result.config.room` (and the `config` event's `room`): the numbers the
+  run's room worked out — `{ window, max_output, limit, held, reserve,
+  result_limit, beat_budget, call_reserve? }`, in tokens — beside `values`,
+  not inside it. `values` stays the table of knobs a caller can name and
+  where each came from; `room` is what was computed from them, so it has no
+  `from`, and `call_reserve` is absent when the run gave none. Before this a
+  run's log said which shares it ran at but not what one result or one beat
+  was allowed, and reading a refusal's `limit` back to its cause meant
+  redoing the room's arithmetic from the profile. Nothing that was in
+  `config` moved.
+
 ### Changed
 
 ### Deprecated
