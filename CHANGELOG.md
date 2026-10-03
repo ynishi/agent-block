@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.42.0] - 2026-10-03
+
+### Added
+
 - `coding.fork(log, beat, opts)`: a new run that continues an earlier one
   from the end of `beat` under new conditions — another model, another room,
   other knobs — so two of them can be compared from the same middle of a run
