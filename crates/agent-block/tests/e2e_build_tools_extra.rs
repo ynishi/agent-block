@@ -42,7 +42,11 @@ fn build_tools_extra_flatten() {
                 .and(predicate::str::contains("flat.name=flat_y"))
                 .and(predicate::str::contains("flat.description=flat desc"))
                 .and(predicate::str::contains("nested.group=nil"))
-                .and(predicate::str::contains("flat.group=nil")),
+                .and(predicate::str::contains("flat.group=nil"))
+                .and(predicate::str::contains("handled.name=flat_h"))
+                .and(predicate::str::contains("handled.handler=nil"))
+                .and(predicate::str::contains("decls.encode=true"))
+                .and(predicate::str::contains("handled.call=banana")),
         );
 }
 
