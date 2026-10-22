@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/agent-block"
 readme = "../../README.md"
 keywords = ["lua", "agent", "runtime", "mcp", "mesh"]
 categories = ["command-line-utilities", "development-tools"]

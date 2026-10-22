@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/agent-block-mcp"
 description = "rmcp client wrapper for agent-block (MCP server lifecycle + custom handler)"
 
 [features]

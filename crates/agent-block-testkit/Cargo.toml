@@ -6,6 +6,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/agent-block-testkit"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
