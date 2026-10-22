@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Teal toolchain: `htl` is 0.18 (and `htl-cli` in `mise.toml`) and `mlua-isle` is 0.10. The Teal modules narrow with `is` instead of comparing `type(..)`, which is what htl's `type-guard` lint asks for; the compiled Lua behaves the same. They type lshape with htl's own declaration of its surface — a shape is held as `lshape.AnySchema`, and `lshape.t.fn` is the function shape instead of one built from lshape's private metatable — and the host now takes `lshape.d.tl` from htl rather than from the tree, which keeps a copy for the checker that a test pins to htl's. That declaration names the lshape it is written for (`-- lshape: 0.3`), and `htl check` reports `lshape-version` when the vendored lshape's `_VERSION` is outside it, so a later `htl` that declares another lshape fails the Teal gate instead of the run.
+- **Breaking (Teal):** the `lshape.d.tl` the host hands a project's `.tl` checker is now htl's. A project `.tl` written against the old one moves with it: `lshape.Schema` is `lshape.AnySchema` (or `lshape.Schema<T>` for a shape of a known type), `lshape.T` / `lshape.Check` are `lshape.Combinators` / `lshape.Checker`, a function shape is `lshape.t.fn` rather than one built on `lshape.t._internal.schema_mt` (no longer declared), and `lshape._VERSION` is no longer declared. The Lua that runs is unchanged.
+
 ### Deprecated
 
 ### Removed

@@ -185,13 +185,13 @@ end
 
 local record M
     record Shapes
-        llm_result: lshape.Schema
-        llm_usage: lshape.Schema
-        tool_use_block: lshape.Schema
-        tool_spec: lshape.Schema
-        call_error: lshape.Schema
+        llm_result: lshape.AnySchema
+        llm_usage: lshape.AnySchema
+        tool_use_block: lshape.AnySchema
+        tool_spec: lshape.AnySchema
+        call_error: lshape.AnySchema
         call_error_kinds: {string}
-        tool_decl: lshape.Schema
+        tool_decl: lshape.AnySchema
     end
     shapes: Shapes
     LLMPort: LLMPort
@@ -368,7 +368,7 @@ M.LLMPort = LLMPort
 ---                       iff status == "refused").
 --- @return table port  a Port instance (impl with the LLMPort metatable)
 function LLMPort.new(impl: any): LLMPort
-    if type(impl) ~= "table" then
+    if not (impl is {string:any}) then
         error("LLMPort.new: impl must be a table")
     end
     local given = impl as {string:any}
@@ -515,8 +515,8 @@ local function estimate(request: any): integer
             bytes = bytes + 4
         elseif t == "table" then
             for k, child in pairs(v as {any:any}) do
-                if type(k) == "string" then
-                    bytes = bytes + #(k as string)
+                if k is string then
+                    bytes = bytes + #k
                 end
                 walk(child)
             end
@@ -797,7 +797,7 @@ function LLMPort:open(conf?: {string:any}): function(kernel.Request): kernel.Llm
         -- open" — a discriminated union would have to close the block
         -- vocabulary, which is the provider's and not the kernel's.
         for _, block in ipairs(mapped.content) do
-            if type(block) == "table" and (block as {string:any}).type == "tool_use" then
+            if block is {string:any} and block.type == "tool_use" then
                 shape.assert_dev(block, TOOL_USE_BLOCK, "llm_result content tool_use")
             end
         end
@@ -1020,7 +1020,7 @@ M.openai = LLMPort.new({
 --- kernel's shape. lshape has no "minus a field" combinator — `T.partial`
 --- makes every field optional, which would give up the one thing checked
 --- loudly here — so the subset is named field by field.
-local KERNEL_TOOL_FIELDS = (kernel.shapes.tool_spec as {string:any}).fields as {string:lshape.Schema}
+local KERNEL_TOOL_FIELDS = (kernel.shapes.tool_spec as {string:any}).fields as {string:lshape.AnySchema}
 local TOOL_DECL = T.shape({
     name = KERNEL_TOOL_FIELDS.name,
     description = KERNEL_TOOL_FIELDS.description,
@@ -1039,7 +1039,7 @@ M.ToolPort = ToolPort
 ---                     inside invoke, never surfaced as a convention).
 --- @return table port  a Port instance (impl with the ToolPort metatable)
 function ToolPort.new(impl: any): ToolPort
-    if type(impl) ~= "table" then
+    if not (impl is {string:any}) then
         error("ToolPort.new: impl must be a table")
     end
     local given = impl as {string:any}

@@ -46,7 +46,7 @@ local record M
     type CompactFactory = function(CompactOpts): Due, Fold
     type LedgerFn = function(kernel.Session): shared.Ledger
     type LedgerFactory = function(?LedgerOpts): LedgerFn
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 
@@ -156,7 +156,7 @@ local function due_of(events: {shared.Event}, at: number, min_beats: integer): s
         end
         if ev.kind == "llm_request" then
             local report = data_of(ev).window
-            if type(report) == "table" then
+            if report is {string:any} then
                 last_report = report as kernel.WindowReport
             end
         end
@@ -205,7 +205,7 @@ end
 --- One value as the text the prose names it by: a string verbatim, anything
 --- else as JSON.
 local function as_text(value: any): string
-    if type(value) == "string" then
+    if value is string then
         return value as string
     end
     if value == nil then
@@ -217,12 +217,12 @@ end
 --- A message's content as prose: text blocks verbatim, a tool call and a
 --- tool result as one line each, everything else left out.
 local function prose_of(content: any): string
-    if type(content) ~= "table" then
+    if not (content is {string:any}) then
         return as_text(content)
     end
     local lines: {string} = {}
     for _, item in ipairs(content as {any}) do
-        local block = (type(item) == "table" and item or {}) as {string:any}
+        local block: {string:any} = item is {string:any} and item or {}
         if block.type == "text" and type(block.text) == "string" then
             lines[#lines + 1] = block.text as string
         elseif block.type == "tool_use" then
@@ -392,10 +392,10 @@ local function ledger_of(events: {shared.Event}, track: {string}, kinds: {string
             local name = tostring(data.name)
             out.calls[name] = (out.calls[name] or 0) + 1
             local args = data.args
-            if type(args) == "table" then
+            if args is {string:any} then
                 for _, key in ipairs(track) do
-                    local value = (args as {string:any})[key]
-                    if type(value) == "string" then
+                    local value = args[key]
+                    if value is string then
                         local by_key = values[name]
                         if by_key == nil then
                             by_key = {}
@@ -461,11 +461,11 @@ function M.ledger(opts?: LedgerOpts): M.LedgerFn
     for _, key in ipairs({ "track", "kinds" }) do
         local list = (opts as {string:any})[key]
         if list ~= nil then
-            if type(list) ~= "table" then
+            if not (list is {string:any}) then
                 error("policy.ledger: " .. key .. " must be an array of strings", 2)
             end
             for i, item in ipairs(list as {any}) do
-                if type(item) ~= "string" or item == "" then
+                if not (item is string) or item == "" then
                     error("policy.ledger: " .. key .. "[" .. i .. "] must be a non-empty string", 2)
                 end
             end

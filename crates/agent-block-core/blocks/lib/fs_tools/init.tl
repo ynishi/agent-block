@@ -143,8 +143,8 @@ local record M
     end
     --- The opts contract, as data. Built whole, once.
     record Shapes ---@struct
-        tool_specs_opts: lshape.Schema
-        register_tools_opts: lshape.Schema
+        tool_specs_opts: lshape.AnySchema
+        register_tools_opts: lshape.AnySchema
     end
     shapes: Shapes
 end
@@ -170,7 +170,7 @@ end
 --- wrote. That is one mistake with two answers, split by an environment
 --- variable. `policy`'s `opts_contract` splits the same way for the same
 --- reason.
-local TOOL_SPECS_OPTS: lshape.Schema
+local TOOL_SPECS_OPTS: lshape.AnySchema
 if shape_ok then
     TOOL_SPECS_OPTS = T.shape({
         allowed = T.array_of(T.string)
@@ -537,8 +537,8 @@ local function context_of(opts: M.Opts): Ctx
         local rt = opts.limits.result_tokens
         if type(rt) == "function" then
             budget_tokens = rt as function(): number
-        elseif type(rt) == "number" then
-            local n = rt as number
+        elseif rt is number then
+            local n = rt
             budget_tokens = function(): number
                 return n
             end

@@ -237,14 +237,14 @@ local UNITS: {string:number} = { s = 1, m = 60, h = 3600, d = 86400 }
 --- @return number seconds
 function M.duration(v: any, who?: string): number
     who = who or "job.duration"
-    if type(v) == "number" then
-        local n = v as number
+    if v is number then
+        local n = v
         if n <= 0 then
             error(who .. ": a duration must be positive, got " .. tostring(v), 2)
         end
         return n
     end
-    if type(v) ~= "string" then
+    if not (v is string) then
         error(who .. ": a duration is a number of seconds or a string like '2m', got " .. tostring(v), 2)
     end
     local text = v as string

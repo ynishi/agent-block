@@ -74,7 +74,7 @@ local record M
     end
     --- The opts contract, as data. Built whole, once.
     record Shapes ---@struct
-        register_tools_opts: lshape.Schema
+        register_tools_opts: lshape.AnySchema
     end
     shapes: Shapes
 end
@@ -83,7 +83,7 @@ end
 --- this module does not know is a typo, and a typo that quietly became a
 --- no-op is a tool surface nobody chose — it looks exactly like the caller
 --- naming the ops and the prefix it meant.
-local REGISTER_TOOLS_OPTS: lshape.Schema
+local REGISTER_TOOLS_OPTS: lshape.AnySchema
 if shape_ok then
     REGISTER_TOOLS_OPTS = T.shape({
         allowed = T.array_of(T.string)

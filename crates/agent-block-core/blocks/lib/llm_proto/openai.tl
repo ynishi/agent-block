@@ -204,7 +204,7 @@ function M.flatten_for_strict_alternation(messages: {M.OaiMessage}): {M.OaiMessa
             role = "user"
         end
 
-        if type(text) ~= "string" then
+        if not (text is string) then
             text = text and std.json.encode(text) or ""
         end
         local line = text as string
@@ -697,7 +697,7 @@ function M.parse(raw: {string:any}): proto.Decoded, string
     -- No reasoning field, but the tags are in the text: llama.cpp with
     -- `--reasoning-format none` leaves them there, and DeepSeek-R1 sometimes
     -- omits the opening tag so the parser never splits it out.
-    if not reasoning and type(text) == "string" and (text as string):find("</think>", 1, true) then
+    if not reasoning and text is string and text:find("</think>", 1, true) then
         local split, rest = M.split_think(text as string)
         reasoning, text = split, rest
     end
@@ -721,11 +721,11 @@ function M.parse(raw: {string:any}): proto.Decoded, string
 
         local input: {string:any}
         local raw_args = fn.arguments
-        if type(raw_args) == "table" then
+        if raw_args is {string:any} then
             input = raw_args as {string:any}
         else
             local ok, parsed = pcall(std.json.decode, (raw_args or "{}") as string)
-            if ok and type(parsed) == "table" then
+            if ok and parsed is {string:any} then
                 input = parsed as {string:any}
             else
                 log.warn(
@@ -915,7 +915,7 @@ function M.profile(spec?: proto.Spec): proto.Profile, string
             return nil, err
         end
         for key, value in pairs((decoded.model_info or {}) as {string:any}) do
-            if type(key) == "string" and key:match("%.context_length$") and type(value) == "number" then
+            if type(key) == "string" and key:match("%.context_length$") and value is number then
                 window = value as number
             end
         end

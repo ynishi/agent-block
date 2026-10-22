@@ -81,7 +81,7 @@ local record M
     type StagnationFactory = function(StagnationOpts): Predicate
     type RetryFactory = function(RetryOpts): RetryFn
     type EscalateFactory = function(EscalateOpts): Next
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 
@@ -205,9 +205,9 @@ local function checks_of(events: {shared.Event}, kind: string): {Check}
             local data = ev.data as {string:any}
             local prev = events[i - 1]
             local at, before = ev.epoch_ms, prev and prev.epoch_ms
-            if type(at) == "number" and type(before) == "number" and (at as number) >= (before as number) then
+            if at is number and before is number and at >= before then
                 found[#found + 1] = {
-                    seconds = ((at as number) - (before as number)) / 1000,
+                    seconds = (at - before) / 1000,
                     ok = data.ok == true,
                     ran = data.ran ~= false,
                     timeout_s = type(data.timeout_s) == "number" and data.timeout_s as number or nil,
@@ -295,8 +295,8 @@ local function measure_of(measure: any): Measure
     if type(measure) == "function" then
         return measure as Measure
     end
-    if type(measure) == "string" and MEASURES[measure as string] then
-        return MEASURES[measure as string]
+    if measure is string and MEASURES[measure] then
+        return MEASURES[measure]
     end
     local names: {string} = {}
     for name in pairs(MEASURES) do
@@ -430,7 +430,7 @@ function M.verdict(opts?: VerdictOpts): M.VerdictFn
             end
             for _, k in ipairs({ "factor", "floor" }) do
                 local v = given[k]
-                if v ~= nil and (type(v) ~= "number" or (v as number) <= 0) then
+                if v ~= nil and (not (v is number) or v <= 0) then
                     error("policy.verdict: timeout." .. k .. " must be a positive number", 2)
                 end
             end
@@ -854,7 +854,7 @@ local function default_when(outcome: kernel.OutcomeValue): boolean
         return false
     end
     local detail = outcome.detail
-    return not (type(detail) == "table" and (detail as {string:any}).retryable == true)
+    return not (detail is {string:any} and detail.retryable == true)
 end
 
 --- Build `next(outcome, device) -> device`: the device the following beat

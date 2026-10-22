@@ -150,7 +150,7 @@ local record M
     type BeatCapFactory = function(BeatCapOpts): Bind
     type ThinkingCapFactory = function(ThinkingCapOpts): Filter
     type RoomNoteFactory = function(RoomNoteOpts): Filter
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 
@@ -531,7 +531,7 @@ local ROOM_TAG = "policy.room"
 
 --- Whether `v` is a room this file built.
 function M.is_room(v: any): boolean
-    return type(v) == "table" and (getmetatable(v) as any) == ROOM_TAG
+    return v is {string:any} and (getmetatable(v) as any) == ROOM_TAG
 end
 
 --- A Port's count, held to being a number.
@@ -603,7 +603,7 @@ function M.room(opts: M.RoomOpts): M.Room
     end
     for _, key in ipairs({ "result_share", "beat_share" }) do
         local share = (opts as {string:any})[key]
-        if share ~= nil and (type(share) ~= "number" or (share as number) <= 0 or (share as number) > 1) then
+        if share ~= nil and (not (share is number) or share <= 0 or share > 1) then
             error("policy.room: " .. key .. " must be a number in (0, 1], got " .. tostring(share), 2)
         end
     end
@@ -1184,7 +1184,7 @@ end
 --- verbatim, anything else as JSON — because that rendering is what the
 --- window pays for, not the table.
 local function rendered(result: any): string
-    if type(result) == "string" then
+    if result is string then
         return result as string
     end
     return std.json.encode(result)
@@ -1449,7 +1449,7 @@ function M.thinking_cap(opts: M.ThinkingCapOpts): M.Filter
     -- request's table replaces the conf's — so a budget sent over a conf that
     -- said nothing would be the thing that turned reasoning on.
     local declared = conf.thinking
-    local on = declared == true or (type(declared) == "table" and (declared as {string:any}).enabled ~= false)
+    local on = declared == true or (declared is {string:any} and declared.enabled ~= false)
     if not on then
         error(
             "policy.thinking_cap: the conf does not turn reasoning on (thinking = true, or { enabled = true, ... }); "
@@ -1480,7 +1480,7 @@ function M.thinking_cap(opts: M.ThinkingCapOpts): M.Filter
         -- `enabled`, a table as its keys — the construction above has already
         -- said it is one of those two.
         local thinking: {string:any} = {}
-        if type(declared) == "table" then
+        if declared is {string:any} then
             for key, value in pairs(declared as {string:any}) do
                 thinking[key] = value
             end

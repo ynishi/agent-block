@@ -66,7 +66,7 @@ M.NS = "_agent_block_session"
 --- The id a caller names a conversation by: a non-empty string. Checked at
 --- run time as well as at build, because the caller is a Lua script.
 local function assert_id(id: any)
-    if type(id) ~= "string" or id == "" then
+    if not (id is string) or id == "" then
         error("session: id must be a non-empty string", 3)
     end
 end
@@ -79,7 +79,7 @@ function M.load(id: string): Messages
     if v == nil then
         return {}
     end
-    if type(v) ~= "table" then
+    if not (v is {string:any}) then
         -- Defensive: a non-table value would mean the slot was clobbered by
         -- something other than session.save. Surface as empty so a corrupted
         -- row does not crash the agent loop; caller can session.clear(id).

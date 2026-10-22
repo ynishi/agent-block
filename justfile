@@ -3,9 +3,9 @@
 # Every file in the tree a generator owns, written by `gen` and by nothing
 # else. One list, because two consumers read it — `gen` regenerates these and
 # the pre-commit hook checks that doing so changed nothing — and a second copy
-# is a copy that goes stale. Each is also in `.styluaignore`, for the reason
-# written there.
-generated := "crates/agent-block-core/blocks/lib/knl_types.d.tl crates/agent-block-core/blocks/lib/knl_types.lua"
+# is a copy that goes stale. The Lua one is also in `.styluaignore`, for the
+# reason written there.
+generated := "crates/agent-block-core/blocks/lib/knl_types.d.tl crates/agent-block-core/blocks/lib/knl_types.lua crates/agent-block-core/blocks/lib/lshape.d.tl"
 
 # [allow-agent]
 # Everything a commit has to pass: regenerate, format, lint, Rust tests, Lua
@@ -36,12 +36,15 @@ check: gen lint test test-lua check-tl test-tl
 # no host load — by the test that also pins them, which writes instead of
 # comparing when `AGENT_BLOCK_WRITE_DTS` is set. Generating and checking from
 # one place is deliberate: a separate generator binary would be a second
-# renderer to keep in step with the first.
+# renderer to keep in step with the first. `lshape.d.tl` is the one file here
+# not rendered from this repo's Rust: it is the declaration the `htl` crate
+# ships, copied into the tree for the checker, and a second test pins it.
 #
 # Idempotent, and safe to run on a clean tree: it writes the same bytes the
-# tests then assert. Run it after the Rust types move, or just run `check`.
+# tests then assert. Run it after the Rust types move or `htl` is bumped, or
+# just run `check`.
 gen:
-    AGENT_BLOCK_WRITE_DTS=1 cargo test -p agent-block-core knl_types_declaration_in_the_tree_is_current
+    AGENT_BLOCK_WRITE_DTS=1 cargo test -p agent-block-core -- knl_types_declaration_in_the_tree_is_current lshape_declaration_in_the_tree_is_current
 
 # [allow-agent]
 # Point this repo's git at the tracked hooks in `.githooks/`.
