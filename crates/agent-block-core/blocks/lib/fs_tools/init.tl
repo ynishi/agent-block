@@ -537,8 +537,8 @@ local function context_of(opts: M.Opts): Ctx
         local rt = opts.limits.result_tokens
         if type(rt) == "function" then
             budget_tokens = rt as function(): number
-        elseif type(rt) == "number" then
-            local n = rt as number
+        elseif rt is number then
+            local n = rt
             budget_tokens = function(): number
                 return n
             end

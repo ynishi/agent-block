@@ -274,7 +274,7 @@ function M.normalize_tool_choice(tc: any): M.ToolChoice, string
         return nil, nil
     end
 
-    if type(tc) == "string" then
+    if tc is string then
         local word = tc as string
         if word == "auto" or word == "none" then
             return { kind = word }, nil
@@ -284,7 +284,7 @@ function M.normalize_tool_choice(tc: any): M.ToolChoice, string
         return nil, "invalid tool_choice string: " .. word
     end
 
-    if type(tc) ~= "table" then
+    if not (tc is {string:any}) then
         return nil, "tool_choice must be a string or table, got " .. type(tc)
     end
 
@@ -347,11 +347,11 @@ function M.normalize_thinking(t: any): M.Thinking, string
         return nil, nil
     end
 
-    if type(t) == "boolean" then
+    if t is boolean then
         return { enabled = t as boolean, mode = "auto" }, nil
     end
 
-    if type(t) ~= "table" then
+    if not (t is {string:any}) then
         return nil, "thinking must be a boolean or table, got " .. type(t)
     end
 
@@ -365,7 +365,7 @@ function M.normalize_thinking(t: any): M.Thinking, string
 
     local effort = given.effort
     if effort ~= nil then
-        if type(effort) ~= "string" or not VALID_EFFORT[effort as string] then
+        if not (effort is string) or not VALID_EFFORT[effort] then
             return nil, "invalid thinking.effort: " .. tostring(effort)
         end
     end
@@ -418,11 +418,11 @@ local QUOTA_CODES: {string:boolean} = {
 --- @return table  { kind, retryable, retry_after (seconds|nil), code, message }
 function M.classify_error(status: integer, body: any, headers?: {string:any}): M.Classified
     local decoded: any = body
-    if type(body) == "string" and body ~= "" then
+    if body is string and body ~= "" then
         local ok, parsed = pcall(std.json.decode, body as string)
         decoded = ok and parsed or nil
     end
-    if type(decoded) ~= "table" then
+    if not (decoded is {string:any}) then
         decoded = {}
     end
     local answered = decoded as {string:any}
@@ -760,7 +760,7 @@ local ARRAY_TAG: {string:string} = { __jsontype = "array" }
 --- and notes the call as failed, which is the honest ending for a response
 --- nobody can read.
 local function response_blocks(content: any): any
-    if type(content) == "table" and #(content as {any}) == 0 then
+    if content is {any} and #content == 0 then
         local empty: any = {}
         return setmetatable(empty, ARRAY_TAG as metatable<any>)
     end
@@ -936,7 +936,7 @@ function M.probe(method: string, url: string, headers: {string:string}, body?: {
         return nil, "probe " .. url .. ": HTTP " .. tostring(resp.status) .. ": " .. tostring(classified.message)
     end
     local decoded_ok, decoded = pcall(std.json.decode, resp.body)
-    if not decoded_ok or type(decoded) ~= "table" then
+    if not decoded_ok or not (decoded is {string:any}) then
         return nil, "probe " .. url .. ": response JSON decode failed"
     end
     return decoded as {string:any}, nil
@@ -1035,8 +1035,8 @@ function M.estimate_tokens(request: any, bytes_per_token?: number): integer
             bytes = bytes + 4
         elseif t == "table" then
             for k, child in pairs(v as {any:any}) do
-                if type(k) == "string" then
-                    bytes = bytes + #(k as string)
+                if k is string then
+                    bytes = bytes + #k
                 end
                 walk(child)
             end

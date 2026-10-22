@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Teal toolchain: `htl` is 0.16 (and `htl-cli` in `mise.toml`) and `mlua-isle` is 0.10. The Teal modules narrow with `is` instead of comparing `type(..)`, which is what htl 0.16's `type-guard` lint asks for; the compiled Lua behaves the same.
+
 ### Deprecated
 
 ### Removed

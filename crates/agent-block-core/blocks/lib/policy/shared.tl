@@ -318,7 +318,7 @@ end
 --- a window of 0 beats or a retry cap of 0 attempts is a policy that silently
 --- does the opposite of what it says.
 function S.whole_at_least(v: any, min: number): boolean
-    return type(v) == "number" and (v as number) % 1 == 0 and (v as number) >= min
+    return v is number and v % 1 == 0 and v >= min
 end
 
 --- Reject an option this factory does not know.

@@ -157,9 +157,9 @@ local function events_of(source: any, who: string): {shared.Event}
     if kernel.is_session(source) then
         return whole_log(source as kernel.Session, who)
     end
-    if type(source) == "table" then
+    if source is {string:any} then
         for i, ev in ipairs(source as {any}) do
-            if type(ev) ~= "table" then
+            if not (ev is {string:any}) then
                 error(who .. ": log[" .. tostring(i) .. "] is not an event (" .. type(ev) .. ")", 3)
             end
         end
@@ -182,7 +182,7 @@ local function point_of(ev: shared.Event): M.Checkpoint
     local files: {string:string} = {}
     if type(data.files) == "table" then
         for path, version in pairs(data.files as {any:any}) do
-            if type(path) == "string" and type(version) == "string" then
+            if path is string and version is string then
                 files[path as string] = version as string
             end
         end
@@ -190,7 +190,7 @@ local function point_of(ev: shared.Event): M.Checkpoint
     local missing = array() as {string}
     if type(data.missing) == "table" then
         for _, path in ipairs(data.missing as {any}) do
-            if type(path) == "string" then
+            if path is string then
                 missing[#missing + 1] = path as string
             end
         end
@@ -198,7 +198,7 @@ local function point_of(ev: shared.Event): M.Checkpoint
     local seq = ev.seq
     return {
         beat = beat_of(ev) or BASELINE,
-        seq = type(seq) == "number" and seq as integer or nil,
+        seq = seq is number and seq as integer or nil,
         files = files,
         missing = missing,
     }

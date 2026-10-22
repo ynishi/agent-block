@@ -368,7 +368,7 @@ M.LLMPort = LLMPort
 ---                       iff status == "refused").
 --- @return table port  a Port instance (impl with the LLMPort metatable)
 function LLMPort.new(impl: any): LLMPort
-    if type(impl) ~= "table" then
+    if not (impl is {string:any}) then
         error("LLMPort.new: impl must be a table")
     end
     local given = impl as {string:any}
@@ -515,8 +515,8 @@ local function estimate(request: any): integer
             bytes = bytes + 4
         elseif t == "table" then
             for k, child in pairs(v as {any:any}) do
-                if type(k) == "string" then
-                    bytes = bytes + #(k as string)
+                if k is string then
+                    bytes = bytes + #k
                 end
                 walk(child)
             end
@@ -797,7 +797,7 @@ function LLMPort:open(conf?: {string:any}): function(kernel.Request): kernel.Llm
         -- open" — a discriminated union would have to close the block
         -- vocabulary, which is the provider's and not the kernel's.
         for _, block in ipairs(mapped.content) do
-            if type(block) == "table" and (block as {string:any}).type == "tool_use" then
+            if block is {string:any} and block.type == "tool_use" then
                 shape.assert_dev(block, TOOL_USE_BLOCK, "llm_result content tool_use")
             end
         end
@@ -1039,7 +1039,7 @@ M.ToolPort = ToolPort
 ---                     inside invoke, never surfaced as a convention).
 --- @return table port  a Port instance (impl with the ToolPort metatable)
 function ToolPort.new(impl: any): ToolPort
-    if type(impl) ~= "table" then
+    if not (impl is {string:any}) then
         error("ToolPort.new: impl must be a table")
     end
     local given = impl as {string:any}

@@ -194,7 +194,7 @@ end
 --- which is a child that can never beat and a supervisor that looks like it
 --- worked.
 local function whole_at_least(v: any, min: number): boolean
-    return type(v) == "number" and (v as number) % 1 == 0 and (v as number) >= min
+    return v is number and v % 1 == 0 and v >= min
 end
 
 --- Reject an option this call does not know. Loud, and in prod too.
@@ -239,7 +239,7 @@ local function read_error(e: any): kernel.Error
     local bridge = rawget(_G as {string:any}, "knl") as {string:any}
     if type(bridge) == "table" and type(bridge.error) == "function" then
         local ok, structured = pcall((bridge.error as function(any): any), e)
-        if ok and type(structured) == "table" then
+        if ok and structured is {string:any} then
             return structured as kernel.Error
         end
     end
@@ -725,7 +725,7 @@ local function decoded(decode: function(string): any, value: any): any
     if value == nil then
         return nil
     end
-    if type(value) == "table" then
+    if value is {string:any} then
         return value
     end
     return decode(value as string)
@@ -734,7 +734,7 @@ end
 --- A session, as the id a query binds: a string is one already, a handle is
 --- asked for its own.
 local function stream_id(value: any, who: string): string
-    if type(value) == "string" then
+    if value is string then
         return value as string
     end
     if is_handle(value) then

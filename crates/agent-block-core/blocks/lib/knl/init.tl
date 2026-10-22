@@ -675,7 +675,7 @@ local function read_error(e: any): Error
         -- `pcall` answers `any`, and what came back is the reader this
         -- module just resolved: a function of the raised value.
         local read_ok, structured = pcall((reader as function(any): any), e)
-        if read_ok and type(structured) == "table" then
+        if read_ok and structured is {string:any} then
             return structured as Error
         end
     end
@@ -735,25 +735,25 @@ end
 function Outcome.is_ok(o: any): boolean
     -- A predicate takes whatever a caller holds, so the status is read off
     -- the Outcome shape it is being tested against.
-    return type(o) == "table" and (o as OutcomeValue).status == "ok"
+    return o is {string:any} and (o as OutcomeValue).status == "ok"
 end
 
 function Outcome.is_refused(o: any): boolean
     -- A predicate takes whatever a caller holds, so the status is read off
     -- the Outcome shape it is being tested against.
-    return type(o) == "table" and (o as OutcomeValue).status == "refused"
+    return o is {string:any} and (o as OutcomeValue).status == "refused"
 end
 
 function Outcome.is_error(o: any): boolean
     -- A predicate takes whatever a caller holds, so the status is read off
     -- the Outcome shape it is being tested against.
-    return type(o) == "table" and (o as OutcomeValue).status == "error"
+    return o is {string:any} and (o as OutcomeValue).status == "error"
 end
 
 function Outcome.is_stopped(o: any): boolean
     -- A predicate takes whatever a caller holds, so the status is read off
     -- the Outcome shape it is being tested against.
-    return type(o) == "table" and (o as OutcomeValue).status == "stopped"
+    return o is {string:any} and (o as OutcomeValue).status == "stopped"
 end
 
 --- Match an Outcome against `arms = { ok = fn, refused = fn, error = fn,
@@ -801,7 +801,7 @@ end
 --- Render a tool_result's payload as request text: a string verbatim, any
 --- other value JSON-encoded (the envelope already carries the rest).
 local function result_text(result: any): string
-    if type(result) == "string" then
+    if result is string then
         return result as string
     end
     return std.json.encode(result)
@@ -1122,8 +1122,8 @@ end
 local function raised_detail(message: string, caught: any): any
     -- `caught` is the value the xpcall handler put there — the map `traced`
     -- builds — and it is read by key.
-    if type(caught) == "table" and (caught as {string:any}).traced then
-        return { message = message, traceback = (caught as {string:any}).traceback }
+    if caught is {string:any} and caught.traced then
+        return { message = message, traceback = caught.traceback }
     end
     return message
 end
@@ -1155,7 +1155,7 @@ local function call_error(err: any, caught: any): {string:any}
     -- The port's own reading is carried through as it came, so the detail is
     -- the map it was, with the three judgements below written over it.
     local detail: {string:any} = {}
-    if type(err) == "table" then
+    if err is {string:any} then
         for k, v in pairs(err as {string:any}) do
             detail[k] = v
         end
@@ -1175,16 +1175,16 @@ local function call_error(err: any, caught: any): {string:any}
     if type(detail.message) ~= "string" then
         detail.message = tostring(err)
     end
-    if type(caught) == "table" and (caught as {string:any}).traced then
-        detail.traceback = (caught as {string:any}).traceback
+    if caught is {string:any} and caught.traced then
+        detail.traceback = caught.traceback
     end
     return detail
 end
 
 --- What a `traced` failure raised, as text.
 local function raised_text(caught: any): string
-    if type(caught) == "table" then
-        return tostring((caught as {string:any}).raised)
+    if caught is {string:any} then
+        return tostring(caught.raised)
     end
     return tostring(caught)
 end
@@ -1460,7 +1460,7 @@ local RESUME_STATE_KEYS: {string:boolean} = { store = true, session = true, budg
 --- Reject anything that is not a state key. Policy has its own constructor
 --- now, so `knl.open{ llm = ... }` is a typo, not a shorthand.
 local function state_only(opts: any, allowed: {string:boolean}, who: string)
-    if type(opts) ~= "table" then
+    if not (opts is {string:any}) then
         error(who .. ": opts must be a table", 3)
     end
     -- The accepted key set is the whole of the check, so the opts are walked
@@ -1795,7 +1795,7 @@ end
 --- @param resp any  whatever `device.llm` answered
 --- @return string|nil  the violation, or nil when the answer is well formed
 local function llm_contract_violation(resp: any): string
-    if type(resp) ~= "table" then
+    if not (resp is {string:any}) then
         if resp == nil then
             return "llm answered neither a result nor an error"
         end
@@ -1852,7 +1852,7 @@ local function decide_tool(policy: function(any, any, any): any, block: {string:
         return nil,
         nil,
         "tool_policy returned "
-            .. (type(decided) == "string" and string.format("%q", decided as string) or type(decided))
+            .. (decided is string and string.format("%q", decided) or type(decided))
             .. ' (a decision must be nil, "run" or "deny")'
     end
     -- Past the check there are three values left: nil (no opinion), "run",
@@ -1862,7 +1862,7 @@ local function decide_tool(policy: function(any, any, any): any, block: {string:
     end
     -- A reason is optional and a string; anything else is not made up into
     -- one, it is left out.
-    return "deny", ((type(reason) == "string" and reason ~= "" and reason) or nil) as string
+    return "deny", ((reason is string and reason ~= "" and reason) or nil) as string
 end
 
 --- Run the tool_use blocks of a response, closing every one with a
@@ -2099,7 +2099,7 @@ function M.beat(session: Session, device: Device): OutcomeValue
         -- that mutates and forgets to return (nil) or returns a
         -- non-table would corrupt the write-ahead record and the wire.
         -- Loud in prod, not just under the dev assert below.
-        if type(filtered) ~= "table" then
+        if not (filtered is {string:any}) then
             return emit(
                 Outcome.err(
                     "filter",
@@ -2159,7 +2159,7 @@ function M.beat(session: Session, device: Device): OutcomeValue
     -- request has not made a report, and a stray second value must not become
     -- a durable one.
     local request_data: {string:any} = { request = request }
-    if type(report) == "table" then
+    if report is {string:any} then
         request_data.window = report
     end
     local rec_ok, rec_err = pcall(
@@ -2201,7 +2201,7 @@ function M.beat(session: Session, device: Device): OutcomeValue
     -- usage to default and no refusal reason to invent: an adapter that broke
     -- its promise has produced no response, and this is where that is said.
     local reason: string
-    if type(resp) ~= "table" then
+    if not (resp is {string:any}) then
         reason = (berr as string) or llm_contract_violation(resp)
     else
         reason = llm_contract_violation(resp)
@@ -2969,7 +2969,7 @@ if shape.is_dev_mode() then
         local export = exports[name]
         if type(export) == "function" then
             exports[name] = arg_checked("knl." .. name, export as function(...: any): any..., entry.args as {{string:any}})
-        elseif type(export) == "table" and type(entry.members) == "table" then
+        elseif export is {string:any} and type(entry.members) == "table" then
             -- A namespace (`Outcome`): its members are exports too. A
             -- member of something this module does not export as a table
             -- (`device:with`) has no function here to replace, and is

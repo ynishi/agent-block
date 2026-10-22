@@ -1411,13 +1411,13 @@ function M.plan_of(input: PlanInput, targets?: {string}, repo?: string): {Step},
     local steps: any = type(input) == "table" and input.steps or nil
     -- The array as a JSON string is the same plan, and models do send it that
     -- way; refusing it costs a beat and a re-file for nothing.
-    if type(steps) == "string" then
-        local ok, decoded = pcall(std.json.decode, steps as string)
-        if ok and type(decoded) == "table" then
+    if steps is string then
+        local ok, decoded = pcall(std.json.decode, steps)
+        if ok and decoded is {string:any} then
             steps = decoded
         end
     end
-    if type(steps) ~= "table" or #(steps as {any}) == 0 then
+    if not (steps is {string:any}) or #(steps as {any}) == 0 then
         return nil, "steps must be a non-empty array of { step, check }"
     end
     local out: {Step} = {}
@@ -2347,8 +2347,8 @@ local function recorded_versions(s: kernel.Session): {string:boolean}
     for _, ev in ipairs((s:events())) do
         if ev.kind == "checkpoint_blob" and type(ev.data) == "table" then
             local version = (ev.data as {string:any}).version
-            if type(version) == "string" then
-                have[version as string] = true
+            if version is string then
+                have[version] = true
             end
         end
     end
@@ -2752,12 +2752,12 @@ local function config_repo(ev: shared.Event): string
         return nil
     end
     local values = (ev.data as {string:any}).values
-    if type(values) ~= "table" then
+    if not (values is {string:any}) then
         return nil
     end
     local repo = (values as {string:any}).repo
-    if type(repo) == "table" and type((repo as {string:any}).value) == "string" then
-        return (repo as {string:any}).value as string
+    if repo is {string:any} and type(repo.value) == "string" then
+        return repo.value as string
     end
     return nil
 end
@@ -3136,7 +3136,7 @@ local function fork_log(source: any): {shared.Event}, string
         end
         return events as {shared.Event}, tostring(s:id())
     end
-    if type(source) ~= "table" then
+    if not (source is {string:any}) then
         error(
             "coding.fork: takes a knl session, or the events of one in seq order (knl.export(s), or the lines "
                 .. "of `agent-block knl export --as events` decoded), got "
@@ -3145,7 +3145,7 @@ local function fork_log(source: any): {shared.Event}, string
         )
     end
     for i, ev in ipairs(source as {any}) do
-        if type(ev) ~= "table" then
+        if not (ev is {string:any}) then
             error("coding.fork: log[" .. tostring(i) .. "] is not an event (" .. type(ev) .. ")", 3)
         end
     end
@@ -3259,7 +3259,7 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
     local cut: integer = nil
     for i, ev in ipairs(events) do
         local meta = ev.meta
-        if type(meta) == "table" and (meta as {string:any}).beat == beat then
+        if meta is {string:any} and meta.beat == beat then
             cut = i
         end
     end
@@ -3289,7 +3289,7 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
     local upto_state = prefix_of(events, at)
     local state_ev = events[at] or {}
     local state_meta = state_ev.meta
-    local state_beat = type(state_meta) == "table" and (state_meta as {string:any}).beat as string or "baseline"
+    local state_beat = state_meta is {string:any} and state_meta.beat as string or "baseline"
     -- Resolved here, before a session opens, so a log missing a blob is
     -- refused now and not halfway through the copy.
     local state = policy.checkpoint_at(upto_state, state_beat)
@@ -3320,7 +3320,7 @@ function M.fork(source: any, beat: string, opts: {string:any}): RunResult
     local cut_seq = cut_ev.seq
     local lineage: {string:any} = {
         session = parent,
-        upto_seq = type(cut_seq) == "number" and math.tointeger(cut_seq as number) or cut,
+        upto_seq = cut_seq is number and math.tointeger(cut_seq) or cut,
         beat = beat,
         reason = opts.reason,
         spent = spent_in(prefix_of(events, cut)),

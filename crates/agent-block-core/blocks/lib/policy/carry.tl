@@ -84,7 +84,7 @@ end
 --- what failed, which is the whole of what the next beat needs. `canonical` is
 --- this module's own renderer and costs it no host global.
 local function render_result(result: any): string
-    if type(result) == "string" then
+    if result is string then
         return result as string
     end
     return canonical(result)

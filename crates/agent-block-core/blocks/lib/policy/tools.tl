@@ -75,7 +75,7 @@ local REQUIRE_ARGS_OPTS, REQUIRE_ARGS_ARG = opts_contract({})
 --- before encoding — a table read back from the log and a table handed to a
 --- handler must key alike.
 local function call_key(name: any, args: any): string
-    if type(args) ~= "table" then
+    if not (args is {string:any}) then
         return tostring(name) .. "\0" .. tostring(args)
     end
     local map = args as {string:any}
@@ -87,7 +87,7 @@ local function call_key(name: any, args: any): string
     local parts: {string} = {}
     for _, k in ipairs(keys) do
         local v = map[k]
-        parts[#parts + 1] = k .. "=" .. (type(v) == "table" and std.json.encode(v) or tostring(v))
+        parts[#parts + 1] = k .. "=" .. (v is {string:any} and std.json.encode(v) or tostring(v))
     end
     return tostring(name) .. "\0" .. table.concat(parts, "\1")
 end
@@ -100,7 +100,7 @@ local function result_succeeded(data: {string:any}): boolean
         return false
     end
     local result = data.result
-    if type(result) == "table" and (result as {string:any}).ok == false then
+    if result is {string:any} and result.ok == false then
         return false
     end
     return true
@@ -294,11 +294,11 @@ function M.require_args(opts?: RequireArgsOpts): M.Wrap
                 error("policy.require_args: tool '" .. tostring(name) .. "' has no handler", 2)
             end
             local schema = entry.input_schema
-            local declared = type(schema) == "table" and (schema as {string:any}).required or nil
+            local declared = schema is {string:any} and schema.required or nil
             local required: {string} = {}
-            if type(declared) == "table" then
+            if declared is {string:any} then
                 for _, key in ipairs(declared as {any}) do
-                    if type(key) == "string" then
+                    if key is string then
                         required[#required + 1] = key as string
                     end
                 end
@@ -312,7 +312,7 @@ function M.require_args(opts?: RequireArgsOpts): M.Wrap
                 end
                 local handler = entry.handler
                 checked.handler = function(args: any): any
-                    local given = type(args) == "table" and args as {string:any} or {}
+                    local given = args is {string:any} and args or {}
                     for _, key in ipairs(required) do
                         if given[key] == nil then
                             return {
