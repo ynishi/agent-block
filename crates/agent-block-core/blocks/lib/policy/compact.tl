@@ -46,7 +46,7 @@ local record M
     type CompactFactory = function(CompactOpts): Due, Fold
     type LedgerFn = function(kernel.Session): shared.Ledger
     type LedgerFactory = function(?LedgerOpts): LedgerFn
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

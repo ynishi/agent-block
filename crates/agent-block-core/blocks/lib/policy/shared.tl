@@ -43,7 +43,7 @@ local record S
     end
     --- One declared argument of the registry.
     record ApiArg
-        shape: lshape.Schema
+        shape: lshape.AnySchema
         desc: string
     end
     --- One entry of the registry: what goes in, what comes out, and the
@@ -105,18 +105,18 @@ local record S
     ELLIPSIS: string
     NOTE_PREFIX: string
     ARRAY_TAG: {string:string}
-    FUNCTION: lshape.Schema
-    CALLABLE: lshape.Schema
-    SESSION_HANDLE: lshape.Schema
-    BEAT_RECORD: lshape.Schema
-    TOOL_PAIR: lshape.Schema
-    STOP_REASON: lshape.Schema
-    LEDGER: lshape.Schema
-    SUMMARY: lshape.Schema
-    COMPACT_SKIPPED: lshape.Schema
-    CHECKPOINT: lshape.Schema
-    CHECKPOINT_BLOB: lshape.Schema
-    FORKED_FROM: lshape.Schema
+    FUNCTION: lshape.AnySchema
+    CALLABLE: lshape.AnySchema
+    SESSION_HANDLE: lshape.AnySchema
+    BEAT_RECORD: lshape.AnySchema
+    TOOL_PAIR: lshape.AnySchema
+    STOP_REASON: lshape.AnySchema
+    LEDGER: lshape.AnySchema
+    SUMMARY: lshape.AnySchema
+    COMPACT_SKIPPED: lshape.AnySchema
+    CHECKPOINT: lshape.AnySchema
+    CHECKPOINT_BLOB: lshape.AnySchema
+    FORKED_FROM: lshape.AnySchema
     EVENTS_ARG: ApiArg
     SESSION_ARG: ApiArg
     OUTCOME_ARG: ApiArg
@@ -577,9 +577,8 @@ end
 -- rather than retyped. A second copy of a contract is a contract with two
 -- versions.
 
---- A Lua function, as a shape. `lshape.t` exposes only the five prims it
---- names, so this is built from the same plain-data schema form.
-S.FUNCTION = setmetatable({ kind = "prim", prim = "function" } as any, lshape.t._internal.schema_mt) as lshape.Schema
+--- A Lua function, as a shape: `lshape.t.fn`.
+S.FUNCTION = T.fn
 
 --- Something a beat can call, and a session handle: the kernel's, not a
 --- second copy. Both used to be written here as well, in the same `any_of`
@@ -633,7 +632,7 @@ end
 --- @param fields table  the field name -> schema map, written once
 --- @return table closed  the published contract
 --- @return table open  the same fields, for the registry
-function S.opts_contract(fields: {string:lshape.Schema}): lshape.Schema, lshape.Schema
+function S.opts_contract(fields: {string:lshape.AnySchema}): lshape.AnySchema, lshape.AnySchema
     return T.shape(fields, { open = false }), T.shape(fields)
 end
 
@@ -753,7 +752,7 @@ S.FORKED_FROM = T.shape({
 -- ============================================================
 
 --- One declared argument: the shape it is held to, and the word for it.
-function S.arg_of(schema: lshape.Schema, desc: string): S.ApiArg
+function S.arg_of(schema: lshape.AnySchema, desc: string): S.ApiArg
     return { shape = schema, desc = desc }
 end
 

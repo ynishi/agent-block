@@ -81,7 +81,7 @@ local record M
     type StagnationFactory = function(StagnationOpts): Predicate
     type RetryFactory = function(RetryOpts): RetryFn
     type EscalateFactory = function(EscalateOpts): Next
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

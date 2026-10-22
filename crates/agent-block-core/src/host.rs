@@ -1228,20 +1228,17 @@ where
 struct TealChecker(#[allow(dead_code)] htl::Htl);
 
 /// The declarations this binary ships for a `.tl` to be checked against:
-/// `host_types.d.tl` and `lshape.d.tl` as the tree holds them, and
-/// `knl_types.d.tl` as this binary renders it from the kernel's Rust types
-/// (`bridge::knl::teal_module_source`) — the binary's own, whatever the
-/// tree's copy said.
+/// `host_types.d.tl` as the tree holds it; `lshape.d.tl` as htl ships it
+/// (`htl::shapes::LSHAPE_DTL`); and `knl_types.d.tl` as this binary renders
+/// it from the kernel's Rust types (`bridge::knl::teal_module_source`) — the
+/// binary's own, whatever the tree's copy said.
 fn teal_declarations() -> Vec<(&'static str, String)> {
     vec![
         (
             "host_types.d.tl",
             include_str!("../blocks/lib/host_types.d.tl").to_string(),
         ),
-        (
-            "lshape.d.tl",
-            include_str!("../blocks/lib/lshape.d.tl").to_string(),
-        ),
+        ("lshape.d.tl", htl::shapes::LSHAPE_DTL.to_string()),
         ("knl_types.d.tl", crate::bridge::knl::teal_module_source()),
     ]
 }
@@ -2660,6 +2657,29 @@ impl agent_mesh_sdk::RequestHandler for BusRelayHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `blocks/lib/lshape.d.tl` is the declaration htl ships
+    /// (`htl::shapes::LSHAPE_DTL`), byte for byte. The host hands out htl's
+    /// text at start (`teal_declarations`); the tree copy is for the checker
+    /// that reads the project's own files and nothing a host wrote —
+    /// `htl check`, and `include_tl!` at `cargo build`. It moves with the
+    /// `htl` dependency: `AGENT_BLOCK_WRITE_DTS=1` makes this test write the
+    /// file instead of comparing, which is how it is refreshed after a bump.
+    #[test]
+    fn lshape_declaration_in_the_tree_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blocks/lib/lshape.d.tl");
+        if std::env::var_os("AGENT_BLOCK_WRITE_DTS").is_some() {
+            std::fs::write(&path, htl::shapes::LSHAPE_DTL).expect("write the declaration");
+            return;
+        }
+        let in_tree = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            in_tree == htl::shapes::LSHAPE_DTL,
+            "{} is not the declaration htl ships — refresh it:\n  \
+             AGENT_BLOCK_WRITE_DTS=1 cargo test -p agent-block-core lshape_declaration_in_the_tree_is_current",
+            path.display()
+        );
+    }
 
     /// The one contract with `blocks/lib/job/init.lua`: a raise carrying
     /// `job.defer: ` is the block not starting, with the reason after the

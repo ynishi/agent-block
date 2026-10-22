@@ -150,7 +150,7 @@ local record M
     type BeatCapFactory = function(BeatCapOpts): Bind
     type ThinkingCapFactory = function(ThinkingCapOpts): Filter
     type RoomNoteFactory = function(RoomNoteOpts): Filter
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

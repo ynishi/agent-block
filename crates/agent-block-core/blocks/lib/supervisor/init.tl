@@ -145,7 +145,7 @@ local record Slot ---@struct
 end
 --- One declared argument of the registry.
 local record ApiArg ---@struct
-    shape: lshape.Schema
+    shape: lshape.AnySchema
     desc: string
 end
 --- One entry of the registry: what goes in, what comes out, and the
@@ -157,14 +157,14 @@ local record ApiEntry
 end
 --- The public contracts, as data.
 local record Shapes
-    child_opts: lshape.Schema
-    child_budget: lshape.Schema
-    child_entry: lshape.Schema
-    parallel_opts: lshape.Schema
-    merge_opts: lshape.Schema
-    joiner: lshape.Schema
-    result_slot: lshape.Schema
-    results: lshape.Schema
+    child_opts: lshape.AnySchema
+    child_budget: lshape.AnySchema
+    child_entry: lshape.AnySchema
+    parallel_opts: lshape.AnySchema
+    merge_opts: lshape.AnySchema
+    joiner: lshape.AnySchema
+    result_slot: lshape.AnySchema
+    results: lshape.AnySchema
     api: {string:ApiEntry}
 end
 
@@ -284,9 +284,8 @@ end
 -- `request` — reached through `kernel.shapes` rather than retyped. A second
 -- copy of a contract is a contract with two versions.
 
---- A Lua function, as a shape. `lshape.t` exposes only the five prims it
---- names, so this is built from the same plain-data schema form.
-local FUNCTION = setmetatable({ kind = "prim", prim = "function" } as any, lshape.t._internal.schema_mt) as lshape.Schema
+--- A Lua function, as a shape: `lshape.t.fn`.
+local FUNCTION: lshape.AnySchema = T.fn
 
 --- A session handle: the kernel's shape, not a second copy of it.
 local SESSION_HANDLE = kernel.shapes.session_handle
@@ -300,7 +299,7 @@ local SESSION_HANDLE = kernel.shapes.session_handle
 --- closed shape, the dev-only gate became the thing that reported an unknown
 --- option, in different words, so the module said two different things about
 --- one typo depending on `LSHAPE_CHECK`.
-local function opts_contract(fields: {string:lshape.Schema}): lshape.Schema, lshape.Schema
+local function opts_contract(fields: {string:lshape.AnySchema}): lshape.AnySchema, lshape.AnySchema
     return T.shape(fields, { open = false }), T.shape(fields)
 end
 
@@ -862,7 +861,7 @@ end
 -- so their entries are declared and walked by the spec and nothing wraps them.
 
 --- One declared argument: the shape it is held to, and the word for it.
-local function arg_of(schema: lshape.Schema, desc: string): ApiArg
+local function arg_of(schema: lshape.AnySchema, desc: string): ApiArg
     return { shape = schema, desc = desc }
 end
 

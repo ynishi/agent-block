@@ -350,29 +350,29 @@ local checkpoint = require("policy.checkpoint")
 --- The public contracts, as data (`policy.shapes`), and the registry
 --- (`policy.shapes.api`).
 local record Shapes
-    room_opts: lshape.Schema
-    beat_cap_opts: lshape.Schema
-    window_opts: lshape.Schema
-    split_opts: lshape.Schema
-    split: lshape.Schema
-    carry_opts: lshape.Schema
-    require_args_opts: lshape.Schema
-    thinking_cap_opts: lshape.Schema
-    room_note_opts: lshape.Schema
-    stagnation_opts: lshape.Schema
-    retry_opts: lshape.Schema
-    escalate_opts: lshape.Schema
-    compact_opts: lshape.Schema
-    ledger_opts: lshape.Schema
-    ledger: lshape.Schema
-    summary: lshape.Schema
-    compact_skipped: lshape.Schema
-    checkpoint: lshape.Schema
-    checkpoint_blob: lshape.Schema
-    forked_from: lshape.Schema
-    beat_record: lshape.Schema
-    tool_pair: lshape.Schema
-    stop_reason: lshape.Schema
+    room_opts: lshape.AnySchema
+    beat_cap_opts: lshape.AnySchema
+    window_opts: lshape.AnySchema
+    split_opts: lshape.AnySchema
+    split: lshape.AnySchema
+    carry_opts: lshape.AnySchema
+    require_args_opts: lshape.AnySchema
+    thinking_cap_opts: lshape.AnySchema
+    room_note_opts: lshape.AnySchema
+    stagnation_opts: lshape.AnySchema
+    retry_opts: lshape.AnySchema
+    escalate_opts: lshape.AnySchema
+    compact_opts: lshape.AnySchema
+    ledger_opts: lshape.AnySchema
+    ledger: lshape.AnySchema
+    summary: lshape.AnySchema
+    compact_skipped: lshape.AnySchema
+    checkpoint: lshape.AnySchema
+    checkpoint_blob: lshape.AnySchema
+    forked_from: lshape.AnySchema
+    beat_record: lshape.AnySchema
+    tool_pair: lshape.AnySchema
+    stop_reason: lshape.AnySchema
     api: {string:shared.ApiEntry}
 end
 

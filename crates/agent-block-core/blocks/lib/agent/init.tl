@@ -252,9 +252,9 @@ end
 
 --- The contracts `M.shapes` publishes.
 local record Shapes ---@struct
-    usage: lshape.Schema
-    run_result: lshape.Schema
-    mcp_call_result: lshape.Schema
+    usage: lshape.AnySchema
+    run_result: lshape.AnySchema
+    mcp_call_result: lshape.AnySchema
 end
 
 --- What `_test_helpers` answers.

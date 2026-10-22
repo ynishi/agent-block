@@ -1230,9 +1230,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "htl"
-version = "0.16.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "233943070978db51a6ce74e61e8e30571af7ef41da8f858dbf939ca5b3bc5067"
+checksum = "eb3a9e15efa1086f6f449bfb204f49dc111efd837d10da562bd0c9e13a6ccb72"
 dependencies = [
  "htl-core",
  "htl-macros",
@@ -1240,9 +1240,9 @@ dependencies = [
 
 [[package]]
 name = "htl-core"
-version = "0.16.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ef44a3820693c975fda1aa4f06d38fde24299f5f872e9e866f9fcb0f4422286"
+checksum = "e2623aa5d531740be2ec95bec9d2da6cc95287a73f76ffa0d58c41bcb2b1b4f6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1262,9 +1262,9 @@ dependencies = [
 
 [[package]]
 name = "htl-macros"
-version = "0.16.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa30ca2fad5cd519b340e6ac533fc23100bb24302f393c4c2362aa98690fd32a"
+checksum = "85a545a2bec37651a96771e6382c7d999bde54c1e482af20715fba0e1a6cdab3"
 dependencies = [
  "htl-core",
  "proc-macro2",

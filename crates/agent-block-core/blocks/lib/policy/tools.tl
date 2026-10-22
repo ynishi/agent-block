@@ -32,7 +32,7 @@ local record M
     type Bind = function(kernel.Session): Wrap
     type RepeatCapFactory = function(RepeatCapOpts): Bind
     type RequireArgsFactory = function(?RequireArgsOpts): Wrap
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

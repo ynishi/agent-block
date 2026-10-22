@@ -28,34 +28,34 @@ local T = lshape.t
 --- are assigned below and `require("knl.shapes")` answers it — so
 --- `knl/init.tl` names the type with a `local type` import of this file.
 local record Shapes
-    outcome: lshape.Schema
-    error: lshape.Schema
-    query_opts: lshape.Schema
+    outcome: lshape.AnySchema
+    error: lshape.AnySchema
+    query_opts: lshape.AnySchema
     schema: any
     error_kinds: {string}
-    call_error: lshape.Schema
+    call_error: lshape.AnySchema
     call_error_kinds: {string}
     call_error_retryable: {string:boolean}
-    request: lshape.Schema
-    window_report: lshape.Schema
-    export_opts: lshape.Schema
-    event_base: lshape.Schema
-    event_meta: lshape.Schema
-    events: {string:lshape.Schema}
-    budget_allocation: lshape.Schema
-    device_config: lshape.Schema
-    tool_spec: lshape.Schema
-    tool_entry: lshape.Schema
-    tool_policy_decision: lshape.Schema
-    cost_result: lshape.Schema
-    llm_result: lshape.Schema
-    llm_usage: lshape.Schema
-    tool_use_block: lshape.Schema
-    session_handle: lshape.Schema
-    callable: lshape.Schema
-    open_opts: lshape.Schema
-    resume_opts: lshape.Schema
-    budget_grant: lshape.Schema
+    request: lshape.AnySchema
+    window_report: lshape.AnySchema
+    export_opts: lshape.AnySchema
+    event_base: lshape.AnySchema
+    event_meta: lshape.AnySchema
+    events: {string:lshape.AnySchema}
+    budget_allocation: lshape.AnySchema
+    device_config: lshape.AnySchema
+    tool_spec: lshape.AnySchema
+    tool_entry: lshape.AnySchema
+    tool_policy_decision: lshape.AnySchema
+    cost_result: lshape.AnySchema
+    llm_result: lshape.AnySchema
+    llm_usage: lshape.AnySchema
+    tool_use_block: lshape.AnySchema
+    session_handle: lshape.AnySchema
+    callable: lshape.AnySchema
+    open_opts: lshape.AnySchema
+    resume_opts: lshape.AnySchema
+    budget_grant: lshape.AnySchema
     --- The registry: one entry per export, naming what goes in and out.
     api: {string:any}
     --- The same, for the predefined views: one entry per view.
@@ -100,15 +100,17 @@ end
 -- these, so the shapes below are the only declaration of them, and the
 -- appends in `knl/init.tl` (`record_event`) are where they are held.
 
---- A Lua function, as a shape. lshape's `prim` handler is `type(v) ==
---- schema.prim` for any type name, but `lshape.t` exposes only the five it
---- names, so these two are built from the same plain-data schema form
+--- A Lua function, as a shape: `lshape.t.fn`.
+local FUNCTION: lshape.AnySchema = T.fn
+
+--- A userdata, as a shape. lshape's `prim` handler is `type(v) ==
+--- schema.prim` for any type name, but `lshape.t` has no userdata prim, so
+--- this one is built from the same plain-data schema form
 --- (Schema-as-Data: the state is the table; the metatable carries only the
---- `:is_optional()` / `:describe()` sugar).
--- The plain-data form is what lshape's own `t` builds and hands out, so the
--- table is named as the Schema it is once the metatable is on it.
-local FUNCTION = setmetatable({ kind = "prim", prim = "function" } as lshape.Schema, lshape.t._internal.schema_mt as metatable<lshape.Schema>)
-local USERDATA = setmetatable({ kind = "prim", prim = "userdata" } as lshape.Schema, lshape.t._internal.schema_mt as metatable<lshape.Schema>)
+--- `:is_optional()` / `:describe()` sugar). The metatable is the one every
+--- schema shares, taken from `T.fn` rather than from a private field of
+--- lshape; the plain-data form is named as the schema it is once it is on.
+local USERDATA = setmetatable({ kind = "prim", prim = "userdata" } as lshape.AnySchema, getmetatable(T.fn as any) as metatable<lshape.AnySchema>)
 
 --- Something a beat can call: a function, or a table / userdata carrying
 --- `__call` — a Port shim may hand back either. The exact test is
@@ -335,7 +337,7 @@ local CALL_ERROR = T.shape({
 --- view over them (`knl.views.tree`) is tied to those two paths the same way
 --- `usage` is tied to `llm_response`: the declaration is what says which
 --- reads move when the shape does.
-local EVENT_DATA: {string:lshape.Schema} = {
+local EVENT_DATA: {string:lshape.AnySchema} = {
     session_opened = T.shape({
         scope_id = T.string,
         owner = T.string,
@@ -426,10 +428,10 @@ local TOOL_SPEC = T.shape({
 --- what an entry promises and what a spec promises cannot say different
 --- things about the same field. Only `input_schema` is read; there is no
 --- alias.
--- A `shape`'s own field map, read as data: `lshape.Schema` is one record for
+-- A `shape`'s own field map, read as data: `lshape.AnySchema` is one interface for
 -- every kind of schema and its `fields` is not part of that surface, so the
 -- map is named here once and the three entries come off it.
-local TOOL_SPEC_FIELDS = (TOOL_SPEC as {string:any}).fields as {string:lshape.Schema}
+local TOOL_SPEC_FIELDS = (TOOL_SPEC as {string:any}).fields as {string:lshape.AnySchema}
 
 local TOOL_ENTRY = T.shape({
     description = TOOL_SPEC_FIELDS.description,
@@ -902,7 +904,7 @@ Shapes.module = {
 --- Two fields rather than one so the widest-true shape (`T.any`, a union)
 --- costs no meaning — `desc` keeps saying "session" where the schema has
 --- stopped being able to.
-local function arg_of(schema: lshape.Schema, desc: string): {string:any}
+local function arg_of(schema: lshape.AnySchema, desc: string): {string:any}
     return { shape = schema, desc = desc }
 end
 

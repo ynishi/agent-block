@@ -697,8 +697,8 @@ local type History = function(kernel.Session): Opening
 
 --- The contracts `M.shapes` publishes.
 local record Shapes ---@struct
-    run_opts: lshape.Schema
-    run_result: lshape.Schema
+    run_opts: lshape.AnySchema
+    run_result: lshape.AnySchema
 end
 
 --- How `beat_outcome` reads an Outcome: each arm answers the three values

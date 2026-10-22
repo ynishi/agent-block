@@ -24,7 +24,7 @@ local record M
     type Filter = function(kernel.Request): kernel.Request
     type Bind = function(kernel.Session): Filter
     type CarryFactory = function(CarryOpts): Bind
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

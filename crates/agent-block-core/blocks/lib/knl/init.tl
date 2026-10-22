@@ -2950,7 +2950,7 @@ local function arg_checked(name: string, fn: function(...: any): any..., declare
                 local declared_arg = declared[i]
                 shape.assert_dev(
                     value,
-                    declared_arg.shape as lshape.Schema,
+                    declared_arg.shape as lshape.AnySchema,
                     name .. " arg " .. i .. " (" .. (declared_arg.desc as string) .. ")"
                 )
             end

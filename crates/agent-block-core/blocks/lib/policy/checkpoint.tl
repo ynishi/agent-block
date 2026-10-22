@@ -126,7 +126,7 @@ local record M
     checkpoints: CheckpointsFn
     checkpoint_at: CheckpointAtFn
     lineage: LineageFn
-    shapes: {string:lshape.Schema}
+    shapes: {string:lshape.AnySchema}
     api: {string:shared.ApiEntry}
 end
 

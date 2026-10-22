@@ -185,13 +185,13 @@ end
 
 local record M
     record Shapes
-        llm_result: lshape.Schema
-        llm_usage: lshape.Schema
-        tool_use_block: lshape.Schema
-        tool_spec: lshape.Schema
-        call_error: lshape.Schema
+        llm_result: lshape.AnySchema
+        llm_usage: lshape.AnySchema
+        tool_use_block: lshape.AnySchema
+        tool_spec: lshape.AnySchema
+        call_error: lshape.AnySchema
         call_error_kinds: {string}
-        tool_decl: lshape.Schema
+        tool_decl: lshape.AnySchema
     end
     shapes: Shapes
     LLMPort: LLMPort
@@ -1020,7 +1020,7 @@ M.openai = LLMPort.new({
 --- kernel's shape. lshape has no "minus a field" combinator — `T.partial`
 --- makes every field optional, which would give up the one thing checked
 --- loudly here — so the subset is named field by field.
-local KERNEL_TOOL_FIELDS = (kernel.shapes.tool_spec as {string:any}).fields as {string:lshape.Schema}
+local KERNEL_TOOL_FIELDS = (kernel.shapes.tool_spec as {string:any}).fields as {string:lshape.AnySchema}
 local TOOL_DECL = T.shape({
     name = KERNEL_TOOL_FIELDS.name,
     description = KERNEL_TOOL_FIELDS.description,
